@@ -17,6 +17,13 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// `DescribeAddressesAttribute` as the projection of an Elastic IP address's `domain-name`
+// attribute state it is: which addresses carry a row, how `AllocationIds` filters them, what
+// it refuses, and how it pages. Declared beside `prefix_lists` for the reason the note above
+// gives: the sorted neighbourhood and the tail of this file are where every new ec2 suite
+// inserts its lines.
+#[path = "all/describe_addresses_attribute.rs"]
+mod describe_addresses_attribute;
 // The two forms an instance id is read in before any lookup, and the two answers a value
 // inside and outside them gets, across a describe, a password read and a mutation. Declared
 // beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood and

@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAddressesAttribute
-//! Reports the `domain-name` attribute — the reverse DNS (PTR) record — of the account's
-//! Elastic IP addresses, narrowed by the allocation ids the request names and paged over
-//! those ids.
+//! Reports the `domain-name` attribute — the reverse DNS (PTR) record — of every Elastic IP
+//! address of the account that HAS that attribute set, narrowed by the allocation ids the
+//! request names and paged over those ids. An address nothing has given a record (and no
+//! record an update is outstanding on) has no attributes associated with it, so it
+//! contributes no row and an allocation id that selects no row is answered with an empty
+//! `addressSet` rather than refused.
 //!
 //! A REPORT: it writes nothing of its own. The one thing it applies is a PTR record update
 //! the clock had already taken past its instant, which was owed whether or not anybody
@@ -142,9 +145,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            decode_page_token, invalid_pagination_token_for, page_from_cursor,
-            require_known_address, require_service_state, PageTokenRule, MAX_PAGE_SIZE,
-            MAX_RESOURCE_IDS,
+            allocation_id_is_well_formed, decode_page_token, invalid_allocation_id_malformed,
+            invalid_pagination_token_for, page_from_cursor, require_service_state, PageTokenRule,
+            MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it. The store
@@ -161,6 +164,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "AllocationIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
                 requested_ids.len()
             )));
+        }
+
+        // A value that is not an allocation id at all is not a narrowing this report can be
+        // asked for, so it is refused the way every EC2 operation refuses the FORM of an id it
+        // was handed. A well-formed id is a FILTER over the attribute state below and asserts
+        // nothing about the account holding that address: it selects the rows it names and
+        // contributes none when it names nothing, so a request that narrows to an address with
+        // no attributes set is answered with an empty `addressSet` rather than refused.
+        for allocation_id in &requested_ids {
+            if !allocation_id_is_well_formed(allocation_id) {
+                return Err(invalid_allocation_id_malformed(allocation_id));
+            }
         }
 
         // "The token for the next page of results"
@@ -181,18 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this one was made.
         store.materialize_due_transitions();
 
-        // "Describes the attributes of the specified Elastic IP addresses": an allocation id
-        // that names no address of the account is an error, not an absent row — a malformed
-        // id before an unknown one, the way the service orders the two.
-        for allocation_id in &requested_ids {
-            require_known_address(&store, allocation_id)?;
-        }
-
-        // DryRun sits AFTER every parameter has been validated and every named address
-        // resolved: the flag asks whether the request WOULD have succeeded, so one that would
-        // have been refused is refused with that reason instead. The model's own `@range` on
-        // `MaxResults` (1..1000) was already applied at the boundary, before this handler
-        // ran.
+        // DryRun sits AFTER every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused with
+        // that reason instead. The model's own `@range` on `MaxResults` (1..1000) was already
+        // applied at the boundary, before this handler ran.
         if input.dry_run == Some(true) {
             return Err(Scaffolded::dry_run_operation());
         }
@@ -204,10 +211,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ask for the same thing. Every other spelling is refused by the request walk before
         // this handler runs.
         //
-        // With no `AllocationIds` every address of the account is reported, and with the list
-        // given an address is reported when the list names it — asked of a set built once, so
-        // the narrowing costs one lookup per stored address however many ids the request
-        // carries. Each row is the ONE projection of the stored address and its PTR record
+        // What a row of this report IS: "the attributes associated with an Elastic IP address"
+        // (`AddressAttribute`). An address the account holds carries an attribute only once
+        // something has set one on it, so the report is a projection of the ATTRIBUTE state —
+        // the PTR record in effect (`AddressAttribute$PtrRecord`) and the update outstanding
+        // on it (`AddressAttribute$PtrRecordUpdate`) — and not a lookup of addresses: an
+        // address nothing has given a reverse DNS record has no attributes to report and
+        // contributes no row, so an account that has never set one is answered an empty
+        // `addressSet` rather than a row per address.
+        //
+        // That state is exactly what [`crate::state::ComAmazonawsEc2Amazonec2State::address_ptr_records`]
+        // holds an entry for, so the report walks THAT map: an address the account no longer
+        // holds contributes nothing either, because the projection is of the stored address
+        // and its record together.
+        //
+        // With no `AllocationIds` every such address is reported, and with the list given one
+        // is reported when the list names it — asked of a set built once, so the narrowing
+        // costs one lookup per reported address however many ids the request carries. Each row
+        // is the ONE projection of the stored address and its PTR record
         // ([`crate::state::ComAmazonawsEc2Amazonec2State::address_attribute_view`]), so this
         // report and the operation that resets the attribute cannot describe one address
         // differently. The row carries the store's own KEY beside the attribute, and the page
@@ -217,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let narrowed_to: ::std::collections::BTreeSet<&str> =
             requested_ids.iter().map(String::as_str).collect();
         let mut selected: Vec<(&String, AddressAttribute)> = store
-            .addresses
+            .address_ptr_records
             .keys()
             .filter(|allocation_id| {
                 narrowed_to.is_empty() || narrowed_to.contains(allocation_id.as_str())
@@ -226,6 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 store
                     .address_attribute_view(allocation_id)
                     .map(|attribute| (allocation_id, attribute))
+            })
+            .filter(|(_, attribute)| {
+                attribute.ptr_record.is_some() || attribute.ptr_record_update.is_some()
             })
             .collect();
         // Paged in `AllocationId` order, which the cursor names a position in. The store is an

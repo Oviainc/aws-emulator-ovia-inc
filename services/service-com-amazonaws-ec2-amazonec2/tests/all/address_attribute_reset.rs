@@ -20,8 +20,9 @@
 //!    unknown — and a `DryRun` request is answered without starting anything, so neither
 //!    stores a thing;
 //! 4. `DescribeAddressesAttribute` is a REPORT of that state: it reports every address of
-//!    the account, narrows by `AllocationIds`, pages in allocation-id order, and two
-//!    identical calls answer the same thing.
+//!    the account whose attribute is SET, narrows by `AllocationIds`, pages in allocation-id
+//!    order, and two identical calls answer the same thing. Which addresses carry a row at
+//!    all is [`super::describe_addresses_attribute`]'s subject.
 //!
 //! Each table row is a distinct input along what the rule generalises over — which address
 //! of how many is named, how many requests have already been made on it, which id form the
@@ -31,9 +32,9 @@
 use std::time::Duration;
 
 use service_com_amazonaws_ec2_amazonec2::state::{
-    ADDRESS_ATTRIBUTE_DOMAIN_NAME, INVALID_ALLOCATION_ID_MALFORMED,
-    INVALID_ALLOCATION_ID_NOT_FOUND, INVALID_PAGINATION_TOKEN, PENDING_REQUEST_ALREADY_EXISTS,
-    PTR_UPDATE_STATUS_PENDING, TRANSITION_DELAY,
+    ADDRESS_ATTRIBUTE_DOMAIN_NAME, AddressPtrRecord, ComAmazonawsEc2Amazonec2State as Ec2State,
+    INVALID_ALLOCATION_ID_MALFORMED, INVALID_ALLOCATION_ID_NOT_FOUND, INVALID_PAGINATION_TOKEN,
+    PENDING_REQUEST_ALREADY_EXISTS, PTR_UPDATE_STATUS_PENDING, TRANSITION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -203,46 +204,36 @@ async fn reset_starts_an_outstanding_update_on_the_named_address() {
         );
 
         // The report reads the SAME state back: the named address carries the outstanding
-        // update, and no other address of the account carries anything.
+        // update, and an address with no attribute set carries nothing to report, so it is
+        // the ONE row the report answers.
         let (reported, token) = described(&router, case, &[]).await;
         assert_eq!(
             token, None,
-            "case {case:?}: four addresses fit one page, so no token was expected, got {token:?}"
+            "case {case:?}: one row fits one page, so no token was expected, got {token:?}"
         );
         assert_eq!(
-            reported.len(),
-            held.len(),
-            "case {case:?}: expected every held address to be reported, got {reported:?}"
+            reported,
+            vec![Attribute {
+                public_ip: Some(public_ip),
+                allocation_id: Some(allocation_id.clone()),
+                // The address was never given a record, and the reset names no new one.
+                ptr_record: None,
+                update_status: Some(PTR_UPDATE_STATUS_PENDING.to_string()),
+                update_value: None,
+            }],
+            "case {case:?}: expected only the address whose record has an update \
+             outstanding, got {reported:?}"
         );
-        for attribute in &reported {
-            let expected_status = (attribute.allocation_id.as_deref() == Some(&allocation_id))
-                .then(|| PTR_UPDATE_STATUS_PENDING.to_string());
-            assert_eq!(
-                attribute.update_status, expected_status,
-                "case {case:?}: expected {expected_status:?} for the address \
-                 {:?}, got {attribute:?}",
-                attribute.allocation_id
-            );
-            assert_eq!(
-                attribute.ptr_record, None,
-                "case {case:?}: no address was given a record, got {attribute:?}"
-            );
-        }
 
         // The update was owed at its instant whether or not anybody called, so once it has
-        // passed the address carries neither the update nor a record.
+        // passed the address carries neither the update nor a record — and an address with
+        // no attribute at all is reported no row.
         tokio::time::sleep(past_the_update()).await;
         let settled = described_one(&router, case, &allocation_id).await;
         assert_eq!(
-            settled,
-            Some(Attribute {
-                public_ip: Some(public_ip),
-                allocation_id: Some(allocation_id),
-                ptr_record: None,
-                update_status: None,
-                update_value: None,
-            }),
-            "case {case:?}: expected the update to have been applied, got {settled:?}"
+            settled, None,
+            "case {case:?}: expected the update to have been applied, leaving the address \
+             with no attribute to report, got {settled:?}"
         );
     }
 }
@@ -397,14 +388,13 @@ async fn reset_refuses_an_id_the_account_holds_no_address_for() {
     }
 
     // Nothing was stored for any of them: the one address the account still holds carries no
-    // record and no outstanding update, so a reset of it is accepted.
-    let reported = described_one(&router, "after the refusals", &held)
-        .await
-        .unwrap_or_else(|| panic!("the held address {held} must still be reported"));
+    // record and no outstanding update, so the report answers no row for it and a reset of it
+    // is accepted.
+    let reported = described_one(&router, "after the refusals", &held).await;
     assert_eq!(
-        (&reported.ptr_record, &reported.update_status),
-        (&None, &None),
-        "a refused request must store nothing, got {reported:?}"
+        reported, None,
+        "a refused request must store nothing, so the address must carry no attribute, \
+         got {reported:?}"
     );
     let (status, body) = reset(&router, &held, &[]).await;
     assert_eq!(
@@ -513,17 +503,19 @@ async fn a_dry_run_starts_nothing() {
     );
 }
 
-/// RULE 4: the report refuses what it cannot answer — an allocation id the account holds no
-/// address for, a token it did not issue — and answers a dry run without reporting a row.
+/// RULE 4: the report refuses what it cannot READ — a value that is not an allocation id at
+/// all, a token it did not issue — and answers a dry run without reporting a row. An
+/// allocation id it CAN read narrows the report instead (see
+/// [`super::describe_addresses_attribute`]).
 #[tokio::test]
 async fn the_report_refuses_what_it_cannot_answer() {
     let router = emulator();
     let (held, _) = allocate_one(&router, "the stored address").await;
 
     // Rows differing along the form of the value the request narrows or pages by: an id that
-    // is not an allocation id at all, a well-formed one nothing holds, and a token this
+    // is not an allocation id at all, the right prefix at the wrong length, and a token this
     // service did not issue.
-    let rows: [(&str, Params, &str); 4] = [
+    let rows: [(&str, Params, &str); 3] = [
         (
             "not an allocation id at all",
             vec![p("AllocationId.1", "vpc-0123456789abcdef0")],
@@ -533,11 +525,6 @@ async fn the_report_refuses_what_it_cannot_answer() {
             "the right prefix at the wrong length",
             vec![p("AllocationId.1", "eipalloc-0123")],
             INVALID_ALLOCATION_ID_MALFORMED,
-        ),
-        (
-            "a well-formed id nothing holds",
-            vec![p("AllocationId.1", "eipalloc-0a1b2c3d4e5f60718")],
-            INVALID_ALLOCATION_ID_NOT_FOUND,
         ),
         (
             "a token this service did not issue",
@@ -582,13 +569,30 @@ async fn the_report_refuses_what_it_cannot_answer() {
 /// the same thing twice.
 #[tokio::test]
 async fn the_report_narrows_by_id_and_pages_in_id_order() {
-    let router = emulator();
+    let (router, engine) = super::ec2_query::emulator();
     let mut held: Vec<String> = Vec::new();
     for index in 0..5 {
         let (allocation_id, _) = allocate_one(&router, &format!("the address {index}")).await;
         held.push(allocation_id);
     }
     held.sort();
+    // The report carries a row for an address whose `domain-name` attribute is SET, so each
+    // of the five is given a record in effect — the state an applied update leaves behind,
+    // which no implemented writer of this service can leave, so it is seeded straight into
+    // the store the handler reads.
+    for allocation_id in &held {
+        engine
+            .state::<Ec2State>()
+            .lock()
+            .address_ptr_records
+            .insert(
+                allocation_id.clone(),
+                AddressPtrRecord {
+                    ptr_record: Some(format!("{allocation_id}.example.com")),
+                    pending_update: None,
+                },
+            );
+    }
 
     // Rows differing along how many ids narrow the report and which: none (every address),
     // one, a subset in an order other than the store's, and every id at once. The attribute
