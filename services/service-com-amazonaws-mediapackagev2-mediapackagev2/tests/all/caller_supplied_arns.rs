@@ -355,7 +355,10 @@ async fn a_put_policy_reads_the_cdn_authorization_arns_before_storing_them() {
 /// (`EncryptionMethod`, `EncryptionContractConfiguration`, `ResourceId`, `DrmSystems`,
 /// `Url` — all required members of `Encryption` / `SpekeKeyProvider`). The enum values come
 /// from the model's `TsEncryptionMethod`, `PresetSpeke20Audio`, `PresetSpeke20Video` and
-/// `DrmSystem` shapes.
+/// `DrmSystem` shapes; the DRM system is the one the TS `AES_128` method protects content
+/// with, since the method and the DRM systems are read against each other
+/// (`DRM_SYSTEMS_ENCRYPTION_METHOD_INCOMPATIBLE`, covered by
+/// `origin_endpoint_encryption_settings`).
 fn segment_with_key_provider_role(role_arn: &str) -> Value {
     json!({
         "Encryption": {
@@ -366,7 +369,7 @@ fn segment_with_key_provider_role(role_arn: &str) -> Value {
                     "PresetSpeke20Video": "PRESET_VIDEO_1",
                 },
                 "ResourceId": "MovieNight20171126093045",
-                "DrmSystems": ["WIDEVINE"],
+                "DrmSystems": ["CLEAR_KEY_AES_128"],
                 "RoleArn": role_arn,
                 "Url": "https://speke.example.com/copyProtection",
             },

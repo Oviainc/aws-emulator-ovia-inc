@@ -8,24 +8,32 @@
 //! configuration, the startover window, the URI separator, the stream-name output mode
 //! and each manifest's window, URI path type and child-manifest URL encoding — are
 //! materialised here and stored, so they are reported on this response and on every
-//! later read — except that a member the model restricts to particular parent-channel
-//! input types is materialised only under a channel whose `InputType` may carry it, which
-//! for the stream-name output mode means an endpoint of any other channel has no mode and
-//! reports none. An unknown group or channel is a `ResourceNotFoundException`; an
-//! endpoint name already used on that channel is a `ConflictException`.
+//! later read — except that a setting the model restricts to particular parent-channel
+//! input types is materialised only under a channel whose `InputType` may carry it, so an
+//! endpoint of any other channel has neither a stream-name output mode nor (under a
+//! multiview channel) a startover window, and reports none. An unknown group or channel is
+//! a `ResourceNotFoundException`; an endpoint name already used on that channel is a
+//! `ConflictException`.
 //!
 //! The rules the model states but cannot express as a member constraint are enforced
-//! before anything is stored, through [`crate::state::manifest_set_violation`]: the
-//! manifest count stays inside the permitted range (`NUM_MANIFESTS_LOW` /
-//! `NUM_MANIFESTS_HIGH`), and no manifest family its `ContainerType` cannot serve. A
-//! `Segment.OutputTimestampMode` is refused on a channel whose output locking mode may
-//! not carry the member ([`crate::state::output_timestamp_mode_violation`], a 400
-//! `ValidationException` / `ONLY_NON_EPOCH_LOCKED_ALLOW_OUTPUT_TIMESTAMP_MODE`), and a
-//! submitted stream-name output mode is refused on a channel whose `InputType` may not
-//! carry THAT member
-//! ([`crate::state::stream_name_output_mode_input_type_violation`], a 400
-//! `ValidationException` / `ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE`). The
-//! operation is also `@idempotent` and binds
+//! before anything is stored. About the request alone:
+//! [`crate::state::manifest_set_violation`] (the manifest count stays inside the permitted
+//! range, `NUM_MANIFESTS_LOW` / `NUM_MANIFESTS_HIGH`, and no manifest family its
+//! `ContainerType` cannot serve), [`crate::state::manifest_name_collision`] (no two
+//! manifests are published at one egress URL, `MANIFEST_NAME_COLLISION`),
+//! [`crate::state::speke_role_arn_rejection`] and
+//! [`crate::state::segment_encryption_rejection`] (the encryption block's method,
+//! initialization vector, DRM systems, key rotation, encryption contract, content-key
+//! period timing and key-server URL, against each other and against the container type).
+//! Against the parents: a `Segment.OutputTimestampMode` is refused on a channel whose
+//! output locking mode may not carry the member
+//! ([`crate::state::output_timestamp_mode_violation`], a 400 `ValidationException` /
+//! `ONLY_NON_EPOCH_LOCKED_ALLOW_OUTPUT_TIMESTAMP_MODE`), and every setting the model
+//! restricts to particular parent-channel input types — the stream-name output mode, the
+//! failover settings, and the ISM container, low-latency HLS and MSS manifests and
+//! startover window a multiview channel's endpoint may not carry — is refused through
+//! [`crate::state::origin_endpoint_input_type_violation`], with the discriminator the
+//! model names for that combination. The operation is also `@idempotent` and binds
 //! `ClientToken` with `@idempotencyToken`: an unchanged repeat under the same token
 //! replays the endpoint it created, and a changed one is a `ConflictException` /
 //! `IDEMPOTENT_PARAMETER_MISMATCH`.
@@ -246,7 +254,7 @@ fn endpoint_output(
         created_at: endpoint.created_at,
         modified_at: endpoint.modified_at,
         description: endpoint.description.clone(),
-        startover_window_seconds: Some(endpoint.startover_window_seconds),
+        startover_window_seconds: endpoint.startover_window_seconds,
         hls_manifests: Some(endpoint.hls_manifests.clone()),
         low_latency_hls_manifests: Some(endpoint.low_latency_hls_manifests.clone()),
         dash_manifests: Some(endpoint.dash_manifests.clone()),
@@ -336,11 +344,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Another rule about the manifest set alone: a manifest name is what makes a
+        // manifest's egress URL identify THAT manifest, so a set that uses one name twice
+        // — in one family or across two — would publish two manifests at one URL and is
+        // refused before any of them is stored.
+        if let Some(rejection) = crate::state::manifest_name_collision(
+            input.hls_manifests.as_deref(),
+            input.low_latency_hls_manifests.as_deref(),
+            input.dash_manifests.as_deref(),
+            input.mss_manifests.as_deref(),
+        ) {
+            return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
+        }
+
         // Another rule about the request alone: a segment's key provider names the IAM role
         // MediaPackage assumes to reach it, so a value that is not the ARN of a role names
         // none and is refused before the endpoint is minted. The crate's one reading of a
         // caller-supplied ARN, shared with the CDN authorization a policy carries.
         if let Some(rejection) = crate::state::speke_role_arn_rejection(input.segment.as_ref()) {
+            return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
+        }
+
+        // And the rest of the encryption block, which is a cross-member configuration: the
+        // method, the initialization vector, the DRM systems, the encryption contract, the
+        // content-key period timing and the key-server endpoint are judged against each
+        // other and against the container type the endpoint packages with, so settings the
+        // key provider could never serve are refused rather than stored.
+        if let Some(rejection) = crate::state::segment_encryption_rejection(
+            input.segment.as_ref(),
+            &input.container_type,
+        ) {
             return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
         }
 
@@ -379,13 +412,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // The parent channel decides which of the endpoint's members may be carried at
+        // The parent channel decides which of the endpoint's settings may be carried at
         // all: the stream-name output mode is "valid only when the associated channel's
-        // `InputType` is `HLS`", so a submitted one is refused here rather than stored on a
-        // channel that may not carry it — and nothing is written before the refusal.
+        // `InputType` is `HLS`", the failover settings only under a CMAF-input channel, and
+        // an endpoint of a channel that composites its tiles from other channels carries
+        // neither an ISM container, a low-latency HLS or MSS manifest nor a startover
+        // window — so a submitted one is refused here rather than stored on a channel that
+        // may not carry it, and nothing is written before the refusal.
         let input_type = channel.input_type.clone();
-        if let Some(rejection) = crate::state::stream_name_output_mode_input_type_violation(
-            input.stream_name_output_mode.as_deref(),
+        if let Some(rejection) = crate::state::origin_endpoint_input_type_violation(
+            crate::state::SubmittedOriginEndpointMembers {
+                stream_name_output_mode: input.stream_name_output_mode.is_some(),
+                force_endpoint_error_configuration: input
+                    .force_endpoint_error_configuration
+                    .is_some(),
+                ism_container_type: crate::state::is_ism_container(&input.container_type),
+                low_latency_hls_manifests: input
+                    .low_latency_hls_manifests
+                    .as_ref()
+                    .is_some_and(|manifests| !manifests.is_empty()),
+                mss_manifests: input
+                    .mss_manifests
+                    .as_ref()
+                    .is_some_and(|manifests| !manifests.is_empty()),
+                startover_window_seconds: input.startover_window_seconds.is_some(),
+            },
             &input_type,
         ) {
             return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
@@ -512,9 +563,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created_at = crate::state::now();
         let arn = crate::state::origin_endpoint_arn(&region, &group_name, &channel.name, &name);
         // Server-applied too: an endpoint created without a startover window still has
-        // one, so the window is materialized here and stored.
-        let startover_window_seconds =
-            crate::state::materialized_startover_window_seconds(input.startover_window_seconds);
+        // one, where its parent channel's input type carries the member at all.
+        let startover_window_seconds = crate::state::materialized_startover_window_seconds(
+            input.startover_window_seconds,
+            &input_type,
+        );
 
         let mut endpoint = crate::state::OriginEndpoint {
             name: name.clone(),

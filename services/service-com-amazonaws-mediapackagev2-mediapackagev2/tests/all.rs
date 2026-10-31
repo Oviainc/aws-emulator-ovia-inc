@@ -136,3 +136,9 @@ mod harvest_job_manifest_reference;
 mod tagging_arn_account_scope;
 #[path = "all/harvest_job_token_namespace.rs"]
 mod harvest_job_token_namespace;
+#[path = "all/origin_endpoint_encryption_settings.rs"]
+mod origin_endpoint_encryption_settings;
+#[path = "all/manifest_name_uniqueness.rs"]
+mod manifest_name_uniqueness;
+#[path = "all/endpoint_settings_by_input_type.rs"]
+mod endpoint_settings_by_input_type;

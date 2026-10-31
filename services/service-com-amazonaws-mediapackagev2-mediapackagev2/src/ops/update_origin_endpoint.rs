@@ -15,6 +15,12 @@
 //! * a manifest set the new `ContainerType` cannot serve, no manifest at all, or more
 //!   manifests than [`crate::state::MAX_MANIFESTS_PER_ORIGIN_ENDPOINT`] — the same rules
 //!   `CreateOriginEndpoint` applies, because an update carries the whole manifest set;
+//! * a manifest set that would publish two manifests at one egress URL
+//!   (`MANIFEST_NAME_COLLISION`), and an encryption block whose method, initialization
+//!   vector, DRM systems, key rotation, encryption contract, content-key period timing or
+//!   key-server URL the service could not act on — both off the rules the create reads
+//!   ([`crate::state::manifest_name_collision`],
+//!   [`crate::state::segment_encryption_rejection`]);
 //! * an `ETag` precondition (`x-amzn-update-if-match`) that is not the endpoint's current
 //!   tag, which the model's doc says rejects the request — judged ahead of every rule
 //!   below, exactly as this service's other conditional writers judge it, because a
@@ -30,10 +36,13 @@
 //!   `ONLY_NON_EPOCH_LOCKED_ALLOW_OUTPUT_TIMESTAMP_MODE` `CreateOriginEndpoint` answers,
 //!   because the restriction is read in one place
 //!   ([`crate::state::output_timestamp_mode_violation`]);
-//! * a `StreamNameOutputMode` named for an endpoint whose parent channel's `InputType` may
-//!   not carry the member at all
-//!   (`ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE`), off the same rule the create
-//!   reads ([`crate::state::stream_name_output_mode_input_type_violation`]);
+//! * a setting named for an endpoint whose parent channel's `InputType` may not carry it
+//!   at all — the stream-name output mode
+//!   (`ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE`), the failover settings
+//!   (`ONLY_CMAF_INPUT_TYPE_ALLOW_FORCE_ENDPOINT_ERROR_CONFIGURATION`) and the ISM
+//!   container, low-latency HLS and MSS manifests and startover window a multiview
+//!   channel's endpoint may not carry — off the same table the create reads
+//!   ([`crate::state::origin_endpoint_input_type_violation`]);
 //! * a manifest set that would stop publishing a manifest one of the endpoint's own
 //!   harvest jobs is still harvesting — a 409 `ConflictException` / `RESOURCE_IN_USE`
 //!   ([`crate::state::harvested_manifest_in_use`]), because the stored job's
@@ -308,7 +317,7 @@ fn endpoint_output(
         created_at: endpoint.created_at,
         modified_at: endpoint.modified_at,
         description: endpoint.description.clone(),
-        startover_window_seconds: Some(endpoint.startover_window_seconds),
+        startover_window_seconds: endpoint.startover_window_seconds,
         hls_manifests: Some(endpoint.hls_manifests.clone()),
         low_latency_hls_manifests: Some(endpoint.low_latency_hls_manifests.clone()),
         dash_manifests: Some(endpoint.dash_manifests.clone()),
@@ -402,9 +411,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same rule the create reads: a manifest name is what makes a manifest's
+        // egress URL identify THAT manifest, so a replacement set that uses one name twice
+        // is refused before anything is written.
+        if let Some(rejection) = crate::state::manifest_name_collision(
+            input.hls_manifests.as_deref(),
+            input.low_latency_hls_manifests.as_deref(),
+            input.dash_manifests.as_deref(),
+            input.mss_manifests.as_deref(),
+        ) {
+            return Err(UpdateOriginEndpointErrorModeled::ValidationException(rejection).into());
+        }
+
         // The same rule the create reads: a segment's key provider role has to be the ARN
         // of an IAM role, decided before a single field is written.
         if let Some(rejection) = crate::state::speke_role_arn_rejection(input.segment.as_ref()) {
+            return Err(UpdateOriginEndpointErrorModeled::ValidationException(rejection).into());
+        }
+
+        // And the rest of the encryption block, through the same reading of it the create
+        // uses: the replacement segment is judged against the container type the endpoint
+        // packages with before it replaces the stored one.
+        if let Some(rejection) = crate::state::segment_encryption_rejection(
+            input.segment.as_ref(),
+            &input.container_type,
+        ) {
             return Err(UpdateOriginEndpointErrorModeled::ValidationException(rejection).into());
         }
 
@@ -474,8 +505,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if let Some(rejection) = crate::state::stream_name_output_mode_input_type_violation(
-            input.stream_name_output_mode.as_deref(),
+        if let Some(rejection) = crate::state::origin_endpoint_input_type_violation(
+            crate::state::SubmittedOriginEndpointMembers {
+                stream_name_output_mode: input.stream_name_output_mode.is_some(),
+                force_endpoint_error_configuration: input
+                    .force_endpoint_error_configuration
+                    .is_some(),
+                ism_container_type: crate::state::is_ism_container(&input.container_type),
+                low_latency_hls_manifests: input
+                    .low_latency_hls_manifests
+                    .as_ref()
+                    .is_some_and(|manifests| !manifests.is_empty()),
+                mss_manifests: input
+                    .mss_manifests
+                    .as_ref()
+                    .is_some_and(|manifests| !manifests.is_empty()),
+                startover_window_seconds: input.startover_window_seconds.is_some(),
+            },
             &input_type,
         ) {
             return Err(UpdateOriginEndpointErrorModeled::ValidationException(rejection).into());
@@ -601,8 +647,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         segment.output_timestamp_mode = endpoint.segment.output_timestamp_mode.clone();
         endpoint.segment = segment;
         endpoint.description = input.description;
-        endpoint.startover_window_seconds =
-            crate::state::materialized_startover_window_seconds(input.startover_window_seconds);
+        endpoint.startover_window_seconds = crate::state::materialized_startover_window_seconds(
+            input.startover_window_seconds,
+            &input_type,
+        );
         endpoint.force_endpoint_error_configuration = input.force_endpoint_error_configuration;
         if let Some(separator) = input.uri_separator {
             endpoint.uri_separator = separator;

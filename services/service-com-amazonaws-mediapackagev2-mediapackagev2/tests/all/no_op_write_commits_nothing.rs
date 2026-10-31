@@ -326,7 +326,12 @@ async fn an_update_that_stores_what_was_already_there_commits_nothing() {
             );
         }
         if level == Level::Endpoint {
-            let (status, created) = emulator.create_channel(GROUP, CHANNEL, json!({})).await;
+            // CMAF, because an endpoint row carries `ForceEndpointErrorConfiguration`,
+            // which the model restricts to the endpoints of a CMAF-input channel
+            // (`ONLY_CMAF_INPUT_TYPE_ALLOW_FORCE_ENDPOINT_ERROR_CONFIGURATION`).
+            let (status, created) = emulator
+                .create_channel(GROUP, CHANNEL, json!({"InputType": "CMAF"}))
+                .await;
             assert_eq!(
                 status, 200,
                 "case {label:?}: the parent channel create expected 200, got {status} {created}"

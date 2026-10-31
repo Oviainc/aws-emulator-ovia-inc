@@ -39,7 +39,8 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     CdnAuthConfiguration, ConflictException, CreateDashManifestConfiguration,
     CreateHlsManifestConfiguration, CreateLowLatencyHlsManifestConfiguration,
-    CreateMssManifestConfiguration, Destination, ForceEndpointErrorConfiguration,
+    CreateMssManifestConfiguration, Destination, EncryptionMethod,
+    ForceEndpointErrorConfiguration,
     GetDashManifestConfiguration, GetHlsManifestConfiguration,
     GetLowLatencyHlsManifestConfiguration, GetMssManifestConfiguration, HarvestedManifests,
     HarvesterScheduleConfiguration, IngestEndpoint, InputSwitchConfiguration,
@@ -1265,9 +1266,10 @@ pub struct OriginEndpoint {
     pub container_type: String,
     pub segment: Segment,
     pub description: Option<String>,
-    /// Materialised at create time: every endpoint has a startover window, whether or
-    /// not the create request named one.
-    pub startover_window_seconds: i32,
+    /// Materialised at create time, but only when the parent channel's input type may
+    /// carry a startover window at all: an endpoint of a channel that may not has none
+    /// and reports none. See [`materialized_startover_window_seconds`].
+    pub startover_window_seconds: Option<i32>,
     pub hls_manifests: Vec<GetHlsManifestConfiguration>,
     pub low_latency_hls_manifests: Vec<GetLowLatencyHlsManifestConfiguration>,
     pub dash_manifests: Vec<GetDashManifestConfiguration>,
@@ -1749,10 +1751,20 @@ pub fn materialized_segment(
 }
 
 /// The startover window an origin endpoint is stored with: the one the request named, or
-/// the service's own ([`DEFAULT_STARTOVER_WINDOW_SECONDS`]). Shared by the create and the
-/// update so one write cannot leave the endpoint reporting a window the other would not.
-pub fn materialized_startover_window_seconds(submitted: Option<i32>) -> i32 {
-    submitted.unwrap_or(DEFAULT_STARTOVER_WINDOW_SECONDS)
+/// the service's own ([`DEFAULT_STARTOVER_WINDOW_SECONDS`]) — on an endpoint whose parent
+/// channel's input type may carry a window at all
+/// ([`input_type_carries_startover_window`]), and `None` on one whose may not, the way
+/// [`materialized_stream_name_output_mode`] withholds the other restricted member with a
+/// documented default. Shared by the create and the update so one write cannot leave the
+/// endpoint reporting a window the other would not.
+pub fn materialized_startover_window_seconds(
+    submitted: Option<i32>,
+    input_type: &str,
+) -> Option<i32> {
+    if !input_type_carries_startover_window(input_type) {
+        return None;
+    }
+    Some(submitted.unwrap_or(DEFAULT_STARTOVER_WINDOW_SECONDS))
 }
 
 /// The URI separator an origin endpoint is stored with — the submitted one, else
@@ -2417,7 +2429,7 @@ pub fn ingest_endpoints(
 ///
 /// One entry per manifest family MediaPackage serves; the family decides the suffix,
 /// not the endpoint's container type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ManifestKind {
     /// HLS and low-latency HLS both publish an `.m3u8` playlist.
     Hls,
@@ -3377,57 +3389,199 @@ pub fn channel_required_member_violation(
         })
 }
 
-/// The `InputType` values whose channels may carry an origin endpoint's stream-name
-/// output mode.
+/// Which of an origin endpoint's restricted settings a request carries.
 ///
-/// An endpoint member can be restricted by its PARENT channel's input type rather than by
-/// the endpoint's own members, which is why this restriction is stated here rather than in
-/// [`CHANNEL_INPUT_TYPE_RULES`]: the member's own doc says the setting "is valid only when
-/// the associated channel's `InputType` is `HLS`". The ONE place that restriction is
-/// written, read both by the mode an endpoint is STORED with
-/// ([`materialized_stream_name_output_mode`]) and by the refusal a submitted mode earns
-/// ([`stream_name_output_mode_input_type_violation`]).
-const STREAM_NAME_OUTPUT_MODE_INPUT_TYPES: &[&str] = &["HLS"];
+/// An endpoint setting can be restricted by its PARENT channel's input type rather than by
+/// the endpoint's own members, which is why those restrictions are stated here rather than
+/// in [`CHANNEL_INPUT_TYPE_RULES`]: they are read against the input type of the channel the
+/// endpoint hangs under. Like [`SubmittedChannelMembers`] one level up, this is about the
+/// REQUEST rather than about either operation's input shape, so `CreateOriginEndpoint` and
+/// `UpdateOriginEndpoint` reduce their own generated inputs to it and the rule table
+/// ([`ORIGIN_ENDPOINT_INPUT_TYPE_RULES`]) is written once.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubmittedOriginEndpointMembers {
+    pub stream_name_output_mode: bool,
+    pub force_endpoint_error_configuration: bool,
+    /// Whether the request names the ISM container type: the restriction is on the VALUE
+    /// of a required member rather than on the member being present at all.
+    pub ism_container_type: bool,
+    pub low_latency_hls_manifests: bool,
+    pub mss_manifests: bool,
+    pub startover_window_seconds: bool,
+}
 
-/// The member path a refused stream-name output mode is named at, as a validation message
-/// names it (lowerCamel, as on the wire).
-const STREAM_NAME_OUTPUT_MODE_MEMBER: &str = "streamNameOutputMode";
+/// An origin-endpoint setting the service only lets the endpoints of particular parent
+/// `InputType`s carry. The mirror of [`ChannelInputTypeRule`] one level down, without the
+/// required-on-that-input-type direction: no endpoint setting is documented as required by
+/// an input type.
+struct OriginEndpointInputTypeRule {
+    /// The member, as a validation message names it (lowerCamel, as on the wire).
+    member: &'static str,
+    /// The `InputType` values whose channels may carry it, from the model's `InputType`
+    /// enum.
+    allowed: &'static [&'static str],
+    /// The `ValidationExceptionType` the model declares for this combination.
+    exception_type: &'static str,
+    /// What the setting is called in the sentence the refusal states. Written to read
+    /// inside a sentence, which is where it lands: [`validation_message`] states the
+    /// member path ahead of it.
+    label: &'static str,
+    /// Whether the request carries the setting at all.
+    present: fn(&SubmittedOriginEndpointMembers) -> bool,
+}
 
-/// What the stream-name output mode is called in the sentence a refusal states.
-const STREAM_NAME_OUTPUT_MODE_LABEL: &str = "StreamNameOutputMode";
+/// The `InputType` values whose channels are NOT the one that composites its video from
+/// other channels ([`INPUT_TYPE_MULTIVIEW`]), from the model's `InputType` enum — the
+/// input types a setting a multiview channel's endpoint may not carry is allowed under.
+/// Written once, so the rows of [`ORIGIN_ENDPOINT_INPUT_TYPE_RULES`] that share that
+/// restriction cannot drift apart.
+const INPUT_TYPES_EXCEPT_MULTIVIEW: &[&str] = &["HLS", "CMAF"];
+
+/// Every parent-`InputType` restriction the model states for an origin endpoint's
+/// settings, one row per `ValidationExceptionType` that names one.
+///
+/// The rows are read off the model rather than guessed: `StreamNameOutputMode`'s own doc
+/// says the setting "is valid only when the associated channel's `InputType` is `HLS`",
+/// and `ValidationExceptionType` names one value per remaining combination —
+/// `ONLY_CMAF_INPUT_TYPE_ALLOW_FORCE_ENDPOINT_ERROR_CONFIGURATION` for the failover
+/// settings, and `MULTIVIEW_INPUT_TYPE_WITH_ISM_CONTAINER`,
+/// `MULTIVIEW_INPUT_TYPE_WITH_LL_HLS_MANIFEST`, `MULTIVIEW_INPUT_TYPE_WITH_MSS_MANIFEST`
+/// and `MULTIVIEW_STARTOVER_WINDOW_NOT_ALLOWED` for the four an endpoint of a channel that
+/// composites its tiles from other channels may not carry — so those four are allowed
+/// under [`INPUT_TYPES_EXCEPT_MULTIVIEW`].
+///
+/// The rows are walked in this order, so the ISM container type — a required member, and
+/// what the endpoint IS — is reported before the MSS manifests only an ISM container
+/// serves ([`container_manifest_conflict`]).
+const ORIGIN_ENDPOINT_INPUT_TYPE_RULES: &[OriginEndpointInputTypeRule] = &[
+    OriginEndpointInputTypeRule {
+        member: "streamNameOutputMode",
+        allowed: &["HLS"],
+        exception_type: "ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE",
+        label: "StreamNameOutputMode",
+        present: |submitted| submitted.stream_name_output_mode,
+    },
+    OriginEndpointInputTypeRule {
+        member: "forceEndpointErrorConfiguration",
+        allowed: &["CMAF"],
+        exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_FORCE_ENDPOINT_ERROR_CONFIGURATION",
+        label: "ForceEndpointErrorConfiguration",
+        present: |submitted| submitted.force_endpoint_error_configuration,
+    },
+    OriginEndpointInputTypeRule {
+        member: "containerType",
+        allowed: INPUT_TYPES_EXCEPT_MULTIVIEW,
+        exception_type: "MULTIVIEW_INPUT_TYPE_WITH_ISM_CONTAINER",
+        label: "an ISM container type",
+        present: |submitted| submitted.ism_container_type,
+    },
+    OriginEndpointInputTypeRule {
+        member: "lowLatencyHlsManifests",
+        allowed: INPUT_TYPES_EXCEPT_MULTIVIEW,
+        exception_type: "MULTIVIEW_INPUT_TYPE_WITH_LL_HLS_MANIFEST",
+        label: "a low-latency HLS manifest",
+        present: |submitted| submitted.low_latency_hls_manifests,
+    },
+    OriginEndpointInputTypeRule {
+        member: "mssManifests",
+        allowed: INPUT_TYPES_EXCEPT_MULTIVIEW,
+        exception_type: "MULTIVIEW_INPUT_TYPE_WITH_MSS_MANIFEST",
+        label: "an MSS manifest",
+        present: |submitted| submitted.mss_manifests,
+    },
+    OriginEndpointInputTypeRule {
+        member: "startoverWindowSeconds",
+        allowed: INPUT_TYPES_EXCEPT_MULTIVIEW,
+        exception_type: "MULTIVIEW_STARTOVER_WINDOW_NOT_ALLOWED",
+        label: "StartoverWindowSeconds",
+        present: |submitted| submitted.startover_window_seconds,
+    },
+];
+
+/// The first parent-`InputType` restriction a request breaks, as the modeled
+/// `ValidationException` to answer it with, or `None` when every setting it carries is
+/// allowed under `input_type`.
+///
+/// The sentence is the one every other input-type restriction of this service states
+/// ([`channel_input_type_violation`]), off the same table the settings an endpoint is
+/// STORED with are materialised from ([`origin_endpoint_carries_member`]). Shared by the
+/// create and the update so the two cannot disagree about which channels carry what.
+pub fn origin_endpoint_input_type_violation(
+    submitted: SubmittedOriginEndpointMembers,
+    input_type: &str,
+) -> Option<ValidationException> {
+    ORIGIN_ENDPOINT_INPUT_TYPE_RULES
+        .iter()
+        .find(|rule| (rule.present)(&submitted) && !rule.allowed.contains(&input_type))
+        .map(|rule| {
+            validation_failed(
+                rule.member,
+                &format!(
+                    "{} can only be configured when the channel InputType is {}. To use \
+                     {}, create a channel with {} input type",
+                    rule.label,
+                    rule.allowed.join(" or "),
+                    rule.label,
+                    rule.allowed.join(" or ")
+                ),
+                rule.exception_type,
+            )
+        })
+}
+
+/// Whether an endpoint of a channel of this input type may carry a restricted setting at
+/// all.
+///
+/// `member` marks the ONE setting it is asked about on an otherwise empty
+/// [`SubmittedOriginEndpointMembers`], so the answer comes off the same table a SUBMITTED
+/// setting is refused by ([`origin_endpoint_input_type_violation`]) — exactly as
+/// [`channel_carries_member`] does one level up. A materialisation that WITHHOLDS a
+/// setting from an endpoint whose parent input type may not carry it decides through here,
+/// so a stored setting and a refused one can never disagree.
+pub fn origin_endpoint_carries_member(
+    member: fn(&mut SubmittedOriginEndpointMembers),
+    input_type: &str,
+) -> bool {
+    let mut submitted = SubmittedOriginEndpointMembers::default();
+    member(&mut submitted);
+    origin_endpoint_input_type_violation(submitted, input_type).is_none()
+}
 
 /// Whether a channel of this input type may carry an origin endpoint's stream-name output
 /// mode at all.
 pub fn input_type_carries_stream_name_output_mode(input_type: &str) -> bool {
-    STREAM_NAME_OUTPUT_MODE_INPUT_TYPES.contains(&input_type)
+    origin_endpoint_carries_member(
+        |members| members.stream_name_output_mode = true,
+        input_type,
+    )
+}
+
+/// Whether an endpoint of a channel of this input type may carry a startover window at
+/// all.
+pub fn input_type_carries_startover_window(input_type: &str) -> bool {
+    origin_endpoint_carries_member(
+        |members| members.startover_window_seconds = true,
+        input_type,
+    )
 }
 
 /// The refusal a SUBMITTED stream-name output mode earns under a channel whose input type
 /// may not carry the member, or `None` when the request names no mode or the channel may
 /// carry one.
 ///
-/// The model's `ValidationExceptionType` names
-/// `ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE` for exactly this combination, and
-/// the sentence is the one every other input-type restriction of this service states
-/// ([`channel_input_type_violation`]), off the same allowed-input-type list the stored
-/// mode is materialised from. Shared by the create and the update so the two cannot
-/// disagree about which channels carry the member.
+/// The one row of [`ORIGIN_ENDPOINT_INPUT_TYPE_RULES`] that is about this member, kept as
+/// its own entry point because the update reads it beside the member's immutability.
 pub fn stream_name_output_mode_input_type_violation(
     submitted: Option<&str>,
     input_type: &str,
 ) -> Option<ValidationException> {
-    (submitted.is_some() && !input_type_carries_stream_name_output_mode(input_type)).then(|| {
-        let allowed = STREAM_NAME_OUTPUT_MODE_INPUT_TYPES.join(" or ");
-        validation_failed(
-            STREAM_NAME_OUTPUT_MODE_MEMBER,
-            &format!(
-                "{STREAM_NAME_OUTPUT_MODE_LABEL} can only be configured when the channel \
-                 InputType is {allowed}. To use {STREAM_NAME_OUTPUT_MODE_LABEL}, create a \
-                 channel with {allowed} input type"
-            ),
-            "ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE",
-        )
-    })
+    origin_endpoint_input_type_violation(
+        SubmittedOriginEndpointMembers {
+            stream_name_output_mode: submitted.is_some(),
+            ..SubmittedOriginEndpointMembers::default()
+        },
+        input_type,
+    )
 }
 
 /// The `InputType` a multiview channel's source channels must have, from
@@ -3583,6 +3737,16 @@ impl ManifestFamily {
             Self::Mss => "MSS",
         }
     }
+
+    /// The container format this family's manifests are published in — the suffix their
+    /// egress URL ends in. The HLS families share it: both publish an `.m3u8` playlist.
+    pub fn kind(self) -> ManifestKind {
+        match self {
+            Self::Hls | Self::LowLatencyHls => ManifestKind::Hls,
+            Self::Dash => ManifestKind::Dash,
+            Self::Mss => ManifestKind::Mss,
+        }
+    }
 }
 
 /// How many manifests a request carries per family, in [`ManifestFamily::ALL`] order —
@@ -3609,6 +3773,116 @@ pub fn manifest_counts<Hls, LowLatencyHls, Dash, Mss>(
         ManifestFamily::Dash => dash_manifests.map_or(0, <[Dash]>::len),
         ManifestFamily::Mss => mss_manifests.map_or(0, <[Mss]>::len),
     })
+}
+
+/// The manifest names a request carries, in [`ManifestFamily::ALL`] order and, within a
+/// family, in the order the request listed them — what [`manifest_name_collision`] reads.
+///
+/// Declared beside [`manifest_counts`] and built the same way, by mapping over `ALL`
+/// itself, so the positions of the array can only ever be the order that enum declares.
+fn submitted_manifest_names(
+    hls_manifests: Option<&[CreateHlsManifestConfiguration]>,
+    low_latency_hls_manifests: Option<&[CreateLowLatencyHlsManifestConfiguration]>,
+    dash_manifests: Option<&[CreateDashManifestConfiguration]>,
+    mss_manifests: Option<&[CreateMssManifestConfiguration]>,
+) -> [Vec<String>; ManifestFamily::ALL.len()] {
+    ManifestFamily::ALL.map(|family| match family {
+        ManifestFamily::Hls => hls_manifests.map_or_else(Vec::new, |manifests| {
+            manifests
+                .iter()
+                .map(|manifest| manifest.manifest_name.clone())
+                .collect()
+        }),
+        ManifestFamily::LowLatencyHls => {
+            low_latency_hls_manifests.map_or_else(Vec::new, |manifests| {
+                manifests
+                    .iter()
+                    .map(|manifest| manifest.manifest_name.clone())
+                    .collect()
+            })
+        }
+        ManifestFamily::Dash => dash_manifests.map_or_else(Vec::new, |manifests| {
+            manifests
+                .iter()
+                .map(|manifest| manifest.manifest_name.clone())
+                .collect()
+        }),
+        ManifestFamily::Mss => mss_manifests.map_or_else(Vec::new, |manifests| {
+            manifests
+                .iter()
+                .map(|manifest| manifest.manifest_name.clone())
+                .collect()
+        }),
+    })
+}
+
+/// The `ValidationExceptionType` a manifest set that uses one name twice carries, from the
+/// model's `ValidationExceptionType` enum.
+pub const VALIDATION_MANIFEST_NAME_COLLISION: &str = "MANIFEST_NAME_COLLISION";
+
+/// The second manifest of a submitted set that would be published at a URL another
+/// manifest of the same set is already published at, as the modeled `ValidationException`
+/// to answer it with, or `None` when every manifest the request carries has an egress URL
+/// of its own.
+///
+/// A manifest name is "a short string that's appended to the endpoint URL" that "creates a
+/// unique path to this endpoint", so it is what makes the URL this service computes and
+/// persists for a manifest ([`manifest_url`], through [`stored_hls_manifest`] and its
+/// siblings) identify THAT manifest. Two manifests collide exactly when that URL is the
+/// same one, which is when they share a name AND a container format
+/// ([`ManifestFamily::kind`]) — so the namespace a name is taken from is the endpoint's,
+/// not one family's: the HLS and low-latency HLS families both publish an `.m3u8`
+/// playlist, which is why the model documents that you "can't use the same manifest name
+/// if you use HLS manifest and low-latency HLS manifest"
+/// (`CreateHlsManifestConfiguration$ManifestName`) and names
+/// `MANIFEST_NAME_COLLISION` for it. The set is walked in [`ManifestFamily::ALL`] order,
+/// so the refusal is a function of the request and not of which family the service happens
+/// to read first. About the request alone, and the same rule for `CreateOriginEndpoint` and
+/// `UpdateOriginEndpoint`, which both write the endpoint's whole manifest set.
+pub fn manifest_name_collision(
+    hls_manifests: Option<&[CreateHlsManifestConfiguration]>,
+    low_latency_hls_manifests: Option<&[CreateLowLatencyHlsManifestConfiguration]>,
+    dash_manifests: Option<&[CreateDashManifestConfiguration]>,
+    mss_manifests: Option<&[CreateMssManifestConfiguration]>,
+) -> Option<ValidationException> {
+    let names = submitted_manifest_names(
+        hls_manifests,
+        low_latency_hls_manifests,
+        dash_manifests,
+        mss_manifests,
+    );
+    let mut taken: BTreeSet<(ManifestKind, &str)> = BTreeSet::new();
+    for (family, names) in ManifestFamily::ALL.into_iter().zip(names.iter()) {
+        for (index, name) in names.iter().enumerate() {
+            if taken.insert((family.kind(), name.as_str())) {
+                continue;
+            }
+            return Some(validation_failed(
+                &format!("{}.manifestName", element_path(family.member(), index)),
+                &format!(
+                    "Each manifest of an origin endpoint must have a manifest name no \
+                     other manifest published in the same format uses. {CHECK_THE_VALUE}"
+                ),
+                VALIDATION_MANIFEST_NAME_COLLISION,
+            ));
+        }
+    }
+    None
+}
+
+/// The `ContainerType` whose endpoints package Microsoft Smooth Streaming, from the
+/// model's `ContainerType` enum.
+///
+/// The one container the model singles out by name in its `ValidationExceptionType`
+/// values (`ISM_CONTAINER_WITH_KEY_ROTATION`,
+/// `ENCRYPTION_CONTRACT_WITH_ISM_CONTAINER_INCOMPATIBLE`,
+/// `MULTIVIEW_INPUT_TYPE_WITH_ISM_CONTAINER`), so the value is written once and the rules
+/// that read it cannot drift.
+pub const CONTAINER_TYPE_ISM: &str = "ISM";
+
+/// Whether this container type is the Microsoft Smooth Streaming one.
+pub fn is_ism_container(container: &str) -> bool {
+    container == CONTAINER_TYPE_ISM
 }
 
 /// The `ValidationExceptionType` that names the refusal of `family` on a `container`
@@ -3741,7 +4015,9 @@ pub fn origin_endpoint_etag(endpoint: &OriginEndpoint) -> String {
         endpoint.arn.clone(),
         endpoint.container_type.clone(),
         endpoint.description.clone().unwrap_or_default(),
-        endpoint.startover_window_seconds.to_string(),
+        // Rendered so that an ABSENT window and a present one stay apart: an endpoint of a
+        // channel that may not carry the member has none at all.
+        format!("{:?}", endpoint.startover_window_seconds),
         format!("{:?}", endpoint.segment),
         manifest_names(
             endpoint
@@ -3970,6 +4246,503 @@ pub fn speke_role_arn_rejection(segment: Option<&Segment>) -> Option<ValidationE
             VALIDATION_ROLE_ARN_INVALID_FORMAT,
         )
     })
+}
+
+// =============================================================================
+// Validation: the encryption settings an origin endpoint's segment carries
+// =============================================================================
+
+/// `ValidationExceptionType` values a refused `Segment.Encryption` carries, from the
+/// model's `ValidationExceptionType` enum.
+///
+/// The enum names one value per way the block can be a configuration the service could not
+/// act on: the encryption METHOD against the endpoint's container format
+/// ([`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`]), the constant
+/// initialization vector against that method ([`VALIDATION_CENC_IV_INCOMPATIBLE`]), the
+/// DRM systems against it ([`VALIDATION_DRM_SYSTEMS_ENCRYPTION_METHOD_INCOMPATIBLE`]), key
+/// rotation against the container ([`VALIDATION_ISM_CONTAINER_WITH_KEY_ROTATION`]), the
+/// encryption contract's presets against each other and against the container
+/// ([`VALIDATION_ENCRYPTION_CONTRACT_UNENCRYPTED`],
+/// [`VALIDATION_ENCRYPTION_CONTRACT_SHARED`],
+/// [`VALIDATION_ENCRYPTION_CONTRACT_WITH_ISM_CONTAINER_INCOMPATIBLE`]) and the content-key
+/// period timing against the SPEKE version and key rotation it needs
+/// ([`VALIDATION_CONTENT_KEY_PERIOD_TIMING_REQUIRES_SPEKE_V2_1`],
+/// [`VALIDATION_CONTENT_KEY_PERIOD_TIMING_WITHOUT_KEY_ROTATION`]).
+pub const VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH: &str =
+    "ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH";
+/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
+pub const VALIDATION_CENC_IV_INCOMPATIBLE: &str = "CENC_IV_INCOMPATIBLE";
+/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
+pub const VALIDATION_DRM_SYSTEMS_ENCRYPTION_METHOD_INCOMPATIBLE: &str =
+    "DRM_SYSTEMS_ENCRYPTION_METHOD_INCOMPATIBLE";
+/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
+pub const VALIDATION_ISM_CONTAINER_WITH_KEY_ROTATION: &str = "ISM_CONTAINER_WITH_KEY_ROTATION";
+/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
+pub const VALIDATION_ENCRYPTION_CONTRACT_UNENCRYPTED: &str = "ENCRYPTION_CONTRACT_UNENCRYPTED";
+/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
+pub const VALIDATION_ENCRYPTION_CONTRACT_SHARED: &str = "ENCRYPTION_CONTRACT_SHARED";
+/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
+pub const VALIDATION_ENCRYPTION_CONTRACT_WITH_ISM_CONTAINER_INCOMPATIBLE: &str =
+    "ENCRYPTION_CONTRACT_WITH_ISM_CONTAINER_INCOMPATIBLE";
+/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
+pub const VALIDATION_CONTENT_KEY_PERIOD_TIMING_REQUIRES_SPEKE_V2_1: &str =
+    "CONTENT_KEY_PERIOD_TIMING_REQUIRES_SPEKE_V2_1";
+/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
+pub const VALIDATION_CONTENT_KEY_PERIOD_TIMING_WITHOUT_KEY_ROTATION: &str =
+    "CONTENT_KEY_PERIOD_TIMING_WITHOUT_KEY_ROTATION";
+
+/// The wire path of the encryption block, under the member the request carries it at.
+const ENCRYPTION_MEMBER: &str = "segment.encryption";
+
+/// The `EncryptionMethod` member an endpoint of this container type carries its method in,
+/// and the container format that member names.
+///
+/// `EncryptionMethod` declares exactly one member per container format the service
+/// packages — `TsEncryptionMethod`, `CmafEncryptionMethod`, `IsmEncryptionMethod`
+/// (`smithy_query(query="shape",shape="EncryptionMethod")`) — so which of them an endpoint
+/// may carry is decided by its `ContainerType` (TS | CMAF | ISM), and the model's
+/// `ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH` is the refusal of any other. `None` for a
+/// container value the model does not name; the boundary validator has already refused one
+/// against the `ContainerType` enum.
+fn encryption_method_member(container: &str) -> Option<&'static str> {
+    match container {
+        "TS" => Some("tsEncryptionMethod"),
+        "CMAF" => Some("cmafEncryptionMethod"),
+        CONTAINER_TYPE_ISM => Some("ismEncryptionMethod"),
+        _ => None,
+    }
+}
+
+/// Every `EncryptionMethod` member the request set, as `(member, value)` pairs in the
+/// order the model declares them.
+fn submitted_encryption_methods(method: &EncryptionMethod) -> Vec<(&'static str, &str)> {
+    [
+        ("tsEncryptionMethod", method.ts_encryption_method.as_deref()),
+        (
+            "cmafEncryptionMethod",
+            method.cmaf_encryption_method.as_deref(),
+        ),
+        (
+            "ismEncryptionMethod",
+            method.ism_encryption_method.as_deref(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(member, value)| value.map(|value| (member, value)))
+    .collect()
+}
+
+/// The `DrmSystem` values an encryption method can protect content with, or an empty slice
+/// for a method value the model does not name.
+///
+/// Each encryption method is a packaging of ONE content-protection scheme, and each DRM
+/// system supports the schemes its vendor implements: `AES_128` is HLS AES-128 with a key
+/// the player fetches in the clear, which is what `CLEAR_KEY_AES_128` names; `SAMPLE_AES`
+/// is Apple's sample encryption, used by `FAIRPLAY`; `CENC` and `CBCS` are the two Common
+/// Encryption schemes, and of them FairPlay signals only `cbcs`, while the Common
+/// Encryption systems (`PLAYREADY`, `WIDEVINE`, `IRDETO`) carry both. The model's
+/// `DRM_SYSTEMS_ENCRYPTION_METHOD_INCOMPATIBLE` is the refusal of a pair outside that, and
+/// the values are the model's own (`smithy_query(query="shape",shape="DrmSystem,
+/// CmafEncryptionMethod,TsEncryptionMethod,IsmEncryptionMethod")`).
+fn drm_systems_for_encryption_method(method: &str) -> &'static [&'static str] {
+    match method {
+        "AES_128" => &["CLEAR_KEY_AES_128"],
+        "SAMPLE_AES" => &["FAIRPLAY"],
+        ENCRYPTION_METHOD_CENC => &["PLAYREADY", "WIDEVINE", "IRDETO"],
+        "CBCS" => &["FAIRPLAY", "PLAYREADY", "WIDEVINE", "IRDETO"],
+        _ => &[],
+    }
+}
+
+/// The Common Encryption method value both the CMAF and the ISM container name, from the
+/// model's `CmafEncryptionMethod` and `IsmEncryptionMethod` enums.
+const ENCRYPTION_METHOD_CENC: &str = "CENC";
+
+/// The `PresetSpeke20Audio` / `PresetSpeke20Video` value that asks for ONE content key
+/// across every audio and video track ("SHARED - Use the same content key for all of the
+/// audio and video tracks in your stream").
+const PRESET_SHARED: &str = "SHARED";
+
+/// The preset value that asks for no encryption of its track group ("UNENCRYPTED - Don't
+/// encrypt any of the audio tracks in your stream").
+const PRESET_UNENCRYPTED: &str = "UNENCRYPTED";
+
+/// The `ContentKeyPeriodTiming` values whose doc states that they signal the start and end
+/// times a content key is used for, and therefore "Requires `SpekeVersion` `V2_1`" and key
+/// rotation ("Signaling start and end times … also requires key rotation to be enabled",
+/// `smithy_query(query="doc",shape="ContentKeyPeriodConfiguration",member="ContentKeyPeriodTiming")`).
+const CONTENT_KEY_PERIOD_TIMINGS_WITH_START_END: &[&str] =
+    &["START_END_ONLY", "INDEX_WITH_START_END"];
+
+/// The `SpekeVersion` those timings require, from the model's `SpekeVersion` enum.
+const SPEKE_VERSION_WITH_KEY_PERIOD_TIMING: &str = "V2_1";
+
+/// The `SpekeVersion` an endpoint's key provider is read as when the request names none
+/// ("If you don't specify a value, the default is `V2_0`").
+const DEFAULT_SPEKE_VERSION: &str = "V2_0";
+
+/// Refuse a segment whose encryption settings are a configuration the service could not
+/// act on, or `None` when the block is one it can.
+///
+/// `Segment.Encryption` is a cross-member configuration: the method, the initialization
+/// vector, the DRM systems, the encryption contract and the key-provider endpoint only make
+/// sense together and against the endpoint's `ContainerType`, and the model states each way
+/// they can disagree as its own `ValidationExceptionType` (see
+/// [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`]) — none of which the boundary
+/// validator can decide, since each is about two members at once. Shared by the writers of
+/// an endpoint's segment (`CreateOriginEndpoint` and `UpdateOriginEndpoint`) so both read
+/// the block the same way, and decided before anything is stored: an endpoint persisted
+/// with settings the key provider could never serve publishes manifests no player can
+/// decrypt.
+///
+/// `SpekeKeyProvider$RoleArn` is read by [`speke_role_arn_rejection`], beside the other
+/// caller-supplied ARN of this model.
+pub fn segment_encryption_rejection(
+    segment: Option<&Segment>,
+    container: &str,
+) -> Option<ValidationException> {
+    let encryption = segment?.encryption.as_ref()?;
+    let provider = &encryption.speke_key_provider;
+    // The member this endpoint's container format configures its method through. `None`
+    // for a container value the model does not name — the method rules below then decide
+    // nothing, while the rules that are about the block alone still do.
+    let expected_member = encryption_method_member(container);
+    let submitted = submitted_encryption_methods(&encryption.encryption_method);
+
+    // The method first: every later rule is about the method the endpoint encrypts with.
+    if let Some(expected_member) = expected_member {
+        for (member, _) in &submitted {
+            if *member != expected_member {
+                return Some(validation_failed(
+                    &format!("{ENCRYPTION_MEMBER}.encryptionMethod.{member}"),
+                    &format!(
+                        "An encryption method of a {container} container endpoint is \
+                         configured through {expected_member}. {CHECK_THE_VALUE}"
+                    ),
+                    VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH,
+                ));
+            }
+        }
+    }
+    let method = expected_member.and_then(|expected_member| {
+        submitted
+            .iter()
+            .find_map(|(member, value)| (*member == expected_member).then_some(*value))
+    });
+
+    if let Some(method) = method {
+        // Common Encryption derives each sample's initialization vector from the content
+        // key, so a CENC endpoint has no constant one to be given.
+        if encryption.constant_initialization_vector.is_some()
+            && method == ENCRYPTION_METHOD_CENC
+        {
+            return Some(validation_failed(
+                &format!("{ENCRYPTION_MEMBER}.constantInitializationVector"),
+                &format!(
+                    "A constant initialization vector can't be combined with the \
+                     {method} encryption method. Remove the vector, or encrypt with a \
+                     method that takes one"
+                ),
+                VALIDATION_CENC_IV_INCOMPATIBLE,
+            ));
+        }
+        let carried = drm_systems_for_encryption_method(method);
+        let incompatible = provider
+            .drm_systems
+            .iter()
+            .find(|system| !carried.contains(&system.as_str()));
+        // A method value the model does not name constrains nothing here; the boundary
+        // validator has already refused one against the method's own enum.
+        if let Some(system) = incompatible.filter(|_| !carried.is_empty()) {
+            return Some(validation_failed(
+                &format!("{ENCRYPTION_MEMBER}.spekeKeyProvider.drmSystems"),
+                &format!(
+                    "The {system} DRM system can't be combined with the {method} \
+                     encryption method. The DRM systems that method supports are {}",
+                    carried.join(", ")
+                ),
+                VALIDATION_DRM_SYSTEMS_ENCRYPTION_METHOD_INCOMPATIBLE,
+            ));
+        }
+    }
+
+    // Key rotation, and then the encryption contract, against the container.
+    if is_ism_container(container) && encryption.key_rotation_interval_seconds.is_some() {
+        return Some(validation_failed(
+            &format!("{ENCRYPTION_MEMBER}.keyRotationIntervalSeconds"),
+            &format!(
+                "An {container} container endpoint can't rotate content keys. Remove the \
+                 rotation interval, or create an origin endpoint whose container type \
+                 rotates keys"
+            ),
+            VALIDATION_ISM_CONTAINER_WITH_KEY_ROTATION,
+        ));
+    }
+    let contract = &provider.encryption_contract_configuration;
+    let audio = contract.preset_speke20_audio.as_str();
+    let video = contract.preset_speke20_video.as_str();
+    let contract_member = format!("{ENCRYPTION_MEMBER}.spekeKeyProvider.encryptionContractConfiguration");
+    if audio == PRESET_UNENCRYPTED && video == PRESET_UNENCRYPTED {
+        return Some(validation_failed(
+            &contract_member,
+            &format!(
+                "An encryption contract that leaves both the audio and the video tracks \
+                 {PRESET_UNENCRYPTED} encrypts nothing. Choose a preset for the audio or \
+                 the video tracks, or remove the encryption settings"
+            ),
+            VALIDATION_ENCRYPTION_CONTRACT_UNENCRYPTED,
+        ));
+    }
+    if (audio == PRESET_SHARED) != (video == PRESET_SHARED) {
+        return Some(validation_failed(
+            &contract_member,
+            &format!(
+                "The {PRESET_SHARED} preset uses one content key for all of the audio and \
+                 video tracks, so it has to be the preset of both. {CHECK_THE_VALUE}"
+            ),
+            VALIDATION_ENCRYPTION_CONTRACT_SHARED,
+        ));
+    }
+    if is_ism_container(container) && !(audio == PRESET_SHARED && video == PRESET_SHARED) {
+        return Some(validation_failed(
+            &contract_member,
+            &format!(
+                "An {container} container endpoint encrypts every track with one content \
+                 key, so its encryption contract must use the {PRESET_SHARED} preset for \
+                 the audio and the video tracks. {CHECK_THE_VALUE}"
+            ),
+            VALIDATION_ENCRYPTION_CONTRACT_WITH_ISM_CONTAINER_INCOMPATIBLE,
+        ));
+    }
+
+    // The content-key period timing, against the two things its doc says it needs.
+    let timing = provider
+        .content_key_period_configuration
+        .as_ref()
+        .and_then(|configuration| configuration.content_key_period_timing.as_deref());
+    if let Some(timing) = timing.filter(|timing| {
+        CONTENT_KEY_PERIOD_TIMINGS_WITH_START_END.contains(timing)
+    }) {
+        let timing_member =
+            format!("{ENCRYPTION_MEMBER}.spekeKeyProvider.contentKeyPeriodConfiguration.contentKeyPeriodTiming");
+        let speke_version = provider
+            .speke_version
+            .as_deref()
+            .unwrap_or(DEFAULT_SPEKE_VERSION);
+        if speke_version != SPEKE_VERSION_WITH_KEY_PERIOD_TIMING {
+            return Some(validation_failed(
+                &timing_member,
+                &format!(
+                    "Signaling the times a content key is used for requires SpekeVersion \
+                     {SPEKE_VERSION_WITH_KEY_PERIOD_TIMING}. Use SpekeVersion \
+                     {SPEKE_VERSION_WITH_KEY_PERIOD_TIMING}, or signal {timing} only as \
+                     the content key index"
+                ),
+                VALIDATION_CONTENT_KEY_PERIOD_TIMING_REQUIRES_SPEKE_V2_1,
+            ));
+        }
+        if encryption.key_rotation_interval_seconds.is_none() {
+            return Some(validation_failed(
+                &timing_member,
+                &format!(
+                    "Signaling the times a content key is used for requires key rotation \
+                     to be enabled. Specify KeyRotationIntervalSeconds, or signal \
+                     {timing} only as the content key index"
+                ),
+                VALIDATION_CONTENT_KEY_PERIOD_TIMING_WITHOUT_KEY_ROTATION,
+            ));
+        }
+    }
+
+    key_provider_url_rejection(&provider.url)
+}
+
+/// `ValidationExceptionType` values a refused `SpekeKeyProvider$Url` carries, from the
+/// model's `ValidationExceptionType` enum.
+///
+/// The enum names one value per way the value can fail to be an endpoint the service could
+/// fetch content keys from: what it IS ([`VALIDATION_URL_INVALID`]), the scheme
+/// ([`VALIDATION_URL_SCHEME`]), the credentials ([`VALIDATION_URL_USER_INFO`]) and port
+/// ([`VALIDATION_URL_PORT`]) it carries, and the host it names
+/// ([`VALIDATION_URL_UNKNOWN_HOST`], [`VALIDATION_URL_LOOPBACK_ADDRESS`],
+/// [`VALIDATION_URL_LOCAL_ADDRESS`], [`VALIDATION_URL_LINK_LOCAL_ADDRESS`],
+/// [`VALIDATION_URL_MULTICAST_ADDRESS`]).
+pub const VALIDATION_URL_INVALID: &str = "URL_INVALID";
+/// See [`VALIDATION_URL_INVALID`].
+pub const VALIDATION_URL_SCHEME: &str = "URL_SCHEME";
+/// See [`VALIDATION_URL_INVALID`].
+pub const VALIDATION_URL_USER_INFO: &str = "URL_USER_INFO";
+/// See [`VALIDATION_URL_INVALID`].
+pub const VALIDATION_URL_PORT: &str = "URL_PORT";
+/// See [`VALIDATION_URL_INVALID`].
+pub const VALIDATION_URL_UNKNOWN_HOST: &str = "URL_UNKNOWN_HOST";
+/// See [`VALIDATION_URL_INVALID`].
+pub const VALIDATION_URL_LOOPBACK_ADDRESS: &str = "URL_LOOPBACK_ADDRESS";
+/// See [`VALIDATION_URL_INVALID`].
+pub const VALIDATION_URL_LOCAL_ADDRESS: &str = "URL_LOCAL_ADDRESS";
+/// See [`VALIDATION_URL_INVALID`].
+pub const VALIDATION_URL_LINK_LOCAL_ADDRESS: &str = "URL_LINK_LOCAL_ADDRESS";
+/// See [`VALIDATION_URL_INVALID`].
+pub const VALIDATION_URL_MULTICAST_ADDRESS: &str = "URL_MULTICAST_ADDRESS";
+
+/// The scheme a key-provider URL has to use: `SpekeKeyProvider$Url` is "The URL of the API
+/// Gateway proxy that you set up to talk to your key server", which "must start with
+/// https://".
+const KEY_PROVIDER_URL_SCHEME: &str = "https";
+
+/// The `ValidationExceptionType` for an IP address a service endpoint may not be at, or
+/// `None` for an address outside those classes.
+///
+/// The model names one value per class of address that is not a reachable, public endpoint
+/// of a key server: the loopback of whoever resolves it, an address private to a network,
+/// a link-local address and a multicast group. Both IP versions, since a URL may carry
+/// either.
+fn local_address_class(address: ::std::net::IpAddr) -> Option<&'static str> {
+    match address {
+        ::std::net::IpAddr::V4(address) => {
+            if address.is_loopback() {
+                Some(VALIDATION_URL_LOOPBACK_ADDRESS)
+            } else if address.is_link_local() {
+                Some(VALIDATION_URL_LINK_LOCAL_ADDRESS)
+            } else if address.is_multicast() {
+                Some(VALIDATION_URL_MULTICAST_ADDRESS)
+            } else if address.is_private() || address.is_unspecified() {
+                Some(VALIDATION_URL_LOCAL_ADDRESS)
+            } else {
+                None
+            }
+        }
+        ::std::net::IpAddr::V6(address) => {
+            if address.is_loopback() {
+                Some(VALIDATION_URL_LOOPBACK_ADDRESS)
+            } else if address.is_multicast() {
+                Some(VALIDATION_URL_MULTICAST_ADDRESS)
+            } else if address.segments()[0] & 0xffc0 == 0xfe80 {
+                Some(VALIDATION_URL_LINK_LOCAL_ADDRESS)
+            } else if address.segments()[0] & 0xfe00 == 0xfc00 || address.is_unspecified() {
+                Some(VALIDATION_URL_LOCAL_ADDRESS)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The host NAMES that resolve to the loopback of whoever resolves them, so a URL naming
+/// one addresses the resolver itself rather than a key server: `localhost` and anything
+/// under it (RFC 6761 reserves the whole `.localhost` tree for exactly this).
+///
+/// Names only — an address literal is read as an address
+/// ([`local_address_class`]) — and a reading of a MODELLED member's value, which is why it
+/// is not the framework's inbound-listener guard: that one decides which `Host` header a
+/// listener answers, over a whole authority including literals and zone ids.
+fn is_loopback_domain_name(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost")
+}
+
+/// The port a key server is reached at: the default port of [`KEY_PROVIDER_URL_SCHEME`],
+/// which is the only one a URL that names the scheme's own endpoint can carry.
+const KEY_PROVIDER_URL_PORT: u16 = 443;
+
+/// Refuse a SPEKE key-provider URL that is not an endpoint this service could fetch
+/// content keys from, or `None` when it is one.
+///
+/// The service RESOLVES this URL and calls it for every content key, so what it names has
+/// to be a reachable key server: the model documents the value as "The URL of the API
+/// Gateway proxy that you set up to talk to your key server", which "must reside in the
+/// same AWS Region as MediaPackage and must start with https://", and its
+/// `ValidationExceptionType` names one value per way the value fails that (see
+/// [`VALIDATION_URL_INVALID`]). A URL carrying credentials or a port of its own does not
+/// name that endpoint, and one naming a host that is not a public name — the resolver's own
+/// loopback, a private, link-local or multicast address, or a name that is not a
+/// fully-qualified one — names no key server reachable from the service at all.
+///
+/// Every class is decided from the VALUE: the emulator serves inbound requests and
+/// resolves nothing, so what the host classes cover is what the text itself settles — the
+/// address literals, and a single-label name, which is not a name the public DNS this
+/// endpoint has to be reachable through can answer. The URI grammar itself is read by the
+/// `http` crate's parser, the one every request's own URI is read with, rather than by a
+/// hand-rolled split.
+pub fn key_provider_url_rejection(url: &str) -> Option<ValidationException> {
+    let member = format!("{ENCRYPTION_MEMBER}.spekeKeyProvider.url");
+    let refused = |requirement: String, exception_type: &str| {
+        Some(validation_failed(&member, &requirement, exception_type))
+    };
+    let parsed = url.parse::<::http::Uri>().ok().and_then(|parsed| {
+        let scheme = parsed.scheme_str()?.to_string();
+        let authority = parsed.authority()?.clone();
+        Some((scheme, authority))
+    });
+    // A value the grammar does not admit, or one naming no scheme or no authority, is not
+    // an endpoint at all rather than an endpoint of the wrong kind.
+    let Some((scheme, authority)) = parsed else {
+        return refused(
+            format!("Member must be a URL naming a scheme and a host. {CHECK_THE_VALUE}"),
+            VALIDATION_URL_INVALID,
+        );
+    };
+    if scheme != KEY_PROVIDER_URL_SCHEME {
+        return refused(
+            format!(
+                "Member must be a {KEY_PROVIDER_URL_SCHEME} URL. {CHECK_THE_VALUE}"
+            ),
+            VALIDATION_URL_SCHEME,
+        );
+    }
+    // The authority carries any userinfo ahead of the host, which the host itself does not.
+    if authority.as_str().contains('@') {
+        return refused(
+            format!("Member must not carry user information. {CHECK_THE_VALUE}"),
+            VALIDATION_URL_USER_INFO,
+        );
+    }
+    if authority
+        .port_u16()
+        .is_some_and(|port| port != KEY_PROVIDER_URL_PORT)
+    {
+        return refused(
+            format!(
+                "Member must not name a port other than {KEY_PROVIDER_URL_PORT}. \
+                 {CHECK_THE_VALUE}"
+            ),
+            VALIDATION_URL_PORT,
+        );
+    }
+    let host = authority.host();
+    if is_loopback_domain_name(host) {
+        return refused(
+            format!(
+                "Member must name a host that is not the loopback of the service \
+                 resolving it. {CHECK_THE_VALUE}"
+            ),
+            VALIDATION_URL_LOOPBACK_ADDRESS,
+        );
+    }
+    // An IPv6 literal is bracketed in an authority, which is where its own colons live.
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    match literal.parse::<::std::net::IpAddr>() {
+        Ok(address) => local_address_class(address).and_then(|exception_type| {
+            refused(
+                format!(
+                    "Member must name a host that is reachable from the service. \
+                     {CHECK_THE_VALUE}"
+                ),
+                exception_type,
+            )
+        }),
+        // A single-label name is not a name the service can resolve to a key server.
+        Err(_) => (!host.trim_end_matches('.').contains('.')).then(|| {
+            validation_failed(
+                &member,
+                &format!("Member must name a host that resolves. {CHECK_THE_VALUE}"),
+                VALIDATION_URL_UNKNOWN_HOST,
+            )
+        }),
+    }
 }
 
 /// The collection a pagination token was issued for.
@@ -4733,7 +5506,10 @@ mod tests {
             container_type: "TS".to_string(),
             segment: materialized_segment(None, None),
             description: None,
-            startover_window_seconds: materialized_startover_window_seconds(None),
+            startover_window_seconds: materialized_startover_window_seconds(
+                None,
+                DEFAULT_INPUT_TYPE,
+            ),
             hls_manifests: Vec::new(),
             low_latency_hls_manifests: Vec::new(),
             dash_manifests: Vec::new(),
@@ -4772,7 +5548,7 @@ mod tests {
             }),
             ("description", |e| e.description = Some("a".to_string())),
             ("startover_window_seconds", |e| {
-                e.startover_window_seconds = 1
+                e.startover_window_seconds = Some(1)
             }),
             ("segment", |e| {
                 e.segment = Segment {

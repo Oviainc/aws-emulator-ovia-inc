@@ -29,6 +29,11 @@ const CHANNEL: &str = "upd-channel";
 
 /// An emulator with the group and channel this suite's endpoints live in, plus the
 /// group's egress domain — the host every manifest URL beneath it is served from.
+///
+/// The channel's `InputType` is CMAF because rows below carry
+/// `ForceEndpointErrorConfiguration`, which the model restricts to the endpoints of a
+/// CMAF-input channel (`ONLY_CMAF_INPUT_TYPE_ALLOW_FORCE_ENDPOINT_ERROR_CONFIGURATION`);
+/// `endpoint_member_input_type_restriction` covers that restriction itself.
 async fn emulator_with_parents() -> (Emulator, String) {
     let emulator = Emulator::new();
     let (status, body) = emulator.create_group(GROUP, json!({})).await;
@@ -38,7 +43,7 @@ async fn emulator_with_parents() -> (Emulator, String) {
         .expect("the created group's egress domain")
         .to_string();
     let (status, body) = emulator
-        .create_channel(GROUP, CHANNEL, json!({"InputType": "HLS"}))
+        .create_channel(GROUP, CHANNEL, json!({"InputType": "CMAF"}))
         .await;
     assert_eq!(status, 200, "CreateChannel expected 200, got {body}");
     (emulator, egress_domain)
