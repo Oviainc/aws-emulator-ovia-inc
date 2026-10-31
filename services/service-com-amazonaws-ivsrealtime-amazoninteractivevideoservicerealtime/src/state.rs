@@ -5803,15 +5803,17 @@ pub fn conflict<E>(
     )
 }
 
-/// How this service states a stop of a composition that is not composing: it names the
-/// composition and the state it is already in, so the caller can see why the stop is not
-/// the next thing that can happen to it.
+/// How this service states a stop of a composition that is not composing: fixed text
+/// around the composition ARN the request named, and nothing else.
 ///
-/// AWS documents no text for `ConflictException` beyond what it means ("Updating or
-/// deleting a resource can cause an inconsistent state"), so the sentence is built from
-/// the request and the stored state, the way every other refusal of this service is.
-pub fn composition_not_running_message(arn: &str, state: &str) -> String {
-    format!("Resource: {arn} is already {state}")
+/// The model documents no text for `ConflictException` beyond what it means ("Updating or
+/// deleting a resource can cause an inconsistent state"), so the wording comes from what
+/// the service was recorded answering: one fixed sentence whose only variable part is the
+/// ARN the request sent. The composition's own lifecycle state is NOT part of it — the
+/// sentence a caller matches on cannot vary with a value this store keeps, so this takes
+/// no state to interpolate.
+pub fn composition_not_running_message(arn: &str) -> String {
+    format!("Resource: {arn} is in a transitioning state")
 }
 
 /// How this service states a request to replicate a participant that is already

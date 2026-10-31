@@ -172,13 +172,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only a composition that is still composing can be stopped. One already past
         // that is the inconsistent state this operation's `ConflictException` (HTTP 409)
         // names: stopping it again would move a terminal state backwards and give the
-        // composition a second end time.
+        // composition a second end time. The sentence names the ARN the request sent and
+        // nothing of the record, so it is one fixed refusal whatever state the stop found
+        // ([`crate::state::composition_not_running_message`]).
         if !composition.is_running() {
-            let message =
-                crate::state::composition_not_running_message(&composition.arn, &composition.state);
             return Err(crate::state::conflict(
                 StopCompositionErrorModeled::ConflictException,
-                message,
+                crate::state::composition_not_running_message(&input.arn),
             ));
         }
 
