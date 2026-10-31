@@ -70,21 +70,24 @@ pub(crate) const DIRECTORY: &str = "d-0123456789";
 /// Each refusal carries the ids the sentence has to name, so the expected message is built
 /// from the ROW's own values rather than copied as one literal — a refusal that named some
 /// other resource would not match.
+///
+/// Borrowed rather than `&'static`, so a suite whose ids are the ones EC2 MINTED at run time
+/// states its expectation here too instead of spelling these sentences a second time.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Expected {
+pub(crate) enum Expected<'a> {
     /// HTTP 200, and the settings the call must leave the registration with.
     Accepted,
     /// The subnet the request named is not in the account's store.
-    NoSuchSubnet(&'static str),
+    NoSuchSubnet(&'a str),
     /// The security group the request named is not in the account's store.
-    NoSuchGroup(&'static str),
+    NoSuchGroup(&'a str),
     /// The subnets do not agree on a VPC; the id is the VPC the earlier ones share.
-    SubnetsDisagree(&'static str),
+    SubnetsDisagree(&'a str),
     /// The security group belongs to another VPC than the subnets do.
-    GroupElsewhere(&'static str, &'static str),
+    GroupElsewhere(&'a str, &'a str),
 }
 
-impl Expected {
+impl Expected<'_> {
     /// The sentence the refusal must carry, spelled out here rather than read from the
     /// implementation: the fixed text of the error class with the ids of this row.
     pub(crate) fn message(self) -> Option<String> {
@@ -151,7 +154,7 @@ struct RegisterRow {
     case: &'static str,
     subnets: &'static [&'static str],
     security_group_id: &'static str,
-    expected: Expected,
+    expected: Expected<'static>,
 }
 
 const REGISTER_ROWS: &[RegisterRow] = &[
@@ -331,7 +334,7 @@ async fn a_registration_without_settings_resolves_no_network() {
 #[tokio::test]
 async fn a_self_managed_domains_subnets_are_resolved_too() {
     // (case, the `DomainNetworkSettings.Subnets` the provider carries, the refusal)
-    let rows: [(&str, &[&str], Expected); 5] = [
+    let rows: [(&str, &[&str], Expected<'static>); 5] = [
         (
             "one subnet the account has",
             &[ACCOUNT_SUBNETS[0]],
@@ -493,7 +496,7 @@ struct UpdateRow {
     remove_subnets: &'static [&'static str],
     /// `None` leaves `UpdateSettings.SecurityGroupId` out, which keeps the stored one.
     security_group_id: Option<&'static str>,
-    expected: Expected,
+    expected: Expected<'static>,
     /// The subnets and security group every later read must report for the registration.
     settings_after: (&'static [&'static str], &'static str),
 }

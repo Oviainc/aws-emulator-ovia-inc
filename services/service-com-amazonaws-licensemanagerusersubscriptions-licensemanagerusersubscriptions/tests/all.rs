@@ -63,6 +63,8 @@ mod product_user_removal_is_one_writer;
 mod refusals;
 #[path = "all/registration_pair_resolution_is_shared.rs"]
 mod registration_pair_resolution_is_shared;
+#[path = "all/registration_resolves_the_network_its_owner_minted.rs"]
+mod registration_resolves_the_network_its_owner_minted;
 #[path = "all/resource_resolution_refusals.rs"]
 mod resource_resolution_refusals;
 #[path = "all/settings_network_resolution.rs"]

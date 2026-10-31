@@ -104,7 +104,7 @@ fn settings(subnets: &[&str], security_group_id: &str) -> Value {
 struct UnusableRow {
     case: &'static str,
     payload: UpdateSettingsPayload,
-    expected: Expected,
+    expected: Expected<'static>,
 }
 
 /// The subnets are resolved before the security group is, so a payload that is wrong about
