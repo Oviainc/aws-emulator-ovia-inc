@@ -3,8 +3,10 @@
 //! @op ListInstanceTypeDetails
 //!
 //! Reports the instance-type catalog one engine version publishes: one entry per
-//! instance type that version offers, each carrying the features it supports, from
-//! the derivation in [`crate::state::instance_type_details`]. The engine version is
+//! instance type that version offers, in the order the service publishes them
+//! ([`crate::state::offered_instance_types`]), each carrying the roles it serves and
+//! the features it supports ([`crate::state::instance_type_details`]). The engine
+//! version is
 //! first RESOLVED against the catalog of releases the service publishes
 //! ([`crate::state::resolve_engine_version`], the set `ListVersions` advertises):
 //! there is no instance-type catalog for a release the service does not offer.
@@ -197,12 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "An optional parameter that lists information for a given instance type" —
         // the filter narrows the listing to that one instance type.
         // `InstanceTypeString`'s pattern admits any `<family>.<size>.search` value, so
-        // one the model publishes no instance type for names nothing at all and is a
+        // one the service publishes no instance type for names nothing at all and is a
         // malformed request; one that IS published but is not offered on this version
         // names an instance type that exists, so the listing it narrows is simply
         // empty.
         if let Some(instance_type) = input.instance_type.as_deref() {
-            if !OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.contains(&instance_type) {
+            if !crate::state::publishes_instance_type(instance_type) {
                 return Err(ListInstanceTypeDetailsErrorModeled::ValidationException(
                     crate::state::unknown_instance_type("InstanceType", instance_type),
                 )

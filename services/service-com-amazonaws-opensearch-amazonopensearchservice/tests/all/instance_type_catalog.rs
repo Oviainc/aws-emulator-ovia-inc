@@ -7,20 +7,26 @@
 //! client sees, not what a handler returns. The harness comes from
 //! [`super::domain_lifecycle`]; this suite adds no second copy of it.
 //!
-//! The tests assert RULES over sets of inputs, not one recorded call:
+//! The tests assert RULES over sets of inputs, not one recorded call, and they assert
+//! them about the ANSWER rather than against a second copy of the service's table:
 //!
-//! * the listing spans the instance types the NAMED ENGINE VERSION offers — the model's
-//!   `OpenSearchPartitionInstanceType` enum, less the families AWS introduced for a
-//!   later engine release — over a table of ten versions of both engines, including
-//!   each release a family is gated on and one either side of it;
-//! * each entry's feature members follow the engine release the feature is available
-//!   from AND what the instance family can serve, and the roles follow the family; a
-//!   feature available on one version is still available on a later one of the same
-//!   engine, over every ordered pair of the version table;
+//! * the listing is the catalog the service publishes for the named release, published
+//!   family by family in the documented order — the current generations by family name,
+//!   then the warm tier, then the previous generations, each family's types smallest
+//!   size first — which is neither the modelled `OpenSearchPartitionInstanceType` value
+//!   set nor its order: the catalog carries current-generation families that enum does
+//!   not list at all, carries every value it does list, and leaves out a family the
+//!   release does not offer;
+//! * each entry's `InstanceRole` is the set of node roles an instance of its FAMILY
+//!   serves — the same for every size of a family and on every release that offers it,
+//!   never a coordinator without a master, never the warm role beside another — and
+//!   each feature member follows the engine release the feature is available from AND
+//!   what the family can serve; a feature available on one release stays available on a
+//!   later one;
 //! * the `instanceType` filter reports exactly the entry it names, over a table of
 //!   types drawn from the listing, answers an empty listing for a published type the
-//!   version does not offer, and refuses a value that names no published instance type;
-//! * the version's catalog is reported COMPLETE in a single answer, with no `NextToken`
+//!   release does not offer, and refuses a value that names no published instance type;
+//! * the release's catalog is reported COMPLETE in a single answer, with no `NextToken`
 //!   member at all, over a table of page sizes: `MaxResults` does not bound what is
 //!   reported and no token is ever handed out, while a `MaxResults` outside the modelled
 //!   range is still refused at either end; a token names a place in the listing, so an
@@ -33,18 +39,19 @@
 //!   release, are refused with the modelled errors;
 //! * the read changes nothing a later caller sees.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES;
+use service_com_amazonaws_opensearch_amazonopensearchservice::state::publishes_every_modelled_instance_type;
 
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
 
 /// The engine versions every table below spans: the oldest Elasticsearch release, each
 /// release an instance family or a feature is gated on, one either side of it, and
 /// OpenSearch releases from the first to a current one. Both engines and both sides of
-/// every published gate, so no row is the only evidence for a rule.
-const VERSIONS: [&str; 10] = [
+/// every gate, so no row is the only evidence for a rule.
+const VERSIONS: [&str; 12] = [
     "Elasticsearch_1.5",
     "Elasticsearch_5.1",
     "Elasticsearch_6.7",
@@ -54,23 +61,45 @@ const VERSIONS: [&str; 10] = [
     "OpenSearch_1.0",
     "OpenSearch_2.9",
     "OpenSearch_2.11",
+    "OpenSearch_2.15",
+    "OpenSearch_2.17",
     "OpenSearch_2.19",
 ];
 
-/// The instance families AWS publishes an engine-release prerequisite for, each with
-/// the release it is offered from. Source: the UltraWarm family arrived with
-/// Elasticsearch 6.8, the Graviton families with Elasticsearch 7.9, and the
-/// OpenSearch-optimized family is OpenSearch-only from 2.11. Every other family of
-/// `OpenSearchPartitionInstanceType` — the model's record of which instance types
-/// exist — is offered on every version.
-///
-/// These are restated here as the test's OWN expectation rather than imported from
-/// `crate::state`, so that changing a gate in `state.rs` fails this suite instead of
-/// being asserted against itself; the handler's copies live beside
-/// `state::offers_instance_type` and have to be kept in step with these.
-const ULTRAWARM_FAMILY: &str = "ultrawarm1";
-const GRAVITON_FAMILIES: [&str; 5] = ["c6g", "m6g", "r6g", "r6gd", "t4g"];
-const OPENSEARCH_OPTIMIZED_FAMILIES: [&str; 1] = ["or1"];
+/// The size tokens of `<family>.<size>.search`, smallest first. Source: the instance
+/// sizes AWS publishes normalization factors for — `nano` is a quarter of a `small`,
+/// a `large` four of them, and each `Nxlarge` N times an `xlarge` — which is the order
+/// a family's types are published in.
+const SIZES_SMALLEST_FIRST: [&str; 15] = [
+    "nano",
+    "micro",
+    "small",
+    "medium",
+    "large",
+    "xlarge",
+    "2xlarge",
+    "4xlarge",
+    "8xlarge",
+    "9xlarge",
+    "10xlarge",
+    "12xlarge",
+    "16xlarge",
+    "18xlarge",
+    "24xlarge",
+];
+
+/// The families AWS publishes as PREVIOUS generation for this service. The published
+/// catalog lists them after the current generations; restated here as the suite's own
+/// expectation rather than imported from the service.
+const PREVIOUS_GENERATION_FAMILIES: [&str; 8] = ["c4", "d2", "i2", "m3", "m4", "r3", "r4", "t2"];
+
+/// The family that serves the warm tier, which the catalog publishes apart from the
+/// hot-tier families.
+const WARM_FAMILY: &str = "ultrawarm1";
+
+/// The families whose instances hold the domain's data and are never master-eligible:
+/// the OpenSearch-optimized ones.
+const DATA_ONLY_FAMILIES: [&str; 2] = ["oi2", "or1"];
 
 /// The families neither encryption at rest nor node-to-node encryption is available
 /// on, whatever the version.
@@ -78,6 +107,12 @@ const UNENCRYPTED_FAMILIES: [&str; 2] = ["m3", "t2"];
 
 /// The burstable families, which UltraWarm cannot be attached to.
 const BURSTABLE_FAMILIES: [&str; 3] = ["t2", "t3", "t4g"];
+
+/// The node roles `InstanceTypeDetails$InstanceRole` reports, from that member's own
+/// documentation ("whether the instance acts as a data node, a dedicated master node,
+/// or an UltraWarm node") plus the dedicated-coordinator role a family that can run one
+/// reports.
+const PUBLISHED_ROLES: [&str; 4] = ["data", "master", "coordinator", "ultrawarm"];
 
 /// `ListInstanceTypeDetails`:
 /// `GET /2021-01-01/opensearch/instanceTypeDetails/{EngineVersion}`, with `query` as
@@ -162,6 +197,35 @@ fn family(instance_type: &str) -> &str {
     instance_type.split('.').next().unwrap_or(instance_type)
 }
 
+/// The size token of an instance type.
+fn size(instance_type: &str) -> &str {
+    instance_type.split('.').nth(1).unwrap_or(instance_type)
+}
+
+/// Where one size sits among the published sizes, smallest first.
+fn size_rank(instance_type: &str) -> usize {
+    let size = size(instance_type);
+    SIZES_SMALLEST_FIRST
+        .iter()
+        .position(|candidate| *candidate == size)
+        .unwrap_or_else(|| {
+            panic!("case {instance_type}: expected a published instance size, got {size}")
+        })
+}
+
+/// Which group of the published catalog a family belongs to: the current generations
+/// lead it, then the warm tier, then the previous generations.
+fn family_group(instance_type: &str) -> u8 {
+    let family = family(instance_type);
+    if family == WARM_FAMILY {
+        1
+    } else if PREVIOUS_GENERATION_FAMILIES.contains(&family) {
+        2
+    } else {
+        0
+    }
+}
+
 /// An engine version read apart, as the test states the rules against it.
 fn parse(engine_version: &str) -> (&str, u32, u32) {
     let (engine, release) = engine_version
@@ -189,51 +253,18 @@ fn since_elasticsearch(engine_version: &str, release: (u32, u32)) -> bool {
     is_opensearch(engine_version) || (major, minor) >= release
 }
 
-/// Whether the version is an OpenSearch release at or past `X.Y`.
-fn opensearch_at_least(engine_version: &str, release: (u32, u32)) -> bool {
-    let (_, major, minor) = parse(engine_version);
-    is_opensearch(engine_version) && (major, minor) >= release
-}
-
-/// Whether `engine_version` offers `instance_type` at all.
-fn offered(engine_version: &str, instance_type: &str) -> bool {
-    let family = family(instance_type);
-    if family == ULTRAWARM_FAMILY {
-        return since_elasticsearch(engine_version, (6, 8));
-    }
-    if GRAVITON_FAMILIES.contains(&family) {
-        return since_elasticsearch(engine_version, (7, 9));
-    }
-    if OPENSEARCH_OPTIMIZED_FAMILIES.contains(&family) {
-        return opensearch_at_least(engine_version, (2, 11));
-    }
-    true
-}
-
-/// Every instance type `engine_version` offers, in the order the model publishes them.
-fn expected_types(engine_version: &str) -> Vec<String> {
-    OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES
-        .iter()
-        .filter(|instance_type| offered(engine_version, instance_type))
-        .map(|instance_type| (*instance_type).to_string())
-        .collect()
-}
-
 #[tokio::test]
-async fn listing_spans_the_instance_types_the_version_offers() {
+async fn the_listing_is_published_in_the_catalogs_documented_order() {
     let emulator = Emulator::new();
 
     for version in VERSIONS {
-        let listing = whole_listing(&emulator, version, "").await;
-        let reported = instance_types(&listing);
-
-        assert_eq!(
-            reported,
-            expected_types(version),
-            "case {version}: expected the instance types this version offers, in the \
-             order the model publishes them, got {} entries",
+        let reported = instance_types(&whole_listing(&emulator, version, "").await);
+        assert!(
+            reported.len() > 50,
+            "case {version}: expected the release's whole catalog, got {} entries",
             reported.len()
         );
+
         let distinct: BTreeSet<&String> = reported.iter().collect();
         assert_eq!(
             distinct.len(),
@@ -243,28 +274,141 @@ async fn listing_spans_the_instance_types_the_version_offers() {
             reported.len(),
             distinct.len()
         );
-        for instance_type in &reported {
+
+        // A family's types are published together, smallest size first: the listing is
+        // a catalog of families and not a flat sort, so a client walking it reads one
+        // family's sizes in order.
+        let mut seen_families: Vec<&str> = Vec::new();
+        for pair in reported.windows(2) {
+            let (left, right) = (pair[0].as_str(), pair[1].as_str());
+            if family(left) == family(right) {
+                assert!(
+                    size_rank(left) < size_rank(right),
+                    "case {version}: expected {} to publish its sizes smallest first, \
+                     got {left} before {right}",
+                    family(left)
+                );
+                continue;
+            }
+            // A family boundary: the family just closed is never reopened, and the
+            // documented order decides which family follows.
             assert!(
-                OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.contains(&instance_type.as_str()),
-                "case {version}: every InstanceType is a value of the modelled enum, got \
-                 {instance_type}"
+                !seen_families.contains(&family(right)),
+                "case {version}: expected one contiguous run per family, got {} reopened \
+                 at {right}",
+                family(right)
             );
+            seen_families.push(family(left));
+            let (left_group, right_group) = (family_group(left), family_group(right));
+            assert!(
+                left_group <= right_group,
+                "case {version}: expected the current generations, then the warm tier, \
+                 then the previous generations, got {left} ({left_group}) before {right} \
+                 ({right_group})"
+            );
+            if left_group == right_group {
+                assert!(
+                    family(left) < family(right),
+                    "case {version}: expected the families of one group published by \
+                     name, got {left} before {right}"
+                );
+            }
         }
     }
 
-    // The gates themselves, stated as the difference one release makes: the release a
-    // family is offered from reports it and the release before it does not.
+    // The catalog is the SERVICE's and not the modelled value set: a release that
+    // offers a family the service added after the model was written reports instance
+    // types `OpenSearchPartitionInstanceType` does not list at all, so a listing
+    // derived from that enum cannot produce this answer.
+    for version in ["OpenSearch_2.15", "OpenSearch_2.19"] {
+        let reported = instance_types(&whole_listing(&emulator, version, "").await);
+        let beyond_the_enum: Vec<&String> = reported
+            .iter()
+            .filter(|instance_type| {
+                !OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.contains(&instance_type.as_str())
+            })
+            .collect();
+        assert!(
+            !beyond_the_enum.is_empty(),
+            "case {version}: expected the published catalog to carry instance types the \
+             modelled enum does not list, got {reported:?}"
+        );
+    }
+
+    // Nor is the ORDER that set's, which is sorted: the catalog is published family by
+    // family, and its groups are not in name order.
+    for version in ["Elasticsearch_7.10", "OpenSearch_2.11", "OpenSearch_2.19"] {
+        let reported = instance_types(&whole_listing(&emulator, version, "").await);
+        let sorted = {
+            let mut sorted = reported.clone();
+            sorted.sort();
+            sorted
+        };
+        assert_ne!(
+            reported, sorted,
+            "case {version}: expected the catalog's published order rather than a sorted \
+             value set"
+        );
+    }
+
+    // The modelled value set is a SUBSET of the published catalog: every type the model
+    // declares is published for the releases that offer its family, so no type the model
+    // names has been dropped along the way — which the service holds for itself too.
+    assert!(
+        publishes_every_modelled_instance_type(),
+        "case the modelled value set: expected the catalog to publish every instance \
+         type the model declares"
+    );
+    let mut published: BTreeSet<String> = BTreeSet::new();
+    for version in VERSIONS {
+        published.extend(instance_types(&whole_listing(&emulator, version, "").await));
+    }
+    for modelled in OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES {
+        assert!(
+            published.contains(*modelled),
+            "case {modelled}: expected some release to offer every instance type the \
+             model declares, got {} published types",
+            published.len()
+        );
+    }
+
+    // The catalog is not filtered by instance GENERATION: a previous-generation family
+    // is published for a current release too, after the current generations.
+    let current = instance_types(&whole_listing(&emulator, "OpenSearch_2.19", "").await);
+    for previous_generation in ["c4.4xlarge.search", "m4.large.search", "t2.micro.search"] {
+        assert!(
+            current.contains(&previous_generation.to_string()),
+            "case {previous_generation} on OpenSearch_2.19: expected the catalog to carry \
+             the previous generations too, got {} entries",
+            current.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_listing_is_the_catalog_the_named_release_offers() {
+    let emulator = Emulator::new();
+
+    // The release gates, stated as the difference one release makes: the release a
+    // family is offered from reports it and the release before it does not. One row per
+    // published prerequisite — the warm tier's, the Graviton families', the two
+    // generations that arrived after the engines forked, and the two
+    // OpenSearch-optimized generations'.
     for (family_member, before, from) in [
         ("ultrawarm1.medium.search", "Elasticsearch_6.7", "Elasticsearch_6.8"),
         ("r6g.large.search", "Elasticsearch_7.8", "Elasticsearch_7.9"),
         ("t4g.small.search", "Elasticsearch_7.8", "Elasticsearch_7.9"),
         ("or1.medium.search", "OpenSearch_2.9", "OpenSearch_2.11"),
+        ("m7i.2xlarge.search", "OpenSearch_2.11", "OpenSearch_2.13"),
+        ("r7i.12xlarge.search", "OpenSearch_2.11", "OpenSearch_2.13"),
+        ("c8g.12xlarge.search", "OpenSearch_2.13", "OpenSearch_2.15"),
+        ("oi2.8xlarge.search", "OpenSearch_2.15", "OpenSearch_2.17"),
     ] {
         let absent = instance_types(&whole_listing(&emulator, before, "").await);
         let present = instance_types(&whole_listing(&emulator, from, "").await);
         assert!(
             !absent.contains(&family_member.to_string()),
-            "case {family_member} on {before}: expected a version before the family was \
+            "case {family_member} on {before}: expected a release before the family was \
              introduced not to offer it"
         );
         assert!(
@@ -274,18 +418,61 @@ async fn listing_spans_the_instance_types_the_version_offers() {
         );
     }
 
-    // An OpenSearch-only family is offered on no Elasticsearch release, however late.
+    // A family the service publishes for the OpenSearch engine alone — one that arrived
+    // after the engines forked — is offered on no Elasticsearch release, however late.
     let last_elasticsearch = instance_types(&whole_listing(&emulator, "Elasticsearch_7.10", "").await);
-    assert!(
-        !last_elasticsearch.contains(&"or1.large.search".to_string()),
-        "case or1.large.search on Elasticsearch_7.10: expected an OpenSearch-only family \
-         to be offered on no Elasticsearch release, got {last_elasticsearch:?}"
-    );
+    for opensearch_only in [
+        "or1.large.search",
+        "oi2.8xlarge.search",
+        "m7i.2xlarge.search",
+        "r7i.large.search",
+        "c8g.8xlarge.search",
+    ] {
+        assert!(
+            !last_elasticsearch.contains(&opensearch_only.to_string()),
+            "case {opensearch_only} on Elasticsearch_7.10: expected a family published for \
+             the OpenSearch engine alone to be offered on no Elasticsearch release"
+        );
+    }
+
+    // A release offers at least what an earlier release of the line offers: a family is
+    // introduced for a release and is offered from it onwards, so the catalog grows
+    // along the succession and never loses an entry.
+    for earlier in VERSIONS {
+        for later in VERSIONS {
+            let succeeds = if parse(earlier).0 == parse(later).0 {
+                (parse(later).1, parse(later).2) >= (parse(earlier).1, parse(earlier).2)
+            } else {
+                is_opensearch(later)
+            };
+            if !succeeds {
+                continue;
+            }
+            let earlier_types: BTreeSet<String> =
+                instance_types(&whole_listing(&emulator, earlier, "").await)
+                    .into_iter()
+                    .collect();
+            let later_types: BTreeSet<String> =
+                instance_types(&whole_listing(&emulator, later, "").await)
+                    .into_iter()
+                    .collect();
+            let lost: Vec<&String> = earlier_types.difference(&later_types).collect();
+            assert!(
+                lost.is_empty(),
+                "case {earlier} -> {later}: expected a release to offer every instance \
+                 type an earlier one offers, lost {lost:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
-async fn features_follow_the_engine_release_and_the_instance_family() {
+async fn roles_and_features_follow_the_family_and_the_engine_release() {
     let emulator = Emulator::new();
+
+    // The roles are the FAMILY's, so they are collected per family and compared across
+    // sizes and releases rather than against a second copy of the service's table.
+    let mut roles_by_family: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
 
     for version in VERSIONS {
         for entry in whole_listing(&emulator, version, "").await {
@@ -343,18 +530,65 @@ async fn features_follow_the_engine_release_and_the_instance_family() {
                  family, got {warm}"
             );
 
-            let expected_roles: Vec<String> = if family == ULTRAWARM_FAMILY {
-                vec!["ultrawarm".to_string()]
-            } else if OPENSEARCH_OPTIMIZED_FAMILIES.contains(&family) {
-                vec!["data".to_string()]
-            } else {
-                vec!["data".to_string(), "master".to_string()]
-            };
+            // The role set is one of the published vocabulary, carries no repeat, and
+            // holds together: a node that is master-eligible or runs as a coordinator
+            // also holds data, a coordinator is only published beside a master, and the
+            // warm role is published alone.
+            let reported = roles(&entry, &case);
+            assert!(
+                !reported.is_empty(),
+                "case {case}: expected the roles an instance of the family serves"
+            );
+            for role in &reported {
+                assert!(
+                    PUBLISHED_ROLES.contains(&role.as_str()),
+                    "case {case}: expected a published role, got {role}"
+                );
+            }
+            let distinct: BTreeSet<&String> = reported.iter().collect();
             assert_eq!(
-                roles(&entry, &case),
-                expected_roles,
-                "case {case}: expected the roles the family can serve, got {:?}",
-                entry["InstanceRole"]
+                distinct.len(),
+                reported.len(),
+                "case {case}: expected each role once, got {reported:?}"
+            );
+            let has = |role: &str| reported.iter().any(|reported| reported == role);
+            if family == WARM_FAMILY {
+                assert_eq!(
+                    reported,
+                    vec!["ultrawarm".to_string()],
+                    "case {case}: expected the warm tier's one role, got {reported:?}"
+                );
+            } else {
+                assert!(
+                    has("data") && !has("ultrawarm"),
+                    "case {case}: expected a hot-tier family to hold data and not serve \
+                     the warm tier, got {reported:?}"
+                );
+            }
+            if DATA_ONLY_FAMILIES.contains(&family) {
+                assert_eq!(
+                    reported,
+                    vec!["data".to_string()],
+                    "case {case}: expected a family whose instances are data nodes only \
+                     to publish that one role, got {reported:?}"
+                );
+            }
+            assert!(
+                !has("coordinator") || has("master"),
+                "case {case}: expected the coordinator role only beside the master one, \
+                 got {reported:?}"
+            );
+
+            // The roles are the family's: every size of it, on every release that offers
+            // it, reports the same set.
+            let remembered = roles_by_family
+                .entry(family.to_string())
+                .or_insert_with(|| (case.clone(), reported.clone()));
+            assert_eq!(
+                reported, remembered.1,
+                "case {case}: expected the roles the family serves, the same as {}, got \
+                 {reported:?}",
+                remembered.0
             );
 
             assert!(
@@ -364,6 +598,32 @@ async fn features_follow_the_engine_release_and_the_instance_family() {
                 entry["AvailabilityZones"]
             );
         }
+    }
+
+    // The role sets really differ between families, so the rule above is not vacuous:
+    // one row per published set, each naming a family of its own.
+    for (family, expected) in [
+        ("m7i", vec!["data", "master", "coordinator"]),
+        ("c8g", vec!["data", "master", "coordinator"]),
+        ("r5", vec!["data", "master", "coordinator"]),
+        ("i3", vec!["data", "master"]),
+        ("c4", vec!["data", "master"]),
+        ("t3", vec!["data", "master"]),
+        ("oi2", vec!["data"]),
+        ("or1", vec!["data"]),
+        ("ultrawarm1", vec!["ultrawarm"]),
+    ] {
+        let (_, reported) = roles_by_family
+            .get(family)
+            .unwrap_or_else(|| panic!("the listing reports the {family} family"));
+        assert_eq!(
+            reported,
+            &expected
+                .iter()
+                .map(|role| (*role).to_string())
+                .collect::<Vec<_>>(),
+            "case {family}: expected the roles an instance of the family serves"
+        );
     }
 }
 
@@ -429,9 +689,48 @@ async fn anchored_entries_are_reported_exactly() {
 
     // Hand-written anchors: the WHOLE entry, written out, for one instance type of
     // each family rule on releases either side of each feature gate. They pin the
-    // parallel expectation above to fixed values, so a rule error replicated in both
-    // the handler and this suite's own gates still fails here.
+    // parallel expectations above to fixed values, so a rule error replicated in both
+    // the handler and this suite's own gates still fails here. The burstable class is
+    // anchored on BOTH of its rules — `t3` on a current release, where encryption and
+    // fine-grained access control are available and the warm tier is not, and `t2` on an
+    // Elasticsearch release, where none of the three is.
     let rows = [
+        (
+            "OpenSearch_2.19",
+            json!({
+                "InstanceType": "m7i.2xlarge.search",
+                "EncryptionEnabled": true,
+                "CognitoEnabled": true,
+                "AppLogsEnabled": true,
+                "AdvancedSecurityEnabled": true,
+                "WarmEnabled": true,
+                "InstanceRole": ["data", "master", "coordinator"],
+            }),
+        ),
+        (
+            "OpenSearch_2.19",
+            json!({
+                "InstanceType": "c8g.12xlarge.search",
+                "EncryptionEnabled": true,
+                "CognitoEnabled": true,
+                "AppLogsEnabled": true,
+                "AdvancedSecurityEnabled": true,
+                "WarmEnabled": true,
+                "InstanceRole": ["data", "master", "coordinator"],
+            }),
+        ),
+        (
+            "OpenSearch_2.19",
+            json!({
+                "InstanceType": "oi2.8xlarge.search",
+                "EncryptionEnabled": true,
+                "CognitoEnabled": true,
+                "AppLogsEnabled": true,
+                "AdvancedSecurityEnabled": true,
+                "WarmEnabled": true,
+                "InstanceRole": ["data"],
+            }),
+        ),
         (
             "OpenSearch_2.11",
             json!({
@@ -441,17 +740,17 @@ async fn anchored_entries_are_reported_exactly() {
                 "AppLogsEnabled": true,
                 "AdvancedSecurityEnabled": true,
                 "WarmEnabled": true,
-                "InstanceRole": ["data", "master"],
+                "InstanceRole": ["data", "master", "coordinator"],
             }),
         ),
         (
             "OpenSearch_2.11",
             json!({
-                "InstanceType": "t2.micro.search",
-                "EncryptionEnabled": false,
+                "InstanceType": "t3.micro.search",
+                "EncryptionEnabled": true,
                 "CognitoEnabled": true,
                 "AppLogsEnabled": true,
-                "AdvancedSecurityEnabled": false,
+                "AdvancedSecurityEnabled": true,
                 "WarmEnabled": false,
                 "InstanceRole": ["data", "master"],
             }),
@@ -507,11 +806,11 @@ async fn anchored_entries_are_reported_exactly() {
         (
             "Elasticsearch_6.7",
             json!({
-                "InstanceType": "t3.small.search",
-                "EncryptionEnabled": true,
+                "InstanceType": "t2.micro.search",
+                "EncryptionEnabled": false,
                 "CognitoEnabled": true,
                 "AppLogsEnabled": true,
-                "AdvancedSecurityEnabled": true,
+                "AdvancedSecurityEnabled": false,
                 "WarmEnabled": false,
                 "InstanceRole": ["data", "master"],
             }),
@@ -525,7 +824,7 @@ async fn anchored_entries_are_reported_exactly() {
                 "AppLogsEnabled": true,
                 "AdvancedSecurityEnabled": true,
                 "WarmEnabled": true,
-                "InstanceRole": ["data", "master"],
+                "InstanceRole": ["data", "master", "coordinator"],
             }),
         ),
     ];
@@ -554,7 +853,7 @@ async fn anchored_entries_are_reported_exactly() {
 #[tokio::test]
 async fn instance_type_filter_reports_exactly_that_type() {
     let emulator = Emulator::new();
-    let version = "OpenSearch_2.11";
+    let version = "OpenSearch_2.19";
     let listing = whole_listing(&emulator, version, "").await;
 
     // One row per way a filtered type differs: the first and last of the listing, one
@@ -568,9 +867,11 @@ async fn instance_type_filter_reports_exactly_that_type() {
         [
             "ultrawarm1.large.search",
             "or1.2xlarge.search",
-            "t2.micro.search",
-            "m3.medium.search",
+            "oi2.medium.search",
+            "m7i.24xlarge.search",
+            "r7i.large.search",
             "t4g.medium.search",
+            "c4.8xlarge.search",
         ]
         .map(str::to_owned),
     );
@@ -605,10 +906,13 @@ async fn instance_type_filter_reports_exactly_that_type() {
         );
     }
 
-    // A published instance type the version does not offer exists but is not in this
+    // A published instance type the release does not offer exists but is not in its
     // listing, so the listing it narrows is empty rather than refused.
     for (not_offered, version) in [
         ("or1.medium.search", "Elasticsearch_7.10"),
+        ("oi2.medium.search", "OpenSearch_2.15"),
+        ("m7i.large.search", "Elasticsearch_7.10"),
+        ("c8g.8xlarge.search", "OpenSearch_2.13"),
         ("ultrawarm1.medium.search", "Elasticsearch_6.7"),
         ("r6g.large.search", "Elasticsearch_7.8"),
     ] {
@@ -632,10 +936,11 @@ async fn instance_type_filter_reports_exactly_that_type() {
     }
 
     // A value of the member's own shape that names no published instance type is a
-    // malformed request: the model's enum is the record of which types exist.
+    // malformed request: the published catalog is the record of which types exist.
     for unknown in [
         "nosuch.large.search",
         "m5.nosuch.search",
+        "m7i.48xlarge.search",
         "r6g.large.search.search",
     ] {
         let answer = list(&emulator, version, &format!("instanceType={unknown}")).await;

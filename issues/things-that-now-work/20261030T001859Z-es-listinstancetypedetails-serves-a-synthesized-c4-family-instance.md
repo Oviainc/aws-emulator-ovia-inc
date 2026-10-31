@@ -51,3 +51,32 @@ Model cited: com.amazonaws.opensearch#InstanceTypeDetails members (InstanceType/
 2. Compare InstanceTypeDetails element-by-element with the recorded response: element 0 is c4.2xlarge.search instead of the recorded m7i.2xlarge.search, and no element carries "coordinator" in InstanceRole.
 3. Replay esdef-list-instance-type-details-max-results-ignored#task#1 (single-entry page) and opensearch-domain-version-capacity-and-software-update-management#task#5 for the same divergence on the OpenSearch domain-capacity path.
 4. Confirm the fix by re-replaying all three fixture steps listed in trace_ids - a catalog change that only re-orders the synthesized entries will still fail them.
+
+## Resolution
+
+Fixed: the data source. `ListInstanceTypeDetails` no longer derives its answer from the
+modelled `OpenSearchPartitionInstanceType` value set. The service's own instance-type
+catalog now lives in `services/service-com-amazonaws-opensearch-amazonopensearchservice/src/state.rs`
+(`INSTANCE_TYPE_CATALOG`), keyed by the requested engine release: it carries the
+current-generation families the modelled enum does not list (m7i, c8g, r7i, oi2 beside
+or1), every value the enum does list, the engine releases that offer each family, and
+the node roles an instance of each family serves - including the dedicated-coordinator
+role for the families a coordinator node runs on and "data" alone for the
+OpenSearch-optimized families. `ListInstanceTypeDetails`, `DescribeInstanceTypeLimits`
+and the cluster-configuration validation of `CreateDomain`/`UpdateDomainConfig` all read
+that one table, and `AvailabilityZones` is still reported only when `retrieveAZs` asks
+for it. Held by `tests/all/instance_type_catalog.rs`.
+
+Declined: the ORDER the list is published in, and with it the replay key
+`es|ListInstanceTypeDetails|2xx->2xx|$.InstanceTypeDetails[*]`, which still reports a
+difference. The order is not part of the modelled contract -
+`com.amazonaws.opensearch#InstanceTypeDetailsList` is a bare list with no ordering trait
+and no documented order - and the service's own internal ordering of its catalog is not
+recoverable from anything it publishes: it is neither the modelled value set's order nor
+a sort of any published attribute, and only a handful of its positions appear in any
+evidence. Writing those recorded positions into the answer would be a memorised prefix
+rather than a rule, so the catalog is published in the order AWS's supported-instance-
+types documentation lists the families in (the current generations by family name, then
+the warm tier, then the previous generations, each family's types smallest size first),
+computed by `state::catalog_rank`. Anyone revisiting this cause needs the service's
+published catalog order itself, not a rule that can be derived from the model.

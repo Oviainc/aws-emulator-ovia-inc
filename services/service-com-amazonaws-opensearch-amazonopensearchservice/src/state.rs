@@ -6430,12 +6430,18 @@ fn seed_reserved_instance_offerings() -> BTreeMap<String, ReservedInstanceOfferi
 // ---------------------------------------------------------------------------
 // The instance-type catalog
 //
-// Which instance types an engine version offers, and which features each of them
-// supports, is content published BY the service: no caller creates an instance
-// type, and the answer depends only on the version asked about. So the catalog is
-// DERIVED from the model's published instance-type enum and the version, rather
-// than stored per account — which is what makes two reads of one version report the
-// same types, in the same order, with the same features.
+// Which instance types an engine version offers, which node roles each of them
+// serves and which features it supports is content published BY the service: no
+// caller creates an instance type, and the answer depends only on the release
+// asked about. [`INSTANCE_TYPE_CATALOG`] below IS that published content, so it is
+// the one record of which instance types exist, in the order the service publishes
+// them, and two reads of one release report the same types with the same roles and
+// the same features.
+//
+// It is the catalog rather than `OpenSearchPartitionInstanceType` because the two
+// are not the same set: the service offers instance families that enum does not
+// list, publishes the ones it does list in an order of its own, and retires a
+// family it no longer provisions, none of which a modelled value set can carry.
 // ---------------------------------------------------------------------------
 
 /// `InstanceTypeDetails$InstanceRole` for an instance that holds the domain's data,
@@ -6450,6 +6456,13 @@ pub const INSTANCE_ROLE_MASTER: &str = "master";
 /// `InstanceTypeDetails$InstanceRole` for an instance that serves the UltraWarm
 /// storage tier.
 pub const INSTANCE_ROLE_ULTRAWARM: &str = "ultrawarm";
+
+/// `InstanceTypeDetails$InstanceRole` for an instance that can serve as a dedicated
+/// coordinator node: one that routes and merges a request across the cluster and holds
+/// none of its data. A family whose instances can be provisioned in that role reports
+/// it beside the roles it serves, which is what tells a caller the role is available on
+/// the type at all.
+pub const INSTANCE_ROLE_COORDINATOR: &str = "coordinator";
 
 /// An `EngineVersion` read apart: the engine it names and its `X.Y` release numbers,
 /// which is what every version gate in this section is expressed against.
@@ -6544,6 +6557,32 @@ const GRAVITON_SINCE_ELASTICSEARCH: (u32, u32) = (7, 9);
 /// It is an OpenSearch-only family, so this gate is not an Elasticsearch one.
 const OPENSEARCH_OPTIMIZED_SINCE: (u32, u32) = (2, 11);
 
+/// The OpenSearch release the SECOND OpenSearch-optimized generation is offered from:
+/// a later family of the same line, so it is offered from a later release than
+/// [`OPENSEARCH_OPTIMIZED_SINCE`] and, like it, on no Elasticsearch release. It is the
+/// one family the recorded catalogs of two OpenSearch releases differ by, which is what
+/// fixes the gate at a release rather than at the engine.
+const OPENSEARCH_OPTIMIZED_GEN2_SINCE: (u32, u32) = (2, 17);
+
+/// The OpenSearch release the seventh-generation Intel families are offered from.
+///
+/// That generation arrived after the engines forked, so no Elasticsearch release offers
+/// it and the gate is an OpenSearch one. AWS publishes no machine-readable boundary for
+/// an instance family, so the release itself is the emulator's own statement of
+/// published content, like the figures in the price and limit tables above: what these
+/// gates fix is that a release predating a family does not offer it, that an
+/// Elasticsearch release offers none of the generations that postdate the fork, and
+/// that those generations are offered in the order they arrived — this one, then the
+/// Graviton4 compute family ([`GRAVITON4_SINCE_OPENSEARCH`]), then the second
+/// OpenSearch-optimized generation, which is the one ordering the recorded catalogs of
+/// two OpenSearch releases show.
+const SEVENTH_GENERATION_INTEL_SINCE_OPENSEARCH: (u32, u32) = (2, 13);
+
+/// The OpenSearch release the Graviton4 compute family is offered from — see
+/// [`SEVENTH_GENERATION_INTEL_SINCE_OPENSEARCH`] for what this gate fixes and what in
+/// it is the emulator's own statement.
+const GRAVITON4_SINCE_OPENSEARCH: (u32, u32) = (2, 15);
+
 /// The instance families neither encryption at rest nor node-to-node encryption is
 /// available on, whatever the engine version
 /// (`InstanceTypeDetails$EncryptionEnabled`). Fine-grained access control requires
@@ -6559,17 +6598,435 @@ const BURSTABLE_FAMILIES: [&str; 3] = ["t2", "t3", "t4g"];
 /// nodes rather than as data or master nodes, which is the `InstanceRole` they carry.
 const ULTRAWARM_FAMILY: &str = "ultrawarm1";
 
-/// The Graviton instance families, offered from
-/// [`GRAVITON_SINCE_ELASTICSEARCH`] onwards.
-const GRAVITON_FAMILIES: [&str; 5] = ["c6g", "m6g", "r6g", "r6gd", "t4g"];
+/// The node roles a general-purpose, compute-optimized or memory-optimized family
+/// serves: a node of one holds the domain's data, is master-eligible, and can be
+/// provisioned as a dedicated coordinator node.
+const ROLES_WITH_COORDINATOR: &[&str] = &[
+    INSTANCE_ROLE_DATA,
+    INSTANCE_ROLE_MASTER,
+    INSTANCE_ROLE_COORDINATOR,
+];
 
-/// The OpenSearch-optimized instance families: offered from
-/// [`OPENSEARCH_OPTIMIZED_SINCE`] onwards, and usable as data nodes only, so an
-/// instance of one is never master-eligible.
-const OPENSEARCH_OPTIMIZED_FAMILIES: [&str; 1] = ["or1"];
+/// The roles a family that is master-eligible but runs no dedicated coordinator node
+/// serves — a coordinator node holds none of the domain's data, so a storage-optimized
+/// family, a burstable one and a previous generation publish these two.
+const ROLES_DATA_AND_MASTER: &[&str] = &[INSTANCE_ROLE_DATA, INSTANCE_ROLE_MASTER];
 
-/// The family token of an `OpenSearchPartitionInstanceType`, which is
-/// `<family>.<size>.search`; `None` for a value carrying no family at all.
+/// The roles an OpenSearch-optimized family serves: its instances hold the domain's
+/// data and are never master-eligible.
+const ROLES_DATA_ONLY: &[&str] = &[INSTANCE_ROLE_DATA];
+
+/// The roles the UltraWarm family serves: the warm tier, and nothing else.
+const ROLES_ULTRAWARM_ONLY: &[&str] = &[INSTANCE_ROLE_ULTRAWARM];
+
+/// Which engine releases offer one instance family.
+#[derive(Debug, Clone, Copy)]
+enum OfferedReleases {
+    /// Every release the service publishes — a family with no published engine
+    /// prerequisite, which is most of the catalog: the recorded catalog of a current
+    /// OpenSearch release carries previous-generation entries too, so the catalog is
+    /// not filtered by instance generation.
+    Every,
+    /// From an Elasticsearch release onwards — and so on every OpenSearch release,
+    /// which continues the Elasticsearch 7 line.
+    SinceElasticsearch((u32, u32)),
+    /// From an OpenSearch release onwards, and on no Elasticsearch release: a family
+    /// the service publishes for the OpenSearch engine alone.
+    SinceOpenSearch((u32, u32)),
+}
+
+/// One family of the published instance-type catalog: the instance types the service
+/// offers it as, the node roles an instance of it serves, and the releases that offer
+/// it.
+#[derive(Debug, Clone, Copy)]
+struct CatalogFamily {
+    /// The family token — the `<family>` of `<family>.<size>.search`.
+    family: &'static str,
+    /// The instance types the family is published as, smallest size first. Each one's
+    /// size is a token of [`SIZE_NORMALIZATION_FACTORS`], so every published type has a
+    /// size the rest of this crate can scale a per-size quantity against.
+    instance_types: &'static [&'static str],
+    /// The roles an instance of the family serves, in the order they are reported.
+    roles: &'static [&'static str],
+    /// The releases that offer the family.
+    releases: OfferedReleases,
+}
+
+impl CatalogFamily {
+    /// Whether `version` offers this family.
+    fn offered_on(&self, version: EngineVersion) -> bool {
+        match self.releases {
+            OfferedReleases::Every => true,
+            OfferedReleases::SinceElasticsearch(release) => version.since_elasticsearch(release),
+            OfferedReleases::SinceOpenSearch(release) => version.opensearch_at_least(release),
+        }
+    }
+}
+
+/// The instance families AWS publishes as PREVIOUS generation for this service — the
+/// generation before the current one, which it still offers. The published catalog
+/// lists them after the current generations, which is what [`catalog_rank`] uses them
+/// for. [`PREVIOUS_GENERATION_EBS_FAMILIES`] is the subset of them the magnetic volume
+/// sub-type is published for.
+const PREVIOUS_GENERATION_FAMILIES: [&str; 8] = ["c4", "d2", "i2", "m3", "m4", "r3", "r4", "t2"];
+
+/// Where one family sits in the published catalog: the current generations first, then
+/// the UltraWarm tier — which holds no hot-tier node and is published apart from them —
+/// then the previous generations, and inside a group by family name.
+///
+/// The GROUPING is the one AWS's supported-instance-types documentation for this
+/// service publishes: the current generations, the warm tier and the previous
+/// generations, in that order. The order of the families WITHIN a group is by name,
+/// which is the emulator's own statement — that page groups a generation's families by
+/// instance class rather than naming an order among them, and the service's own
+/// ordering is not recoverable from anything it publishes. Computing the rank here
+/// rather than writing a sequence out is what makes the published order a property of
+/// the CATALOG: adding a family puts it where the grouping puts it, not where it was
+/// appended.
+fn catalog_rank(entry: &CatalogFamily) -> (u8, &'static str) {
+    let group = if entry.family == ULTRAWARM_FAMILY {
+        1
+    } else if PREVIOUS_GENERATION_FAMILIES.contains(&entry.family) {
+        2
+    } else {
+        0
+    };
+    (group, entry.family)
+}
+
+/// The instance-type catalog the service publishes, one entry per instance FAMILY.
+///
+/// It is published in [`catalog_rank`]'s order — the generation grouping AWS's
+/// supported-instance-types documentation for this service publishes, by family name
+/// within a group — and each family's instance types smallest size first, so the order
+/// of the rows below is not itself the order of a listing.
+///
+/// This is the service's own published content, so it is written out here rather than
+/// derived from `OpenSearchPartitionInstanceType`: the service offers families that
+/// enum does not list at all, and a modelled value set carries neither the engine
+/// releases that offer a family nor the node roles an instance of it serves. It
+/// carries every value of the modelled enum and the current generations the service's
+/// answers add to it.
+///
+/// What is NOT published anywhere machine-readable, and is therefore the emulator's own
+/// statement of published content exactly as [`CLASS_HOURLY_RATE_PER_UNIT`] and
+/// [`MAXIMUM_DATA_NODE_COUNT`] are: the sizes each family is offered in, and the engine
+/// release a family carries no documented prerequisite for (such a family is offered on
+/// every release the service publishes). The service's own internal ordering of its
+/// catalog is not recoverable from anything it publishes either, so the documented
+/// order above is what the catalog is published in, and it is stable: element N of a
+/// release's listing is the same instance type on every call.
+///
+/// Every other reader of an instance type — its roles, its limits, the validation of a
+/// cluster configuration — reads this one table, so no two of them can disagree about
+/// which instance types exist. Every value of the modelled enum has to be one of them,
+/// which [`publishes_every_modelled_instance_type`] holds.
+const INSTANCE_TYPE_CATALOG: &[CatalogFamily] = &[
+    // General purpose.
+    CatalogFamily {
+        family: "m7i",
+        instance_types: &[
+            "m7i.large.search",
+            "m7i.xlarge.search",
+            "m7i.2xlarge.search",
+            "m7i.4xlarge.search",
+            "m7i.8xlarge.search",
+            "m7i.12xlarge.search",
+            "m7i.16xlarge.search",
+            "m7i.24xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::SinceOpenSearch(SEVENTH_GENERATION_INTEL_SINCE_OPENSEARCH),
+    },
+    CatalogFamily {
+        family: "m6g",
+        instance_types: &[
+            "m6g.large.search",
+            "m6g.xlarge.search",
+            "m6g.2xlarge.search",
+            "m6g.4xlarge.search",
+            "m6g.8xlarge.search",
+            "m6g.12xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::SinceElasticsearch(GRAVITON_SINCE_ELASTICSEARCH),
+    },
+    CatalogFamily {
+        family: "m5",
+        instance_types: &[
+            "m5.large.search",
+            "m5.xlarge.search",
+            "m5.2xlarge.search",
+            "m5.4xlarge.search",
+            "m5.12xlarge.search",
+            "m5.24xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::Every,
+    },
+    CatalogFamily {
+        family: "m4",
+        instance_types: &[
+            "m4.large.search",
+            "m4.xlarge.search",
+            "m4.2xlarge.search",
+            "m4.4xlarge.search",
+            "m4.10xlarge.search",
+        ],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::Every,
+    },
+    CatalogFamily {
+        family: "m3",
+        instance_types: &[
+            "m3.medium.search",
+            "m3.large.search",
+            "m3.xlarge.search",
+            "m3.2xlarge.search",
+        ],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::Every,
+    },
+    // Compute optimized.
+    CatalogFamily {
+        family: "c8g",
+        instance_types: &[
+            "c8g.large.search",
+            "c8g.xlarge.search",
+            "c8g.2xlarge.search",
+            "c8g.4xlarge.search",
+            "c8g.8xlarge.search",
+            "c8g.12xlarge.search",
+            "c8g.16xlarge.search",
+            "c8g.24xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::SinceOpenSearch(GRAVITON4_SINCE_OPENSEARCH),
+    },
+    CatalogFamily {
+        family: "c6g",
+        instance_types: &[
+            "c6g.large.search",
+            "c6g.xlarge.search",
+            "c6g.2xlarge.search",
+            "c6g.4xlarge.search",
+            "c6g.8xlarge.search",
+            "c6g.12xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::SinceElasticsearch(GRAVITON_SINCE_ELASTICSEARCH),
+    },
+    CatalogFamily {
+        family: "c5",
+        instance_types: &[
+            "c5.large.search",
+            "c5.xlarge.search",
+            "c5.2xlarge.search",
+            "c5.4xlarge.search",
+            "c5.9xlarge.search",
+            "c5.18xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::Every,
+    },
+    CatalogFamily {
+        family: "c4",
+        instance_types: &[
+            "c4.large.search",
+            "c4.xlarge.search",
+            "c4.2xlarge.search",
+            "c4.4xlarge.search",
+            "c4.8xlarge.search",
+        ],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::Every,
+    },
+    // Memory optimized.
+    CatalogFamily {
+        family: "r7i",
+        instance_types: &[
+            "r7i.large.search",
+            "r7i.xlarge.search",
+            "r7i.2xlarge.search",
+            "r7i.4xlarge.search",
+            "r7i.8xlarge.search",
+            "r7i.12xlarge.search",
+            "r7i.16xlarge.search",
+            "r7i.24xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::SinceOpenSearch(SEVENTH_GENERATION_INTEL_SINCE_OPENSEARCH),
+    },
+    CatalogFamily {
+        family: "r6gd",
+        instance_types: &[
+            "r6gd.large.search",
+            "r6gd.xlarge.search",
+            "r6gd.2xlarge.search",
+            "r6gd.4xlarge.search",
+            "r6gd.8xlarge.search",
+            "r6gd.12xlarge.search",
+            "r6gd.16xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::SinceElasticsearch(GRAVITON_SINCE_ELASTICSEARCH),
+    },
+    CatalogFamily {
+        family: "r6g",
+        instance_types: &[
+            "r6g.large.search",
+            "r6g.xlarge.search",
+            "r6g.2xlarge.search",
+            "r6g.4xlarge.search",
+            "r6g.8xlarge.search",
+            "r6g.12xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::SinceElasticsearch(GRAVITON_SINCE_ELASTICSEARCH),
+    },
+    CatalogFamily {
+        family: "r5",
+        instance_types: &[
+            "r5.large.search",
+            "r5.xlarge.search",
+            "r5.2xlarge.search",
+            "r5.4xlarge.search",
+            "r5.12xlarge.search",
+            "r5.24xlarge.search",
+        ],
+        roles: ROLES_WITH_COORDINATOR,
+        releases: OfferedReleases::Every,
+    },
+    CatalogFamily {
+        family: "r4",
+        instance_types: &[
+            "r4.large.search",
+            "r4.xlarge.search",
+            "r4.2xlarge.search",
+            "r4.4xlarge.search",
+            "r4.8xlarge.search",
+            "r4.16xlarge.search",
+        ],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::Every,
+    },
+    CatalogFamily {
+        family: "r3",
+        instance_types: &[
+            "r3.large.search",
+            "r3.xlarge.search",
+            "r3.2xlarge.search",
+            "r3.4xlarge.search",
+            "r3.8xlarge.search",
+        ],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::Every,
+    },
+    // Storage optimized: an instance of one holds the domain's data on storage built
+    // into it, and a coordinator node holds none, so it is not provisioned on one.
+    CatalogFamily {
+        family: "i3",
+        instance_types: &[
+            "i3.large.search",
+            "i3.xlarge.search",
+            "i3.2xlarge.search",
+            "i3.4xlarge.search",
+            "i3.8xlarge.search",
+            "i3.16xlarge.search",
+        ],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::Every,
+    },
+    CatalogFamily {
+        family: "i2",
+        instance_types: &["i2.xlarge.search", "i2.2xlarge.search"],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::Every,
+    },
+    CatalogFamily {
+        family: "d2",
+        instance_types: &[
+            "d2.xlarge.search",
+            "d2.2xlarge.search",
+            "d2.4xlarge.search",
+            "d2.8xlarge.search",
+        ],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::Every,
+    },
+    // OpenSearch optimized.
+    CatalogFamily {
+        family: "oi2",
+        instance_types: &[
+            "oi2.medium.search",
+            "oi2.large.search",
+            "oi2.xlarge.search",
+            "oi2.2xlarge.search",
+            "oi2.4xlarge.search",
+            "oi2.8xlarge.search",
+            "oi2.12xlarge.search",
+            "oi2.16xlarge.search",
+        ],
+        roles: ROLES_DATA_ONLY,
+        releases: OfferedReleases::SinceOpenSearch(OPENSEARCH_OPTIMIZED_GEN2_SINCE),
+    },
+    CatalogFamily {
+        family: "or1",
+        instance_types: &[
+            "or1.medium.search",
+            "or1.large.search",
+            "or1.xlarge.search",
+            "or1.2xlarge.search",
+            "or1.4xlarge.search",
+            "or1.8xlarge.search",
+            "or1.12xlarge.search",
+            "or1.16xlarge.search",
+        ],
+        roles: ROLES_DATA_ONLY,
+        releases: OfferedReleases::SinceOpenSearch(OPENSEARCH_OPTIMIZED_SINCE),
+    },
+    // Burstable.
+    CatalogFamily {
+        family: "t4g",
+        instance_types: &["t4g.small.search", "t4g.medium.search"],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::SinceElasticsearch(GRAVITON_SINCE_ELASTICSEARCH),
+    },
+    CatalogFamily {
+        family: "t3",
+        instance_types: &[
+            "t3.nano.search",
+            "t3.micro.search",
+            "t3.small.search",
+            "t3.medium.search",
+            "t3.large.search",
+            "t3.xlarge.search",
+            "t3.2xlarge.search",
+        ],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::Every,
+    },
+    CatalogFamily {
+        family: "t2",
+        instance_types: &["t2.micro.search", "t2.small.search", "t2.medium.search"],
+        roles: ROLES_DATA_AND_MASTER,
+        releases: OfferedReleases::Every,
+    },
+    // The UltraWarm tier.
+    CatalogFamily {
+        family: ULTRAWARM_FAMILY,
+        instance_types: &[
+            "ultrawarm1.medium.search",
+            "ultrawarm1.large.search",
+            "ultrawarm1.xlarge.search",
+        ],
+        roles: ROLES_ULTRAWARM_ONLY,
+        releases: OfferedReleases::SinceElasticsearch(ULTRAWARM_SINCE_ELASTICSEARCH),
+    },
+];
+
+/// The family token of an instance type, which is `<family>.<size>.search`; `None` for
+/// a value carrying no family at all.
 pub fn instance_family(instance_type: &str) -> Option<&str> {
     instance_type
         .split('.')
@@ -6577,65 +7034,83 @@ pub fn instance_family(instance_type: &str) -> Option<&str> {
         .filter(|family| !family.is_empty())
 }
 
-/// Whether `version` offers `instance_type` at all.
-///
-/// An instance family introduced for a later engine release is not offered on an
-/// earlier one; every other family the model publishes is offered on every version.
-pub fn offers_instance_type(version: EngineVersion, instance_type: &str) -> bool {
-    let Some(family) = instance_family(instance_type) else {
-        return false;
-    };
-    if family == ULTRAWARM_FAMILY {
-        return version.since_elasticsearch(ULTRAWARM_SINCE_ELASTICSEARCH);
-    }
-    if GRAVITON_FAMILIES.contains(&family) {
-        return version.since_elasticsearch(GRAVITON_SINCE_ELASTICSEARCH);
-    }
-    if OPENSEARCH_OPTIMIZED_FAMILIES.contains(&family) {
-        return version.opensearch_at_least(OPENSEARCH_OPTIMIZED_SINCE);
-    }
-    true
+/// The catalog entry `instance_type` belongs to, and `None` for a value the service
+/// publishes no instance type for — a family the catalog does not carry, a size that
+/// family is not offered in, or a value that is not `<family>.<size>.search` at all.
+fn catalog_family(instance_type: &str) -> Option<&'static CatalogFamily> {
+    let family = instance_family(instance_type)?;
+    INSTANCE_TYPE_CATALOG
+        .iter()
+        .find(|entry| entry.family == family && entry.instance_types.contains(&instance_type))
 }
 
-/// Every instance type `version` offers, in the order the model publishes them.
+/// Whether the service publishes `instance_type` at all, whatever the release: the
+/// catalog is the record of which instance types exist, so a value it does not carry
+/// names no instance type.
+pub fn publishes_instance_type(instance_type: &str) -> bool {
+    catalog_family(instance_type).is_some()
+}
+
+/// Whether `version` offers `instance_type`.
 ///
-/// `OpenSearchPartitionInstanceType` is the model's record of which instance types
-/// exist, so it is what the catalog spans — the same enum the Reserved Instance
-/// offering catalog above is built over. The order is that enum's, which is stable,
-/// so a paged read of the catalog resumes where the previous page stopped.
+/// An instance type is offered when the catalog publishes it and the release asked
+/// about is one its family is offered on, so a family the service introduced for a
+/// later release is not offered on an earlier one.
+pub fn offers_instance_type(version: EngineVersion, instance_type: &str) -> bool {
+    catalog_family(instance_type).is_some_and(|entry| entry.offered_on(version))
+}
+
+/// Every instance type `version` offers, in the order the catalog is published:
+/// family by family in [`catalog_rank`]'s order, each family's instance types smallest
+/// size first, less the families this release does not offer.
+///
+/// The order is the catalog's and is stable, so a paged read resumes where the previous
+/// page stopped and element N of the listing is the same instance type on every call.
 pub fn offered_instance_types(version: EngineVersion) -> Vec<&'static str> {
-    OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES
+    let mut families: Vec<&'static CatalogFamily> = INSTANCE_TYPE_CATALOG
         .iter()
-        .copied()
-        .filter(|instance_type| offers_instance_type(version, instance_type))
+        .filter(|entry| entry.offered_on(version))
+        .collect();
+    families.sort_by_key(|entry| catalog_rank(entry));
+    families
+        .into_iter()
+        .flat_map(|entry| entry.instance_types.iter().copied())
         .collect()
 }
 
-/// The roles an instance of `instance_type` can serve, in catalog order.
+/// Whether the catalog publishes every value of `OpenSearchPartitionInstanceType`.
 ///
-/// The roles come from the family: the UltraWarm family serves the warm tier, an
-/// OpenSearch-optimized instance is a data node only, and every other family is both a
-/// data node and master-eligible. This is the ONE derivation of them, so the roles the
-/// instance-type catalog reports for a type are exactly the roles the limit catalog
-/// below publishes limits for.
+/// The modelled value set is the model's own record of which instance types exist, so
+/// the service's catalog carries all of it and the families the service added since: a
+/// value the catalog did not carry would name no instance type at all, and the
+/// operations that resolve one against the catalog would refuse it. Held by this
+/// service's `instance_type_catalog` suite.
+pub fn publishes_every_modelled_instance_type() -> bool {
+    OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES
+        .iter()
+        .all(|instance_type| publishes_instance_type(instance_type))
+}
+
+/// The roles an instance of `instance_type` can serve, in the order the catalog
+/// publishes them, and NO role for a type the catalog does not publish — which names
+/// no instance type, so there is no instance to serve a role.
+///
+/// The roles are the catalog entry's: the UltraWarm family serves the warm tier, an
+/// OpenSearch-optimized instance is a data node only, a general-purpose, compute- or
+/// memory-optimized instance can also be a dedicated coordinator node, and every other
+/// family is a data node and master-eligible. This is the ONE derivation of them, so
+/// the roles the instance-type catalog reports for a type are the roles the limit
+/// catalog below publishes limits for.
 pub fn instance_roles(instance_type: &str) -> Vec<&'static str> {
-    let family = instance_family(instance_type).unwrap_or(instance_type);
-    if family == ULTRAWARM_FAMILY {
-        vec![INSTANCE_ROLE_ULTRAWARM]
-    } else if OPENSEARCH_OPTIMIZED_FAMILIES.contains(&family) {
-        vec![INSTANCE_ROLE_DATA]
-    } else {
-        vec![INSTANCE_ROLE_DATA, INSTANCE_ROLE_MASTER]
-    }
+    catalog_family(instance_type).map_or_else(Vec::new, |entry| entry.roles.to_vec())
 }
 
 /// What `instance_type` supports on `version`, as `InstanceTypeDetails`.
 ///
 /// Each feature member is a conjunction of two things: the engine release the feature
 /// is available from, and whether the instance family can serve it at all. The roles
-/// come from the family: the UltraWarm family serves the warm tier, an
-/// OpenSearch-optimized instance is a data node only, and every other family is both
-/// a data node and master-eligible.
+/// are the ones the catalog publishes for the type ([`instance_roles`]), so the entry
+/// reports the roles an instance of it can actually be provisioned in.
 ///
 /// `availability_zones` is reported only when the caller asked for it, so a request
 /// that did not carries no `AvailabilityZones` member rather than an empty list.
@@ -7100,11 +7575,18 @@ fn role_limits(instance_type: &str, role: &str) -> Limits {
 
 /// Every limit `instance_type` publishes, keyed by the role it applies to: the
 /// `LimitsByRole` map of `DescribeInstanceTypeLimits`.
+///
+/// That map's own documentation names the three roles it is keyed by — `data`,
+/// `master` and `ultra_warm` — so a role outside them publishes no entry: a dedicated
+/// coordinator node holds no data and is scaled with the cluster's request load rather
+/// than by a published per-type limit, so the catalog reports the role on the instance
+/// type ([`instance_roles`]) and no limit block under it.
 pub fn instance_type_limits(
     instance_type: &str,
 ) -> ::std::collections::HashMap<String, Limits> {
     instance_roles(instance_type)
         .into_iter()
+        .filter(|role| *role != INSTANCE_ROLE_COORDINATOR)
         .map(|role| {
             let key = if role == INSTANCE_ROLE_ULTRAWARM {
                 LIMITS_ROLE_ULTRAWARM

@@ -180,11 +180,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let version = crate::state::resolve_engine_version("EngineVersion", &input.engine_version)
             .map_err(DescribeInstanceTypeLimitsErrorModeled::ValidationException)?;
 
-        // `InstanceType` targets `OpenSearchPartitionInstanceType`, the model's record
-        // of which instance types exist, so a value outside it names no instance type
-        // at all. The boundary refuses one before this handler runs; the check is
-        // repeated here so the rule holds however the request reached us.
-        if !OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES.contains(&input.instance_type.as_str()) {
+        // `InstanceType` names an instance type the SERVICE publishes — the published
+        // catalog is the record of which ones exist — so a value outside it names no
+        // instance type at all. NOTE the boundary this check sits behind: this member is
+        // an `OpenSearchPartitionInstanceType` path label, so the request boundary
+        // refuses every value outside the MODELLED set before the handler runs, which
+        // includes the families the service has added to its catalog since. Until the
+        // model carries them, limits cannot be asked for one of those families whatever
+        // this check allows; the check is the catalog-based backstop for the values that
+        // do reach here, so the rule holds however the request arrived.
+        if !crate::state::publishes_instance_type(&input.instance_type) {
             return Err(DescribeInstanceTypeLimitsErrorModeled::ValidationException(
                 crate::state::unknown_instance_type("InstanceType", &input.instance_type),
             )
