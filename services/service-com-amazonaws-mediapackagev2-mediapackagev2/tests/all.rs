@@ -132,3 +132,5 @@ mod origin_endpoint_reset_content_scope;
 mod harvest_job_modification_instant;
 #[path = "all/harvest_job_manifest_reference.rs"]
 mod harvest_job_manifest_reference;
+#[path = "all/tagging_arn_account_scope.rs"]
+mod tagging_arn_account_scope;

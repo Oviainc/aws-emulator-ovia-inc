@@ -68,7 +68,12 @@ const ABSENT_LEAF: &str = "tap-absent";
 
 /// The tag every live resource is created with, so a refused request is shown to have
 /// written and removed nothing.
-const SEEDED: (&str, &str) = ("seeded", "1");
+///
+/// `pub(crate)` with [`live_targets`], [`Target`], [`message`] and
+/// [`assert_seeded_tags_untouched`]: a sibling suite that judges the same tagging front end
+/// over the same hierarchy (`tagging_arn_account_scope`) drives it through these rather than
+/// building a second chain of its own.
+pub(crate) const SEEDED: (&str, &str) = ("seeded", "1");
 
 /// An ordinary caller tag, sent BESIDE the fault so a refusal is shown to store neither
 /// half, and sent alone by the control rows.
@@ -82,7 +87,7 @@ const PUBLISHED_MANIFEST: &str = "index";
 /// member `Message`, while the tagging front end's own refusals (the two codes the model
 /// does not declare) carry the protocol's `message`, so a row reading either one asks for
 /// both.
-fn message(body: &Value) -> &str {
+pub(crate) fn message(body: &Value) -> &str {
     ["Message", "message"]
         .iter()
         .find_map(|member| body.get(*member).and_then(Value::as_str))
@@ -109,10 +114,10 @@ impl Existence {
 
 /// One taggable level: the ARN the service minted for the resource it holds there, and the
 /// same ARN with its deepest name replaced by one nothing was created under.
-struct Target {
-    kind: &'static str,
-    live: String,
-    absent: String,
+pub(crate) struct Target {
+    pub(crate) kind: &'static str,
+    pub(crate) live: String,
+    pub(crate) absent: String,
 }
 
 impl Target {
@@ -151,7 +156,7 @@ fn arn_of(case: &str, created: &Value) -> String {
 
 /// A channel group -> channel -> origin endpoint -> harvest job chain, every level created
 /// carrying [`SEEDED`] and nothing else, and one [`Target`] per level.
-async fn live_targets(emulator: &Emulator) -> Vec<Target> {
+pub(crate) async fn live_targets(emulator: &Emulator) -> Vec<Target> {
     let seeded = map_of(&[SEEDED]);
 
     // `@jsonName("tags")` on `CreateChannelGroupRequest$Tags` and `CreateChannelRequest$Tags`;
@@ -333,7 +338,7 @@ fn assert_request_level_refusal(
 
 /// Assert the live resource at `target` still carries exactly [`SEEDED`]: no refused
 /// request wrote a tag, and none removed one.
-async fn assert_seeded_tags_untouched(emulator: &Emulator, target: &Target, case: &str) {
+pub(crate) async fn assert_seeded_tags_untouched(emulator: &Emulator, target: &Target, case: &str) {
     let (status, listed) = emulator.list_tags(&target.live).await;
     assert_eq!(
         status, 200,

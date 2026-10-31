@@ -687,11 +687,12 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
 
     /// The channel group a tagging ARN reaches from a request served in `region`.
     ///
-    /// `None` when the ARN names another Region: the resource it names lives in that
-    /// Region's namespace, so from this endpoint there is nothing of that name to tag,
-    /// report or untag.
+    /// `None` when the ARN names a scope this emulator does not hold the resource in
+    /// ([`TagTarget::reaches`] — another account, or another Region): the resource it
+    /// names lives in that scope's namespace, so from this endpoint there is nothing of
+    /// that name to tag, report or untag.
     fn resolved_group(&self, region: &str, target: &TagTarget) -> Option<&ChannelGroup> {
-        (target.region == region).then_some(())?;
+        target.reaches(region).then_some(())?;
         self.channel_group(region, target.resource.group())
     }
 
@@ -703,8 +704,9 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
     /// already there commits nothing — the same rule every other write is judged by
     /// ([`VersionedRecord::commit_if_changed`]).
     ///
-    /// `false` means the resource the ARN names does not exist in `region` (see
-    /// [`Self::resolved_group`]), so there was nothing to write to.
+    /// `false` means the resource the ARN names does not exist in the scope a request
+    /// served in `region` reaches (see [`Self::resolved_group`]), so there was nothing to
+    /// write to.
     pub fn with_tags_mut(
         &mut self,
         region: &str,
@@ -712,7 +714,7 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
         at: ::aws_smithy_types::DateTime,
         mutate: impl FnOnce(&mut HashMap<String, String>),
     ) -> bool {
-        if target.region != region {
+        if !target.reaches(region) {
             return false;
         }
         let Some(group) = self.channel_group_mut(region, target.resource.group()) else {
@@ -1871,16 +1873,35 @@ impl TaggedResource {
     }
 }
 
-/// What a tagging `ResourceArn` names: the Region the ARN is scoped to, and the resource
-/// its path names inside that Region.
+/// What a tagging `ResourceArn` names: the account and the Region the ARN is scoped to,
+/// and the resource its path names inside that scope.
 ///
-/// The Region is read rather than skipped because it is part of the resource's identity
-/// (see [`ChannelGroupKey`]): the same path in two Regions names two different
-/// resources, so a request can only reach the one its own Region holds.
+/// The account and the Region are read rather than skipped because both are part of the
+/// resource's identity: the same path under another account, or in another Region (see
+/// [`ChannelGroupKey`]), names a different resource, so a request can only reach the one
+/// its own scope holds — [`TagTarget::reaches`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagTarget {
+    pub account: String,
     pub region: String,
     pub resource: TaggedResource,
+}
+
+impl TagTarget {
+    /// Whether a tagging request served in `region` can reach the resource this ARN
+    /// names at all.
+    ///
+    /// An ARN addresses one resource in one account's Region-scoped namespace, and every
+    /// resource this emulator holds belongs to the single account its own ARNs carry
+    /// ([`::engine::emulator_account_id`]) — so an ARN naming any other account, or a
+    /// Region other than the one the request is served in, names nothing that is here to
+    /// report, tag or untag. The one reading of that scope, so the reporting path
+    /// ([`ServiceState::resolved_group`]) and the writing path
+    /// ([`ServiceState::with_tags_mut`]) can never disagree about which ARNs reach a
+    /// resource.
+    pub fn reaches(&self, region: &str) -> bool {
+        self.account == ::engine::emulator_account_id() && self.region == region
+    }
 }
 
 /// The resource a tagging `ResourceArn` names, or `None` when the string is not a
@@ -1894,22 +1915,18 @@ pub struct TagTarget {
 /// refused as malformed. Anything else cannot name a MediaPackage resource, which is a
 /// different failure from naming one that is absent: the caller has to fix the ARN
 /// rather than create the resource.
+///
+/// The SCOPE fields an ARN carries — its account and its Region — are kept rather than
+/// dropped, because they are part of what the ARN addresses; whether the scope they name
+/// is one this emulator holds a resource in is [`TagTarget::reaches`], and an ARN of a
+/// scope that holds nothing is an absent resource rather than a malformed ARN.
 pub fn parse_tag_arn(arn: &str) -> Option<TagTarget> {
-    let mut fields = arn.splitn(6, ':');
-    let (Some("arn"), Some(partition), Some(service), Some(region), Some(_account), Some(resource)) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    ) else {
-        return None;
-    };
-    if partition.is_empty() || service != SIGNING_NAME {
-        return None;
-    }
-    let segments: Vec<&str> = resource.split('/').collect();
+    // The six fields come from the SHARED ARN parse — the form a service reads its OWN
+    // resource ARNs with ([`::service_common::arn::parse_of`]), over the same reader the
+    // caller-supplied ARN members of this model are judged by ([`cdn_auth_rejection`]), so
+    // this crate reads one ARN grammar rather than two.
+    let parsed = ::service_common::arn::parse_of(arn, SIGNING_NAME)?;
+    let segments: Vec<&str> = parsed.resource.split('/').collect();
     if segments.iter().any(|segment| segment.is_empty()) {
         return None;
     }
@@ -1946,7 +1963,8 @@ pub fn parse_tag_arn(arn: &str) -> Option<TagTarget> {
         _ => return None,
     };
     Some(TagTarget {
-        region: region.to_string(),
+        account: parsed.account.to_string(),
+        region: parsed.region.to_string(),
         resource,
     })
 }
