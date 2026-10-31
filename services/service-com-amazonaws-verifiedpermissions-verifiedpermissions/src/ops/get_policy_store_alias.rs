@@ -27,7 +27,10 @@
 //!
 //! * `ValidationException` (HTTP 400) — the name does not carry the documented
 //!   prefix, so it is not a well-formed alias name.
-//! * `ResourceNotFoundException` (HTTP 404) — no alias of that name exists.
+//! * `ResourceNotFoundException` (HTTP 404) — the Region this request was signed
+//!   for holds no alias of that name. An alias name is scoped to the account and
+//!   Region, so an alias of that name in another Region is another alias and is
+//!   not reported here.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -93,7 +96,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The member's own documented prefix is a request-SHAPE rule, so it is
         // answered before state is consulted: an unprefixed name is not a name
         // this service could hold, and reporting it as an absent alias would say
@@ -102,13 +104,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetPolicyStoreAliasErrorModeled::ValidationException(invalid).into());
         }
 
+        // An alias name is unique within the account AND Region, so the alias a
+        // name points at is the one in the Region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetPolicyStoreAliasErrorModeled::InternalServerException(InternalServerException {
                 message: "the service state store is unavailable".to_string(),
             })
         })?;
         let state = state.lock();
-        let alias = state.aliases.get(&input.alias_name).ok_or_else(|| {
+        let alias = state.alias(&region, &input.alias_name).ok_or_else(|| {
             // `resourceId` is the alias's own name, without the resource path
             // its `aliasName` carries: an id a caller can feed back into the
             // API, which a prefixed one is not.

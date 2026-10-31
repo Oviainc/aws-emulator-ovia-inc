@@ -116,7 +116,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // An item's `policyStoreId` may name an alias, whose name is unique
+        // within the account and Region, so every item of this batch is resolved
+        // in the Region the one request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             BatchGetPolicyErrorModeled::InternalServerException(InternalServerException {
                 message: "the service state store is unavailable".to_string(),
@@ -137,7 +140,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `policy-store-alias/<name>` store reference, the store that
             // reference resolves to, and the policy inside it. Each miss is
             // reported as the code for the reference that missed.
-            let store_id = match state.lookup_store_id(&item.policy_store_id) {
+            let store_id = match state.lookup_store_id(&region, &item.policy_store_id) {
                 Ok(store_id) => store_id,
                 Err(crate::state::StoreLookupMiss::AliasNotFound) => {
                     let alias = item

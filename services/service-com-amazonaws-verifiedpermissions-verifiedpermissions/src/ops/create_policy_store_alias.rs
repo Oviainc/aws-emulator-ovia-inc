@@ -18,8 +18,10 @@
 //!   therefore answers with the PERSISTED alias, timestamp included, rather than
 //!   minting a second one.
 //! * **The name is unique in the account and Region** — a request naming a name
-//!   another store already holds conflicts (HTTP 409), which is what makes
-//!   concurrent creations of one name have exactly one winner.
+//!   another store already holds IN THE REGION IT IS SIGNED FOR conflicts (HTTP
+//!   409), which is what makes concurrent creations of one name have exactly one
+//!   winner; the same name in another Region is a free name there, and the alias
+//!   it creates resolves only from that Region.
 //! * **A name in `PendingDeletion` cannot be taken** —
 //!   `DeletePolicyStoreAlias` documents that "when a policy store alias is in the
 //!   `PendingDeletion` state, new policy store aliases cannot be created with the
@@ -167,6 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreatePolicyStoreAliasErrorModeled::ValidationException(invalid).into());
         }
 
+        // An alias name is scoped to the account AND Region, so the Region the
+        // request was signed for is part of the alias's identity: it keys the
+        // record, decides which names collide, and names the Region in the ARN.
+        let region = crate::state::request_region(ctx.parts());
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let mut state = state.lock();
 
@@ -185,9 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The name is unique in the account: a duplicate of the SAME association
-        // is the documented no-op, and anything else holding the name conflicts.
-        if let Some(existing) = state.aliases.get(&input.alias_name) {
+        // The name is unique in the account and Region: a duplicate of the SAME
+        // association is the documented no-op, and anything else holding the name
+        // IN THIS REGION conflicts. A name held only in another Region is free.
+        if let Some(existing) = state.alias(&region, &input.alias_name) {
             if existing.state == crate::state::ALIAS_STATE_ACTIVE
                 && existing.policy_store_id == input.policy_store_id
             {
@@ -225,21 +233,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             alias_name: input.alias_name.clone(),
             // The alias ARN names the region the request was signed for: an
             // alias name is unique in the account and Region, so the ARN that
-            // identifies it has to say which Region.
-            arn: crate::state::alias_arn(
-                &crate::state::request_region(ctx.parts()),
-                &input.alias_name,
-            ),
+            // identifies it has to say which Region — the same Region the record
+            // is keyed under, so the ARN and the key cannot disagree.
+            arn: crate::state::alias_arn(&region, &input.alias_name),
             policy_store_id: input.policy_store_id.clone(),
             created_at: crate::state::now(),
             state: crate::state::ALIAS_STATE_ACTIVE.to_string(),
         };
-        state.aliases.insert(input.alias_name.clone(), alias);
+        state.insert_alias(&region, alias);
 
         // Read the response back out of what was just persisted.
         let stored = state
-            .aliases
-            .get(&input.alias_name)
+            .alias(&region, &input.alias_name)
             .ok_or_else(unavailable)?;
         let output = output_for(stored);
         crate::ops::audit(ctx, "CreatePolicyStoreAlias", &output.alias_name, "created");

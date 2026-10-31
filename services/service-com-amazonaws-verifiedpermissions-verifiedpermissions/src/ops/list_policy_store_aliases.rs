@@ -3,12 +3,17 @@
 //! @op ListPolicyStoreAliases
 //!
 //! `@readonly`, `@paginated(items=policyStoreAliases, inputToken/outputToken=nextToken,
-//! pageSize=maxResults)`: enumerates the account's persisted policy store
-//! aliases in a stable order, applies `filter`, truncates at `maxResults` and
-//! hands back an opaque `nextToken` that resumes exactly where the page stopped.
-//! It writes nothing.
+//! pageSize=maxResults)`: enumerates the persisted policy store aliases of the
+//! account AND Region the request was signed for, in a stable order, applies
+//! `filter`, truncates at `maxResults` and hands back an opaque `nextToken` that
+//! resumes exactly where the page stopped. It writes nothing.
 //!
-//! Every alias the account holds is reported, whatever its `state`: a
+//! An alias name is unique within an account and Region
+//! (`CreatePolicyStoreAliasInput$aliasName`), so an alias belongs to the Region
+//! it was created in and this regional endpoint lists that Region's aliases: an
+//! alias created against another Region is not part of this response.
+//!
+//! Every alias the Region holds is reported, whatever its `state`: a
 //! soft-deleted alias stays in state as `PendingDeletion` (see
 //! `delete_policy_store_alias.rs`) and `PolicyStoreAliasItem$state` is
 //! **required**, so an alias in that state is listed and says so rather than
@@ -150,15 +155,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // An alias belongs to the Region it was created in, and this endpoint is
+        // addressed for one Region, so the page is built from that Region's
+        // aliases.
+        let region = crate::state::request_region(ctx.parts());
 
         // The cursor is decoded — and one belonging to another listing refused —
         // by the service's one pagination rule, which this operation only lifts
-        // into its own error enum. This listing enumerates the ACCOUNT's
-        // aliases rather than one store's, so its cursors name no store and
-        // nothing has to be resolved before reading one.
+        // into its own error enum. The listing is this operation IN THIS REGION:
+        // an alias name is unique within the account and Region, so a cursor
+        // naming a position among one Region's names resumes nothing among
+        // another's.
         let cursor = crate::ops::PageCursor::read(
-            crate::state::page_scope(Self::NAME, None),
+            crate::state::page_scope(Self::NAME, Some(&region)),
             input.next_token.as_deref(),
         )
         .map_err(|invalid| {
@@ -174,17 +183,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
-        // `aliases` is a `BTreeMap` keyed by the full alias name, so the
-        // enumeration order is stable across calls, and the page — its size, its
-        // boundary and the cursor that resumes it — is built by the service's one
-        // pagination rule. The model's `range min 1` already refuses a zero or
-        // negative `maxResults` at the boundary and the modelled `@default: 5` is
-        // materialised for an absent one, so what reaches the rule here is always
-        // a value the caller named; the operation documents that "the service
-        // might return fewer results than the maximum even when there are more
-        // results available", which is what the rule's cap answers with.
-        let (policy_store_aliases, next_token) = crate::ops::page(
-            &state.aliases,
+        // `aliases` is a `BTreeMap` keyed by Region and then the full alias name,
+        // so one Region's aliases are a contiguous range of it in a stable order,
+        // and the page — its size, its boundary and the cursor that resumes it —
+        // is built by the service's one pagination rule over that range. The
+        // model's `range min 1` already refuses a zero or negative `maxResults`
+        // at the boundary and the modelled `@default: 5` is materialised for an
+        // absent one, so what reaches the rule here is always a value the caller
+        // named; the operation documents that "the service might return fewer
+        // results than the maximum even when there are more results available",
+        // which is what the rule's cap answers with.
+        let (policy_store_aliases, next_token) = crate::ops::page_entries(
+            state.aliases_in_region(&region),
             &cursor,
             Some(input.max_results),
             ALIAS_DEFAULT_PAGE_SIZE,

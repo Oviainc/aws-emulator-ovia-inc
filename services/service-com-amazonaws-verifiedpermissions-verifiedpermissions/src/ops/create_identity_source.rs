@@ -183,17 +183,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let mut state = state.lock();
+        // The Region the request was signed for: it scopes the alias a
+        // `policyStoreId` may name — an alias name is unique within an account
+        // and Region — and it is also the Region an identity source's user pool
+        // has to live in.
+        let region = crate::state::request_region(ctx.parts());
         // The store the request names is resolved BEFORE any of the request's own
         // payload is read, so a reference to a store that does not exist answers
         // `ResourceNotFoundException` rather than a refusal about the payload.
         // Resolving is a READ, so a request refused below still changes nothing.
         let store_id = state
-            .resolve_store_id(&input.policy_store_id)
+            .resolve_store_id(&region, &input.policy_store_id)
             .ok_or_else(not_found)?;
 
         // The provider reference is resolved before any state is CHANGED: a
         // request this service cannot resolve must change nothing.
-        let region = crate::state::request_region(ctx.parts());
         let configuration = crate::ops::persisted_identity_source_configuration(
             &*self.engine,
             &input.configuration,

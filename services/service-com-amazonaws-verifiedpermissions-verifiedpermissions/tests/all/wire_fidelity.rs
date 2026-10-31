@@ -21,12 +21,12 @@
 //! really reached state.
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
-// The wire harness is shared with every other suite in this crate; this suite
-// adds only its own region-varying caller below, because the signing region is
-// what one of its rules varies.
-use super::harness::{error_code, router, user_pool_arn};
+// The wire harness is shared with every other suite in this crate, including the
+// region-varying caller one of this suite's rules needs.
+use super::harness::{
+    call_in, error_code, ok_in, router, store_with_validation_off_in, user_pool_arn,
+};
 
 /// The prefix every policy store alias name carries, from
 /// `CreatePolicyStoreAliasInput$aliasName`'s model documentation: "The alias name
@@ -48,76 +48,11 @@ const ACCOUNT_ID: &str = "000000000000";
 const STATEMENT: &str = "permit(principal == User::\"alice\", action == Action::\"view\", \
                          resource == Photo::\"vacation\");";
 
-/// Call one operation with the request SIGNED for `region`, and return
-/// `(http status, parsed body)`.
-///
-/// The credential scope is the only thing that varies between rows of the ARN
-/// table, which is what makes that table a test of the rule rather than of one
-/// recorded region. An empty `region` sends no `authorization` header at all.
-async fn call_in_region(
-    router: &MultiServiceRouter,
-    region: &str,
-    operation: &str,
-    body: &Value,
-) -> (u16, Value) {
-    let mut request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("VerifiedPermissions.{operation}"));
-    if !region.is_empty() {
-        request = request.header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 \
-                 Credential=AKIAEXAMPLE/20260101/{region}/verifiedpermissions/aws4_request, \
-                 SignedHeaders=host;x-amz-target, Signature=0"
-            ),
-        );
-    }
-    let request = request
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("a test request body always serializes"),
-        ))
-        .expect("a valid test request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, parsed)
-}
-
-/// Call one operation in `region`, requiring success, and return the body.
-async fn ok_in_region(
-    router: &MultiServiceRouter,
-    region: &str,
-    operation: &str,
-    body: &Value,
-) -> Value {
-    let (status, parsed) = call_in_region(router, region, operation, body).await;
-    assert_eq!(
-        status, 200,
-        "case {region:?}: {operation} must succeed, got {status} {parsed}"
-    );
-    parsed
-}
-
-/// Create a store signed for `region` and return its `policyStoreId`.
-async fn store_in_region(router: &MultiServiceRouter, region: &str) -> String {
-    ok_in_region(
-        router,
-        region,
-        "CreatePolicyStore",
-        &json!({ "validationSettings": { "mode": "OFF" } }),
-    )
-    .await["policyStoreId"]
-        .as_str()
-        .expect("policyStoreId is required on the CreatePolicyStore response")
-        .to_string()
-}
+// The signing region is the only thing that varies between rows of the ARN table
+// below, which is what makes that table a test of the rule rather than of one
+// recorded region. The region-varying caller is the shared harness's
+// [`super::harness::call_in`] — an empty region there sends no `authorization`
+// header at all — so this suite shapes no request of its own.
 
 // ---------------------------------------------------------------------------
 // 1. A minted alias ARN names the signing region
@@ -152,12 +87,12 @@ async fn an_alias_arn_names_the_region_the_request_was_signed_for() {
 
     for (case, signed_for, expected_region) in rows {
         let router = router();
-        let store_id = store_in_region(&router, signed_for).await;
+        let store_id = store_with_validation_off_in(&router, signed_for).await;
         let alias_name = format!("{ALIAS_PREFIX}regional");
         let expected_arn =
             format!("arn:aws:verifiedpermissions:{expected_region}:{ACCOUNT_ID}:{alias_name}");
 
-        let created = ok_in_region(
+        let created = ok_in(
             &router,
             signed_for,
             "CreatePolicyStoreAlias",
@@ -187,11 +122,19 @@ async fn an_alias_arn_names_the_region_the_request_was_signed_for() {
             "case {case:?}: ResourceArn field 4 is the account, got {arn:?}"
         );
 
-        // Reading the alias back serves the PERSISTED ARN, so the region does not
-        // follow whoever happens to read it: a read signed elsewhere still reports
-        // the region the alias was created in.
-        for reader_region in ["", "eu-west-1", signed_for] {
-            let read = ok_in_region(
+        // Reading the alias back serves the PERSISTED ARN, so the ARN is not
+        // rebuilt per reader. The readers here are the request forms that address
+        // the alias's OWN region — the scope it was created under, and that
+        // region named explicitly, which are the same region whenever the create
+        // fell back to `DEFAULT_REGION`.
+        for reader_region in ["", signed_for, expected_region] {
+            // An unsigned read addresses `DEFAULT_REGION`, so it reaches this
+            // alias only when that is the region the alias was created in; the
+            // other two forms both address the alias's own region.
+            if reader_region.is_empty() && *expected_region != DEFAULT_REGION {
+                continue;
+            }
+            let read = ok_in(
                 &router,
                 reader_region,
                 "GetPolicyStoreAlias",
@@ -205,6 +148,28 @@ async fn an_alias_arn_names_the_region_the_request_was_signed_for() {
                  got {read}"
             );
         }
+
+        // An alias name is unique within an account AND Region, so the alias
+        // belongs to the region it was created in: a read addressed to any OTHER
+        // region holds no alias of that name. See
+        // `tests/all/alias_region_scope.rs` for the whole rule.
+        let foreign_region = if *expected_region == "eu-west-1" {
+            "ap-northeast-1"
+        } else {
+            "eu-west-1"
+        };
+        let (status, body) = call_in(
+            &router,
+            foreign_region,
+            "GetPolicyStoreAlias",
+            &json!({ "aliasName": alias_name }),
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?} read in {foreign_region:?}: an alias of another region must not \
+             resolve, got {status} {body}"
+        );
     }
 }
 
@@ -229,20 +194,20 @@ async fn an_alias_arn_names_the_region_the_request_was_signed_for() {
 async fn a_not_found_error_names_the_referenced_resource_and_its_bare_id() {
     let router = router();
     let region = DEFAULT_REGION;
-    let store_id = store_in_region(&router, region).await;
+    let store_id = store_with_validation_off_in(&router, region).await;
 
     // An alias that exists but pends deletion: a reference to it must fail, and
     // the failure still names the alias by its bare name.
     let pending_suffix = "pending/deletion";
     let pending_alias = format!("{ALIAS_PREFIX}{pending_suffix}");
-    ok_in_region(
+    ok_in(
         &router,
         region,
         "CreatePolicyStoreAlias",
         &json!({ "aliasName": pending_alias, "policyStoreId": store_id }),
     )
     .await;
-    ok_in_region(
+    ok_in(
         &router,
         region,
         "DeletePolicyStoreAlias",
@@ -415,7 +380,7 @@ async fn a_not_found_error_names_the_referenced_resource_and_its_bare_id() {
     ];
 
     for (case, operation, request, resource_type, resource_id) in rows {
-        let (status, body) = call_in_region(&router, region, operation, request).await;
+        let (status, body) = call_in(&router, region, operation, request).await;
         assert_eq!(
             status, 404,
             "case {case:?}: expected 404, got {status} {body}"

@@ -3,10 +3,12 @@
 //! End-to-end suite for `ListPolicyStoreAliases`.
 //!
 //! The rule under test: the operation reports every policy store alias the
-//! account holds — whatever its `state` — narrowed by `filter`, in a stable
-//! order, in pages of at most `maxResults` items (5 when the caller names none,
-//! 50 at most), with a `nextToken` present exactly when items remain and
-//! resuming exactly where the page stopped.
+//! account holds in the Region the request is signed for — whatever its `state`
+//! — narrowed by `filter`, in a stable order, in pages of at most `maxResults`
+//! items (5 when the caller names none, 50 at most), with a `nextToken` present
+//! exactly when items remain and resuming exactly where the page stopped.
+//! Which Region's aliases a page reports is pinned by
+//! `tests/all/alias_region_scope.rs`.
 //!
 //! Every assertion goes over the wire through the shared [`super::harness`], so a
 //! listed alias is only listed if it really reached state.

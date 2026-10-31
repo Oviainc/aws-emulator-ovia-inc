@@ -145,7 +145,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reference that names no store is a missing resource whatever else the
         // request carries.
         let store_id = state
-            .resolve_store_id(&input.policy_store_id)
+            .resolve_store_id(
+                &crate::state::request_region(ctx.parts()),
+                &input.policy_store_id,
+            )
             .ok_or_else(not_found)?;
 
         // How much schema text one store may hold is bounded, and a size limit is

@@ -242,7 +242,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceNotFoundException` rather than a refusal about the payload.
         // Resolving is a READ, so a request refused below still changes nothing.
         let store_id = state
-            .resolve_store_id(&input.policy_store_id)
+            .resolve_store_id(
+                &crate::state::request_region(ctx.parts()),
+                &input.policy_store_id,
+            )
             .ok_or_else(not_found)?;
 
         // `@idempotencyToken` replay: the same token answers with the policy the

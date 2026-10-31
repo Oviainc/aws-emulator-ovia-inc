@@ -233,7 +233,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not exist answers `ResourceNotFoundException` rather than a refusal about the
         // payload, the same precedence every other authorization operation follows.
         let store_id = state
-            .resolve_store_id(&input.policy_store_id)
+            .resolve_store_id(
+                &crate::state::request_region(ctx.parts()),
+                &input.policy_store_id,
+            )
             .ok_or_else(not_found)?;
         let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
 

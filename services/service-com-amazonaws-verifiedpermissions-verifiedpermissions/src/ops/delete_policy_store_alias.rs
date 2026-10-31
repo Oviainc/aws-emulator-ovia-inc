@@ -30,7 +30,9 @@
 //!   ([`crate::state::ALIAS_PREFIX`]). A value without that prefix is refused as
 //!   a malformed member ([`crate::ops::invalid_alias_name`]): the documented
 //!   idempotent success is for a name that is well formed and names nothing, not
-//!   for one no alias could carry.
+//!   for one no alias could carry. The name is read in the Region the request was
+//!   signed for, the scope the name is unique in, so an alias of that name in
+//!   another Region is untouched.
 //! * `deletionMode` (DeletionMode, one of: SoftDelete | HardDelete) — absent
 //!   means `SoftDelete`.
 //!
@@ -130,11 +132,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
+        // An alias name is unique within the account AND Region, so this deletes
+        // the alias of that name in the Region the request was signed for; an
+        // alias of the same name in another Region is a different alias and is
+        // left alone.
+        let region = crate::state::request_region(ctx.parts());
+
         // Absent means `SoftDelete`: the model calls it "the default behavior
         // when no deletionMode is specified".
         let hard_delete = input.deletion_mode.as_deref() == Some("HardDelete");
 
-        if !state.aliases.contains_key(&input.alias_name) {
+        if state.alias(&region, &input.alias_name).is_none() {
             crate::ops::audit(
                 ctx,
                 "DeletePolicyStoreAlias",
@@ -145,9 +153,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if hard_delete {
-            state.aliases.remove(&input.alias_name);
+            state.remove_alias(&region, &input.alias_name);
             crate::ops::audit(ctx, "DeletePolicyStoreAlias", &input.alias_name, "deleted");
-        } else if let Some(alias) = state.aliases.get_mut(&input.alias_name) {
+        } else if let Some(alias) = state.alias_mut(&region, &input.alias_name) {
             alias.state = crate::state::ALIAS_STATE_PENDING_DELETION.to_string();
             crate::ops::audit(
                 ctx,

@@ -38,6 +38,11 @@ pub const MAX_POLICY_STORES: usize = 100;
 /// [`MAX_POLICY_STORES`] because an alias is an alternative identifier for a
 /// store, and a store that reaches it refuses further aliases with the
 /// `ServiceQuotaExceededException` `CreatePolicyStoreAlias` models.
+///
+/// Being a memory bound, it caps the alias table as a WHOLE — every Region
+/// together — even though an alias name is scoped to one account and Region: a
+/// caller may sign for any number of Regions, so a per-Region cap would bound
+/// nothing.
 pub const MAX_POLICY_STORE_ALIASES: usize = 100;
 
 /// The prefix every policy store alias name carries, from
@@ -291,11 +296,18 @@ pub struct ComAmazonawsVerifiedpermissionsVerifiedpermissionsState {
     /// `ListPolicies`/`ListPolicyStores` enumerate in a stable order and a
     /// pagination cursor resumes exactly where the previous page stopped.
     pub policy_stores: BTreeMap<String, PolicyStore>,
-    /// Every policy store alias, keyed by its FULL `aliasName` — the name
+    /// Every policy store alias, keyed by [`alias_key`]: the Region the creating
+    /// request was signed for, then the alias's FULL `aliasName` — the name
     /// including its [`ALIAS_PREFIX`], exactly as the caller gave it, which is
-    /// also the form a `policyStoreId` member carries when it names an alias. A
-    /// `BTreeMap` so `ListPolicyStoreAliases` can enumerate in a stable order.
-    pub aliases: BTreeMap<String, PolicyStoreAlias>,
+    /// also the form a `policyStoreId` member carries when it names an alias.
+    ///
+    /// The Region is part of the key because an alias name is unique within an
+    /// account AND Region, so the same name may name a different store in each
+    /// Region and only the Region a request was signed for may resolve it. A
+    /// `BTreeMap` so `ListPolicyStoreAliases` can enumerate one Region's aliases
+    /// ([`ComAmazonawsVerifiedpermissionsVerifiedpermissionsState::aliases_in_region`])
+    /// in a stable order, as one contiguous range of the table.
+    pub aliases: BTreeMap<AliasKey, PolicyStoreAlias>,
     /// `(operation, clientToken)` -> the resource that token already created, so
     /// an `@idempotencyToken` replay answers with the first result. The OPERATION
     /// is part of the key because an idempotency token is scoped to one request:
@@ -329,6 +341,21 @@ pub struct PolicyStoreAlias {
     pub created_at: DateTime,
     /// [`ALIAS_STATE_ACTIVE`] or [`ALIAS_STATE_PENDING_DELETION`].
     pub state: String,
+}
+
+/// How the alias table is keyed: `(region, full aliasName)`.
+///
+/// `CreatePolicyStoreAliasInput$aliasName` documents the SCOPE of an alias name
+/// as "your Amazon Web Services account and Amazon Web Services Region", so the
+/// Region the request was signed for ([`request_region`]) is part of an alias's
+/// identity: the same name is free in another Region, and names a different
+/// store there.
+pub type AliasKey = (String, String);
+
+/// The [`AliasKey`] of `alias_name` in `region` — the ONE place that shapes an
+/// alias table key, so a write and a read cannot key the same alias differently.
+pub fn alias_key(region: &str, alias_name: &str) -> AliasKey {
+    (region.to_string(), alias_name.to_string())
 }
 
 /// How a policy store and its child resources are encrypted: the state behind
@@ -947,8 +974,8 @@ pub fn assigned_name(name: Option<&str>) -> Option<&str> {
 /// Why a `policyStoreId` request member named no store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreLookupMiss {
-    /// The reference was `policy-store-alias/<name>` and no alias is named
-    /// `<name>`.
+    /// The reference was `policy-store-alias/<name>` and the Region the request
+    /// was signed for holds no alias named `<name>`.
     AliasNotFound,
     /// The reference named a store id — directly, or through an alias that does
     /// resolve — that no policy store has.
@@ -975,8 +1002,46 @@ impl ComAmazonawsVerifiedpermissionsVerifiedpermissionsState {
         format!("PS{}", base62(scramble(self.next_store_seq)))
     }
 
+    /// The alias `alias_name` names in `region`, whatever its state, or `None`
+    /// when that Region holds no alias of that name. An alias of the same name in
+    /// ANOTHER Region is a different alias and is not reported here.
+    pub fn alias(&self, region: &str, alias_name: &str) -> Option<&PolicyStoreAlias> {
+        self.aliases.get(&alias_key(region, alias_name))
+    }
+
+    /// [`Self::alias`], for a caller that changes the record it finds.
+    pub fn alias_mut(&mut self, region: &str, alias_name: &str) -> Option<&mut PolicyStoreAlias> {
+        self.aliases.get_mut(&alias_key(region, alias_name))
+    }
+
+    /// Persist `alias` in `region`, under its own name.
+    pub fn insert_alias(&mut self, region: &str, alias: PolicyStoreAlias) {
+        let key = alias_key(region, &alias.alias_name);
+        self.aliases.insert(key, alias);
+    }
+
+    /// Forget the alias `alias_name` names in `region`, if it holds one.
+    pub fn remove_alias(&mut self, region: &str, alias_name: &str) -> Option<PolicyStoreAlias> {
+        self.aliases.remove(&alias_key(region, alias_name))
+    }
+
+    /// Every alias `region` holds, by full name, in the table's stable order.
+    ///
+    /// The Region leads the [`AliasKey`], so one Region's aliases are a
+    /// contiguous range of the table and a `ListPolicyStoreAliases` cursor
+    /// resumes inside it at the first name at or after the cursor.
+    pub fn aliases_in_region<'state, 'region: 'state>(
+        &'state self,
+        region: &'region str,
+    ) -> impl Iterator<Item = (&'state str, &'state PolicyStoreAlias)> + 'state {
+        self.aliases
+            .range(alias_key(region, "")..)
+            .take_while(move |((alias_region, _), _)| alias_region.as_str() == region)
+            .map(|((_, alias_name), alias)| (alias_name.as_str(), alias))
+    }
+
     /// Resolve a `policyStoreId` request member: either a store id, or
-    /// `policy-store-alias/<name>` naming one.
+    /// `policy-store-alias/<name>` naming one, as seen from `region`.
     ///
     /// Answers `Some` ONLY for a store that is present, on both branches — a
     /// caller-supplied reference must never resolve to a key that is not in
@@ -986,8 +1051,8 @@ impl ComAmazonawsVerifiedpermissionsVerifiedpermissionsState {
     /// `PendingDeletion`, "if the policy store alias is used in an API that has a
     /// `policyStoreId` field, the operation will fail with a `ResourceNotFound`
     /// exception".
-    pub fn resolve_store_id(&self, reference: &str) -> Option<String> {
-        self.lookup_store_id(reference).ok()
+    pub fn resolve_store_id(&self, region: &str, reference: &str) -> Option<String> {
+        self.lookup_store_id(region, reference).ok()
     }
 
     /// Resolve a `policyStoreId` request member that the model restricts to an
@@ -1005,12 +1070,16 @@ impl ComAmazonawsVerifiedpermissionsVerifiedpermissionsState {
     }
 
     /// [`Self::resolve_store_id`], but saying WHICH reference failed: an alias
-    /// name no active alias carries is a different miss from a store id no store
-    /// has, and the batch operations report the two with distinct codes.
-    pub fn lookup_store_id(&self, reference: &str) -> Result<String, StoreLookupMiss> {
+    /// name no active alias of `region` carries is a different miss from a store
+    /// id no store has, and the batch operations report the two with distinct
+    /// codes.
+    pub fn lookup_store_id(&self, region: &str, reference: &str) -> Result<String, StoreLookupMiss> {
         let candidate = if reference.starts_with(ALIAS_PREFIX) {
-            self.aliases
-                .get(reference)
+            // An alias name is scoped to the account and Region, so only the
+            // Region the request was signed for can resolve it: the same name in
+            // another Region names another store, and no alias at all in this
+            // one is a miss.
+            self.alias(region, reference)
                 .filter(|alias| alias.state == ALIAS_STATE_ACTIVE)
                 .ok_or(StoreLookupMiss::AliasNotFound)?
                 .policy_store_id
@@ -1410,14 +1479,17 @@ pub fn alias_reference(alias_name: &str) -> ReferencedResource {
 /// page it resumes starts at.
 ///
 /// A unit separator, which neither part can contain: a listing is named by an
-/// operation name and a minted `policyStoreId`, and every key this service pages
-/// by is a minted id or an alias name — all of them printable text the model
-/// constrains to `[a-zA-Z0-9-/_]`.
+/// operation name and either a minted `policyStoreId` or an AWS Region code, and
+/// every key this service pages by is a minted id or an alias name — all of them
+/// printable text the model constrains to `[a-zA-Z0-9-/_]`.
 const PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
 
 /// The listing a pagination cursor belongs to: the `@paginated` operation that
-/// minted it and, for an operation that enumerates ONE policy store's resources,
-/// that store's own id — `None` for one that enumerates the account's.
+/// minted it and, where the operation enumerates the resources WITHIN one scope
+/// rather than everything it can reach, the scope's own identifier — a policy
+/// store's id for an operation that lists that store's resources, and the Region
+/// for `ListPolicyStoreAliases`, whose aliases belong to the account and Region
+/// the request was signed for.
 ///
 /// A cursor names a POSITION in one enumeration, so it means nothing to any
 /// other: the keys `ListPolicies` walks are the ids of one store's policies, and
@@ -1427,13 +1499,13 @@ const PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
 /// not, so a cursor from elsewhere is refused instead of silently truncating a
 /// page.
 ///
-/// `policy_store_id` is the store id the request RESOLVED to, never the
-/// `policyStoreId` member verbatim: a store reached by its id and the same store
-/// reached by an alias name are one listing, so a cursor minted through either
-/// reference resumes through the other.
-pub fn page_scope(operation: &str, policy_store_id: Option<&str>) -> String {
-    match policy_store_id {
-        Some(policy_store_id) => format!("{operation}/{policy_store_id}"),
+/// `within` is the scope the request RESOLVED to, never a request member
+/// verbatim: a store reached by its id and the same store reached by an alias
+/// name are one listing, so a cursor minted through either reference resumes
+/// through the other.
+pub fn page_scope(operation: &str, within: Option<&str>) -> String {
+    match within {
+        Some(within) => format!("{operation}/{within}"),
         None => operation.to_string(),
     }
 }

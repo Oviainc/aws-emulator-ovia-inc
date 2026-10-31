@@ -171,8 +171,8 @@ pub fn schema_validation_exception(
 /// `[a-zA-Z0-9-/_]*` — and it is documented on the member itself, for every
 /// operation that takes one, so every one of them refuses an unprefixed value
 /// here instead of letting it reach [`crate::state`], whose alias table is keyed
-/// by the FULL name and could only ever report such a value as a resource that
-/// does not exist. Keeping the check in one place keeps the status, the error
+/// by the Region and the FULL name and could only ever report such a value as a
+/// resource that does not exist. Keeping the check in one place keeps the status, the error
 /// code and the `fieldList` entry naming [`paths::ALIAS_NAME`] identical
 /// whichever operation read the member.
 pub fn invalid_alias_name(alias_name: &str) -> Option<types::ValidationException> {
@@ -276,16 +276,42 @@ pub fn page<Entry, Item>(
     selects: impl Fn(&Entry) -> bool,
     item: impl Fn(&Entry) -> Item,
 ) -> (Vec<Item>, Option<String>) {
+    page_entries(
+        entries.iter().map(|(key, entry)| (key.as_str(), entry)),
+        cursor,
+        max_results,
+        default_page_size,
+        selects,
+        item,
+    )
+}
+
+/// [`page`] over an ordered SEQUENCE of `(cursor key, record)` pairs, for a
+/// collection whose own key is not the key the cursor names: the alias table is
+/// keyed by Region and name, and one Region's aliases are a contiguous, ordered
+/// range of it
+/// ([`crate::state::ComAmazonawsVerifiedpermissionsVerifiedpermissionsState::aliases_in_region`])
+/// whose cursor is the name alone. [`page`] is this function over a map's own
+/// keys, so both go through ONE implementation and no two list operations can
+/// page differently.
+pub fn page_entries<'entries, Entry: 'entries, Item>(
+    entries: impl IntoIterator<Item = (&'entries str, &'entries Entry)>,
+    cursor: &PageCursor,
+    max_results: Option<i32>,
+    default_page_size: usize,
+    selects: impl Fn(&Entry) -> bool,
+    item: impl Fn(&Entry) -> Item,
+) -> (Vec<Item>, Option<String>) {
     let size = page_size(max_results, default_page_size);
     let mut items: Vec<Item> = Vec::new();
     let mut next_token = None;
     for (key, entry) in entries
-        .iter()
+        .into_iter()
         .filter(|(key, _)| {
             cursor
                 .resume_from
                 .as_deref()
-                .is_none_or(|from| key.as_str() >= from)
+                .is_none_or(|from| *key >= from)
         })
         .filter(|(_, entry)| selects(entry))
     {

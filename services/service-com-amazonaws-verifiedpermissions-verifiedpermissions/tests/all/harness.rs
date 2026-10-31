@@ -55,20 +55,45 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
 }
 
 /// Call one operation and return `(http status, parsed body)`.
+///
+/// Signed for [`SIGNING_REGION`]; [`call_in`] is the same call for a suite that
+/// chooses the region.
 pub async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
-    let request = http::Request::builder()
+    call_in(router, SIGNING_REGION, operation, body).await
+}
+
+/// Call one operation with the request SIGNED for `region`, and return
+/// `(http status, parsed body)`.
+///
+/// The region is read out of the SigV4 credential scope, and it is the scope a
+/// policy store ALIAS lives in — an alias name is unique within an account and
+/// Region — so a suite about that scope addresses each request to the region it
+/// means. An EMPTY `region` sends no `authorization` header at all, which is how
+/// a suite exercises a request that names no region; the service then falls back
+/// to its own default. Every request this test crate sends to this service is
+/// shaped here, once.
+pub async fn call_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
+    let mut request = http::Request::builder()
         .method("POST")
         .uri("/")
         .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("VerifiedPermissions.{operation}"))
-        .header(
+        .header("x-amz-target", format!("VerifiedPermissions.{operation}"));
+    if !region.is_empty() {
+        request = request.header(
             "authorization",
             format!(
                 "AWS4-HMAC-SHA256 \
-                 Credential=AKIAEXAMPLE/20260101/{SIGNING_REGION}/verifiedpermissions/aws4_request, \
+                 Credential=AKIAEXAMPLE/20260101/{region}/verifiedpermissions/aws4_request, \
                  SignedHeaders=host;x-amz-target, Signature=0"
             ),
-        )
+        );
+    }
+    let request = request
         .body(bytes::Bytes::from(
             serde_json::to_vec(body).expect("a test request body always serializes"),
         ))
@@ -90,12 +115,33 @@ pub async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> V
     parsed
 }
 
+/// [`call_in`], requiring success, and returning the parsed body.
+pub async fn ok_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
+    let (status, parsed) = call_in(router, region, operation, body).await;
+    assert_eq!(
+        status, 200,
+        "{operation} signed for {region} failed: {parsed}"
+    );
+    parsed
+}
+
 /// Create a store with the given validation `mode` and return its
 /// `policyStoreId`. The ONE store-creation helper this test crate has; every
 /// suite reaches a store through it.
 pub async fn store_with_mode(router: &MultiServiceRouter, mode: &str) -> String {
-    let created = ok(
+    store_with_mode_in(router, SIGNING_REGION, mode).await
+}
+
+/// The same, signed for `region`.
+pub async fn store_with_mode_in(router: &MultiServiceRouter, region: &str, mode: &str) -> String {
+    let created = ok_in(
         router,
+        region,
         "CreatePolicyStore",
         &json!({ "validationSettings": { "mode": mode } }),
     )
@@ -109,6 +155,11 @@ pub async fn store_with_mode(router: &MultiServiceRouter, mode: &str) -> String 
 /// Create a store with validation mode `OFF` and return its `policyStoreId`.
 pub async fn store_with_validation_off(router: &MultiServiceRouter) -> String {
     store_with_mode(router, "OFF").await
+}
+
+/// The same, signed for `region`.
+pub async fn store_with_validation_off_in(router: &MultiServiceRouter, region: &str) -> String {
+    store_with_mode_in(router, region, "OFF").await
 }
 
 /// Call one Amazon Cognito user-pool operation, requiring success, and return the parsed

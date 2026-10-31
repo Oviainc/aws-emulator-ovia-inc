@@ -141,7 +141,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let not_found = || {
             ListIdentitySourcesErrorModeled::ResourceNotFoundException(
@@ -156,7 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
         let store_id = state
-            .resolve_store_id(&input.policy_store_id)
+            .resolve_store_id(
+                &crate::state::request_region(ctx.parts()),
+                &input.policy_store_id,
+            )
             .ok_or_else(not_found)?;
         let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
 

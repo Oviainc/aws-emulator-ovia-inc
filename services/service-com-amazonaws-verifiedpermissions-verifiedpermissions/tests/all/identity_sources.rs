@@ -14,6 +14,10 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+// The shared request shaper: this suite signs for several regions, so it reaches
+// the harness's region-taking caller directly.
+use super::harness::call_in;
+
 /// A router serving this service and the Amazon Cognito user-pool service it
 /// resolves a `userPoolArn` against, over a fresh shared engine. This suite signs
 /// requests for several regions, so it wires its own router rather than taking the
@@ -33,39 +37,6 @@ fn router() -> MultiServiceRouter {
         ),
     );
     router
-}
-
-/// Call one operation, signed for `region`, and return `(http status, parsed body)`.
-async fn call_in(
-    router: &MultiServiceRouter,
-    region: &str,
-    operation: &str,
-    body: &Value,
-) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("VerifiedPermissions.{operation}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260101/{region}/verifiedpermissions/aws4_request, \
-                 SignedHeaders=host;x-amz-target, Signature=0"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("a test request body always serializes"),
-        ))
-        .expect("a valid test request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, parsed)
 }
 
 /// The region every request in this suite is signed for unless it says otherwise.

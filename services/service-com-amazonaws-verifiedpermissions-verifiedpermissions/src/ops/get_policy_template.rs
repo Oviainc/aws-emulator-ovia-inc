@@ -155,7 +155,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
         let store_id = state
-            .resolve_store_id(&input.policy_store_id)
+            .resolve_store_id(
+                &crate::state::request_region(ctx.parts()),
+                &input.policy_store_id,
+            )
             .ok_or_else(store_not_found)?;
         let template = state
             .policy_stores
