@@ -692,9 +692,12 @@ fn storage_resolution(datum: &MetricDatum, path: &str) -> Result<i32, PutMetricD
         Some(resolution) if VALID.contains(&resolution) => Ok(resolution),
         Some(_) => {
             let permitted: Vec<String> = VALID.iter().map(i32::to_string).collect();
-            Err(invalid_parameter_value(format!(
-                "The parameter {path}.StorageResolution must be a value in the set [ {} ].",
-                permitted.join(", ")
+            // Stated by the one renderer every refusal of a value outside the set its member
+            // accepts goes through ([`crate::state::value_in_set_message`]), so this sentence
+            // and a read's cannot drift in how they spell the set.
+            Err(invalid_parameter_value(crate::state::value_in_set_message(
+                &format!("{path}.StorageResolution"),
+                &permitted,
             )))
         }
     }

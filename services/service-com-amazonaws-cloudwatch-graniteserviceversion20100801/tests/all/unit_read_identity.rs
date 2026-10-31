@@ -20,7 +20,7 @@
 //! 2. A value outside the set the enumerated type its member targets declares is refused by
 //!    the validator of the OPERATION it arrived on: the read whose model declares this
 //!    service's parameter faults answers `InvalidParameterValue` naming the parameter and the
-//!    whole declared set, and the read whose model declares none of them keeps this service's
+//!    whole accepted set as the service announces it, and the read whose model declares none of them keeps this service's
 //!    own validation code with the framework's counting clause naming the member path and that
 //!    set. (`GetMetricStatistics` models `InvalidParameterValueException`,
 //!    `InvalidParameterCombinationException`, `MissingRequiredParameterException` and
@@ -44,10 +44,10 @@ fn dimensions() -> Value {
 /// published with, which is also the set a refusal of a value outside it enumerates.
 ///
 /// Written out here rather than taken from the crate's own generated
-/// `STANDARD_UNIT_VALUES`, which holds the same 27 values ALPHABETICALLY: the refusal
-/// sentence lists them in the order the model declares them, so the order is part of what
-/// this suite asserts and has to be stated independently of the generated copy.
-const STANDARD_UNITS: [&str; 27] = [
+/// `STANDARD_UNIT_VALUES`, which holds the same 27 values ALPHABETICALLY: the constraint
+/// clause lists them in the order the model declares them, so the order is part of what this
+/// suite asserts and has to be stated independently of the generated copy.
+pub const STANDARD_UNITS: [&str; 27] = [
     "Seconds",
     "Microseconds",
     "Milliseconds",
@@ -461,13 +461,11 @@ struct RefusalRow {
 }
 
 /// What the read whose model declares the parameter faults says about a `parameter` holding a
-/// value outside `StandardUnit`: the parameter and the whole declared set, and nothing of the
-/// submitted value.
+/// value outside `StandardUnit`: the parameter and the whole accepted set as the service
+/// announces it, and nothing of the submitted value — the one sentence the suite that owns the
+/// announced sets states ([`crate::announced_value_sets`]).
 fn parameter_in_set(parameter: &str) -> String {
-    format!(
-        "The parameter {parameter} must be a value in the set [{}].",
-        STANDARD_UNITS.join(", ")
-    )
+    crate::announced_value_sets::unit_in_set_message(parameter)
 }
 
 /// What the read whose model declares NONE of them says about the member at `path` holding

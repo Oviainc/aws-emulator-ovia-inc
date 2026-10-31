@@ -302,13 +302,109 @@ pub fn value_is_invalid_message(value: &str, parameter: &str) -> String {
 ///
 /// The set is what a client repairs the request from — the message is only actionable when it
 /// enumerates the legal values — so it is passed in from the declaration that owns it (an
-/// enumerated member's own value set, as the model declares it) rather than written here.
+/// enumerated member's own value set, as the model declares it) rather than written here. HOW
+/// that set is spelled is the service's own ([`announced_set`]): a set this service is recorded
+/// announcing in an order or a bracket form of its own is spelled that way, and every other one
+/// is spelled in the order the declaration holds, bare.
 pub fn value_in_set_message(parameter: &str, allowed: &[String]) -> String {
     format!(
-        "The parameter {parameter} must be a value in the set [{}].",
-        allowed.join(", ")
+        "The parameter {parameter} must be a value in the set {}.",
+        announced_set(allowed)
     )
 }
+
+/// One set of accepted values AS THIS SERVICE ANNOUNCES IT: the values in the order it emits
+/// them, and the bracket form it emits them in.
+struct AnnouncedSet {
+    /// The accepted values, in the order the service lists them.
+    values: &'static [&'static str],
+    /// Whether each bracket carries one space inside it.
+    padded: bool,
+}
+
+impl AnnouncedSet {
+    /// Whether this is the announcement of `values`: the same values, in whatever order the
+    /// caller holds them — the announcement's own order is the point of it, so it cannot be the
+    /// key as well.
+    fn announces(&self, values: &[String]) -> bool {
+        values.len() == self.values.len()
+            && values
+                .iter()
+                .all(|value| self.values.contains(&value.as_str()))
+    }
+
+    /// The set as the service writes it: the values comma-and-space joined inside its brackets.
+    fn rendered(&self) -> String {
+        let listed = self.values.join(", ");
+        if self.padded {
+            format!("[ {listed} ]")
+        } else {
+            format!("[{listed}]")
+        }
+    }
+}
+
+/// `allowed` as this service announces it.
+///
+/// Neither the order a set is listed in nor the padding of its brackets is derivable from the
+/// declaration that owns the set: both are properties of the service's own renderer, recorded
+/// from what it answers. So a set with a recorded announcement is spelled from it, matched by
+/// the set itself rather than by the member path, so that every member accepting the same
+/// values announces them alike; any other set is spelled in the order its declaration holds,
+/// inside bare brackets.
+fn announced_set(allowed: &[String]) -> String {
+    ANNOUNCED_SETS
+        .iter()
+        .find(|announced| announced.announces(allowed))
+        .map_or_else(|| format!("[{}]", allowed.join(", ")), AnnouncedSet::rendered)
+}
+
+/// Every set this service is recorded announcing other than bare and in declaration order.
+const ANNOUNCED_SETS: &[AnnouncedSet] = &[MEASUREMENT_UNITS, STORAGE_RESOLUTIONS];
+
+/// How this service announces the unit a measurement is expressed in — the value set
+/// `StandardUnit` declares (`smithy_query(query="shape",shape="StandardUnit")`), which every
+/// `Unit` member targets — in the order it lists them, which the order the model declares them
+/// in is not, inside padded brackets.
+const MEASUREMENT_UNITS: AnnouncedSet = AnnouncedSet {
+    values: &[
+        "Megabits",
+        "Terabits",
+        "Gigabits",
+        "Count",
+        "Bytes",
+        "Gigabytes",
+        "Gigabytes/Second",
+        "Kilobytes",
+        "Kilobits/Second",
+        "Terabytes",
+        "Terabits/Second",
+        "Bytes/Second",
+        "Percent",
+        "Megabytes",
+        "Megabits/Second",
+        "Milliseconds",
+        "Microseconds",
+        "Kilobytes/Second",
+        "Gigabits/Second",
+        "Megabytes/Second",
+        "Bits",
+        "Bits/Second",
+        "Count/Second",
+        "Seconds",
+        "Kilobits",
+        "Terabytes/Second",
+        "None",
+    ],
+    padded: true,
+};
+
+/// How this service announces the resolutions a datum may be stored at ("Valid values are 1 and
+/// 60", `MetricDatum$StorageResolution`): the two values, inside padded brackets.
+const STORAGE_RESOLUTIONS: AnnouncedSet = AnnouncedSet {
+    values: &["1", "60"],
+    padded: true,
+};
 
 /// How CloudWatch states a value it understands but cannot serve on the member it arrived on —
 /// a statistic name that is not of the kind its member computes, say: the value, because which
