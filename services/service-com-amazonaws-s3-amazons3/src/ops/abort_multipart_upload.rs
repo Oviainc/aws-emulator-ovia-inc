@@ -310,7 +310,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An upload id this bucket never had in progress, one initiated for another
             // key, and one a completion or an earlier abort already took away all name no
             // upload — which is the single failure this operation models: "The specified
-            // multipart upload does not exist" (`NoSuchUpload`, HTTP 404).
+            // multipart upload does not exist" (`NoSuchUpload`, HTTP 404), and the refusal
+            // the behavioral corpus records for an abort of an upload that is not there.
             crate::state::UploadAbort::NoSuchUpload => {
                 return Err(AbortMultipartUploadErrorModeled::NoSuchUpload(NoSuchUpload {}).into());
             }

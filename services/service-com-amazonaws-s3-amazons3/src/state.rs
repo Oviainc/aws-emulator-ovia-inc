@@ -7090,6 +7090,80 @@ pub struct ReportedObjectLock {
     pub legal_hold_status: Option<String>,
 }
 
+/// The Object Lock a WRITE asked for, as [`requested_object_lock`] read it off the three
+/// `x-amz-object-lock-*` members every object write declares.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestedObjectLock {
+    /// The retention the write named, for [`Object::retention`] — `None` when it named
+    /// neither a mode nor a date, in which case the bucket's own default retention is what
+    /// locks the version ([`Bucket::put_object`] applies it).
+    pub retention: Option<ObjectRetention>,
+    /// The legal hold the write named, for [`Object::legal_hold`] — `None` when it named no
+    /// status, which leaves the version with no hold ever applied.
+    pub legal_hold: Option<bool>,
+}
+
+impl RequestedObjectLock {
+    /// Whether the write named any Object Lock member at all — what decides whether the
+    /// bucket has to carry an Object Lock configuration for it to be served.
+    pub fn names_a_member(&self) -> bool {
+        self.retention.is_some() || self.legal_hold.is_some()
+    }
+}
+
+/// Why the Object Lock a write asked for cannot be recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectLockRequestRejection {
+    /// One of `x-amz-object-lock-mode` and `x-amz-object-lock-retain-until-date` without the
+    /// other: a retention runs in a mode TO a date, so half of one describes no period.
+    IncompleteRetention,
+    /// A `x-amz-object-lock-retain-until-date` outside the range of instants this platform
+    /// can hold, which no period a version is locked for can run to.
+    UnrepresentableRetainUntilDate,
+}
+
+/// The Object Lock an object write asked for, read off the three members that carry it, or
+/// why it cannot be recorded.
+///
+/// "The Object Lock mode that you want to apply to this object" with "the date and time when
+/// you want this object's Object Lock to expire" beside it
+/// (`PutObjectRequest$ObjectLockMode` and `$ObjectLockRetainUntilDate`), and "specifies
+/// whether a legal hold will be applied to this object"
+/// (`$ObjectLockLegalHoldStatus`) — so a write that names them stores them ON the version it
+/// writes, which is what a later delete of that version is judged against
+/// ([`Bucket::object_lock_delete_refusal`]), and `PutObjectRetention` /
+/// `PutObjectLegalHold` are what change them afterwards.
+///
+/// ONE place for the rule, so every write that declares these members — the one-shot write,
+/// the copy and the multipart initiation whose settings the completed object carries —
+/// records the same lock from the same values.
+pub fn requested_object_lock(
+    mode: Option<&str>,
+    retain_until_date: Option<&::aws_smithy_types::DateTime>,
+    legal_hold_status: Option<&str>,
+) -> Result<RequestedObjectLock, ObjectLockRequestRejection> {
+    let retention = match (mode, retain_until_date) {
+        (None, None) => None,
+        (Some(mode), Some(date)) => {
+            let Some(retain_until) = instant_of(date) else {
+                return Err(ObjectLockRequestRejection::UnrepresentableRetainUntilDate);
+            };
+            Some(ObjectRetention {
+                mode: mode.to_string(),
+                retain_until,
+            })
+        }
+        _ => return Err(ObjectLockRequestRejection::IncompleteRetention),
+    };
+    Ok(RequestedObjectLock {
+        retention,
+        // "ON" is a hold in place and "OFF" is one that is not; a write naming no status
+        // leaves the version with none ever applied, which is a third state a reader reports
+        // apart from `OFF` (see [`Object::legal_hold`]).
+        legal_hold: legal_hold_status.map(|status| status == LEGAL_HOLD_ON_STATUS),
+    })
+}
+
 /// The one value the `ObjectLockEnabled` enum publishes
 /// (`smithy_query(query="shape",shape="ObjectLockEnabled")`, whose values
 /// [`crate::ops::types::OBJECT_LOCK_ENABLED_VALUES`] carries): "indicates whether this
@@ -7757,6 +7831,14 @@ pub struct MultipartUpload {
     /// only place that sees the byte budgets a retained part counts against; an initiation
     /// records an upload with no part at all.
     pub parts: BTreeMap<i32, UploadedPart>,
+    /// The Object Lock the INITIATING request asked the completed object to be stored with
+    /// — see [`RequestedObjectLock`].
+    ///
+    /// "When you initiate a multipart upload, you specify the options you want on the
+    /// finished object" (`CreateMultipartUpload`'s own documentation), and the Object Lock
+    /// mode, retain-until date and legal hold are three of those options, so they are held
+    /// with the upload until the completion stores them on the version it writes.
+    pub object_lock: RequestedObjectLock,
 }
 
 impl MultipartUpload {
@@ -7778,9 +7860,18 @@ impl MultipartUpload {
 
     /// How many bytes the parts of this upload retain — what the per-bucket and
     /// service-wide byte budgets count for an upload, measured the way
-    /// [`Object::retained_bytes`] measures a stored object's.
+    /// [`Object::retained_bytes`] measures a stored object's: the parts, plus the
+    /// caller-supplied strings held beside them.
     pub fn retained_bytes(&self) -> usize {
-        self.parts.values().map(UploadedPart::retained_bytes).sum()
+        self.parts
+            .values()
+            .map(UploadedPart::retained_bytes)
+            .sum::<usize>()
+            + self
+                .object_lock
+                .retention
+                .as_ref()
+                .map_or(0, ObjectRetention::retained_bytes)
     }
 }
 
@@ -7982,8 +8073,9 @@ pub const ANY_ENTITY_TAG: &str = "*";
 /// (`$IfMatchSize`): every member the request carries has to hold, so one failing condition
 /// refuses the delete.
 ///
-/// The tags are compared by VALUE ([`etag_value`]), for the reason
-/// [`write_precondition_fails`] compares them that way.
+/// The `If-Match` value is judged by the one rule every entity-tag precondition in this
+/// module is judged by ([`entity_tag_matches`]): by VALUE, with the wildcard, the weak marker
+/// and the comma-separated list RFC 7232 §3.1 admits.
 pub fn delete_precondition_fails(
     held: Option<&Object>,
     if_match: Option<&str>,
@@ -7991,10 +8083,7 @@ pub fn delete_precondition_fails(
     if_match_size: Option<i64>,
 ) -> bool {
     let match_fails = if_match.is_some_and(|expected| {
-        held.is_none_or(|object| {
-            expected.trim() != ANY_ENTITY_TAG
-                && etag_value(&object.etag) != etag_value(expected.trim())
-        })
+        held.is_none_or(|object| !entity_tag_matches(expected, &object.etag))
     });
     let time_fails = if_match_last_modified_time.is_some_and(|expected| {
         held.is_some_and(|object| {
@@ -8048,6 +8137,179 @@ fn whole_seconds(instant: SystemTime) -> Option<u64> {
         .duration_since(::std::time::UNIX_EPOCH)
         .ok()
         .map(|since| since.as_secs())
+}
+
+/// The source one `x-amz-copy-source` value names: the bucket, the key and the stored
+/// version it addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopySource {
+    /// The source bucket, URL-decoded.
+    pub bucket: String,
+    /// The source object's key, URL-decoded.
+    pub key: String,
+    /// The stored version the value's `?versionId=` named, or `None` when it named none —
+    /// in which case the copy is of the key's current version.
+    pub version_id: Option<String>,
+}
+
+/// Read an `x-amz-copy-source` value into the bucket, key and version it names, or report
+/// why it names none.
+///
+/// "Specify the name of the source bucket and the key of the source object, separated by a
+/// slash (/). For example, to copy the object `reports/january.pdf` from the general
+/// purpose bucket `awsexamplebucket`, use `awsexamplebucket/reports/january.pdf`. The
+/// value must be URL-encoded." A stored version is addressed by appending
+/// `?versionId=<version-id>` to that value
+/// (`smithy_query(query="doc",shape="CopyObjectRequest",member="CopySource")`), and the
+/// member's own pattern (`^\/?.+\/.+$`) allows one leading slash, so the FIRST slash after
+/// it separates the bucket from the key — a key with slashes of its own keeps them.
+///
+/// ONE place for the rule, so every operation that takes a copy source — the whole-object
+/// copy and the part copy, which document the member identically — addresses exactly the
+/// same objects and refuses exactly the same values.
+pub fn parse_copy_source(value: &str) -> Result<CopySource, String> {
+    let rejection = || {
+        format!(
+            "x-amz-copy-source must name the source bucket and the source object's key \
+             separated by a slash, URL-encoded, optionally followed by \
+             ?versionId=<version-id>, got {value:?}"
+        )
+    };
+    // The value is URL-encoded, so a `?` in it is the query delimiter and a `?` in a key
+    // arrives as `%3F` — which is what makes the FIRST one the end of the key, and makes
+    // `versionId` the only subresource the value may carry.
+    let (path, version_id) = match value.split_once('?') {
+        None => (value, None),
+        Some((path, query)) => match query.strip_prefix("versionId=") {
+            Some(version_id) if !version_id.is_empty() => (path, Some(version_id)),
+            _ => return Err(rejection()),
+        },
+    };
+    let path = path.strip_prefix('/').unwrap_or(path);
+    let Some((bucket, key)) = path.split_once('/') else {
+        return Err(rejection());
+    };
+    if bucket.is_empty() || key.is_empty() {
+        return Err(rejection());
+    }
+    let Some(bucket) = url_decoded(bucket) else {
+        return Err(rejection());
+    };
+    let Some(key) = url_decoded(key) else {
+        return Err(rejection());
+    };
+    let version_id = match version_id {
+        None => None,
+        Some(version_id) => match url_decoded(version_id) {
+            Some(version_id) => Some(version_id),
+            None => return Err(rejection()),
+        },
+    };
+    Ok(CopySource {
+        bucket,
+        key,
+        version_id,
+    })
+}
+
+/// One percent-encoded element of a copy source, decoded — or `None` when its escapes do
+/// not decode to UTF-8, which no bucket name or object key this store holds is.
+fn url_decoded(value: &str) -> Option<String> {
+    ::percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .ok()
+        .map(::std::borrow::Cow::into_owned)
+}
+
+/// The prefix of the second documented `x-amz-copy-source` form — the ARN of an object "as
+/// accessed through the access point", or through S3 on Outposts, which this emulator holds
+/// none of.
+pub const ACCESS_POINT_ARN_PREFIX: &str = "arn:";
+
+/// Whether a copy source names an object by ARN rather than by `bucket/key`.
+///
+/// The one leading slash the member's pattern allows is stripped the way
+/// [`parse_copy_source`] strips it, so a value is classified the same here and there.
+pub fn copy_source_is_arn(value: &str) -> bool {
+    value
+        .strip_prefix('/')
+        .unwrap_or(value)
+        .starts_with(ACCESS_POINT_ARN_PREFIX)
+}
+
+/// The four copy-source conditional members one request carried, as
+/// [`unmet_copy_source_precondition`] judges them.
+///
+/// Every operation that takes a copy source declares the same four
+/// (`x-amz-copy-source-if-match`, `-if-none-match`, `-if-modified-since` and
+/// `-if-unmodified-since`), so the values travel as one struct and the rule lives in one
+/// place.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CopySourceConditions<'a> {
+    pub if_match: Option<&'a str>,
+    pub if_none_match: Option<&'a str>,
+    /// The instant `x-amz-copy-source-if-modified-since` named, in whole seconds since the
+    /// epoch — the unit the HTTP date it arrives as carries.
+    pub if_modified_since: Option<i64>,
+    /// The same for `x-amz-copy-source-if-unmodified-since`.
+    pub if_unmodified_since: Option<i64>,
+}
+
+/// The copy-source precondition a request carries that does NOT hold against `source`,
+/// named by its header, or `None` when every one of them holds.
+///
+/// The four members are evaluated in the order RFC 7232 gives them — an entity-tag
+/// precondition first, and the date precondition beside it only when that tag member is
+/// absent — which is exactly what the two combinations the members document describe:
+/// "if both the x-amz-copy-source-if-match and x-amz-copy-source-if-unmodified-since
+/// headers are present … x-amz-copy-source-if-match condition evaluates to true
+/// [and] x-amz-copy-source-if-unmodified-since condition evaluates to false" answers 200
+/// and copies, while "x-amz-copy-source-if-none-match condition evaluates to false [and]
+/// x-amz-copy-source-if-modified-since condition evaluates to true" answers 412.
+pub fn unmet_copy_source_precondition(
+    conditions: &CopySourceConditions<'_>,
+    source: &Object,
+) -> Option<&'static str> {
+    // The stored time is compared at whole-second granularity, because that is the
+    // granularity of the HTTP-date these members carry and of the `Last-Modified` the
+    // client read the value from.
+    let modified_at = i64::try_from(whole_seconds(source.last_modified).unwrap_or_default())
+        .unwrap_or(i64::MAX);
+    if let Some(header) = conditions.if_match {
+        if !entity_tag_matches(header, &source.etag) {
+            return Some("x-amz-copy-source-if-match");
+        }
+    } else if let Some(since) = conditions.if_unmodified_since {
+        // "Copies the object if it hasn't been modified since the specified time."
+        if modified_at > since {
+            return Some("x-amz-copy-source-if-unmodified-since");
+        }
+    }
+    if let Some(header) = conditions.if_none_match {
+        if entity_tag_matches(header, &source.etag) {
+            return Some("x-amz-copy-source-if-none-match");
+        }
+    } else if let Some(since) = conditions.if_modified_since {
+        // "Copies the object if it has been modified since the specified time."
+        if modified_at <= since {
+            return Some("x-amz-copy-source-if-modified-since");
+        }
+    }
+    None
+}
+
+/// Whether an entity-tag precondition value names `etag`.
+///
+/// An `ETag` is reported inside quotes, and a client may send the value back with or
+/// without them, as a comma-separated list, or as the [`ANY_ENTITY_TAG`] wildcard that names
+/// any existing entity (RFC 7232 §2.3, §3.1) — so each candidate is compared on the tag's
+/// own value ([`etag_value`]), with the weak marker stripped too.
+pub fn entity_tag_matches(header: &str, etag: &str) -> bool {
+    let stored = etag_value(etag);
+    header.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == ANY_ENTITY_TAG || etag_value(candidate.trim_start_matches("W/")) == stored
+    })
 }
 
 /// The same digest as [`object_etag`], Base64 encoded the way the `Content-MD5` header
@@ -8559,6 +8821,16 @@ impl<'a> DeclaredChecksums<'a> {
         ]
     }
 
+    /// How many of the ten members carried a value — what decides whether the write
+    /// declared ONE checksum type or several, which S3 refuses
+    /// ([`IntegrityRejection::MultipleChecksumTypes`]).
+    pub fn declared_count(&self) -> usize {
+        self.pairs()
+            .into_iter()
+            .filter(|(_, declared)| declared.is_some())
+            .count()
+    }
+
     /// The `ChecksumAlgorithm` value of the FIRST member that carried one, in that same
     /// order, or `None` when the write declared no individual checksum — which is what makes
     /// an individual checksum name the algorithm a write's own checksum is computed under
@@ -8593,6 +8865,10 @@ pub enum IntegrityRejection {
     },
     /// A `Content-MD5` that does not Base64-decode to a 128-bit digest.
     MalformedContentMd5,
+    /// More than one `x-amz-checksum-*` header on one write: each names a checksum TYPE for
+    /// the same bytes, and S3 computes and stores exactly one per object, so a request
+    /// carrying several asks for something no stored object can report.
+    MultipleChecksumTypes,
     /// A well-formed `Content-MD5` that is not the MD5 of the payload.
     ContentMd5Mismatch,
 }
@@ -8607,7 +8883,7 @@ impl IntegrityRejection {
     /// digest that does not describe the bytes.
     pub fn code(&self) -> &'static str {
         match self {
-            Self::MalformedChecksum { .. } => INVALID_REQUEST_CODE,
+            Self::MalformedChecksum { .. } | Self::MultipleChecksumTypes => INVALID_REQUEST_CODE,
             Self::MalformedContentMd5 => INVALID_DIGEST_CODE,
             Self::ChecksumMismatch { .. } | Self::ContentMd5Mismatch => BAD_DIGEST_CODE,
         }
@@ -8637,6 +8913,7 @@ impl std::fmt::Display for IntegrityRejection {
             ),
             Self::MalformedContentMd5 => write!(f, "{INVALID_DIGEST_MESSAGE}"),
             Self::ContentMd5Mismatch => write!(f, "{CONTENT_MD5_MISMATCH_MESSAGE}"),
+            Self::MultipleChecksumTypes => write!(f, "{MULTIPLE_CHECKSUM_TYPES_MESSAGE}"),
         }
     }
 }
@@ -8649,6 +8926,15 @@ pub const INVALID_DIGEST_CODE: &str = "InvalidDigest";
 /// See [`INVALID_DIGEST_CODE`] — the text that list publishes for it.
 pub const INVALID_DIGEST_MESSAGE: &str =
     "The Content-MD5 or checksum value that you specified is not valid.";
+
+/// The `<Message>` S3 sends with [`INVALID_REQUEST_CODE`] for a write that declared more
+/// than one `x-amz-checksum-*` header: "Expecting a single x-amz-checksum- header. Multiple
+/// checksum Types are not allowed."
+///
+/// Fixed text that names the header PREFIX rather than any of the members the request
+/// carried, so nothing of the request is interpolated into it.
+pub const MULTIPLE_CHECKSUM_TYPES_MESSAGE: &str =
+    "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.";
 
 /// The `<Message>` S3 sends with [`BAD_DIGEST_CODE`] for a `Content-MD5` that IS a digest
 /// but not this payload's: fixed text, with no variable part — it names neither the digest
@@ -8673,6 +8959,15 @@ pub fn verify_declared_integrity(
     checksums: &DeclaredChecksums<'_>,
     body: &[u8],
 ) -> Result<(), IntegrityRejection> {
+    // One write declares ONE checksum type: "you can only specify one checksum algorithm per
+    // request" (`PutObjectRequest$ChecksumAlgorithm` names the single algorithm a write's
+    // checksum is computed under), and a stored object carries one checksum
+    // ([`Object::checksum`]), so several `x-amz-checksum-*` headers at once ask for something
+    // no object can report. Judged before any value is read, because it is a property of the
+    // request alone.
+    if checksums.declared_count() > 1 {
+        return Err(IntegrityRejection::MultipleChecksumTypes);
+    }
     if let Some(declared) = content_md5 {
         // "The Base64 encoded 128-bit MD5 digest of the data" (`PutObjectRequest$ContentMD5`)
         // — so a value that is not Base64 at all, or is Base64 of anything other than 16
@@ -10794,6 +11089,24 @@ pub const UNABLE_TO_VALIDATE_DESTINATIONS_MESSAGE: &str =
 /// — see [`CorsConfigurationRejection::code`] — where [`INVALID_ARGUMENT_CODE`] is the
 /// code for a value that is wrong for the PARAMETER carrying it.
 pub const INVALID_REQUEST_CODE: &str = "InvalidRequest";
+
+/// The code S3 answers a request whose HEADERS ask for functionality the service does not
+/// implement for the resource addressed: "NotImplemented — A header you provided implies
+/// functionality that is not implemented", HTTP 501 (Amazon S3 "Error responses", list of
+/// error codes).
+///
+/// What a member S3 documents for DIRECTORY buckets alone is answered with when the request
+/// addresses a general purpose bucket: the service implements that functionality for one
+/// kind of bucket and not for the other, so the header, not the value in it, is what cannot
+/// be served. The model declares no shape for the code, so it travels through the unmodelled
+/// channel.
+pub const NOT_IMPLEMENTED_CODE: &str = "NotImplemented";
+/// The HTTP status [`NOT_IMPLEMENTED_CODE`] is rendered with: 501, from the same list.
+pub const NOT_IMPLEMENTED_STATUS: u16 = 501;
+/// See [`NOT_IMPLEMENTED_CODE`] — the text that same list publishes for it, which names the
+/// header class rather than the member, so nothing of the request is interpolated into it.
+pub const NOT_IMPLEMENTED_HEADER_MESSAGE: &str =
+    "A header you provided implies functionality that is not implemented";
 
 /// "The CORS configuration does not exist": the code `GetBucketCors` answers for a bucket
 /// no cors configuration has been set on, with HTTP 404 (Amazon S3 "Error responses").

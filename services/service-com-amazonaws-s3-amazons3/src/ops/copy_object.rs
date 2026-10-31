@@ -403,12 +403,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         //   back here, and no object this store holds was encrypted with one — which is
         //   also why the `x-amz-copy-source-server-side-encryption-customer-*` members
         //   have nothing to decrypt.
-        // * the Object Lock members decide whether a later delete is allowed; no
-        //   retention, hold or event hold is emulated.
+        // * the Object Lock EVENT hold members decide when a period starts running from an
+        //   event nothing here raises, so no stored version can carry one.
         //
         // The copy-source PRECONDITIONS are not in this list: they are judged below
         // against the stored source object, and a condition that does not hold is answered
         // with the 412 S3 documents for them.
+        //
+        // The Object Lock MODE, RETAIN-UNTIL DATE and LEGAL HOLD are not in this list
+        // either: they are the lock the destination version is stored with, recorded on it
+        // below exactly as `PutObject` records its own.
         for (member, present) in [
             ("If-Match", input.if_match.is_some()),
             ("If-None-Match", input.if_none_match.is_some()),
@@ -427,15 +431,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             (
                 "x-amz-copy-source-server-side-encryption-customer-key",
                 input.copy_source_sse_customer_key.is_some(),
-            ),
-            ("x-amz-object-lock-mode", input.object_lock_mode.is_some()),
-            (
-                "x-amz-object-lock-retain-until-date",
-                input.object_lock_retain_until_date.is_some(),
-            ),
-            (
-                "x-amz-object-lock-legal-hold",
-                input.object_lock_legal_hold_status.is_some(),
             ),
             (
                 "x-amz-object-lock-event-hold",
@@ -480,19 +475,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // through the access point" by ARN. This emulator holds no access points and no
         // Outposts, so there is no object such a value could address — and a 200 for it
         // would claim a copy out of a resource that does not exist here.
-        // The one leading slash the member's pattern allows is stripped the same way
-        // `parse_copy_source` strips it, so a value is classified the same here and there.
-        if input
-            .copy_source
-            .strip_prefix('/')
-            .unwrap_or(&input.copy_source)
-            .starts_with(ACCESS_POINT_ARN_PREFIX)
-        {
+        if crate::state::copy_source_is_arn(&input.copy_source) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "CopyObject with an Amazon Resource Name as x-amz-copy-source",
             ));
         }
-        let source = match parse_copy_source(&input.copy_source) {
+        let source = match crate::state::parse_copy_source(&input.copy_source) {
             Ok(source) => source,
             // The member's pattern (`^\/?.+\/.+$`) is already enforced at the boundary,
             // so what reaches here is a value that satisfies it and still names no
@@ -572,6 +560,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // gets.
         let excludes_annotations = input.annotation_directive.as_deref() == Some(DIRECTIVE_EXCLUDE);
 
+        // The Object Lock this copy asks for the DESTINATION version to be stored with, read
+        // off the three members that carry it through the one rule every write in this
+        // service reads them by ([`crate::state::requested_object_lock`]). Half a retention
+        // describes no period and a date outside the range this platform holds names no
+        // instant: either is a parameter that is not valid for the request, which is what the
+        // modelled `InvalidRequest` reports.
+        let Ok(requested_lock) = crate::state::requested_object_lock(
+            input.object_lock_mode.as_deref(),
+            input.object_lock_retain_until_date.as_ref(),
+            input.object_lock_legal_hold_status.as_deref(),
+        ) else {
+            return Err(CopyObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+        };
+
         let mut store = state.lock();
 
         // The DESTINATION bucket decides the encryption of a copy that named none of it,
@@ -587,6 +589,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         } else {
             requested.clone()
         };
+        // A retention and a legal hold are the two halves of S3 Object Lock, which a bucket
+        // has only once an Object Lock configuration is on it: the configuration's rule "will
+        // be applied by default to every new object placed in the specified bucket"
+        // (`PutObjectLockConfiguration`'s own documentation), and a bucket carrying none locks
+        // nothing. Asking a write into such a bucket for a lock is a request S3 cannot carry
+        // out as given, which is what `InvalidRequest` reports — the refusal
+        // `PutObjectRetention` answers the same cause with.
+        if requested_lock.names_a_member() && !destination.object_lock_enabled() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE,
+            ));
+        }
 
         // The SOURCE object, copied out of the store so the write below can borrow it
         // mutably. "If your source bucket versioning is enabled, the x-amz-copy-source
@@ -662,8 +678,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             ));
         }
 
-        // The copy-source preconditions, judged against the version actually found.
-        if let Some(unmet) = unmet_source_precondition(&input, &source_object) {
+        // The copy-source preconditions, judged against the version actually found, through
+        // the one rule every copy in this service judges them by.
+        if let Some(unmet) = crate::state::unmet_copy_source_precondition(
+            &copy_source_conditions(&input),
+            &source_object,
+        ) {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::PRECONDITION_FAILED_CODE,
                 crate::state::PRECONDITION_FAILED_STATUS,
@@ -754,15 +774,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             // bucket's versioning state: this write carries no id of its own.
             version_id: None,
             encryption: encryption.clone(),
-            // This write names no Object Lock retention of its own: the object-lock headers
-            // are refused above. The store applies the destination bucket's own default
-            // retention to the version it records, when its Object Lock configuration names
-            // one, and `PutObjectRetention` is what places a retention on a stored version
-            // afterwards.
-            retention: None,
-            // Nor a legal hold, for the same reason: `PutObjectLegalHold` is what applies
-            // one to a stored version.
-            legal_hold: None,
+            // The Object Lock this copy asked for the destination version to be stored with:
+            // "the Object Lock mode that you want to apply to the copied object"
+            // (`CopyObjectRequest$ObjectLockMode`) with the date it runs to, and the legal
+            // hold "you want to apply to the copied object"
+            // (`$ObjectLockLegalHoldStatus`) — never the SOURCE version's lock, which stays
+            // with the source. A copy naming no retention leaves the store to apply the
+            // destination bucket's own default, and `PutObjectRetention` /
+            // `PutObjectLegalHold` are what change either afterwards.
+            retention: requested_lock.retention.clone(),
+            legal_hold: requested_lock.legal_hold,
             // And no restore: the copy is stored in a non-archived storage class (the source
             // had to be out of one for this copy to be served at all), so there is nothing
             // to restore; `RestoreObject` is what asks for one.
@@ -994,10 +1015,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
     }
 }
 
-/// The prefix of the second documented `x-amz-copy-source` form — the ARN of an object
-/// "as accessed through the access point", or through S3 on Outposts.
-const ACCESS_POINT_ARN_PREFIX: &str = "arn:";
-
 /// The `MetadataDirective` / `TaggingDirective` value that takes the member from the
 /// REQUEST rather than the source object. Both enums are `COPY | REPLACE`
 /// (`smithy_query(query="shape",shape="MetadataDirective,TaggingDirective")`), and `COPY`
@@ -1011,145 +1028,20 @@ const DIRECTIVE_REPLACE: &str = "REPLACE";
 /// the copy carries over.
 const DIRECTIVE_EXCLUDE: &str = "EXCLUDE";
 
-/// The source one `x-amz-copy-source` value names.
-#[derive(Debug)]
-struct CopySourceRef {
-    /// The source bucket, URL-decoded.
-    bucket: String,
-    /// The source object's key, URL-decoded.
-    key: String,
-    /// The stored version the value's `?versionId=` named, or `None` when it named none —
-    /// in which case the copy is of the key's current version.
-    version_id: Option<String>,
-}
-
-/// Read a `CopySource` value into the bucket, key and version it names, or report why it
-/// names none.
-///
-/// "Specify the name of the source bucket and the key of the source object, separated by a
-/// slash (/). For example, to copy the object `reports/january.pdf` from the general
-/// purpose bucket `awsexamplebucket`, use `awsexamplebucket/reports/january.pdf`. The
-/// value must be URL-encoded." A stored version is addressed by appending
-/// `?versionId=<version-id>` to that value
-/// (`smithy_query(query="doc",shape="CopyObjectRequest",member="CopySource")`), and the
-/// member's own pattern (`^\/?.+\/.+$`) allows one leading slash, so the FIRST slash after
-/// it separates the bucket from the key — a key with slashes of its own keeps them.
-fn parse_copy_source(value: &str) -> Result<CopySourceRef, String> {
-    let rejection = || {
-        format!(
-            "x-amz-copy-source must name the source bucket and the source object's key \
-             separated by a slash, URL-encoded, optionally followed by \
-             ?versionId=<version-id>, got {value:?}"
-        )
-    };
-    // The value is URL-encoded, so a `?` in it is the query delimiter and a `?` in a key
-    // arrives as `%3F` — which is what makes the FIRST one the end of the key, and makes
-    // `versionId` the only subresource the value may carry.
-    let (path, version_id) = match value.split_once('?') {
-        None => (value, None),
-        Some((path, query)) => match query.strip_prefix("versionId=") {
-            Some(version_id) if !version_id.is_empty() => (path, Some(version_id)),
-            _ => return Err(rejection()),
-        },
-    };
-    let path = path.strip_prefix('/').unwrap_or(path);
-    let Some((bucket, key)) = path.split_once('/') else {
-        return Err(rejection());
-    };
-    if bucket.is_empty() || key.is_empty() {
-        return Err(rejection());
+/// The four copy-source conditional members this request carried, for the one rule every
+/// copy in this service judges them by
+/// ([`crate::state::unmet_copy_source_precondition`]).
+fn copy_source_conditions(input: &CopyObjectInput) -> crate::state::CopySourceConditions<'_> {
+    crate::state::CopySourceConditions {
+        if_match: input.copy_source_if_match.as_deref(),
+        if_none_match: input.copy_source_if_none_match.as_deref(),
+        if_modified_since: input
+            .copy_source_if_modified_since
+            .as_ref()
+            .map(::aws_smithy_types::DateTime::secs),
+        if_unmodified_since: input
+            .copy_source_if_unmodified_since
+            .as_ref()
+            .map(::aws_smithy_types::DateTime::secs),
     }
-    let Some(bucket) = url_decoded(bucket) else {
-        return Err(rejection());
-    };
-    let Some(key) = url_decoded(key) else {
-        return Err(rejection());
-    };
-    let version_id = match version_id {
-        None => None,
-        Some(version_id) => match url_decoded(version_id) {
-            Some(version_id) => Some(version_id),
-            None => return Err(rejection()),
-        },
-    };
-    Ok(CopySourceRef {
-        bucket,
-        key,
-        version_id,
-    })
-}
-
-/// One percent-encoded element of a copy source, decoded — or `None` when its escapes do
-/// not decode to UTF-8, which no bucket name or object key this store holds is.
-fn url_decoded(value: &str) -> Option<String> {
-    ::percent_encoding::percent_decode_str(value)
-        .decode_utf8()
-        .ok()
-        .map(::std::borrow::Cow::into_owned)
-}
-
-/// The copy-source precondition this request carries that does NOT hold against
-/// `source`, named by its header, or `None` when every one of them holds.
-///
-/// The four members are evaluated in the order RFC 7232 gives them — an entity-tag
-/// precondition first, and the date precondition beside it only when that tag member is
-/// absent — which is exactly what the two combinations the members document describe:
-/// "if both the x-amz-copy-source-if-match and x-amz-copy-source-if-unmodified-since
-/// headers are present … x-amz-copy-source-if-match condition evaluates to true
-/// [and] x-amz-copy-source-if-unmodified-since condition evaluates to false" answers 200
-/// and copies, while "x-amz-copy-source-if-none-match condition evaluates to false [and]
-/// x-amz-copy-source-if-modified-since condition evaluates to true" answers 412.
-fn unmet_source_precondition(
-    input: &CopyObjectInput,
-    source: &crate::state::Object,
-) -> Option<&'static str> {
-    // The stored time is compared at whole-second granularity, because that is the
-    // granularity of the HTTP-date these members carry and of the `Last-Modified` the
-    // client read the value from.
-    let modified_at = unix_seconds(source.last_modified);
-    if let Some(header) = input.copy_source_if_match.as_deref() {
-        if !etag_matches(header, &source.etag) {
-            return Some("x-amz-copy-source-if-match");
-        }
-    } else if let Some(since) = input.copy_source_if_unmodified_since.as_ref() {
-        // "Copies the object if it hasn't been modified since the specified time."
-        if modified_at > since.secs() {
-            return Some("x-amz-copy-source-if-unmodified-since");
-        }
-    }
-    if let Some(header) = input.copy_source_if_none_match.as_deref() {
-        if etag_matches(header, &source.etag) {
-            return Some("x-amz-copy-source-if-none-match");
-        }
-    } else if let Some(since) = input.copy_source_if_modified_since.as_ref() {
-        // "Copies the object if it has been modified since the specified time."
-        if modified_at <= since.secs() {
-            return Some("x-amz-copy-source-if-modified-since");
-        }
-    }
-    None
-}
-
-/// Whether an entity-tag precondition value names `etag`.
-///
-/// An `ETag` is reported inside quotes, and a client may send the value back with or
-/// without them, as a comma-separated list, or as the `*` wildcard that names any existing
-/// entity (RFC 7232 §2.3, §3.1) — so each candidate is compared on the tag's own value
-/// ([`crate::state::etag_value`]), with the weak marker stripped too.
-fn etag_matches(header: &str, etag: &str) -> bool {
-    let stored = crate::state::etag_value(etag);
-    header.split(',').any(|candidate| {
-        let candidate = candidate.trim();
-        candidate == "*"
-            || crate::state::etag_value(candidate.trim_start_matches("W/")) == stored
-    })
-}
-
-/// `at` as whole seconds since the Unix epoch, the unit the modelled timestamps the
-/// preconditions carry are compared in.
-fn unix_seconds(at: ::std::time::SystemTime) -> i64 {
-    at.duration_since(::std::time::SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|since| i64::try_from(since.as_secs()).ok())
-        .unwrap_or_default()
 }

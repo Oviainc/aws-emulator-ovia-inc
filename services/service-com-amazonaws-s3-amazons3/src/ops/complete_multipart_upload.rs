@@ -586,10 +586,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
         // Everything else about the object is what the INITIATING request settled — "when
         // you initiate a multipart upload, you specify the options you want on the finished
         // object" — read off the recorded upload rather than off this request, which carries
-        // none of it. The members a later call places on a stored version (its Object Lock
-        // retention and legal hold, its restore, its annotations and its ACL) are unset,
-        // which is the state any write leaves a version in.
+        // none of it. The members a later call places on a stored version (its restore, its
+        // annotations and its ACL) are unset, which is the state any write leaves a version
+        // in; its Object Lock is one of the options the initiation settled, so the version is
+        // stored under the lock that initiation named.
         let encryption = upload.encryption.clone();
+        let object_lock = upload.object_lock.clone();
         let object = crate::state::Object {
             etag: etag.clone(),
             // The instant the object came into being, which is what `Last-Modified` reports:
@@ -610,8 +612,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
             // state: a completion carries no id of its own either.
             version_id: None,
             encryption: encryption.clone(),
-            retention: None,
-            legal_hold: None,
+            retention: object_lock.retention.clone(),
+            legal_hold: object_lock.legal_hold,
             restore: None,
             annotations: ::std::collections::BTreeMap::new(),
             acl: None,

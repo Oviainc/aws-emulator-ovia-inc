@@ -29,6 +29,7 @@
 
 use std::sync::Arc;
 
+use service_com_amazonaws_s3_amazons3::state::DEFAULT_SSE_ALGORITHM;
 use service_com_amazonaws_s3_amazons3::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -185,8 +186,11 @@ struct InitiationCase {
     /// The `ChecksumAlgorithm` the response and the read-back must report, or `None` when
     /// the initiation named none (in which case neither reports one).
     checksum_algorithm: Option<&'static str>,
-    /// The `x-amz-server-side-encryption` the response must report, or `None` when the
-    /// initiation named none.
+    /// The `x-amz-server-side-encryption` the response must report. An initiation that
+    /// names none is recorded under the BUCKET's default encryption configuration — "Amazon
+    /// S3 encrypts data with server-side encryption by using Amazon S3 managed keys (SSE-S3)
+    /// by default" (`PutObjectRequest$ServerSideEncryption`) — so such a row reports
+    /// [`DEFAULT_SSE_ALGORITHM`], exactly as a one-shot write into the same bucket does.
     sse_algorithm: Option<&'static str>,
 }
 
@@ -201,7 +205,7 @@ fn initiation_cases() -> Vec<InitiationCase> {
             headers: Vec::new(),
             storage_class: "STANDARD",
             checksum_algorithm: None,
-            sse_algorithm: None,
+            sse_algorithm: Some(DEFAULT_SSE_ALGORITHM),
         },
         InitiationCase {
             case: "a nested key, a content type and user metadata".to_string(),
@@ -214,7 +218,7 @@ fn initiation_cases() -> Vec<InitiationCase> {
             ],
             storage_class: "STANDARD",
             checksum_algorithm: None,
-            sse_algorithm: None,
+            sse_algorithm: Some(DEFAULT_SSE_ALGORITHM),
         },
         InitiationCase {
             case: "a tag set in x-amz-tagging".to_string(),
@@ -222,7 +226,7 @@ fn initiation_cases() -> Vec<InitiationCase> {
             headers: vec![("x-amz-tagging", "Project=emulator&Stage=test")],
             storage_class: "STANDARD",
             checksum_algorithm: None,
-            sse_algorithm: None,
+            sse_algorithm: Some(DEFAULT_SSE_ALGORITHM),
         },
         InitiationCase {
             case: "server-side encryption with an S3 managed key".to_string(),
@@ -255,7 +259,7 @@ fn initiation_cases() -> Vec<InitiationCase> {
             headers: Vec::new(),
             storage_class: "STANDARD",
             checksum_algorithm: None,
-            sse_algorithm: None,
+            sse_algorithm: Some(DEFAULT_SSE_ALGORITHM),
         },
     ];
     // One row per storage class the model declares that this suite names, so the recorded
@@ -267,7 +271,7 @@ fn initiation_cases() -> Vec<InitiationCase> {
             headers: vec![("x-amz-storage-class", storage_class)],
             storage_class,
             checksum_algorithm: None,
-            sse_algorithm: None,
+            sse_algorithm: Some(DEFAULT_SSE_ALGORITHM),
         });
     }
     // One row per checksum algorithm, which is a CONFIGURATION of the upload: it is
@@ -280,7 +284,7 @@ fn initiation_cases() -> Vec<InitiationCase> {
             headers: vec![("x-amz-checksum-algorithm", algorithm)],
             storage_class: "STANDARD",
             checksum_algorithm: Some(algorithm),
-            sse_algorithm: None,
+            sse_algorithm: Some(DEFAULT_SSE_ALGORITHM),
         });
     }
     cases

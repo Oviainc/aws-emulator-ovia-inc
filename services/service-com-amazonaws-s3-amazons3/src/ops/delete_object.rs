@@ -383,6 +383,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
             let Some(bucket_record) = store.bucket(&input.bucket) else {
                 return Err(DeleteObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
             };
+            // "The `If-Match` header is supported for both general purpose and directory
+            // buckets. `IfMatchLastModifiedTime` and `IfMatchSize` is only supported for
+            // directory buckets" (`DeleteObject`'s own documentation, and the same note on
+            // `DeleteObjectRequest$IfMatchSize`) — so those two members on a general purpose
+            // bucket ask for functionality the service does not implement there, which is
+            // the 501 S3 answers a header it cannot honour with. The delete is refused
+            // whole: an unserved condition must not be dropped and the object deleted anyway.
+            if !bucket_record.is_directory()
+                && names_directory_bucket_only_condition(&input)
+            {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NOT_IMPLEMENTED_CODE,
+                    crate::state::NOT_IMPLEMENTED_STATUS,
+                    crate::state::NOT_IMPLEMENTED_HEADER_MESSAGE,
+                ));
+            }
             // A delete that names a `versionId` addresses that stored version; one that
             // names none addresses the key's CURRENT object, which is nothing at all where
             // the key holds nothing or a delete marker hides it.
@@ -623,4 +639,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
             }
         }
     }
+}
+
+/// Whether `input` makes its delete conditional on a member S3 supports only for DIRECTORY
+/// buckets.
+///
+/// "The `If-Match` header is supported for both general purpose and directory buckets.
+/// `IfMatchLastModifiedTime` and `IfMatchSize` is only supported for directory buckets"
+/// (`DeleteObject`'s own documentation), so those two are the members a delete addressed to a
+/// general purpose bucket cannot be judged by — and `If-Match`, which both kinds support, is
+/// not among them.
+fn names_directory_bucket_only_condition(input: &DeleteObjectInput) -> bool {
+    input.if_match_last_modified_time.is_some() || input.if_match_size.is_some()
 }

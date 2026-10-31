@@ -366,12 +366,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //   S3 does not keep, or answering reads of an object whose key was never checked.
         //   `GetObject` refuses them for the same reason, so no object here is addressed
         //   by one.
-        // * the Object Lock members decide whether a later delete is allowed; no
-        //   retention or hold is emulated.
+        // * the Object Lock EVENT hold members start a period running from an event nothing
+        //   here raises, so no stored version can carry one.
         //
         // `If-Match` and `If-None-Match` are NOT in this list: they make the write
         // conditional on what the key holds, which is judged below against the object the
         // store really holds and refused with the documented 412 when it does not hold.
+        //
+        // The Object Lock MODE, RETAIN-UNTIL DATE and LEGAL HOLD are NOT in this list
+        // either: they are the lock the version this write stores is stored WITH, recorded
+        // on it below, which is what a later delete of that version is judged against.
         //
         // `x-amz-tagging` is NOT in this list: it carries a tag set this emulator stores
         // on the object it writes (see below), exactly as `PutObjectTagging` would.
@@ -395,15 +399,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "x-amz-server-side-encryption-customer-key",
                 input.sse_customer_key.is_some(),
             ),
-            ("x-amz-object-lock-mode", input.object_lock_mode.is_some()),
-            (
-                "x-amz-object-lock-retain-until-date",
-                input.object_lock_retain_until_date.is_some(),
-            ),
-            (
-                "x-amz-object-lock-legal-hold",
-                input.object_lock_legal_hold_status.is_some(),
-            ),
             (
                 "x-amz-object-lock-event-hold",
                 input.object_lock_event_hold.is_some(),
@@ -415,6 +410,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+
+        // The Object Lock this write asks for the version it stores to be locked under, read
+        // off the three members that carry it through the one rule every write in this
+        // service reads them by ([`crate::state::requested_object_lock`]). Half a retention
+        // describes no period and a date outside the range this platform holds names no
+        // instant: either is a parameter that is not valid for the request, which is what the
+        // modelled `InvalidRequest` reports.
+        let Ok(requested_lock) = crate::state::requested_object_lock(
+            input.object_lock_mode.as_deref(),
+            input.object_lock_retain_until_date.as_ref(),
+            input.object_lock_legal_hold_status.as_deref(),
+        ) else {
+            return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+        };
 
         // The integrity values this write DECLARED, judged before anything is stored:
         // `Content-MD5` is "a message integrity check to verify that the request body was
@@ -554,6 +563,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             requested
         };
+        // A retention and a legal hold are the two halves of S3 Object Lock, which a bucket
+        // has only once an Object Lock configuration is on it: the configuration's rule "will
+        // be applied by default to every new object placed in the specified bucket"
+        // (`PutObjectLockConfiguration`'s own documentation), and a bucket carrying none locks
+        // nothing. Asking a write into such a bucket for a lock is a request S3 cannot carry
+        // out as given, which is what `InvalidRequest` reports — the refusal
+        // `PutObjectRetention` answers the same cause with.
+        if requested_lock.names_a_member() && !bucket_record.object_lock_enabled() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE,
+            ));
+        }
 
         // The BYTES this write leaves at the key, and the class they are stored in.
         //
@@ -735,14 +758,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // versioning state: this write carries no id of its own.
             version_id: None,
             encryption: encryption.clone(),
-            // This write names no Object Lock retention of its own: the object-lock headers
-            // are refused above. The store applies the bucket's own default retention to the
-            // version it records, when its Object Lock configuration names one, and
-            // `PutObjectRetention` is what places a retention on a stored version afterwards.
-            retention: None,
-            // Nor a legal hold, for the same reason: `PutObjectLegalHold` is what applies
-            // one to a stored version.
-            legal_hold: None,
+            // The Object Lock this write asked the version it stores to be locked under:
+            // "the Object Lock mode that you want to apply to this object"
+            // (`PutObjectRequest$ObjectLockMode`) with the date it runs to, and "whether a
+            // legal hold will be applied to this object"
+            // (`$ObjectLockLegalHoldStatus`) — which is what a later delete of this version
+            // is judged against. A write naming no retention leaves the store to apply the
+            // bucket's own default retention, when its Object Lock configuration names one,
+            // and `PutObjectRetention` / `PutObjectLegalHold` are what change either
+            // afterwards.
+            retention: requested_lock.retention.clone(),
+            legal_hold: requested_lock.legal_hold,
             // A write initiates no restore either: a restore is asked for on an
             // already-archived version afterwards, by `RestoreObject`.
             restore: None,

@@ -24,6 +24,13 @@
 //! `x-amz-if-match-size` conditional headers in conjunction with each-other or individually"
 //! (`$IfMatchSize`): every member the request carries has to hold.
 //!
+//! WHERE each is supported differs, which is what decides the bucket a row is sent to: "the
+//! `If-Match` header is supported for both general purpose and directory buckets.
+//! `IfMatchLastModifiedTime` and `IfMatchSize` is only supported for directory buckets"
+//! (`DeleteObject`'s own documentation) — so the rows carrying a time or a size are sent to a
+//! directory bucket, and [`super::directory_bucket_conditional_deletes`] is what pins the
+//! refusal of those two members on a general purpose bucket.
+//!
 //! The rows differ along what the rule generalises over: WHICH member carries the condition
 //! and how many of them at once, whether each one holds, how the entity tag is QUOTED (a
 //! client may send it with or without the double quotes HTTP's quoted-string syntax wraps it
@@ -38,6 +45,7 @@ use service_com_amazonaws_s3_amazons3::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{router, send_bytes, Answer};
+use super::directory_bucket_sessions_and_appends::directory_bucket;
 use super::object_and_tagging_roundtrip::{bucket, get_object, put_object, text};
 use super::object_partial_reads::seeded_payload;
 
@@ -65,7 +73,10 @@ fn as_timestamp(last_modified: &str) -> String {
 }
 
 /// `DELETE /<bucket>/<key>` — `DeleteObject`, with the conditional headers the row carries.
-async fn delete_object(
+///
+/// `pub(crate)`: the suite that pins which bucket kind supports which of those members
+/// ([`super::directory_bucket_conditional_deletes`]) sends the same request.
+pub(crate) async fn delete_object(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
@@ -117,6 +128,10 @@ async fn a_conditional_delete_is_carried_out_only_when_every_condition_holds() {
     let router = router();
     let name = "conditional-delete-bucket";
     bucket(&router, name).await;
+    // The modification-time and size conditions are "only supported for directory buckets",
+    // so the rows that carry one are sent here instead.
+    let directory = "conditional-delete--use1-az4--x-s3";
+    directory_bucket(&router, directory, "use1-az4").await;
 
     // The rows: each member on its own, holding and not holding; the two forms of a tag that
     // holds and the wildcard; a key holding nothing under each member; several members at
@@ -263,6 +278,13 @@ async fn a_conditional_delete_is_carried_out_only_when_every_condition_holds() {
     for (index, row) in rows.iter().enumerate() {
         let case = row.case;
         let key = format!("locks/row-{index}.bin");
+        // Where the row's conditions are supported: a time or a size names a condition only a
+        // directory bucket serves, and an `If-Match` on its own is served by either kind.
+        let name = if row.size == Fact::Unnamed && row.time == Fact::Unnamed {
+            name
+        } else {
+            directory
+        };
 
         // What the key holds, and the facts about it a read reports — the tag, the size and
         // the modification time every condition is judged against.

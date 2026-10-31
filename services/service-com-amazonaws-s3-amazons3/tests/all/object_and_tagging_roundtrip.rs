@@ -668,12 +668,14 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
 
     // Members whose semantics this emulator cannot carry out keep the scaffold's 501
     // rather than being stripped and answered as a plain success — and the request they
-    // were refused on changes nothing. Three members are NOT among them any more: the
+    // were refused on changes nothing. Four members are NOT among them any more: the
     // server-side-encryption pair is recorded with the object and reported back (the
     // `object_encryption` suite covers it), `x-amz-tagging`'s tag set is parsed and
-    // stored (`object_tagging_on_put.rs`), and the conditional members are judged against
-    // what the key holds (`object_conditional_writes.rs`). SSE-C stays, because S3 stores no
-    // customer key.
+    // stored (`object_tagging_on_put.rs`), the conditional members are judged against
+    // what the key holds (`object_conditional_writes.rs`), and the Object Lock mode,
+    // retain-until date and legal hold are stored ON the version the write records
+    // (`object_lock_on_write.rs`). SSE-C stays, because S3 stores no customer key, and so
+    // does the Object Lock EVENT hold, whose period runs from an event nothing here raises.
     for (case, headers) in [
         (
             "a customer-provided encryption key",
@@ -683,8 +685,8 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
             )][..],
         ),
         (
-            "an object lock mode",
-            &[("x-amz-object-lock-mode", "GOVERNANCE")][..],
+            "an object lock event hold",
+            &[("x-amz-object-lock-event-hold", "ON")][..],
         ),
     ] {
         let refused = put_object(

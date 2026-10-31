@@ -305,12 +305,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
 
         // The whole request is addressed to one bucket, so a bucket this emulator does not
         // hold refuses it entirely rather than reporting a per-key error: `NoSuchBucket`
-        // (404), the code every other object operation here answers it with.
-        if store.bucket(&input.bucket).is_none() {
+        // (404), the code every other object operation here answers it with. The bucket's
+        // KIND is read off the same lookup, so what the conditions below are judged by cannot
+        // default to "general purpose" for a bucket nothing resolved.
+        let Some(bucket_record) = store.bucket(&input.bucket) else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::NO_SUCH_BUCKET_CODE,
                 404,
                 crate::state::NO_SUCH_BUCKET_MESSAGE,
+            ));
+        };
+        let general_purpose = !bucket_record.is_directory();
+
+        // "The `If-Match` header is supported for both general purpose and directory
+        // buckets. `IfMatchLastModifiedTime` and `IfMatchSize` is only supported for
+        // directory buckets" (`DeleteObject`'s own documentation) — and this batch's
+        // identifiers carry the same three conditions, as `ObjectIdentifier$LastModifiedTime`
+        // and `$Size` repeat ("this functionality is only supported for directory buckets").
+        // So a batch addressed to a general purpose bucket that makes any identifier
+        // conditional on a modification time or a size asks for functionality the service
+        // does not implement there: the 501 S3 answers a header it cannot honour with,
+        // refusing the request whole rather than dropping the condition and deleting anyway.
+        if general_purpose
+            && identifiers
+                .iter()
+                .any(|identifier| {
+                    identifier.last_modified_time.is_some() || identifier.size.is_some()
+                })
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NOT_IMPLEMENTED_CODE,
+                crate::state::NOT_IMPLEMENTED_STATUS,
+                crate::state::NOT_IMPLEMENTED_HEADER_MESSAGE,
             ));
         }
 
@@ -336,6 +362,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
         let now = ::std::time::SystemTime::now();
         for identifier in identifiers {
             let key = identifier.key.as_str();
+            // The conditional members of THIS identifier, judged against the version it
+            // addresses before anything is taken away, through the one rule every
+            // conditional delete in this service is judged by
+            // ([`crate::state::delete_precondition_fails`]): "an entity tag (ETag) …
+            // makes the request method conditional on `ETags`"
+            // (`ObjectIdentifier$ETag`), beside the modification time and size a directory
+            // bucket's identifier may add. A condition that does not hold is THIS key's
+            // failure — "for each key, Amazon S3 performs a delete operation and returns the
+            // result of that delete, success or failure, in the response" — so it is reported
+            // beside the keys that did delete, with the code and sentence a single-object
+            // conditional delete answers, and nothing of this key is removed.
+            if identifier.e_tag.is_some()
+                || identifier.last_modified_time.is_some()
+                || identifier.size.is_some()
+            {
+                let unmet = store.bucket(&input.bucket).is_some_and(|bucket| {
+                    let addressed = match identifier.version_id.as_deref() {
+                        None => bucket.object(key),
+                        Some(version_id) => bucket
+                            .stored_version(key, version_id)
+                            .and_then(crate::state::StoredVersion::as_object),
+                    };
+                    crate::state::delete_precondition_fails(
+                        addressed,
+                        identifier.e_tag.as_deref(),
+                        identifier
+                            .last_modified_time
+                            .as_ref()
+                            .and_then(crate::state::instant_of),
+                        identifier.size,
+                    )
+                });
+                if unmet {
+                    errors.push(Error {
+                        key: Some(key.to_string()),
+                        version_id: identifier.version_id.clone(),
+                        code: Some(crate::state::PRECONDITION_FAILED_CODE.to_string()),
+                        message: Some(crate::state::PRECONDITION_FAILED_MESSAGE.to_string()),
+                    });
+                    continue;
+                }
+            }
             // S3 OBJECT LOCK protects the version an identifier would permanently remove —
             // the one its `VersionId` names, or the `null` version a simple delete takes
             // away on a bucket that keeps no history — so the lock is read before anything

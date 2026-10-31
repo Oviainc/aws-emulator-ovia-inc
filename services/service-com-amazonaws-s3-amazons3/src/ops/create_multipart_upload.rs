@@ -394,10 +394,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The encryption configuration this upload is initiated under, taken from the
-        // modelled members the request carried — the CONFIGURATION, not a key and not a
-        // ciphertext, the same record `PutObject` keeps on a stored object.
-        let encryption = crate::state::ObjectEncryption {
+        // The encryption configuration this upload ASKED for, taken from the modelled
+        // members the request carried — the CONFIGURATION, not a key and not a ciphertext,
+        // the same record `PutObject` keeps on a stored object.
+        let requested = crate::state::ObjectEncryption {
             sse_algorithm: input.server_side_encryption.clone(),
             kms_key_id: input.ssekms_key_id.clone(),
             kms_encryption_context: input.ssekms_encryption_context.clone(),
@@ -408,8 +408,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // three names something only SSE-KMS has, so one of them beside another algorithm
         // — or beside none — is a parameter that is not valid for this request, which S3
         // answers with `InvalidArgument` (400). `PutObject` refuses it identically.
-        if !encryption.uses_kms() {
-            if let Some(member) = encryption.kms_only_member() {
+        if !requested.uses_kms() {
+            if let Some(member) = requested.kms_only_member() {
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::INVALID_ARGUMENT_CODE,
                     crate::state::INVALID_ARGUMENT_STATUS,
@@ -479,6 +479,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // The Object Lock this initiation asks the finished object to be stored with, read
+        // off the three members that carry it through the one rule every write in this
+        // service reads them by ([`crate::state::requested_object_lock`]). Half a retention
+        // describes no period and a date outside the range this platform holds names no
+        // instant: either is a parameter that is not valid for the request, which is
+        // `InvalidRequest` (400) with the sentence the modelled shape states for itself —
+        // this operation declares no error shapes, so it goes out through the unmodelled
+        // channel, and nothing is recorded.
+        let Ok(requested_lock) = crate::state::requested_object_lock(
+            input.object_lock_mode.as_deref(),
+            input.object_lock_retain_until_date.as_ref(),
+            input.object_lock_legal_hold_status.as_deref(),
+        ) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                crate::state::INVALID_REQUEST_MESSAGE,
+            ));
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store the upload cannot be recorded at all, and no modelled
+            // error says that, so the documented code for "we could not carry out the
+            // request" goes out rather than a 501, which would claim this operation is
+            // unwritten.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // The encryption the upload is INITIATED under, which is what every later part write
+        // and the completed object report: what the request named, or — when it named none of
+        // the four members — the BUCKET's default encryption configuration, because "Amazon
+        // S3 encrypts data with server-side encryption by using Amazon S3 managed keys
+        // (SSE-S3) by default" and the other key options are the ones that configuration
+        // carries (`PutObjectRequest$ServerSideEncryption`). Resolved from the same accessor
+        // `PutObject` resolves a one-shot write's through, so an object assembled from parts
+        // is stored under exactly the encryption a write of the same bytes would be. Reading
+        // it writes nothing: a never-configured bucket's default is computed, not
+        // materialised.
+        let encryption = if requested.names_no_member() {
+            let store = state.lock();
+            match store.bucket(&input.bucket) {
+                Some(bucket) => bucket.default_object_encryption(),
+                // A bucket this emulator does not hold records no upload at all: the
+                // initiation below is what answers that, so nothing is decided here.
+                None => requested.clone(),
+            }
+        } else {
+            requested.clone()
+        };
+
         let upload = crate::state::MultipartUpload {
             key: input.key.clone(),
             // Read here, where the upload comes into being, so `Initiated` is the moment
@@ -519,18 +573,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // multipart upload … before you can upload any part" (`UploadPart`'s own
             // documentation), so the parts arrive afterwards, through `UploadPart`.
             parts: ::std::collections::BTreeMap::new(),
-        };
-
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            // Without the store the upload cannot be recorded at all, and no modelled
-            // error says that, so the documented code for "we could not carry out the
-            // request" goes out rather than a 501, which would claim this operation is
-            // unwritten.
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::INTERNAL_ERROR_CODE,
-                crate::state::INTERNAL_ERROR_STATUS,
-                "the shared S3 store is unreachable from this engine",
-            ));
+            // "When you initiate a multipart upload, you specify the options you want on the
+            // finished object": the Object Lock this initiation named is held with the upload
+            // and stored on the version the completion writes.
+            object_lock: requested_lock.clone(),
         };
 
         // The store reports what the initiation did, because it may refuse: a bucket this
@@ -539,6 +585,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answered as a refusal, so nothing is recorded and the caller is told.
         let outcome = {
             let mut store = state.lock();
+            // A retention and a legal hold are the two halves of S3 Object Lock, which a
+            // bucket has only once an Object Lock configuration is on it, so asking an upload
+            // into a bucket carrying none for a lock is a request S3 cannot carry out as
+            // given: `InvalidRequest` (400), the refusal `PutObject` and `PutObjectRetention`
+            // answer the same cause with. A bucket this emulator does not hold is answered by
+            // the initiation below instead, so the address is reported before the lock is.
+            if requested_lock.names_a_member()
+                && store
+                    .bucket(&input.bucket)
+                    .is_some_and(|bucket| !bucket.object_lock_enabled())
+            {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_REQUEST_CODE,
+                    crate::state::INVALID_REQUEST_STATUS,
+                    crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE,
+                ));
+            }
             store.create_multipart_upload(&input.bucket, upload)
         };
         let Some(outcome) = outcome else {
@@ -631,8 +694,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             upload_id: Some(upload_id),
             // The encryption configuration the upload was recorded under, reported back
             // the way `PutObject` reports a stored object's: these are the recorded
-            // values, so an initiation that named no encryption reports none rather than a
-            // default nothing applied.
+            // values, so an initiation that named no encryption of its own reports the
+            // bucket's own default, which is what the object it completes into is stored
+            // under.
             server_side_encryption: encryption.sse_algorithm.clone(),
             ssekms_key_id: encryption.kms_key_id.clone(),
             ssekms_encryption_context: encryption.kms_encryption_context.clone(),
@@ -674,15 +738,6 @@ fn unserved_feature(input: &CreateMultipartUploadInput) -> Option<&'static str> 
             "SSECustomerAlgorithm",
         ),
         (input.sse_customer_key.is_some(), "SSECustomerKey"),
-        (input.object_lock_mode.is_some(), "ObjectLockMode"),
-        (
-            input.object_lock_retain_until_date.is_some(),
-            "ObjectLockRetainUntilDate",
-        ),
-        (
-            input.object_lock_legal_hold_status.is_some(),
-            "ObjectLockLegalHoldStatus",
-        ),
         (
             input.object_lock_event_hold.is_some(),
             "ObjectLockEventHold",

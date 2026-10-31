@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UploadPartCopy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UploadPartCopy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UploadPartCopy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this records ONE part of an in-progress multipart upload from the bytes of
+//! an object this emulator already holds — "uploads a part by copying data from an existing
+//! object as data source" — so the part is addressable by its number exactly as an
+//! `UploadPart` body is, and a later `CompleteMultipartUpload` assembles it like any other.
 //!
 //! ## Shape of an operation
 //!
@@ -219,14 +215,22 @@ use super::types::*;
 // `UploadPartCopyError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `UploadPartCopyError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#UploadPartCopy")]
+// The operation's MODELED errors — this operation declares NONE
+// (`smithy_query(query="operation",operation="UploadPartCopy")` reports an empty error
+// list), so the enum is widened with `extra_errors` by the three shapes this SERVICE models
+// for the addresses a part copy can miss: either bucket (`NoSuchBucket`, HTTP 404), the
+// source object (`NoSuchKey`) and the upload the part belongs to (`NoSuchUpload`, which this
+// operation's own documentation publishes as its first special error, "the specified
+// multipart upload does not exist", HTTP 404).
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#UploadPartCopy",
+    extra_errors = ["NoSuchBucket", "NoSuchKey", "NoSuchUpload"]
+)]
 #[derive(Debug)]
 pub enum UploadPartCopyErrorModeled {
+    NoSuchBucket(NoSuchBucket),
+    NoSuchKey(NoSuchKey),
+    NoSuchUpload(NoSuchUpload),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -280,18 +284,373 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UploadPartCopy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UploadPartCopyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UploadPartCopy"))
+        // A part copy needs nothing from the request beyond its deserialized input: the
+        // bytes come from an object this emulator already holds rather than from a payload.
+        let _ = ctx;
+
+        // What this emulator cannot carry out faithfully, refused rather than answered with
+        // an entity tag that would claim it — the same list `UploadPart` refuses a part for,
+        // plus the copy-source half of SSE-C: those members carry a customer-provided KEY
+        // that S3 itself does not store, so no object here was encrypted with one and no
+        // upload here was initiated with one, and `RequestPayer` asks to be charged for the
+        // request, which nothing here does.
+        if let Some(unserved) = unserved_feature(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "UploadPartCopy with {unserved}"
+            )));
+        }
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // destination bucket, the request fails with the HTTP status code 403 Forbidden"
+        // (`UploadPartCopyRequest$ExpectedBucketOwner`, and the same sentence for the source
+        // bucket on `ExpectedSourceBucketOwner`), judged the way every other operation here
+        // judges it: this emulator serves one account, so that account owns every bucket it
+        // holds.
+        for expected in [
+            input.expected_bucket_owner.as_deref(),
+            input.expected_source_bucket_owner.as_deref(),
+        ] {
+            if expected.is_some_and(|account| account != ::engine::emulator_account_id()) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::ACCESS_DENIED_CODE,
+                    crate::state::ACCESS_DENIED_STATUS,
+                    crate::state::ACCESS_DENIED_MESSAGE,
+                ));
+            }
+        }
+
+        // "Part number of part being copied. This is a positive integer between 1 and
+        // 10,000" (`UploadPartCopyRequest$PartNumber`). The model constrains the member not
+        // at all, so nothing refuses a number outside that range before this: a part number
+        // S3 does not address a part by is a parameter whose value is not valid, which is
+        // `InvalidArgument` (400) — refused exactly as `UploadPart` refuses its own.
+        if !(crate::state::MIN_PART_NUMBER..=crate::state::MAX_PART_NUMBER)
+            .contains(&input.part_number)
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                format!(
+                    "Part number must be an integer between {} and {}, inclusive: {}",
+                    crate::state::MIN_PART_NUMBER,
+                    crate::state::MAX_PART_NUMBER,
+                    input.part_number
+                ),
+            ));
+        }
+
+        // The second documented form of a copy source names the object "as accessed through
+        // the access point" by ARN. This emulator holds no access points and no Outposts, so
+        // there is no object such a value could address — and a 200 for it would claim a copy
+        // out of a resource that does not exist here. `CopyObject` refuses it identically.
+        if crate::state::copy_source_is_arn(&input.copy_source) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UploadPartCopy with an Amazon Resource Name as x-amz-copy-source",
+            ));
+        }
+        // The bucket, key and version the copy source names, read by the one rule every copy
+        // in this service reads it by. The member's pattern (`^\/?.+\/.+$`) is already
+        // enforced at the boundary, so what reaches here is a value that satisfies it and
+        // still names no bucket-and-key pair: "the value of the parameter is not valid" is
+        // `InvalidArgument` (400), and the message names the member the caller has to fix.
+        let source = match crate::state::parse_copy_source(&input.copy_source) {
+            Ok(source) => source,
+            Err(rejection) => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    rejection,
+                ))
+            }
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store neither the source can be read nor the part recorded, and no
+            // modelled error says that — each would be a false statement about the upload —
+            // so the documented code for a request this emulator could not carry out goes out
+            // rather than a 501, which would claim this operation is unwritten.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+        let mut store = state.lock();
+
+        // The DESTINATION of the copy: the upload this part belongs to, addressed by its id
+        // AND the key it was initiated for, exactly as `UploadPart` addresses it — so an id
+        // this bucket has no upload in progress under, or one initiated for another key, names
+        // no upload, which is this operation's own first special error ("the specified
+        // multipart upload does not exist. The upload ID might be invalid, or the multipart
+        // upload might have been aborted or completed").
+        let Some(destination) = store.bucket(&input.bucket) else {
+            return Err(UploadPartCopyErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let Some(upload) = destination
+            .multipart_upload(&input.upload_id)
+            .filter(|upload| upload.key == input.key)
+        else {
+            return Err(UploadPartCopyErrorModeled::NoSuchUpload(NoSuchUpload {}).into());
+        };
+        // The encryption the UPLOAD was initiated under, which is what this answer reports:
+        // the part is stored into that upload, so what it says about encryption is what the
+        // initiation settled rather than anything this request named.
+        let encryption = upload.encryption.clone();
+
+        // The SOURCE object, copied out of the store so the part write below can borrow it
+        // mutably. "If your source bucket versioning is enabled, the x-amz-copy-source header
+        // by default identifies the current version of an object to copy. If the current
+        // version is a delete marker, Amazon S3 behaves as if the object was deleted. To copy
+        // a different version, use the versionId query parameter" — the same resolution
+        // `CopyObject` performs for the same member.
+        let Some(source_bucket) = store.bucket(&source.bucket) else {
+            return Err(UploadPartCopyErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let held = match source.version_id.as_deref() {
+            None => source_bucket.object(&source.key).cloned(),
+            Some(version_id) => {
+                // A `versionId` that is not SHAPED like one cannot name a version of
+                // anything, so it is a malformed argument rather than an absent version.
+                if !crate::state::version_id_is_well_formed(version_id) {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_ARGUMENT_CODE,
+                        crate::state::INVALID_ARGUMENT_STATUS,
+                        crate::state::INVALID_VERSION_ID_MESSAGE,
+                    ));
+                }
+                let Some(held) = source_bucket.stored_version(&source.key, version_id) else {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::NO_SUCH_VERSION_CODE,
+                        404,
+                        crate::state::NO_SUCH_VERSION_MESSAGE,
+                    ));
+                };
+                // A delete marker holds no bytes for a copy to read, and naming one
+                // explicitly is not something this method can do — the same 405 a read of one
+                // is answered with.
+                if held.as_delete_marker().is_some() {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::METHOD_NOT_ALLOWED_CODE,
+                        crate::state::METHOD_NOT_ALLOWED_STATUS,
+                        crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+                    ));
+                }
+                held.as_object().cloned()
+            }
+        };
+        let Some(source_object) = held else {
+            return Err(UploadPartCopyErrorModeled::NoSuchKey(NoSuchKey {}).into());
+        };
+
+        // ONE instant for the whole call, so the state the source is judged in and the time
+        // the part is recorded at cannot come from two different readings of the clock.
+        let now = ::std::time::SystemTime::now();
+
+        // "Before using an object as a source object for the copy operation, you must restore
+        // a copy of it if … the storage class of the source object is GLACIER or
+        // DEEP_ARCHIVE" — so a source whose bytes are archived with no restored copy available
+        // bars the copy, exactly when a READ of that same version is barred, and `CopyObject`
+        // answers the same cause with the same code and sentence.
+        if source_object.archived_at(now) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_OBJECT_STATE_CODE,
+                crate::state::INVALID_OBJECT_STATE_STATUS,
+                crate::state::INVALID_OBJECT_STATE_COPY_SOURCE_MESSAGE,
+            ));
+        }
+
+        // The copy-source preconditions, judged against the version actually found, through
+        // the one rule every copy in this service judges them by.
+        if let Some(unmet) = crate::state::unmet_copy_source_precondition(
+            &copy_source_conditions(&input),
+            &source_object,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::PRECONDITION_FAILED_CODE,
+                crate::state::PRECONDITION_FAILED_STATUS,
+                format!("{}: {unmet}", crate::state::PRECONDITION_FAILED_MESSAGE),
+            ));
+        }
+
+        // WHICH of the source's bytes this part is: "the range of bytes to copy from the
+        // source object. The range value must use the form bytes=first-last, where the first
+        // and last are the zero-based byte offsets to copy"
+        // (`UploadPartCopyRequest$CopySourceRange`), and a request naming no range copies the
+        // whole object.
+        let body = match input.copy_source_range.as_deref() {
+            None => source_object.body.clone(),
+            Some(range) => {
+                // "You can copy a range only if the source object is greater than 5 MB"
+                // (same member) — a smaller source is what this operation's own special
+                // errors publish `InvalidRequest` for: "the specified copy source is not
+                // supported as a byte-range copy source" (HTTP 400).
+                if source_object.body.len() <= crate::state::MIN_MULTIPART_PART_BYTES {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_REQUEST_CODE,
+                        crate::state::INVALID_REQUEST_STATUS,
+                        UNSUPPORTED_BYTE_RANGE_SOURCE_MESSAGE,
+                    ));
+                }
+                let Some((first, last)) = parse_copy_source_range(range) else {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_ARGUMENT_CODE,
+                        crate::state::INVALID_ARGUMENT_STATUS,
+                        format!(
+                            "The x-amz-copy-source-range value must use the form \
+                             bytes=first-last, where first and last are the zero-based byte \
+                             offsets to copy: {range:?}"
+                        ),
+                    ));
+                };
+                // The offsets are INTO the source object, and the range is inclusive of both,
+                // so a last offset the source does not have — and a first past the last —
+                // names bytes the source does not hold.
+                if first > last || last >= source_object.body.len() {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_ARGUMENT_CODE,
+                        crate::state::INVALID_ARGUMENT_STATUS,
+                        format!(
+                            "Range specified is not valid for source object of size: {}",
+                            source_object.body.len()
+                        ),
+                    ));
+                }
+                source_object.body[first..=last].to_vec()
+            }
+        };
+
+        // The part as the store records it: the bytes the copy took from the source, the
+        // instant they were accepted, and the entity tag over those bytes — the tag
+        // `CopyPartResult$ETag` reports and the one a later completion names the part by,
+        // rendered the one way every part's is ([`crate::state::object_etag`]).
+        let etag = crate::state::object_etag(&body);
+        let part = crate::state::UploadedPart {
+            part_number: input.part_number,
+            etag: etag.clone(),
+            uploaded_at: now,
+            body,
+        };
+
+        // Recorded through the one place a part is ever recorded, so a copied part counts
+        // against exactly the byte budgets an uploaded one does and is refused the same way;
+        // nothing is recorded unless the write was taken.
+        let outcome = store.upload_part(&input.bucket, &input.upload_id, &input.key, part);
+        let Some(outcome) = outcome else {
+            return Err(UploadPartCopyErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        match outcome {
+            crate::state::PartUpload::Stored { .. } => {}
+            crate::state::PartUpload::NoSuchUpload => {
+                return Err(UploadPartCopyErrorModeled::NoSuchUpload(NoSuchUpload {}).into());
+            }
+            // The emulator's own ceilings, not AWS quotas (S3 bounds neither the number of
+            // objects nor their total size), so no AWS error code describes them: they go out
+            // through the framework's 400 `ValidationException` channel, the same channel
+            // `UploadPart` answers its own byte budgets through.
+            crate::state::PartUpload::ByteBudgetReached { would_hold } => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "copying part {} would leave the bucket {:?} holding {would_hold} bytes, \
+                     past the {} bytes this emulator keeps per bucket",
+                    input.part_number,
+                    input.bucket,
+                    crate::state::MAX_OBJECT_BYTES_PER_BUCKET
+                )));
+            }
+            crate::state::PartUpload::TotalByteBudgetReached { would_hold } => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "copying part {} would leave this emulator holding {would_hold} bytes \
+                     across every bucket, past the {} bytes it keeps in total",
+                    input.part_number,
+                    crate::state::MAX_OBJECT_BYTES_TOTAL
+                )));
+            }
+        }
+
+        Ok(UploadPartCopyOutput {
+            // "Container for all response elements" — the entity tag of the part this copy
+            // recorded and the instant it was recorded at, which is what a completion names
+            // the part by and what a `ListParts` reports for it.
+            copy_part_result: Some(CopyPartResult {
+                e_tag: Some(etag),
+                last_modified: Some(::aws_smithy_types::DateTime::from(now)),
+                // The checksum members would each need a checksum nothing here computes for
+                // a part, so none is reported rather than invented.
+                ..CopyPartResult::default()
+            }),
+            // "The version of the source object that was copied, if you have enabled
+            // versioning on the source bucket" — read off the stored source version, so it is
+            // reported exactly when that version has an id of its own.
+            copy_source_version_id: source_object.version_id.clone(),
+            // The encryption the upload was initiated under, reported back the way
+            // `UploadPart` reports it for a part of the same upload.
+            server_side_encryption: encryption.sse_algorithm.clone(),
+            ssekms_key_id: encryption.kms_key_id.clone(),
+            bucket_key_enabled: encryption.bucket_key_enabled,
+            // Everything else this output can carry describes something no recorded part
+            // has: the SSE-C members are refused above, and `RequestCharged` reports a
+            // Requester Pays charge nothing here makes.
+            ..UploadPartCopyOutput::default()
+        })
     }
+}
+
+/// The `<Message>` this operation's own special errors publish beside
+/// [`crate::state::INVALID_REQUEST_CODE`] for a ranged copy whose source is too small to copy
+/// a range of: "the specified copy source is not supported as a byte-range copy source",
+/// HTTP 400.
+const UNSUPPORTED_BYTE_RANGE_SOURCE_MESSAGE: &str =
+    "The specified copy source is not supported as a byte-range copy source.";
+
+/// The four copy-source conditional members this request carried, for the one rule every
+/// copy in this service judges them by
+/// ([`crate::state::unmet_copy_source_precondition`]).
+fn copy_source_conditions(input: &UploadPartCopyInput) -> crate::state::CopySourceConditions<'_> {
+    crate::state::CopySourceConditions {
+        if_match: input.copy_source_if_match.as_deref(),
+        if_none_match: input.copy_source_if_none_match.as_deref(),
+        if_modified_since: input
+            .copy_source_if_modified_since
+            .as_ref()
+            .map(::aws_smithy_types::DateTime::secs),
+        if_unmodified_since: input
+            .copy_source_if_unmodified_since
+            .as_ref()
+            .map(::aws_smithy_types::DateTime::secs),
+    }
+}
+
+/// The inclusive pair of zero-based offsets an `x-amz-copy-source-range` value names, or
+/// `None` for a value that is not of the one form the member publishes.
+///
+/// "The range value must use the form bytes=first-last, where the first and last are the
+/// zero-based byte offsets to copy. For example, bytes=0-9 indicates that you want to copy
+/// the first 10 bytes of the source" (`UploadPartCopyRequest$CopySourceRange`) — so both
+/// offsets are required, which is what makes this narrower than the `Range` of a read, where
+/// either side may be left open.
+fn parse_copy_source_range(value: &str) -> Option<(usize, usize)> {
+    let (first, last) = value.trim().strip_prefix("bytes=")?.split_once('-')?;
+    Some((first.trim().parse().ok()?, last.trim().parse().ok()?))
+}
+
+/// The feature `input` asks for that this emulator does not serve, if any — named for the
+/// 501 that refuses it, the way `UploadPart` names its own.
+fn unserved_feature(input: &UploadPartCopyInput) -> Option<&'static str> {
+    [
+        (
+            input.sse_customer_algorithm.is_some(),
+            "SSECustomerAlgorithm",
+        ),
+        (input.sse_customer_key.is_some(), "SSECustomerKey"),
+        (
+            input.copy_source_sse_customer_algorithm.is_some(),
+            "CopySourceSSECustomerAlgorithm",
+        ),
+        (
+            input.copy_source_sse_customer_key.is_some(),
+            "CopySourceSSECustomerKey",
+        ),
+        (input.request_payer.is_some(), "RequestPayer"),
+    ]
+    .into_iter()
+    .find_map(|(asked, name)| asked.then_some(name))
 }

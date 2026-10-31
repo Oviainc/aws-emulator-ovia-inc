@@ -150,7 +150,11 @@ async fn append_object(
 
 /// A directory bucket in one zone, created and asserted created, so a suite about what is
 /// served ON one does not repeat the create table.
-async fn directory_bucket(router: &MultiServiceRouter, name: &str, zone_id: &str) {
+///
+/// `pub(crate)`: the conditional-delete suite ([`super::object_conditional_deletes`]) needs
+/// one too, because the modification-time and size conditions of a delete are "only
+/// supported for directory buckets" (`DeleteObjectRequest$IfMatchSize`).
+pub(crate) async fn directory_bucket(router: &MultiServiceRouter, name: &str, zone_id: &str) {
     let created = create_directory_bucket(
         router,
         name,

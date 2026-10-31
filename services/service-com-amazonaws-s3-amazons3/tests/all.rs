@@ -99,6 +99,8 @@ mod bucket_website;
 mod bucket_website_delete;
 #[path = "all/checksum_mode_header_case.rs"]
 mod checksum_mode_header_case;
+#[path = "all/directory_bucket_conditional_deletes.rs"]
+mod directory_bucket_conditional_deletes;
 #[path = "all/directory_bucket_sessions_and_appends.rs"]
 mod directory_bucket_sessions_and_appends;
 #[path = "all/error_message_envelope.rs"]
@@ -107,6 +109,11 @@ mod error_message_envelope;
 // `error_message_envelope`, which spans the same rule from the model's own catalog.
 #[path = "all/error_messages.rs"]
 mod error_messages;
+// Deliberately empty: the general purpose bucket naming rule this fix tried to enforce is a
+// cause of another open issue, and enforcing it here refused names unrelated service crates'
+// fixtures create — see the file's own header.
+#[path = "all/general_purpose_bucket_names.rs"]
+mod general_purpose_bucket_names;
 #[path = "all/head_object_read_back.rs"]
 mod head_object_read_back;
 #[path = "all/list_buckets.rs"]
@@ -117,6 +124,8 @@ mod listing_encoding_type;
 mod listing_optional_members;
 #[path = "all/multipart_checksum_type.rs"]
 mod multipart_checksum_type;
+#[path = "all/multipart_part_copy.rs"]
+mod multipart_part_copy;
 #[path = "all/multipart_part_upload.rs"]
 mod multipart_part_upload;
 #[path = "all/multipart_upload_abort.rs"]
@@ -175,6 +184,8 @@ mod object_listing_encoding;
 mod object_listing_v1;
 #[path = "all/object_lock_enforcement.rs"]
 mod object_lock_enforcement;
+#[path = "all/object_lock_on_write.rs"]
+mod object_lock_on_write;
 #[path = "all/object_partial_reads.rs"]
 mod object_partial_reads;
 #[path = "all/object_plane_byte_budget.rs"]
@@ -231,6 +242,8 @@ mod signature_refusal_wording;
 mod state_roundtrip;
 #[path = "all/version_id_classification.rs"]
 mod version_id_classification;
+#[path = "all/write_checksum_header_count.rs"]
+mod write_checksum_header_count;
 #[path = "all/write_response_identity.rs"]
 mod write_response_identity;
 #[path = "all/zz_probe.rs"]
