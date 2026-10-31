@@ -6990,10 +6990,52 @@ pub fn resolve_kms_key_target(
 /// with the epoch MILLISECONDS every other timestamp of this service carries.
 pub const MILLIS_PER_SECOND: i64 = 1_000;
 
-/// The refusal CloudWatch Logs answers when a request's time range runs backwards — its end
-/// before its start — which includes no instant at all. The text is fixed for the condition:
-/// it names the two ends of the range and interpolates neither of their values.
-pub const REVERSED_TIME_RANGE_MESSAGE: &str = "End time should not be before start time.";
+/// The name the SDK envelope this service's refusals carry names the service by — the
+/// legacy client name of CloudWatch Logs, not the model's `sdkId`.
+const SDK_ENVELOPE_SERVICE: &str = "AWSLogs";
+
+/// The HTTP status and error code of one refusal, kept PAIRED so neither can be stated in
+/// an SDK envelope without the other: they are the two values a client reads back out of
+/// the message text, and they must be the status and code the response itself carries.
+pub type SdkEnvelopeFacts = (u16, &'static str);
+
+/// The status and code of a refusal for a parameter "specified incorrectly", as the model
+/// declares `InvalidParameterException` for this service (client error, HTTP 400).
+pub const ENVELOPE_INVALID_PARAMETER: SdkEnvelopeFacts = (400, "InvalidParameterException");
+
+/// `body` followed by the envelope the AWS SDK appends to a CloudWatch Logs refusal:
+/// ` (Service: AWSLogs; Status Code: <status>; Error Code: <code>; Request ID: <id>; Proxy: null)`.
+///
+/// `facts` is the status-and-code pair of the refusal being worded (one of the
+/// `ENVELOPE_*` constants). The request id is the ONLY per-run field: a request id is
+/// minted by the service per call — nothing in the request carries one — so it comes from
+/// the emulator's one request-id mint
+/// ([`service_common::query_error_envelope::new_request_id`]), a fresh v4 UUID
+/// indistinguishable from the one the framework's own renderers report. Nothing of the
+/// request is interpolated.
+///
+/// One function, so every refusal worded this way carries the envelope in the same shape.
+pub fn with_sdk_error_envelope(body: &str, facts: SdkEnvelopeFacts) -> String {
+    let (status_code, error_code) = facts;
+    format!(
+        "{body} (Service: {SDK_ENVELOPE_SERVICE}; Status Code: {status_code}; \
+         Error Code: {error_code}; Request ID: {}; Proxy: null)",
+        ::service_common::query_error_envelope::new_request_id()
+    )
+}
+
+/// The sentence CloudWatch Logs answers when the time range a query is asked over runs
+/// backwards — its end before its start — which includes no instant at all. Fixed text for
+/// the condition: it names the two ends of the range and interpolates neither of their
+/// values.
+pub const REVERSED_TIME_RANGE_MESSAGE: &str = "End time cannot be less than Start time";
+
+/// The whole message such a refusal carries: the fixed sentence plus the SDK envelope of
+/// the `InvalidParameterException` it is refused under, so the status and code stated inside
+/// the text are the ones the response answers with.
+pub fn reversed_time_range_refusal() -> String {
+    with_sdk_error_envelope(REVERSED_TIME_RANGE_MESSAGE, ENVELOPE_INVALID_PARAMETER)
+}
 
 /// The refusal `CreateExportTask` answers when the window it is given is not a time range:
 /// its fixed text states what the service requires of a window — that the two values bound a

@@ -267,10 +267,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`StartQuery$endTime`) — a range whose end precedes its start includes nothing, so
         // it is not a time range at all and the request is refused as the incorrectly
         // specified parameter it is, in the sentence CloudWatch Logs states for a reversed
-        // window: fixed text about the two ends, interpolating neither of them.
+        // window plus the SDK envelope that sentence is answered inside: fixed text about the
+        // two ends, interpolating neither of their values.
         if input.end_time < input.start_time {
             return Err(invalid_parameter(
-                crate::state::REVERSED_TIME_RANGE_MESSAGE.to_string(),
+                crate::state::reversed_time_range_refusal(),
             ));
         }
 
