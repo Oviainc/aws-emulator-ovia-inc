@@ -17,7 +17,12 @@
 //! the `controlIdentifier`/`targetIdentifier` pair is the control and the organizational
 //! unit it is enabled on. A request naming neither names no enablement at all, which is
 //! the modelled `ValidationException`; one naming an enablement this account does not hold
-//! is the modelled `ResourceNotFoundException`; and either way nothing is torn down.
+//! is the modelled `ResourceNotFoundException`; and either way nothing is torn down. Each
+//! member is read the way every handler of this service reads it, before the store is asked
+//! what it names: a `controlIdentifier` that is no control reference at all, and a
+//! `targetIdentifier` that is not the ARN of an organizational unit, name nothing this
+//! service could hold an enablement of, so both are the modelled `ValidationException`
+//! rather than a resource this account does not hold.
 //!
 //! A MANDATORY control is one AWS Control Tower applies to every target it governs itself,
 //! so it is not a caller's to turn off: a request naming such an enablement is refused with
@@ -246,6 +251,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
                 if let Some(target_identifier) = &input.target_identifier {
+                    // And WHAT this member names is settled the same way, by the one reading
+                    // every handler gives a `targetIdentifier`: a value that is not an
+                    // organizational unit ARN names no target this service can hold an
+                    // enablement on, so it is a malformed input rather than a target this
+                    // enablement is not on. Only a value that does name a target can
+                    // disagree with this enablement's, which is what the mismatch below
+                    // reports.
+                    organizational_unit_target(target_identifier)?;
                     if target_identifier != &enabled.target_identifier {
                         return Err(DisableControlErrorModeled::ValidationException(
                             ValidationException {
@@ -290,6 +303,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // exist, anything else is not a control reference at all — the reading
                 // `EnableControl` gives this member too.
                 let control = control_of(control_identifier)?;
+                // And the same reading of the OTHER member of the pair, which the store is
+                // then asked about: only an organizational unit is a target a control is
+                // enabled on, so a value that is not one names no target to look an
+                // enablement up on — a malformed input, not a resource this account does
+                // not hold.
+                organizational_unit_target(target_identifier)?;
 
                 let Some(enabled) = store.enabled_control_on_target(control, target_identifier)
                 else {
@@ -394,6 +413,24 @@ fn control_of(
             DisableControlErrorModeled::ValidationException(ValidationException { message }).into()
         }
     })
+}
+
+/// Refuses a `target_identifier` that is not the ARN of an organizational unit, which is
+/// the only kind of target a control is enabled on.
+///
+/// The classification and the wording are [`crate::state::non_organizational_unit_target_message`],
+/// the one place that refusal is built, so `EnableControl`, `EnableBaseline` and both of
+/// this handler's paths answer one value the same way: a value satisfying the member's ARN
+/// pattern that is no organizational unit ARN is a malformed input
+/// (`ValidationException`), whichever other members the request carries.
+fn organizational_unit_target(target_identifier: &str) -> Result<(), DisableControlError> {
+    match crate::state::non_organizational_unit_target_message(target_identifier) {
+        Some(message) => Err(DisableControlErrorModeled::ValidationException(
+            ValidationException { message },
+        )
+        .into()),
+        None => Ok(()),
+    }
 }
 
 /// The members of this request that carry a value, as the refusal above lists them back to

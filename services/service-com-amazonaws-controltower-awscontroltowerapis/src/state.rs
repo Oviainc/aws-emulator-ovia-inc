@@ -3727,8 +3727,8 @@ fn is_lower_alnum(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
 }
 
-/// Why `target` cannot have a baseline enabled on it, or `None` when it is an
-/// organizational unit ARN.
+/// Why `target` cannot be the target of an enablement — a baseline's or a control's — or
+/// `None` when it is an organizational unit ARN.
 ///
 /// The one place that refusal's wording is built. The message is built from the request
 /// and from the rule, so it tells the caller what kind of target it may name.

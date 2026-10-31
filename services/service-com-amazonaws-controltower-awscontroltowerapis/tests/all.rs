@@ -25,6 +25,8 @@ mod delete_landing_zone_idempotence;
 mod disable_baseline;
 #[path = "all/disable_control.rs"]
 mod disable_control;
+#[path = "all/disable_control_target_reference.rs"]
+mod disable_control_target_reference;
 #[path = "all/drift_summary_projection.rs"]
 mod drift_summary_projection;
 #[path = "all/enable_baseline_persistence.rs"]
