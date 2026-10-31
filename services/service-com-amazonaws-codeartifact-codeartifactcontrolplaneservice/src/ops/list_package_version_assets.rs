@@ -11,8 +11,9 @@
 //! A READ: the store guard is taken immutably, so nothing a later caller sees moves
 //! because a version's assets were listed. The version's `status` is reported by
 //! `DescribePackageVersion`, not here, and no status hides a version's assets — an
-//! unfinished version lists the assets it has accepted so far, and a disposed one lists
-//! none because disposal deleted them.
+//! unfinished version lists the assets it has accepted so far, and a disposed one lists the
+//! assets it still holds, disposal's own asset deletion being out-of-band work rather than
+//! part of the call that disposed it.
 //!
 //! ## Shape of an operation
 //!

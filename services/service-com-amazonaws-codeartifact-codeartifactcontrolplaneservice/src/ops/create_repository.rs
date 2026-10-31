@@ -193,7 +193,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ConflictException {
                     message: crate::state::repository_already_exists_message(
                         &input.domain,
-                        &domain.owner,
                         &input.repository,
                     ),
                     resource_id: Some(input.repository.clone()),

@@ -27,9 +27,11 @@ use crate::harness::{call, create_domain, emulator, Answer, ACCOUNT};
 /// valid for a period of 12 hours" (`GetAuthorizationToken`'s own documentation).
 const DEFAULT_PERIOD_SECONDS: f64 = 12.0 * 60.0 * 60.0;
 
-/// The period a `durationSeconds=0` token gets: the life of the caller's temporary
-/// credentials, whose documented default is `AssumeRole`'s 3600 seconds.
-const CALLER_CREDENTIAL_PERIOD_SECONDS: f64 = 3_600.0;
+/// The period a `durationSeconds=0` token gets when the caller presented no session: 0
+/// ties the token to the expiration of the caller's own temporary credentials, and a
+/// credential with no session behind it carries none, so the token gets the full
+/// documented authorization period.
+const CALLER_CREDENTIAL_PERIOD_SECONDS: f64 = DEFAULT_PERIOD_SECONDS;
 
 /// How far two expirations that must be the SAME instant may sit apart, and the slack
 /// allowed when comparing one against `now + period`: the wall-clock cost of the calls
@@ -96,24 +98,21 @@ async fn expirations_are_ordered_by_the_period_each_request_asked_for() {
         "CreateDomain must succeed before a token is requested"
     );
 
-    // Rows in ascending period order: the caller-credential value and an explicit request
-    // for that same number of seconds share a period, as do "no durationSeconds" and the
-    // published maximum — the documented default IS 12 hours.
+    // Rows in ascending period order. "No durationSeconds", the published maximum and the
+    // caller-credential value share a period — the documented default IS 12 hours, which is
+    // also the ceiling and the period a token tied to a credential with no session behind
+    // it gets.
     let cases: [(&str, Option<i64>, f64); 6] = [
         ("the published minimum", Some(900), 900.0),
+        ("an hour", Some(3_600), 3_600.0),
         ("two hours", Some(7_200), 7_200.0),
+        ("the published maximum", Some(43_200), 43_200.0),
+        ("no durationSeconds", None, DEFAULT_PERIOD_SECONDS),
         (
             "the caller-credential value",
             Some(0),
             CALLER_CREDENTIAL_PERIOD_SECONDS,
         ),
-        (
-            "the caller-credential period asked for explicitly",
-            Some(3_600),
-            CALLER_CREDENTIAL_PERIOD_SECONDS,
-        ),
-        ("the published maximum", Some(43_200), 43_200.0),
-        ("no durationSeconds", None, DEFAULT_PERIOD_SECONDS),
     ];
 
     let mut answered: Vec<(&str, f64, f64)> = Vec::new();

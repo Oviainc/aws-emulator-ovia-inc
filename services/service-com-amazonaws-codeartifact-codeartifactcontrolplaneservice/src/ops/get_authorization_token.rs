@@ -211,15 +211,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(period) = authorization_period(input.duration_seconds) else {
             return Err(GetAuthorizationTokenErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "durationSeconds value {} is not valid; valid values are {} and any \
-                         number between {} and {}.",
-                        input.duration_seconds.unwrap_or_default(),
-                        CALLER_CREDENTIAL_DURATION_SECONDS,
-                        MIN_REQUESTED_DURATION_SECONDS,
-                        MAX_REQUESTED_DURATION_SECONDS
-                    ),
-                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                    message: in_gap_duration_message(input.duration_seconds.unwrap_or_default()),
+                    reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
                 },
             )
             .into());
@@ -255,12 +248,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `durationSeconds=0` ties the token to the CALLER'S OWN credentials — "A value of
         // 0 will set the expiration of the authorization token to the same expiration of
         // the user's role's temporary credentials" — so the expiration is that session's
-        // own expiry wherever the caller presented a session this emulator minted, and the
-        // documented default lifetime of temporary credentials where it did not.
+        // own expiry wherever the caller presented a session this emulator minted. A
+        // credential with no session behind it (a long-term key) carries no expiry to tie
+        // the token to, so the token gets the full authorization period the operation
+        // documents, which is the longest one it can be issued for.
         let expiration = match period {
-            Period::CallerCredentials => {
-                caller_credential_expiry(&*self.engine, ctx, now).unwrap_or(now + CALLER_CREDENTIAL_PERIOD)
-            }
+            Period::CallerCredentials => caller_credential_expiry(&*self.engine, ctx, now)
+                .unwrap_or(now + DEFAULT_AUTHORIZATION_PERIOD),
             Period::Fixed(period) => now + period,
         };
 
@@ -318,27 +312,38 @@ pub const MAX_REQUESTED_DURATION_SECONDS: i64 = 43_200;
 /// (`durationSeconds`' own documentation).
 pub const CALLER_CREDENTIAL_DURATION_SECONDS: i64 = 0;
 
-/// How long a token stays valid when the caller names no `durationSeconds`.
+/// How long a token stays valid when the caller names no `durationSeconds`, and the
+/// longest period one can be issued for.
 ///
 /// The operation's own documentation states the period — "CodeArtifact authorization
 /// tokens are valid for a period of 12 hours", with `durationSeconds` able to set "a
 /// custom authorization period, up to a maximum of 12 hours" — so this is a duration the
 /// service documents, not a chosen one.
+///
+/// It is also what a token requested with `durationSeconds=0` gets when the caller
+/// presented no session this emulator holds: that value ties the token to the expiration
+/// of the caller's own temporary credentials ([`caller_credential_expiry`]), and a
+/// credential with no session behind it carries none, so what is left is the full
+/// authorization period this sentence documents.
 pub const DEFAULT_AUTHORIZATION_PERIOD: ::std::time::Duration =
     ::std::time::Duration::from_secs(12 * 60 * 60);
 
-/// How long a token requested with `durationSeconds=0` stays valid when the caller
-/// presented no session this emulator holds: the documented DEFAULT lifetime of AWS
-/// temporary credentials — `AssumeRole`'s `DurationSeconds` is documented "By default, the
-/// value is set to 3600 seconds" — which is the expiry a caller holding default temporary
-/// credentials would in fact get.
+/// The `ValidationException` message for a `durationSeconds` inside the modelled `@range`
+/// but outside the accepted set — a non-zero value below
+/// [`MIN_REQUESTED_DURATION_SECONDS`].
 ///
-/// A caller that DID present a session this emulator minted gets that session's own
-/// expiry instead ([`caller_credential_expiry`]), which is what the member documents; this
-/// is the fallback for a credential with no session behind it, so it is a documented
-/// duration standing in for one there is nothing to read, not a chosen one.
-pub const CALLER_CREDENTIAL_PERIOD: ::std::time::Duration =
-    ::std::time::Duration::from_secs(3_600);
+/// The service states its OWN rule here, naming the value it refused and the set it
+/// accepts; the value above [`MAX_REQUESTED_DURATION_SECONDS`] is refused a level earlier,
+/// by the modelled-range boundary, in the shared constraint-violation envelope
+/// ([`crate::state::constraint_violation_message`]), so the two ends of the discontinuous
+/// set keep two distinct sentences.
+fn in_gap_duration_message(requested: i64) -> String {
+    format!(
+        "Invalid durationSeconds value of {requested}: value must be \
+         {CALLER_CREDENTIAL_DURATION_SECONDS} or between {MIN_REQUESTED_DURATION_SECONDS} \
+         and {MAX_REQUESTED_DURATION_SECONDS} (inclusive)."
+    )
+}
 
 /// The expiry of the temporary credentials THIS request was signed with, when it was
 /// signed with a session this emulator minted and the clock has not passed it.

@@ -13,7 +13,8 @@
 //!
 //! 1. `durationSeconds=0` sets the token's expiration to the expiration of the CALLER'S OWN
 //!    temporary credentials — whatever that session's own expiry is — while every other
-//!    accepted value keeps naming a period from issuance.
+//!    accepted value keeps naming a period from issuance; a credential with no session
+//!    behind it carries no expiry, so the token gets the full documented period.
 //! 2. Minting needs BOTH `codeartifact:GetAuthorizationToken` and the cross-service
 //!    `sts:GetServiceBearerToken` in the caller's identity policies: a principal holding one
 //!    without the other is refused `AccessDeniedException` (403) and is handed no token.
@@ -46,10 +47,12 @@ const SESSION_NAME: &str = "publish-session";
 /// wall-clock cost of the call itself, which is a handler invocation rather than a sleep.
 const CLOCK_SLACK_SECONDS: f64 = 60.0;
 
-/// The documented default lifetime of temporary credentials, which a `durationSeconds=0`
-/// request falls back to when the caller presented no session this emulator holds
-/// (`AssumeRole`'s `DurationSeconds`: "By default, the value is set to 3600 seconds").
-const DEFAULT_CREDENTIAL_SECONDS: f64 = 3_600.0;
+/// The full authorization period the operation documents — "CodeArtifact authorization
+/// tokens are valid for a period of 12 hours", with `durationSeconds` able to set one "up
+/// to a maximum of 12 hours" — which is what a `durationSeconds=0` request gets when the
+/// caller presented no session this emulator holds, there being no credential expiry to
+/// tie the token to.
+const MAX_AUTHORIZATION_PERIOD_SECONDS: f64 = 12.0 * 60.0 * 60.0;
 
 /// One emulator holding this service over one shared engine, with that engine kept so a
 /// test can seed the STS and IAM stores the decision is read from.
@@ -194,9 +197,9 @@ async fn a_zero_duration_token_expires_with_the_session_that_minted_it() {
         );
     }
 
-    // A caller presenting no session this emulator holds has no credential expiry to read,
-    // so `durationSeconds=0` falls back to the documented default lifetime of temporary
-    // credentials.
+    // A caller presenting no session this emulator holds has no credential expiry to tie
+    // the token to, so `durationSeconds=0` gets the full authorization period the operation
+    // documents — the longest a token can be issued for, not the shortest.
     let before = epoch_seconds(SystemTime::now());
     let answer = get_token_as(&emulator.router, "AKIDEXAMPLE", domain, Some(0)).await;
     assert_eq!(
@@ -207,9 +210,9 @@ async fn a_zero_duration_token_expires_with_the_session_that_minted_it() {
         panic!("case \"no session behind the credential\": expected an expiration, got {answer:?}");
     };
     assert!(
-        (expiration - (before + DEFAULT_CREDENTIAL_SECONDS)).abs() <= CLOCK_SLACK_SECONDS,
-        "case \"no session behind the credential\": expected the documented default lifetime, \
-         got {expiration}"
+        (expiration - (before + MAX_AUTHORIZATION_PERIOD_SECONDS)).abs() <= CLOCK_SLACK_SECONDS,
+        "case \"no session behind the credential\": expected the full authorization period \
+         ({MAX_AUTHORIZATION_PERIOD_SECONDS}s), got {expiration}"
     );
 }
 

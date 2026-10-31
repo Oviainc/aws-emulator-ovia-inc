@@ -12,7 +12,8 @@
 //! a
 //! `ValidationException` (400) that stores nothing; an unknown domain or repository is a
 //! `ResourceNotFoundException` (404); a package whose origin configuration blocks
-//! publishing is an `AccessDeniedException` (403).
+//! publishing is a `ValidationException` (400) too — the request is invalid for that
+//! package, not unauthorized for the caller.
 //!
 //! ## Shape of an operation
 //!
@@ -384,17 +385,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PublishPackageVer
         // Checked against the STORED package: a package that does not exist yet is
         // created with the default configuration, which allows publishing, and
         // `PutPackageOriginConfiguration` is what sets `publish` to `BLOCK`.
+        //
+        // The refusal is a VALIDATION failure, not an authorization one: the `publish`
+        // restriction decides "whether new versions of the package can be published
+        // directly to the repository", so the request is invalid for this package whatever
+        // credential made it, and no credential change can make it valid. The sentence is
+        // entirely fixed text — it names no package, because the condition is the
+        // repository's origin control rather than anything about this request's coordinate.
         if repository
             .packages
             .get(&key)
             .is_some_and(|existing| !existing.publish_allowed())
         {
-            return Err(PublishPackageVersionErrorModeled::AccessDeniedException(
-                AccessDeniedException {
-                    message: format!(
-                        "Publishing package {} is blocked by its package origin configuration.",
-                        input.package
-                    ),
+            return Err(PublishPackageVersionErrorModeled::ValidationException(
+                ValidationException {
+                    message: PUBLISH_BLOCKED_BY_ORIGIN_MESSAGE.to_string(),
+                    reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
                 },
             )
             .into());
@@ -622,6 +628,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PublishPackageVer
 /// The `ValidationExceptionReason` a refused member carries, as this service spells it
 /// for every handler-level refusal ([`crate::state::VALIDATION_REASON_FIELD_FAILED`]).
 const VALIDATION_REASON_FIELD_FAILED: &str = crate::state::VALIDATION_REASON_FIELD_FAILED;
+
+/// The `ValidationException` message for a publish into a package whose origin
+/// configuration blocks new versions.
+///
+/// Entirely fixed text: the condition is the package's `publish` restriction, which is a
+/// property of the repository's origin controls rather than of this request, so the
+/// sentence names neither the package nor the repository.
+const PUBLISH_BLOCKED_BY_ORIGIN_MESSAGE: &str =
+    "This package is configured to block new versions from being published.";
 
 /// A `ResourceNotFoundException` (404) naming the resource that was addressed.
 fn not_found(message: String, resource_id: &str, resource_type: &str) -> PublishPackageVersionError {

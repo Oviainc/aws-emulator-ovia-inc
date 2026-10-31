@@ -91,3 +91,5 @@ mod package_coordinate_refusals;
 mod repository_authorization;
 #[path = "all/copy_from_upstream.rs"]
 mod copy_from_upstream;
+#[path = "all/service_rule_refusals.rs"]
+mod service_rule_refusals;

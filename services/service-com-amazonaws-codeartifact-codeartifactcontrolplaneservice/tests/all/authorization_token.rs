@@ -32,9 +32,11 @@ use crate::harness::{call, create_domain, emulator, Answer, ACCOUNT};
 /// valid for a period of 12 hours" (`GetAuthorizationToken`'s own documentation).
 const DEFAULT_PERIOD_SECONDS: f64 = 12.0 * 60.0 * 60.0;
 
-/// The period a `durationSeconds=0` token gets: the life of the caller's temporary
-/// credentials, whose documented default is `AssumeRole`'s 3600 seconds.
-const CALLER_CREDENTIAL_PERIOD_SECONDS: f64 = 3_600.0;
+/// The period a `durationSeconds=0` token gets when the caller presented no session: 0
+/// ties the token to the expiration of the caller's own temporary credentials, and a
+/// credential with no session behind it carries none, so the token gets the full
+/// documented authorization period.
+const CALLER_CREDENTIAL_PERIOD_SECONDS: f64 = DEFAULT_PERIOD_SECONDS;
 
 /// How far an asserted `expiration` may sit from `now + period`: the wall-clock cost of
 /// the call itself, which is a handler invocation rather than a sleep.

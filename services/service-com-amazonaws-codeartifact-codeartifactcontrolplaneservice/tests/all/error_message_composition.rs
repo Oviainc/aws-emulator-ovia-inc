@@ -17,8 +17,9 @@
 //!    account the emulator serves when the request named none). So a `ResourceNotFound`
 //!    reads `Domain not found. Domain '<d>' owned by account '<a>' does not exist.` and
 //!    `Repository not found. Repository '<r>' in domain '<d>' owned by account '<a>' does
-//!    not exist.`, and a create conflict reads `Domain '<d>' owned by '<a>' already
-//!    exists.` / `Repository '<r>' in domain '<d>' owned by '<a>' already exists.`
+//!    not exist.`, and a domain create conflict reads `Domain '<d>' owned by '<a>' already
+//!    exists.` A conflict on a name that is unique WITHIN another resource names that
+//!    scope instead of the account: `Repository <r> already exists in domain <d>.`
 //! 2. A refusal that states a PRECONDITION interpolates nothing: `DeleteDomain` on a
 //!    non-empty domain answers the same sentence whatever domain was addressed and
 //!    however many repositories it holds.
@@ -87,9 +88,11 @@ fn domain_exists(domain: &str, owner: &str) -> String {
     format!("Domain '{domain}' owned by '{owner}' already exists.")
 }
 
-/// RULE 1, for a repository create whose name is already held in the addressed domain.
-fn repository_exists(domain: &str, owner: &str, repository: &str) -> String {
-    format!("Repository '{repository}' in domain '{domain}' owned by '{owner}' already exists.")
+/// RULE 1, for a repository create whose name is already held in the addressed domain:
+/// a repository name is taken per DOMAIN, so the sentence names the two things it is unique
+/// within and not the account.
+fn repository_exists(domain: &str, repository: &str) -> String {
+    format!("Repository {repository} already exists in domain {domain}.")
 }
 
 /// RULE 2: the precondition `DeleteDomain` states, which interpolates nothing.
@@ -383,7 +386,7 @@ async fn duplicate_create_refusals_quote_the_name_and_the_owning_account() {
             uri: format!("/v1/repository?domain={shortest_domain}&repository={repository}"),
             body: Some(json!({})),
             answer: CONFLICT,
-            message: repository_exists(&shortest_domain, ACCOUNT, &repository),
+            message: repository_exists(&shortest_domain, &repository),
         });
     }
 

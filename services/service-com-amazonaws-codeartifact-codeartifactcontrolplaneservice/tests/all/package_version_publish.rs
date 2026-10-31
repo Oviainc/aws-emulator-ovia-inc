@@ -27,9 +27,11 @@
 //!    reopened, so a further publish into it is `ConflictException` (409).
 //! 7. `versionRevision` identifies the version's CONTENT: it is stable across reads of an
 //!    unchanged version, identical for a repeated publish of the same bytes, and
-//!    different once an asset is added or the version closes.
+//!    different once an asset is added.
 //! 8. A domain's `assetSizeBytes` is the total size of the assets its repositories hold.
-//! 9. Origin control decides whether a package accepts a publish at all.
+//! 9. Origin control decides whether a package accepts a publish at all — a package whose
+//!    `publish` restriction is `BLOCK` is `ValidationException` (400), the request being
+//!    invalid for that package rather than unauthorized for the caller.
 //!
 //! The declared ceilings are row-tested where a test can reach them: the assets-per-version
 //! bound is (100 small publishes). The remaining three are not, and deliberately —
@@ -895,9 +897,9 @@ async fn origin_control_decides_whether_a_package_accepts_a_publish() {
     // created by `PutPackageOriginConfiguration` alone.
     let cases = [
         ("ALLOW, package already published", "ALLOW", true, 200),
-        ("BLOCK, package already published", "BLOCK", true, 403),
+        ("BLOCK, package already published", "BLOCK", true, 400),
         ("ALLOW, package created by the origin call", "ALLOW", false, 200),
-        ("BLOCK, package created by the origin call", "BLOCK", false, 403),
+        ("BLOCK, package created by the origin call", "BLOCK", false, 400),
     ];
     assert_eq!(
         ALLOW_PUBLISH_VALUES,
@@ -945,11 +947,18 @@ async fn origin_control_decides_whether_a_package_accepts_a_publish() {
             answer.status, expected_status,
             "case {label:?}: expected status {expected_status}, got {answer:?}"
         );
-        if expected_status == 403 {
+        if expected_status == 400 {
             assert_eq!(
                 answer.code(),
-                "AccessDeniedException".to_string(),
-                "case {label:?}: a blocked publish is an authorization refusal, got {answer:?}"
+                "ValidationException".to_string(),
+                "case {label:?}: a blocked publish is a validation refusal, not an \
+                 authorization one, got {answer:?}"
+            );
+            assert_eq!(
+                answer.message(),
+                "This package is configured to block new versions from being published.",
+                "case {label:?}: expected the service's fixed origin-block sentence, got \
+                 {answer:?}"
             );
             // And it stored nothing: the version the blocked call named is absent.
             let absent = describe(&router, &attempt).await;

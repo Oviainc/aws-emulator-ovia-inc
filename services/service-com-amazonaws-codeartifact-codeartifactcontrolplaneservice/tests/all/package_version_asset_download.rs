@@ -29,8 +29,10 @@
 //! 5. Downloading is a READ: two downloads answer identically and nothing a later caller
 //!    sees (the version's description and revision, the domain's `assetSizeBytes`) moves
 //!    because an asset was downloaded.
-//! 6. A version whose assets `DisposePackageVersions` deleted holds none, so the download
-//!    that used to succeed is `ResourceNotFoundException` (404) on the asset.
+//! 6. A version `DisposePackageVersions` disposed keeps its asset records — that
+//!    operation's asset deletion is out-of-band work, not part of the call — so the
+//!    download that succeeded before it still answers the same bytes; only an asset NAME
+//!    the version does not hold is `ResourceNotFoundException` (404).
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -650,11 +652,11 @@ async fn download_changes_nothing_a_later_caller_sees() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 6: a disposed version holds no asset to download.
+// Rule 6: a disposed version still serves the bytes it holds.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn disposed_version_holds_no_asset_to_download() {
+async fn disposed_version_still_serves_the_asset_it_holds() {
     let router = emulator_with_repository().await;
 
     let cases = vec![
@@ -683,24 +685,45 @@ async fn disposed_version_holds_no_asset_to_download() {
         let after = download(&router, &Get::of(case)).await;
         assert_eq!(
             (after.status, after.code()),
-            (404, "ResourceNotFoundException".to_string()),
-            "case {label:?}: a disposed version's assets are deleted, so the download is a \
-             404, got {after:?}"
+            (200, String::new()),
+            "case {label:?}: disposal deletes no asset record, so the download still \
+             succeeds, got {after:?}"
         );
         assert_eq!(
-            after.resource(),
-            ("asset".to_string(), case.asset_name.clone()),
-            "case {label:?}: the refusal must name the asset that is gone, got {:?}",
-            after.error()
+            after.payload, case.content,
+            "case {label:?}: expected the originally published bytes, got {} bytes",
+            after.payload.len()
+        );
+        assert_eq!(
+            (
+                after.asset_name.clone(),
+                after.package_version.clone(),
+                after.revision_header()
+            ),
+            (
+                before.asset_name.clone(),
+                before.package_version.clone(),
+                before.revision_header()
+            ),
+            "case {label:?}: disposal relabels the version, so the asset's own metadata \
+             headers must be the ones before it, got {after:?}"
         );
 
-        // The VERSION is still held — disposal keeps the record — so the refusal above is
-        // about the asset, not about a version that vanished.
+        // The VERSION is relabelled all the same, which is what the disposal did.
         let described = describe(&router, case).await;
         assert_eq!(
             described.body["packageVersion"]["status"].as_str(),
             Some("Disposed"),
             "case {label:?}: the disposed version must still be described, got {described:?}"
+        );
+
+        // An asset NAME the version does not hold is still a 404: the read is gated by the
+        // asset, never by the version's status.
+        let absent = download(&router, &Get::of(case).asset("absent-asset.bin")).await;
+        assert_eq!(
+            (absent.status, absent.code()),
+            (404, "ResourceNotFoundException".to_string()),
+            "case {label:?}: an asset the version never held must be a 404, got {absent:?}"
         );
     }
 }

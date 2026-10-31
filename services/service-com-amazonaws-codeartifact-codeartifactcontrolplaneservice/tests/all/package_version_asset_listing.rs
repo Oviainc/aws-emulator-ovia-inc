@@ -28,8 +28,9 @@
 //! 6. An UNFINISHED version lists the assets it has accepted so far, with the revision the
 //!    publish reported; the asset that closes the version appears in the same listing, and
 //!    a refused publish into the closed version leaves the listing alone.
-//! 7. A version whose assets `DisposePackageVersions` deleted holds none, so the listing
-//!    succeeds and carries an EMPTY `assets` list rather than an absent one.
+//! 7. A version `DisposePackageVersions` disposed keeps its asset records — that
+//!    operation's asset deletion is out-of-band work, not part of the call — so the
+//!    listing after a disposal is the listing before it.
 
 use std::collections::BTreeSet;
 
@@ -821,11 +822,12 @@ async fn unfinished_version_lists_the_assets_accepted_so_far() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 7: a disposed version holds no asset, and lists an empty list.
+// Rule 7: disposal relabels the version and leaves its asset records, so the listing is
+// unchanged by it.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn disposed_version_lists_no_assets() {
+async fn disposed_version_still_lists_the_assets_it_holds() {
     let router = emulator_with_repository().await;
 
     let cases: Vec<VersionCase> = vec![
@@ -871,9 +873,9 @@ async fn disposed_version_lists_no_assets() {
         );
         assert_eq!(
             after.body["assets"],
-            json!([]),
-            "case {label:?}: a disposed version's assets are deleted, so the list is present \
-             and EMPTY, got {after:?}"
+            before.body["assets"],
+            "case {label:?}: disposal removes no asset record, so the listing must be the \
+             one before it, got {after:?}"
         );
         assert_eq!(
             after.body["version"].as_str(),

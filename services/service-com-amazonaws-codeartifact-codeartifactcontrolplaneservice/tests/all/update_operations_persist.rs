@@ -21,9 +21,11 @@
 //!    package version" (`UpdateRepositoryRequest$upstreams`).
 //! 3. A refused mutation changes nothing: a request outside a quota, a constraint or a
 //!    per-version precondition leaves the record exactly as the last accepted call left it.
-//! 4. `UpdatePackageVersionsStatus` decides each named version on its own and answers 200
-//!    with a per-version outcome; the versions it moved carry the status and the revision a
-//!    later read of them reports.
+//! 4. `UpdatePackageVersionsStatus` decides every named version first and answers 200 with
+//!    a per-version outcome; the batch is all-or-nothing, so one version that cannot make
+//!    the transition leaves the others `SKIPPED` and unmoved. A version it did move carries
+//!    the status a later read reports and the revision the publish produced — relabelling a
+//!    version does not republish it.
 //!
 //! The ceilings and value sets these cases span are read from the service's own constants
 //! or from the model's generated ones, so a change to either moves the table rather than
@@ -897,8 +899,8 @@ async fn update_package_versions_status_commits_the_new_status() {
             );
 
             // Rule 1: the move is committed, so the read reports it — with the SAME
-            // revision the answer reported, because a version's revision identifies its
-            // content and its status is part of that content.
+            // revision the answer reported, which is the revision the version already had:
+            // a revision identifies the version's content, which a relabel leaves alone.
             let (status, revision) =
                 described_status_and_revision(&describe(&router, request).await);
             assert_eq!(
@@ -954,9 +956,11 @@ async fn update_package_versions_status_refusals_change_nothing() {
             (400, "ValidationException".to_string()),
             "case targetStatus {target}: expected a 400 ValidationException, got {refused:?}"
         );
-        assert!(
-            refused.message().contains("targetStatus"),
-            "case targetStatus {target}: the refusal must name the member, got {refused:?}"
+        assert_eq!(
+            refused.message(),
+            "Target status is not allowed.",
+            "case targetStatus {target}: the refusal must be the service's own rule, not a \
+             narrower enum than the model publishes, got {refused:?}"
         );
         let (status, _) = described_status_and_revision(&describe(&router, &request).await);
         assert_eq!(
@@ -1131,17 +1135,17 @@ async fn put_package_origin_configuration_commits_restrictions_to_both_readers()
 }
 
 // ---------------------------------------------------------------------------
-// Rules 1, 3 and 4 on DisposePackageVersions: the assets go, the status moves, and the
+// Rules 1, 3 and 4 on DisposePackageVersions: the status moves, the assets stay, and the
 // status is terminal.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn dispose_package_versions_deletes_the_assets_and_commits_a_terminal_status() {
+async fn dispose_package_versions_retains_the_assets_and_commits_a_terminal_status() {
     let router = emulator_with_repository().await;
 
     // Rows differ along what the rule generalises over: the namespace, the size of the
-    // assets disposed (so the derived total it frees differs), and the status the version is
-    // in when it is disposed.
+    // assets the disposed version holds, and the status the version is in when it is
+    // disposed.
     let cases: Vec<(&str, Publish, Option<&str>)> = vec![
         (
             "a published version",
@@ -1202,8 +1206,8 @@ async fn dispose_package_versions_deletes_the_assets_and_commits_a_terminal_stat
         );
 
         // Rule 1: the move is committed, and the revision reported is the one a read of the
-        // disposed version reports — the assets are part of what a revision identifies, so
-        // deleting them moves it.
+        // disposed version reports — which is the revision the publish produced, because a
+        // disposal relabels the version rather than changing what it holds.
         let (status, revision) = described_status_and_revision(&describe(&router, request).await);
         assert_eq!(
             status.as_deref(),
@@ -1215,18 +1219,20 @@ async fn dispose_package_versions_deletes_the_assets_and_commits_a_terminal_stat
             reported["revision"].as_str(),
             "case {label:?}: the reported revision must be the one a read reports, got {revision:?}"
         );
-        assert_ne!(
+        assert_eq!(
             revision, revision_before,
-            "case {label:?}: disposing deletes the assets, so the revision must move, got {revision:?}"
+            "case {label:?}: a disposal relabels the version, so the revision must not move, \
+             got {revision:?}"
         );
 
-        // The assets really are gone: the domain's `assetSizeBytes` is summed from the
-        // assets its repositories hold, so it drops by exactly what this version held.
+        // The assets stay: disposal's own asset deletion is out-of-band work, so the
+        // domain's `assetSizeBytes` — summed from the assets its repositories hold — is
+        // unchanged by the call.
         let freed = held_bytes - domain_asset_size_bytes(&router, &request.domain).await;
         assert_eq!(
-            freed,
-            request.content.len() as i64,
-            "case {label:?}: expected the disposed assets ({} bytes) to be freed, got {freed}",
+            freed, 0,
+            "case {label:?}: expected the disposed version's {} bytes to be retained, got \
+             {freed} freed",
             request.content.len()
         );
 

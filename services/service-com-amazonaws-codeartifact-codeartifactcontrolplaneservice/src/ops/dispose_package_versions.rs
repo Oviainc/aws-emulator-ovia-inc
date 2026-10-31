@@ -17,13 +17,15 @@
 //!   status is not the `expectedStatus` the caller pinned is `MISMATCHED_STATUS`, and a
 //!   version whose revision is not the one `versionRevisions` pinned is
 //!   `MISMATCHED_REVISION`;
-//! * every other named version has its ASSETS DELETED and its status moved to `Disposed`,
-//!   committed to the store: the version record stays ("To view information about a disposed
-//!   package version, use DescribePackageVersion"), so a later read reports it with status
-//!   `Disposed` and no assets, and the domain's derived `assetSizeBytes` drops by what those
-//!   assets held. That is also why the status is terminal — "a disposed package version
-//!   cannot be restored in your repository because its assets are deleted" — which
-//!   `UpdatePackageVersionsStatus` enforces.
+//! * every other named version has its status moved to `Disposed`, committed to the store:
+//!   the version record stays ("To view information about a disposed package version, use
+//!   DescribePackageVersion"), so a later read reports it with status `Disposed`. The asset
+//!   deletion the operation documents ("Deletes the assets in package versions") is work the
+//!   service does out of band rather than part of answering this call, so the version's
+//!   asset records — and the bytes `GetPackageVersionAsset` serves from them — are still
+//!   there for a caller reading straight after the disposal. The status is terminal all the
+//!   same, which `UpdatePackageVersionsStatus` enforces: "a disposed package version cannot
+//!   be restored in your repository".
 //!
 //! ## Shape of an operation
 //!
@@ -299,9 +301,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DisposePackageVer
             ::std::collections::HashMap::new();
         let mut failed: ::std::collections::HashMap<String, PackageVersionError> =
             ::std::collections::HashMap::new();
-        // The versions this call disposed, and how many assets each one lost — the state
-        // change each disposal announces.
-        let mut disposed: Vec<(String, usize)> = Vec::new();
+        // The versions this call disposed — the state change each disposal announces.
+        let mut disposed: Vec<String> = Vec::new();
 
         let revisions = input.version_revisions.unwrap_or_default();
 
@@ -366,23 +367,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DisposePackageVer
                 }
             }
 
-            // The write: the assets go and the status moves. Both are committed to the
-            // stored version, so `DescribePackageVersion` reports a disposed version with
-            // no assets from here on, and the domain's derived `assetSizeBytes` — summed
-            // from the assets themselves — drops by what they held.
-            let assets_removed = stored.assets.len();
+            // The write: the status moves, and it is COMMITTED to the stored version, so
+            // `DescribePackageVersion` reports a disposed version from here on. The ASSET
+            // records stay: the deletion disposal documents is asynchronous work the
+            // service does out of band, not part of answering this call, so a caller
+            // reading the version's assets straight after a disposal is still served the
+            // bytes it published.
             let status_changed = stored.status != crate::state::PACKAGE_VERSION_STATUS_DISPOSED;
-            stored.assets.clear();
             stored.status = crate::state::PACKAGE_VERSION_STATUS_DISPOSED.to_string();
-            if assets_removed > 0 || status_changed {
+            if status_changed {
                 stored.advance_sequence();
-                disposed.push((version.clone(), assets_removed));
+                disposed.push(version.clone());
             }
             successful.insert(
                 version.clone(),
                 SuccessfulPackageVersionInfo {
-                    // Read AFTER the write: a version's revision identifies its content, and
-                    // this call changed both the assets and the status.
+                    // A version's revision identifies its CONTENT, which this call leaves
+                    // as it is: the status it moved is not part of it.
                     revision: Some(stored.revision()),
                     status: Some(stored.status.clone()),
                 },
@@ -394,16 +395,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DisposePackageVer
             failed_versions: Some(failed),
         };
 
-        // A disposal is a state change of the version it disposed: its assets are gone and
-        // its status moved, which is what the event's `changes` states. Read back off the
-        // stored records, so the revision announced is the one the disposal left.
+        // A disposal is a state change of the version it disposed: its status moved, which
+        // is what the event's `changes` states. No asset left the version in this call, so
+        // none is announced as removed. Read back off the stored records, so the revision
+        // announced is the one the disposal left.
         let mut changes: Vec<crate::state::package_version_events::VersionChange> = Vec::new();
         if let Some(repository) = store
             .domain(&input.domain, input.domain_owner.as_deref())
             .and_then(|domain| domain.repositories.get(&input.repository))
         {
             if let Some(held) = repository.packages.get(&key) {
-                for (version, assets_removed) in disposed {
+                for version in disposed {
                     if let Some(stored) = held.versions.get(&version) {
                         changes.push(crate::state::package_version_events::VersionChange::of(
                             repository,
@@ -411,8 +413,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DisposePackageVer
                             stored,
                             crate::state::package_version_events::OPERATION_UPDATED,
                             crate::state::package_version_events::VersionChanges {
-                                assets_removed: i64::try_from(assets_removed)
-                                    .unwrap_or(i64::MAX),
                                 status_changed: true,
                                 ..crate::state::package_version_events::VersionChanges::default()
                             },

@@ -24,11 +24,11 @@
 //! `PackageVersionErrorCode` `MISMATCHED_REVISION`; it is a conflict rather than a
 //! not-found because the version IS held, at a revision other than the one asked for.
 //!
-//! A version's STATUS is not a gate here, and deliberately: the only status that makes an
-//! asset unavailable in this store is `Disposed`, whose assets `DisposePackageVersions`
-//! deleted, and that version holds no asset to find, so it answers 404 on the asset like
-//! any other name the version does not hold. No modelled text makes any other status
-//! refuse this read.
+//! A version's STATUS is not a gate here, and deliberately: no modelled text makes any
+//! status refuse this read. A `Disposed` version is served like any other — the asset
+//! deletion `DisposePackageVersions` documents is out-of-band work rather than part of the
+//! call that disposed the version, so its asset records are still here and this operation
+//! streams their bytes; only an asset NAME the version does not hold is a 404.
 //!
 //! This is a REPORTING operation: the store guard is taken immutably, so nothing a later
 //! caller sees can move because an asset was downloaded.

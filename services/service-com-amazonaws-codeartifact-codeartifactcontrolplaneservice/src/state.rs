@@ -254,10 +254,12 @@ pub const UPDATABLE_PACKAGE_VERSION_STATUSES: &[&str] = &[
     PACKAGE_VERSION_STATUS_UNLISTED,
 ];
 
-/// `PackageVersionStatus` of a version `DisposePackageVersions` disposed: its assets are
-/// deleted and the version record stays, which is why the status is terminal — "a disposed
-/// package version cannot be restored in your repository because its assets are deleted"
-/// (`DisposePackageVersions`' own documentation).
+/// `PackageVersionStatus` of a version `DisposePackageVersions` disposed: the version
+/// record stays, which is why a disposed version is still readable, and the status is
+/// terminal — "a disposed package version cannot be restored in your repository"
+/// (`DisposePackageVersions`' own documentation). The asset deletion that operation
+/// documents is work the service does out of band, so a disposed version's asset records
+/// are not removed by the call that disposed it.
 pub const PACKAGE_VERSION_STATUS_DISPOSED: &str = "Disposed";
 
 /// `PackageVersionStatus` of a version a delete removed, which is what
@@ -1763,10 +1765,14 @@ pub struct PackageVersion {
 impl PackageVersion {
     /// `versionRevision`: an opaque token that identifies this version's CONTENT.
     ///
-    /// Derived from everything a revision has to move with — the version, its status and
-    /// each asset's name and content digest — so two reads of an unchanged version report
-    /// the same revision, adding an asset or closing an unfinished version reports a new
-    /// one, and a version restored to identical content reports the identical token.
+    /// Derived from everything a revision has to move with — the version, its metadata
+    /// document and each asset's name and content digest — so two reads of an unchanged
+    /// version report the same revision, adding an asset reports a new one, and a version
+    /// restored to identical content reports the identical token. The version's STATUS is
+    /// deliberately not among them: a revision identifies what the version holds, and an
+    /// operation that only relabels it (a status move, a disposal) leaves the content — and
+    /// therefore the token clients pin in `versionRevisions` — exactly as the publish
+    /// produced it.
     /// Base64 of a SHA-256 digest, which is 44 characters: inside the modelled
     /// `PackageVersionRevision` length (1..50) and `^\S+$` pattern.
     ///
@@ -1776,7 +1782,7 @@ impl PackageVersion {
     pub fn revision(&self) -> String {
         use base64::Engine as _;
 
-        let mut fields: Vec<&str> = vec![self.version.as_str(), self.status.as_str()];
+        let mut fields: Vec<&str> = vec![self.version.as_str()];
         // The metadata document is part of the version's content too: a version restored
         // with the same assets but a different manifest is not the same version.
         if let Some(manifest) = &self.manifest {
@@ -2555,10 +2561,12 @@ pub fn domain_already_exists_message(domain: &str, owner: &str) -> String {
 
 /// The `ConflictException` message for a create whose repository name is already held in
 /// the addressed domain.
-pub fn repository_already_exists_message(domain: &str, owner: &str, repository: &str) -> String {
-    format!(
-        "Repository '{repository}' in domain '{domain}' owned by '{owner}' already exists."
-    )
+///
+/// The sentence names the two things a repository name is unique WITHIN — the name itself
+/// and the domain holding it — unquoted, and nothing else: a repository name is taken per
+/// domain, so the account owning that domain is not part of what the conflict reports.
+pub fn repository_already_exists_message(domain: &str, repository: &str) -> String {
+    format!("Repository {repository} already exists in domain {domain}.")
 }
 
 /// The `ConflictException` message for `DeleteDomain` on a domain that still holds
@@ -2570,16 +2578,20 @@ pub fn repository_already_exists_message(domain: &str, owner: &str, repository: 
 pub const DOMAIN_NOT_EMPTY_MESSAGE: &str = "Domain must contain 0 repositories before deletion";
 
 /// The `ResourceNotFoundException` message for a package group the addressed domain does
-/// not hold. Same composition as the two above, for the third resource kind a domain
-/// contains: the pattern is the group's identifier, so it is what the sentence quotes.
+/// not hold, as CodeArtifact itself words it — the resource kind capitalised, its "not
+/// found" clause doubled, the group's identifying PATTERN single-quoted, the domain and the
+/// account bare, and no sentence-final period.
+///
+/// Stated by every package-group operation that resolves one, so the sentence a caller
+/// matches is the same whichever of them missed.
 pub fn package_group_not_found_message(
     domain: &str,
     domain_owner: Option<&str>,
     package_group: &str,
 ) -> String {
     format!(
-        "Package group not found. Package group '{package_group}' in domain '{domain}' \
-         owned by account '{}' does not exist.",
+        "Package Group not found not found. Package Group '{package_group}' in domain \
+         {domain} owned by account {} does not exist",
         addressed_domain_owner(domain_owner)
     )
 }

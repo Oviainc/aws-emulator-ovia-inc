@@ -9,25 +9,28 @@
 //! * `targetStatus` must be a status this operation moves a version TO — `Archived`,
 //!   `Published` or `Unlisted` ("To set the status of a package version to Disposed, use
 //!   DisposePackageVersions"). `PackageVersionStatus` models six values, so one of the
-//!   other three is `ValidationException` (400) naming the member, not a status change;
+//!   other three is wire-valid but fails the SERVICE's rule: `ValidationException` (400)
+//!   stating that the target status is not allowed, rather than a modelled-enum sentence;
 //! * an `expectedStatus` naming a state no stored version carries is also
 //!   `ValidationException` (400), from the set every operation that takes a status as input
 //!   shares ([`crate::state::input_package_version_status_refusal`]);
 //! * the addressed domain, repository and package are resolved next; one this caller does
 //!   not hold is `ResourceNotFoundException` (404), so a request that names no package is
 //!   refused rather than reported as a list of per-version failures;
-//! * each named version is decided on its own and reported in ONE of the two modelled
-//!   maps, because this operation answers 200 with a per-version outcome rather than
-//!   failing the call: a version the package does not hold is `NOT_FOUND`, a version whose
-//!   status is not the `expectedStatus` the caller pinned is `MISMATCHED_STATUS`, a version
-//!   whose revision is not the one the caller's `versionRevisions` entry pinned is
-//!   `MISMATCHED_REVISION`, a version that was DISPOSED is `NOT_ALLOWED` (its assets are
-//!   deleted, so "a disposed package version cannot be restored"), and every other named
-//!   version is moved to `targetStatus`;
-//! * the move is committed to the store, so `DescribePackageVersion` reports the new status
-//!   from the very next call, and the `revision` reported beside it is the one the UPDATED
-//!   version has — a version's revision identifies its content, and its status is part of
-//!   that content.
+//! * each named version is DECIDED first, against the store as the call found it, and
+//!   reported in ONE of the two modelled maps, because this operation answers 200 with a
+//!   per-version outcome rather than failing the call: a version the package does not hold
+//!   is `NOT_FOUND`, a version whose status is not the `expectedStatus` the caller pinned is
+//!   `MISMATCHED_STATUS`, a version whose revision is not the one the caller's
+//!   `versionRevisions` entry pinned is `MISMATCHED_REVISION`, and a version that was
+//!   DISPOSED is `NOT_ALLOWED` ("a disposed package version cannot be restored");
+//! * the batch is ALL-OR-NOTHING: if any named version failed its decision, no version is
+//!   written and every version that could have moved is reported `SKIPPED` and keeps the
+//!   status it had — which is what that modelled error code is for;
+//! * otherwise every move is committed to the store, so `DescribePackageVersion` reports
+//!   the new status from the very next call. The `revision` reported beside it is the one
+//!   the version already had: a revision identifies the version's CONTENT, and relabelling
+//!   it does not republish it.
 //!
 //! ## Shape of an operation
 //!
@@ -252,27 +255,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
             );
         };
 
-        // `targetStatus` is modelled as the whole `PackageVersionStatus` enum, so the
-        // boundary validator admits all six values; only three of them are a status THIS
-        // operation moves a version to (`crate::state::UPDATABLE_PACKAGE_VERSION_STATUSES`,
-        // which quotes the operation's own documentation). The rest are reachable only
-        // through the operation that owns each, so naming one is a bad request — stated in
-        // the same constraint-violation envelope the boundary states a modelled constraint
-        // in, naming the member and the requirement it failed.
+        // `targetStatus` is modelled as the whole `PackageVersionStatus` enum, so every one
+        // of its six values is WIRE-VALID; only three of them are a status THIS operation
+        // moves a version to (`crate::state::UPDATABLE_PACKAGE_VERSION_STATUSES`, which
+        // quotes the operation's own documentation). The rest are reachable only through the
+        // operation that owns each ("To set the status of a package version to Disposed, use
+        // DisposePackageVersions"), so naming one fails the SERVICE's own rule rather than a
+        // constraint of the model: the refusal is the service's fixed sentence, which names
+        // neither the member nor a narrower value set than the one the model publishes.
         if !crate::state::UPDATABLE_PACKAGE_VERSION_STATUSES.contains(&input.target_status.as_str())
         {
             return Err(
                 UpdatePackageVersionsStatusErrorModeled::ValidationException(
                     ValidationException {
-                        message: crate::state::constraint_violation_message(
-                            "targetStatus",
-                            &input.target_status,
-                            &format!(
-                                "Member must satisfy enum value set: [{}]",
-                                crate::state::UPDATABLE_PACKAGE_VERSION_STATUSES.join(", ")
-                            ),
-                        ),
-                        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                        message: TARGET_STATUS_NOT_ALLOWED_MESSAGE.to_string(),
+                        reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
                     },
                 )
                 .into(),
@@ -342,93 +339,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         // The versions this call MOVED, whose state change is announced below.
         let mut changed: Vec<String> = Vec::new();
 
-        let revisions = input.version_revisions.unwrap_or_default();
+        let revisions = input.version_revisions.clone().unwrap_or_default();
 
+        // PHASE 1 — DECIDE every named version, against the store exactly as this call
+        // found it, and write NOTHING. The batch is all-or-nothing: `SKIPPED` exists for
+        // the versions of a call that one forbidden transition stopped, so whether a
+        // sibling is applied depends on the decisions taken for the OTHER named versions,
+        // which cannot be known while they are being committed one at a time.
+        let mut decided: Vec<(String, Result<(), PackageVersionError>)> = Vec::new();
         for version in &input.versions {
             // Both answers are MAPS keyed by version, so a list that repeats a version
             // carries one outcome for it: the first decision stands, and the repeat is not
-            // re-decided against the store the first one already changed.
-            if successful.contains_key(version) || failed.contains_key(version) {
+            // decided again.
+            if decided.iter().any(|(named, _)| named == version) {
                 continue;
             }
+            decided.push((
+                version.clone(),
+                decide(&input, &revisions, package.versions.get(version), version),
+            ));
+        }
 
-            let Some(stored) = package.versions.get_mut(version) else {
+        // One failed decision stops the whole call: every version that could have moved is
+        // reported `SKIPPED` and keeps the status it had, which is what a caller that
+        // branches on that code is told to expect.
+        let stopped = decided.iter().any(|(_, outcome)| outcome.is_err());
+
+        // PHASE 2 — COMMIT, and only now.
+        for (version, outcome) in decided {
+            if let Err(error) = outcome {
+                failed.insert(version, error);
+                continue;
+            }
+            if stopped {
                 failed.insert(
                     version.clone(),
                     version_error(
-                        PACKAGE_VERSION_ERROR_NOT_FOUND,
-                        crate::state::package_version_not_found_message(
-                            &input.package,
-                            version,
-                            &input.repository,
-                        ),
+                        PACKAGE_VERSION_ERROR_SKIPPED,
+                        skipped_message(&input.package, &version),
                     ),
                 );
+                continue;
+            }
+            let Some(stored) = package.versions.get_mut(&version) else {
                 continue;
             };
-
-            // A DISPOSED version is terminal: "a disposed package version cannot be
-            // restored in your repository because its assets are deleted"
-            // (`DisposePackageVersions`), so no status move can bring one back. Reported as
-            // the per-version `NOT_ALLOWED` rather than refusing the whole call, because
-            // every other named version is still decided on its own.
-            if stored.status == crate::state::PACKAGE_VERSION_STATUS_DISPOSED {
-                failed.insert(
-                    version.clone(),
-                    version_error(
-                        PACKAGE_VERSION_ERROR_NOT_ALLOWED,
-                        format!(
-                            "Package version {} {} is {}; its assets are deleted, so its status cannot be changed.",
-                            input.package,
-                            version,
-                            crate::state::PACKAGE_VERSION_STATUS_DISPOSED
-                        ),
-                    ),
-                );
-                continue;
-            }
-
-            // `expectedStatus` is the caller's precondition: "the package version's status
-            // is updated only if its status at the time UpdatePackageVersionsStatus is
-            // called matches expectedStatus". A version in another status is left exactly
-            // as it was and reported as the mismatch.
-            if let Some(expected) = &input.expected_status {
-                if &stored.status != expected {
-                    failed.insert(
-                        version.clone(),
-                        version_error(
-                            PACKAGE_VERSION_ERROR_MISMATCHED_STATUS,
-                            format!(
-                                "Package version {} {} is {}, not the expected status {}.",
-                                input.package, version, stored.status, expected
-                            ),
-                        ),
-                    );
-                    continue;
-                }
-            }
-
-            // `versionRevisions` is the same kind of precondition on the version's
-            // CONTENT: an entry for this version pins the revision the caller last saw, so
-            // a version whose content moved since is left alone and reported as the
-            // revision mismatch.
-            if let Some(expected) = revisions.get(version) {
-                let held = stored.revision();
-                if &held != expected {
-                    failed.insert(
-                        version.clone(),
-                        version_error(
-                            PACKAGE_VERSION_ERROR_MISMATCHED_REVISION,
-                            format!(
-                                "Package version {} {} is at revision {}, not the expected revision {}.",
-                                input.package, version, held, expected
-                            ),
-                        ),
-                    );
-                    continue;
-                }
-            }
-
             // The write: the new status is COMMITTED to the stored version, so
             // `DescribePackageVersion` and `ListPackageVersions` report it from here on.
             // A version already in the target status is left as it is and announces
@@ -442,9 +397,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
             successful.insert(
                 version.clone(),
                 SuccessfulPackageVersionInfo {
-                    // Read AFTER the write: a version's revision identifies its content,
-                    // and its status is part of that content, so the revision this answer
-                    // reports is the one a read of the updated version reports.
+                    // A version's revision identifies its CONTENT, which a status move
+                    // leaves alone, so this is the revision the publish produced — the same
+                    // one a read of the relabelled version reports.
                     revision: Some(stored.revision()),
                     status: Some(stored.status.clone()),
                 },
@@ -488,6 +443,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
 
 /// `PackageVersionErrorCode$NOT_FOUND`: the package holds no version of that name.
 const PACKAGE_VERSION_ERROR_NOT_FOUND: &str = "NOT_FOUND";
+
+/// `PackageVersionErrorCode$SKIPPED`: this version could have moved, and was not moved,
+/// because another version named by the same call could not.
+const PACKAGE_VERSION_ERROR_SKIPPED: &str = "SKIPPED";
+
+/// The `ValidationException` message for a `targetStatus` this operation does not move a
+/// version to.
+///
+/// The service's own rule, not a constraint of the model: `PackageVersionStatus` models
+/// all six values, so the sentence states that the transition is not allowed rather than
+/// advertising a narrower enum than the model publishes.
+const TARGET_STATUS_NOT_ALLOWED_MESSAGE: &str = "Target status is not allowed.";
+
+/// The `errorMessage` of a `SKIPPED` entry: why this version was not moved, which is
+/// nothing about the version itself.
+fn skipped_message(package: &str, version: &str) -> String {
+    format!(
+        "Package version {package} {version} was skipped because another package version \
+         in the same request could not be updated."
+    )
+}
+
+/// The outcome this call owes ONE named version, decided against the stored record and
+/// writing nothing: `Ok` for a version the move may be applied to, `Err` for the modelled
+/// per-version failure it owes instead.
+///
+/// `stored` is the record the addressed package holds for that version, `None` when it
+/// holds none.
+fn decide(
+    input: &UpdatePackageVersionsStatusInput,
+    revisions: &::std::collections::HashMap<String, String>,
+    stored: Option<&crate::state::PackageVersion>,
+    version: &str,
+) -> Result<(), PackageVersionError> {
+    let Some(stored) = stored else {
+        return Err(version_error(
+            PACKAGE_VERSION_ERROR_NOT_FOUND,
+            crate::state::package_version_not_found_message(
+                &input.package,
+                version,
+                &input.repository,
+            ),
+        ));
+    };
+
+    // A DISPOSED version is terminal: "a disposed package version cannot be restored in
+    // your repository" (`DisposePackageVersions`), so no status move can bring one back.
+    // Reported as the per-version `NOT_ALLOWED`, because this operation answers 200 with a
+    // per-version outcome rather than failing the call.
+    if stored.status == crate::state::PACKAGE_VERSION_STATUS_DISPOSED {
+        return Err(version_error(
+            PACKAGE_VERSION_ERROR_NOT_ALLOWED,
+            format!(
+                "Package version {} {} is {}, so its status cannot be changed.",
+                input.package, version, crate::state::PACKAGE_VERSION_STATUS_DISPOSED
+            ),
+        ));
+    }
+
+    // `expectedStatus` is the caller's precondition: "the package version's status is
+    // updated only if its status at the time UpdatePackageVersionsStatus is called matches
+    // expectedStatus". A version in another status is left exactly as it was and reported
+    // as the mismatch.
+    if let Some(expected) = &input.expected_status {
+        if &stored.status != expected {
+            return Err(version_error(
+                PACKAGE_VERSION_ERROR_MISMATCHED_STATUS,
+                format!(
+                    "Package version {} {} is {}, not the expected status {}.",
+                    input.package, version, stored.status, expected
+                ),
+            ));
+        }
+    }
+
+    // `versionRevisions` is the same kind of precondition on the version's CONTENT: an
+    // entry for this version pins the revision the caller last saw, so a version whose
+    // content moved since is left alone and reported as the revision mismatch.
+    if let Some(expected) = revisions.get(version) {
+        let held = stored.revision();
+        if &held != expected {
+            return Err(version_error(
+                PACKAGE_VERSION_ERROR_MISMATCHED_REVISION,
+                format!(
+                    "Package version {} {} is at revision {}, not the expected revision {}.",
+                    input.package, version, held, expected
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
 
 /// `PackageVersionErrorCode$MISMATCHED_STATUS`: the version is not in the status the
 /// caller's `expectedStatus` pinned.

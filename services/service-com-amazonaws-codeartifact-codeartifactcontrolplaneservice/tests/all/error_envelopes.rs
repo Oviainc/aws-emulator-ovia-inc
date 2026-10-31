@@ -97,8 +97,8 @@ fn repository_not_found(domain: &str, owner: &str, repository: &str) -> String {
 
 fn package_group_not_found(domain: &str, owner: &str, pattern: &str) -> String {
     format!(
-        "Package group not found. Package group '{pattern}' in domain '{domain}' owned by \
-         account '{owner}' does not exist."
+        "Package Group not found not found. Package Group '{pattern}' in domain {domain} \
+         owned by account {owner} does not exist"
     )
 }
 
