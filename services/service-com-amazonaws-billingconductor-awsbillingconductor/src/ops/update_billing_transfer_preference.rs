@@ -270,17 +270,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The preference REPLACES whatever the transfer held: the whole preference is one
+        // `LastModifiedTime` is "the most recent time when the preference was modified",
+        // so it moves only when this call actually modified the preference: a request
+        // that restates the preference the transfer already holds — the same `Enabled`
+        // and, once the plan reference is resolved to the one spelling the store keeps,
+        // the same pricing plan — modified nothing, so it answers with the stored record
+        // and writes neither the record nor a fresh instant. That is the rule this
+        // crate's sibling writers hold their own resources to (`UpdateBillingGroup`,
+        // `UpdatePricingRule`), decided here by the state method that names the members a
+        // preference consists of
+        // ([`crate::state::BillingTransferPreferenceRecord::holds_same_preference_as`]).
+        //
+        // Anything else REPLACES whatever the transfer held: the whole preference is one
         // required member, so there is no member to carry over. Nothing is created here —
         // "the preference applies only to billing groups that are created after you
         // enable it", and the accounts that transfer their bill to the bill source
         // account are Organizations state this service does not hold.
-        let stored = state.set_billing_transfer_preference(
-            &transfer_arn,
-            requested.enabled,
-            plan_arn,
-            crate::state::now_millis(),
-        );
+        let restated = state
+            .billing_transfer_preference(&transfer_arn)
+            .filter(|held| held.holds_same_preference_as(requested.enabled, plan_arn.as_deref()))
+            .cloned();
+        let changed = restated.is_none();
+        let stored = match restated {
+            Some(held) => held,
+            None => state.set_billing_transfer_preference(
+                &transfer_arn,
+                requested.enabled,
+                plan_arn,
+                crate::state::now_millis(),
+            ),
+        };
         state.record_idempotent_arn(Self::NAME, input.client_token.as_deref(), &transfer_arn);
 
         // The audit record for a state-changing call: who asked, what changed and that it
@@ -291,8 +310,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             akid = %::engine::extract_akid(&ctx.parts().headers),
             responsibility_transfer_arn = %stored.responsibility_transfer_arn,
             enabled = stored.enabled,
-            outcome = "updated",
-            "billing transfer preference updated"
+            outcome = if changed { "updated" } else { "unchanged" },
+            "billing transfer preference update served"
         );
         Ok(render(&stored))
     }

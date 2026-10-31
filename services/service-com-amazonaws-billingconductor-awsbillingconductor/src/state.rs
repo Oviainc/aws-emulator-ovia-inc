@@ -2411,8 +2411,10 @@ impl CustomLineItemVersion {
 ///
 /// `AutoTransferBillingGroupCreationPreference` carries `Enabled` and — only while the
 /// preference is enabled — the `PricingPlanArn` the automatically created billing groups
-/// are to compute with. The record adds the instant the preference was last set, which
-/// is what `LastModifiedTime` reports; a transfer with NO record is how "the preference
+/// are to compute with. The record adds the instant a call last MODIFIED the preference,
+/// which is what `LastModifiedTime` reports: a call that restates the preference already
+/// held modified nothing, so it leaves that instant where it was
+/// ([`Self::holds_same_preference_as`]). A transfer with NO record is how "the preference
 /// has never been set" is represented, so that case reports the documented default and
 /// an empty `LastModifiedTime` rather than a stored zero.
 #[derive(Debug, Clone, Default)]
@@ -2428,6 +2430,20 @@ pub struct BillingTransferPreferenceRecord {
     /// `Enabled` is `false`."
     pub pricing_plan_arn: Option<String>,
     pub last_modified_time_millis: i64,
+}
+
+impl BillingTransferPreferenceRecord {
+    /// Is the preference this record holds the one a request asking for `enabled` /
+    /// `pricing_plan_arn` already describes — so that recording it would modify nothing?
+    ///
+    /// `AutoTransferBillingGroupCreationPreference` IS those two members, so they are the
+    /// whole comparison; the transfer the record belongs to is its identity rather than
+    /// part of its preference. `pricing_plan_arn` is compared in the one spelling the
+    /// store keeps ([`normalize_pricing_plan_arn`]), so a plan named by its bare id and
+    /// the same plan named by its full ARN are the same preference.
+    pub fn holds_same_preference_as(&self, enabled: bool, pricing_plan_arn: Option<&str>) -> bool {
+        self.enabled == enabled && self.pricing_plan_arn.as_deref() == pricing_plan_arn
+    }
 }
 
 /// ONE billing transfer of an organization, as its `ResponsibilityTransferArn` spells it.
@@ -2844,6 +2860,10 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// Record one billing transfer's preference and hand back what was stored,
     /// forgetting the oldest-set preference once [`MAX_BILLING_TRANSFER_PREFERENCES`]
     /// are held.
+    ///
+    /// `now` becomes the record's `LastModifiedTime`, so a writer hands a fresh instant
+    /// here only for a call that actually modifies the preference
+    /// ([`BillingTransferPreferenceRecord::holds_same_preference_as`]).
     pub fn set_billing_transfer_preference(
         &mut self,
         arn: &str,

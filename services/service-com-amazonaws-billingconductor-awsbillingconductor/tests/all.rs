@@ -49,6 +49,8 @@ mod billing_group_size_one_rule;
 mod billing_transfer_identity;
 #[path = "all/billing_transfer_preference.rs"]
 mod billing_transfer_preference;
+#[path = "all/billing_transfer_preference_unchanged_update.rs"]
+mod billing_transfer_preference_unchanged_update;
 #[path = "all/cost_report_charges_of_the_generation_in_effect.rs"]
 mod cost_report_charges_of_the_generation_in_effect;
 #[path = "all/cost_report_mutual_percentage_associations.rs"]

@@ -79,10 +79,14 @@ const CLIENT_TOKEN_HEADER: &str = "x-amzn-client-token";
 /// the modelled `PricingPlanArn` pattern beside the customer-minted `[a-zA-Z0-9]{10}`
 /// form (`smithy_query(query="shape",shape="PricingPlanArn")`). Their ARN carries the
 /// literal `aws` account segment the same pattern allows.
-const AWS_MANAGED_PLAN_IDS: &[&str] = &["BasicPricingPlan", "Passthrough"];
+pub(crate) const AWS_MANAGED_PLAN_IDS: &[&str] = &["BasicPricingPlan", "Passthrough"];
 
 /// A live emulator holding only this service.
-struct Emulator {
+///
+/// `pub(crate)` because the suite that owns the no-op restatement rule
+/// (`tests/all/billing_transfer_preference_unchanged_update.rs`) drives the same two
+/// operations and the same payer-gated, transfer-designating setup.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The engine the service was built on, kept so the suite can record the billing
     /// transfers the organization has — see [`Emulator::designate_transfer`].
@@ -99,7 +103,7 @@ impl Emulator {
     /// both the world in which these operations are reachable at all and the
     /// organization whose billing transfers they answer for. The denial every other
     /// caller gets is asserted in `tests/all/payer_account_gate.rs`.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         engine
             .state::<BillingConductorState>()
@@ -112,7 +116,7 @@ impl Emulator {
 
     /// Record a billing transfer the organization HAS, and hand its ARN back — the shared
     /// seam [`crate::billing_transfer_identity::designate_transfer`].
-    fn designate_transfer(&self, arn: &str) -> String {
+    pub(crate) fn designate_transfer(&self, arn: &str) -> String {
         crate::billing_transfer_identity::designate_transfer(&self.engine, arn)
     }
 
@@ -156,7 +160,7 @@ impl Emulator {
     }
 
     /// `GetBillingTransferPreference` for one transfer, whatever it answers.
-    async fn get(&self, transfer: &str) -> (u16, Value) {
+    pub(crate) async fn get(&self, transfer: &str) -> (u16, Value) {
         self.call(
             "POST",
             GET_PATH,
@@ -167,7 +171,7 @@ impl Emulator {
     }
 
     /// `GetBillingTransferPreference`, asserting it was served: the parsed body.
-    async fn read_back(&self, case: &str, transfer: &str) -> Value {
+    pub(crate) async fn read_back(&self, case: &str, transfer: &str) -> Value {
         let (status, parsed) = self.get(transfer).await;
         assert_eq!(
             status, 200,
@@ -179,7 +183,7 @@ impl Emulator {
 
     /// `UpdateBillingTransferPreference` with the preference `preference`, whatever it
     /// answers. `token` is the `ClientToken`, carried in its modelled header.
-    async fn update(
+    pub(crate) async fn update(
         &self,
         transfer: &str,
         preference: &Value,
@@ -196,7 +200,7 @@ impl Emulator {
     }
 
     /// `UpdateBillingTransferPreference`, asserting it was served: the parsed body.
-    async fn set(
+    pub(crate) async fn set(
         &self,
         case: &str,
         transfer: &str,
@@ -213,7 +217,7 @@ impl Emulator {
     }
 
     /// `CreatePricingPlan`, asserting the setup succeeded: the plan's full ARN.
-    async fn create_plan(&self, case: &str, name: &str) -> String {
+    pub(crate) async fn create_plan(&self, case: &str, name: &str) -> String {
         let (status, parsed) = self
             .call("POST", CREATE_PLAN_PATH, &json!({ "Name": name }), &[])
             .await;
@@ -261,7 +265,7 @@ fn transfer_arn_of(account_id: &str, org: &str, direction: &str, id: &str) -> St
 }
 
 /// A billing transfer of THIS organization.
-fn transfer_arn(org: &str, direction: &str, id: &str) -> String {
+pub(crate) fn transfer_arn(org: &str, direction: &str, id: &str) -> String {
     transfer_arn_of(account(), org, direction, id)
 }
 
@@ -272,7 +276,7 @@ fn plan_arn(id: &str) -> String {
 
 /// The ARN of a plan Amazon Web Services owns: the `PricingPlanArn` pattern spells the
 /// account segment of those as the literal `aws`.
-fn managed_plan_arn(id: &str) -> String {
+pub(crate) fn managed_plan_arn(id: &str) -> String {
     format!("arn:aws:billingconductor::aws:pricingplan/{id}")
 }
 
@@ -292,7 +296,7 @@ fn expected_plan(preference: &Value) -> Option<String> {
 
 /// The bare-id spelling of a full ARN — the other form the modelled `PricingPlanArn`
 /// pattern admits for the same plan.
-fn bare_id(arn: &str) -> String {
+pub(crate) fn bare_id(arn: &str) -> String {
     arn.rsplit('/').next().unwrap_or_default().to_string()
 }
 
@@ -308,7 +312,7 @@ struct Setting {
 
 /// Assert one `GetBillingTransferPreference` body reports `enabled` / `plan`, and hand
 /// back its `LastModifiedTime`.
-fn assert_reports(
+pub(crate) fn assert_reports(
     case: &str,
     body: &Value,
     transfer: &str,
