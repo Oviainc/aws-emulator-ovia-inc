@@ -8,6 +8,9 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The one claim rule for a service whose SigV4 signing name is shared with another
+# emulated service (here the Payment Cryptography data plane).
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -39,6 +42,13 @@ sha2 = { workspace = true }
 sha1 = "0.10"
 # Renders a KCV as hex, and the opaque `NextToken` the list operations hand out.
 hex = { workspace = true }
+# The RSA-2048 key pair a TR-34 export token's signing key certificate names, and the
+# RSASSA-PKCS1-v1_5 signature over each certificate: real keys and real signatures.
+aws-lc-rs = "1"
+# The DER X.509 certificates `GetParametersForExport` hands out are encoded by this
+# crate rather than by anything hand-rolled here; the `pem` feature is its own PEM
+# framing for them.
+x509-cert = { version = "0.2", features = ["pem"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

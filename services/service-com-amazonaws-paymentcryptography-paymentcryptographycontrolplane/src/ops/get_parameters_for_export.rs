@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetParametersForExport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetParametersForExport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetParametersForExport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Hands out the export token and the signing key certificate a TR-34 key export is
+//! initiated with: it mints an RSA-2048 key pair and the certificate chain that names
+//! it, stores the whole set in [`crate::state`] under a freshly generated export token,
+//! and answers that stored set — or, when the request asks to reuse the last generated
+//! token, the stored set that still has enough validity left.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +207,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetParametersForExport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetParametersForExportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetParametersForExport"))
+        // Every modelled constraint on this input is refused by the centralized walk
+        // before this body runs: `KeyMaterialType` and `SigningKeyAlgorithm` being
+        // present, and both of those enums' value lists. What is left for this body is
+        // what the model cannot say: that `RSA_2048` "is the only signing key algorithm
+        // allowed" (`SigningKeyAlgorithm`'s own documentation), which every other
+        // member of the `KeyAlgorithm` enum is refused by with the modelled
+        // `ValidationException`.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal)?;
+
+        if input.signing_key_algorithm != crate::state::TR34_SIGNING_KEY_ALGORITHM {
+            return Err(GetParametersForExportErrorModeled::ValidationException(
+                ValidationException {
+                    // The refusal is worded as `SigningKeyAlgorithm`'s own
+                    // documentation states the rule, naming the one algorithm from the
+                    // constant that enforces it so the two cannot drift.
+                    message: Some(format!(
+                        "{} is the only signing key algorithm allowed",
+                        crate::state::TR34_SIGNING_KEY_ALGORITHM
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now();
+        // "To return a previously generated export token and signing key certificate
+        // instead of generating new ones, set ReuseLastGeneratedToken to true" (the
+        // operation's own documentation), and `ReuseLastGeneratedToken`'s own
+        // documentation gives what counts as reusable: a set for the same key material
+        // type and signing key algorithm with at least seven days of validity left.
+        // "The default value is false, which generates a new export token and signing
+        // key certificate on every call."
+        if input.reuse_last_generated_token == Some(true) {
+            let reusable = state
+                .lock()
+                .reusable_export_parameters(
+                    &input.key_material_type,
+                    &input.signing_key_algorithm,
+                    now,
+                )
+                .map(answer);
+            if let Some(answer) = reusable {
+                return Ok(answer);
+            }
+        }
+
+        // The store is judged BEFORE any key pair is generated, so a call the store has
+        // no room for costs no key generation; the bound is enforced again under the one
+        // borrow that inserts (`remember_export_parameters`), which is what two
+        // concurrent calls are held to. The lock is released with this block, because
+        // generating two RSA key pairs is hundreds of milliseconds of CPU and must hold
+        // no other request out of this service's state while it runs.
+        if state.lock().valid_export_parameters(now) >= crate::state::MAX_EXPORT_PARAMETERS {
+            return Err(quota_exceeded());
+        }
+
+        // The signing key pair and its certificate chain are minted on tokio's BOUNDED
+        // blocking pool, so hundreds of milliseconds of RSA key generation does not
+        // starve the runtime, and no lock is held while it runs.
+        let valid_until = now
+            .checked_add(crate::state::EXPORT_PARAMETERS_VALIDITY)
+            .ok_or_else(internal)?;
+        let Ok(Some(signing_key)) = ::tokio::task::spawn_blocking(move || {
+            crate::state::mint_tr34_signing_key(
+                crate::state::TR34_SIGNING_KEY_SUBJECT,
+                now,
+                valid_until,
+            )
+        })
+        .await
+        else {
+            return Err(internal());
+        };
+
+        let stored = state
+            .lock()
+            .remember_export_parameters(
+                &input.key_material_type,
+                &input.signing_key_algorithm,
+                signing_key,
+                now,
+                valid_until,
+            )
+            .ok_or_else(quota_exceeded)?;
+
+        // Answered from the set that was just stored, so a later call that reuses the
+        // token reports the same certificate, token and expiry.
+        crate::state::record_mutation(ctx.parts(), Self::NAME, &stored.export_token);
+        Ok(answer(&stored))
     }
+}
+
+/// One stored export parameter set, as this operation's output.
+fn answer(parameters: &crate::state::ExportParameters) -> GetParametersForExportOutput {
+    GetParametersForExportOutput {
+        signing_key_certificate: parameters.signing_key_certificate.clone(),
+        signing_key_certificate_chain: parameters.signing_key_certificate_chain.clone(),
+        signing_key_algorithm: parameters.signing_key_algorithm.clone(),
+        export_token: parameters.export_token.clone(),
+        parameters_valid_until_timestamp: ::aws_smithy_types::DateTime::from(
+            parameters.valid_until,
+        ),
+    }
+}
+
+/// This service's own failure, which is the modelled `InternalServerException`.
+fn internal() -> GetParametersForExportError {
+    GetParametersForExportErrorModeled::InternalServerException(InternalServerException {
+        message: Some(
+            "the payment cryptography export parameters could not be prepared".to_string(),
+        ),
+    })
+    .into()
+}
+
+/// Refuse a call the store has no room for: the modelled
+/// `ServiceQuotaExceededException`, naming the maximum this emulator holds.
+fn quota_exceeded() -> GetParametersForExportError {
+    GetParametersForExportErrorModeled::ServiceQuotaExceededException(
+        ServiceQuotaExceededException {
+            message: Some(format!(
+                "this account already holds the maximum of {} unexpired export tokens; \
+                 reuse one or wait for the outstanding ones to expire",
+                crate::state::MAX_EXPORT_PARAMETERS
+            )),
+        },
+    )
+    .into()
 }

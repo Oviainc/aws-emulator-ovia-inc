@@ -74,13 +74,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `payment-cryptography` — a signing name it SHARES with
+        // the Payment Cryptography CONTROL plane, which declares the same `sigv4Name` and
+        // is a wire service of its own (`controlplane.payment-cryptography`,
+        // `awsJson1_0`) against this one's `dataplane.payment-cryptography`, `restJson1`.
+        // The router resolves the routing key from the SigV4 credential scope first, so
+        // both services see the key `payment-cryptography`: claiming on the signing name
+        // ALONE makes each claim the other's traffic, and the router — which refuses
+        // rather than guesses — answers `AmbiguousService` for ALL of it.
+        //
+        // So the claim is narrowed to this service's own modelled wire surface, by the
+        // one rule `service-common` states for every service under a shared signing name.
+        // This model is `restJson1`: its surface is the URI path space its operations bind
+        // (`/keys/…`, `/pindata/…`, `/mac/…`, and the rest), which is what
+        // `claims_request` matches against the generated `ROUTE_PATH_SEGMENTS` when a
+        // service declares no RPC protocol. The control plane's `awsJson1_0` traffic posts
+        // to the root and names its own service shape, so it is claimed there alone.
+        service_common::claims_request(
+            parts,
+            self.entry.identity().signing_name(),
+            crate::ROUTE_PATH_SEGMENTS,
+            None,
+        )
     }
 
     fn override_operation(

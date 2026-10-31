@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableDefaultKeyReplicationRegions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableDefaultKeyReplicationRegions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableDefaultKeyReplicationRegions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the requested Regions to the account's default key replication regions in
+//! [`crate::state`] and answers the whole enabled set, so a later
+//! `GetDefaultKeyReplicationRegions` and every key created afterwards see it.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +175,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableDefaultKeyReplicationRegions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableDefaultKeyReplicationRegionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Every modelled constraint on `ReplicationRegions` — the member being
+        // present, and each entry matching the `Region` pattern — is refused by the
+        // centralized walk before this body runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            EnableDefaultKeyReplicationRegionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the payment cryptography key store is unavailable".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // "The complete list of regions where default key replication is now enabled
+        // for the account. This includes both previously enabled regions and the newly
+        // added regions from this operation" (`EnabledReplicationRegions`' own
+        // documentation), answered from the set as it now stands.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableDefaultKeyReplicationRegions"))
+        // The regions are caller-supplied strings and the model bounds neither the
+        // list's length nor how many calls may add to the set, so a call that would
+        // take the account past the set this emulator holds
+        // (`MAX_ENABLED_REPLICATION_REGIONS`) is refused with the modelled
+        // `ServiceQuotaExceededException` and stores nothing.
+        let enabled_replication_regions = state
+            .lock()
+            .enable_default_replication_regions(input.replication_regions)
+            .ok_or_else(|| {
+                EnableDefaultKeyReplicationRegionsErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account cannot have more than {} default key replication \
+                             regions enabled",
+                            crate::state::MAX_ENABLED_REPLICATION_REGIONS
+                        )),
+                    },
+                )
+            })?;
+        crate::state::record_mutation(ctx.parts(), Self::NAME, ::engine::emulator_account_id());
+        Ok(EnableDefaultKeyReplicationRegionsOutput {
+            enabled_replication_regions,
+        })
     }
 }

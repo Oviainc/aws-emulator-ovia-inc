@@ -14,7 +14,7 @@
 //! key check value is computed from — so the KCV a caller reads back is derived from
 //! stored material by the named KCV algorithm rather than being a fabricated string.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aes::cipher::generic_array::GenericArray;
@@ -25,6 +25,17 @@ use des::TdesEde3;
 use hmac::Hmac;
 use sha1::{Digest, Sha1};
 use sha2::{Sha224, Sha256, Sha384, Sha512};
+use x509_cert::attr::AttributeTypeAndValue;
+use x509_cert::der::asn1::{Any, BitString, OctetString, SetOfVec};
+use x509_cert::der::oid::AssociatedOid;
+use x509_cert::der::{Decode, Encode, EncodePem, Tag as DerTag};
+use x509_cert::ext::pkix::BasicConstraints;
+use x509_cert::ext::Extension;
+use x509_cert::name::{Name, RdnSequence, RelativeDistinguishedName};
+use x509_cert::serial_number::SerialNumber;
+use x509_cert::spki::{AlgorithmIdentifierOwned, ObjectIdentifier, SubjectPublicKeyInfoOwned};
+use x509_cert::time::{Time, Validity as CertificateValidity};
+use x509_cert::{Certificate, TbsCertificate, Version};
 
 use crate::ops::types::{Alias, Key, KeyAttributes, KeySummary, Tag, SYMMETRIC_KEY_ALGORITHM_VALUES};
 
@@ -154,9 +165,109 @@ pub const MAX_ALIASES: usize = 1000;
 /// (0..200), named so a handler can state it.
 pub const MAX_TAGS: usize = 200;
 
+/// The most default key replication regions this emulator will hold for the account.
+///
+/// Emulator resource guard, NOT an AWS quota, for the same reason as [`MAX_KEYS`]: the
+/// set is grown by caller-supplied region strings and shrinks only when a caller
+/// disables one by name, and every enable, disable and read answers the whole set. The
+/// figure only has to be comfortably above the number of Regions AWS publishes, so no
+/// real configuration meets it.
+pub const MAX_ENABLED_REPLICATION_REGIONS: usize = 64;
+
 /// The tag-key namespace AWS reserves for itself, in every service: a caller may not
 /// set a tag whose key starts with it.
 pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
+// ---------------------------------------------------------------------------
+// TR-34 export parameters
+// ---------------------------------------------------------------------------
+
+/// The prefix every export token carries, from the modelled `ExportTokenId` pattern
+/// `^(export-token-[0-9a-zA-Z]{16,64})?$`.
+pub const EXPORT_TOKEN_PREFIX: &str = "export-token-";
+
+/// Length of the id segment of a generated export token: the minimum that pattern
+/// admits.
+pub const EXPORT_TOKEN_ID_LEN: usize = 16;
+
+/// How long an export token and its signing key certificate stay valid.
+///
+/// From `GetParametersForExport`'s own documentation: "The export token expires in 30
+/// days."
+pub const EXPORT_PARAMETERS_VALIDITY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How much validity a stored export token must have left for
+/// `ReuseLastGeneratedToken` to answer with it instead of minting a new one.
+///
+/// From that member's own documentation: "If set to true and a valid export token
+/// exists for the same key material type and signing key algorithm with at least 7
+/// days of remaining validity, the existing token and signing key certificate are
+/// returned."
+pub const EXPORT_TOKEN_REUSE_REMAINING: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The only `KeyAlgorithm` a TR-34 signing key certificate is issued for, from
+/// `SigningKeyAlgorithm`'s own documentation: "RSA_2048 is the only signing key
+/// algorithm allowed."
+pub const TR34_SIGNING_KEY_ALGORITHM: &str = "RSA_2048";
+
+/// The most export parameter sets this emulator will hold at once.
+///
+/// Emulator resource guard, NOT an AWS quota: each call may mint a set, so the store
+/// needs a bound. Sets the clock has already expired do not count against it.
+pub const MAX_EXPORT_PARAMETERS: usize = 100;
+
+/// One TR-34 export parameter set: the export token a later `ExportKey` names, the
+/// signing key certificate that signs the wrapped key inside the TR-34 payload, and
+/// the instant both expire at.
+#[derive(Debug, Clone)]
+pub struct ExportParameters {
+    /// The modelled `ExportTokenId` naming this set; also its key in the store.
+    pub export_token: String,
+    /// The `KeyMaterialType` the set was minted for, which with
+    /// [`ExportParameters::signing_key_algorithm`] is what a reuse request matches on.
+    pub key_material_type: String,
+    /// The `KeyAlgorithm` of the signing key.
+    pub signing_key_algorithm: String,
+    /// The signing key certificate, as `SigningKeyCertificate` reports it.
+    pub signing_key_certificate: String,
+    /// The certificate of the root authority that signed it, as
+    /// `SigningKeyCertificateChain` reports it.
+    pub signing_key_certificate_chain: String,
+    /// When this set was minted.
+    pub created: SystemTime,
+    /// When it expires, as `ParametersValidUntilTimestamp` reports it.
+    pub valid_until: SystemTime,
+    /// The private half of the signing key pair, PKCS#8 DER.
+    ///
+    /// Held because it is what signs the wrapped key inside the TR-34 key block a
+    /// later `ExportKey` builds; never returned and never logged, and its `Debug` is
+    /// redacted like a key's own material. Private to this module, so every set is
+    /// minted through [`ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState::remember_export_parameters`]
+    /// and no handler can store one whose certificate is not the certificate of this
+    /// key.
+    signing_key_pkcs8: KeyMaterial,
+}
+
+impl ExportParameters {
+    /// The private half of this set's signing key pair, PKCS#8 DER: what signs the
+    /// wrapped key inside the TR-34 key block a later `ExportKey` builds, and the key
+    /// whose public half the signing key certificate carries.
+    pub fn signing_key_pkcs8(&self) -> &[u8] {
+        self.signing_key_pkcs8.bytes()
+    }
+
+    /// Whether this set is still valid at `now`.
+    pub fn is_valid(&self, now: SystemTime) -> bool {
+        now < self.valid_until
+    }
+
+    /// Whether this set still has `remaining` of its validity left at `now`, which is
+    /// what `ReuseLastGeneratedToken` requires of the set it answers with.
+    pub fn has_remaining(&self, now: SystemTime, remaining: Duration) -> bool {
+        now.checked_add(remaining)
+            .is_some_and(|deadline| deadline <= self.valid_until)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The stored key
@@ -212,6 +323,10 @@ pub struct StoredKey {
     /// key carries a replication configuration of its own is a fact about what was
     /// stored.
     pub replication_regions: Vec<String>,
+    /// Whether this key replicates to the account's DEFAULT replication regions
+    /// rather than to a configuration of its own — true for a create that named no
+    /// `ReplicationRegions`, which is what `UsingDefaultReplicationRegions` reports.
+    pub uses_default_replication_regions: bool,
     pub tags: BTreeMap<String, String>,
     /// The generated secret. Never returned and never logged: it is the source of
     /// the key check value and of nothing else in this slice. Its own `Debug` is
@@ -290,11 +405,6 @@ impl StoredKey {
         self.delete_pending_timestamp
     }
 
-    /// Whether this key replicates to any other region.
-    fn is_multi_region(&self) -> bool {
-        !self.replication_regions.is_empty()
-    }
-
     /// This key as the modelled `Key` structure, every member read from what is
     /// stored.
     pub fn to_key(&self, now: SystemTime) -> Key {
@@ -330,7 +440,7 @@ impl StoredKey {
             // `UsingDefaultReplicationRegions`' own documentation: false means "the
             // key has a custom replication configuration that overrides the account
             // defaults", which is exactly a key whose create named its regions.
-            using_default_replication_regions: Some(!self.is_multi_region()),
+            using_default_replication_regions: Some(self.uses_default_replication_regions),
             // Multi-Party Approval is a separate slice; this key went through none,
             // so it carries no MPA status.
             mpa_status: None,
@@ -395,6 +505,17 @@ pub struct ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
     /// stores a bound alias — the operation's own documentation says an alias cannot
     /// be created without a key.
     pub aliases: BTreeMap<String, Option<String>>,
+    /// The account's default key replication regions: the regions a key created
+    /// without a replication configuration of its own is replicated to.
+    ///
+    /// `EnableDefaultKeyReplicationRegions` adds to this set and
+    /// `DisableDefaultKeyReplicationRegions` removes from it, so it is a SET rather
+    /// than a list: enabling a region twice enables it once, and
+    /// `GetDefaultKeyReplicationRegions` answers it in one stable order.
+    pub enabled_replication_regions: BTreeSet<String>,
+    /// The TR-34 export parameter sets `GetParametersForExport` has handed out, keyed
+    /// by the export token that names each one.
+    pub export_parameters: BTreeMap<String, ExportParameters>,
     /// Mixed into generated key ids and key material, so two creates in the same
     /// nanosecond differ.
     counter: u64,
@@ -449,7 +570,7 @@ impl ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
         // happens to be full. The capacity guard is applied at the one place that
         // grows the store, just before the insert below.
         let tags = tag_map(&request.tags)?;
-        if let Some(why) = key_class_rejection(&request.key_attributes) {
+        if let Some(why) = attribute_rejection(&request.key_attributes) {
             return Err(MintRejection::Invalid(why));
         }
 
@@ -483,6 +604,18 @@ impl ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
             )));
         }
 
+        // "New keys created in this account will automatically be replicated to
+        // these regions unless explicitly configured otherwise during key creation"
+        // (`EnabledReplicationRegions`' own documentation), so a create that named no
+        // regions of its own takes the account's defaults as they stand now, and one
+        // that named its own keeps them and overrides the defaults.
+        let uses_default_replication_regions = request.replication_regions.is_empty();
+        let replication_regions = if uses_default_replication_regions {
+            self.enabled_replication_regions.iter().cloned().collect()
+        } else {
+            request.replication_regions
+        };
+
         let material = self.fresh_material(material_len);
         // An id no stored key is using, so the insert below can only add a record.
         let key_id = self.fresh_key_id(region).ok_or_else(|| {
@@ -513,7 +646,8 @@ impl ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
             delete_pending_timestamp: None,
             delete_key_in_days: None,
             derive_key_usage: request.derive_key_usage,
-            replication_regions: request.replication_regions,
+            replication_regions,
+            uses_default_replication_regions,
             tags,
             material,
         };
@@ -530,6 +664,147 @@ impl ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
         // record, never replace one.
         self.keys.insert(key_arn, stored.clone());
         Ok(stored)
+    }
+
+    /// The account's default key replication regions, in one stable order.
+    pub fn default_replication_regions(&self) -> Vec<String> {
+        self.enabled_replication_regions.iter().cloned().collect()
+    }
+
+    /// Enable `regions` as default key replication regions and answer the whole set
+    /// that is enabled afterwards.
+    ///
+    /// Additive, because `EnableDefaultKeyReplicationRegions`' own documentation says
+    /// it "Enables Multi-Region key replication settings for your account, causing new
+    /// keys to be automatically replicated to the specified Regions": a call names the
+    /// regions it enables, not the whole configuration, so enabling one twice leaves
+    /// one.
+    ///
+    /// `None` when the call would take the set past
+    /// [`MAX_ENABLED_REPLICATION_REGIONS`], which is checked BEFORE anything is stored:
+    /// the regions are caller-supplied strings and a disable only removes the ones a
+    /// caller names, so without this one request with a long list — or a run of
+    /// requests naming fresh region-shaped strings — would grow the set, and the answer
+    /// built from it, without end. Nothing is stored on a refusal.
+    pub fn enable_default_replication_regions(
+        &mut self,
+        regions: Vec<String>,
+    ) -> Option<Vec<String>> {
+        let requested: BTreeSet<String> = regions.into_iter().collect();
+        let would_hold = self
+            .enabled_replication_regions
+            .union(&requested)
+            .count();
+        if would_hold > MAX_ENABLED_REPLICATION_REGIONS {
+            return None;
+        }
+        self.enabled_replication_regions.extend(requested);
+        Some(self.default_replication_regions())
+    }
+
+    /// Disable `regions` as default key replication regions and answer the set that
+    /// remains enabled. A region that was not enabled changes nothing.
+    pub fn disable_default_replication_regions(&mut self, regions: &[String]) -> Vec<String> {
+        for region in regions {
+            self.enabled_replication_regions.remove(region);
+        }
+        self.default_replication_regions()
+    }
+
+    /// The export parameter set `ReuseLastGeneratedToken` answers with, if this store
+    /// holds one: the most recently minted set for the same key material type and
+    /// signing key algorithm that still has [`EXPORT_TOKEN_REUSE_REMAINING`] of its
+    /// validity left at `now`.
+    pub fn reusable_export_parameters(
+        &self,
+        key_material_type: &str,
+        signing_key_algorithm: &str,
+        now: SystemTime,
+    ) -> Option<&ExportParameters> {
+        self.export_parameters
+            .values()
+            .filter(|parameters| {
+                parameters.key_material_type == key_material_type
+                    && parameters.signing_key_algorithm == signing_key_algorithm
+                    && parameters.has_remaining(now, EXPORT_TOKEN_REUSE_REMAINING)
+            })
+            .max_by_key(|parameters| parameters.created)
+    }
+
+    /// How many export parameter sets are still valid at `now`.
+    pub fn valid_export_parameters(&self, now: SystemTime) -> usize {
+        self.export_parameters
+            .values()
+            .filter(|parameters| parameters.is_valid(now))
+            .count()
+    }
+
+    /// Store an export parameter set for `signing_key`, minted at `now` and expiring
+    /// at `valid_until`, and answer it.
+    ///
+    /// The sets the clock has already expired are dropped here: an expired token names
+    /// no parameters a later `ExportKey` could use, so it is not kept and does not
+    /// count against [`MAX_EXPORT_PARAMETERS`].
+    ///
+    /// `None` when the store already holds that many unexpired sets or when no unused
+    /// export token is available — both judged under the SAME borrow that inserts, so
+    /// concurrent calls cannot each pass a check and together push the store past the
+    /// bound. Nothing is stored on a refusal.
+    pub fn remember_export_parameters(
+        &mut self,
+        key_material_type: &str,
+        signing_key_algorithm: &str,
+        signing_key: MintedSigningKey,
+        now: SystemTime,
+        valid_until: SystemTime,
+    ) -> Option<ExportParameters> {
+        self.export_parameters
+            .retain(|_, parameters| parameters.is_valid(now));
+        if self.export_parameters.len() >= MAX_EXPORT_PARAMETERS {
+            return None;
+        }
+        let export_token = self.fresh_export_token()?;
+        let parameters = ExportParameters {
+            export_token: export_token.clone(),
+            key_material_type: key_material_type.to_string(),
+            signing_key_algorithm: signing_key_algorithm.to_string(),
+            signing_key_certificate: signing_key.certificate,
+            signing_key_certificate_chain: signing_key.certificate_chain,
+            created: now,
+            valid_until,
+            signing_key_pkcs8: signing_key.private_key_pkcs8,
+        };
+        self.export_parameters
+            .insert(export_token, parameters.clone());
+        Some(parameters)
+    }
+
+    /// An export token no stored parameter set is using, or `None` when every id this
+    /// generator can produce is taken.
+    ///
+    /// Drawn from the same mixing stream as a key id, and checked against the store
+    /// the same way, so no mint can ever replace a set a caller still holds the token
+    /// for.
+    fn fresh_export_token(&mut self) -> Option<String> {
+        let mut seed = self.draw();
+        for _ in 0..MAX_KEY_ID_ATTEMPTS {
+            let candidate: String = (0..EXPORT_TOKEN_ID_LEN)
+                .map(|_| {
+                    let draw = splitmix64(&mut seed);
+                    KEY_ID_ALPHABET[(draw % KEY_ID_ALPHABET.len() as u64) as usize] as char
+                })
+                .collect();
+            let token = format!("{EXPORT_TOKEN_PREFIX}{candidate}");
+            if !self.export_parameters.contains_key(&token) {
+                return Some(token);
+            }
+        }
+        // Bounded fallback, for the same reason as [`Self::fresh_key_id`]: the
+        // zero-padded decimals are also `[0-9a-zA-Z]{16}`, and there are always more
+        // of them than there are stored sets.
+        (0u64..=self.export_parameters.len() as u64)
+            .map(|n| format!("{EXPORT_TOKEN_PREFIX}{n:016}"))
+            .find(|token| !self.export_parameters.contains_key(token))
     }
 
     /// A key id no stored key in `region` is using, or `None` when every id this
@@ -626,6 +901,83 @@ pub fn generated_key_class(key_algorithm: &str) -> &'static str {
     }
 }
 
+/// Why a key's `KeyUsage`, `KeyClass` and `KeyAlgorithm` cannot describe a key this
+/// service generates, or `None` when they agree.
+///
+/// `KeyAttributes`' own documentation points the caller at "Understanding key
+/// attributes" for the valid combinations; what is enforced here is the rule the three
+/// members state directly: each of them already says whether the key is a single
+/// secret or an asymmetric pair — the usage through the TR-31 key block usage it names
+/// ([`key_usage_class`]), the algorithm through its family ([`generated_key_class`]) —
+/// and all of them have to say the same thing. A request where they disagree describes
+/// no key at all and is refused with the modelled `ValidationException`.
+fn attribute_rejection(attributes: &KeyAttributes) -> Option<String> {
+    if let Some(why) = key_usage_rejection(attributes) {
+        return Some(why);
+    }
+    key_class_rejection(attributes)
+}
+
+/// Why a key's `KeyUsage` cannot describe a key of its `KeyAlgorithm`, or `None` when
+/// the two agree.
+///
+/// The refusal is worded the way the service words an attribute combination it does
+/// not accept: the member that is not valid, then the member it is not valid for.
+fn key_usage_rejection(attributes: &KeyAttributes) -> Option<String> {
+    let by_algorithm = generated_key_class(&attributes.key_algorithm);
+    let unusable = format!(
+        "KeyAlgorithm {} is not valid for the KeyUsage {}.",
+        attributes.key_algorithm, attributes.key_usage
+    );
+    let Some(by_usage) = key_usage_class(&attributes.key_usage) else {
+        return Some(unusable);
+    };
+    (by_usage != by_algorithm).then_some(unusable)
+}
+
+/// The `KeyClass` the key block usage `key_usage` names: one secret, or one half of an
+/// asymmetric pair.
+///
+/// The TR-31 key block usages `KeyUsage` enumerates ("as defined in section A.5.2 of
+/// the TR-31 spec", that member's own documentation) each name a key of one kind: the
+/// four asymmetric usages name a key pair — data encryption under a public key, key
+/// agreement, digital signature and the TR-34 asymmetric key — and every other usage
+/// names a symmetric key. The table names each modelled value
+/// (`smithy_query(query="shape",shape="KeyUsage")`) rather than matching the spelling
+/// of a member, the same rule [`material_len`] and [`default_kcv_algorithm`] follow, so
+/// a usage the model gains later answers `None` and the create is refused instead of
+/// being classified by a name prefix.
+pub fn key_usage_class(key_usage: &str) -> Option<&'static str> {
+    let class = match key_usage {
+        "TR31_D1_ASYMMETRIC_KEY_FOR_DATA_ENCRYPTION"
+        | "TR31_K2_TR34_ASYMMETRIC_KEY"
+        | "TR31_K3_ASYMMETRIC_KEY_FOR_KEY_AGREEMENT"
+        | "TR31_S0_ASYMMETRIC_KEY_FOR_DIGITAL_SIGNATURE" => KEY_CLASS_ASYMMETRIC_PAIR,
+        "TR31_B0_BASE_DERIVATION_KEY"
+        | "TR31_C0_CARD_VERIFICATION_KEY"
+        | "TR31_D0_SYMMETRIC_DATA_ENCRYPTION_KEY"
+        | "TR31_E0_EMV_MKEY_APP_CRYPTOGRAMS"
+        | "TR31_E1_EMV_MKEY_CONFIDENTIALITY"
+        | "TR31_E2_EMV_MKEY_INTEGRITY"
+        | "TR31_E4_EMV_MKEY_DYNAMIC_NUMBERS"
+        | "TR31_E5_EMV_MKEY_CARD_PERSONALIZATION"
+        | "TR31_E6_EMV_MKEY_OTHER"
+        | "TR31_K0_KEY_ENCRYPTION_KEY"
+        | "TR31_K1_KEY_BLOCK_PROTECTION_KEY"
+        | "TR31_M0_ISO_16609_MAC_KEY"
+        | "TR31_M1_ISO_9797_1_MAC_KEY"
+        | "TR31_M3_ISO_9797_3_MAC_KEY"
+        | "TR31_M6_ISO_9797_5_CMAC_KEY"
+        | "TR31_M7_HMAC_KEY"
+        | "TR31_P0_PIN_ENCRYPTION_KEY"
+        | "TR31_P1_PIN_GENERATION_KEY"
+        | "TR31_V1_IBM3624_PIN_VERIFICATION_KEY"
+        | "TR31_V2_VISA_PIN_VERIFICATION_KEY" => KEY_CLASS_SYMMETRIC,
+        _ => return None,
+    };
+    Some(class)
+}
+
 /// Why a key's `KeyClass` and `KeyAlgorithm` cannot describe a key this service
 /// generates, or `None` when they agree.
 ///
@@ -638,14 +990,17 @@ pub fn generated_key_class(key_algorithm: &str) -> &'static str {
 /// and `PRIVATE_KEY`, each name ONE HALF of a pair that already exists — what a key
 /// block carries into `ImportKey`, not something a generate call can mint — so they
 /// are refused with the modelled `ValidationException` whatever the algorithm.
+///
+/// Worded like [`key_usage_rejection`], which is how the service words an attribute
+/// combination it does not accept: the member that is not valid, then the member it is
+/// not valid for.
 fn key_class_rejection(attributes: &KeyAttributes) -> Option<String> {
     let expected = generated_key_class(&attributes.key_algorithm);
     if attributes.key_class == expected {
         return None;
     }
     Some(format!(
-        "KeyAttributes.KeyClass {} cannot describe a generated {} key; that key is \
-         created as {expected}",
+        "KeyClass {} is not valid for the KeyAlgorithm {}.",
         attributes.key_class, attributes.key_algorithm,
     ))
 }
@@ -1084,6 +1439,241 @@ fn tdes_key(key_algorithm: &str, material: &[u8]) -> Option<[u8; 24]> {
     Some(key)
 }
 
+// ---------------------------------------------------------------------------
+// The TR-34 signing key certificate
+// ---------------------------------------------------------------------------
+
+/// A freshly minted TR-34 signing key: its certificate, the certificate of the
+/// authority that signed it, and the private half of its key pair.
+#[derive(Debug)]
+pub struct MintedSigningKey {
+    /// The signing key certificate, as `SigningKeyCertificate` reports it.
+    pub certificate: String,
+    /// The root authority's certificate, as `SigningKeyCertificateChain` reports it.
+    pub certificate_chain: String,
+    /// The private half of the signing key pair, PKCS#8 DER. Private to this module
+    /// and carried in the same redacted wrapper as a key's own material, so no
+    /// formatter anywhere can print it.
+    private_key_pkcs8: KeyMaterial,
+}
+
+/// The object identifiers the minted certificates name.
+mod oid {
+    use x509_cert::spki::ObjectIdentifier;
+
+    /// `id-at-commonName` (RFC 5280 appendix A).
+    pub const COMMON_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
+    /// `id-at-organizationName` (RFC 5280 appendix A).
+    pub const ORGANIZATION: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.10");
+    /// `sha256WithRSAEncryption` (RFC 8017 appendix C).
+    pub const SHA256_WITH_RSA: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+}
+
+/// Mint the TR-34 signing key an export token hands out: an RSA-2048 key pair whose
+/// certificate is signed by a freshly minted root authority of its own, both valid
+/// from `not_before` until `not_after`.
+///
+/// Every byte of this is real: both key pairs come from `aws-lc-rs`
+/// (`aws_lc_rs::rsa`), each certificate carries the DER `SubjectPublicKeyInfo` that
+/// library computes from the key it generated, and each signature is an
+/// RSASSA-PKCS1-v1_5 SHA-256 signature that same library makes over the DER of the
+/// certificate's own `TBSCertificate` — so a caller can verify the signing key
+/// certificate against the chain it is handed, and the private key the store keeps is
+/// the private half of the key the certificate names.
+///
+/// `subject_common_name` names the signing key the certificate is issued for.
+/// Generating two RSA key pairs is hundreds of milliseconds of CPU, so a caller runs
+/// this with no lock held.
+///
+/// `None` when the library refuses to produce or encode a key pair, or when a
+/// certificate field cannot be encoded (an instant X.509 cannot represent, say).
+pub fn mint_tr34_signing_key(
+    subject_common_name: &str,
+    not_before: SystemTime,
+    not_after: SystemTime,
+) -> Option<MintedSigningKey> {
+    let root = RsaKeyPairDer::generate()?;
+    let signing = RsaKeyPairDer::generate()?;
+
+    let root_name = distinguished_name(TR34_ROOT_COMMON_NAME)?;
+    let signing_name = distinguished_name(subject_common_name)?;
+
+    let root_certificate = certificate(
+        &root_name,
+        &root_name,
+        &root.public_key_spki,
+        (not_before, not_after),
+        true,
+        &root,
+    )?;
+    let signing_certificate = certificate(
+        &root_name,
+        &signing_name,
+        &signing.public_key_spki,
+        (not_before, not_after),
+        false,
+        &root,
+    )?;
+
+    Some(MintedSigningKey {
+        certificate: signing_certificate,
+        certificate_chain: root_certificate,
+        private_key_pkcs8: KeyMaterial(signing.private_key_pkcs8),
+    })
+}
+
+/// The common name of the root authority a minted signing key certificate is signed
+/// by. It names the service and the key block standard the certificate is for.
+const TR34_ROOT_COMMON_NAME: &str = "Payment Cryptography TR-34 Root CA";
+
+/// The common name a minted TR-34 signing key certificate carries: the key it names is
+/// the service's own signing key for a TR-34 key export.
+pub const TR34_SIGNING_KEY_SUBJECT: &str = "Payment Cryptography TR-34 Signing Key";
+
+/// The organization name every minted certificate carries.
+const TR34_ORGANIZATION_NAME: &str = "Payment Cryptography";
+
+/// An RSA key pair, as the two DER encodings a certificate needs.
+struct RsaKeyPairDer {
+    /// The public half, a DER X.509 `SubjectPublicKeyInfo`.
+    public_key_spki: Vec<u8>,
+    /// The private half, PKCS#8 DER.
+    private_key_pkcs8: Vec<u8>,
+}
+
+impl RsaKeyPairDer {
+    /// A fresh RSA-2048 key pair from `aws-lc-rs` — the modulus size
+    /// [`TR34_SIGNING_KEY_ALGORITHM`] names.
+    fn generate() -> Option<Self> {
+        use ::aws_lc_rs::encoding::AsDer;
+
+        let private_key =
+            ::aws_lc_rs::rsa::PrivateDecryptingKey::generate(::aws_lc_rs::rsa::KeySize::Rsa2048)
+                .ok()?;
+        Some(Self {
+            public_key_spki: private_key.public_key().as_der().ok()?.as_ref().to_vec(),
+            private_key_pkcs8: private_key.as_der().ok()?.as_ref().to_vec(),
+        })
+    }
+
+    /// `message` signed by this key pair's private half, RSASSA-PKCS1-v1_5 over
+    /// SHA-256 — the signature `sha256WithRSAEncryption` names.
+    fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
+        let pair = ::aws_lc_rs::signature::RsaKeyPair::from_pkcs8(&self.private_key_pkcs8).ok()?;
+        // A PKCS #1 signature is exactly as long as the key's modulus.
+        let mut signature = vec![0u8; pair.public_modulus_len()];
+        pair.sign(
+            &::aws_lc_rs::signature::RSA_PKCS1_SHA256,
+            &::aws_lc_rs::rand::SystemRandom::new(),
+            message,
+            &mut signature,
+        )
+        .ok()?;
+        Some(signature)
+    }
+}
+
+/// One X.509 certificate: `subject`, holding the public key `subject_public_key_spki`,
+/// issued by `issuer` for `validity` and signed by `signer`.
+///
+/// `is_authority` marks the certificate as a certificate authority, which is what lets
+/// the root certificate in the chain sign the signing key certificate (RFC 5280 section
+/// 4.2.1.9).
+fn certificate(
+    issuer: &Name,
+    subject: &Name,
+    subject_public_key_spki: &[u8],
+    validity: (SystemTime, SystemTime),
+    is_authority: bool,
+    signer: &RsaKeyPairDer,
+) -> Option<String> {
+    let algorithm = AlgorithmIdentifierOwned {
+        oid: oid::SHA256_WITH_RSA,
+        // RSASSA-PKCS1-v1_5 takes an explicit NULL parameter (RFC 8017 appendix C).
+        parameters: Some(Any::new(DerTag::Null, Vec::new()).ok()?),
+    };
+    let tbs_certificate = TbsCertificate {
+        version: Version::V3,
+        serial_number: certificate_serial()?,
+        signature: algorithm.clone(),
+        issuer: issuer.clone(),
+        validity: CertificateValidity {
+            not_before: Time::try_from(validity.0).ok()?,
+            not_after: Time::try_from(validity.1).ok()?,
+        },
+        subject: subject.clone(),
+        subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(subject_public_key_spki)
+            .ok()?,
+        issuer_unique_id: None,
+        subject_unique_id: None,
+        extensions: Some(vec![basic_constraints(is_authority)?]),
+    };
+    let signature = signer.sign(&tbs_certificate.to_der().ok()?)?;
+    let certificate = Certificate {
+        tbs_certificate,
+        signature_algorithm: algorithm,
+        signature: BitString::from_bytes(&signature).ok()?,
+    };
+    // "The signing key certificate in PEM format (base64 encoded)"
+    // (`SigningKeyCertificate`'s own documentation): the PEM block itself, base64
+    // encoded, which is the form `ImportKey`'s matching member is given too. The PEM
+    // framing comes from `x509-cert`'s own encoder, not from anything written here.
+    Some(::aws_smithy_types::base64::encode(
+        certificate.to_pem(::x509_cert::der::pem::LineEnding::LF).ok()?,
+    ))
+}
+
+/// The `basicConstraints` extension of a certificate that is, or is not, a certificate
+/// authority (RFC 5280 section 4.2.1.9), which that section requires to be critical in
+/// a CA certificate.
+fn basic_constraints(is_authority: bool) -> Option<Extension> {
+    let constraints = BasicConstraints {
+        ca: is_authority,
+        path_len_constraint: None,
+    };
+    Some(Extension {
+        extn_id: BasicConstraints::OID,
+        critical: true,
+        extn_value: OctetString::new(constraints.to_der().ok()?).ok()?,
+    })
+}
+
+/// A certificate serial number: 16 bytes from the OS random source, which RFC 5280
+/// section 4.1.2.2 allows up to 20 of.
+///
+/// `SerialNumber::new` keeps the value the positive integer that section requires by
+/// prepending a zero byte when the leading bit is set, which changes no value.
+fn certificate_serial() -> Option<SerialNumber> {
+    let mut bytes = [0u8; 16];
+    ::aws_lc_rs::rand::fill(&mut bytes).ok()?;
+    SerialNumber::new(&bytes).ok()
+}
+
+/// The X.500 distinguished name a minted certificate carries: the common name it is
+/// given, under this service's organization name (RFC 5280 section 4.1.2.4).
+fn distinguished_name(common_name: &str) -> Option<Name> {
+    Some(Name::from(RdnSequence(vec![
+        relative_distinguished_name(oid::ORGANIZATION, TR34_ORGANIZATION_NAME)?,
+        relative_distinguished_name(oid::COMMON_NAME, common_name)?,
+    ])))
+}
+
+/// One relative distinguished name: the `SET OF` holding the single attribute type and
+/// its UTF8String value.
+fn relative_distinguished_name(
+    attribute: ObjectIdentifier,
+    value: &str,
+) -> Option<RelativeDistinguishedName> {
+    let pair = AttributeTypeAndValue {
+        oid: attribute,
+        value: Any::new(DerTag::Utf8String, value.as_bytes()).ok()?,
+    };
+    Some(RelativeDistinguishedName::from(
+        SetOfVec::try_from(vec![pair]).ok()?,
+    ))
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -1101,11 +1691,18 @@ mod tests {
     use crate::ops::types::KeyModesOfUse;
 
     /// A `CreateKey` request for `key_algorithm`, with the class that algorithm is
-    /// generated as.
+    /// generated as and a key usage of the same class — a PIN encryption key for a
+    /// symmetric algorithm, a digital signature key for an asymmetric one — so the
+    /// three attributes describe one key.
     fn request(key_algorithm: &str) -> NewKey {
+        let key_usage = if is_symmetric_algorithm(key_algorithm) {
+            "TR31_P0_PIN_ENCRYPTION_KEY"
+        } else {
+            "TR31_S0_ASYMMETRIC_KEY_FOR_DIGITAL_SIGNATURE"
+        };
         NewKey {
             key_attributes: KeyAttributes {
-                key_usage: "TR31_P0_PIN_ENCRYPTION_KEY".to_string(),
+                key_usage: key_usage.to_string(),
                 key_class: generated_key_class(key_algorithm).to_string(),
                 key_algorithm: key_algorithm.to_string(),
                 key_modes_of_use: KeyModesOfUse {

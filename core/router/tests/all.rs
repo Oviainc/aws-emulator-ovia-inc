@@ -628,6 +628,11 @@ mod logs_emf_extraction_policy_scope;
 mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]
 mod personalize_signing_name_routing;
+// Declared HERE, in this quiet span of the sorted list, for the reason the entries around
+// it record: the appended tail at the end of this file and the head of the list are both
+// regions every concurrently landing router suite puts its line in.
+#[path = "all/payment_cryptography_signing_name_routing.rs"]
+mod payment_cryptography_signing_name_routing;
 // Declared HERE, in this quiet span of the sorted list, rather than appended at the end of
 // this file or beside the other `cloudformation_provisions_*` suites in the `c` span: both
 // of those are where every concurrently landing suite puts its line, so a declaration there

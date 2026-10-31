@@ -29,7 +29,7 @@ use service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::o
     KEY_ALGORITHM_VALUES, KEY_CHECK_VALUE_ALGORITHM_VALUES, KEY_CLASS_VALUES,
 };
 use service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::state::{
-    delete_pending_instant, key_check_value,
+    delete_pending_instant, generated_key_class, key_check_value,
 };
 use service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::{
     ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState as KeyStore,
@@ -37,18 +37,18 @@ use service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::{
 };
 
 /// The region every request below signs for; every minted ARN must carry it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries.
 const ACCOUNT: &str = "000000000000";
 /// The `X-Amz-Target` prefix from this crate's OPERATIONS.md wire-protocol section.
-const TARGET_PREFIX: &str = "PaymentCryptographyControlPlane";
+pub(crate) const TARGET_PREFIX: &str = "PaymentCryptographyControlPlane";
 /// A day in seconds, the unit `DeleteKeyInDays` counts in.
 const ONE_DAY_SECS: f64 = 24.0 * 60.0 * 60.0;
 
 /// A router serving this one service over a fresh engine, as `build_router` does in
 /// production, plus a handle on that engine so a test can read the persisted record
 /// and check the response was computed from it.
-fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -57,12 +57,16 @@ fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// A router serving this one service over a fresh engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     router_with_engine().0
 }
 
 /// Call one operation and return `(http status, parsed body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -101,7 +105,11 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// Succeed-or-explain: the call must answer 200.
-async fn ok_call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok_call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -111,7 +119,7 @@ async fn ok_call(router: &MultiServiceRouter, operation: &str, body: &Value) -> 
 }
 
 /// The wire error shape of a failed call (`__type`, with any namespace stripped).
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -122,7 +130,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// A string member that must be present.
-fn string<'a>(value: &'a Value, member: &str) -> &'a str {
+pub(crate) fn string<'a>(value: &'a Value, member: &str) -> &'a str {
     value
         .get(member)
         .and_then(Value::as_str)
@@ -131,7 +139,7 @@ fn string<'a>(value: &'a Value, member: &str) -> &'a str {
 
 /// A timestamp member, in epoch seconds (awsJson1_0 renders a `Timestamp` as a
 /// number).
-fn timestamp(value: &Value, member: &str) -> f64 {
+pub(crate) fn timestamp(value: &Value, member: &str) -> f64 {
     value
         .get(member)
         .and_then(Value::as_f64)
@@ -139,7 +147,7 @@ fn timestamp(value: &Value, member: &str) -> f64 {
 }
 
 /// Now, in epoch seconds.
-fn now_secs() -> f64 {
+pub(crate) fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64())
@@ -562,9 +570,19 @@ async fn create_key_refuses_attributes_and_tags_the_service_does_not_accept() {
 
     for (key_algorithm, key_class, accepted) in rows {
         let case = format!("{key_algorithm} as {key_class}");
+        // The usage is the one of this ALGORITHM's own family, read from the same
+        // table the service classifies an algorithm with rather than from the spelling
+        // of its name, so an algorithm the model gains later cannot be mis-classified
+        // here. What the negative rows below are refused for is the class their
+        // algorithm cannot carry.
+        let key_usage = if generated_key_class(key_algorithm) == "SYMMETRIC_KEY" {
+            "TR31_D0_SYMMETRIC_DATA_ENCRYPTION_KEY"
+        } else {
+            "TR31_S0_ASYMMETRIC_KEY_FOR_DIGITAL_SIGNATURE"
+        };
         let body = json!({
             "KeyAttributes": {
-                "KeyUsage": "TR31_D0_SYMMETRIC_DATA_ENCRYPTION_KEY",
+                "KeyUsage": key_usage,
                 "KeyClass": key_class,
                 "KeyAlgorithm": key_algorithm,
                 "KeyModesOfUse": modes.clone(),
