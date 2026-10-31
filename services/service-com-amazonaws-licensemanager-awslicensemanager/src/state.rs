@@ -12,6 +12,12 @@
 //! the `ClientToken` the request that minted it carried, so a repeat of that request
 //! reports the same license instead of minting a second one.
 //!
+//! A license's **entitlement consumption** is held as one record per outstanding
+//! grant, keyed by the consumption token that grant was issued under, so the usage
+//! of an entitlement is the sum over those records: a report of the usage
+//! recomputes it from stored state instead of reading a counter, and releasing a
+//! grant drops exactly what it consumed.
+//!
 //! Tags live in their own ARN-keyed map rather than on the record: `TagResource`,
 //! `UntagResource` and `ListTagsForResource` are modelled against a generic
 //! `ResourceArn`, so the map is the single place the tags of any taggable resource
@@ -103,6 +109,12 @@ pub const MAX_LICENSE_CONFIGURATIONS: usize = 500;
 /// past it stores nothing; `CreateLicense` models no resource-limit error, so its
 /// handler renders the refusal as the modelled `ServerInternalException`.
 pub const MAX_LICENSES: usize = 500;
+
+/// The most consumption records this emulator will hold — one per outstanding
+/// checkout of a license — enforced in
+/// [`ComAmazonawsLicensemanagerAwslicensemanagerState::insert_consumption`]. A
+/// record past it is not stored.
+pub const MAX_LICENSE_CONSUMPTIONS: usize = 500;
 
 /// The most tags one resource may carry. Emulator resource guard, matching the
 /// 50-tags-per-resource ceiling AWS applies to tagged resources generally; enforced
@@ -312,6 +324,24 @@ impl StoredLicense {
     }
 }
 
+/// One outstanding checkout's consumption of a license's entitlements, keyed by the
+/// `LicenseConsumptionToken` that checkout answered.
+///
+/// Consumption is persisted HERE and nowhere else, so a license's entitlement usage
+/// is the sum over these records rather than a counter some operation moved: a
+/// record is added when a checkout grants entitlements and dropped when the grant is
+/// released, and every read of the usage recomputes the same total from them.
+#[derive(Debug, Clone, Default)]
+pub struct StoredLicenseConsumption {
+    /// The consumption token the checkout minted; this record's store key.
+    pub token: String,
+    /// The ARN of the license whose entitlements this record consumes.
+    pub license_arn: String,
+    /// How many units of each entitlement — keyed by the `Entitlement.Name` the
+    /// license declares — this checkout holds, in that entitlement's own unit.
+    pub consumed_units: BTreeMap<String, i64>,
+}
+
 /// Per-service state for com-amazonaws-licensemanager-awslicensemanager. A handler
 /// reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -330,6 +360,10 @@ pub struct ComAmazonawsLicensemanagerAwslicensemanagerState {
     /// [`Self::remove_license`], so it holds at most one entry per stored license
     /// and is bounded by [`MAX_LICENSES`].
     pub license_client_tokens: BTreeMap<String, String>,
+    /// Every outstanding consumption of a license's entitlements, keyed by the
+    /// consumption token it was granted under. A `BTreeMap` so the usage read walks
+    /// them in one stable order, and so a token names at most one record.
+    pub license_consumptions: BTreeMap<String, StoredLicenseConsumption>,
     /// Tags, keyed by resource ARN then tag key. Shared by `TagResource`,
     /// `UntagResource` and `ListTagsForResource`, and seeded from the `Tags` passed
     /// to `CreateLicenseConfiguration` or `CreateLicense`.
@@ -423,7 +457,48 @@ impl ComAmazonawsLicensemanagerAwslicensemanagerState {
         let license = self.licenses.remove(arn)?;
         self.tags.remove(arn);
         self.license_client_tokens.retain(|_, minted| minted != arn);
+        // Nothing consumes the entitlements of a license the store no longer holds,
+        // so its consumption records go with it and can never be summed into another
+        // license's usage.
+        self.license_consumptions
+            .retain(|_, consumption| consumption.license_arn != arn);
         Some(license)
+    }
+
+    /// Store one checkout's consumption of a license's entitlements, refusing it —
+    /// and changing nothing — when the store already holds
+    /// [`MAX_LICENSE_CONSUMPTIONS`] or already holds a record under this token.
+    ///
+    /// The bound is enforced HERE, at the growth site, like every other store bound
+    /// in this file, so no caller can grow the map past it by forgetting a
+    /// pre-check, and a repeated token can never silently replace a stored grant.
+    /// `false` means nothing was stored.
+    #[must_use]
+    pub fn insert_consumption(&mut self, consumption: StoredLicenseConsumption) -> bool {
+        if self.license_consumptions.len() >= MAX_LICENSE_CONSUMPTIONS
+            || self.license_consumptions.contains_key(&consumption.token)
+            || consumption.token.is_empty()
+        {
+            return false;
+        }
+        self.license_consumptions
+            .insert(consumption.token.clone(), consumption);
+        true
+    }
+
+    /// How many units of the entitlement `entitlement_name` of the license
+    /// `license_arn` are consumed: the sum of that entitlement's units over every
+    /// consumption record the store holds against that license. Zero when none is
+    /// outstanding, which is what a license nothing has checked out consumes.
+    ///
+    /// A read of the usage computes this; it never writes, so two reads of an
+    /// unchanged store report the same total.
+    pub fn consumed_entitlement_units(&self, license_arn: &str, entitlement_name: &str) -> i64 {
+        self.license_consumptions
+            .values()
+            .filter(|consumption| consumption.license_arn == license_arn)
+            .filter_map(|consumption| consumption.consumed_units.get(entitlement_name))
+            .fold(0_i64, |total, units| total.saturating_add(*units))
     }
 
     /// Whether `arn` names a resource this service stores, and can therefore tag: a

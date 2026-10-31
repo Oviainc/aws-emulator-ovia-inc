@@ -15,5 +15,7 @@
 mod license_configuration_lifecycle;
 #[path = "all/license_lifecycle.rs"]
 mod license_lifecycle;
+#[path = "all/license_usage.rs"]
+mod license_usage;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
