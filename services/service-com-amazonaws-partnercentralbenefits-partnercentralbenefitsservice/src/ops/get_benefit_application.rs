@@ -211,19 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let Some(application) = store.application(&input.catalog, &input.identifier) else {
-            return Err(
-                GetBenefitApplicationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::not_found_message(
-                            crate::state::APPLICATION_KIND,
-                            &input.identifier,
-                        ),
-                    },
-                )
-                .into(),
-            );
-        };
+        // The application and the refusal a missing one is answered with are ONE
+        // resolution — see [`crate::state::require_application`].
+        let application = store
+            .require_application(&input.catalog, &input.identifier)
+            .map_err(GetBenefitApplicationErrorModeled::ResourceNotFoundException)?;
 
         // Every member is read back off the stored record — including the ARN, which is
         // the one the create minted, not one rebuilt from this request's region.

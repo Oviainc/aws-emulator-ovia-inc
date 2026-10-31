@@ -1675,6 +1675,23 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
         self.catalogs.get(catalog)?.applications.get(&id)
     }
 
+    /// The application `identifier` names, or the refusal a request naming one this store
+    /// does not hold is answered with — the rule [`Self::catalog`] states, for the
+    /// application resource.
+    ///
+    /// ONE resolution for every reporting operation that binds an application identifier:
+    /// the lookup ([`Self::application`]) and the refusal it fails with are the same step,
+    /// so no operation can pick a different resource kind for the message or quote a
+    /// different identifier than the one the request named.
+    pub fn require_application(
+        &self,
+        catalog: &str,
+        identifier: &str,
+    ) -> Result<&BenefitApplication, crate::ops::types::ResourceNotFoundException> {
+        self.application(catalog, identifier)
+            .ok_or_else(|| application_not_found(identifier))
+    }
+
     /// The identity of the application `identifier` names, as a request fingerprint covers
     /// it ([`request_fingerprint`]).
     ///
@@ -1858,6 +1875,19 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     ) -> Option<&mut BenefitApplication> {
         let id = self.resolve_application_id(catalog, identifier)?;
         self.catalogs.get_mut(catalog)?.applications.get_mut(&id)
+    }
+
+    /// The application `identifier` names, for an operation the spec says mutates it, or
+    /// the refusal a request naming one this store does not hold is answered with: what
+    /// [`Self::require_application`] is for a reporting operation, over the writing handle
+    /// [`Self::application_mut`] hands out.
+    pub fn require_application_mut(
+        &mut self,
+        catalog: &str,
+        identifier: &str,
+    ) -> Result<&mut BenefitApplication, crate::ops::types::ResourceNotFoundException> {
+        self.application_mut(catalog, identifier)
+            .ok_or_else(|| application_not_found(identifier))
     }
 
     /// Store a newly created application and index it by ARN and by `ClientToken`.
@@ -3029,6 +3059,20 @@ pub fn parse_resource_arn<'a>(
 /// [`ALLOCATION_KIND`].
 pub fn not_found_message(resource: &str, identifier: &str) -> String {
     format!("{resource} `{identifier}` not found")
+}
+
+/// The refusal an application lookup fails with: [`APPLICATION_KIND`] paired with the
+/// identifier the REQUEST named it with, through [`not_found_message`].
+///
+/// One construction for every operation that resolves an application, reached through
+/// [`ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::require_application`]
+/// and its writing counterpart, so the kind the sentence names and the identifier it
+/// quotes are the same in all of them — the identifier as written by the request, not the
+/// stored id it would have resolved to.
+fn application_not_found(identifier: &str) -> crate::ops::types::ResourceNotFoundException {
+    crate::ops::types::ResourceNotFoundException {
+        message: not_found_message(APPLICATION_KIND, identifier),
+    }
 }
 
 /// The message a request refused because of the application's STATUS carries: the

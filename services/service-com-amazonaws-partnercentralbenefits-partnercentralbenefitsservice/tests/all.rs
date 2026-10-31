@@ -21,6 +21,8 @@ mod amend_benefit_application;
 mod amend_caller_supplied_members;
 #[path = "all/amend_terminal_refusal.rs"]
 mod amend_terminal_refusal;
+#[path = "all/application_refusal_one_construction.rs"]
+mod application_refusal_one_construction;
 #[path = "all/application_status_gates.rs"]
 mod application_status_gates;
 #[path = "all/application_workflow_stage.rs"]

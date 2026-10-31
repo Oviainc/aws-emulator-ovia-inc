@@ -228,19 +228,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(None) => {}
         }
 
-        let Some(application) = store.application_mut(&input.catalog, &input.identifier) else {
-            return Err(
-                CancelBenefitApplicationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::not_found_message(
-                            crate::state::APPLICATION_KIND,
-                            &input.identifier,
-                        ),
-                    },
-                )
-                .into(),
-            );
-        };
+        // The application and the refusal a missing one is answered with are ONE
+        // resolution — see [`crate::state::require_application_mut`].
+        let application = store
+            .require_application_mut(&input.catalog, &input.identifier)
+            .map_err(CancelBenefitApplicationErrorModeled::ResourceNotFoundException)?;
 
         // AWS has finished with a terminal application, so there is nothing left to
         // cancel and the record is left exactly as it is.

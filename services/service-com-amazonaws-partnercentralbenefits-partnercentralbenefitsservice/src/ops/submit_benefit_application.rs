@@ -176,19 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let Some(application) = store.application_mut(&input.catalog, &input.identifier) else {
-            return Err(
-                SubmitBenefitApplicationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::not_found_message(
-                            crate::state::APPLICATION_KIND,
-                            &input.identifier,
-                        ),
-                    },
-                )
-                .into(),
-            );
-        };
+        // The application and the refusal a missing one is answered with are ONE
+        // resolution — see [`crate::state::require_application_mut`].
+        let application = store
+            .require_application_mut(&input.catalog, &input.identifier)
+            .map_err(SubmitBenefitApplicationErrorModeled::ResourceNotFoundException)?;
 
         if application.status != crate::state::STATUS_PENDING_SUBMISSION {
             return Err(SubmitBenefitApplicationErrorModeled::ConflictException(
