@@ -517,13 +517,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A copy whose destination IS the source has no coherent answer: the one image
         // set would have to be the read-only source and the locked destination of the
-        // same copy. Refused as the input-constraint failure it is, naming the member.
+        // same copy. Refused as the input-constraint failure it is, naming the member —
+        // and NOT the identifier it held: what the request broke is this member's
+        // relation to `sourceImageSetId`, not anything about the value itself, which is
+        // a legal `ImageSetId`. So the clause withholds it, exactly as the promote
+        // clash above does ([`crate::state::handler_requirement_error`]).
         if let Some(destination) = &information.destination_image_set {
             if destination.image_set_id == input.source_image_set_id {
                 return Err(CopyImageSetErrorModeled::ValidationException(ValidationException {
                     message: crate::state::handler_requirement_error(
                         DESTINATION_IMAGE_SET_ID_PATH,
-                        Some(&destination.image_set_id),
+                        None,
                         "Member must not name the source image set",
                     ),
                 })

@@ -79,6 +79,8 @@ mod metadata_merge_depth;
 mod page_token_payload_forgery;
 #[path = "all/regional_isolation.rs"]
 mod regional_isolation;
+#[path = "all/relational_refusal_values.rs"]
+mod relational_refusal_values;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
