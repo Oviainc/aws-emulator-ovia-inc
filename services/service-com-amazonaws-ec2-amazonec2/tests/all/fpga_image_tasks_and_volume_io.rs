@@ -1200,8 +1200,11 @@ pub(super) fn attach_in_store(
 }
 
 /// A detach is refused unless the volume HOLDS the attachment the request names: a volume
-/// attached to nothing, to another instance, or at another device is `IncorrectState`, and
-/// the id itself is resolved malformed before not found.
+/// attached to nothing is `IncorrectState` (the state of the resource the request named is
+/// what is wrong), while a volume that IS attached — to another instance, or at another device
+/// — is `InvalidAttachment.NotFound`, because the volume is in a state that admits a detach
+/// and what is missing is the ATTACHMENT. The id itself is resolved malformed before not
+/// found.
 #[tokio::test]
 async fn detach_volume_is_refused_unless_the_volume_holds_that_attachment() {
     let (router, engine) = emulator();
@@ -1223,13 +1226,13 @@ async fn detach_volume_is_refused_unless_the_volume_holds_that_attachment() {
                 p("InstanceId", "i-0fedcba987654321f"),
             ],
             400,
-            "IncorrectState",
+            "InvalidAttachment.NotFound",
         ),
         (
             "a volume attached at another device",
             vec![p("VolumeId", &attached), p("Device", "/dev/sdz")],
             400,
-            "IncorrectState",
+            "InvalidAttachment.NotFound",
         ),
         (
             "a value that is not a volume id at all",

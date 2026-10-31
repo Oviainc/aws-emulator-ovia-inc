@@ -252,6 +252,13 @@ mod run_instances_tag_specifications;
 // above rather than in sorted position, for the reason this file's header note gives.
 #[path = "all/run_instances_iam_instance_profile.rs"]
 mod run_instances_iam_instance_profile;
+// What a LAUNCH does with an `ImageId` that names a Systems Manager parameter instead of an
+// AMI, and the EBS attachment lifecycle such a launch feeds: attach, the describe that reports
+// it, and the detach. Declared beside the two launch suites above rather than at the end of
+// this file: the end is where every new ec2 suite now appends, so a line added there loses
+// serialized squash merges.
+#[path = "all/launch_from_ssm_image_alias.rs"]
+mod launch_from_ssm_image_alias;
 // The virtual private gateway slice: create, read back, delete. Declared here rather than in
 // sorted position for the reason given above — the sorted neighbourhood is the contended
 // region of this file, and this suite lost several serialized squash merges to it.

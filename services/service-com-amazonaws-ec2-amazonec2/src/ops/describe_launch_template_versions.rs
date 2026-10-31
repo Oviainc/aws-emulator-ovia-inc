@@ -738,15 +738,11 @@ fn filter_values<'a>(
 /// in the response for `imageId`" (`ResolveAlias`), and such a value is written
 /// `resolve:ssm:<parameter-name>` (Amazon EC2 User Guide, "Use a Systems Manager parameter
 /// instead of an AMI ID").
-pub const SSM_IMAGE_ALIAS_PREFIX: &str = "resolve:ssm:";
-
-/// The Systems Manager parameter name `image_id` is an alias for, or `None` when it names
-/// an AMI directly.
-fn ssm_image_alias_parameter(image_id: &str) -> Option<&str> {
-    image_id
-        .strip_prefix(SSM_IMAGE_ALIAS_PREFIX)
-        .filter(|parameter| !parameter.is_empty())
-}
+///
+/// Re-exported from [`crate::state`], where the prefix and the reading of a value carrying it
+/// live: a launch resolves the SAME value this report resolves, so neither may read it its
+/// own way.
+pub use crate::state::{SSM_IMAGE_ALIAS_PREFIX, ssm_image_alias_parameter};
 
 /// One stored launch template version as this operation reports it: the modelled
 /// [`LaunchTemplateVersion`].

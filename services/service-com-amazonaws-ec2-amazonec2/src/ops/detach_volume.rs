@@ -9,11 +9,12 @@
 //! refused with `IncorrectState`, the code EC2 answers when the resource exists but is not
 //! in a state that admits the request. THAT refusal carries EC2's wording for the code —
 //! the kind of resource, the id the request named and the state it is in, and nothing more
-//! ([`crate::state::incorrect_state_of`]). A volume attached to some instance other than
-//! the one the request named is refused with the same code but a message about the
-//! attachment rather than the state: the volume IS in a state that admits a detach, and
-//! what is missing is the attachment the request asked about, so the message names that
-//! instead. A detach that is admitted puts the attachment into the non-terminal
+//! ([`crate::state::incorrect_state_of`]). A volume that DOES hold an attachment, but not
+//! the one the request named — another instance's, or the same instance's at another device
+//! — is refused with `InvalidAttachment.NotFound`
+//! ([`crate::state::invalid_attachment_not_found`]) instead: the volume IS in a state that
+//! admits a detach, so what is missing is the ATTACHMENT the request asked about, not a
+//! state. A detach that is admitted puts the attachment into the non-terminal
 //! `detaching` state and the clock owes it `detached`
 //! ([`crate::state::VolumeRecord::detaching_at`]), at which point the volume holds no
 //! attachment and is `available` again — which is what `DescribeVolumes` then reports. That
@@ -22,8 +23,9 @@
 //!
 //! The refusals in order: a malformed volume or instance id (`InvalidVolumeID.Malformed` /
 //! `InvalidInstanceID.Malformed`), then `DryRun` (`DryRunOperation`), then an id the account
-//! holds no volume for (`InvalidVolume.NotFound`), then the state (`IncorrectState`), then
-//! an attachment that is not the account's to take down (`UnsupportedOperation`).
+//! holds no volume for (`InvalidVolume.NotFound`), then the state (`IncorrectState`), then an
+//! attachment the volume does not hold (`InvalidAttachment.NotFound`), then an attachment
+//! that is not the account's to take down (`UnsupportedOperation`).
 //!
 //! "You can't detach or force detach volumes that are attached to Amazon Web
 //! Services-managed resources": such an attachment is the one whose `AssociatedResource` /
@@ -201,9 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             TRANSITION_DELAY, VOLUME_ATTACHMENT_STATE_DETACHING, VolumeRecord,
-            dry_run_operation, incorrect_state, incorrect_state_of, instance_id_is_well_formed,
-            invalid_volume_id_malformed, invalid_volume_id_not_found, require_service_state,
-            unsupported_operation, volume_id_is_well_formed,
+            dry_run_operation, incorrect_state_of, instance_id_is_well_formed,
+            invalid_attachment_not_found, invalid_volume_id_malformed,
+            invalid_volume_id_not_found, require_service_state, unsupported_operation,
+            volume_id_is_well_formed,
         };
 
         // A volume carries its own Availability Zone, so nothing here depends on the Region
@@ -269,17 +272,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cloned()
             .collect();
         let Some(attachment) = named.first().cloned() else {
-            return Err(incorrect_state(format!(
-                "Volume '{}' is not attached to {}",
-                input.volume_id,
-                match (requested_instance, requested_device) {
-                    (Some(instance_id), Some(device)) =>
-                        format!("instance '{instance_id}' at device '{device}'"),
-                    (Some(instance_id), None) => format!("instance '{instance_id}'"),
-                    (None, Some(device)) => format!("a device named '{device}'"),
-                    (None, None) => "any instance".to_string(),
-                }
-            )));
+            return Err(invalid_attachment_not_found(
+                &input.volume_id,
+                requested_instance,
+                requested_device,
+            ));
         };
         // "If you are detaching a Multi-Attach enabled volume, you must specify an instance
         // ID" (`InstanceId`): more than one attachment answers the request as it stands, so

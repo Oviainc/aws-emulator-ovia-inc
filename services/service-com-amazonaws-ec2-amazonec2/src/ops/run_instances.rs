@@ -13,6 +13,16 @@
 //! so the instance reports it as `Instance$IamInstanceProfile` and
 //! `DescribeIamInstanceProfileAssociations` reports the same record.
 //!
+//! An `ImageId` may name a Systems Manager parameter instead of an AMI — "alternatively, you
+//! can specify a Systems Manager parameter […] The Systems Manager parameter will resolve to
+//! an AMI ID on launch", written `resolve:ssm:<parameter>` — so such a value is resolved
+//! against the image catalogue ([`crate::state::ssm_image_alias_parameter`] and
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::public_ssm_parameter_image_ids`], the one
+//! place this emulator records which AMI a parameter names) and the launch runs from the AMI
+//! it names, which is also the id the instance reports. Only a value that names an AMI
+//! DIRECTLY is held to the issued-id form; a parameter the account can see no image under is
+//! `InvalidAMIID.NotFound`.
+//!
 //! A repeat of the same request under one `ClientToken` returns the reservation that
 //! token already minted instead of launching again. A `LaunchTemplate` is answered
 //! with a 501: it names a resource no implemented operation creates, so there is
@@ -323,10 +333,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            architecture_for, availability_zones_in_region,
+            architecture_for, availability_zones_in_region, echoed_resource_id,
             iam_instance_profile_association_payload_bytes, invalid_ami_id_malformed_expecting_ami,
-            issued_image_id_is_well_formed, private_dns_name, request_region,
-            require_service_state, resolve_iam_instance_profile, validate_kernel_or_ramdisk_id,
+            invalid_ami_id_not_found, issued_image_id_is_well_formed, private_dns_name,
+            request_region, require_service_state, resolve_iam_instance_profile,
+            ssm_image_alias_parameter, validate_kernel_or_ramdisk_id,
             validate_tag_size,
             IamInstanceProfileAssociationSpec, InstanceDetail, InstanceDetailSpec, InstanceRecord,
             InstanceStateName,
@@ -386,13 +397,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "The request must contain the parameter ImageId",
             ));
         };
+        // "Alternatively, you can specify a Systems Manager parameter […] The Systems Manager
+        // parameter will resolve to an AMI ID on launch" (`ImageId`): a value carrying the
+        // `resolve:ssm:` prefix names a PARAMETER, not an AMI, so it is read through the one
+        // reading of that form this crate has ([`crate::state::ssm_image_alias_parameter`])
+        // and resolved against the image catalogue below, once the store is open.
+        let image_alias = ssm_image_alias_parameter(&image_id).map(str::to_string);
         // "An AMI ID is required to launch an instance" (`RunInstancesRequest$ImageId`), and
         // the id's FORM is read before anything is looked up under it: a value EC2 could not
         // have issued an AMI id names no image that could ever exist, so the launch is
         // refused as malformed rather than started from an id with no image behind it. A
         // client that cannot tell a mistyped id from a missing image goes on polling for an
         // instance that can never appear.
-        if !issued_image_id_is_well_formed(&image_id) {
+        if image_alias.is_none() && !issued_image_id_is_well_formed(&image_id) {
             return Err(invalid_ami_id_malformed_expecting_ami(&image_id));
         }
         if input.min_count < 1 {
@@ -529,6 +546,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::ComAmazonawsEc2Amazonec2State::ensure_default_network`]).
         store.ensure_default_network(&region);
 
+        // The parameter an `ImageId` of the `resolve:ssm:` form names, resolved: "the Systems
+        // Manager parameter will resolve to an AMI ID on launch". The mapping is the image
+        // catalogue's own ([`crate::state::ComAmazonawsEc2Amazonec2State::public_ssm_parameter_image_ids`]),
+        // the one place this emulator records which AMI a parameter names, so the launch runs
+        // from the image `DescribeImages` reports under that parameter and the instance
+        // reports THAT id — not the parameter it was asked for. A parameter the account can
+        // see no image under names no AMI, which is the launch's `InvalidAMIID.NotFound`: the
+        // value is well formed and there is simply no image behind it — and the value that
+        // refusal names the caller back is cut to the same bound every echoed id of this crate
+        // is ([`crate::state::echoed_resource_id`]), a parameter name carrying no modelled
+        // length of its own.
+        let image_id = match image_alias {
+            Some(parameter) => {
+                match store
+                    .public_ssm_parameter_image_ids(::engine::emulator_account_id())
+                    .remove(&parameter)
+                {
+                    Some(resolved) => resolved,
+                    None => {
+                        return Err(invalid_ami_id_not_found(&echoed_resource_id(&image_id)));
+                    }
+                }
+            }
+            None => image_id,
+        };
+
         // "The ID of the subnet to launch the instance into" (`RunInstancesRequest$SubnetId`)
         // — and a subnet belongs to ONE Availability Zone, so a launch that named a subnet
         // of this account and no zone of its own runs in that subnet's zone rather than in
@@ -658,6 +701,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested = usize::try_from(input.max_count).unwrap_or(usize::MAX);
         let per_instance_bytes = input.user_data.as_ref().map_or(0, String::len)
             + input.client_token.as_ref().map_or(0, String::len)
+            // The RESOLVED image id, which is the value the instance record keeps: the charge
+            // is for what this launch STORES, not for the parameter the request carried.
             + image_id.len()
             + instance_type.len()
             + input.subnet_id.as_ref().map_or(0, String::len)

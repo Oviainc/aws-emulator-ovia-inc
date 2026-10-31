@@ -14956,6 +14956,48 @@ pub fn volume_in_use<E>(volume_id: &str, instance_id: &str) -> crate::scaffolded
     )
 }
 
+/// EC2's error code for an ATTACHMENT a request names that the volume does not hold (EC2 API
+/// error codes, "InvalidAttachment.NotFound").
+pub const INVALID_ATTACHMENT_NOT_FOUND: &str = "InvalidAttachment.NotFound";
+
+/// Refuse a request that named an attachment the volume does not hold: HTTP 400
+/// `InvalidAttachment.NotFound`.
+///
+/// The ATTACHMENT, not the volume's state, is what is missing: the volume exists and is in a
+/// state that admits the request, and what it does not have is the attachment the request
+/// asked about — so this is the attachment-not-found class rather than `IncorrectState`,
+/// which is the class for the state of the resource the request named.
+///
+/// The message is EC2's: the volume, and whichever of the instance and the device the request
+/// named — "The volume '<id>' is not attached to instance '<id>' as device '<name>'." Both
+/// members are optional on the request, so the clauses the sentence carries are the ones the
+/// caller gave, and every variable part comes from the request. Only the BOTH-clause form has a
+/// recorded wording behind it; the narrower forms follow the same template with the clause the
+/// caller omitted left out, there being no recorded sentence for them.
+pub fn invalid_attachment_not_found<E>(
+    volume_id: &str,
+    instance_id: Option<&str>,
+    device: Option<&str>,
+) -> crate::scaffolded::Scaffolded<E> {
+    let named = match (instance_id, device) {
+        (Some(instance_id), Some(device)) => {
+            format!(" to instance '{instance_id}' as device '{device}'")
+        }
+        (Some(instance_id), None) => format!(" to instance '{instance_id}'"),
+        (None, Some(device)) => format!(" as device '{device}'"),
+        // Defensive: a request that names neither member selects every attachment the
+        // resource holds, so a caller reaching this refusal has named at least one of them —
+        // a resource holding NO attachment is refused for its state instead
+        // ([`incorrect_state_of`]).
+        (None, None) => String::new(),
+    };
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_ATTACHMENT_NOT_FOUND,
+        400,
+        format!("The volume '{volume_id}' is not attached{named}."),
+    )
+}
+
 impl ComAmazonawsEc2Amazonec2State {
     /// The EBS attachments the instance `instance_id` holds at `now`, as
     /// `(volume id, attachment)` in volume-id order.
@@ -18112,6 +18154,35 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         resolved
     }
+}
+
+/// The prefix an `ImageId` carries when it names a Systems Manager parameter instead of an
+/// AMI.
+///
+/// "Alternatively, you can specify a Systems Manager parameter, using one of the following
+/// formats. The Systems Manager parameter will resolve to an AMI ID on launch. To reference a
+/// public parameter: `resolve:ssm:public-parameter`"
+/// (`RequestLaunchTemplateData$ImageId`).
+pub const SSM_IMAGE_ALIAS_PREFIX: &str = "resolve:ssm:";
+
+/// The Systems Manager parameter name `image_id` is an alias for, or `None` when it names an
+/// AMI directly.
+///
+/// The ONE reading of that value in this crate: the launch that resolves a parameter to the
+/// AMI it names and the describe that reports what a stored one resolves to cannot read the
+/// same value two ways. The parameter the value carries is resolved against the image
+/// catalogue ([`ComAmazonawsEc2Amazonec2State::public_ssm_parameter_image_ids`]), which is
+/// the one place this emulator records which AMI a parameter names.
+///
+/// Whatever follows the prefix is the parameter name, so the documented `<name>:<version-number>`
+/// and `<name>:<label>` forms are read as names of their own and resolve to no AMI here: this
+/// emulator records one AMI per published parameter and no versions or labels of it, and a value
+/// that named a version would otherwise be answered with an image chosen for a version nothing
+/// published.
+pub fn ssm_image_alias_parameter(image_id: &str) -> Option<&str> {
+    image_id
+        .strip_prefix(SSM_IMAGE_ALIAS_PREFIX)
+        .filter(|parameter| !parameter.is_empty())
 }
 
 /// A public AMI Amazon publishes: owned by Amazon's publishing account
