@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateImageUsageReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateImageUsageReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates one AMI usage report over the image, resource types and accounts the
+//! request names, stores it in [`crate::state`] and answers the `ReportId` it was minted
+//! with. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateImageUsageReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The report is a RESOURCE: `DescribeImageUsageReports` reads back exactly what this call
+//! stored and `DeleteImageUsageReport` removes it, so the store — never this handler's stack
+//! frame — is what a later caller sees. A report is answered in the non-terminal `pending`
+//! state ("the report is being created and not available to view",
+//! `ImageUsageReport$State`) with `available` owed to the clock, and it carries the deletion
+//! instant AWS documents ("30 days after the report was created"); both moves live in
+//! `crate::state::image_usage_reports` beside the store, so every reader observes them the
+//! one way.
+//!
+//! Every member a request may get wrong is refused with EC2's own code before anything is
+//! stored: an `ImageId` that is not an AMI id at all is `InvalidAMIID.Malformed`, one in the
+//! obfuscated long form that names no image the account can see is the same code with the
+//! image resource's own sentence, and a legacy short-form one the account holds no image for
+//! is `InvalidAMIID.NotFound` ([`require_reportable_image`], which records both recorded
+//! answers), a `ResourceTypes` entry outside the two words the member documents, a scope
+//! option on a resource type the member does not admit one for, an `AccountIds` entry that is
+//! not an account id, and a `TagSpecifications` entry naming any resource type other than the
+//! report itself. A `ClientToken` makes the create idempotent: the same token answers the
+//! report it first created, and the same token with a different request is the mismatch EC2
+//! refuses.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +160,383 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateImageUsageReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateImageUsageReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateImageUsageReport"))
+        use ::std::time::SystemTime;
+
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            IMAGE_USAGE_REPORT_TAGGABLE_RESOURCE, ImageUsageReportSpec, MAX_CLIENT_TOKEN_CHARS,
+            MAX_IMAGE_USAGE_REPORTS, MAX_STORED_BYTES, aws_account_id_is_well_formed,
+            deduplicate_ids, idempotent_parameter_mismatch, image_usage_report_limit_exceeded,
+            image_usage_report_payload_bytes, invalid_user_id_malformed, require_service_state,
+            same_image_usage_report_request, tags_from_specifications,
+        };
+
+        // A usage report carries no Region member of its own — `DescribeImageUsageReports`
+        // reads one back without consulting the Region either — so nothing here depends on
+        // the Region the request was signed for; `ctx` carries request metadata only, and the
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "A unique, case-sensitive identifier that you provide to ensure idempotency of the
+        // request" (`$ClientToken`): the token map keeps whatever it is given for the
+        // process's lifetime, so its length is bounded the way every other create in this
+        // crate bounds it. The modelled `length 0..128` says the same, so a longer token is
+        // already refused before this handler runs; the bound is restated here because it is
+        // the store's, not the model's.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // "The resource types to include in the report" (`$ResourceTypes`) is a modelled
+        // `@required` member, so a request that names none is already refused by the boundary
+        // validator before this handler runs. The check stands for a caller that reaches this
+        // operation with an EMPTY list: a report over no resource type at all is a report over
+        // nothing, which is the parameter missing rather than a report to store.
+        if input.resource_types.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter ResourceType",
+            ));
+        }
+        let resource_types = reported_resource_types(&input.resource_types)?;
+
+        // "The Amazon Web Services account IDs to include in the report. To include all
+        // accounts, omit this parameter" (`$AccountIds`): the member names a SET of accounts,
+        // so one id given twice names the same account once, and something that is not an
+        // account id at all is refused with EC2's own code for that
+        // (`crate::state::invalid_user_id_malformed`). The modelled `length 0..200` bounds how
+        // many may be named, and the boundary validator has already enforced it.
+        let account_ids = deduplicate_ids(input.account_ids.as_deref().unwrap_or_default());
+        for account_id in &account_ids {
+            if !aws_account_id_is_well_formed(account_id) {
+                return Err(invalid_user_id_malformed(account_id));
+            }
+        }
+
+        // "The tags to apply to the report on creation. The ResourceType must be set to
+        // image-usage-report; any other value will cause the report creation to fail"
+        // (`$TagSpecifications`) — refused by the one helper every create in this crate bounds
+        // its tag payload with.
+        let tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            IMAGE_USAGE_REPORT_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+
+        // The report as this request asks for it: what a replayed `ClientToken` is compared
+        // against, and what the store is given below. The id, the state and both instants are
+        // the service's to decide, so they are set at the write.
+        let asked = ImageUsageReport {
+            image_id: Some(input.image_id.clone()),
+            resource_types: Some(resource_types.clone()),
+            account_ids: Some(account_ids.clone()),
+            tags: Some(tags.clone()),
+            ..ImageUsageReport::default()
+        };
+
+        // The caller-chosen bytes this create would retain for the process's lifetime: the
+        // tags, the ids it names, its resource types and the client token the token map keeps.
+        // A COUNT ceiling admits megabytes on its own, because the record holds strings the
+        // caller chose the length of, so both are asked below.
+        let payload_bytes = image_usage_report_payload_bytes(&asked, input.client_token.as_deref());
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // A report past its `ExpirationTime` was deleted by EC2 at that instant whether or not
+        // anybody called, so it is gone before this create counts what the account holds —
+        // the same materialisation `DescribeImageUsageReports` makes.
+        store.expire_due_image_usage_reports(SystemTime::now());
+
+        // "The ID of the image to report on" (`$ImageId`): resolved by this operation's own
+        // validator ([`require_reportable_image`]), which answers a long-form id the account
+        // can see no image for differently from a legacy short-form one.
+        require_reportable_image(&store, &input.image_id)?;
+
+        // Idempotency: one token names the one report it created, so a replay reports that
+        // report and creates nothing. Read here, answered below the DryRun check, because a
+        // replay stores nothing and so passes the ceilings a fresh create has to clear.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.image_usage_report_client_tokens.get(token).cloned());
+
+        // A token is only idempotent for the REQUEST it was first given with: replayed with a
+        // different request it names a report the caller did not ask for, which EC2 refuses
+        // rather than answers. Checked before the DryRun flag, so a dry run of such a request
+        // is refused with this reason too.
+        if let Some(report_id) = replayed.as_deref() {
+            let stored = store.image_usage_reports.get(report_id).ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "a client token names AMI usage report '{report_id}', which is not stored"
+                ))
+            })?;
+            if !same_image_usage_report_request(stored, &asked) {
+                return Err(idempotent_parameter_mismatch());
+            }
+        }
+
+        if replayed.is_none() {
+            let held = store.image_usage_reports.len();
+            if held >= MAX_IMAGE_USAGE_REPORTS {
+                return Err(image_usage_report_limit_exceeded(held));
+            }
+            if store.would_exceed_stored_bytes(payload_bytes) {
+                return Err(Scaffolded::request_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store {payload_bytes} more",
+                    store.stored_bytes()
+                )));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and the image resolved, and
+        // BEFORE the first write: the flag asks whether the request WOULD have worked, so one
+        // that would have been refused is refused with that reason instead, and one that
+        // would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        if let Some(report_id) = replayed {
+            return Ok(CreateImageUsageReportOutput {
+                report_id: Some(report_id),
+            });
+        }
+
+        // The store mints the id, reads the creation instant off the clock and records the
+        // `available` move the clock owes the report (`crate::state::image_usage_reports`), so
+        // this handler decides none of them twice.
+        let report_id = store.insert_image_usage_report(
+            ImageUsageReportSpec {
+                image_id: input.image_id.clone(),
+                resource_types,
+                account_ids,
+                tags,
+            },
+            SystemTime::now(),
+        );
+        if let Some(token) = input.client_token.clone() {
+            store
+                .image_usage_report_client_tokens
+                .insert(token, report_id.clone());
+        }
+        // The bytes this record and its token retain are charged against the store's budget at
+        // the insert, so no path can store them uncharged;
+        // `crate::state::ComAmazonawsEc2Amazonec2State::remove_image_usage_report` gives them
+        // back.
+        store.add_stored_bytes(payload_bytes);
+
+        // Read the answer back OUT of the store, so the caller is told the id a later
+        // `DescribeImageUsageReports` will report rather than one held only in this stack
+        // frame.
+        store
+            .image_usage_reports
+            .get(&report_id)
+            .map(|stored| CreateImageUsageReportOutput {
+                report_id: stored.report_id.clone(),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created AMI usage report '{report_id}' could not be read back"
+                ))
+            })
     }
+}
+
+/// Resolve the AMI this create reports on, or refuse the id the way THIS operation's
+/// validator refuses one.
+///
+/// EC2's per-operation validators do not agree about an image id they cannot resolve, and
+/// this one draws the line at the ID FORM — an AMI id is `ami-` followed by 8 or 17 lowercase
+/// hexadecimal digits ([`crate::state::image_id_is_well_formed`]), and the two forms are not
+/// read the same way:
+///
+/// * The LONG form is EC2's obfuscated id, so a value in it that names no image the account
+///   can see is not an id this account was ever issued: it is refused before any lookup as
+///   `InvalidAMIID.Malformed`, "The image ID '<id>' is malformed"
+///   ([`crate::state::unresolvable_image_id`], the crate's one wording for that answer,
+///   recorded for `CreateStoreImageTask` and `DescribeImageAttribute`).
+/// * The legacy SHORT form is parsed without unobfuscation, so one the account holds no image
+///   for is simply absent: `InvalidAMIID.NotFound`, "The image id '[<id>]' does not exist"
+///   ([`crate::state::invalid_ami_id_not_found`]) — which is what the recorded refusal of this
+///   operation for a short-form id shows.
+///
+/// A value that is no AMI id at all is answered before either, with the crate's generic
+/// malformed-id template ([`crate::state::invalid_ami_id_malformed`]). The set of images an
+/// account may name is the crate's one definition of that question
+/// ([`crate::state::account_can_see_image`]), so this operation and the describes of the
+/// account's images agree about which AMIs exist for a caller.
+fn require_reportable_image(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    image_id: &str,
+) -> Result<(), CreateImageUsageReportError> {
+    use crate::state::{
+        LONG_RESOURCE_ID_DIGITS, account_can_see_image, image_id_is_well_formed,
+        invalid_ami_id_malformed, invalid_ami_id_not_found, unresolvable_image_id,
+    };
+
+    if !image_id_is_well_formed(image_id) {
+        return Err(invalid_ami_id_malformed(image_id));
+    }
+    if account_can_see_image(store, image_id) {
+        return Ok(());
+    }
+    let long_form = image_id
+        .split_once('-')
+        .is_some_and(|(_prefix, suffix)| suffix.len() == LONG_RESOURCE_ID_DIGITS);
+    if long_form {
+        return Err(unresolvable_image_id(image_id));
+    }
+    Err(invalid_ami_id_not_found(image_id))
+}
+
+/// The resource types a report is created over, as the report REPORTS them: the words the
+/// request named, each with the scope options that resource type admits and the documented
+/// default filled in where it named none.
+///
+/// "The resource types to include in the report"
+/// (`CreateImageUsageReportRequest$ResourceTypes`), whose entries are "Valid values:
+/// `ec2:Instance` | `ec2:LaunchTemplate`" — a plain string in the model, so the catalog is
+/// `crate::state::IMAGE_USAGE_RESOURCE_TYPE_NAMES` and this is the only place it is enforced.
+/// A type named twice is refused rather than reported twice: the member names the SCOPE of one
+/// report, and a second entry for one type has no defined winner for its options.
+fn reported_resource_types(
+    requested: &[ImageUsageResourceTypeRequest],
+) -> Result<Vec<ImageUsageResourceType>, CreateImageUsageReportError> {
+    use crate::scaffolded::Scaffolded;
+    use crate::state::{
+        IMAGE_USAGE_RESOURCE_TYPE_LAUNCH_TEMPLATE, IMAGE_USAGE_RESOURCE_TYPE_NAMES,
+        modelled_catalog_word,
+    };
+
+    // At most one entry per documented word is admitted — a type named twice is refused below
+    // — so this is never sized from the request.
+    let mut reported: Vec<ImageUsageResourceType> = Vec::new();
+    for entry in requested {
+        let name = modelled_catalog_word(
+            entry.resource_type.as_deref(),
+            IMAGE_USAGE_RESOURCE_TYPE_NAMES,
+            "resourceType",
+            None,
+        )?
+        .ok_or_else(|| {
+            Scaffolded::missing_parameter("Each resource type of the report must name a type")
+        })?;
+        if reported
+            .iter()
+            .any(|seen| seen.resource_type.as_deref() == Some(name))
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request names the resource type '{name}' more than once"
+            )));
+        }
+        let asked_options = entry.resource_type_options.as_deref().unwrap_or_default();
+        // "The options that affect the scope of the report. Valid only when `ResourceType` is
+        // `ec2:LaunchTemplate`" (`ImageUsageResourceTypeRequest$ResourceTypeOptions`): an
+        // option on any other type is two members that cannot hold together, so it is refused
+        // rather than accepted and discarded.
+        if name != IMAGE_USAGE_RESOURCE_TYPE_LAUNCH_TEMPLATE {
+            if !asked_options.is_empty() {
+                return Err(Scaffolded::invalid_parameter_combination(format!(
+                    "resourceTypeOptions may be specified only when resourceType is \
+                     '{IMAGE_USAGE_RESOURCE_TYPE_LAUNCH_TEMPLATE}'"
+                )));
+            }
+            reported.push(ImageUsageResourceType {
+                resource_type: Some(name.to_string()),
+                resource_type_options: None,
+            });
+            continue;
+        }
+        reported.push(ImageUsageResourceType {
+            resource_type: Some(name.to_string()),
+            resource_type_options: Some(scope_options(asked_options)?),
+        });
+    }
+    Ok(reported)
+}
+
+/// The scope options one launch-template resource type is reported with.
+///
+/// "Valid value: `version-depth` - The number of launch template versions to check"
+/// (`ImageUsageResourceTypeOptionRequest$OptionName`) and "Valid values: Integers between `1`
+/// and `10000`. Default: `20`" (`$OptionValues`) — neither of which the model constrains, so
+/// this is the only place those published values are enforced. A type that names no option at
+/// all is reported with the documented default, so the stored report states the scope it was
+/// created with rather than leaving a later reader to guess it.
+fn scope_options(
+    requested: &[ImageUsageResourceTypeOptionRequest],
+) -> Result<Vec<ImageUsageResourceTypeOption>, CreateImageUsageReportError> {
+    use crate::scaffolded::Scaffolded;
+    use crate::state::{
+        DEFAULT_IMAGE_USAGE_VERSION_DEPTH, IMAGE_USAGE_RESOURCE_TYPE_OPTION_VALUES,
+        IMAGE_USAGE_VERSION_DEPTH_OPTION, IMAGE_USAGE_VERSION_DEPTH_RANGE,
+    };
+
+    let default_option = || ImageUsageResourceTypeOption {
+        option_name: Some(IMAGE_USAGE_VERSION_DEPTH_OPTION.to_string()),
+        option_values: Some(vec![DEFAULT_IMAGE_USAGE_VERSION_DEPTH.to_string()]),
+    };
+    if requested.is_empty() {
+        return Ok(vec![default_option()]);
+    }
+
+    let (depth_min, depth_max) = IMAGE_USAGE_VERSION_DEPTH_RANGE;
+    // At most one entry per documented option name is admitted, for the same reason.
+    let mut reported: Vec<ImageUsageResourceTypeOption> = Vec::new();
+    for option in requested {
+        let name = option.option_name.as_deref().unwrap_or_default();
+        if name != IMAGE_USAGE_VERSION_DEPTH_OPTION {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{name}' for optionName. Valid values: \
+                 {IMAGE_USAGE_VERSION_DEPTH_OPTION}"
+            )));
+        }
+        if reported
+            .iter()
+            .any(|seen| seen.option_name.as_deref() == Some(name))
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The resource type names the option '{name}' more than once"
+            )));
+        }
+        let values = option.option_values.as_deref().unwrap_or_default();
+        // "A value for the specified option" is ONE value, so a depth given as several is
+        // refused rather than one of them being chosen — which is also what bounds the values
+        // one stored report retains, the list carrying no modelled length.
+        if values.len() > IMAGE_USAGE_RESOURCE_TYPE_OPTION_VALUES {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Value for parameter {name} is invalid. It takes \
+                 {IMAGE_USAGE_RESOURCE_TYPE_OPTION_VALUES} value, and the request carries {}",
+                values.len()
+            )));
+        }
+        for value in values {
+            if !value
+                .parse::<u32>()
+                .is_ok_and(|depth| (depth_min..=depth_max).contains(&depth))
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{value}' for optionValue. It must be an integer from \
+                     {depth_min} to {depth_max}"
+                )));
+            }
+        }
+        // An option that names no value at all asks for the documented default.
+        if values.is_empty() {
+            reported.push(default_option());
+            continue;
+        }
+        reported.push(ImageUsageResourceTypeOption {
+            option_name: Some(name.to_string()),
+            option_values: Some(values.to_vec()),
+        });
+    }
+    Ok(reported)
 }

@@ -3816,8 +3816,22 @@ pub struct ComAmazonawsEc2Amazonec2State {
     pub volumes_in_recycle_bin: BTreeMap<String, RecycledVolumeRecord>,
     /// Every AMI usage report the account holds, by `ReportId`, as the modelled
     /// [`ImageUsageReport`] shape the describe reports. `CreateImageUsageReport` is the
-    /// operation that adds one and `DeleteImageUsageReport` the one that removes it.
+    /// operation that adds one and `DeleteImageUsageReport` the one that removes it — see
+    /// [`image_usage_reports`], the submodule that owns this slice.
     pub image_usage_reports: BTreeMap<String, ImageUsageReport>,
+    /// The `pending` -> `available` move the clock owes a created AMI usage report, by
+    /// `ReportId` — the report counterpart of [`Self::vpc_available_at`], beside the report
+    /// store rather than inside it because that store holds the modelled shape itself.
+    /// `CreateImageUsageReport` answers a report in the non-terminal `pending` state, so the
+    /// clock owes it `available` [`TRANSITION_DELAY`] later, and
+    /// [`Self::materialize_due_image_usage_reports`] applies it. A report that has already
+    /// moved has no entry.
+    pub image_usage_report_available_at: BTreeMap<String, Instant>,
+    /// A `ClientToken` an AMI usage report was created under and the `ReportId` it minted, so
+    /// a repeat of the same request answers with that report instead of creating a second
+    /// one. Cleared for a report that is removed, so a token cannot name a report that is
+    /// gone ([`Self::remove_image_usage_report`]).
+    pub image_usage_report_client_tokens: HashMap<String, String>,
     /// Every instance export task the account holds, by `ExportTaskId` — see
     /// [`ExportTaskRecord`]. `CreateInstanceExportTask` is the operation that starts one and
     /// `CancelExportTask` the one that cancels it.
@@ -4495,6 +4509,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             fpga_image_client_tokens: HashMap::new(),
             volumes_in_recycle_bin: BTreeMap::new(),
             image_usage_reports: BTreeMap::new(),
+            image_usage_report_available_at: BTreeMap::new(),
+            image_usage_report_client_tokens: HashMap::new(),
             export_tasks: BTreeMap::new(),
             secondary_subnets: BTreeMap::new(),
             secondary_interfaces: BTreeMap::new(),
@@ -7633,6 +7649,11 @@ impl ComAmazonawsEc2Amazonec2State {
         // at its exit instant whether or not anybody called, so that deletion is applied
         // before anything reads the bin.
         self.delete_due_recycled_volumes(now);
+        // An AMI usage report past its `ExpirationTime` was deleted by EC2 at that instant —
+        // "30 days after the report was created" — and a `pending` report reaches `available`
+        // once its own due instant has passed; both were owed whether or not anybody called.
+        self.expire_due_image_usage_reports(SystemTime::now());
+        self.materialize_due_image_usage_reports(now);
         for instance in self.instances.values_mut() {
             let due = instance
                 .pending_transition
@@ -34886,6 +34907,16 @@ impl RecycledVolumeRecord {
 // =============================================================================
 // AMI usage reports
 // =============================================================================
+
+/// This service's AMI usage REPORT slice: what one is stored as, the documented words,
+/// defaults and bounds its members take, the quota a create asks about, the bytes a stored
+/// report is charged, the comparison a replayed `ClientToken` is judged on and the two moves
+/// the clock owes a report. A SUBMODULE, so that surface grows without touching the parts of
+/// this file the other resource kinds own; `pub use` keeps every name reachable as
+/// `crate::state::<name>`, which is where each handler names it. The report ID SPACE and the
+/// two refusals a report id can draw stay here, beside this file's other id readers.
+pub mod image_usage_reports;
+pub use image_usage_reports::*;
 
 /// The code EC2 answers for a report id the account holds no AMI usage report for.
 ///

@@ -18,10 +18,13 @@
 //! the way this service answers every malformed resource id.
 //!
 //! A report whose `ExpirationTime` has passed is GONE — "the date and time when Amazon EC2
-//! will delete the report (30 days after the report was created)" — so this read
-//! materialises that deletion ([`expire_due_reports`]) before it answers: the deletion was
-//! owed at this instant whether or not anybody called, so it changes nothing a later caller
-//! would otherwise have seen.
+//! will delete the report (30 days after the report was created)" — and a report
+//! `CreateImageUsageReport` answered as `pending` has reached `available` once its own due
+//! instant has passed, so this read materialises both moves
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::expire_due_image_usage_reports`] and
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_image_usage_reports`])
+//! before it answers: each was owed at this instant whether or not anybody called, so it
+//! changes nothing a later caller would otherwise have seen.
 //!
 //! ## Shape of an operation
 //!
@@ -292,8 +295,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A report EC2 has already deleted is not reported, and is not held either: the
         // deletion fell due at its `ExpirationTime`, whether or not anybody called (see the
-        // module docs), so this is observed here rather than caused.
-        expire_due_reports(&mut store, ::std::time::SystemTime::now());
+        // module docs), so this is observed here rather than caused — as is the `available`
+        // state a `pending` report reached when its own due instant passed.
+        store.expire_due_image_usage_reports(::std::time::SystemTime::now());
+        store.materialize_due_image_usage_reports(::std::time::Instant::now());
 
         // "The IDs of the image usage reports" (`ReportIds`) name this operation's own
         // resource, so one the account holds no report for is an error rather than an
@@ -401,34 +406,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Drop every AMI usage report whose expiration has come due as of `now`.
-///
-/// "The date and time when Amazon EC2 will delete the report (30 days after the report was
-/// created)" (`ImageUsageReport$ExpirationTime`): past that instant the report no longer
-/// exists, so this reporting operation may apply the deletion — it was owed at this instant
-/// whether or not anybody asked, so materialising it changes nothing a later caller would
-/// otherwise have seen. A report carrying no expiration time is never owed one.
-///
-/// Instants are compared as `(seconds, nanoseconds)`, the way every other instant
-/// comparison in this crate does it: the modelled timestamp type carries no `Ord`, and
-/// comparing through `f64` seconds would lose precision the `MillisecondDateTime` the
-/// member targets keeps.
-fn expire_due_reports(
-    store: &mut crate::state::ComAmazonawsEc2Amazonec2State,
-    now: ::std::time::SystemTime,
-) {
-    fn key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
-        (at.secs(), at.subsec_nanos())
-    }
-
-    let now = key(crate::state::system_time_to_date_time(now));
-    store.image_usage_reports.retain(|_report_id, report| {
-        report
-            .expiration_time
-            .map(key)
-            .is_none_or(|expires_at| now < expires_at)
-    });
-}
+// The clock-owed deletion of a report past its `ExpirationTime`, and the `pending` ->
+// `available` move of a report that has just been created, both live in
+// `crate::state::image_usage_reports`, beside the store they are about, so every reader of
+// this slice observes them the one way.
 
 /// The filter names this operation documents, from
 /// `DescribeImageUsageReportsRequest$Filters`:

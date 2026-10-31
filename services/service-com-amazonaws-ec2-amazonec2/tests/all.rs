@@ -17,6 +17,14 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `CreateImageUsageReport` computes one AMI usage report from — the image, resource
+// types, scope options, accounts and tags the request names — the `pending` -> `available`
+// move the clock owes it, the 30-day deletion it carries, its `ClientToken` idempotency and
+// what it refuses. Declared beside `prefix_lists` for the reason the note above gives: the
+// sorted neighbourhood and the tail of this file are where every new ec2 suite inserts its
+// lines.
+#[path = "all/create_image_usage_report.rs"]
+mod create_image_usage_report;
 // What `CopySnapshot` mints from a stored snapshot, which members it reads off the source and
 // which off the request, and what it refuses. Declared beside `prefix_lists` for the reason
 // the note above gives: the sorted neighbourhood and the tail of this file are where every new

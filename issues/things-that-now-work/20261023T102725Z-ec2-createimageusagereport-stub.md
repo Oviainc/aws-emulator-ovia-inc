@@ -34,3 +34,29 @@ $headers.content-type: value_mismatch (expected 'text/xml;charset=UTF-8', got 't
 Boot the ec2 emulator
 Call CreateImageUsageReport and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+
+Implemented: `CreateImageUsageReport` stores ONE AMI usage report over the image, resource
+types, scope options and accounts the request names, as the modelled `ImageUsageReport` shape
+`DescribeImageUsageReports` reports, and answers the `ReportId` read back out of the store.
+The scaffold header line is gone. The report is handed back `pending` with the clock owing it
+`available`, and carries the deletion AWS documents 30 days out; both moves live in the new
+`state/image_usage_reports.rs` slice beside the store, so `DescribeImageUsageReports`
+observes them rather than causing them. A launch-template resource type that names no scope
+option gets the documented `version-depth` default. One `ClientToken` names one report, and a
+token replayed with a different request is `IdempotentParameterMismatch`. `DryRun` reports
+whether the call would have succeeded without writing. Every removal — the delete and the
+clock-owed expiry — now goes through one state path that also gives back the bytes the create
+charged. Covered end to end by `tests/all/create_image_usage_report.rs`.
+
+The `ImageId` refusals follow the two recorded answers of this operation: a value in the
+obfuscated long id form that names no image the account can see is
+`InvalidAMIID.Malformed`, "The image ID '<id>' is malformed", while a legacy short-form id the
+account holds no image for is `InvalidAMIID.NotFound`, "The image id '[<id>]' does not exist".
+
+Still diverging in the replayed units, on causes this issue does not own and did not cause:
+the `CreateImage` stub (`ec2-instance-dependent-ops-error-paths#task#1`, its own issue), the
+`CreateStoreImageTask` refusal code and message
+(`ec2-image-tasks-and-usage-report-invalid-input-errors#task#3`) and the `CreateSnapshots`
+refusal message — the latter two surfaced only because this operation's step now passes.

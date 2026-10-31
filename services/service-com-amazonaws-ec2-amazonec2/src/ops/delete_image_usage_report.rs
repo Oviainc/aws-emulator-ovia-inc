@@ -165,8 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The delete is what takes the report out of the store, so the answer reports a
-        // removal that happened rather than one this handler assumed.
-        if store.image_usage_reports.remove(&input.report_id).is_none() {
+        // removal that happened rather than one this handler assumed. It goes through the
+        // store's one removal path, so the bytes the report and any `ClientToken` naming it
+        // retained are given back with it.
+        if store.remove_image_usage_report(&input.report_id).is_none() {
             return Err(invalid_image_usage_report_id_not_found(&input.report_id));
         }
         Ok(DeleteImageUsageReportOutput {
