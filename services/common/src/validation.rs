@@ -111,10 +111,12 @@
 //!   layer that prints members no model declares
 //!   ([`refusing_violations_with_printed_echoes_over`]);
 //! * a `@pattern` printed as the expression a value has to satisfy, without the `^`/`$`
-//!   anchors a model writes to demand a whole-string match ([`unanchored`], and
+//!   anchors a model writes to demand a whole-string match ([`unanchored`],
 //!   [`unanchored_grouping_alternation`] for the services whose recordings show the pair
 //!   dropped from a top-level alternation, where the alternation is kept grouped so the
-//!   expression still matches what it matched anchored) — LANDED here,
+//!   expression still matches what it matched anchored, and
+//!   [`unanchored_keeping_inner_anchors`] for the services whose refusals quote an
+//!   expression that anchors its own BRANCHES as the model declares it) — LANDED here,
 //!   while ~26 service crates still carry their own inlined copy
 //!   (`grep -rln 'fn unanchored' services/*/src`), each pinned by that service's own
 //!   recordings and tests; deleting those copies in favour of this one is the migration's
@@ -1084,16 +1086,64 @@ pub fn unanchored_grouping_alternation(regex: &str) -> String {
     format!("({stated})")
 }
 
+/// [`unanchored`], declining the drop where what the pair encloses carries an anchor of
+/// its OWN — an alternation whose branches are each anchored (`^$|^arn:…$`, `^(^a$)|(^b$)$`).
+///
+/// Same reading of the pair as [`unanchored`]: the published `@pattern` is the expression a
+/// service advertises with the whole-value pair written around it by the model, and this
+/// rendering is the inverse of that wrapping. What this adds is a discriminator on what the
+/// pair ENCLOSES. An expression carrying no anchor of its own is one the model wrapped,
+/// whatever its top level does — so a top-level alternation alone does not stop the drop,
+/// and the lambdacore recording quoted in [`unanchored`]
+/// (`^(arn:…)|[a-zA-Z0-9_-]{1,64}$`, quoted as `(arn:…)|[a-zA-Z0-9_-]{1,64}`) is stated
+/// identically by both renderings. An expression that anchors its own BRANCHES is already a
+/// whole-value expression before any wrapping: the two ends of its text are the first and
+/// last branch's anchors, so dropping them states a requirement of neither branch — what is
+/// left begins with an alternative that is a bare end-of-input anchor, which every value
+/// satisfies, and the branch that anchor belonged to (the empty-string branch of `^$|…`
+/// included) is no longer stated at all. Such an expression is quoted as the model declares
+/// it.
+///
+/// Which of the renderings a service states is part of its validation-message dialect (the
+/// module docs above), so this is a third dialect beside the two above rather than a change
+/// to either, and it shares their one reading of the pair: the DROP is [`unanchored`]'s,
+/// called rather than restated.
+#[must_use]
+pub fn unanchored_keeping_inner_anchors(regex: &str) -> String {
+    let stated = unanchored(regex);
+    if stated == regex || !regex_syntax(&stated).anchor {
+        return stated;
+    }
+    regex.to_string()
+}
+
 /// Whether `text` alternates at its TOP level — a `|` that is not inside a group and not
-/// inside a character class, where it is the literal character. Escapes are honoured
-/// throughout, so an escaped `|`, `[`, `]`, `(` or `)` is a literal too.
+/// inside a character class, where it is the literal character.
+fn alternates_at_top_level(text: &str) -> bool {
+    regex_syntax(text).top_level_alternation
+}
+
+/// What a regular expression spells in its own syntax, as the renderings above decide on.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RegexSyntax {
+    /// A `|` that separates branches of the whole expression: one that is neither inside a
+    /// group nor inside a character class, where it is the literal character.
+    top_level_alternation: bool,
+    /// A `^` or `$` the expression ANCHORS with: one that neither negates a character
+    /// class, nor sits inside one, nor is escaped into a literal.
+    anchor: bool,
+}
+
+/// [`RegexSyntax`] of `text`, in ONE scan. Escapes are honoured throughout, so an escaped
+/// `|`, `[`, `]`, `(`, `)`, `^` or `$` is a literal.
 ///
 /// A `]` in the FIRST position of a class is the literal bracket rather than the class's
 /// end (`[]|]` is the two-character class `]|`, not an empty class followed by `|]`), and a
 /// leading `^` does not count as a position, so `[^]|]` is read the same way. Tracking the
 /// position inside the class is what keeps a `|` in such a class from being read as an
-/// alternation.
-fn alternates_at_top_level(text: &str) -> bool {
+/// alternation, and a `^` that negates one from being read as an anchor.
+fn regex_syntax(text: &str) -> RegexSyntax {
+    let mut syntax = RegexSyntax::default();
     let mut escaped = false;
     // `Some(n)`: inside a class, with `n` characters seen in it (a leading `^` excluded).
     let mut in_class: Option<usize> = None;
@@ -1116,11 +1166,12 @@ fn alternates_at_top_level(text: &str) -> bool {
             ('[', None) => in_class = Some(0),
             ('(', None) => depth += 1,
             (')', None) => depth = depth.saturating_sub(1),
-            ('|', None) if depth == 0 => return true,
+            ('|', None) if depth == 0 => syntax.top_level_alternation = true,
+            ('^' | '$', None) => syntax.anchor = true,
             _ => {}
         }
     }
-    false
+    syntax
 }
 
 /// Whether `text` ends in an escape — an odd number of trailing backslashes, so the
@@ -2113,9 +2164,10 @@ mod tests {
     use super::{
         echo_of, is_elision_of, list_of_element, quoted_echo, rendered_declared_structure,
         rendered_entries, rendered_map, rendered_sequence, rendered_structure, unanchored,
-        unanchored_grouping_alternation, Composite, RenderedChild, Submitted, SubmittedEcho,
-        SubmittedValues, MAX_RECORDED_BYTES, MAX_RECORDED_LEAVES, MAX_RECORDED_RENDERED_BYTES,
-        MAX_RECORDED_RENDERINGS, MAX_RENDERED_CHILDREN, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
+        unanchored_grouping_alternation, unanchored_keeping_inner_anchors, Composite,
+        RenderedChild, Submitted, SubmittedEcho, SubmittedValues, MAX_RECORDED_BYTES,
+        MAX_RECORDED_LEAVES, MAX_RECORDED_RENDERED_BYTES, MAX_RECORDED_RENDERINGS,
+        MAX_RENDERED_CHILDREN, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
     };
     use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
     use std::collections::HashMap;
@@ -3007,6 +3059,87 @@ mod tests {
                 actual, grouped,
                 "case {case:?}: expected unanchored_grouping_alternation {grouped:?}, \
                  got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: [`super::unanchored_keeping_inner_anchors`] drops the same pair the two
+    /// renderings above drop — whatever the expression's top level does, which is what the
+    /// recorded lambdacore refusal quoted in [`super::unanchored`] states — and declines the
+    /// drop for one case: an expression carrying an anchor of its OWN, which is a whole-value
+    /// expression before any wrapping and so is quoted as the model declares it.
+    ///
+    /// The rows are the forms a published `@pattern` takes in the tree: a plain whole-value
+    /// expression, the recorded top-level alternation that carries no anchor of its own, the
+    /// alternations whose branches anchor themselves (sharing one pair, parenthesised, and
+    /// with an empty first branch), the half-anchored forms no rendering may touch, and the
+    /// regex constructs that can hide an anchor — an escape, a negated class, a class whose
+    /// first member is a literal bracket.
+    #[test]
+    fn the_inner_anchor_rendering_declines_the_drop_for_a_self_anchored_expression() {
+        // (case, the model's pattern, what `unanchored_keeping_inner_anchors` states)
+        let rows: [(&str, &str, &str); 14] = [
+            ("a plain whole-value pattern", "^[0-9]{12}$", "[0-9]{12}"),
+            // The recorded form: a top-level alternation carrying no anchor of its own, so
+            // the pair is the model's wrapping and is dropped, exactly as `unanchored`
+            // states it (`com.amazonaws.lambdacore#NetworkConnectorName`).
+            (
+                "a recorded top-level alternation of a group and a bare branch",
+                "^(arn:[^:]+:network-connector:[^:]+)|[a-zA-Z0-9_-]{1,64}$",
+                "(arn:[^:]+:network-connector:[^:]+)|[a-zA-Z0-9_-]{1,64}",
+            ),
+            ("a bare top-level alternation", "^a|b$", "a|b"),
+            ("an alternation already inside a group", "^(a|b)$", "(a|b)"),
+            // Branches that anchor themselves while sharing the outer pair: dropping it
+            // would state `a$|^b`, which requires nothing of either branch.
+            (
+                "branches anchored individually, sharing the outer pair",
+                "^a$|^b$",
+                "^a$|^b$",
+            ),
+            // The shape of an "empty or an ARN" member: the first branch IS the anchored
+            // empty string, the only value it accepts.
+            (
+                "an anchored empty branch beside an anchored ARN branch",
+                r"^$|^arn:aws:logs:r:1:log-group:g:\*$",
+                r"^$|^arn:aws:logs:r:1:log-group:g:\*$",
+            ),
+            (
+                "branches anchored inside their own groups, wrapped in a further pair",
+                "^(^a$)|(^b$)$",
+                "^(^a$)|(^b$)$",
+            ),
+            (
+                "branches anchored inside their own groups, with no outer pair",
+                "(^a$)|(^b$)",
+                "(^a$)|(^b$)",
+            ),
+            ("anchored at the start only", "^abc", "^abc"),
+            ("anchored at the end only", "abc$", "abc$"),
+            ("no anchors at all", "[0-9]+", "[0-9]+"),
+            (
+                "a trailing escaped dollar, which is a literal and no anchor",
+                r"^cost\$$",
+                r"cost\$",
+            ),
+            (
+                "an escaped caret inside the expression, which is a literal",
+                r"^a\^b$",
+                r"a\^b",
+            ),
+            (
+                "a caret negating a class, and a literal bracket opening another",
+                "^[^:]+[]|]$",
+                "[^:]+[]|]",
+            ),
+        ];
+
+        for (case, pattern, stated) in rows {
+            let actual = unanchored_keeping_inner_anchors(pattern);
+            assert_eq!(
+                actual, stated,
+                "case {case:?}: expected unanchored_keeping_inner_anchors {stated:?}, got \
+                 {actual:?}"
             );
         }
     }

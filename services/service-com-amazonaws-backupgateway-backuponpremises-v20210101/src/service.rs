@@ -115,12 +115,15 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
         ViolationKind::MaxValue(max) => {
             format!("Member must have value less than or equal to {max}")
         }
-        // The requirement reported is the expression itself, without the `^` / `$` the
-        // model spells it with: this service states the character class a value must
-        // satisfy, not the anchoring the model uses to make the match total.
+        // The requirement reported is the expression itself, without the whole-value
+        // `^` / `$` pair the model writes around it: this service states the character
+        // class a value must satisfy, not the anchoring the model uses to make the match
+        // total. An expression that anchors its own BRANCHES is already a whole-value
+        // expression and is stated as the model declares it — the shared rendering's rule,
+        // called rather than restated here.
         ViolationKind::Pattern(pattern) => format!(
             "Member must satisfy regular expression pattern: {}",
-            unanchored(pattern)
+            ::service_common::validation::unanchored_keeping_inner_anchors(pattern)
         ),
         ViolationKind::EnumValue(allowed) => {
             format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
@@ -191,24 +194,6 @@ pub(crate) fn handler_constraint_violation(
         None => "Value".to_string(),
     };
     envelope(&[constraint_clause_at(&subject, at, requirement)])
-}
-
-/// A `@pattern` expression without the anchors a model may spell it with. A `$` escaped
-/// by a backslash is a literal dollar sign inside the expression, not the end anchor, so
-/// it stays.
-fn unanchored(pattern: &str) -> &str {
-    let body = pattern.strip_prefix('^').unwrap_or(pattern);
-    match body.strip_suffix('$') {
-        Some(trimmed) => {
-            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
-            if backslashes % 2 == 0 {
-                trimmed
-            } else {
-                body
-            }
-        }
-        None => body,
-    }
 }
 
 /// The `ValidationException` message for a refusal: the AWS envelope

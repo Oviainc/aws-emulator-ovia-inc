@@ -99,7 +99,7 @@ async fn a_constraint_violation_on_a_sensitive_member_never_echoes_the_value() {
             "username",
             "bad\tusername",
             true,
-            // The modelled `Username` pattern, unanchored
+            // The modelled `Username` pattern, without its redundant outer anchors
             // (`smithy_query(query="shape",shape="Username")`).
             "Member must satisfy regular expression pattern: [ -\\.0-\\[\\]-~]*[!-\\.0-\\[\\]-~][ -\\.0-\\[\\]-~]*",
         ),
