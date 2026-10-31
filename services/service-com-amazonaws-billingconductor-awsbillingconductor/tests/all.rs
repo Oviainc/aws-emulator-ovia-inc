@@ -167,5 +167,7 @@ mod validation_exception_message;
 mod validation_message_value_sensitivity;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;
+#[path = "all/versioned_resource_generations.rs"]
+mod versioned_resource_generations;
 #[path = "all/write_audit_records.rs"]
 mod write_audit_records;

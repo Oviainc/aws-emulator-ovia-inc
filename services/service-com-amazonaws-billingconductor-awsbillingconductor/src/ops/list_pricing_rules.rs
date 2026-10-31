@@ -78,6 +78,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The billing-period versioning rule a read of a pricing rule is answered from
+/// (`exists_in` / `effective_in`), implemented once for every versioned resource of this
+/// store.
+use crate::state::VersionedResource;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
