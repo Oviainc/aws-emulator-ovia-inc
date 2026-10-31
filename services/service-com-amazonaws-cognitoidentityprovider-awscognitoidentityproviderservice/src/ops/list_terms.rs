@@ -223,13 +223,10 @@ fn user_pool_not_found(user_pool_id: &str) -> ListTermsError {
 }
 
 /// This operation's `InvalidParameterException` for a `NextToken` that names no
-/// page of this listing.
+/// page of this listing ([`crate::state::PAGINATION_TOKEN_INVALID_MESSAGE`]).
 fn invalid_next_token() -> ListTermsError {
     ListTermsErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(
-            "NextToken is not a pagination token this operation issued for this user pool"
-                .to_string(),
-        ),
+        message: Some(crate::state::PAGINATION_TOKEN_INVALID_MESSAGE.to_string()),
         // `reasonCode` is AWS's own classification of the bad parameter and this
         // service's model documents no value for it, so nothing is invented here.
         reason_code: None,

@@ -543,8 +543,8 @@ async fn an_update_names_a_status_the_model_declares() {
     // Every row is a value `UpdateReplicaStatusType` does not declare: the two
     // `ReplicaStatusType` values that are the service's to set rather than the
     // caller's, a value of the right shape in the wrong case, a value from
-    // another enum of this service, the empty string, and one longer than a
-    // refusal echoes, which is elided rather than echoed whole.
+    // another enum of this service, the empty string, and one longer than the
+    // framework's own echo bound, which a clause of this service quotes whole.
     let over_cap = "x".repeat(300);
     for status in [
         REPLICA_STATUS_CREATING,
@@ -578,23 +578,15 @@ async fn an_update_names_a_status_the_model_declares() {
             "case {status:?}: the refusal states the member, the value set it broke and the \
              value it submitted, got {payload}"
         );
-        // A value no longer than the echo bound appears whole; a longer one is
-        // elided the way every other constraint message of this emulator
-        // elides, so the refusal cannot be grown by the request.
-        if status.len() <= 256 {
-            assert!(
-                message.contains(&format!("Value '{status}' at 'status'")),
-                "case {status:?}: a short submitted value is echoed whole, got {payload}"
-            );
-        } else {
-            assert!(
-                message.contains(&format!("... [{} bytes]", status.len()))
-                    && !message.contains(status),
-                "case of {} bytes: an over-long submitted value is elided rather than echoed \
-                 whole, got {payload}",
-                status.len()
-            );
-        }
+        // The submitted value is quoted WHOLE, however long it was: an Amazon
+        // Cognito constraint clause quotes the value the request carried, which
+        // `input_validation_refusal_wording.rs` asserts over the class of such
+        // values. Bounded all the same, by the ceiling this service states from
+        // its own model rather than by the framework's own 256-byte elision.
+        assert!(
+            message.contains(&format!("Value '{status}' at 'status'")),
+            "case {status:?}: the submitted value is quoted whole, got {payload}"
+        );
         assert_eq!(
             status_of(&router, &user_pool_id, REPLICA_REGION).await,
             REPLICA_STATUS_INACTIVE,

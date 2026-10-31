@@ -224,13 +224,11 @@ fn user_pool_not_found(user_pool_id: &str) -> ListUserImportJobsError {
 }
 
 /// This operation's `InvalidParameterException` for a `PaginationToken` that
-/// names no page of this listing.
+/// names no page of this listing
+/// ([`crate::state::PAGINATION_TOKEN_INVALID_MESSAGE`]).
 fn invalid_pagination_token() -> ListUserImportJobsError {
     ListUserImportJobsErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(
-            "PaginationToken is not a pagination token this operation issued for this user pool"
-                .to_string(),
-        ),
+        message: Some(crate::state::PAGINATION_TOKEN_INVALID_MESSAGE.to_string()),
         // `reasonCode` is AWS's own classification of the bad parameter and this
         // service's model documents no value for it, so nothing is invented here.
         reason_code: None,

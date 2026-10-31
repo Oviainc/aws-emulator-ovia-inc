@@ -998,7 +998,15 @@ async fn an_attribute_the_schema_freezes_is_refused_by_name_on_every_write() {
             "case {case:?}: expected a 400 InvalidParameterException, got {status} with {payload}"
         );
         let message = error_message(&payload);
-        let expected = format!("Cannot modify the non-mutable attribute {}", row.attribute);
+        // A write that submits a VALUE is validated against the pool's schema
+        // value by value, so it is refused with that report's own line for the
+        // finding; a DELETION, which carries names alone, is refused with the
+        // sentence about the attribute. Both name the attribute and nothing else.
+        let expected = if row.updates {
+            format!("user.{}: Attribute cannot be updated.\n", row.attribute)
+        } else {
+            format!("Cannot modify the non-mutable attribute {}", row.attribute)
+        };
         assert_eq!(
             message, expected,
             "case {case:?}: expected {expected:?}, got {message:?}"

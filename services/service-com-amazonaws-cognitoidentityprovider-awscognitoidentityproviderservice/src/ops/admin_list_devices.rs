@@ -256,13 +256,11 @@ fn device_remembering_not_configured() -> AdminListDevicesError {
 }
 
 /// This operation's `InvalidParameterException` for a `PaginationToken` that
-/// names no page of this listing.
+/// names no page of this listing
+/// ([`crate::state::PAGINATION_TOKEN_INVALID_MESSAGE`]).
 fn invalid_pagination_token() -> AdminListDevicesError {
     AdminListDevicesErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(
-            "PaginationToken is not a pagination token this operation issued for this user"
-                .to_string(),
-        ),
+        message: Some(crate::state::PAGINATION_TOKEN_INVALID_MESSAGE.to_string()),
         // `reasonCode` is AWS's own classification of the bad parameter and this
         // service's model documents no value for it, so nothing is invented here.
         reason_code: None,

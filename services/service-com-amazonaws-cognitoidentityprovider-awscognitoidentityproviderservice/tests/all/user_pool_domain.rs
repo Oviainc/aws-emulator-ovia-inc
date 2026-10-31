@@ -697,11 +697,11 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
         );
     }
 
-    // The same bounds hold for the reader, which names a domain alone.
+    // The reader, which names a domain alone, refuses a domain outside the
+    // modelled LENGTH the same way.
     for (label, domain) in [
         ("an empty domain", String::new()),
         ("a domain of 64 characters", "d".repeat(64)),
-        ("a domain carrying dots", "auth.example.com".to_string()),
     ] {
         let (status, payload) = call(
             &router,
@@ -714,4 +714,22 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
             "case {label:?}: DescribeUserPoolDomain refuses it too, got {status} with {payload}"
         );
     }
+
+    // The FORM of the name is a different matter for the reader: a name no
+    // create could take holds no domain, so the reader reports the domain it
+    // found (none) rather than refusing the name.
+    // `input_validation_refusal_wording.rs` asserts that over a set of such
+    // names, beside the prose the operations that ask FOR a name answer.
+    let (status, payload) = call(
+        &router,
+        "DescribeUserPoolDomain",
+        &json!({ "Domain": "auth.example.com" }),
+    )
+    .await;
+    assert_eq!(
+        (status, &payload["DomainDescription"]),
+        (200, &json!({})),
+        "case \"a domain carrying dots\": the reader reports no domain for it, got {status} \
+         with {payload}"
+    );
 }

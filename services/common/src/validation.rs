@@ -63,10 +63,14 @@
 //!   default. 64x the largest `@length` maximum most emulated members declare (256), so the
 //!   fidelity this exists for — echoing a 300-character id, an over-long ARN, a rejected
 //!   enum value — always lands, while one clause can never carry request-sized content. A
-//!   service whose model declares a member LONGER than this (a policy document, say) states
-//!   its own ceiling from that member's declared maximum
-//!   ([`refusing_violations_quoting_up_to`]), which is a model constant rather than a
-//!   request-sized one.
+//!   service whose model declares a member LONGER than this (a policy document, a stylesheet)
+//!   states its own ceiling from that member's declared maximum
+//!   ([`refusing_violations_quoting_up_to`], or
+//!   [`refusing_violations_with_declared_echoes_quoting_up_to`] for a service that reads the
+//!   echo rather than the restored violation), which is a model constant rather than a
+//!   request-sized one. A stated ceiling raises the per-message total with it, and bounds one
+//!   LEAF value only: a COMPOSITE's rendering keeps this ceiling, since it is built from many
+//!   of a caller's values rather than being one of them.
 //! * [`MAX_RESTORED_TOTAL`] (64 KiB) — the restored bytes ALL clauses of one message may
 //!   carry together, so `violations x value size` is bounded as a product. For scale, the
 //!   framework's own ceiling on the same text is 100 clauses x 256 bytes ~= 25 KiB, so
@@ -390,6 +394,41 @@ pub fn refusing_violations_with_declared_echoes_over<O: Operation>(
         .collect()
 }
 
+/// As [`refusing_violations_with_declared_echoes_over`], with the largest single value one
+/// clause may quote stated by the SERVICE rather than taken from [`MAX_RESTORED_ECHO`].
+///
+/// The echo counterpart of [`refusing_violations_quoting_up_to`], and it exists for the same
+/// reason: the flat bound is sized for the members most models declare, so a model that
+/// declares a `@length` maximum ABOVE it has refusals whose value could never be quoted in
+/// full — the one thing an AWS constraint message always does. A service whose model declares
+/// such a member states its own ceiling here, from that member's declared maximum, so the
+/// ceiling is a MODEL constant and no response is sized by the request.
+///
+/// The ceiling is the one a LEAF value is quoted up to, and with it the bytes one message may
+/// restore. A COMPOSITE's rendering keeps this module's own ceiling
+/// ([`MAX_RESTORED_ECHO`]): a composite is built from many of a caller's values rather than
+/// being one of them, so quoting it is not the fidelity this knob exists for. Everything else
+/// is [`refusing_violations_with_declared_echoes_over`]'s: the same collecting walk, the same
+/// violations, the same position count.
+#[must_use]
+pub fn refusing_violations_with_declared_echoes_quoting_up_to<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    max_positions: usize,
+    max_echo: usize,
+) -> Vec<(Violation, SubmittedEcho)> {
+    let refusing = violations_in::<O>(
+        protocol,
+        req,
+        Echoes::DeclaredRenderingsQuotingUpTo(max_positions, max_echo),
+    );
+    refusing
+        .violations
+        .into_iter()
+        .zip(refusing.echoes)
+        .collect()
+}
+
 /// As [`refusing_violations_with_declared_echoes_over`], with the members a structure is
 /// printed over stated by the CALLER for the shapes `printed` names, instead of read off
 /// the model.
@@ -462,6 +501,10 @@ pub(crate) enum Echoes {
     /// As [`Self::RenderingsOver`], with a structure rendered over every member its shape
     /// declares ([`refusing_violations_with_declared_echoes_over`]).
     DeclaredRenderingsOver(usize),
+    /// As [`Self::DeclaredRenderingsOver`], quoting one LEAF value up to the ceiling the
+    /// SERVICE states ([`refusing_violations_with_declared_echoes_quoting_up_to`]) instead of
+    /// [`MAX_RESTORED_ECHO`].
+    DeclaredRenderingsQuotingUpTo(usize, usize),
     /// As [`Self::DeclaredRenderingsOver`], with the members a structure is printed over
     /// stated by the caller for the shapes it names
     /// ([`refusing_violations_with_printed_echoes_over`]).
@@ -591,6 +634,7 @@ pub(crate) fn violations_in<O: Operation>(
                         MAX_RECORDED_LEAVES,
                         StructureForm::MembersSet,
                         MapForm::Entries,
+                        MAX_RESTORED_ECHO,
                     )
                     .into_iter()
                     .unzip();
@@ -608,6 +652,25 @@ pub(crate) fn violations_in<O: Operation>(
                         max_positions,
                         StructureForm::EveryMemberDeclared,
                         MapForm::Unrendered,
+                        MAX_RESTORED_ECHO,
+                    )
+                    .into_iter()
+                    .unzip();
+                    Refusing {
+                        violations,
+                        lists: HashMap::new(),
+                        echoes,
+                    }
+                }
+                Echoes::DeclaredRenderingsQuotingUpTo(max_positions, max_echo) => {
+                    let (violations, echoes) = echoed_over(
+                        violations,
+                        &input,
+                        O::INPUT_SCHEMA,
+                        max_positions,
+                        StructureForm::EveryMemberDeclared,
+                        MapForm::Unrendered,
+                        max_echo,
                     )
                     .into_iter()
                     .unzip();
@@ -625,6 +688,7 @@ pub(crate) fn violations_in<O: Operation>(
                         max_positions,
                         StructureForm::MembersPrinted(printed),
                         MapForm::Unrendered,
+                        MAX_RESTORED_ECHO,
                     )
                     .into_iter()
                     .unzip();
@@ -836,13 +900,16 @@ pub fn with_submitted_echoes_over(
         max_positions,
         StructureForm::MembersSet,
         MapForm::Unrendered,
+        MAX_RESTORED_ECHO,
     )
 }
 
-/// [`with_submitted_echoes_over`], with the STRUCTURE and MAP forms the caller states.
+/// [`with_submitted_echoes_over`], with the STRUCTURE and MAP forms the caller states, and
+/// the ceiling one LEAF value is quoted up to.
 ///
 /// The one body every echo mode runs: the walk, the path spelling and the echo bounds are
 /// the same, so the forms cannot drift into several walks.
+#[allow(clippy::too_many_arguments)]
 fn echoed_over(
     violations: Vec<Violation>,
     input: &dyn SerializableStruct,
@@ -850,6 +917,7 @@ fn echoed_over(
     max_positions: usize,
     structures: StructureForm,
     maps: MapForm,
+    max_echo: usize,
 ) -> Vec<(Violation, SubmittedEcho)> {
     // A refusal that states no value at all (an absent `@required` member is the common
     // case) is not worth a walk over the whole input.
@@ -859,7 +927,7 @@ fn echoed_over(
             .map(|violation| (violation, SubmittedEcho::Absent))
             .collect();
     }
-    let renderings = renderings_in(input, schema, max_positions, structures, maps);
+    let renderings = renderings_in(input, schema, max_positions, structures, maps, max_echo);
     // ONE pass over the renderings builds the lookup, so the cost is O(positions) rather
     // than O(violations x positions).
     let mut by_path: HashMap<&str, Option<&str>> = HashMap::new();
@@ -868,21 +936,25 @@ fn echoed_over(
             .entry(position.as_str())
             .or_insert(rendering.as_deref());
     }
-    let mut budget = MAX_RESTORED_TOTAL;
+    // One clause may quote up to the stated ceiling, so the bytes all clauses of one
+    // message restore is at least that much.
+    let mut budget = MAX_RESTORED_TOTAL.max(max_echo);
     violations
         .into_iter()
         .map(|violation| {
-            let echo = echo_of(&violation, &by_path, &mut budget);
+            let echo = echo_of(&violation, &by_path, &mut budget, max_echo);
             (violation, echo)
         })
         .collect()
 }
 
-/// How a clause can state `violation`'s value, within the bounds this module states.
+/// How a clause can state `violation`'s value, within the bounds this module states and the
+/// ceiling the caller stated for one value.
 fn echo_of(
     violation: &Violation,
     by_path: &HashMap<&str, Option<&str>>,
     budget: &mut usize,
+    max_echo: usize,
 ) -> SubmittedEcho {
     if violation.value.is_none() {
         return SubmittedEcho::Absent;
@@ -900,7 +972,7 @@ fn echo_of(
         },
     };
     match rendered {
-        Some(rendering) if rendering.len() <= MAX_RESTORED_ECHO && rendering.len() <= *budget => {
+        Some(rendering) if rendering.len() <= max_echo && rendering.len() <= *budget => {
             *budget -= rendering.len();
             SubmittedEcho::Rendered(rendering.to_string())
         }
@@ -1203,7 +1275,12 @@ pub fn list_of_element(leaf_path: &str) -> Option<&str> {
 ///
 /// Stated as a relation rather than by re-deriving the elision, so this does not depend
 /// on the cap the frozen crate elides at — only on the shape of what it writes.
-fn is_elision_of(stored: &str, submitted: &str) -> bool {
+///
+/// `pub(crate)` because the other half of this crate's clause rendering
+/// ([`crate::validation_message::quoting_the_whole_submitted_value`]) restores a clause the
+/// framework elided and has to recognise the same relation, which belongs with the walk that
+/// mirrors that renderer rather than being re-derived beside it.
+pub(crate) fn is_elision_of(stored: &str, submitted: &str) -> bool {
     if stored == submitted {
         return true;
     }
@@ -1370,23 +1447,26 @@ pub fn submitted_renderings_over(
         max_positions,
         StructureForm::MembersSet,
         MapForm::Unrendered,
+        MAX_RESTORED_ECHO,
     )
 }
 
-/// [`submitted_renderings_over`], with the STRUCTURE and MAP forms the caller states: the
-/// one walk every form runs.
+/// [`submitted_renderings_over`], with the STRUCTURE and MAP forms the caller states and the
+/// ceiling one LEAF rendering is kept up to: the one walk every form runs.
 fn renderings_in(
     input: &dyn SerializableStruct,
     schema: &Schema,
     max_positions: usize,
     structures: StructureForm,
     maps: MapForm,
+    max_echo: usize,
 ) -> Vec<(String, Option<String>)> {
     // The ONLY walk that composes renderings: a caller that reads one named leaf
     // ([`submitted_leaves`], [`submitted_lists`]) pays nothing for them.
     let mut walk = SubmittedValues {
         renders: true,
         max_positions: Some(max_positions),
+        max_echo: Some(max_echo),
         structures,
         maps,
         ..SubmittedValues::default()
@@ -1673,6 +1753,14 @@ struct SubmittedValues {
     /// ([`submitted_leaves_up_to`]) collects to that same ceiling, because a leaf no clause
     /// could quote is not worth copying.
     max_value: Option<usize>,
+    /// The largest single LEAF rendering this walk keeps, or `None` for
+    /// [`MAX_RESTORED_ECHO`], the bound this module states. A caller that quotes one value
+    /// up to a ceiling of its own
+    /// ([`refusing_violations_with_declared_echoes_quoting_up_to`]) keeps a rendering up to
+    /// that same ceiling, because a rendering no clause could quote is not worth holding. A
+    /// COMPOSITE's rendering is bounded by [`MAX_RESTORED_ECHO`] whatever this says: it is
+    /// built from many of a caller's values rather than being one of them.
+    max_echo: Option<usize>,
     /// The composites currently open, innermost last, collecting the children each
     /// renders from. Pushed and popped with `collections`.
     open: Vec<Composite>,
@@ -1695,6 +1783,11 @@ impl SubmittedValues {
     /// The largest single leaf this walk copies; see [`Self::max_value`].
     fn value_bound(&self) -> usize {
         self.max_value.unwrap_or(MAX_RESTORED_ECHO)
+    }
+
+    /// The largest single leaf rendering this walk keeps; see [`Self::max_echo`].
+    fn echo_bound(&self) -> usize {
+        self.max_echo.unwrap_or(MAX_RESTORED_ECHO)
     }
 
     /// True once no further leaf can be recorded, so the rest of the walk is skipped.
@@ -1814,10 +1907,10 @@ impl SubmittedValues {
         // handed to the composite this value is a child of: holding it would retain
         // request-sized text once per nesting level. The composite then renders as
         // nothing, rather than as a value missing a part of itself.
-        let rendering = rendering.filter(|rendered| rendered.len() <= MAX_RESTORED_ECHO);
+        let rendering = rendering.filter(|rendered| rendered.len() <= self.echo_bound());
         let bytes = position.len() + rendering.as_ref().map_or(0, String::len);
         if self.renderings.len() < self.recorded_renderings_bound()
-            && self.rendered + bytes <= MAX_RECORDED_RENDERED_BYTES
+            && self.rendered + bytes <= MAX_RECORDED_RENDERED_BYTES.max(self.echo_bound())
         {
             self.rendered += bytes;
             self.renderings.push((position, rendering.clone()));
@@ -2872,7 +2965,7 @@ mod tests {
                 value: value.map(str::to_string),
             };
             let mut budget = MAX_RESTORED_TOTAL;
-            let actual = echo_of(&violation, &by_path, &mut budget);
+            let actual = echo_of(&violation, &by_path, &mut budget, MAX_RESTORED_ECHO);
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"

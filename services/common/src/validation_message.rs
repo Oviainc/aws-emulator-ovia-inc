@@ -199,6 +199,41 @@ pub fn quoting_the_submitted_collection(
     }
 }
 
+/// `violation` with the clause's value half restored to the WHOLE value the caller
+/// submitted, where the framework stored its own elision of it.
+///
+/// The framework's constraint walk elides the rejected value into the clause at a ceiling of
+/// its own — a byte-bounded prefix plus `... [<n> bytes]`
+/// (`vendor/smithy-schema-server/src/constraints.rs`) — which is wire text AWS never emits:
+/// an AWS constraint clause quotes the value the request carried, however long that value
+/// was. The echo ([`crate::validation::SubmittedEcho`], collected by the walk that owns every
+/// bound on what one clause may quote) is that value, so the clause is restored from it.
+///
+/// ONLY that one clause is touched: the stored echo has to BE the framework's rendering of
+/// the submitted value — identical, or its prefix plus the marker naming its byte count — so
+/// a clause the framework wrote from something else (a collection's size summary, which
+/// [`quoting_the_submitted_collection`] answers) keeps the framework's own text, and so does
+/// a value the echo bounds declined to render.
+#[must_use]
+pub fn quoting_the_whole_submitted_value(
+    violation: Violation,
+    echo: &crate::validation::SubmittedEcho,
+) -> Violation {
+    let crate::validation::SubmittedEcho::Rendered(submitted) = echo else {
+        return violation;
+    };
+    let elided = violation.value.as_deref().is_some_and(|stored| {
+        stored != submitted && crate::validation::is_elision_of(stored, submitted)
+    });
+    if elided {
+        return Violation {
+            value: Some(submitted.clone()),
+            ..violation
+        };
+    }
+    violation
+}
+
 /// The clause `violation` states with its VALUE half dropped — `Value at '<member path>'
 /// failed to satisfy constraint: <requirement>` — whichever half the framework wrote: the
 /// submitted value a present member echoes, or the `null` an ABSENT member is stated with.
@@ -993,7 +1028,8 @@ mod tests {
         aws_validation_refusal_withholding, aws_validation_refusal_withholding_with,
         enum_value_not_found, envelope_over, float_value_text, in_float_value_rendering,
         map_key_refusal, map_key_refusal_quoting, pattern_mismatch, property_count_refusal,
-        quoting_the_submitted_collection, string_too_long, string_too_short,
+        quoting_the_submitted_collection, quoting_the_whole_submitted_value, string_too_long,
+        string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -1110,6 +1146,69 @@ mod tests {
                 Some(expected),
                 "case {case:?}: expected {expected:?}, got {:?}",
                 stated.value
+            );
+        }
+    }
+
+    /// RULE: a clause whose value half the framework ELIDED states the whole value the
+    /// caller submitted, and only there: a clause the framework wrote from something else
+    /// keeps what it had.
+    ///
+    /// The rows span the forms the framework's rendering takes — the value itself, a prefix
+    /// plus the marker naming its byte count — beside the ones that are not that rendering
+    /// at all: a collection's size summary, an echo the walk could not produce, and a stored
+    /// value that is a prefix of the submitted one WITHOUT the marker.
+    #[test]
+    fn a_clause_the_framework_elided_quotes_the_whole_submitted_value() {
+        use crate::validation::SubmittedEcho;
+
+        let long = "x".repeat(300);
+        let elided = format!("{}... [{} bytes]", &long[..256], long.len());
+        // (case, the violation's stored value, the echo, the value stated)
+        let rows: [(&str, &str, SubmittedEcho, &str); 5] = [
+            (
+                "a value the framework elided",
+                elided.as_str(),
+                SubmittedEcho::Rendered(long.clone()),
+                long.as_str(),
+            ),
+            (
+                "a value short enough to be stored whole",
+                "a-name",
+                SubmittedEcho::Rendered("a-name".to_string()),
+                "a-name",
+            ),
+            (
+                "a collection's size summary, which is no elision of a value",
+                "2 items",
+                SubmittedEcho::Rendered("[a, b]".to_string()),
+                "2 items",
+            ),
+            (
+                "an echo the walk could not produce",
+                elided.as_str(),
+                SubmittedEcho::Unrendered,
+                elided.as_str(),
+            ),
+            (
+                "a prefix carrying no byte-count marker",
+                "xxx",
+                SubmittedEcho::Rendered(long.clone()),
+                "xxx",
+            ),
+        ];
+
+        for (case, stored, echo, expected) in rows {
+            let stated = quoting_the_whole_submitted_value(
+                violation("description", ViolationKind::MaxLength(8), stored),
+                &echo,
+            );
+            assert_eq!(
+                stated.value.as_deref(),
+                Some(expected),
+                "case {case:?}: expected a value of {} bytes, got {:?} bytes",
+                expected.len(),
+                stated.value.as_deref().map(str::len)
             );
         }
     }

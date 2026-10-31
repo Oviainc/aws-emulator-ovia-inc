@@ -55,11 +55,15 @@
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints::{self, Violation, ViolationKind};
 use aws_smithy_schema_server::ProtocolError;
-use service_common::validation::{refusing_violations_with_declared_echoes_over, SubmittedEcho};
-use service_common::validation_message::list_item_count;
+use service_common::validation::{
+    refusing_violations_with_declared_echoes_quoting_up_to, unanchored, SubmittedEcho,
+};
+use service_common::validation_message::{
+    quoting_the_submitted_collection, quoting_the_whole_submitted_value,
+};
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
-    Refused, Service,
+    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext,
+    OperationError, OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service,
 };
 use std::sync::Arc;
 
@@ -87,6 +91,37 @@ const INVALID_PARAMETER_EXCEPTION: &str = "InvalidParameterException";
 /// with room for the other members of the request carrying it. Past it the framework's own
 /// count summary stands, which is the fail-safe direction.
 const MAX_ECHO_POSITIONS: usize = 512;
+
+/// The largest `@length` maximum any member of this model declares: `CSSType` and
+/// `ImageFileType` (`smithy_query(query="shape",shape="CSSType")`).
+const LARGEST_DECLARED_LENGTH: usize = 131_072;
+
+/// The largest single value one clause of this service quotes.
+///
+/// An Amazon Cognito constraint clause quotes the value the request carried, and a value
+/// that BREAKS a declared maximum is longer than that maximum — so a ceiling able to quote
+/// the refusal of this model's largest member has to sit above
+/// [`LARGEST_DECLARED_LENGTH`]. Twice it, so a value a little past the largest member's
+/// bound is quoted whole while one clause can never carry request-sized content: a MODEL
+/// constant rather than a request-sized one. Past it the framework's own elided rendering
+/// stands, which is the fail-safe direction.
+const MAX_QUOTED_VALUE: usize = 2 * LARGEST_DECLARED_LENGTH;
+
+/// The validation path of the `Domain` member every operation that names a user pool's
+/// hosted domain binds (`smithy_query(query="operation",operation="CreateUserPoolDomain")`),
+/// as the framework spells a member path.
+const DOMAIN_MEMBER_PATH: &str = "domain";
+
+/// The operations that ask a user pool FOR a hosted domain name, as against the ones that
+/// address a domain already asked for: a create of the pool's domain, and the update that
+/// re-points it. Their request carries a name the pool is to TAKE, which is the name Amazon
+/// Cognito validates with its own prose ([`domain_name_prose`]).
+const DOMAIN_NAMING_OPERATIONS: [&str; 2] = ["CreateUserPoolDomain", "UpdateUserPoolDomain"];
+
+/// The operation that reports the domain a name holds, which Amazon Cognito answers for ANY
+/// name (`smithy_query(query="operation",operation="DescribeUserPoolDomain")`): see
+/// [`served_despite`].
+const DESCRIBE_USER_POOL_DOMAIN: &str = "DescribeUserPoolDomain";
 
 /// The `com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -313,30 +348,159 @@ impl<O> WithSubmittedValues<O> {
     }
 }
 
-/// `violation` with the clause's value half replaced by the LIST the caller submitted,
-/// where the framework stored its own summary of one there.
+/// `violation` with the clause's value half stating the value the caller submitted, and its
+/// `@pattern` requirement quoted the way Amazon Cognito quotes one.
 ///
-/// The framework's constraint walk has no rendering for a collection, so a clause on a
-/// list over or under its `@length` carries the walk's `<n> items` summary — read back
-/// with the one reader of that rendering — which is not a value any caller sent. That one
-/// is replaced by the list as `echo` renders it. Every other clause keeps the framework's
-/// own rendering, which already states the bytes the caller submitted, and a list this
-/// walk could not render (one past the bounds the echo collector states) keeps the summary
-/// rather than losing the clause.
-fn quoting_the_submitted_collection(violation: Violation, echo: SubmittedEcho) -> Violation {
-    let summarised = violation.value.as_deref().is_some_and(|stored| {
-        matches!(
-            violation.kind,
-            ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
-        ) && list_item_count(stored).is_some()
-    });
-    match echo {
-        SubmittedEcho::Rendered(value) if summarised => Violation {
-            value: Some(value),
-            ..violation
+/// Three renderings of one clause, each delegated to the one place that owns it:
+///
+/// * the framework's constraint walk has no rendering for a COLLECTION, so a clause on a
+///   list or a map over or under its `@length` carries the walk's `<n> items` / `<n> entries`
+///   summary, which is not a value any caller sent: it is replaced by the collection as
+///   `echo` renders it ([`quoting_the_submitted_collection`]);
+/// * that walk ELIDES a long value into the clause at a ceiling of its own, while Amazon
+///   Cognito quotes the whole value the request carried: the elided half is replaced by that
+///   value ([`quoting_the_whole_submitted_value`], within [`MAX_QUOTED_VALUE`]);
+/// * a `@pattern` requirement is quoted WITHOUT the `^`/`$` a whole-value pattern is written
+///   with in the model, which is how Amazon Cognito publishes the expression a value has to
+///   satisfy ([`unanchored`]). The CHECK is still the model's pattern as written: only this
+///   rendering drops the pair.
+///
+/// Every other clause keeps the framework's own rendering, which already states the bytes the
+/// caller submitted, and a value the echo bounds declined to render keeps the framework's
+/// text rather than losing the clause.
+fn quoting_the_submitted_value(violation: Violation, echo: SubmittedEcho) -> Violation {
+    let quoted = quoting_the_whole_submitted_value(
+        quoting_the_submitted_collection(violation, echo.clone()),
+        &echo,
+    );
+    match &quoted.kind {
+        ViolationKind::Pattern(pattern) => Violation {
+            kind: ViolationKind::Pattern(unanchored(pattern)),
+            ..quoted
         },
-        _ => violation,
+        _ => quoted,
     }
+}
+
+/// The prose Amazon Cognito answers a `Domain` that is not a name a user pool's hosted
+/// domain may take, in place of the constraint report the framework would render \u2014 or `None`
+/// where this refusal is not that one.
+///
+/// Amazon Cognito validates the domain name a request ASKS FOR itself and reports a character
+/// a domain name
+/// cannot carry in its own sentence, naming the characters a domain may carry and the format
+/// a name has to follow, rather than as a clause about a member. The format it quotes is the
+/// expression the model declares for a domain name, taken from the violation rather than
+/// restated here, so the sentence cannot drift from the pattern that refused the name \u2014 and
+/// quoted as the MODEL writes it, anchors included, because the prose states the expression a
+/// WHOLE name must match rather than the one a clause quotes.
+///
+/// Only an `operation` that asks for a name answers it ([`DOMAIN_NAMING_OPERATIONS`]): one
+/// that merely ADDRESSES a domain is asking about a name rather than for one, so it keeps the
+/// modelled constraint report. And only for a request refused for the FORM of its domain name
+/// and nothing else: a
+/// request that breaks another member's constraint too is a refusal of more than this
+/// sentence reports, so the framework's envelope stands.
+fn domain_name_prose(operation: &str, violations: &[(Violation, SubmittedEcho)]) -> Option<String> {
+    if !DOMAIN_NAMING_OPERATIONS.contains(&operation) {
+        return None;
+    }
+    if violations
+        .iter()
+        .any(|(violation, _)| violation.path != DOMAIN_MEMBER_PATH)
+    {
+        return None;
+    }
+    violations
+        .iter()
+        .find_map(|(violation, _)| match &violation.kind {
+            ViolationKind::Pattern(pattern) => Some(format!(
+                "The domain name contains an invalid character. Domain names can only contain \
+                 lower-case letters, numbers, and hyphens. Please enter a different name that \
+                 follows this format: {pattern}"
+            )),
+            _ => None,
+        })
+}
+
+/// Whether `violation` is one this service does NOT refuse on, because Amazon Cognito
+/// SERVES the request that carries it.
+///
+/// A lookup addressed BY a hosted domain name reports the domain that name holds, and a
+/// name no create could ever take holds none — so Amazon Cognito answers such a lookup with
+/// the domain it found (none) rather than refusing the name's form, even though the model
+/// declares that form on the member. The operations that ask a pool FOR a name do refuse it
+/// ([`DOMAIN_NAMING_OPERATIONS`], [`domain_name_prose`]), which is where the name has to be
+/// one the pool can take.
+fn served_despite(operation: &str, violation: &Violation) -> bool {
+    operation == DESCRIBE_USER_POOL_DOMAIN
+        && violation.path == DOMAIN_MEMBER_PATH
+        && matches!(violation.kind, ViolationKind::Pattern(_))
+}
+
+impl<O> WithSubmittedValues<O>
+where
+    O: Operation + ErasedOperation,
+{
+    /// Serve a request the model's own constraints would refuse and Amazon Cognito answers
+    /// ([`served_despite`]), or `None` when its body is not one this protocol can read at
+    /// all — which the framework's own sequence then answers in its own envelope.
+    ///
+    /// The framework's centralized sequence validates EVERY modelled constraint between
+    /// deserializing and handling, with no seam to leave one of them out, so the steps
+    /// around that check are taken here instead: the protocol's own deserializer, the
+    /// operation's own handler and the protocol's own serializer, each called rather than
+    /// reimplemented, so the body, the status and the error wording stay the ones every
+    /// other request of this service gets.
+    ///
+    /// ONE thing that sequence owns is NOT taken: its telemetry — the recording timer, the
+    /// in-flight guard and the failure classification
+    /// (`vendor/smithy-server-runtime/src/operation.rs`) — because none of it is reachable
+    /// from here. A request served this way is therefore invisible to a collecting client,
+    /// which is the cost of having no seam to skip one violation; the structural fix is such
+    /// a seam in that frozen crate, and until it exists this is the narrower loss (one
+    /// member of one operation) than answering a request Amazon Cognito serves with a
+    /// refusal.
+    async fn served(
+        &self,
+        svc: &dyn Service,
+        req: &RtRequest,
+        ctx: &OperationContext<'_>,
+    ) -> Option<RtResponse> {
+        // Each protocol borrow is taken, used and dropped inside one statement:
+        // `&dyn ErasedServiceDefinition` is not `Sync`, so holding one across the await
+        // below would make this future non-`Send`.
+        let input = {
+            let protocol = wire_protocol(svc);
+            let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
+            <O::Input as DeserializableStruct>::deserialize(&mut *deserializer).ok()?
+        };
+        let answered = self.operation.handle(input, ctx).await;
+        let protocol = wire_protocol(svc);
+        let rendered = match &answered {
+            Ok(output) => protocol.serialize_output(
+                output,
+                O::OUTPUT_SCHEMA,
+                O::NAME,
+                O::SUCCESS_STATUS,
+            ),
+            Err(error) => protocol.serialize_error(
+                error.as_serializable(),
+                error.variant_schema(),
+                error.shape_name(),
+                error.http_status(),
+            ),
+        };
+        Some(rendered.unwrap_or_else(|failed| svc.definition().framework_error_response(failed)))
+    }
+}
+
+/// The wire protocol a response of this service is rendered with: the one this service
+/// overrides the model's with ([`EmulatedService::override_protocol`]), as the framework's
+/// own sequence resolves it.
+fn wire_protocol(svc: &dyn Service) -> &dyn ServerHttpProtocol {
+    svc.override_protocol()
+        .unwrap_or_else(|| svc.definition().protocol())
 }
 
 impl<O> ErasedOperation for WithSubmittedValues<O>
@@ -353,15 +517,27 @@ where
             // The protocol is read, used and dropped inside this one statement:
             // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the
             // await below would make this future non-`Send`.
-            let refused: Vec<Violation> = refusing_violations_with_declared_echoes_over::<O>(
+            let collected = refusing_violations_with_declared_echoes_quoting_up_to::<O>(
                 svc.definition().protocol(),
                 req,
                 MAX_ECHO_POSITIONS,
-            )
-            .into_iter()
-            .map(|(violation, echo)| quoting_the_submitted_collection(violation, echo))
-            .collect();
-            if let Some(message) = constraints::envelope(&refused) {
+                MAX_QUOTED_VALUE,
+            );
+            // Read off the violations as the MODEL stated them, before the clause
+            // renderings below requote the expression: the prose quotes the pattern a
+            // whole domain name must match, anchors included.
+            let prose = domain_name_prose(O::NAME, &collected);
+            // A violation this service does not refuse on is left out of the refusal and
+            // noted, because the framework's own sequence WOULD refuse it.
+            let served = collected
+                .iter()
+                .any(|(violation, _)| served_despite(O::NAME, violation));
+            let refused: Vec<Violation> = collected
+                .into_iter()
+                .filter(|(violation, _)| !served_despite(O::NAME, violation))
+                .map(|(violation, echo)| quoting_the_submitted_value(violation, echo))
+                .collect();
+            if let Some(message) = prose.or_else(|| constraints::envelope(&refused)) {
                 // The framework renders the refusal in this service's own envelope; the
                 // one thing it does not state on an awsJson error is the error shape in
                 // `x-amzn-errortype`, which this service answers on EVERY error, so the
@@ -376,6 +552,14 @@ where
                     ),
                     INVALID_PARAMETER_EXCEPTION,
                 );
+            }
+            // Nothing left to refuse. A request carrying a violation this service serves
+            // is served HERE, because the framework's own sequence would refuse it; every
+            // other request goes through that sequence unchanged.
+            if served {
+                if let Some(response) = self.served(svc, req, ctx).await {
+                    return response;
+                }
             }
             self.operation.run(svc, req, ctx).await
         })
@@ -478,11 +662,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // this seam remains for the rest (a body the codec cannot open at all), so one
         // request that breaks a modelled rule is never worded two ways.
         match refusal {
-            Refusal::Invalid(violations) => Some(Refused {
-                code: "InvalidParameterException".to_string(),
-                message: ::aws_smithy_schema_server::constraints::envelope(violations)
-                    .unwrap_or_else(|| "invalid request".to_string()),
-            }),
+            Refusal::Invalid(violations) => {
+                // The `@pattern` rendering is the same one the wrapper states, so one
+                // request's expression cannot be quoted two ways.
+                let violations: Vec<Violation> = violations
+                    .iter()
+                    .map(|violation| match &violation.kind {
+                        ViolationKind::Pattern(pattern) => Violation {
+                            kind: ViolationKind::Pattern(unanchored(pattern)),
+                            ..violation.clone()
+                        },
+                        _ => violation.clone(),
+                    })
+                    .collect();
+                Some(Refused {
+                    code: INVALID_PARAMETER_EXCEPTION.to_string(),
+                    message: ::aws_smithy_schema_server::constraints::envelope(&violations)
+                        .unwrap_or_else(|| "invalid request".to_string()),
+                })
+            }
             // An unauthenticated caller is the emulator's own refusal, not this
             // service's, so it keeps the framework's wording.
             _ => None,

@@ -207,10 +207,10 @@ fn user_pool_not_found(user_pool_id: &str) -> ListUserPoolReplicasError {
 }
 
 /// This operation's `InvalidParameterException` for a `NextToken` that names no
-/// page of this listing.
+/// page of this listing ([`crate::state::PAGINATION_TOKEN_INVALID_MESSAGE`]).
 fn invalid_next_token() -> ListUserPoolReplicasError {
     ListUserPoolReplicasErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some("NextToken is not a pagination token this operation issued".to_string()),
+        message: Some(crate::state::PAGINATION_TOKEN_INVALID_MESSAGE.to_string()),
         // `ReasonCode` is an optional machine code AWS fills in for a few
         // specific refusals only, so none is invented here.
         reason_code: None,

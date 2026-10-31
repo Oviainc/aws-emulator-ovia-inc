@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let filter = if filter_text.is_empty() {
             None
         } else {
-            Some(UserFilter::parse(filter_text).ok_or_else(constraints_not_satisfied)?)
+            Some(UserFilter::parse(filter_text).map_err(FilterRefusal::error)?)
         };
 
         // The users the search selects, in ascending stored-key order — the
@@ -398,8 +398,7 @@ struct UserFilter {
 }
 
 impl UserFilter {
-    /// The search `text` asks for, or `None` when it is not one this operation
-    /// can run — which the caller refuses with [`constraints_not_satisfied`].
+    /// The search `text` asks for, or why it is not one this operation can run.
     ///
     /// The documented form is `AttributeName Filter-Type "AttributeValue"`, where
     /// `Filter-Type` is `=` for an exact match or `^=` for a prefix ("starts
@@ -408,11 +407,16 @@ impl UserFilter {
     /// one attribute" (`ListUsers.Filter`, this service's model), so a filter that
     /// carries anything beyond one such comparison is not one this operation runs.
     ///
+    /// The two ways that fails are different refusals ([`FilterRefusal`]): text
+    /// this FORM cannot be read out of at all is a parse failure, while a
+    /// comparison the form does read whose attribute no server-side search covers
+    /// is input the operation will not accept.
+    ///
     /// This grammar is Amazon Cognito's own and holds exactly one comparison, so
     /// the reading below is ONE forward pass with no recursion and no nesting to
     /// descend, over an input `UserFilterType`'s modelled length (0..256) already
     /// bounds before this handler runs.
-    fn parse(text: &str) -> Option<Self> {
+    fn parse(text: &str) -> Result<Self, FilterRefusal> {
         let rest = text.trim_start();
         let name_end = rest
             .find(|character: char| {
@@ -421,19 +425,23 @@ impl UserFilter {
             .unwrap_or(rest.len());
         let (name, rest) = rest.split_at(name_end);
         if name.is_empty() {
-            return None;
+            return Err(FilterRefusal::NotParsed);
         }
         let rest = rest.trim_start();
         let (prefix, rest) = match rest.strip_prefix("^=") {
             Some(rest) => (true, rest),
-            None => (false, rest.strip_prefix('=')?),
+            None => (
+                false,
+                rest.strip_prefix('=').ok_or(FilterRefusal::NotParsed)?,
+            ),
         };
-        let value = quoted_value(rest.trim())?;
+        let value = quoted_value(rest.trim()).ok_or(FilterRefusal::NotParsed)?;
         let searched = SEARCHABLE_ATTRIBUTES
             .iter()
             .find(|(candidate, _)| *candidate == name)
-            .map(|(_, searched)| *searched)?;
-        Some(Self {
+            .map(|(_, searched)| *searched)
+            .ok_or(FilterRefusal::NotSearchable)?;
+        Ok(Self {
             searched,
             prefix,
             value,
@@ -492,29 +500,61 @@ fn user_pool_not_found(user_pool_id: &str) -> ListUsersError {
     .into()
 }
 
+/// Why a submitted `Filter` is no search this operation can run.
+///
+/// The two are different refusals of Amazon Cognito's: the filter is an expression
+/// language of its own, so text the language cannot be read out of is a PARSE
+/// failure, while a comparison it reads whose attribute no server-side search
+/// covers is a member whose submitted value the operation will not accept — the
+/// same refusal an `AttributesToGet` the results cannot serve earns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterRefusal {
+    /// The text is not one comparison in the filter language at all.
+    NotParsed,
+    /// It is one comparison, over an attribute [`SEARCHABLE_ATTRIBUTES`] does not
+    /// cover.
+    NotSearchable,
+}
+
+impl FilterRefusal {
+    /// This operation's `InvalidParameterException` for this refusal.
+    fn error(self) -> ListUsersError {
+        match self {
+            Self::NotParsed => invalid_parameter(FILTER_NOT_PARSED_MESSAGE.to_string()),
+            Self::NotSearchable => constraints_not_satisfied(),
+        }
+    }
+}
+
 /// How Amazon Cognito words input it will not accept for a member of this
 /// operation: it states that the submitted input missed the constraints on the
 /// member, naming neither the member nor the value, so the refusal reports
 /// nothing about the pool it was asked about.
 const CONSTRAINT_MESSAGE: &str = "Input fails to satisfy the constraints.";
 
-/// This operation's `InvalidParameterException` for input it will not accept:
-/// a `Filter` that is no search it can run — a comparison on an attribute no
-/// server-side search covers, or a string that is not one such comparison at
-/// all — and an `AttributesToGet` naming an attribute the selected users cannot
-/// serve. Both are a member whose submitted value missed the constraints on it,
-/// so both carry [`CONSTRAINT_MESSAGE`].
+/// How Amazon Cognito words a `Filter` the filter language cannot be read out of.
+///
+/// The `Filter` is a little expression language of its own
+/// (`AttributeName Filter-Type "AttributeValue"`, `ListUsers.Filter`), so text
+/// that is not one such comparison is text the server could not PARSE — which is
+/// what the refusal reports, in fixed text naming neither the filter nor the
+/// member it arrived in.
+const FILTER_NOT_PARSED_MESSAGE: &str = "Error while parsing filter.";
+
+/// This operation's `InvalidParameterException` for input it will not accept: a
+/// `Filter` naming an attribute no server-side search covers, and an
+/// `AttributesToGet` naming an attribute the selected users cannot serve. Both are
+/// a member whose submitted value missed the constraints on it, so both carry
+/// [`CONSTRAINT_MESSAGE`].
 fn constraints_not_satisfied() -> ListUsersError {
     invalid_parameter(CONSTRAINT_MESSAGE.to_string())
 }
 
 /// This operation's `InvalidParameterException` for a `PaginationToken` that
-/// names no page of this listing.
+/// names no page of this listing
+/// ([`crate::state::PAGINATION_TOKEN_INVALID_MESSAGE`]).
 fn invalid_pagination_token() -> ListUsersError {
-    invalid_parameter(
-        "PaginationToken is not a pagination token this operation issued for this search"
-            .to_string(),
-    )
+    invalid_parameter(crate::state::PAGINATION_TOKEN_INVALID_MESSAGE.to_string())
 }
 
 /// This operation's `InvalidParameterException` carrying `message`.
@@ -542,7 +582,7 @@ mod tests {
     //! runs and which are not. `tests/all/list_users.rs` asserts the search
     //! itself over the wire, against stored users.
 
-    use super::{Searched, UserFilter};
+    use super::{FilterRefusal, Searched, UserFilter};
 
     #[test]
     fn a_filter_reads_as_one_comparison_on_one_searchable_attribute() {
@@ -617,7 +657,7 @@ mod tests {
 
         for (case, filter, searched, prefix, value) in rows {
             let actual = UserFilter::parse(filter);
-            let expected = Some(UserFilter {
+            let expected = Ok(UserFilter {
                 searched: *searched,
                 prefix: *prefix,
                 value: (*value).to_string(),
@@ -631,42 +671,62 @@ mod tests {
 
     #[test]
     fn a_filter_that_is_not_one_such_comparison_is_not_a_search() {
-        // (case, filter)
-        let rows: &[(&str, &str)] = &[
-            ("a bare attribute name", "username"),
+        // (case, filter, why it is no search)
+        let rows: &[(&str, &str, FilterRefusal)] = &[
+            ("a bare attribute name", "username", FilterRefusal::NotParsed),
             (
                 "a comparison this operation does not accept",
                 "email ~= \"user@example.com\"",
+                FilterRefusal::NotParsed,
             ),
-            ("an unquoted value", "email = user@example.com"),
+            (
+                "an unquoted value",
+                "email = user@example.com",
+                FilterRefusal::NotParsed,
+            ),
             (
                 "a value whose quotation mark is never closed",
                 "email = \"user@example.com",
+                FilterRefusal::NotParsed,
             ),
             (
                 "two comparisons, where the filter matches no more than one attribute",
                 "email = \"a@example.com\" and name = \"Ada\"",
+                FilterRefusal::NotParsed,
             ),
-            ("no attribute name at all", "= \"alice\""),
+            (
+                "no attribute name at all",
+                "= \"alice\"",
+                FilterRefusal::NotParsed,
+            ),
+            (
+                "unbalanced punctuation, which is no comparison at all",
+                "((",
+                FilterRefusal::NotParsed,
+            ),
             (
                 "a custom attribute, which is not searchable",
                 "custom:department = \"finance\"",
+                FilterRefusal::NotSearchable,
             ),
             (
                 "a standard attribute outside the searchable catalog",
                 "nickname = \"ada\"",
+                FilterRefusal::NotSearchable,
             ),
             (
                 "a searchable name in another case, which is not that name",
                 "Username = \"alice\"",
+                FilterRefusal::NotSearchable,
             ),
         ];
 
-        for (case, filter) in rows {
+        for (case, filter, refusal) in rows {
             let actual = UserFilter::parse(filter);
-            assert!(
-                actual.is_none(),
-                "case {case:?} ({filter:?}): expected no search at all, got {actual:?}"
+            assert_eq!(
+                actual.as_ref().err(),
+                Some(refusal),
+                "case {case:?} ({filter:?}): expected {refusal:?}, got {actual:?}"
             );
         }
     }

@@ -2707,19 +2707,24 @@ impl UserPool {
         Duration::from_secs(u64::try_from(days).unwrap_or(0).saturating_mul(24 * 60 * 60))
     }
 
+    /// Whether this pool's schema declares the attribute `name` — a standard
+    /// attribute every pool carries, or an entry its own schema holds. An
+    /// attribute a pool does not declare cannot hold a value.
+    pub fn declares_attribute(&self, name: &str) -> bool {
+        is_standard_attribute(name)
+            || self
+                .schema
+                .iter()
+                .any(|entry| entry.name.as_deref() == Some(name))
+    }
+
     /// `None` when every name in `names` is an attribute this pool's schema
     /// declares, else the first one that is not: an attribute a pool does not
     /// declare cannot hold a value.
     pub fn unknown_attribute(&self, names: &[String]) -> Option<String> {
         names
             .iter()
-            .find(|name| {
-                !is_standard_attribute(name)
-                    && !self
-                        .schema
-                        .iter()
-                        .any(|entry| entry.name.as_deref() == Some(name.as_str()))
-            })
+            .find(|name| !self.declares_attribute(name))
             .cloned()
     }
 
@@ -4431,11 +4436,13 @@ impl User {
     ///
     /// Each submitted setting REPLACES what this user held for the factor it
     /// configures, and a factor the request names none of is left exactly as it
-    /// was. Turning a factor on — activating it, or making it the preferred one —
-    /// needs the delivery configuration it reaches the user through
-    /// ([`User::holds_mfa_delivery_config`]), so a request that asks for one the
-    /// user cannot receive is refused. The WHOLE request is checked before
-    /// anything is written, so a refused one leaves this user untouched.
+    /// was. Activating a factor needs the delivery configuration it reaches the
+    /// user through ([`User::holds_mfa_delivery_config`]), so a request that asks
+    /// for one the user cannot receive is refused; and a factor the request does
+    /// not activate is not one it can also make PREFERRED, so a setting that asks
+    /// for the preference without the activation is refused for the preference
+    /// itself. The WHOLE request is checked before anything is written, so a
+    /// refused one leaves this user untouched.
     ///
     /// "Only one factor can be set as preferred" (`SetUserMFAPreference` in this
     /// service's model), so the preference a request expresses replaces the one
@@ -4447,9 +4454,18 @@ impl User {
         requested: &[MfaSettingRequest<'_>],
         now: SystemTime,
     ) -> Result<(), MfaPreferenceRejection> {
+        // A factor the request does not ACTIVATE is not one it can also make
+        // preferred, whatever the user holds for it, so that is judged first and
+        // reported as the preference it refuses.
+        if requested
+            .iter()
+            .any(|setting| setting.preferred && !setting.activates())
+        {
+            return Err(MfaPreferenceRejection::PreferredWhileDisabled);
+        }
         if let Some(refused) = requested
             .iter()
-            .find(|setting| setting.turns_on() && !self.holds_mfa_delivery_config(setting.setting))
+            .find(|setting| setting.activates() && !self.holds_mfa_delivery_config(setting.setting))
         {
             return Err(MfaPreferenceRejection::NoDeliveryConfig(
                 refused.setting.to_string(),
@@ -6570,10 +6586,70 @@ pub enum VerifiedFlagAuthority {
 /// away alike, since both change it. Amazon Cognito reports that in one
 /// sentence whose only variable part is the attribute the request named, and
 /// names neither the pool nor the user: the schema, not this user's state, is
-/// what refused it. Every path that enforces that flag carries this one
-/// template, so an update and a delete cannot word it differently.
+/// what refused it.
+///
+/// This is the sentence a DELETION of such an attribute carries. A write that
+/// submits a VALUE for it is validated against the schema value by value, so it
+/// is refused with that report's own line for the finding
+/// ([`schema_validation_report`]) rather than with this sentence.
 pub fn non_mutable_attribute_message(attribute_name: &str) -> String {
     format!("Cannot modify the non-mutable attribute {attribute_name}")
+}
+
+/// What Amazon Cognito's schema validation of a user's submitted attributes reports
+/// about ONE attribute it will not write.
+///
+/// A write that submits name/value pairs is validated against the pool's schema
+/// attribute by attribute, and each finding is reported as its own line: the
+/// attribute, under the `user.` prefix the schema gives a user's own attributes,
+/// then what is wrong with it, then the newline every line of that report ends
+/// with. [`schema_validation_report`] is the report those lines make up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaValidationFinding {
+    /// The pool's schema declares no such attribute, so there is nothing to write.
+    NotInSchema,
+    /// The pool's schema declares the attribute immutable
+    /// (`SchemaAttributeType.Mutable`), so its stored value cannot change.
+    NotUpdatable,
+}
+
+impl SchemaValidationFinding {
+    /// The sentence this finding is reported with.
+    fn sentence(self) -> &'static str {
+        match self {
+            Self::NotInSchema => "Attribute does not exist in the schema.",
+            Self::NotUpdatable => "Attribute cannot be updated.",
+        }
+    }
+}
+
+/// The report Amazon Cognito's schema validation states for `attributes`, each with the
+/// finding it earned: one line per attribute, in the order they are handed over, each
+/// ending in its own newline.
+///
+/// Empty when `attributes` is empty, which is a request that broke nothing.
+pub fn schema_validation_report<'a>(
+    attributes: impl IntoIterator<Item = (&'a str, SchemaValidationFinding)>,
+) -> String {
+    attributes
+        .into_iter()
+        .map(|(name, finding)| format!("user.{name}: {}\n", finding.sentence()))
+        .collect()
+}
+
+/// The message a request refused for naming an attribute whose type the pool's schema
+/// does not declare carries.
+///
+/// An attribute DELETION names attributes without values
+/// (`AttributeNameListType`), so each name's declared type is what says what is being
+/// taken away, and a name the schema declares nothing for has no type to resolve at all.
+/// Amazon Cognito reports that rather than a schema-validation line, since no value was
+/// validated: the attribute is named in braces, as the report names a name it could not
+/// resolve.
+pub fn undetermined_attribute_type_message(attribute_name: &str) -> String {
+    format!(
+        "Invalid user attributes: Type for attribute {{{attribute_name}}} could not be determined"
+    )
 }
 
 /// Decide what `requested` does to `user` of `pool`, or the refusal it earns.
@@ -6631,14 +6707,23 @@ pub fn plan_attribute_update(
     }
     // Every attribute written has to be one the pool's schema declares. Asked
     // of the submitted list as it arrived, so an undeclared attribute is
-    // reported as undeclared whatever else the list carries.
+    // reported as undeclared whatever else the list carries, and EVERY one of
+    // them is reported: the schema validation states a line per attribute it
+    // will not write.
     let names: Vec<String> = requested
         .iter()
         .map(|attribute| attribute.name.clone())
         .collect();
-    if let Some(unknown) = pool.unknown_attribute(&names) {
-        return Err(AttributeUpdateRefusal::Invalid(format!(
-            "Invalid attributes given, {unknown} is not a valid attribute of this user pool"
+    let undeclared: Vec<&str> = names
+        .iter()
+        .filter(|name| !pool.declares_attribute(name))
+        .map(String::as_str)
+        .collect();
+    if !undeclared.is_empty() {
+        return Err(AttributeUpdateRefusal::Invalid(schema_validation_report(
+            undeclared
+                .into_iter()
+                .map(|name| (name, SchemaValidationFinding::NotInSchema)),
         )));
     }
     // A user holds ONE value per attribute, so a list naming the same
@@ -6658,22 +6743,31 @@ pub fn plan_attribute_update(
     let mut updates = Vec::new();
     let mut verifications = Vec::new();
     let mut demotions: Vec<(String, &'static str)> = Vec::new();
+    // `SchemaAttributeType.Mutable` is what says a stored value may change, so an
+    // attribute the schema freezes cannot be updated at all — and EVERY one the
+    // request names is reported, a line each, exactly as the undeclared ones above
+    // are: the schema validation states a line per attribute it will not write.
+    // Judged in request order, over the attributes this request actually writes.
+    let frozen: Vec<&str> = requested
+        .iter()
+        .map(|attribute| attribute.name.as_str())
+        .filter(|name| !settled_by_a_deletion(name, &submitted))
+        .filter(|name| !pool.attribute_mutable(name))
+        .collect();
+    if !frozen.is_empty() {
+        return Err(AttributeUpdateRefusal::Invalid(schema_validation_report(
+            frozen
+                .into_iter()
+                .map(|name| (name, SchemaValidationFinding::NotUpdatable)),
+        )));
+    }
     for (name, value) in &submitted {
         let name = (*name).to_string();
         // A verified flag whose attribute this same request DELETES has
         // nothing left to record, so the deletion settles the flag (below)
         // rather than the value submitted for it.
-        if verified_attribute_of(&name)
-            .is_some_and(|described| submitted.get(described).is_some_and(|value| value.is_empty()))
-        {
+        if settled_by_a_deletion(&name, &submitted) {
             continue;
-        }
-        // `SchemaAttributeType.Mutable` is what says a stored value may change,
-        // so an attribute the schema freezes cannot be updated at all.
-        if !pool.attribute_mutable(&name) {
-            return Err(AttributeUpdateRefusal::Invalid(
-                non_mutable_attribute_message(&name),
-            ));
         }
         let value = (*value).to_string();
         if value.is_empty() {
@@ -6843,9 +6937,7 @@ pub fn plan_attribute_deletion(
         ));
     }
     if let Some(unknown) = pool.unknown_attribute(&names) {
-        return Err(format!(
-            "Invalid attributes given, {unknown} is not a valid attribute of this user pool"
-        ));
+        return Err(undetermined_attribute_type_message(&unknown));
     }
 
     let mut deletions = BTreeSet::new();
@@ -6878,6 +6970,14 @@ fn verified_attribute_of(flag: &str) -> Option<&'static str> {
     ["email", "phone_number"]
         .into_iter()
         .find(|attribute| verified_flag(attribute) == Some(flag))
+}
+
+/// Whether `name` is a verified flag whose attribute the same request DELETES, so
+/// the deletion settles the flag and the value submitted for it writes nothing
+/// ([`plan_attribute_update`]).
+fn settled_by_a_deletion(name: &str, submitted: &BTreeMap<&str, &str>) -> bool {
+    verified_attribute_of(name)
+        .is_some_and(|described| submitted.get(described).is_some_and(|value| value.is_empty()))
 }
 
 /// Whether `flag` says "confirmed" once this request has been applied: the
@@ -6997,32 +7097,41 @@ pub struct MfaSettingRequest<'a> {
 }
 
 impl MfaSettingRequest<'_> {
-    /// Whether this setting asks to TURN THE FACTOR ON — to activate it, or to
-    /// make it the preferred one, which is what needs the delivery configuration
-    /// the factor reaches the user through. A setting that asks for neither turns
-    /// the factor off, which needs nothing.
-    pub fn turns_on(&self) -> bool {
-        self.enabled || self.preferred
+    /// Whether this setting asks to ACTIVATE the factor, which is what needs the
+    /// delivery configuration the factor reaches the user through. A setting that
+    /// does not turns the factor off, which needs nothing.
+    pub fn activates(&self) -> bool {
+        self.enabled
     }
 }
 
 /// Why a submitted MFA preference is refused ([`User::set_mfa_preference`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MfaPreferenceRejection {
-    /// The `UserMFASettingList` setting the request asks to turn on while the
+    /// The `UserMFASettingList` setting the request asks to ACTIVATE while the
     /// user holds no delivery configuration for it.
     NoDeliveryConfig(String),
+    /// The request asks for a factor to be the user's PREFERRED one while not
+    /// activating it: a factor that is off is not one a user prefers.
+    PreferredWhileDisabled,
 }
 
 impl MfaPreferenceRejection {
-    /// What the refusal reports: the factor the request asked to turn on, and
-    /// that the user has no configuration to receive it with. Only the submitted
-    /// setting is named, so nothing stored is disclosed.
+    /// What the refusal reports.
+    ///
+    /// An activation the user cannot receive reports the factor it asked for and
+    /// that the user holds no configuration to receive it with. A preference over a
+    /// factor the request leaves off reports that alone and names NO factor: "only
+    /// one factor can be set as preferred" (`SetUserMFAPreference` in this
+    /// service's model) and a factor that is off is not one a user prefers, so the
+    /// refusal is about the preference rather than about any one factor. Nothing
+    /// stored is disclosed either way.
     pub fn message(&self) -> String {
         match self {
             Self::NoDeliveryConfig(setting) => {
                 format!("User does not have delivery config set to turn on {setting}")
             }
+            Self::PreferredWhileDisabled => "Can't mark a disabled mfa as preferred".to_string(),
         }
     }
 }
@@ -8415,6 +8524,24 @@ pub struct Page {
     pub keys: Vec<String>,
     pub next_token: Option<String>,
 }
+
+/// The message an `InvalidParameterException` carries for a pagination token that
+/// names no page of the listing it was presented to.
+///
+/// Amazon Cognito reports a token it cannot resume a listing from in FIXED text
+/// that names neither the token nor the resource the listing was over: a token is
+/// a value the caller holds already and the pool it belonged to is not something
+/// the refusal discloses. It does not word that sentence identically in every list
+/// API — the group listing answers
+/// [`PAGINATION_TOKEN_INVALID_RETRY_MESSAGE`] — so an operation names the sentence
+/// ITS OWN API answers, and this is the one the rest of them answer.
+pub const PAGINATION_TOKEN_INVALID_MESSAGE: &str = "Invalid pagination token given.";
+
+/// The same refusal as the group listing (`ListGroups`) words it: the sentence that
+/// also tells the caller what to do about it. See
+/// [`PAGINATION_TOKEN_INVALID_MESSAGE`].
+pub const PAGINATION_TOKEN_INVALID_RETRY_MESSAGE: &str =
+    "Provided pagination token is invalid. Check the token and try your request again.";
 
 /// How many items a listing serves for `limit`.
 ///

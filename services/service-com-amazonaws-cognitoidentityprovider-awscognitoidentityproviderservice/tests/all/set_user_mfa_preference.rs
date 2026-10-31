@@ -9,11 +9,13 @@
 //! replacing what that user held for the factor it configures and leaving every
 //! factor the request does not name alone, with at most one factor preferred —
 //! and refuses with HTTP 400 `InvalidParameterException`, changing nothing, any
-//! request that asks to activate or to prefer a factor the user holds no
-//! delivery configuration for: a verified phone number for SMS message MFA, a
-//! verified email address for email message MFA, a registered TOTP
-//! authenticator for software token MFA. Turning a factor OFF needs no such
-//! configuration.
+//! request that asks to ACTIVATE a factor the user holds no delivery
+//! configuration for: a verified phone number for SMS message MFA, a verified
+//! email address for email message MFA, a registered TOTP authenticator for
+//! software token MFA. A factor the request does not activate is not one it can
+//! also make PREFERRED, so a setting that asks for the preference without the
+//! activation is refused for the preference itself. Turning a factor OFF needs no
+//! such configuration.
 //!
 //! What is stored is read back through `GetUserAuthFactors` and `GetUser`, so
 //! each row asserts the preference a later caller sees rather than the answer of
@@ -381,9 +383,13 @@ enum Expect {
         settings: &'static [&'static str],
         preferred: Option<&'static str>,
     },
-    /// The call is refused for this `UserMFASettingList` setting, and the user
-    /// holds nothing.
+    /// The call is refused for ACTIVATING this `UserMFASettingList` setting while
+    /// the user holds no delivery configuration for it, and the user holds
+    /// nothing.
     Refused { setting: &'static str },
+    /// The call is refused for asking that a factor be PREFERRED while the
+    /// request does not activate it, and the user holds nothing.
+    RefusedPreference,
 }
 
 /// One row of the preference table.
@@ -523,7 +529,8 @@ const CASES: &[Case] = &[
         expected: Expect::Refused { setting: SMS_MFA },
     },
     Case {
-        case: "activating SMS MFA for a user whose phone number is not verified is refused",
+        case: "activating and preferring SMS MFA for a user whose phone number is not verified \
+               is refused for the delivery configuration",
         attributes: UNVERIFIED_PHONE,
         software_token_registered: false,
         sms: Some((true, true)),
@@ -538,13 +545,26 @@ const CASES: &[Case] = &[
         software_token_registered: false,
         sms: None,
         software_token: None,
+        email: Some((true, false)),
+        expected: Expect::Refused {
+            setting: EMAIL_OTP_MFA,
+        },
+    },
+    Case {
+        case: "activating and preferring email message MFA for a user whose email address is \
+               not verified is refused for the delivery configuration too",
+        attributes: UNVERIFIED_EMAIL,
+        software_token_registered: false,
+        sms: None,
+        software_token: None,
         email: Some((true, true)),
         expected: Expect::Refused {
             setting: EMAIL_OTP_MFA,
         },
     },
     Case {
-        case: "preferring software token MFA before a TOTP authenticator is registered is refused",
+        case: "activating and preferring software token MFA before a TOTP authenticator is \
+               registered is refused for the delivery configuration",
         attributes: VERIFIED_EMAIL,
         software_token_registered: false,
         sms: None,
@@ -555,15 +575,44 @@ const CASES: &[Case] = &[
         },
     },
     Case {
+        case: "activating software token MFA before a TOTP authenticator is registered, without \
+               preferring it, is refused for the delivery configuration",
+        attributes: VERIFIED_EMAIL,
+        software_token_registered: false,
+        sms: None,
+        software_token: Some((true, false)),
+        email: None,
+        expected: Expect::Refused {
+            setting: SOFTWARE_TOKEN_MFA,
+        },
+    },
+    Case {
+        case: "preferring SMS MFA the request does not activate is refused for the preference",
+        attributes: VERIFIED_PHONE,
+        software_token_registered: false,
+        sms: Some((false, true)),
+        software_token: None,
+        email: None,
+        expected: Expect::RefusedPreference,
+    },
+    Case {
+        case: "preferring email message MFA the request does not activate is refused for the \
+               preference, even for a user that could receive it",
+        attributes: VERIFIED_EMAIL,
+        software_token_registered: false,
+        sms: None,
+        software_token: None,
+        email: Some((false, true)),
+        expected: Expect::RefusedPreference,
+    },
+    Case {
         case: "preferring a factor the request does not even activate is refused just the same",
         attributes: &[],
         software_token_registered: false,
         sms: None,
         software_token: Some((false, true)),
         email: None,
-        expected: Expect::Refused {
-            setting: SOFTWARE_TOKEN_MFA,
-        },
+        expected: Expect::RefusedPreference,
     },
     Case {
         case: "one unreceivable factor refuses the whole request, storing not even the \
@@ -634,6 +683,29 @@ async fn set_user_mfa_preference_stores_the_factors_the_user_can_receive() {
                 );
                 // A refused request changes nothing, so the user still holds the
                 // preference it was created with: none.
+                Preference {
+                    settings: Vec::new(),
+                    preferred: None,
+                }
+            }
+            Expect::RefusedPreference => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: the refusal is a 400, got {status} with {payload}"
+                );
+                let code = error_code(&payload);
+                assert!(
+                    code.ends_with("InvalidParameterException"),
+                    "case {case:?}: expected InvalidParameterException, got {code:?} with {payload}"
+                );
+                let message = error_message(&payload);
+                // The sentence names no factor: a factor the request leaves off is
+                // not one a user prefers, whichever factor the request named.
+                let wanted = "Can't mark a disabled mfa as preferred";
+                assert_eq!(
+                    message, wanted,
+                    "case {case:?}: expected the refusal to report {wanted:?}, got {message:?}"
+                );
                 Preference {
                     settings: Vec::new(),
                     preferred: None,

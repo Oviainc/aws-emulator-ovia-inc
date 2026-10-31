@@ -111,6 +111,8 @@ mod group_role_claims;
 mod identity_provider_lifecycle;
 #[path = "all/initiate_auth.rs"]
 mod initiate_auth;
+#[path = "all/input_validation_refusal_wording.rs"]
+mod input_validation_refusal_wording;
 #[path = "all/list_devices.rs"]
 mod list_devices;
 #[path = "all/list_groups.rs"]

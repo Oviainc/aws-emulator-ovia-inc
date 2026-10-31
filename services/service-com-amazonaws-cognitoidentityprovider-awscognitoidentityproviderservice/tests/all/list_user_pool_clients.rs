@@ -618,8 +618,7 @@ async fn an_absent_pool_and_an_unissued_token_are_refused() {
             (
                 400,
                 "InvalidParameterException",
-                "NextToken is not a pagination token this operation issued for this user pool"
-                    .to_string(),
+                "Invalid pagination token given.".to_string(),
             ),
         ),
         (
@@ -628,8 +627,7 @@ async fn an_absent_pool_and_an_unissued_token_are_refused() {
             (
                 400,
                 "InvalidParameterException",
-                "NextToken is not a pagination token this operation issued for this user pool"
-                    .to_string(),
+                "Invalid pagination token given.".to_string(),
             ),
         ),
         (
@@ -638,8 +636,7 @@ async fn an_absent_pool_and_an_unissued_token_are_refused() {
             (
                 400,
                 "InvalidParameterException",
-                "NextToken is not a pagination token this operation issued for this user pool"
-                    .to_string(),
+                "Invalid pagination token given.".to_string(),
             ),
         ),
     ] {

@@ -133,11 +133,18 @@ async fn user(
     created["User"].clone()
 }
 
-/// The one sentence Amazon Cognito says for input it will not accept for a
-/// member of this operation — a `Filter` that is no search, or an
-/// `AttributesToGet` the results cannot serve: it states that the submitted
-/// input missed the constraints, naming neither the member nor the value.
+/// The one sentence Amazon Cognito says for an `AttributesToGet` the results
+/// cannot serve, and for a `Filter` whose comparison names an attribute no
+/// server-side search covers: it states that the submitted input missed the
+/// constraints, naming neither the member nor the value.
 const CONSTRAINT_MESSAGE: &str = "Input fails to satisfy the constraints.";
+
+/// The one sentence Amazon Cognito says for text the filter language cannot be
+/// read out of at all: the `Filter` is an expression language of its own
+/// (`ListUsers.Filter`), so such text is text the server could not parse, which
+/// is what the refusal reports — naming neither the filter nor the member it
+/// arrived in.
+const FILTER_MESSAGE: &str = "Error while parsing filter.";
 
 /// The one sentence `AdminCreateUser` says for a username the pool already
 /// holds, which names no username.
@@ -1016,14 +1023,14 @@ async fn an_absent_pool_a_filter_that_is_no_search_and_an_unissued_token_are_ref
 }
 
 #[tokio::test]
-async fn every_filter_that_is_no_search_is_refused_with_one_sentence() {
+async fn every_filter_that_is_no_search_is_refused_with_the_sentence_for_its_class() {
     let router = router();
     let (user_pool_id, _) = fixture(&router, "filter-message-pool").await;
 
-    // The rows differ along WHY the filter is no search: an attribute no
-    // server-side search covers (custom or standard), a comparison this
-    // operation does not accept, a value that is not one quoted string, and a
-    // string carrying more than one comparison. All of them are the same refusal.
+    // Text the filter language cannot be read out of at all: a missing
+    // comparison, a comparison this operation does not accept, a value that is
+    // not one quoted string, and a string carrying more than one comparison. All
+    // of them are the parse failure.
     for (label, filter) in [
         ("a bare attribute name", "username"),
         ("a comparison this operation does not accept", "email ~= \"a\""),
@@ -1036,6 +1043,20 @@ async fn every_filter_that_is_no_search_is_refused_with_one_sentence() {
             "two comparisons in one filter",
             "email = \"bob@example.com\" and given_name = \"Bob\"",
         ),
+    ] {
+        let (status, payload) = call(&router, "ListUsers", &search(&user_pool_id, Some(filter))).await;
+        assert_eq!(
+            (status, error_code(&payload), error_message(&payload)),
+            (400, "InvalidParameterException", FILTER_MESSAGE),
+            "case {label:?} (filter {filter:?}): got {status} with {payload}"
+        );
+    }
+
+    // One comparison the language DOES read, over an attribute no server-side
+    // search covers (custom, standard-but-outside-the-catalog, and a searchable
+    // name in another case): the filter parsed, so what is wrong is the value of
+    // the member, which is the constraint sentence.
+    for (label, filter) in [
         (
             "a custom attribute, which is not searchable",
             "custom:department = \"finance\"",

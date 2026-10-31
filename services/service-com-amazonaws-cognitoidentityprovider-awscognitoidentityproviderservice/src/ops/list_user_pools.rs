@@ -200,10 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// This operation's `InvalidParameterException` for a `NextToken` that names no
-/// page of this listing.
+/// page of this listing ([`crate::state::PAGINATION_TOKEN_INVALID_MESSAGE`]).
 fn invalid_next_token() -> ListUserPoolsError {
     ListUserPoolsErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some("NextToken is not a pagination token this operation issued".to_string()),
+        message: Some(crate::state::PAGINATION_TOKEN_INVALID_MESSAGE.to_string()),
         // `reasonCode` is AWS's own classification of the bad parameter and
         // this service's model documents no value for it, so nothing is
         // invented here.
