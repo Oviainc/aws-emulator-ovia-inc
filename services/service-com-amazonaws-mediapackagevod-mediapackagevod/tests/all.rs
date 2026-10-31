@@ -27,6 +27,8 @@ mod egress_access_log_group_names;
 mod empty_response_framing;
 #[path = "all/error_responses.rs"]
 mod error_responses;
+#[path = "all/ingest_source_status.rs"]
+mod ingest_source_status;
 #[path = "all/manifest_list_required.rs"]
 mod manifest_list_required;
 #[path = "all/modelled_constraint_refusals.rs"]

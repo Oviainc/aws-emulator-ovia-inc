@@ -7,7 +7,9 @@
 //! `PackagingGroupId` that resolves to nothing — both as request-parameter violations,
 //! `UnprocessableEntityException` (422) attributing each to its member — judges the
 //! `Tags` map against AWS's resource-tagging restrictions
-//! ([`crate::state::check_tags`]) with the same 422, persists the
+//! ([`crate::state::check_tags`]) with the same 422, establishes whether the source
+//! those two members name is one the packaging job could READ
+//! ([`crate::state::ingest_source`]), persists the
 //! asset, and answers with the record just stored plus the `EgressEndpoints` DERIVED
 //! from the packaging configurations attached to that group.
 //!
@@ -171,7 +173,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
-        let mut state = store.lock();
 
         if input.id.is_empty() {
             return Err(crate::scaffolded::UnprocessableEntity::member(
@@ -202,6 +203,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::IAM_ROLE_ARN,
             ),
         ])?;
+        // WHAT THOSE TWO VALUES NAME, which is what the packaging job this submit starts
+        // can actually read: the object, of the emulator's own Amazon S3, as the role, of
+        // the account's IAM records. It decides the TERMINAL status of every egress
+        // endpoint this asset derives, so it is established HERE — the packaging job
+        // reads the source at the instant it runs — and kept on the record, which leaves
+        // every later read of the asset a pure read.
+        //
+        // Asked before the store is locked, because both reads are in-process calls into
+        // other services and this service's guard is not held across them. A request the
+        // checks below then refuse has read nothing but its own request and written
+        // nothing anywhere.
+        let source_readability = crate::state::ingest_source::source_readability(
+            ctx,
+            &region,
+            &input.source_arn,
+            &input.source_role_arn,
+        )
+        .await;
+
+        let mut state = store.lock();
         // An id in the request BODY that resolves to nothing is a violation of that
         // PARAMETER, not a missing addressed resource: the request addresses
         // `/assets`, which exists. So it is the 422 that names the member, not a 404.
@@ -252,6 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_id: input.resource_id,
             source_arn: input.source_arn,
             source_role_arn: input.source_role_arn,
+            source_readability,
             created_instant: std::time::Instant::now(),
         };
         state.set_tags(&arn, input.tags.as_ref());

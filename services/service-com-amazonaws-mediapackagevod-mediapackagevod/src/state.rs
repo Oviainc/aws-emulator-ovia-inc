@@ -21,7 +21,11 @@
 //! `ApproximateAssetCount` and `EgressEndpoints` are never stored: they are
 //! derived from these maps on every read ([`Self::asset_count`],
 //! [`Self::egress_endpoints`]), so adding a packaging configuration or an asset
-//! shows up in the next describe without rewriting any stored record.
+//! shows up in the next describe without rewriting any stored record. What an
+//! endpoint's `Status` reports is the state of the packaging job that (asset,
+//! configuration) pair started: the clock says whether that job is waiting, running or
+//! done, and the asset's own [`AssetRecord::source_readability`] says how a job that is
+//! done came out.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -34,6 +38,13 @@ use crate::ops::types::{
     HlsManifest, HlsPackage, MssPackage,
 };
 
+// Whether the SOURCE an asset was ingested with is one this service could read — the fact
+// the TERMINAL packaging status of its egress endpoints turns on — lives in
+// `state/ingest_source.rs`.
+pub mod ingest_source;
+
+pub use ingest_source::SourceReadability;
+
 /// The region an unsigned request is served in. A signed request names its own
 /// region in the SigV4 credential scope; see [`request_region`].
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -42,25 +53,44 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// (`arnNamespace: mediapackage-vod`).
 pub const ARN_NAMESPACE: &str = "mediapackage-vod";
 
-/// How long after both the asset and the packaging configuration exist the
-/// packaging job the service owes is due, so the endpoint reports
-/// [`EGRESS_STATUS_PLAYABLE`] instead of [`EGRESS_STATUS_QUEUED`].
+/// How long after both the asset and the packaging configuration exist the packaging
+/// job the service owes has RUN, so the endpoint reports its terminal status —
+/// [`EGRESS_STATUS_PLAYABLE`] for an asset whose source the ingest read, and
+/// [`EGRESS_STATUS_FAILED`] for one it could not ([`SourceReadability`]).
 ///
 /// AWS documents no duration for VOD ingest, so this span is CHOSEN: it is long
 /// enough that a caller acting straight after `CreateAsset` still observes the
-/// non-terminal status, and short enough not to slow a test down.
+/// non-terminal statuses, and short enough not to slow a test down.
 pub const INGEST_PLAYABLE_AFTER: Duration = Duration::from_millis(500);
 
-/// The non-terminal egress-endpoint status: the packaging job is not due yet.
+/// How long after that same instant the packaging job has been PICKED UP, so the
+/// endpoint reports [`EGRESS_STATUS_PROCESSING`] rather than [`EGRESS_STATUS_QUEUED`]:
+/// the job is no longer waiting to run and has not finished running.
+///
+/// Chosen, like [`INGEST_PLAYABLE_AFTER`], and strictly inside it: a job is queued, then
+/// processing, then done, so the two spans divide one ingest into its three states.
+pub const INGEST_PROCESSING_AFTER: Duration = Duration::from_millis(250);
+
+/// The egress-endpoint status of a packaging job that has not been picked up yet.
 ///
 /// From `EgressEndpoint$Status`: "The current processing status of the asset used
 /// for the packaging configuration. The status can be either QUEUED, PROCESSING,
 /// PLAYABLE, or FAILED."
 pub const EGRESS_STATUS_QUEUED: &str = "QUEUED";
 
+/// The egress-endpoint status of a packaging job that is RUNNING: picked up, not
+/// finished. Same `EgressEndpoint$Status` value list as [`EGRESS_STATUS_QUEUED`].
+pub const EGRESS_STATUS_PROCESSING: &str = "PROCESSING";
+
 /// The terminal egress-endpoint status for a successfully packaged asset. Same
 /// `EgressEndpoint$Status` value list as [`EGRESS_STATUS_QUEUED`].
 pub const EGRESS_STATUS_PLAYABLE: &str = "PLAYABLE";
+
+/// The terminal egress-endpoint status of a packaging job that could not be carried
+/// out: the asset's source was not readable ([`SourceReadability::Unreadable`]), so
+/// nothing was packaged for this configuration and nothing ever will be. Same
+/// `EgressEndpoint$Status` value list as [`EGRESS_STATUS_QUEUED`].
+pub const EGRESS_STATUS_FAILED: &str = "FAILED";
 
 /// The manifest file name a packaging configuration uses when its manifest block
 /// names none. `HlsManifest$ManifestName` (and the Dash/Mss equivalents) is "An
@@ -322,6 +352,15 @@ pub struct AssetRecord {
     pub source_arn: String,
     /// The IAM role ARN used to read the source object.
     pub source_role_arn: String,
+    /// What the ingest ESTABLISHED about this asset's source when it was submitted:
+    /// whether the object `source_arn` names was one this service could read as the
+    /// role `source_role_arn` names ([`ingest_source::source_readability`]).
+    ///
+    /// Asked once, by the submit, and kept here — the packaging job reads the source at
+    /// the instant it runs, so every later read of this asset reports the outcome of
+    /// THAT read rather than asking again. It is what decides the TERMINAL status of
+    /// each of this asset's egress endpoints.
+    pub source_readability: SourceReadability,
     /// Monotonic instant ingest started, for the packaging job the clock owes.
     pub created_instant: Instant,
 }
@@ -594,7 +633,9 @@ impl ComAmazonawsMediapackagevodMediapackagevodState {
     /// the next read, which is how the real service behaves. Only the group and the
     /// configurations of the asset's OWN Region take part, since those are the only
     /// ones that exist where the asset does. `now` is the reading instant, so the
-    /// packaging status the clock owes is materialised without writing anything.
+    /// packaging status the clock owes is materialised without writing anything — the
+    /// TERMINAL one of which is read off the asset's own record
+    /// ([`AssetRecord::source_readability`]) rather than from the clock.
     pub fn egress_endpoints(&self, asset: &AssetRecord, now: Instant) -> Vec<EgressEndpoint> {
         let Some(group) = self.packaging_group(&asset.region, &asset.packaging_group_id) else {
             return Vec::new();
@@ -612,18 +653,30 @@ impl ComAmazonawsMediapackagevodMediapackagevodState {
 
 /// The processing status of one asset packaged by one configuration.
 ///
-/// Packaging cannot start before BOTH the asset and the configuration exist, so the
-/// job is due [`INGEST_PLAYABLE_AFTER`] past the later of the two.
+/// Packaging cannot start before BOTH the asset and the configuration exist, so the job
+/// is queued from the later of the two, picked up [`INGEST_PROCESSING_AFTER`] past it and
+/// finished [`INGEST_PLAYABLE_AFTER`] past it.
+///
+/// The TERMINAL status is the outcome of the job rather than another instant of the
+/// clock: a job whose source the ingest could not read packaged nothing and never will,
+/// so it ends [`EGRESS_STATUS_FAILED`]; only one that read its source ends
+/// [`EGRESS_STATUS_PLAYABLE`]. See [`AssetRecord::source_readability`].
 fn egress_status(
     asset: &AssetRecord,
     cfg: &PackagingConfigurationRecord,
     now: Instant,
 ) -> &'static str {
     let started = asset.created_instant.max(cfg.created_instant);
-    if now.saturating_duration_since(started) >= INGEST_PLAYABLE_AFTER {
-        EGRESS_STATUS_PLAYABLE
-    } else {
+    let elapsed = now.saturating_duration_since(started);
+    if elapsed < INGEST_PROCESSING_AFTER {
         EGRESS_STATUS_QUEUED
+    } else if elapsed < INGEST_PLAYABLE_AFTER {
+        EGRESS_STATUS_PROCESSING
+    } else {
+        match asset.source_readability {
+            SourceReadability::Readable => EGRESS_STATUS_PLAYABLE,
+            SourceReadability::Unreadable => EGRESS_STATUS_FAILED,
+        }
     }
 }
 

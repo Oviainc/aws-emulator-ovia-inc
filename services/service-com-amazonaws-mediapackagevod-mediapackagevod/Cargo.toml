@@ -30,6 +30,13 @@ hex = { workspace = true }
 # their ARN-documented members (`SourceArn`, `SourceRoleArn`, the CDN authorization
 # block, a SPEKE role) through rather than splitting a value again here.
 service-common = { path = "../common" }
+# The Amazon S3 client this service reads an asset's `SourceArn` object through, over the
+# in-process callback into this same emulator (no network client feature: the transport is
+# the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "behavior-version-latest",
+] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -40,6 +47,12 @@ hex = { workspace = true }
 # `time` on top of the workspace features, so a test can await a sleep rather than
 # blocking the runtime thread.
 tokio = { workspace = true, features = ["time"] }
+# The Amazon S3 service, mounted beside this one on a single engine so an asset's source
+# object can be staged with `PutObject` and read by the ingest that names it.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The IAM service, on that same engine, so an asset's `SourceRoleArn` resolves against
+# roles a real `CreateRole` created.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

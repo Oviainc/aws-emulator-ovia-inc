@@ -2,8 +2,11 @@
 
 //! @op DescribeAsset
 //! IMPLEMENTED: the read-back for `CreateAsset`. Returns the stored Asset, with
-//! `EgressEndpoints` DERIVED from the packaging configurations attached to its group,
-//! and `NotFoundException` (404) for an `Id` no asset is stored under.
+//! `EgressEndpoints` DERIVED from the packaging configurations attached to its group —
+//! each one's `Status` the state of that configuration's packaging job, whose terminal
+//! value is the outcome the ingest established for the asset's source
+//! ([`crate::state::ingest_source`]) — and `NotFoundException` (404) for an `Id` no asset
+//! is stored under.
 //!
 //! Reporting only: it writes nothing.
 //!

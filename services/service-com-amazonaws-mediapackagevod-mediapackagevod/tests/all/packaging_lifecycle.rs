@@ -726,6 +726,10 @@ fn filler_asset(id: &str, group_id: &str) -> vod::AssetRecord {
         resource_id: Some(id.to_string()),
         source_arn: format!("arn:aws:s3:::test-bucket/{id}.smil"),
         source_role_arn: format!("arn:aws:iam::{}:role/MediaPackageVod", account_id()),
+        // Pre-filled records stand in for assets whose ingest read their source; what
+        // decides this for a record a CreateAsset wrote is asserted in
+        // `tests/all/ingest_source_status.rs`.
+        source_readability: vod::SourceReadability::Readable,
         created_instant: std::time::Instant::now(),
     }
 }
