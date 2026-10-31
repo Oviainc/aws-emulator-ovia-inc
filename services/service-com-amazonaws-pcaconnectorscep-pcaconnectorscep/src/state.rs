@@ -1058,9 +1058,12 @@ pub fn is_region_shaped(value: &str) -> bool {
 /// THIS call, which `std` seeds from the operating system — it is what makes `HashMap`
 /// resistant to collision attacks — so a caller holding one challenge password cannot derive
 /// the next one. The counter and the clock also go in, so two ids minted in the same
-/// nanosecond, in the same or different threads, still differ. The version and variant
-/// nibbles are set as RFC 9562 §5.4 specifies for a random-bytes UUID, so the result is a
-/// well-formed UUID and not merely 32 hex characters.
+/// nanosecond, in the same or different threads, still differ.
+///
+/// Those digest bytes are then handed to the `uuid` crate, which owns both of the remaining
+/// rules: it writes the version and variant nibbles a random-bytes UUID carries, and renders
+/// the canonical hyphenated lowercase form. So the result is a well-formed UUID and not
+/// merely 32 hex characters, and neither rule is restated here to drift from the library's.
 pub fn new_uuid() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1082,17 +1085,10 @@ pub fn new_uuid() -> String {
 
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex = ::hex::encode(bytes);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
+    ::uuid::Builder::from_random_bytes(bytes)
+        .into_uuid()
+        .hyphenated()
+        .to_string()
 }
 
 /// The per-process root seed [`new_uuid`] mixes into every identifier.

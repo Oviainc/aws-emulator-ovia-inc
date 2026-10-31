@@ -24,7 +24,12 @@ tracing = { workspace = true }
 # Mixes the per-identifier counter and the clock into the UUID-format connector/challenge
 # ids and the challenge passwords the ARN patterns and the `Password` member's doc require.
 sha2 = { workspace = true }
-# Hex: the identifier bytes above, and the opaque `NextToken` both listings page with.
+# Lays those digest bytes out as a UUID: the version and variant nibbles, and the canonical
+# hyphenated rendering (see `state::new_uuid`). No feature is named because
+# `Builder::from_random_bytes` needs none — the bytes come from the digest above, not from
+# `uuid`'s own generators, so the `v4` feature other crates here enable is deliberately off.
+uuid = "1"
+# Hex: the opaque `NextToken` both listings page with.
 hex = { workspace = true }
 
 [build-dependencies]

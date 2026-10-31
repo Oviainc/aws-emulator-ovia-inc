@@ -39,6 +39,8 @@ mod connector_vpc_endpoint;
 mod harness;
 #[path = "all/harness_contract.rs"]
 mod harness_contract;
+#[path = "all/minted_identifier_form.rs"]
+mod minted_identifier_form;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/region_segment_rule.rs"]
