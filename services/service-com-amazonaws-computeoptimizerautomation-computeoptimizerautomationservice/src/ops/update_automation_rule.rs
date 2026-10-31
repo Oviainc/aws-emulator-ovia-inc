@@ -222,23 +222,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `priority` is a plain `String` in the model but documents a decimal
-        // between 0 and 1, so its form is checked here.
-        if let Some(priority) = input.priority.as_deref() {
-            if !crate::state::priority_is_valid(priority) {
-                return Err(invalid_parameter(crate::state::constraint_report(
-                    "priority",
-                    "Member must be a decimal number between 0 and 1 with up to 30 digits after \
-                     the decimal point",
-                )));
-            }
+        // between 0 and 1, so its form is judged where the create judges it
+        // (`crate::state::priority_violation`).
+        if let Some(report) = input
+            .priority
+            .as_deref()
+            .and_then(crate::state::priority_violation)
+        {
+            return Err(invalid_parameter(report));
         }
-        // "Must be 1-128 characters long": the `@length` on `RuleName` has
-        // `min: 0`, so the boundary admits an empty name.
-        if input.name.as_deref().is_some_and(str::is_empty) {
-            return Err(invalid_parameter(crate::state::constraint_report(
-                "name",
-                "Member must have length greater than or equal to 1",
-            )));
+        // "Must be 1-128 characters long", of which the floor is the service's
+        // own and is judged where the create judges it
+        // (`crate::state::rule_name_violation`).
+        if let Some(report) = input
+            .name
+            .as_deref()
+            .and_then(crate::state::rule_name_violation)
+        {
+            return Err(invalid_parameter(report));
         }
         // A member an update REPLACES must satisfy the rules a create holds it
         // to, or the update would turn a valid rule into one this service could

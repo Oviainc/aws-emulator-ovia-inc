@@ -2929,6 +2929,11 @@ pub fn recommended_action_types_violation(action_types: &[String]) -> Option<Str
     empty_value_list_violation("recommendedActionTypes", action_types.len())
 }
 
+/// The requirement a member carrying nothing fails — an empty value list, or a
+/// name of no characters. Written once, so the floor is worded the same whichever
+/// member of this service is judged against it.
+const MIN_LENGTH_REQUIREMENT: &str = "Member must have length greater than or equal to 1";
+
 /// Why a value list a request supplies to act THROUGH cannot be acted on, if it
 /// cannot: it carries no value, so it selects nothing.
 ///
@@ -2948,8 +2953,25 @@ pub fn recommended_action_types_violation(action_types: &[String]) -> Option<Str
 /// not judged here when it is absent: omitting it leaves the stored value
 /// alone, and sending it empty is judged exactly as sending it is.
 pub fn empty_value_list_violation(member: &str, count: usize) -> Option<String> {
-    (count == 0)
-        .then(|| constraint_report(member, "Member must have length greater than or equal to 1"))
+    (count == 0).then(|| constraint_report(member, MIN_LENGTH_REQUIREMENT))
+}
+
+/// Why this `name` cannot name a rule, if it cannot, as the service's own
+/// validation report ([`constraint_report`], which echoes no request value).
+///
+/// A rule's name "Must be 1-128 characters long"
+/// (`smithy_query(query="doc",shape="UpdateAutomationRuleRequest",member="name")`),
+/// of which only the ceiling reaches the protocol boundary: the `@length` on
+/// `RuleName` has `min: 0` (`smithy_query(query="shape",shape="RuleName")`), so
+/// the boundary admits the empty name and the floor is this service's own, worded
+/// as every member of this service that carries nothing is refused with.
+///
+/// Both operations that write a rule's name — the create that requires it and
+/// the update that REPLACES it — judge it here, so the two cannot drift apart
+/// over which names they refuse or over how they word the refusal.
+pub fn rule_name_violation(name: &str) -> Option<String> {
+    name.is_empty()
+        .then(|| constraint_report("name", MIN_LENGTH_REQUIREMENT))
 }
 
 /// Why this rule's `ruleType` and `organizationConfiguration` do not go
@@ -3913,8 +3935,9 @@ pub fn recommended_action_matches_filters(
 /// 30 digits after the decimal point)"
 /// (`smithy_query(query="doc",shape="CreateAutomationRuleRequest",member="priority")`).
 /// The model types the member as a plain `String`, so this rule is the service's
-/// own and is checked here rather than at the protocol boundary.
-pub fn priority_is_valid(priority: &str) -> bool {
+/// own and is checked here rather than at the protocol boundary. The report for a
+/// value outside the form is [`priority_violation`].
+fn priority_is_valid(priority: &str) -> bool {
     let (integral, fractional) = match priority.split_once('.') {
         Some((integral, fractional)) => (integral, Some(fractional)),
         None => (priority, None),
@@ -3936,6 +3959,24 @@ pub fn priority_is_valid(priority: &str) -> bool {
         Ok(1) => fractional.is_none_or(|f| f.bytes().all(|b| b == b'0')),
         _ => false,
     }
+}
+
+/// Why this `priority` cannot order a rule, if it cannot, as the service's own
+/// validation report ([`constraint_report`], which echoes no request value).
+///
+/// The form is the documented one ([`priority_is_valid`]). Both operations that
+/// write a rule's precedence — the create and the update that replaces it —
+/// judge it here, so the two cannot drift apart over which values they refuse,
+/// over the bound and the fractional width they refuse them at, or over how they
+/// word the refusal.
+pub fn priority_violation(priority: &str) -> Option<String> {
+    (!priority_is_valid(priority)).then(|| {
+        constraint_report(
+            "priority",
+            "Member must be a decimal number between 0 and 1 with up to 30 digits after the \
+             decimal point",
+        )
+    })
 }
 
 /// Where a page of a paginated list operation resumed from: how far into the

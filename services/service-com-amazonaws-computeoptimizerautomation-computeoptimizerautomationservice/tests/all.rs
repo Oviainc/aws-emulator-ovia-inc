@@ -107,6 +107,8 @@ mod resource_tagging;
 mod resource_tags;
 #[path = "all/rule_change_stamps.rs"]
 mod rule_change_stamps;
+#[path = "all/rule_name_and_priority_rules.rs"]
+mod rule_name_and_priority_rules;
 #[path = "all/rule_projection.rs"]
 mod rule_projection;
 #[path = "all/rule_value_validation.rs"]

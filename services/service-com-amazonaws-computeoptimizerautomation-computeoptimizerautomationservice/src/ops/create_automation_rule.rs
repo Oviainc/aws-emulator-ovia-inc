@@ -424,13 +424,15 @@ fn access_denied() -> CreateAutomationRuleError {
 ///
 /// Each clause is a documented rule the Smithy constraints cannot carry:
 ///
-/// * `name` — "Must be 1-128 characters long" (the `@length` on `RuleName` has
-///   `min: 0`, so the boundary admits an empty name).
+/// * `name` — "Must be 1-128 characters long", of which the floor is the
+///   service's own ([`crate::state::rule_name_violation`]), which the update
+///   holds a replacement name to as well.
 /// * `organizationConfiguration` — the member and the `OrganizationRule` rule
 ///   type stand and fall together, in both directions
 ///   ([`crate::state::organization_configuration_violation`]).
 /// * `priority` — "a decimal number between 0 and 1 (having up to 30 digits
-///   after the decimal point)"; the member is a plain `String`.
+///   after the decimal point)" ([`crate::state::priority_violation`]), which the
+///   update holds a replacement precedence to as well.
 /// * `recommendedActionTypes` — the action types the rule executes, so an empty
 ///   list automates nothing ([`crate::state::recommended_action_types_violation`]).
 /// * `schedule` — "The expression that defines when the schedule runs", with
@@ -450,11 +452,8 @@ fn access_denied() -> CreateAutomationRuleError {
 /// Every clause runs BEFORE the store is touched, so a refused create leaves
 /// the store exactly as it was.
 fn invalid_parameter(input: &CreateAutomationRuleInput) -> Option<String> {
-    if input.name.is_empty() {
-        return Some(crate::state::constraint_report(
-            "name",
-            "Member must have length greater than or equal to 1",
-        ));
+    if let Some(report) = crate::state::rule_name_violation(&input.name) {
+        return Some(report);
     }
     if let Some(report) = crate::state::organization_configuration_violation(
         &input.rule_type,
@@ -462,14 +461,12 @@ fn invalid_parameter(input: &CreateAutomationRuleInput) -> Option<String> {
     ) {
         return Some(report);
     }
-    if let Some(priority) = input.priority.as_deref() {
-        if !crate::state::priority_is_valid(priority) {
-            return Some(crate::state::constraint_report(
-                "priority",
-                "Member must be a decimal number between 0 and 1 with up to 30 digits after the \
-                 decimal point",
-            ));
-        }
+    if let Some(report) = input
+        .priority
+        .as_deref()
+        .and_then(crate::state::priority_violation)
+    {
+        return Some(report);
     }
     if let Some(report) =
         crate::state::recommended_action_types_violation(&input.recommended_action_types)
