@@ -26,6 +26,9 @@ sha2 = { workspace = true }
 # Hex codec for the opaque `NextToken` cursors of the paginated list operations
 # (`GetFindings`, `GetEnabledStandards`).
 hex = { workspace = true }
+# The per-response `RequestId` every Security Hub error envelope reports
+# (`crate::scaffolded`).
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

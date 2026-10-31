@@ -16,6 +16,11 @@
 //! grouping attribute this slice cannot evaluate answers 501 naming it, rather than
 //! counting findings it did not filter.
 //!
+//! An `InsightArn` the caller's hub holds no insight for is the modelled
+//! `InvalidInputException` (400) carrying this service's fixed text for that class — the
+//! ARN is an input value that resolves to nothing, so the read is refused rather than
+//! answered with a result computed over no insight.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -217,12 +222,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             insight_arn: insight_arn.clone(),
         };
         let Some(insight) = store.insights.get(&key) else {
-            return Err(GetInsightResultsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "No insight with ARN {insight_arn} exists for account {account_id} in Region {region}"
-                    )),
-                    code: Some("ResourceNotFoundException".to_string()),
+            // An insight ARN with no insight behind it is a bad INPUT value here, not
+            // an absent subresource: Security Hub CSPM answers the modelled
+            // `InvalidInputException` (400) with its fixed text for that class, and
+            // never a success computed over no insight at all.
+            return Err(GetInsightResultsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::INSIGHT_NOT_FOUND_MESSAGE.to_string()),
+                    code: Some("InvalidInputException".to_string()),
                 },
             )
             .into());

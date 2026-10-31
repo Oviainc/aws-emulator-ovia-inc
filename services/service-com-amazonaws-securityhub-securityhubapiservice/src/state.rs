@@ -341,6 +341,13 @@ pub fn arn_does_not_exist_message(arn: &str) -> String {
     format!("Given Arn: {arn} does not exist")
 }
 
+/// The whole message an INSIGHT-addressed call is refused with when its `InsightArn`
+/// resolves to no insight of the caller's hub. Security Hub CSPM states only that no
+/// insight answers to the ARN: the message interpolates nothing from the request — not
+/// the ARN, not the account and not the Region — so a caller can match it as a
+/// constant.
+pub const INSIGHT_NOT_FOUND_MESSAGE: &str = "Cannot find any insight for the given Arn";
+
 /// The message `CreateActionTarget` refuses a duplicate with: the conflict is keyed on
 /// the `Id` the client chose, which is the only name it holds at that point, not on
 /// the ARN the first create derived from it.

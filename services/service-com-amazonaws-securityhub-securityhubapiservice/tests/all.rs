@@ -18,6 +18,9 @@ mod insight_lifecycle;
 // Declared here for the same reason: a new suite conflicts with no other change.
 #[path = "all/member_deletion.rs"]
 mod member_deletion;
+// And this one, for the same reason.
+#[path = "all/error_envelope.rs"]
+mod error_envelope;
 // Declared here for the same reason: a new suite conflicts with no other change.
 #[path = "all/member_listing.rs"]
 mod member_listing;

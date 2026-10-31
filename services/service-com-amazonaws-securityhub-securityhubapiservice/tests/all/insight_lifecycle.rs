@@ -380,7 +380,7 @@ async fn created_insights_get_distinct_arns_and_reads_do_not_mutate() {
 /// RULE: the insight plane refuses what the model says it refuses — an unsubscribed
 /// account (401), a `GroupByAttribute` that is not a finding attribute or a `Filters`
 /// outside the documented limits (400), a name already in use (409), and an ARN no
-/// insight has (404).
+/// insight has (400 `InvalidInputException`).
 #[tokio::test]
 async fn the_insight_plane_refuses_what_the_model_refuses() {
     // Before EnableSecurityHub there is no hub to create an insight in.
@@ -475,8 +475,8 @@ async fn the_insight_plane_refuses_what_the_model_refuses() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case \"GetInsightResults for an unknown ARN\": expected 404, got {status} with {payload}"
+        status, 400,
+        "case \"GetInsightResults for an unknown ARN\": expected 400, got {status} with {payload}"
     );
 }
 
@@ -595,8 +595,8 @@ async fn disabling_security_hub_deletes_the_hubs_insights() {
 
     let (status, body) = insight_results(&harness, &arn).await;
     assert_eq!(
-        status, 404,
-        "after disable: expected 404 for the deleted insight {arn}, got {status} with {body}"
+        status, 400,
+        "after disable: expected 400 for the deleted insight {arn}, got {status} with {body}"
     );
 
     // And the name is free again, which is what proves the record itself is gone.

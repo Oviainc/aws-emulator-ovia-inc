@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInsight
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInsight`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInsight::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one custom insight from the caller's hub, addressed by the ARN
+//! `CreateInsight` answered with, and echoes that ARN back. The insight is a saved
+//! query, so the delete removes the query and nothing it queried: the hub's findings
+//! are untouched, and the insight's `Name` is free for a later `CreateInsight`.
+//!
+//! An `InsightArn` the hub holds no insight for is the modelled `InvalidInputException`
+//! (400) carrying this service's fixed text for that class — the same refusal
+//! `GetInsightResults` answers a dangling insight ARN with, because it is the same
+//! lookup failing; a caller whose account is not subscribed in the Region is the
+//! modelled `InvalidAccessException` (401).
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +151,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInsight` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInsightErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInsight"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteInsightError::Modeled(DeleteInsightErrorModeled::InternalException(
+                InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+
+        let hub = crate::state::hub_key(ctx);
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&hub) {
+            return Err(DeleteInsightErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(crate::state::not_subscribed_message(&hub.0, &hub.1)),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The ARN the create answered with is the insight's address, so the lookup is
+        // against the stored key: an insight ARN of another account or Region names no
+        // insight of THIS hub.
+        let key = crate::state::InsightKey {
+            account_id: hub.0.clone(),
+            region: hub.1.clone(),
+            insight_arn: input.insight_arn.clone(),
+        };
+        if store.insights.remove(&key).is_none() {
+            return Err(DeleteInsightErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::INSIGHT_NOT_FOUND_MESSAGE.to_string()),
+                    code: Some("InvalidInputException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteInsightOutput {
+            insight_arn: input.insight_arn,
+        })
     }
 }

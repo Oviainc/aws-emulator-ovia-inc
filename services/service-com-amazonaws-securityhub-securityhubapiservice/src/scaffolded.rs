@@ -177,6 +177,57 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `Type` member of the error ENVELOPE: the name of the exception the body
+/// carries.
+///
+/// No model declares it — it belongs to the envelope Security Hub CSPM wraps every
+/// failure in, beside the `Message` and `Code` the error SHAPE declares — so it is
+/// declared here, in the `smithy.framework` namespace, for the same reason the
+/// synthetic shapes above are: it must not collide with a modeled shape. It is a
+/// client's classification channel: an SDK reads the exception name from it (and from
+/// the `x-amzn-errortype` header the protocol renderer sets from the same name), so an
+/// error body without it degrades to an unmodeled failure of its status code.
+static ERROR_ENVELOPE_TYPE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#ErrorEnvelope$Type",
+        "smithy.framework",
+        "Type",
+    ),
+    ShapeType::String,
+    "Type",
+    0,
+)
+.with_json_name("Type")
+.with_xml_name("Type");
+
+/// The `RequestId` member of the error envelope: the identifier of the response that
+/// reported the failure.
+///
+/// Also undeclared by any model, and the counterpart of the request id a successful
+/// response reports: it is what a caller quotes when it asks about one failed call, so
+/// every failure carries its own.
+static ERROR_ENVELOPE_REQUEST_ID: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#ErrorEnvelope$RequestId",
+        "smithy.framework",
+        "RequestId",
+    ),
+    ShapeType::String,
+    "RequestId",
+    1,
+)
+.with_json_name("RequestId")
+.with_xml_name("RequestId");
+
+/// The request id one error response reports.
+///
+/// A fresh value per response, so two failures are distinguishable — which is what a
+/// caller correlating a report with a call needs. It is an identifier, not a secret: a
+/// random v4 UUID is what AWS's own ids look like and it need not be unpredictable.
+fn new_request_id() -> String {
+    ::uuid::Uuid::new_v4().to_string()
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -250,12 +301,11 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
 /// rendered. Only the synthetic variant behaves differently — and it is the one that
 /// must answer 501.
 impl<E: OperationError> OperationError for Scaffolded<E> {
+    /// The whole error BODY: the error shape's own members, plus the envelope members
+    /// every Security Hub CSPM failure carries. See the [`SerializableStruct`] impl
+    /// below for why this is `self` rather than the payload.
     fn as_serializable(&self) -> &dyn SerializableStruct {
-        match self {
-            Self::NotImplemented(e) => e,
-            Self::Modeled(e) => e.as_serializable(),
-            Self::ValidationException(e) => e,
-        }
+        self
     }
 
     fn variant_schema(&self) -> &'static Schema {
@@ -300,5 +350,35 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }
+    }
+}
+
+impl<E: OperationError> Scaffolded<E> {
+    /// The error SHAPE's own payload: the members the shape declares (`Message` and
+    /// `Code` on this service's modeled errors), without the envelope members below.
+    fn payload(&self) -> &dyn SerializableStruct {
+        match self {
+            Self::NotImplemented(e) => e,
+            Self::Modeled(e) => e.as_serializable(),
+            Self::ValidationException(e) => e,
+        }
+    }
+}
+
+/// The error body Security Hub CSPM answers with: the error shape's own members, then
+/// the two envelope members no model declares — the exception's name in `Type`, and
+/// this response's own `RequestId`.
+///
+/// Stated HERE, on the one error channel every operation of this service returns
+/// through, rather than per handler: the envelope is a property of the service's
+/// failures, not of any one operation, so a handler constructs its modeled error and
+/// nothing else. The status, the `Code`, the `Message` and the `x-amzn-errortype`
+/// header stay with the shape and the protocol renderer that already own them.
+impl<E: OperationError> SerializableStruct for Scaffolded<E> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        self.payload().serialize_members(s)?;
+        s.write_string(&ERROR_ENVELOPE_TYPE, self.shape_name())?;
+        s.write_string(&ERROR_ENVELOPE_REQUEST_ID, new_request_id().as_str())?;
+        Ok(())
     }
 }
