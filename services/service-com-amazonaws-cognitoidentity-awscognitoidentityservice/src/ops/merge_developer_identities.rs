@@ -267,46 +267,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> MergeDeveloperIde
         // A developer identity is a login of the pool keyed by the pool's own
         // `DeveloperProviderName` — "the 'domain' by which Cognito will refer to your
         // users" — whose value is the developer user identifier. A request naming any other
-        // provider therefore names mappings this pool cannot hold, exactly as one naming
-        // identifiers that were never registered does.
+        // provider therefore names mappings this pool cannot hold at all, which is not a
+        // statement about either user it names: it is answered as access this caller does
+        // not have, exactly as the lookup of a mapping under such a provider is.
         let developer_provider = pool
             .developer_provider_name
             .clone()
             .filter(|provider| *provider == input.developer_provider_name);
-        let (source, destination) = match &developer_provider {
-            Some(provider) => (
-                store
-                    .linked_identity(
-                        &input.identity_pool_id,
-                        provider,
-                        &input.source_user_identifier,
-                    )
-                    .cloned(),
-                store
-                    .linked_identity(
-                        &input.identity_pool_id,
-                        provider,
-                        &input.destination_user_identifier,
-                    )
-                    .cloned(),
-            ),
-            None => (None, None),
-        };
-
-        // "Only developer-authenticated users can be merged": each side of the merge is a
-        // developer user identifier this pool has registered, and one it has not registered
-        // names no user the caller may be told about — resolving a developer user identifier
-        // is an authorization question, so nothing is disclosed about what the pool holds
-        // for one, exactly as the lookup and the unlink of one answer.
-        let (Some(developer_provider), Some(source), Some(destination)) =
-            (developer_provider, source, destination)
-        else {
+        let Some(developer_provider) = developer_provider else {
             return Err(
                 MergeDeveloperIdentitiesErrorModeled::NotAuthorizedException(
                     NotAuthorizedException {
                         message: Some(
                             crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE.to_string(),
                         ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Only developer-authenticated users can be merged": each side of the merge is a
+        // developer user identifier this pool has REGISTERED, and one it has registered
+        // against no identity names no user of the pool — the USER is the resource the
+        // request addressed, so it is the resource reported missing, with the identifier the
+        // caller itself sent. Each side is reported on its own, so the caller is told WHICH
+        // of the two it got wrong.
+        let resolve = |identifier: &str| {
+            store
+                .linked_identity(&input.identity_pool_id, &developer_provider, identifier)
+                .cloned()
+        };
+        let Some(source) = resolve(&input.source_user_identifier) else {
+            return Err(
+                MergeDeveloperIdentitiesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::developer_user_not_found_message(
+                            &input.source_user_identifier,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(destination) = resolve(&input.destination_user_identifier) else {
+            return Err(
+                MergeDeveloperIdentitiesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::developer_user_not_found_message(
+                            &input.destination_user_identifier,
+                        )),
                     },
                 )
                 .into(),
@@ -333,10 +343,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> MergeDeveloperIde
         // two different users of it — and the pool's own developer provider is excluded,
         // being the provider whose two users this call exists to combine.
         //
-        // This refusal and the one below it carry wording taken from the sentences of this
-        // operation's own documentation that state the rule, with the provider, the count and
-        // the limit filled in from the request and the store: no recording of either refusal
-        // is available to read AWS's own fixed text off.
+        // The refusal is AWS's own fixed sentence, with no part taken from the request or
+        // the store: what the caller is told is that this PAIR cannot be merged, and naming
+        // the provider the two users share would report what the pool holds for a user the
+        // caller did not ask about.
         let shared_public_provider = source_logins
             .iter()
             .map(|(provider, _)| provider)
@@ -346,14 +356,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> MergeDeveloperIde
                         .iter()
                         .any(|(linked, _)| linked == *provider)
             });
-        if let Some(provider) = shared_public_provider {
+        if shared_public_provider.is_some() {
             return Err(
                 MergeDeveloperIdentitiesErrorModeled::ResourceConflictException(
                     ResourceConflictException {
-                        message: Some(format!(
-                            "The users to be merged are associated with the provider \
-                             '{provider}' as two different users."
-                        )),
+                        message: Some(crate::state::CANNOT_MERGE_IDENTITIES_MESSAGE.to_string()),
                     },
                 )
                 .into(),
@@ -366,6 +373,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> MergeDeveloperIde
         // disjoint — one indexed login resolves to one identity — so the merged user would
         // carry exactly their sum, and a sum past the limit is a pair of users this service
         // cannot merge rather than a single login held by another account.
+        //
+        // The wording of this one is taken from the sentence of the operation's own
+        // documentation that states the rule, with the count and the limit filled in: no
+        // recording of it is available to read AWS's own fixed text off.
         let linked_after = source_logins.len() + destination_logins.len();
         if linked_after > crate::state::MAX_LINKED_LOGINS_PER_IDENTITY {
             return Err(
@@ -398,9 +409,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> MergeDeveloperIde
             store.merge_identity_into(&input.identity_pool_id, &destination, &source, now);
         // Both identities were resolved through THIS pool's own login index, which names no
         // other pool's identities, so the merge has no pair to decline here: the arm is the
-        // invariant written down rather than an input any request reaches. A pair it does
-        // decline is one this pool does not hold, which is the same refusal an identifier it
-        // has not registered gets.
+        // invariant written down rather than an input any request reaches. A pair it did
+        // decline would be one this pool does not hold, which is a mapping this caller may
+        // not reach here.
         let Some(revoked) = revoked else {
             return Err(
                 MergeDeveloperIdentitiesErrorModeled::NotAuthorizedException(

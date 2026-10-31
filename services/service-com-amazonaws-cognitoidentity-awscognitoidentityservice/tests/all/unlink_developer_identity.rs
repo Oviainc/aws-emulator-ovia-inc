@@ -14,8 +14,8 @@
 //!   an identifier registered under it, and keeping every federated login it had;
 //! * a call naming a developer provider that is not the pool's configured one is an
 //!   `InvalidParameterException` — a bad input parameter, not an access decision — while
-//!   one naming an identifier the pool has registered against no identity is a
-//!   `NotAuthorizedException`,
+//!   one naming an identifier the pool has registered against no identity has nothing left
+//!   to forget and is SERVED,
 //!   one naming a mapping held against another identity is a
 //!   `ResourceConflictException`, one naming a pool or an identity this service does not
 //!   hold is the modelled `ResourceNotFoundException`, one naming an identity of ANOTHER
@@ -24,9 +24,8 @@
 //!   refused ahead of the operation with a `ValidationException` — every one of them HTTP
 //!   400, and every refusal
 //!   writes nothing;
-//! * the call is therefore not idempotent in its answer but is in its effect: repeating it
-//!   is refused as a mapping this pool no longer holds and leaves the pool exactly as the
-//!   first call did.
+//! * the call is therefore idempotent in its answer as well as in its effect: repeating it
+//!   is served and leaves the pool exactly as the first call did.
 //!
 //! The harness is `identity_pool_flow`'s: one shared engine behind the same
 //! `MultiServiceRouter` the production router builds.
@@ -42,8 +41,8 @@ const OPERATION: &str = "UnlinkDeveloperIdentity";
 /// A well-formed `IdentityId` that nothing ever minted.
 const ABSENT_IDENTITY_ID: &str = "us-east-1:55555555-5555-5555-5555-555555555555";
 
-/// The message Amazon Cognito Identity answers a request naming a developer-identity
-/// mapping the pool does not hold with (`crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE`)
+/// The message Amazon Cognito Identity answers a request naming an identity the caller may
+/// not reach here with (`crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE`)
 /// — asserted here against the literal so the wire-visible wording is pinned by the test,
 /// not by the code under test. One fixed sentence: it names neither the identifier the
 /// request carried nor any identity.
@@ -521,17 +520,6 @@ async fn a_call_the_mapping_cannot_act_on_is_refused() {
             "ResourceNotFoundException",
         ),
         (
-            "an identifier that was never registered",
-            unlink_request(
-                Some(&pool_id),
-                Some(&identity_id),
-                Some(developer_provider),
-                Some("never-registered"),
-            ),
-            400,
-            "NotAuthorizedException",
-        ),
-        (
             "a developer provider name that is not this pool's",
             unlink_request(
                 Some(&pool_id),
@@ -730,8 +718,8 @@ async fn a_call_the_mapping_cannot_act_on_is_refused() {
     }
 }
 
-/// RULE: the EFFECT of the call is idempotent — the mapping the first call forgot is gone,
-/// so repeating the same request is refused as a mapping this pool no longer holds and
+/// RULE: the call is idempotent in its ANSWER as well as its effect — the mapping the first
+/// call forgot is gone, so repeating the same request is served with the same empty body and
 /// leaves the pool exactly as the first call left it.
 #[tokio::test]
 async fn repeating_the_call_forgets_nothing_more() {
@@ -760,29 +748,25 @@ async fn repeating_the_call_forgets_nothing_more() {
 
     let (status, body) = emulator.call(OPERATION, &request).await;
     assert_eq!(
-        status, 400,
-        "the mapping the first call forgot is gone, so the second is refused, got {status} with \
-         {body}"
-    );
-    assert!(
-        error_code(&body).contains("NotAuthorizedException"),
-        "expected NotAuthorizedException on the repeated call, got {body}"
+        status, 200,
+        "the mapping the first call forgot is gone, so the second has nothing left to forget \
+         and is served, got {status} with {body}"
     );
     assert_eq!(
-        error_message("the repeated call", &body),
-        NO_ACCESS_MESSAGE,
-        "expected the fixed no-access message on the repeated call, got {body}"
+        body,
+        json!({}),
+        "the repeated call answers this operation's empty output, got {body}"
     );
 
     let twice = description(&emulator, &pool_id, &identity_id).await;
     assert_eq!(
         once, twice,
-        "the refused repeat leaves the identity as the first call left it"
+        "the repeat leaves the identity as the first call left it"
     );
     assert_eq!(
         identifiers_of(&emulator, &pool_id, &identity_id).await,
         identifiers_once,
-        "the refused repeat forgets no further mapping"
+        "the repeat forgets no further mapping"
     );
     assert_eq!(
         identifiers_once,

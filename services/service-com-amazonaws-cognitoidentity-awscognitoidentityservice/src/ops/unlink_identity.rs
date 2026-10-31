@@ -251,6 +251,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
         };
         let identity_pool_id = identity.identity_pool_id.clone();
 
+        // An identity is an identity OF a pool, so resolving it is not done until the pool
+        // it belongs to is resolved too: the record of an identity outlives the delete of
+        // its pool, and a call made once the pool has gone reports the resource that is
+        // actually missing — the pool — before anything about the identity or the logins
+        // presented for it is decided.
+        let Some(pool) = store.identity_pools.get(&identity_pool_id) else {
+            return Err(UnlinkIdentityErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("IdentityPool '{identity_pool_id}' not found.")),
+                },
+            )
+            .into());
+        };
+
         // This operation takes LINKED LOGINS off an identity, and an UNAUTHENTICATED (guest)
         // identity — the one `GetId` mints for a call presenting no login at all — has never
         // had one: there is nothing of it to unlink, whatever the call presents.
@@ -270,14 +284,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
         // that is not the kind of token its provider issues, and one issued by someone other
         // than the provider it is presented under, authorize nothing — and then the trust
         // that pool states for the token's issuer, with the audience that trust accepts.
-        let Some(pool) = store.identity_pools.get(&identity_pool_id) else {
-            return Err(UnlinkIdentityErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("IdentityPool '{identity_pool_id}' not found.")),
-                },
-            )
-            .into());
-        };
         if let Some(refusal) = pool.refuse_logins(&registered, &input.logins) {
             return Err(UnlinkIdentityErrorModeled::NotAuthorizedException(
                 NotAuthorizedException {

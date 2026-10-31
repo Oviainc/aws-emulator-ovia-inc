@@ -59,9 +59,6 @@ const NO_PUBLIC_PROVIDER_MESSAGE: &str = "Please provide a valid public provider
 const UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE: &str =
     "This identity pool does not support the specified developer provider.";
 
-/// The message a developer-identity mapping the pool holds against nobody is refused with.
-const NO_ACCESS_MESSAGE: &str = "You do not have access to this identity";
-
 /// The `Logins` provider name of the Amazon Cognito user pool the fixture pool below
 /// trusts: a user pool is named `cognito-idp.<region>.amazonaws.com/<UserPoolId>`
 /// (`smithy_query(query="doc",shape="GetIdInput",member="Logins")`), and its login is that
@@ -728,8 +725,9 @@ async fn an_unlink_presenting_no_public_provider_is_refused() {
 /// RULE: the developer unlink decides the `DeveloperProviderName` against the pool's
 /// configured one first — a provider the pool does not support is a bad input parameter the
 /// caller has to correct (`InvalidParameterException`), which is a different answer from the
-/// access decision an identifier the pool has registered against no identity gets
-/// (`NotAuthorizedException`) — and every refusal leaves the mapping registered.
+/// one an identifier the pool has registered against no identity gets (the removal it asks
+/// for has already happened, so the call is SERVED and forgets nothing) — and every refusal
+/// leaves the mapping registered.
 #[tokio::test]
 async fn an_unsupported_developer_provider_is_a_bad_parameter_not_an_access_decision() {
     let emulator = Emulator::new();
@@ -800,16 +798,6 @@ async fn an_unsupported_developer_provider_is_a_bad_parameter_not_an_access_deci
             code: "InvalidParameterException",
             message: UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE,
         },
-        DeveloperUnlinkCase {
-            case: "the pool's own provider with an identifier it registered against nobody",
-            pool: pool_id.as_str(),
-            identity: identity_id.as_str(),
-            provider: developer_provider,
-            identifier: "never-registered",
-            status: 400,
-            code: "NotAuthorizedException",
-            message: NO_ACCESS_MESSAGE,
-        },
     ];
 
     for row in &cases {
@@ -851,9 +839,35 @@ async fn an_unsupported_developer_provider_is_a_bad_parameter_not_an_access_deci
         );
     }
 
+    // The pool's own provider with an identifier it registered against NOBODY is not one of
+    // those refusals: nothing is left to forget for it, so the call is served and the
+    // mapping the pool does hold is untouched.
+    let (status, body) = emulator
+        .call(
+            "UnlinkDeveloperIdentity",
+            &unlink_developer_request(&pool_id, &identity_id, developer_provider, "never-registered"),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "an identifier the pool registered against nobody has nothing left to unlink, so the \
+         call is served, got {status} with {body}"
+    );
+    let looked_up = emulator
+        .ok(
+            "LookupDeveloperIdentity",
+            &json!({"IdentityPoolId": &pool_id, "DeveloperUserIdentifier": identifier}),
+        )
+        .await;
+    assert_eq!(
+        looked_up["IdentityId"],
+        json!(identity_id),
+        "unlinking an identifier the pool does not hold leaves {identifier:?} resolving to \
+         {identity_id}, got {looked_up}"
+    );
+
     // The pool's own provider with the identifier it DID register is served, which is what
-    // makes the refusals above about the provider and the identifier rather than about the
-    // operation.
+    // makes the refusals above about the provider rather than about the operation.
     emulator
         .ok(
             "UnlinkDeveloperIdentity",

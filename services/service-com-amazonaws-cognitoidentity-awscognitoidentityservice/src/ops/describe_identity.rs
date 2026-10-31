@@ -225,6 +225,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DescribeIdentity<
             .into());
         };
 
+        // An identity is an identity OF a pool, so the pool it belongs to has to be one
+        // this service still holds: the record of an identity outlives the delete of its
+        // pool, and a read of it once the pool has gone reports the resource that is
+        // actually missing — the pool — exactly as the credential and token operations
+        // scoped to an identity do.
+        if !store.identity_pools.contains_key(&identity.identity_pool_id) {
+            return Err(DescribeIdentityErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "IdentityPool '{}' not found.",
+                        identity.identity_pool_id
+                    )),
+                },
+            )
+            .into());
+        }
+
         // The same metadata a listing of the pool's identities reports for it, read from
         // the one stored record both answer from — including the login projection, which
         // carries the disabled sentinel for an identity an unlink left linked to nothing.

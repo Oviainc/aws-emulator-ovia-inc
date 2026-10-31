@@ -8,6 +8,11 @@
 //! developer provider only once no identifier of it is left; an identity reached through
 //! no login at all is what makes it inaccessible.
 //!
+//! This is the ONE operation that detaches a developer login, and what it asks for is a
+//! STATE: a pool that holds no such mapping — because an earlier call of it already
+//! detached the identifier, or because the pool never registered it — has nothing left to
+//! forget, so the call is served with the same empty body a removal answers.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -318,16 +323,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkDeveloperId
                 .into(),
             );
         }
-        // An identity an unlink left reachable through no login at all is INACCESSIBLE:
-        // nothing resolves to it, so it holds no mapping for this call to forget — which the
-        // identifier resolution below answers on its own, as it does for any identifier this
-        // pool has registered against nobody.
-
         // The provider is this pool's own, so what is left to resolve is the IDENTIFIER
-        // under it. An identifier this pool has indexed against no identity is refused as
-        // access this caller does not have, not as a resource reported missing: resolving a
-        // developer user identifier is an authorization question, so nothing is disclosed
-        // about what the pool holds for one.
+        // under it, and by here the pool, the identity and the identity's membership of that
+        // pool have all been checked against stored state. What is left is the REMOVAL
+        // itself, and what the caller asks for is a state — "Unlinked developer users will be
+        // considered new identities next time they are seen" — which already holds for an
+        // identifier this pool has indexed against no identity: there is nothing left to
+        // forget, so the call is served with the same empty body (`Unit` output) it answers
+        // the removal of a mapping that was there, and writes nothing. That is this
+        // service's answer for a removal whose state already holds, as `DeleteIdentities`
+        // answers an id it holds no identity for and a merge of two identifiers that are
+        // already one user answers that user. A mapping the pool DOES hold against another
+        // identity is refused below, so this is never the answer for one the caller may not
+        // touch. An identity reachable through no login at all holds no mapping either,
+        // which is the same answer.
         let registered_to = store
             .linked_identity(
                 &input.identity_pool_id,
@@ -336,16 +345,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkDeveloperId
             )
             .cloned();
         let Some(registered_to) = registered_to else {
-            return Err(
-                UnlinkDeveloperIdentityErrorModeled::NotAuthorizedException(
-                    NotAuthorizedException {
-                        message: Some(
-                            crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
+            return Ok(UnlinkDeveloperIdentityOutput);
         };
 
         // A mapping held against a DIFFERENT identity belongs to that other account, so it

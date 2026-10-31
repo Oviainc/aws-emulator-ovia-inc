@@ -18,7 +18,8 @@
 //! * a call the pool cannot act on is refused with the modelled error for what is wrong with
 //!   it and writes nothing: a pool this service does not hold is the modelled
 //!   `ResourceNotFoundException`, a developer user
-//!   identifier the pool has not registered (or a developer provider that is not the pool's)
+//!   identifier the pool has not registered is the same error naming that USER, a developer
+//!   provider that is not the pool's own
 //!   is a `NotAuthorizedException`, two users reached through one public provider are a
 //!   `ResourceConflictException`, a pair whose linked
 //!   logins together pass the service's documented limit is an `InvalidParameterException`,
@@ -36,11 +37,20 @@ use crate::identity_pool_flow::{error_code, Emulator, ABSENT_POOL_ID};
 /// The operation under test, spelled once.
 const OPERATION: &str = "MergeDeveloperIdentities";
 
-/// The message Amazon Cognito Identity answers a request naming a developer user identifier
-/// the pool has not registered with (`crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE`)
+/// The message Amazon Cognito Identity answers a request naming a developer provider that is
+/// not its identity pool's own with (`crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE`)
 /// — asserted here against the literal so the wire-visible wording is pinned by the test,
 /// not by the code under test.
 const NO_ACCESS_MESSAGE: &str = "You do not have access to this identity";
+
+/// The message Amazon Cognito Identity answers a pair of users that cannot become one user
+/// with (`crate::state::CANNOT_MERGE_IDENTITIES_MESSAGE`) — one fixed sentence, naming
+/// neither user nor the provider they share.
+const CANNOT_MERGE_MESSAGE: &str = "Cannot merge these identities.";
+
+/// A developer user identifier no call of this test ever registers, so every pool holds it
+/// against no identity.
+const ABSENT_IDENTIFIER: &str = "never-registered";
 
 /// The most logins Amazon Cognito links to one identity: "The number of linked logins is
 /// limited to 20. So, the number of linked logins for the source user,
@@ -542,13 +552,13 @@ async fn a_merge_the_pool_cannot_act_on_is_refused_and_writes_nothing() {
             "a source identifier that was never registered",
             Broken::AbsentSourceIdentifier,
             400,
-            "NotAuthorizedException",
+            "ResourceNotFoundException",
         ),
         (
             "a destination identifier that was never registered",
             Broken::AbsentDestinationIdentifier,
             400,
-            "NotAuthorizedException",
+            "ResourceNotFoundException",
         ),
         (
             "two users reached through one public provider",
@@ -686,10 +696,10 @@ async fn a_merge_the_pool_cannot_act_on_is_refused_and_writes_nothing() {
                 request["DeveloperProviderName"] = json!("another.example.app");
             }
             Broken::AbsentSourceIdentifier => {
-                request["SourceUserIdentifier"] = json!("never-registered");
+                request["SourceUserIdentifier"] = json!(ABSENT_IDENTIFIER);
             }
             Broken::AbsentDestinationIdentifier => {
-                request["DestinationUserIdentifier"] = json!("never-registered");
+                request["DestinationUserIdentifier"] = json!(ABSENT_IDENTIFIER);
             }
             Broken::SharedPublicProvider | Broken::PastTheLinkedLoginLimit => {}
             Broken::OutsideTheModel(override_members) => {
@@ -727,6 +737,28 @@ async fn a_merge_the_pool_cannot_act_on_is_refused_and_writes_nothing() {
                 NO_ACCESS_MESSAGE,
                 "case {case:?}: expected the fixed no-access message, got {body}"
             );
+        }
+        // A developer user identifier the pool has registered against no identity names a
+        // USER this service does not hold, and the refusal names that user with the
+        // identifier the request carried; two users of one public provider cannot become
+        // one user at all, and that refusal carries AWS's fixed sentence with no part of the
+        // request or the store in it.
+        match broken {
+            Broken::AbsentSourceIdentifier | Broken::AbsentDestinationIdentifier => {
+                assert_eq!(
+                    error_message(case, &body),
+                    format!("User '{ABSENT_IDENTIFIER}' not found."),
+                    "case {case:?}: expected the missing developer user to be named, got {body}"
+                );
+            }
+            Broken::SharedPublicProvider => {
+                assert_eq!(
+                    error_message(case, &body),
+                    CANNOT_MERGE_MESSAGE,
+                    "case {case:?}: expected the fixed cannot-merge message, got {body}"
+                );
+            }
+            _ => {}
         }
 
         // The refusal wrote nothing: the two users are still two users, each registered

@@ -27,6 +27,8 @@ mod control_plane_audit;
 mod custom_role_arn_from_token_roles;
 #[path = "all/delete_identities.rs"]
 mod delete_identities;
+#[path = "all/deleted_pool_and_developer_user_refusals.rs"]
+mod deleted_pool_and_developer_user_refusals;
 #[path = "all/describe_identity.rs"]
 mod describe_identity;
 #[path = "all/developer_credentials_authorization.rs"]

@@ -15,7 +15,7 @@ pub mod authorization;
 
 use crate::ops::types::{CognitoIdentityProvider, MappingRule, RoleMapping};
 use emulator_server::CredentialStore;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -48,6 +48,18 @@ pub const MAX_LOGINS_PER_POOL: usize = 2 * MAX_IDENTITIES_PER_POOL;
 /// single call can reach while still bounding the stored record and the `Logins` list
 /// every `ListIdentities` page carries. Refused with the modelled `LimitExceededException`.
 pub const MAX_LOGIN_PROVIDERS_PER_IDENTITY: usize = 50;
+
+/// The most identity RECORDS this emulator keeps for identities whose pool has been
+/// deleted. An identity belongs to the pool that minted it and the record of it outlives
+/// that pool's delete, so an identity-scoped call made afterwards can report the POOL as
+/// the resource that is missing; but the pool's delete also releases the per-pool ceiling
+/// those records were counted against ([`MAX_IDENTITIES_PER_POOL`]), so without a ceiling
+/// of their own a caller repeating create-pool / mint / delete-pool would grow the store
+/// without limit. THIS EMULATOR's own bound, like the ceilings above, and it is enforced by
+/// EVICTION rather than by a refusal: the delete is a call AWS serves, so the oldest
+/// orphaned records are given up instead — an identity-scoped call naming one this
+/// emulator no longer keeps reports that identity missing, which is what it is.
+pub const MAX_ORPHANED_IDENTITY_RECORDS: usize = MAX_IDENTITIES_PER_POOL;
 
 /// The most logins AMAZON COGNITO links to one identity — not this emulator's own
 /// ceiling, but the service's documented limit: "The number of linked logins is limited to
@@ -630,6 +642,27 @@ pub const CANNOT_UNLINK_UNAUTHENTICATED_MESSAGE: &str = "Cannot unlink unauthent
 /// Fixed text, naming neither the logins presented nor the identities they resolve to: the
 /// caller is told that these logins cannot be linked, which is what it has to act on.
 pub const CANNOT_LINK_LOGINS_MESSAGE: &str = "Cannot link these logins.";
+
+/// How AWS words the refusal of a merge of two developer users that cannot become one
+/// user — they are reached through one public provider as two different users, so no
+/// single identity can hold both.
+///
+/// Fixed text, naming neither the provider the two users share nor either user: what the
+/// caller is told is that this pair cannot be merged, which is the whole of what it can
+/// act on. Worded as [`CANNOT_LINK_LOGINS_MESSAGE`] is, the two being the same kind of
+/// refusal of one combination of logins.
+pub const CANNOT_MERGE_IDENTITIES_MESSAGE: &str = "Cannot merge these identities.";
+
+/// How AWS reports a DEVELOPER USER the identity pool has registered against no identity —
+/// the resource a request naming a developer user identifier addresses.
+///
+/// The one part taken from the request is the identifier it named, which the caller sent
+/// itself, so the refusal discloses nothing the caller did not already hold; the rest is
+/// fixed text. Shared, so every operation that reports a developer user missing words it
+/// alike.
+pub fn developer_user_not_found_message(developer_user_identifier: &str) -> String {
+    format!("User '{developer_user_identifier}' not found.")
+}
 
 /// How AWS words the refusal of a call that names an identity the caller has not proven it
 /// may act for: one already linked to a login, reached with no login of it at all.
@@ -1600,6 +1633,13 @@ pub struct ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     pub principal_tag_attribute_maps: HashMap<(String, String), PrincipalTagAttributeMap>,
     /// Identities by `IdentityId`.
     pub identities: HashMap<String, Identity>,
+    /// The identities whose pool has been DELETED, in the order the deletes orphaned them.
+    /// Their records stay in [`Self::identities`] so an identity-scoped call made after the
+    /// pool went reports the POOL as the resource that is missing; this is the queue that
+    /// keeps that retention bounded by [`MAX_ORPHANED_IDENTITY_RECORDS`], the oldest
+    /// orphaned record being given up first. An entry whose record a later
+    /// `DeleteIdentities` removed is simply nothing left to evict.
+    pub orphaned_identities: VecDeque<String>,
     /// The identities of one pool, in the order `GetId` minted them, so a paginated
     /// `ListIdentities` resumes at a stable position.
     pub identities_by_pool: HashMap<String, Vec<String>>,
@@ -2126,12 +2166,14 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// credentials the caller must now forget. `None` when this service holds no such
     /// identity, so nothing was written.
     ///
-    /// The same teardown [`Self::delete_identity_pool`] does for every identity of a pool:
-    /// once the identity is gone, a login that resolved to it resolves nothing (so
-    /// presenting it again is a NEW user), a listing of the pool no longer names it, and the
-    /// credentials and tokens that spoke for it speak for nobody. Removing the record is
-    /// this transition's own: a merge gives an identity's LOGINS up, not the record, and
-    /// leaves it stored as a disabled one ([`Self::merge_identity_into`]).
+    /// The teardown [`Self::delete_identity_pool`] does for the logins, credentials and
+    /// tokens of every identity of a pool, plus the RECORD itself, which only this
+    /// transition removes: once the identity is gone, a login that resolved to it resolves
+    /// nothing (so presenting it again is a NEW user), a listing of the pool no longer names
+    /// it, and the credentials and tokens that spoke for it speak for nobody. Removing the
+    /// record is this transition's own: a merge gives an identity's LOGINS up, not the
+    /// record, and leaves it stored as a disabled one ([`Self::merge_identity_into`]), and a
+    /// pool delete leaves the records of the identities it minted standing.
     pub fn delete_identity(&mut self, identity_id: &str) -> Option<Vec<String>> {
         let identity = self.identities.remove(identity_id)?;
         if let Some(identities) = self.identities_by_pool.get_mut(&identity.identity_pool_id) {
@@ -2150,11 +2192,27 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         )
     }
 
-    /// Remove a pool with everything that belongs to it — its identities, their login
-    /// index entries, their outstanding credentials, the OIDC tokens it issued and the
-    /// principal-tag attribute maps of its providers — and
+    /// Remove a pool with everything that belongs to it — its login index entries, its
+    /// identities' outstanding credentials, the OIDC tokens it issued, the listing order of
+    /// its identities and the principal-tag attribute maps of its providers — and
     /// report the access key ids whose credentials the caller must now forget. `None` when
     /// no such pool is stored.
+    ///
+    /// What the pool does NOT take with it is the RECORD of each identity it minted: an
+    /// identity belongs to the pool that minted it and names it for as long as the record
+    /// stands, so a call naming such an identity still resolves it and then finds the pool
+    /// it names gone — which is why an identity-scoped call made after the pool went reports
+    /// the POOL as the missing resource and not the identity. Nothing resolves to those
+    /// identities any more (every login of them was indexed per pool, and the index entries
+    /// go here), and no listing reports them, the pool whose listing held them being gone.
+    ///
+    /// That retention is BOUNDED: the delete releases the per-pool ceiling those records
+    /// were counted against, so they are queued in [`Self::orphaned_identities`] and the
+    /// oldest are given up as soon as the queue would pass
+    /// [`MAX_ORPHANED_IDENTITY_RECORDS`], which keeps repeated create-pool / mint /
+    /// delete-pool cycles from growing the store without limit. A record this eviction
+    /// removes is one this emulator no longer holds at all, so a call naming it reports that
+    /// identity missing.
     pub fn delete_identity_pool(&mut self, identity_pool_id: &str) -> Option<Vec<String>> {
         self.identity_pools.remove(identity_pool_id)?;
         self.identity_pool_roles.remove(identity_pool_id);
@@ -2166,9 +2224,14 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             .unwrap_or_default();
         let mut revoked = Vec::new();
         for identity_id in &identity_ids {
-            self.identities.remove(identity_id);
             if let Some(issued) = self.credentials.remove(identity_id) {
                 revoked.push(issued.access_key_id);
+            }
+        }
+        self.orphaned_identities.extend(identity_ids);
+        while self.orphaned_identities.len() > MAX_ORPHANED_IDENTITY_RECORDS {
+            if let Some(evicted) = self.orphaned_identities.pop_front() {
+                self.identities.remove(&evicted);
             }
         }
         self.login_index
@@ -3259,5 +3322,129 @@ pub fn forget_issued_web_identities_of_identity<Eng: Send + Sync + 'static>(
 ) {
     if let Some(registry) = issued_web_identity_tokens(engine) {
         registry.lock().forget_subject(identity_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stored pool carrying only what a delete reads, under `identity_pool_id`.
+    fn stored_pool(identity_pool_id: &str) -> IdentityPool {
+        IdentityPool {
+            identity_pool_id: identity_pool_id.to_string(),
+            identity_pool_name: "bounded".to_string(),
+            allow_unauthenticated_identities: true,
+            allow_classic_flow: None,
+            supported_login_providers: None,
+            developer_provider_name: None,
+            open_id_connect_provider_arns: None,
+            cognito_identity_providers: None,
+            saml_provider_arns: None,
+            identity_pool_tags: None,
+        }
+    }
+
+    /// Store `count` identities of `identity_pool_id`, as a mint of each would.
+    fn mint_identities(
+        store: &mut ComAmazonawsCognitoidentityAwscognitoidentityserviceState,
+        identity_pool_id: &str,
+        count: usize,
+    ) -> Vec<String> {
+        let now = SystemTime::UNIX_EPOCH;
+        let mut minted = Vec::new();
+        for index in 0..count {
+            let identity_id = format!("us-east-1:{identity_pool_id}-{index}");
+            store.identities.insert(
+                identity_id.clone(),
+                Identity {
+                    identity_id: identity_id.clone(),
+                    identity_pool_id: identity_pool_id.to_string(),
+                    logins: Vec::new(),
+                    disabled: false,
+                    creation_date: now,
+                    last_modified_date: now,
+                },
+            );
+            store
+                .identities_by_pool
+                .entry(identity_pool_id.to_string())
+                .or_default()
+                .push(identity_id.clone());
+            minted.push(identity_id);
+        }
+        minted
+    }
+
+    /// The records a pool delete orphans are kept so an identity-scoped call can report the
+    /// POOL that is missing, and that retention is BOUNDED: the delete releases the per-pool
+    /// ceiling the records were counted against, so the queue never holds more than
+    /// [`MAX_ORPHANED_IDENTITY_RECORDS`] of them and the oldest go first — however many
+    /// pools a caller creates, fills and deletes.
+    #[test]
+    fn the_records_a_pool_delete_orphans_are_kept_within_one_ceiling() {
+        // Rows differ along how the orphans arrive: in one delete at the ceiling, in one
+        // past it, and spread over several deletes that pass it together.
+        // (case, the identities each successive pool is filled with)
+        let cases: [(&str, &[usize]); 4] = [
+            ("one pool exactly at the ceiling", &[MAX_ORPHANED_IDENTITY_RECORDS]),
+            (
+                "one pool one past the ceiling",
+                &[MAX_ORPHANED_IDENTITY_RECORDS + 1],
+            ),
+            (
+                "two pools passing the ceiling together",
+                &[MAX_ORPHANED_IDENTITY_RECORDS - 1, 2],
+            ),
+            (
+                "many small pools, each created, filled and deleted",
+                &[7; 16],
+            ),
+        ];
+
+        for (case, pool_sizes) in cases {
+            let mut store = ComAmazonawsCognitoidentityAwscognitoidentityserviceState::default();
+            let mut orphaned_in_order: Vec<String> = Vec::new();
+            for (index, count) in pool_sizes.iter().enumerate() {
+                let identity_pool_id = format!("pool{index}");
+                store
+                    .identity_pools
+                    .insert(identity_pool_id.clone(), stored_pool(&identity_pool_id));
+                orphaned_in_order.extend(mint_identities(&mut store, &identity_pool_id, *count));
+                assert!(
+                    store.delete_identity_pool(&identity_pool_id).is_some(),
+                    "case {case:?}: the pool must be deleted, not reported missing"
+                );
+            }
+
+            let kept = orphaned_in_order.len().min(MAX_ORPHANED_IDENTITY_RECORDS);
+            assert_eq!(
+                store.identities.len(),
+                kept,
+                "case {case:?}: expected {kept} identity records kept, got {}",
+                store.identities.len()
+            );
+            assert_eq!(
+                store.orphaned_identities.len(),
+                kept,
+                "case {case:?}: expected the queue to hold {kept} entries, got {}",
+                store.orphaned_identities.len()
+            );
+            // The oldest orphans are the ones given up, so the records kept are the LAST
+            // `kept` to be orphaned — which is what makes a call about a recently deleted
+            // pool report that pool.
+            for identity_id in &orphaned_in_order[orphaned_in_order.len() - kept..] {
+                assert!(
+                    store.identities.contains_key(identity_id),
+                    "case {case:?}: {identity_id} was orphaned last and must be kept"
+                );
+            }
+            for identity_id in &orphaned_in_order[..orphaned_in_order.len() - kept] {
+                assert!(
+                    !store.identities.contains_key(identity_id),
+                    "case {case:?}: {identity_id} was orphaned first and must be given up"
+                );
+            }
+        }
     }
 }
