@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNetworkAclEntry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNetworkAclEntry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNetworkAclEntry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: takes one entry (a rule) off the network ACL the request names, so
+//! `DescribeNetworkAcls` stops reporting the rule the caller removed. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +144,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNetworkAclEntry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNetworkAclEntryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNetworkAclEntry"))
+        use crate::state;
+
+        // A network ACL carries no Region or ARN member, so nothing here depends on the
+        // Region the request was signed for. The store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        // "The ID of the network ACL" (`$NetworkAclId`): the id's FORM first, before any
+        // other member is looked at and before the store is — a value that is not a network
+        // ACL id at all names nothing that could exist in any account. `CreateNetworkAclEntry`
+        // reads it in the same order.
+        let network_acl_id = input.network_acl_id.as_str();
+        state::require_well_formed_id(
+            state::NETWORK_ACL_ID_PREFIX,
+            network_acl_id,
+            state::INVALID_NETWORK_ACL_ID_MALFORMED,
+        )?;
+
+        // "The range 32767 to 65535 is reserved for internal use"
+        // (`CreateNetworkAclEntryRequest$RuleNumber`), which is where the catch-all deny every
+        // ACL ends with sits: a caller cannot write a rule there, and cannot take one away
+        // either — an ACL with no catch-all entry is a state the service never produces. The
+        // bound is read before the ACL's own entries are, so the refusal does not depend on
+        // what the ACL holds.
+        if !state::NETWORK_ACL_ENTRY_RULE_NUMBERS.contains(&input.rule_number) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({number}) for parameter ruleNumber is invalid. Rulenumber must be \
+                 in range {first}..{last}",
+                number = input.rule_number,
+                first = state::NETWORK_ACL_ENTRY_RULE_NUMBERS.start(),
+                last = state::NETWORK_ACL_ENTRY_RULE_NUMBERS.end(),
+            )));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // The id itself, now that the store can be asked: an entry cannot be taken off an
+        // ACL the account does not hold.
+        if !store.network_acls.contains_key(network_acl_id) {
+            return Err(state::invalid_network_acl_id_not_found(network_acl_id));
+        }
+
+        // "Deletes the specified ingress or egress entry (rule) from the specified network
+        // ACL" (this operation's own doc): the rule number identifies one entry WITHIN the
+        // direction `Egress` names — "Each network ACL has a set of numbered ingress rules
+        // and a separate set of numbered egress rules" (`CreateNetworkAclEntry`) — so an
+        // entry the ACL does not hold is refused rather than deleted as a no-op.
+        if !store.network_acl_holds_entry(network_acl_id, input.rule_number, input.egress) {
+            return Err(state::invalid_network_acl_entry_not_found(input.rule_number));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Removing is also what RESOLVES the entry, so the entry that left the store is the
+        // entry the check above found.
+        if store
+            .remove_network_acl_entry(network_acl_id, input.rule_number, input.egress)
+            .is_none()
+        {
+            return Err(state::invalid_network_acl_entry_not_found(input.rule_number));
+        }
+
+        // The operation's modelled output is `Unit`, so there is nothing to project.
+        Ok(DeleteNetworkAclEntryOutput)
     }
 }

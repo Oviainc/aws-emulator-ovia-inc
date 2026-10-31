@@ -1639,7 +1639,8 @@ use crate::ops::types::{
     IpamResourceDiscovery, IpamResourceDiscoveryAssociation, IpamResourceTag,
     IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta, IpamScope,
     MemoryInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo, VCpuInfo,
-    InstanceState, InstanceTypeOffering, InterruptionInfo, IpPermission, IpRange, Ipv6Range,
+    InstanceState, InstanceTypeOffering, InterruptibleCapacityAllocation, InterruptionInfo,
+    IpPermission, IpRange, Ipv6Range,
     LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, MacModificationTask, MacSystemIntegrityProtectionConfiguration,
     Monitoring, NatGateway, NetworkInsightsAccessScope,
@@ -8856,6 +8857,18 @@ impl ComAmazonawsEc2Amazonec2State {
                         allocation.status =
                             Some(INTERRUPTIBLE_ALLOCATION_STATUS_ACTIVE.to_string());
                         allocation.instance_count = allocation.target_instance_count;
+                    }
+                }
+                CapacityReservationMove::AllocationCanceled => {
+                    if let Some(allocation) = record.view.interruptible_capacity_allocation.as_mut()
+                    {
+                        // The end of a cancellation: the capacity has gone back to the
+                        // source reservation (the counts went with the call that cancelled
+                        // it), so nothing is allocated to the interruptible reservation any
+                        // more and the allocation is in its terminal status.
+                        allocation.status =
+                            Some(INTERRUPTIBLE_ALLOCATION_STATUS_CANCELED.to_string());
+                        allocation.instance_count = Some(0);
                     }
                 }
             }
@@ -24417,6 +24430,19 @@ pub const CAPACITY_RESERVATION_STATE_PAYMENT_PENDING: &str = "payment-pending";
 /// reservation will transition to.
 pub const CAPACITY_RESERVATION_STATE_CANCELLING: &str = "cancelling";
 
+/// "`cancelled` - The Capacity Reservation was canceled. The reserved capacity is no longer
+/// available for your use" (`CapacityReservation$State`), the TERMINAL state
+/// `CancelCapacityReservation` moves a reservation to: "Cancels the specified Capacity
+/// Reservation, releases the reserved capacity, and changes the Capacity Reservation's state
+/// to `cancelled`" (that operation's own doc).
+pub const CAPACITY_RESERVATION_STATE_CANCELLED: &str = "cancelled";
+
+/// "`delayed` - (Future-dated Capacity Reservations) Amazon EC2 encountered a delay in
+/// provisioning the requested future-dated Capacity Reservation" (`CapacityReservation$State`)
+/// — one of the states a reservation can still be cancelled from
+/// (`CancelCapacityReservation`).
+pub const CAPACITY_RESERVATION_STATE_DELAYED: &str = "delayed";
+
 /// "Valid range: 1 - 1000" (`CreateCapacityReservationRequest$InstanceCount`). The model
 /// puts no `@range` on the member, so this is the only place the published one is kept.
 pub const CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE: ::std::ops::RangeInclusive<i32> = 1..=1000;
@@ -24467,6 +24493,31 @@ pub const INTERRUPTIBLE_ALLOCATION_STATUS_PENDING: &str = "pending";
 /// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] moves a `pending`
 /// allocation to once [`TRANSITION_DELAY`] has passed.
 pub const INTERRUPTIBLE_ALLOCATION_STATUS_ACTIVE: &str = "active";
+
+/// The status of an interruptible allocation whose size is being changed: that enum's
+/// `updating` member — "The current status of the allocation (updating during reclamation,
+/// active when complete)" (`InterruptibleCapacityAllocation$Status`) — where an allocation
+/// sits between the call that changes its `TargetInstanceCount` and the instant the capacity
+/// has moved.
+pub const INTERRUPTIBLE_ALLOCATION_STATUS_UPDATING: &str = "updating";
+
+/// The status of an interruptible allocation whose capacity is on its way back to the
+/// source reservation: that enum's `canceling` member, where an allocation sits between the
+/// call that cancels it and the instant the capacity has been reclaimed.
+pub const INTERRUPTIBLE_ALLOCATION_STATUS_CANCELING: &str = "canceling";
+
+/// That enum's `canceled` member: the TERMINAL status of an allocation whose capacity has
+/// gone back to the source reservation, which
+/// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] moves a `canceling`
+/// allocation to once [`TRANSITION_DELAY`] has passed.
+pub const INTERRUPTIBLE_ALLOCATION_STATUS_CANCELED: &str = "canceled";
+
+/// The constant the request's creating status is kept as: the `CREATING` of "The current
+/// status of the allocation request (creating, active, updating)"
+/// (`CreateInterruptibleCapacityReservationAllocationResult$Status`), the one word that
+/// vocabulary has which the allocation's own enum does not — every other request status is
+/// the allocation's own status in the same upper-case vocabulary.
+pub const INTERRUPTIBLE_ALLOCATION_REQUEST_STATUS_CREATING: &str = "CREATING";
 
 /// "Specify `default` to cancel the interruptible Capacity Reservation and return the
 /// capacity to your source Capacity Reservation. The default value is `default`"
@@ -24521,6 +24572,10 @@ pub enum CapacityReservationMove {
     /// `TargetInstanceCount` allocated — the completion of the `pending` move
     /// `CreateInterruptibleCapacityReservationAllocation` starts on the SOURCE reservation.
     AllocationActive,
+    /// The interruptible allocation the reservation carries reaches `canceled` with nothing
+    /// allocated to it — the completion of the `canceling` move a cancellation starts on the
+    /// SOURCE reservation, after which the capacity is the source's again.
+    AllocationCanceled,
 }
 
 /// The move the clock owes one Capacity Reservation: a [`ClockTransition`] to the next
@@ -24619,7 +24674,44 @@ impl CapacityReservationRecord {
     pub fn view_at(&self, now: SystemTime) -> CapacityReservation {
         let mut view = self.view.clone();
         view.state = Some(self.state_at(now).to_string());
+        view.interruptible_capacity_allocation = self.interruptible_capacity_allocation_at(now);
         view
+    }
+
+    /// The interruptible allocation this reservation carries as of `now`, or `None` for one
+    /// that carries none.
+    ///
+    /// The allocation's own move is a fact of the CLOCK, exactly like the reservation's state
+    /// above: an allocation answered `pending` is complete — "active when complete"
+    /// (`InterruptibleCapacityAllocation$Status`), with the instances the request asked for
+    /// allocated — from the instant its [`CapacityReservationTransition`] fell due, and one
+    /// answered `canceling` is `canceled` with nothing allocated from the instant its own
+    /// move fell due, whether or not anybody called again. Derived here rather than stored,
+    /// so a REPORTING operation shows what was already due without writing it; the same
+    /// moves [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] writes for the
+    /// operations that do write.
+    pub fn interruptible_capacity_allocation_at(
+        &self,
+        now: SystemTime,
+    ) -> Option<InterruptibleCapacityAllocation> {
+        let mut allocation = self.view.interruptible_capacity_allocation.clone()?;
+        let due = self
+            .pending
+            .as_ref()
+            .filter(|pending| now >= pending.at)
+            .map(|pending| pending.to);
+        match due {
+            Some(CapacityReservationMove::AllocationActive) => {
+                allocation.status = Some(INTERRUPTIBLE_ALLOCATION_STATUS_ACTIVE.to_string());
+                allocation.instance_count = allocation.target_instance_count;
+            }
+            Some(CapacityReservationMove::AllocationCanceled) => {
+                allocation.status = Some(INTERRUPTIBLE_ALLOCATION_STATUS_CANCELED.to_string());
+                allocation.instance_count = Some(0);
+            }
+            _ => {}
+        }
+        Some(allocation)
     }
 
     /// "The remaining capacity. Indicates the number of instances that can be launched in
@@ -24790,9 +24882,15 @@ impl ComAmazonawsEc2Amazonec2State {
             // allocated to a running instance.
             capacity_allocations: Some(Vec::new()),
             reservation_type: Some(CAPACITY_RESERVATION_TYPE_DEFAULT.to_string()),
-            // Billing of the unused capacity is assigned to another account only by
-            // `AssociateCapacityReservationBillingOwner`, which is still a scaffold.
-            unused_reservation_billing_owner_id: None,
+            // "The ID of the Amazon Web Services account to which billing of the unused
+            // capacity of the Capacity Reservation is assigned"
+            // (`CapacityReservation$UnusedReservationBillingOwnerId`): the owner's own
+            // account until `AssociateCapacityReservationBillingOwner` assigns it to
+            // another one, so every reservation reports the account that is billed for the
+            // capacity nothing has launched into.
+            unused_reservation_billing_owner_id: Some(
+                ::engine::emulator_account_id().to_string(),
+            ),
             // "Information about the commitment for the Capacity Reservation"
             // (`CapacityReservation$CommitmentInfo`) and "The delivery method"
             // (`$DeliveryPreference`): members of a future-dated reservation only, so a
@@ -24842,6 +24940,204 @@ impl ComAmazonawsEc2Amazonec2State {
             },
         );
         Some(capacity_reservation_id)
+    }
+
+    /// Cancel the Capacity Reservation `capacity_reservation_id` names, and answer whether
+    /// the store held one.
+    ///
+    /// "Cancels the specified Capacity Reservation, releases the reserved capacity, and
+    /// changes the Capacity Reservation's state to `cancelled`"
+    /// (`CancelCapacityReservation`): the ONE place that transition is written, so the
+    /// operation that cancels and every reader of a cancelled reservation agree on what it
+    /// holds. The reserved capacity stays the reservation's own count — "the total number of
+    /// instances for which the Capacity Reservation reserves capacity"
+    /// (`CapacityReservation$TotalInstanceCount`) is what was reserved, whatever state the
+    /// reservation ends in.
+    ///
+    /// An interruptible allocation ties two reservations together and cannot outlive either
+    /// of them, so the pair is released here too
+    /// ([`Self::release_interruptible_allocation`]): cancelling an interruptible reservation
+    /// releases the allocation recorded on its source, and cancelling a source that carries
+    /// one cancels the interruptible reservation that allocation created. Either way the
+    /// allocated capacity is the source's again and the allocation reaches its terminal
+    /// status on the clock.
+    pub fn cancel_capacity_reservation(&mut self, capacity_reservation_id: &str) -> bool {
+        let Some(record) = self.capacity_reservations.get(capacity_reservation_id) else {
+            return false;
+        };
+        let allocated_from = record
+            .view
+            .interruption_info
+            .as_ref()
+            .and_then(|info| info.source_capacity_reservation_id.clone());
+        let carries_allocation = record.view.interruptible_capacity_allocation.is_some();
+        if let Some(record) = self.capacity_reservations.get_mut(capacity_reservation_id) {
+            record.view.state = Some(CAPACITY_RESERVATION_STATE_CANCELLED.to_string());
+            record.pending = None;
+        }
+        if let Some(source_id) = allocated_from {
+            self.release_interruptible_allocation(&source_id);
+        }
+        if carries_allocation {
+            self.release_interruptible_allocation(capacity_reservation_id);
+        }
+        true
+    }
+
+    /// Release the interruptible allocation recorded on the source Capacity Reservation
+    /// `source_id`: the allocated capacity goes back to the source, the interruptible
+    /// reservation that allocation created is cancelled, and the allocation starts the move
+    /// to its terminal status the clock owes it.
+    ///
+    /// "A value of `default` cancels the interruptible Capacity Reservation and returns the
+    /// capacity to your source Capacity Reservation"
+    /// (`InterruptibleCapacityAllocation$ZeroSizePreference`) — returning the capacity is
+    /// what a cancellation of the allocation does, so the counts the allocation drew out of
+    /// the source ([`crate::ops::create_interruptible_capacity_reservation_allocation`]) are
+    /// added back to it here.
+    ///
+    /// Silent for a reservation that carries no allocation, and idempotent for one whose
+    /// allocation is already on its way out: an allocation is released once however many
+    /// times either side of it is cancelled.
+    ///
+    /// The move is recorded in the record's one `pending` slot, which also carries the
+    /// reservation's OWN state moves ([`CapacityReservationMove::Active`] /
+    /// [`CapacityReservationMove::Scheduled`], read by
+    /// [`CapacityReservationRecord::state_at`]). That is sound because capacity can only be
+    /// allocated out of an `active` reservation with no end date
+    /// (`CreateInterruptibleCapacityReservationAllocation`), and a reservation already in
+    /// `active` is owed no state move — so a source carrying an allocation never has one of
+    /// those pending for this to overwrite.
+    fn release_interruptible_allocation(&mut self, source_id: &str) {
+        let interruptible_id = {
+            let Some(record) = self.capacity_reservations.get_mut(source_id) else {
+                return;
+            };
+            let Some(allocation) = record.view.interruptible_capacity_allocation.as_mut() else {
+                return;
+            };
+            if matches!(
+                allocation.status.as_deref(),
+                Some(INTERRUPTIBLE_ALLOCATION_STATUS_CANCELING)
+                    | Some(INTERRUPTIBLE_ALLOCATION_STATUS_CANCELED)
+            ) {
+                return;
+            }
+            let returned = allocation.target_instance_count.unwrap_or_default();
+            let interruptible_id = allocation.interruptible_capacity_reservation_id.clone();
+            allocation.status = Some(INTERRUPTIBLE_ALLOCATION_STATUS_CANCELING.to_string());
+            record.view.total_instance_count = Some(
+                record
+                    .view
+                    .total_instance_count
+                    .unwrap_or_default()
+                    .saturating_add(returned),
+            );
+            record.view.available_instance_count = Some(
+                record
+                    .view
+                    .available_instance_count
+                    .unwrap_or_default()
+                    .saturating_add(returned),
+            );
+            // The terminal status is owed to the clock rather than written now, so a caller
+            // polling for it sees the `canceling` the model carries for the capacity still
+            // moving — and sees `canceled` from the instant it falls due, whether or not
+            // anybody calls again.
+            record.pending = Some(CapacityReservationTransition::starting_now(
+                CapacityReservationMove::AllocationCanceled,
+            ));
+            interruptible_id
+        };
+        if let Some(interruptible) = interruptible_id
+            .as_deref()
+            .and_then(|id| self.capacity_reservations.get_mut(id))
+        {
+            interruptible.view.state = Some(CAPACITY_RESERVATION_STATE_CANCELLED.to_string());
+            interruptible.pending = None;
+        }
+    }
+
+    /// Move the interruptible allocation recorded on the source Capacity Reservation
+    /// `source_id` to `target_instance_count` instances, and answer whether it was applied.
+    ///
+    /// "Modifies the number of instances allocated to an interruptible reservation, allowing
+    /// you to add more capacity or reclaim capacity to your source Capacity Reservation"
+    /// (`UpdateInterruptibleCapacityReservationAllocation`): the difference between the
+    /// target the allocation had and the one it is given MOVES between the two reservations —
+    /// out of the source to add capacity, back into it to reclaim — so the pair always
+    /// accounts for the capacity that was reserved. The caller must have checked that the
+    /// source has the capacity an increase asks for.
+    ///
+    /// The allocation is left `updating` — "updating during reclamation, active when
+    /// complete" (`InterruptibleCapacityAllocation$Status`) — and the clock owes it `active`
+    /// with the new target allocated, whether or not anybody calls again.
+    ///
+    /// `false`, with nothing written, for a reservation the store does not hold or one that
+    /// carries no allocation. The `pending` slot it writes carries the allocation's move on
+    /// the terms [`Self::release_interruptible_allocation`] states.
+    pub fn resize_interruptible_allocation(
+        &mut self,
+        source_id: &str,
+        target_instance_count: i32,
+    ) -> bool {
+        // What leaves the source — positive to allocate more, negative to reclaim — and the
+        // reservation it moves to, taken in one borrow of the source's record so the two
+        // halves of the move cannot disagree about the number.
+        let moved_to = {
+            let Some(record) = self.capacity_reservations.get_mut(source_id) else {
+                return false;
+            };
+            let Some(allocation) = record.view.interruptible_capacity_allocation.as_mut() else {
+                return false;
+            };
+            let moved = target_instance_count
+                .saturating_sub(allocation.target_instance_count.unwrap_or_default());
+            allocation.target_instance_count = Some(target_instance_count);
+            allocation.status = Some(INTERRUPTIBLE_ALLOCATION_STATUS_UPDATING.to_string());
+            let interruptible_id = allocation.interruptible_capacity_reservation_id.clone();
+            record.view.total_instance_count = Some(
+                record
+                    .view
+                    .total_instance_count
+                    .unwrap_or_default()
+                    .saturating_sub(moved),
+            );
+            record.view.available_instance_count = Some(
+                record
+                    .view
+                    .available_instance_count
+                    .unwrap_or_default()
+                    .saturating_sub(moved),
+            );
+            record.pending = Some(CapacityReservationTransition::starting_now(
+                CapacityReservationMove::AllocationActive,
+            ));
+            interruptible_id.map(|id| (id, moved))
+        };
+        // The allocation's own half of the move. An allocation naming no reservation has no
+        // other half to move — the source's side is applied either way, which is what makes
+        // this answer `true`.
+        let Some((interruptible_id, moved)) = moved_to else {
+            return true;
+        };
+        if let Some(interruptible) = self.capacity_reservations.get_mut(&interruptible_id) {
+            interruptible.view.total_instance_count = Some(
+                interruptible
+                    .view
+                    .total_instance_count
+                    .unwrap_or_default()
+                    .saturating_add(moved),
+            );
+            interruptible.view.available_instance_count = Some(
+                interruptible
+                    .view
+                    .available_instance_count
+                    .unwrap_or_default()
+                    .saturating_add(moved),
+            );
+        }
+        true
     }
 
     /// Store the pair one Capacity Block purchase buys — the block, and the Capacity
@@ -46890,28 +47186,34 @@ pub const DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER: i32 = 32767;
 ///
 /// The ONE definition of those entries, so a default ACL cannot be written two ways.
 pub fn default_network_acl_entries() -> Vec<NetworkAclEntry> {
-    [false, true]
+    let mut entries: Vec<NetworkAclEntry> = [false, true]
         .into_iter()
         .flat_map(|egress| {
             [
                 (DEFAULT_NETWORK_ACL_ALLOW_RULE_NUMBER, RULE_ACTION_ALLOW),
                 (DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER, RULE_ACTION_DENY),
             ]
-            .map(|(rule_number, rule_action)| NetworkAclEntry {
-                cidr_block: Some(ALL_IPV4_ADDRESSES.to_string()),
-                egress: Some(egress),
-                // ICMP type and code describe an entry whose protocol is ICMP, and a port
-                // range one whose protocol is TCP or UDP; this entry's protocol is every
-                // protocol, so it carries neither.
-                icmp_type_code: None,
-                ipv6_cidr_block: None,
-                port_range: None,
-                protocol: Some(ALL_IP_PROTOCOLS.to_string()),
-                rule_action: Some(rule_action.to_string()),
-                rule_number: Some(rule_number),
+            .map(|(rule_number, rule_action)| {
+                reported_network_acl_entry(NetworkAclEntry {
+                    cidr_block: Some(ALL_IPV4_ADDRESSES.to_string()),
+                    egress: Some(egress),
+                    // ICMP type and code describe an entry whose protocol is ICMP, and a
+                    // port range one whose protocol is TCP or UDP; this entry's protocol is
+                    // every protocol, so it carries neither of them filled in.
+                    icmp_type_code: None,
+                    ipv6_cidr_block: None,
+                    port_range: None,
+                    protocol: Some(ALL_IP_PROTOCOLS.to_string()),
+                    rule_action: Some(rule_action.to_string()),
+                    rule_number: Some(rule_number),
+                })
             })
         })
-        .collect()
+        .collect();
+    // Stored in the order an ACL's entries are reported in, through the one definition of
+    // that order.
+    entries.sort_by_key(network_acl_entry_report_order);
+    entries
 }
 
 /// The caller-chosen bytes one stored network ACL holds: its tags and the text of its
@@ -46921,20 +47223,16 @@ pub fn default_network_acl_entries() -> Vec<NetworkAclEntry> {
 ///
 /// The ONE definition of that charge, the way [`flow_log_payload_bytes`] is for a flow log:
 /// [`ComAmazonawsEc2Amazonec2State::insert_network_acl`] charges exactly it and
-/// [`ComAmazonawsEc2Amazonec2State::remove_network_acl`] gives back exactly it.
+/// [`ComAmazonawsEc2Amazonec2State::remove_network_acl`] gives back exactly it. One entry's
+/// own share of it is [`network_acl_entry_payload_bytes`], which is what an entry added to a
+/// stored ACL is charged.
 pub fn network_acl_payload_bytes(entries: &[NetworkAclEntry], tags: &[Tag]) -> usize {
-    let text = |value: Option<&str>| value.map_or(0, str::len);
     STORED_RECORD_OVERHEAD_BYTES
         .saturating_add(tag_list_bytes(tags))
         .saturating_add(
             entries
                 .iter()
-                .map(|entry| {
-                    text(entry.cidr_block.as_deref())
-                        .saturating_add(text(entry.ipv6_cidr_block.as_deref()))
-                        .saturating_add(text(entry.protocol.as_deref()))
-                        .saturating_add(text(entry.rule_action.as_deref()))
-                })
+                .map(network_acl_entry_payload_bytes)
                 .sum::<usize>(),
         )
 }

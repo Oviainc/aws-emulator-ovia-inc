@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNetworkAcl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNetworkAcl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNetworkAcl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the network ACL the request names from [`crate::state`], so every
+//! read of it afterwards answers the not-found refusal for its id. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +143,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNetworkAcl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNetworkAclErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNetworkAcl"))
+        use crate::state;
+
+        // A network ACL carries no Region or ARN member, so nothing here depends on the
+        // Region the request was signed for. The store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        // "The ID of the network ACL" (`$NetworkAclId`): the id's FORM first, before the
+        // store is touched at all — a value that is not a network ACL id names nothing that
+        // could exist in any account, and the sibling entry operations read it in the same
+        // order.
+        let network_acl_id = input.network_acl_id.as_str();
+        state::require_well_formed_id(
+            state::NETWORK_ACL_ID_PREFIX,
+            network_acl_id,
+            state::INVALID_NETWORK_ACL_ID_MALFORMED,
+        )?;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // The id itself: a delete that removed nothing must never answer as though it had.
+        let Some(network_acl) = store.network_acls.get(network_acl_id) else {
+            return Err(state::invalid_network_acl_id_not_found(network_acl_id));
+        };
+
+        // "You can't delete the default network ACL" (this operation's own doc): the ACL a
+        // VPC comes with exists for as long as the VPC does, so only `DeleteVpc` removes it.
+        if network_acl.is_default == Some(true) {
+            return Err(state::invalid_parameter_value(format!(
+                "The network acl '{network_acl_id}' is the default network acl and cannot \
+                 be deleted"
+            )));
+        }
+
+        // "You can't delete the ACL if it's associated with any subnets" (same doc): the
+        // associations are the ACL's dependencies, and each one is cleared by associating its
+        // subnet with another ACL or by deleting the subnet.
+        let associated = network_acl
+            .associations
+            .as_deref()
+            .unwrap_or_default()
+            .len();
+        if associated > 0 {
+            return Err(state::dependency_violation(format!(
+                "The networkAcl '{network_acl_id}' has dependencies and cannot be deleted."
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Removing is also what RESOLVES the id a second time, so the record that left the
+        // store is the record the checks above were made against — and the removal gives
+        // the bytes the ACL held back to the store's budget.
+        if store.remove_network_acl(network_acl_id).is_none() {
+            return Err(state::invalid_network_acl_id_not_found(network_acl_id));
+        }
+
+        // The operation's modelled output is `Unit`, so there is nothing to project.
+        Ok(DeleteNetworkAclOutput)
     }
 }

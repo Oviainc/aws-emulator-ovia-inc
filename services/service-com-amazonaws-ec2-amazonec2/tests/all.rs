@@ -17,6 +17,18 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The entries (rules) of a network ACL: what `CreateNetworkAclEntry` stores on a stored ACL
+// and in which order, what `DeleteNetworkAclEntry` takes off it, and the not-found answer
+// every read of a `DeleteNetworkAcl`-ed ACL gets. Declared beside `prefix_lists` for the
+// reason the note above gives: the sorted neighbourhood and the tail of this file are where
+// every new ec2 suite inserts its lines.
+#[path = "all/network_acl_entries.rs"]
+mod network_acl_entries;
+// What `CancelCapacityReservation` releases: the reservation's own `cancelled` state in every
+// reader of it, and the terminal status cancelling either side gives an interruptible
+// allocation. Declared beside `prefix_lists` for the reason the note above gives.
+#[path = "all/capacity_reservation_cancellation.rs"]
+mod capacity_reservation_cancellation;
 // `DescribeAddressesAttribute` as the projection of an Elastic IP address's `domain-name`
 // attribute state it is: which addresses carry a row, how `AllocationIds` filters them, what
 // it refuses, and how it pages. Declared beside `prefix_lists` for the reason the note above

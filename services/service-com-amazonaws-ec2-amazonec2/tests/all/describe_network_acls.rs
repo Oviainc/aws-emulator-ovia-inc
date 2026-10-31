@@ -232,9 +232,11 @@ fn with_icmp(mut entry: NetworkAclEntry, icmp_type: i32, code: i32) -> NetworkAc
 }
 
 /// The entries every default network ACL carries: in each direction, allow everything at
-/// rule 100 and the catch-all deny at 32767 (Amazon VPC User Guide, "Default network ACL").
+/// rule 100 and the catch-all deny at 32767 (Amazon VPC User Guide, "Default network ACL"),
+/// reported egress-first and then ingress, each by ascending rule number — the order an
+/// ACL's `entrySet` comes back in.
 fn default_entries() -> Vec<ReportedEntry> {
-    [false, true]
+    [true, false]
         .into_iter()
         .flat_map(|egress| {
             [("100", "allow"), ("32767", "deny")].map(|(rule_number, rule_action)| ReportedEntry {
@@ -244,8 +246,10 @@ fn default_entries() -> Vec<ReportedEntry> {
                 cidr_block: Some("0.0.0.0/0".to_string()),
                 ipv6_cidr_block: None,
                 egress: egress.to_string(),
-                port_range: None,
-                icmp_type_code: None,
+                // A reported entry carries both members; an entry whose protocol has no ICMP
+                // numbers and no ports carries them EMPTY rather than not at all.
+                port_range: Some((String::new(), String::new())),
+                icmp_type_code: Some((String::new(), String::new())),
             })
         })
         .collect()

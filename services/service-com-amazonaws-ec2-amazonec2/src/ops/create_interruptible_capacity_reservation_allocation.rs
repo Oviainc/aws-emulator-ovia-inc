@@ -3,7 +3,8 @@
 //! @op CreateInterruptibleCapacityReservationAllocation
 //! IMPLEMENTED: moves unused capacity out of the source Capacity Reservation the request
 //! names into a new interruptible Capacity Reservation [`crate::state`] stores, and
-//! answers the allocation's own status. This is the ONLY file to touch for this operation.
+//! answers the status of the allocation request it accepted. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -429,9 +430,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // charged here so no path can store them uncharged.
         store.add_stored_bytes(input.client_token.as_deref().map_or(0, str::len));
 
-        // The source gives up the capacity it just allocated: "the number of unused
-        // instances you want to allocate from your source reservation" is not available for
-        // it to launch any more, so a second allocation cannot claim the same instances.
+        // The source gives up the capacity it just allocated: this action "moves unused
+        // capacity out of" the source reservation, so the instances the allocation drew are
+        // no longer the source's to launch OR to reserve — both "the total number of
+        // instances for which the Capacity Reservation reserves capacity"
+        // (`CapacityReservation$TotalInstanceCount`) and "the remaining capacity"
+        // (`$AvailableInstanceCount`) drop by the allocated count, and the interruptible
+        // reservation holds exactly those instances under its own id. A second allocation
+        // therefore cannot claim the same instances, and the two reservations together still
+        // account for the capacity that was reserved.
+        //
         // The allocation itself is recorded on the source, which is where the model carries
         // it, and reports the move it has just started. The modelled
         // `InterruptibleCapacityReservationAllocationStatus` carries ONE word for a request
@@ -446,6 +454,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
         record.view.available_instance_count = Some(available - input.instance_count);
+        record.view.total_instance_count = Some(
+            record
+                .view
+                .total_instance_count
+                .unwrap_or_default()
+                .saturating_sub(input.instance_count),
+        );
         record.view.interruptible_capacity_allocation = Some(InterruptibleCapacityAllocation {
             instance_count: Some(0),
             target_instance_count: Some(input.instance_count),
@@ -475,6 +490,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Read out of the store rather than built from the request, so a replay of an idempotent
 /// request and the call that made it answer the same thing, and both report the status the
 /// clock has actually reached.
+///
+/// This operation's `Status` is the status of the allocation REQUEST — "The current status
+/// of the allocation request (creating, active, updating)"
+/// (`CreateInterruptibleCapacityReservationAllocationResult$Status`) — rather than the
+/// ALLOCATION's own status, which every reader of
+/// `InterruptibleCapacityAllocation$Status` reports as the stored enum word. The request's
+/// vocabulary is [`request_status`].
 fn allocation_response(
     store: &crate::state::ComAmazonawsEc2Amazonec2State,
     source_id: &str,
@@ -492,10 +514,34 @@ fn allocation_response(
                  to report"
             ))
         })?;
+    let status = request_status(allocation.status.as_deref());
     Ok(CreateInterruptibleCapacityReservationAllocationOutput {
         source_capacity_reservation_id: Some(source_id.to_string()),
         target_instance_count: allocation.target_instance_count,
-        status: allocation.status,
+        status: Some(status),
         interruption_type: allocation.interruption_type,
     })
+}
+
+/// The status of the allocation REQUEST whose allocation is in the status
+/// `allocation_status`.
+///
+/// ONE rule for every value, so no input is a special case: Amazon EC2 words the REQUEST's
+/// status in upper case (the `CREATING` of "The current status of the allocation request
+/// (creating, active, updating)",
+/// `CreateInterruptibleCapacityReservationAllocationResult$Status`), while the ALLOCATION's
+/// own status is the lower-case member of the modelled
+/// `InterruptibleCapacityReservationAllocationStatus` enum
+/// (`smithy_query(query="shape",shape="InterruptibleCapacityReservationAllocationStatus")`:
+/// `pending`, `active`, `updating`, `canceling`, `canceled`, `failed`). So the request's
+/// status is the allocation's status in that vocabulary — and an allocation that has not
+/// moved yet, which the enum calls `pending`, is a request still CREATING its allocation,
+/// the one word the request's vocabulary has that the enum does not.
+fn request_status(allocation_status: Option<&str>) -> String {
+    match allocation_status {
+        None | Some(crate::state::INTERRUPTIBLE_ALLOCATION_STATUS_PENDING) => {
+            crate::state::INTERRUPTIBLE_ALLOCATION_REQUEST_STATUS_CREATING.to_string()
+        }
+        Some(reached) => reached.to_ascii_uppercase(),
+    }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelCapacityReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelCapacityReservation`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: cancels the Capacity Reservation the request names — the reservation
+//! [`crate::state`] holds moves to `cancelled` and the interruptible allocation it is
+//! either side of is released, its capacity going back to the source reservation. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelCapacityReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +155,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelCapacityReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelCapacityReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelCapacityReservation"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — the store
+        // holds Capacity Reservations per account, so the Region a request was signed for
+        // does not narrow them. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // ONE reading of the wall clock for this call: the state the reservation is judged
+        // in, the state its refusal names and the commitment window it is measured against
+        // are the same instant.
+        let now = ::std::time::SystemTime::now();
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Every move the clock already owed — a future-dated request's `assessing` ->
+        // `scheduled` among them — is materialised before anything is read, so this call
+        // decides against the state a caller would have been shown anyway.
+        store.materialize_due_transitions();
+
+        // "The ID of the Capacity Reservation to be cancelled": an id the account holds no
+        // reservation for is an error, not a cancel of nothing.
+        let record =
+            state::require_known_capacity_reservation(&store, &input.capacity_reservation_id)?;
+        let reservation_id = input.capacity_reservation_id.clone();
+        let reservation_state = record.state_at(now).to_string();
+
+        // "You can't modify or cancel a Capacity Block" (this operation's own doc): the
+        // reservation that holds a block's capacity is bought for that block's window and
+        // goes with it.
+        if record.view.capacity_block_id.is_some() {
+            return Err(state::incorrect_state(format!(
+                "The Capacity Reservation '{reservation_id}' holds the capacity of a \
+                 Capacity Block, which cannot be cancelled"
+            )));
+        }
+
+        // "You can cancel a Capacity Reservation that is in the following states:
+        // `assessing` … `scheduled` … `active` … `delayed`" (this operation's own doc).
+        // Every other state is either terminal already or one in which no capacity was
+        // reserved, so the refusal is the one this crate words for a request a resource's own
+        // state forbids, naming the state it is in.
+        if !CANCELLABLE_STATES.contains(&reservation_state.as_str()) {
+            return Err(state::incorrect_state_of(
+                CAPACITY_RESERVATION,
+                &reservation_id,
+                &reservation_state,
+            ));
+        }
+
+        // Whether this cancellation falls inside a commitment: a reservation cancelled
+        // "during the commitment duration … requires a cancellation quote", and past it
+        // "the commitment duration has elapsed" and the cancel needs none (this operation's
+        // own doc).
+        let within_commitment = record
+            .view
+            .commitment_info
+            .as_ref()
+            .and_then(|commitment| commitment.commitment_end_date)
+            .and_then(|end_date| ::std::time::SystemTime::try_from(end_date).ok())
+            .is_some_and(|end_date| end_date > now);
+
+        // "The ID of the cancellation quote to use for the cancellation … The cancellation
+        // quote must be in an active state" (`$QuoteId`): a quote generated for another
+        // reservation, or one that is not usable, cannot pay for this cancellation. The id's
+        // own FORM is read before any lookup, so a value that is not a quote id is
+        // malformed rather than reported as a quote the account does not hold.
+        if let Some(quote_id) = input.quote_id.as_deref() {
+            if !state::capacity_reservation_cancellation_quote_id_is_well_formed(quote_id) {
+                return Err(state::invalid_capacity_reservation_cancellation_quote_id_malformed(
+                    quote_id,
+                ));
+            }
+            let quote = store
+                .capacity_reservation_cancellation_quotes
+                .get(quote_id)
+                .ok_or_else(|| {
+                    state::invalid_capacity_reservation_cancellation_quote_id_not_found(quote_id)
+                })?;
+            if quote.view.capacity_reservation_id.as_deref() != Some(reservation_id.as_str()) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{quote_id}' for quoteId: the cancellation quote was \
+                     generated for another Capacity Reservation"
+                )));
+            }
+            let quote_state = quote.quote_state_at(now).to_string();
+            if quote_state != state::CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE {
+                return Err(state::incorrect_state(format!(
+                    "The cancellation quote '{quote_id}' is in state '{quote_state}', not \
+                     '{active}', so it cannot be used for a cancellation",
+                    active = state::CAPACITY_RESERVATION_CANCELLATION_QUOTE_STATE_ACTIVE,
+                )));
+            }
+        }
+
+        // "Use CreateCapacityReservationCancellationQuote to generate a quote, then pass the
+        // quote ID with ApplyCancellationCharges set to `commitment-wind-down`" — both of
+        // them, for a reservation still inside its commitment.
+        if within_commitment && input.quote_id.is_none() {
+            return Err(state::missing_parameter(format!(
+                "The request must contain the parameter quoteId: the Capacity Reservation \
+                 '{reservation_id}' is within its commitment duration"
+            )));
+        }
+        if within_commitment
+            && input.apply_cancellation_charges.as_deref()
+                != Some(state::APPLY_CANCELLATION_CHARGES_COMMITMENT_WIND_DOWN)
+        {
+            return Err(state::missing_parameter(format!(
+                "The request must contain the parameter applyCancellationCharges set to \
+                 '{charges}': the Capacity Reservation '{reservation_id}' is within its \
+                 commitment duration",
+                charges = state::APPLY_CANCELLATION_CHARGES_COMMITMENT_WIND_DOWN,
+            )));
+        }
+
+        // DryRun sits AFTER the reservation has been resolved and every precondition
+        // checked, and BEFORE the first write: "Checks whether you have the required
+        // permissions for the action, without actually making the request" (`DryRun`), so a
+        // request that would have been refused is refused with that reason instead, and one
+        // that would have succeeded leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "Cancels the specified Capacity Reservation, releases the reserved capacity, and
+        // changes the Capacity Reservation's state to `cancelled`", through the ONE place
+        // this crate writes that transition — which is also what releases the interruptible
+        // allocation this reservation is either side of.
+        if !store.cancel_capacity_reservation(&reservation_id) {
+            return Err(Scaffolded::internal_error(format!(
+                "the Capacity Reservation '{reservation_id}' could not be read back to \
+                 cancel it"
+            )));
+        }
+
+        // "Returns `true` if the request succeeds; otherwise, it returns an error"
+        // (`$Return`).
+        Ok(CancelCapacityReservationOutput {
+            r#return: Some(true),
+        })
     }
 }
+
+/// The `CapacityReservationState`s a Capacity Reservation can be cancelled from: "You can
+/// cancel a Capacity Reservation that is in the following states: `assessing` … `scheduled`
+/// … `active` … `delayed`" (`CancelCapacityReservation`).
+///
+/// Every other member of the modelled enum
+/// (`smithy_query(query="shape",shape="CapacityReservationState")`) is either terminal
+/// already — `cancelled`, `expired`, `failed`, `payment-failed`, `unsupported` — or a state
+/// in which no capacity is held yet, so there is nothing to release.
+const CANCELLABLE_STATES: [&str; 4] = [
+    crate::state::CAPACITY_RESERVATION_STATE_ACTIVE,
+    crate::state::CAPACITY_RESERVATION_STATE_ASSESSING,
+    crate::state::CAPACITY_RESERVATION_STATE_SCHEDULED,
+    crate::state::CAPACITY_RESERVATION_STATE_DELAYED,
+];
+
+/// The KIND of resource this operation's state refusal names, as the sibling operations that
+/// refuse on a Capacity Reservation's state spell it
+/// (`crate::ops::move_capacity_reservation_instances`).
+const CAPACITY_RESERVATION: &str = "Capacity Reservation";

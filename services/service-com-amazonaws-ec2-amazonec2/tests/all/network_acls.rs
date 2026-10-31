@@ -169,9 +169,10 @@ fn reported_entries(case: &str, body: &str) -> Vec<ReportedEntry> {
 }
 
 /// The entries AWS gives a network ACL a caller just created: the catch-all deny in each
-/// direction, ingress first, as the wire renders them.
+/// direction, EGRESS first, as the wire renders them — the order an ACL's `entrySet` comes
+/// back in (the egress rules, then the ingress rules, each by ascending rule number).
 fn catch_all_entries() -> Vec<ReportedEntry> {
-    ["false", "true"]
+    ["true", "false"]
         .into_iter()
         .map(|egress| {
             (

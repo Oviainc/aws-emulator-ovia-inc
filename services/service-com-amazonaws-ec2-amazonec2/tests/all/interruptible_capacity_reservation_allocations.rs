@@ -21,9 +21,9 @@
 //!    one that already carries an allocation are refused with `IncorrectState`, and an
 //!    `InstanceCount` outside `1..=AvailableInstanceCount` with `InvalidParameterValue`.
 //! 3. A successful allocation MOVES that many unused instances out of the source into a new
-//!    interruptible Capacity Reservation: the source's `AvailableInstanceCount` drops by the
-//!    allocated count and carries the allocation naming the reservation it created, which
-//!    reserves the same capacity under its own id.
+//!    interruptible Capacity Reservation: both the source's `TotalInstanceCount` and its
+//!    `AvailableInstanceCount` drop by the allocated count, and it carries the allocation
+//!    naming the reservation it created, which reserves the same capacity under its own id.
 //! 4. The allocation starts `pending` — the one word the modelled
 //!    `InterruptibleCapacityReservationAllocationStatus` carries for a request that was
 //!    accepted and is not complete — and the CLOCK owes it `active` ("active when complete",
@@ -44,7 +44,8 @@ use std::time::{Duration, SystemTime};
 use ec2::ops::types::{Tag, CAPACITY_RESERVATION_STATE_VALUES};
 use ec2::state::ComAmazonawsEc2Amazonec2State as Ec2State;
 use ec2::state::{
-    CapacityReservationSpec, CAPACITY_RESERVATION_STATE_ACTIVE, INTERRUPTIBLE_ALLOCATION_STATUS_ACTIVE,
+    CapacityReservationSpec, CAPACITY_RESERVATION_STATE_ACTIVE, INTERRUPTIBLE_ALLOCATION_REQUEST_STATUS_CREATING,
+    INTERRUPTIBLE_ALLOCATION_STATUS_ACTIVE,
     INTERRUPTIBLE_ALLOCATION_STATUS_PENDING, INTERRUPTION_TYPE_ADHOC,
     MAX_STORED_CAPACITY_RESERVATIONS, TRANSITION_DELAY, ZERO_SIZE_PREFERENCE_DEFAULT,
     ZERO_SIZE_PREFERENCE_RETAIN,
@@ -213,10 +214,10 @@ fn source_spec(
 
 /// Write one source Capacity Reservation straight into the engine's store.
 ///
-/// Only for the states no implemented operation puts a reservation in: nothing cancels or
-/// fails a reservation yet (`CancelCapacityReservation` and the rest of that family are
-/// still scaffolds), so a row that needs one is seeded here. Every other row goes through
-/// `CreateCapacityReservation` over the wire ([`create_source`]).
+/// Only for the states no implemented operation puts a reservation in — a `failed` or an
+/// `expired` one — so a row that needs one is seeded here. Every other row goes through
+/// `CreateCapacityReservation` over the wire ([`create_source`]), and a `cancelled` one
+/// through `CancelCapacityReservation` (see [`super::capacity_reservation_cancellation`]).
 fn seed_source(engine: &engine::InMemoryEngine, spec: CapacityReservationSpec) -> String {
     engine
         .state::<Ec2State>()
@@ -486,7 +487,13 @@ async fn an_allocation_moves_unused_capacity_into_a_new_interruptible_reservatio
         for (member, expected) in [
             ("sourceCapacityReservationId", source.clone()),
             ("targetInstanceCount", count.to_string()),
-            ("status", INTERRUPTIBLE_ALLOCATION_STATUS_PENDING.to_string()),
+            // This operation reports the status of the allocation REQUEST, which has just
+            // been accepted; the ALLOCATION's own status is `pending` until the clock moves
+            // it, and is asserted below where a reader reports it.
+            (
+                "status",
+                INTERRUPTIBLE_ALLOCATION_REQUEST_STATUS_CREATING.to_string(),
+            ),
             ("interruptionType", INTERRUPTION_TYPE_ADHOC.to_string()),
         ] {
             assert_eq!(
@@ -496,13 +503,14 @@ async fn an_allocation_moves_unused_capacity_into_a_new_interruptible_reservatio
             );
         }
 
-        // The source, read back: the allocated instances are no longer available for it to
-        // launch, and the allocation it now carries names the reservation they went to.
+        // The source, read back: the allocated instances left it — they are neither
+        // reserved by it nor available for it to launch any more — and the allocation it now
+        // carries names the reservation they went to.
         let report = reported_usage(&router, case, &source).await;
         for (member, expected) in [
             ("capacityReservationId", source.clone()),
             ("instanceType", "c5.xlarge".to_string()),
-            ("totalInstanceCount", capacity.to_string()),
+            ("totalInstanceCount", (capacity - count).to_string()),
             ("availableInstanceCount", (capacity - count).to_string()),
             ("state", CAPACITY_RESERVATION_STATE_ACTIVE.to_string()),
             ("interruptible", "false".to_string()),

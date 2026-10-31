@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateInterruptibleCapacityReservationAllocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateInterruptibleCapacityReservationAllocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateInterruptibleCapacityReservationAllocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the interruptible allocation the source Capacity Reservation carries to
+//! the instance count the request names — capacity out of the source to add, back into it to
+//! reclaim — and cancels the allocation at zero unless it is set to be retained. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +149,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateInterruptibleCapacityReservationAllocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateInterruptibleCapacityReservationAllocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — the store
+        // holds Capacity Reservations per account, so the Region a request was signed for
+        // does not narrow them. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Specifies the UPDATED behavior for the interruptible Capacity Reservation when you
+        // reduce its allocation to zero instances" (`$ZeroSizePreference`). The member targets
+        // a modelled enum, so the boundary validator has already refused any other word; this
+        // maps the one the request carries onto the catalog's own `&'static str`, so nothing
+        // taken from a request is stored as a state word. A request that names none leaves the
+        // preference the allocation already has.
+        let zero_size_preference = match input.zero_size_preference.as_deref() {
+            None => None,
+            Some(state::ZERO_SIZE_PREFERENCE_RETAIN) => Some(state::ZERO_SIZE_PREFERENCE_RETAIN),
+            Some(state::ZERO_SIZE_PREFERENCE_DEFAULT) => Some(state::ZERO_SIZE_PREFERENCE_DEFAULT),
+            Some(other) => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{other}' for zeroSizePreference"
+                )))
+            }
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Every move the clock already owed — an earlier allocation's `pending` -> `active`
+        // among them — is materialised before anything is read, so this call decides against
+        // the state a caller would have been shown anyway.
+        store.materialize_due_transitions();
+
+        // "The ID of the source Capacity Reservation containing the interruptible allocation
+        // to modify" (`$CapacityReservationId`): an id the account holds no reservation for is
+        // an error, not a change to nothing.
+        let source = state::require_known_capacity_reservation(&store, &input.capacity_reservation_id)?;
+        let source_id = input.capacity_reservation_id.clone();
+        let source_state = source.state_at(now).to_string();
+
+        // There is nothing to modify on a reservation that never allocated anything:
+        // `CreateInterruptibleCapacityReservationAllocation` is what makes an allocation, and
+        // this call changes the size of the one it made.
+        let Some(allocation) = source.view.interruptible_capacity_allocation.clone() else {
+            return Err(state::incorrect_state(format!(
+                "The Capacity Reservation '{source_id}' carries no interruptible allocation \
+                 to modify; create one with \
+                 CreateInterruptibleCapacityReservationAllocation"
+            )));
+        };
+        // An allocation on its way out is not resized: its capacity is already going back to
+        // the source, and the reservation it was held under is cancelled.
+        if matches!(
+            allocation.status.as_deref(),
+            Some(state::INTERRUPTIBLE_ALLOCATION_STATUS_CANCELING)
+                | Some(state::INTERRUPTIBLE_ALLOCATION_STATUS_CANCELED)
+        ) {
+            return Err(state::incorrect_state(format!(
+                "The interruptible allocation of the Capacity Reservation '{source_id}' is \
+                 in status '{status}', so its size cannot be changed",
+                status = allocation.status.as_deref().unwrap_or_default(),
+            )));
+        }
+        // Capacity moves out of the source, so the source has to be holding capacity to move.
+        if source_state != state::CAPACITY_RESERVATION_STATE_ACTIVE {
+            return Err(state::incorrect_state(format!(
+                "The Capacity Reservation '{source_id}' is in state '{source_state}', not \
+                 '{active}', so its interruptible allocation cannot be changed",
+                active = state::CAPACITY_RESERVATION_STATE_ACTIVE,
+            )));
+        }
+
+        // "The new number of instances to allocate. Enter a higher number to add more
+        // capacity to share, or a lower number to reclaim capacity to your source Capacity
+        // Reservation" (`$TargetInstanceCount`). A request that names none asks for no change
+        // in size. Zero is the one count below what an allocation can be CREATED with, and it
+        // is what `ZeroSizePreference` is about, so the range starts there.
+        let current_target = allocation.target_instance_count.unwrap_or_default();
+        let target = input.target_instance_count.unwrap_or(current_target);
+        let highest = *state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE.end();
+        if !(0..=highest).contains(&target) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The instance count isn't valid. Enter a value between 0 and {highest} \
+                 instances, and try again"
+            )));
+        }
+        // Added capacity comes out of what the source has left: "you can only allocate
+        // available instances (also called unused capacity)"
+        // (`CreateInterruptibleCapacityReservationAllocationRequest$InstanceCount`), which is
+        // as true of adding to an allocation as of making one.
+        let available = source.available_instance_count();
+        let added = target.saturating_sub(current_target);
+        if added > available {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{target}' for targetInstanceCount: Capacity Reservation \
+                 '{source_id}' has {available} instances available for allocation"
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and the allocation resolved,
+        // and BEFORE the first write: "Checks whether you have the required permissions for
+        // the action, without actually making the request" (`DryRun`).
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The preference the allocation is judged by at zero: the one this request names, or
+        // the one it already had. Only the catalog's own words are ever stored, so a stored
+        // word that is not `retain` is the documented default.
+        let preference = match (zero_size_preference, allocation.zero_size_preference.as_deref()) {
+            (Some(named), _) => named,
+            (None, Some(state::ZERO_SIZE_PREFERENCE_RETAIN)) => {
+                state::ZERO_SIZE_PREFERENCE_RETAIN
+            }
+            (None, _) => state::ZERO_SIZE_PREFERENCE_DEFAULT,
+        };
+        if let Some(record) = store.capacity_reservations.get_mut(&source_id) {
+            if let Some(allocation) = record.view.interruptible_capacity_allocation.as_mut() {
+                allocation.zero_size_preference = Some(preference.to_string());
+            }
+        }
+
+        // "Specify `retain` to keep the interruptible Capacity Reservation active at zero
+        // capacity so that you can allocate instances to it again later. Specify `default` to
+        // cancel the interruptible Capacity Reservation and return the capacity to your source
+        // Capacity Reservation" (`$ZeroSizePreference`): at zero the preference decides
+        // whether the allocation survives, and everywhere else the size simply moves.
+        if target == 0 && preference == state::ZERO_SIZE_PREFERENCE_DEFAULT {
+            // The same release a cancellation of either side performs, through the one place
+            // this crate writes it: the capacity goes back to the source, the interruptible
+            // reservation is cancelled and the allocation reaches its terminal status on the
+            // clock.
+            if !store.cancel_capacity_reservation(
+                allocation
+                    .interruptible_capacity_reservation_id
+                    .as_deref()
+                    .unwrap_or_default(),
+            ) {
+                return Err(Scaffolded::internal_error(format!(
+                    "the interruptible Capacity Reservation of '{source_id}' could not be \
+                     read back to cancel it"
+                )));
+            }
+            // "The requested number of instances for the interruptible Capacity Reservation"
+            // (`$TargetInstanceCount`) is what this request asked for, which is none: the
+            // release above gave the capacity back against the target the allocation HAD, so
+            // the new target is recorded after it.
+            if let Some(allocation) = store
+                .capacity_reservations
+                .get_mut(&source_id)
+                .and_then(|record| record.view.interruptible_capacity_allocation.as_mut())
+            {
+                allocation.target_instance_count = Some(0);
+            }
+        } else if !store.resize_interruptible_allocation(&source_id, target) {
+            return Err(Scaffolded::internal_error(format!(
+                "the interruptible allocation of the Capacity Reservation '{source_id}' \
+                 could not be read back to resize it"
+            )));
+        }
+
+        // The answer is read back OUT of the store, so this call and a later
+        // `DescribeCapacityReservations` cannot report one allocation differently.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateInterruptibleCapacityReservationAllocation"))
+        // Its `Status` is the ALLOCATION's own status — "The current status of the allocation
+        // (updating during reclamation, active when complete)" (`$Status`), the same sentence
+        // `InterruptibleCapacityAllocation$Status` carries — so it is the stored lower-case
+        // member of the modelled enum, and NOT the request vocabulary
+        // `CreateInterruptibleCapacityReservationAllocation` answers, whose own member is
+        // documented as "the current status of the allocation request".
+        let Some(allocation) = store
+            .capacity_reservations
+            .get(&source_id)
+            .and_then(|record| record.view.interruptible_capacity_allocation.clone())
+        else {
+            return Err(Scaffolded::internal_error(format!(
+                "the Capacity Reservation '{source_id}' holds no interruptible allocation \
+                 to report"
+            )));
+        };
+        Ok(UpdateInterruptibleCapacityReservationAllocationOutput {
+            interruptible_capacity_reservation_id: allocation
+                .interruptible_capacity_reservation_id,
+            source_capacity_reservation_id: Some(source_id),
+            instance_count: allocation.instance_count,
+            target_instance_count: allocation.target_instance_count,
+            status: allocation.status,
+            interruption_type: allocation.interruption_type,
+        })
     }
 }
