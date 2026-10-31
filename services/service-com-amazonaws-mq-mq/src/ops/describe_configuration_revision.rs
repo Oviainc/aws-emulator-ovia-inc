@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConfigurationRevision
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConfigurationRevision`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one revision of the configuration an id names, out of this service's state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConfigurationRevision::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `ConfigurationId` that names no configuration, and a `ConfigurationRevision` that
+//! names no revision of it, are both answered with the modelled `NotFoundException`
+//! (HTTP 404). This operation only reports: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +71,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -147,18 +144,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConfigurationRevision` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConfigurationRevisionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConfigurationRevision"))
+        let _ = ctx;
+        let Some(service_state) = state::service_state(&*self.engine) else {
+            return Err(
+                DescribeConfigurationRevisionErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some("the service state store is unavailable".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let store = service_state.lock();
+        let Some(configuration) = store.configurations.get(&input.configuration_id) else {
+            return Err(
+                DescribeConfigurationRevisionErrorModeled::NotFoundException(NotFoundException {
+                    error_attribute: Some(state::CONFIGURATION_ID_ATTRIBUTE.to_string()),
+                    message: Some(state::configuration_not_found_message(
+                        &input.configuration_id,
+                    )),
+                    resource_share_errors: None,
+                })
+                .into(),
+            );
+        };
+
+        // `ConfigurationRevision` is the revision NUMBER, carried as a path label:
+        // a label that is not one of this configuration's revision numbers names
+        // no revision, whether it is out of range or not a number at all.
+        let revision = input
+            .configuration_revision
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .and_then(|number| {
+                configuration
+                    .revisions
+                    .iter()
+                    .find(|revision| revision.revision == number)
+            });
+        let Some(revision) = revision else {
+            return Err(
+                DescribeConfigurationRevisionErrorModeled::NotFoundException(NotFoundException {
+                    error_attribute: Some(state::CONFIGURATION_REVISION_ATTRIBUTE.to_string()),
+                    message: Some(state::configuration_revision_not_found_message(
+                        &input.configuration_id,
+                        &input.configuration_revision,
+                    )),
+                    resource_share_errors: None,
+                })
+                .into(),
+            );
+        };
+
+        Ok(DescribeConfigurationRevisionOutput {
+            configuration_id: Some(configuration.configuration_id.clone()),
+            created: Some(::aws_smithy_types::DateTime::from(revision.created)),
+            // The document the revision was made from, as the update sent it. The
+            // revision a CREATE makes holds the engine's own default settings,
+            // which no request supplied and this service does not generate, so
+            // that revision reports no document rather than an invented one.
+            data: revision.data.clone(),
+            description: Some(revision.description.clone()),
+            // The number of the revision this answer describes, read from the
+            // record it was resolved out of.
+            revision: Some(revision.revision),
+        })
     }
 }

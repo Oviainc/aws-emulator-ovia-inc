@@ -273,16 +273,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("configuration:{configuration_id}"),
         );
         // A created configuration holds the engine's default settings, so its
-        // first revision is the one Amazon MQ generates, numbered from one.
-        let first_revision = state::ConfigurationRevisionRecord {
-            revision: state::FIRST_CONFIGURATION_REVISION,
+        // first revision is the one Amazon MQ generates, numbered from one. No
+        // request member carries a configuration document for it.
+        let first_revision = state::ConfigurationRevisionRecord::accepted(
+            state::FIRST_CONFIGURATION_REVISION,
             created,
-            description: state::default_configuration_description(
+            state::default_configuration_description(
                 &input.name,
                 &input.engine_type,
                 &engine_version,
             ),
-        };
+            None,
+        );
         let configuration = state::ConfigurationRecord {
             configuration_id: configuration_id.clone(),
             configuration_arn: configuration_arn.clone(),
@@ -300,13 +302,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(CreateConfigurationOutput {
             arn: Some(configuration_arn),
-            authentication_strategy: Some(authentication_strategy),
+            // Reported in the spelling the configuration surface uses, derived
+            // from the modelled value the record holds.
+            authentication_strategy: Some(state::reported_configuration_authentication_strategy(
+                &authentication_strategy,
+            )),
             created: Some(::aws_smithy_types::DateTime::from(created)),
             id: Some(configuration_id),
             latest_revision: Some(ConfigurationRevision {
                 created: ::aws_smithy_types::DateTime::from(first_revision.created),
                 description: Some(first_revision.description),
                 revision: first_revision.revision,
+                is_invalid: first_revision.is_invalid,
             }),
             name: Some(input.name),
         })

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Makes the next revision of the configuration an id names, out of this service's
+//! state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The revision the call makes carries the `Description` the request supplied and the
+//! `Data` document it sent; a `ConfigurationId` that names no configuration is
+//! answered with the modelled `NotFoundException` (HTTP 404), and a `Data` that is not
+//! the base64 the member documents with `BadRequestException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +79,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,18 +153,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(service_state) = state::service_state(&*self.engine) else {
+            return Err(UpdateConfigurationErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the service state store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        // `Data` is "the base64-encoded XML configuration" (ActiveMQ) or "the
+        // base64-encoded Cuttlefish configuration" (RabbitMQ), so a value that is
+        // not base64 at all is refused naming the member — before any revision
+        // exists, which is what keeps a stored revision one this service accepted.
+        // The value that is CHECKED is the value that is stored, so a document the
+        // revision reports back is one that decodes.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConfiguration"))
+        // No recorded response covers the SENTENCE for this refusal, so it is
+        // worded the way this service words its other value refusals of a member a
+        // caller spelled wrongly (see `state::validate_configuration_name`).
+        let data = input.data.trim().to_string();
+        state::validate_present("data", &data).map_err(bad_request)?;
+        if ::aws_smithy_types::base64::decode(&data).is_err() {
+            return Err(bad_request(state::Invalid::new(
+                "data",
+                "Make sure your configuration data is base64-encoded.",
+            )));
+        }
+
+        let mut store = service_state.lock();
+        let Some(configuration) = store.configurations.get_mut(&input.configuration_id) else {
+            return Err(UpdateConfigurationErrorModeled::NotFoundException(
+                NotFoundException {
+                    error_attribute: Some(state::CONFIGURATION_ID_ATTRIBUTE.to_string()),
+                    message: Some(state::configuration_not_found_message(
+                        &input.configuration_id,
+                    )),
+                    resource_share_errors: None,
+                },
+            )
+            .into());
+        };
+
+        // The next revision of the chain the record already holds, read and
+        // appended under the SAME lock, so two concurrent updates of one
+        // configuration cannot be assigned the same number.
+        //
+        // The emulator's own bound on how far ONE record may grow
+        // ([`state::MAX_CONFIGURATION_REVISIONS`]) is applied first, so an update
+        // loop cannot grow the chain without bound; nothing is stored for the
+        // refused call, and no member of the request is at fault — the
+        // configuration's revision count is.
+        if configuration.revisions.len() >= state::MAX_CONFIGURATION_REVISIONS {
+            return Err(bad_request(state::Invalid {
+                attribute: None,
+                message: format!(
+                    "this configuration already holds its quota of {} revisions; delete the \
+                     configuration before making another",
+                    state::MAX_CONFIGURATION_REVISIONS
+                ),
+            }));
+        }
+        let revision = state::ConfigurationRevisionRecord::accepted(
+            configuration.next_revision_number(),
+            ::std::time::SystemTime::now(),
+            input.description.clone().unwrap_or_default(),
+            Some(data),
+        );
+        configuration.revisions.push(revision.clone());
+
+        Ok(UpdateConfigurationOutput {
+            arn: Some(configuration.configuration_arn.clone()),
+            // `Created` is "the date and time of the configuration": the instant
+            // the configuration was created, which every operation that reports
+            // this configuration answers with — an update does not re-create it.
+            created: Some(configuration.created_timestamp()),
+            id: Some(configuration.configuration_id.clone()),
+            latest_revision: Some(ConfigurationRevision {
+                created: ::aws_smithy_types::DateTime::from(revision.created),
+                description: Some(revision.description),
+                revision: revision.revision,
+                is_invalid: revision.is_invalid,
+            }),
+            name: Some(configuration.name.clone()),
+            // `Warnings` are "the first 20 warnings about the configuration
+            // elements or attributes that were SANITIZED". This service does not
+            // sanitize: it stores the document as sent, and refuses one it cannot
+            // decode, so there is no element it removed to warn about. The
+            // recorded Amazon MQ answer for a document it accepted carries the
+            // member as an EMPTY list, which is what this reports; a document AWS
+            // would have sanitized is a gap of the stored-as-sent document itself,
+            // not of this member.
+            warnings: Some(Vec::new()),
+            // The answer describes the configuration this call revised, so it
+            // reports that configuration's strategy in the spelling the
+            // configuration surface uses, exactly as its own describe does.
+            authentication_strategy: Some(state::reported_configuration_authentication_strategy(
+                &configuration.authentication_strategy,
+            )),
+        })
     }
+}
+
+/// Lift a refused value into this operation's modelled `BadRequestException` (HTTP 400).
+fn bad_request(invalid: state::Invalid) -> UpdateConfigurationError {
+    UpdateConfigurationErrorModeled::BadRequestException(BadRequestException {
+        error_attribute: invalid.attribute,
+        message: Some(invalid.message),
+        resource_share_errors: None,
+    })
+    .into()
 }

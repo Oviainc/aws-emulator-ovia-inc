@@ -96,12 +96,154 @@ pub struct InternalServerErrorException {
     pub resource_share_errors: Option<Vec<ResourceShareError>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.mq#ConfigurationRevision")]
+/// One member schema of a hand-written structure of this service, at `index` in that
+/// structure's member list: the member's shape id, its shape type and its wire name,
+/// exactly as the vendored codegen emits them.
+///
+/// Shared by every shape whose schema and codec this crate writes by hand (see the
+/// note on [`ConfigurationRevision`] for why any of them are), so the three such
+/// shapes cannot drift in how they name a member.
+pub(crate) const fn mq_member_schema(
+    shape_id: &'static str,
+    name: &'static str,
+    shape_type: ::aws_smithy_schema::ShapeType,
+    index: usize,
+) -> ::aws_smithy_schema::Schema {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(shape_id, "com.amazonaws.mq", name),
+        shape_type,
+        name,
+        index,
+    )
+}
+
+// `ConfigurationRevision`'s schema and codec are written out by hand rather than
+// derived with `#[smithy_macros::smithy(shape = ...)]`.
+//
+// WHY: a recorded Amazon MQ answer for a configuration carries one member on this
+// shape that the on-disk model does not declare at all — `isInvalid`, the flag
+// saying whether the revision's configuration document is unusable. The derive
+// admits EXACTLY the model's member list (a Rust field with no member behind it is
+// a compile error), so a member the service really sends but the model omits cannot
+// be declared through it. These items are the ones the derive emits — one
+// `M_<MEMBER>` member schema per member (index = that member's position in the
+// member list), a `SCHEMA` naming them in that order, the `<SHAPE>_SCHEMA` static
+// and the `SerializableStruct`/`DeserializableStruct` pair — from a member list this
+// file gives, so the extra member can be appended to it.
+//
+// The model's own members keep the names, order and indices the model gives them
+// (`smithy_query(query="shape", shape="ConfigurationRevision")`), and the unmodelled
+// member is appended LAST, so a later model refresh that declares it only has to
+// move it into place and put the derive back. Each member schema carries the wire
+// name as its member name, which is this shape's `@jsonName` for every member, and
+// no constraint trait: the validating walk reads an operation's INPUT schema only,
+// and this shape appears in no operation input.
+//
+// `created` carries no `@timestampFormat` here either: its ISO-8601 rendering is
+// the protocol's, applied to every timestamp this service writes (see
+// `crate::service::iso8601_timestamps`).
 #[derive(Debug, Clone)]
 pub struct ConfigurationRevision {
     pub created: ::aws_smithy_types::DateTime,
     pub description: Option<String>,
     pub revision: i32,
+    /// `isInvalid`: the member the recorded answer carries and the model does not
+    /// declare. Not an `Option`, because Amazon MQ reports it on every revision.
+    pub is_invalid: bool,
+}
+
+impl ConfigurationRevision {
+    pub const M_CREATED: ::aws_smithy_schema::Schema = mq_member_schema(
+        "com.amazonaws.mq#ConfigurationRevision$created",
+        "created",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        0,
+    );
+    pub const M_DESCRIPTION: ::aws_smithy_schema::Schema = mq_member_schema(
+        "com.amazonaws.mq#ConfigurationRevision$description",
+        "description",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    pub const M_REVISION: ::aws_smithy_schema::Schema = mq_member_schema(
+        "com.amazonaws.mq#ConfigurationRevision$revision",
+        "revision",
+        ::aws_smithy_schema::ShapeType::Integer,
+        2,
+    );
+    /// The member the model does not declare, appended after the modelled ones.
+    pub const M_IS_INVALID: ::aws_smithy_schema::Schema = mq_member_schema(
+        "com.amazonaws.mq#ConfigurationRevision$isInvalid",
+        "isInvalid",
+        ::aws_smithy_schema::ShapeType::Boolean,
+        3,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.mq#ConfigurationRevision",
+            "com.amazonaws.mq",
+            "ConfigurationRevision",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_CREATED,
+            &Self::M_DESCRIPTION,
+            &Self::M_REVISION,
+            &Self::M_IS_INVALID,
+        ],
+    );
+}
+
+pub static CONFIGURATION_REVISION_SCHEMA: &::aws_smithy_schema::Schema = &ConfigurationRevision::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ConfigurationRevision {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // `created` and `revision` are `@required`, so each is written
+        // unconditionally — the derive's `is_option` split puts a non-`Option`
+        // field on this branch — and so is the unmodelled flag.
+        s.write_timestamp(&Self::M_CREATED, &self.created)?;
+        if let ::std::option::Option::Some(description) = self.description.as_ref() {
+            s.write_string(&Self::M_DESCRIPTION, description.as_str())?;
+        }
+        s.write_integer(&Self::M_REVISION, self.revision)?;
+        s.write_boolean(&Self::M_IS_INVALID, self.is_invalid)?;
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ConfigurationRevision {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut created = ::std::option::Option::None;
+        let mut description = ::std::option::Option::None;
+        let mut revision = ::std::option::Option::None;
+        let mut is_invalid = ::std::option::Option::None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => created = Some(d.read_timestamp(member)?),
+                Some(1) => description = Some(d.read_string(member)?),
+                Some(2) => revision = Some(d.read_integer(member)?),
+                Some(3) => is_invalid = Some(d.read_boolean(member)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            created: created.ok_or_else(|| ::aws_smithy_schema_server::missing_member("created"))?,
+            description,
+            revision: revision
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("revision"))?,
+            // Absent on the wire reads as "not invalid": the member is the one
+            // the model does not declare, so a document written from the model
+            // alone carries none.
+            is_invalid: is_invalid.unwrap_or(false),
+        })
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.mq#NotFoundException")]

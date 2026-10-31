@@ -31,6 +31,9 @@ use service_com_amazonaws_mq_mq::state::{
 
 use crate::broker_lifecycle::{create_body, string_at, Mq};
 use crate::configuration_name::configuration_body;
+use crate::configuration_wire_form::{
+    authentication_strategy_on_the_wire, engine_type_on_the_wire,
+};
 
 /// Whether `id` has the shape Amazon MQ mints for a configuration: `c-` then 32
 /// lower-case hex digits in the 8-4-4-4-12 grouping.
@@ -105,12 +108,12 @@ async fn a_created_configuration_reads_back_with_the_documented_defaults() {
                 );
                 assert_eq!(
                     string_at(&described, "/engineType"),
-                    *engine_type,
+                    engine_type_on_the_wire(engine_type),
                     "case {case:?}: expected the stored engineType, got {described:?}"
                 );
                 assert_eq!(
                     string_at(&described, "/authenticationStrategy"),
-                    *strategy,
+                    authentication_strategy_on_the_wire(strategy),
                     "case {case:?}: expected the strategy the request set, got {described:?}"
                 );
                 // "Defaults to the latest available version for the specified broker
@@ -162,7 +165,7 @@ async fn a_configuration_created_without_a_strategy_carries_the_documented_defau
         );
         assert_eq!(
             string_at(&created, "/authenticationStrategy"),
-            DEFAULT_AUTHENTICATION_STRATEGY,
+            authentication_strategy_on_the_wire(DEFAULT_AUTHENTICATION_STRATEGY),
             "case {case:?}: expected the documented default, got {created:?}"
         );
 
@@ -170,7 +173,7 @@ async fn a_configuration_created_without_a_strategy_carries_the_documented_defau
         let (_status, _code, described) = mq.describe_configuration(&id).await;
         assert_eq!(
             string_at(&described, "/authenticationStrategy"),
-            DEFAULT_AUTHENTICATION_STRATEGY,
+            authentication_strategy_on_the_wire(DEFAULT_AUTHENTICATION_STRATEGY),
             "case {case:?}: the stored strategy must be the default, got {described:?}"
         );
     }
@@ -404,7 +407,7 @@ async fn a_configuration_id_with_no_configuration_behind_it_is_refused() {
         );
         assert_eq!(
             string_at(&answer, "/message"),
-            "Resource was not found",
+            format!("Configuration ID [{id}] can't be found. Make sure it exists."),
             "case {case:?}: expected Amazon MQ's sentence for this failure, got {answer:?}"
         );
     }

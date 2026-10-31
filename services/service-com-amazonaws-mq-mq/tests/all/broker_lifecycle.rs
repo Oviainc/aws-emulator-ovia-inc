@@ -255,11 +255,18 @@ async fn the_broker_lifecycle_round_trips_through_state() {
             described.pointer(pointer)
         );
     }
+    // `Created` targets `__timestampIso8601`, the model's only timestamp shape, which
+    // carries `@timestampFormat("date-time")`: the wire form is a string, so the
+    // instant is read the way a client bound to this model reads it.
+    let described_at = crate::configuration_wire_form::iso_instant(
+        "describe a created broker",
+        &described,
+        "/created",
+    );
     assert!(
-        described
-            .pointer("/created")
-            .is_some_and(|c| c.as_f64().is_some_and(|secs| secs > 0.0)),
-        "describe: expected a Created timestamp, got {:?}",
+        described_at.secs() > 0,
+        "describe: expected a Created timestamp of the instant the broker was created, \
+         got {:?}",
         described.pointer("/created")
     );
     let body = serde_json::to_string(&described).expect("render the describe body");

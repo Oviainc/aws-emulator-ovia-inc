@@ -18,12 +18,131 @@ pub struct DescribeConfigurationRevisionInput {
     pub configuration_revision: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.mq#DescribeConfigurationRevisionResponse")]
+// `DescribeConfigurationRevisionResponse`'s schema and codec are written out by hand
+// rather than derived with `#[smithy_macros::smithy(shape = ...)]`, for the reason the
+// note on `ConfigurationRevision` in `types/shared_types.rs` states at length: a
+// recorded Amazon MQ answer carries a member the on-disk model does not declare — here
+// `revision`, the number of the revision the answer describes — and the derive admits
+// exactly the model's member list.
+//
+// The model's own members keep the names, order and indices the model gives them
+// (`smithy_query(query="shape", shape="DescribeConfigurationRevisionResponse")`), and
+// the unmodelled member is appended LAST. Each member schema carries the wire name as
+// its member name, which is this shape's `@jsonName` for every member, and no
+// constraint trait: the validating walk reads an operation's INPUT schema only.
 #[derive(Debug, Clone, Default)]
 pub struct DescribeConfigurationRevisionOutput {
     pub configuration_id: Option<String>,
     pub created: Option<::aws_smithy_types::DateTime>,
     pub data: Option<String>,
     pub description: Option<String>,
+    /// `revision`: the member the recorded answer carries and the model does not
+    /// declare.
+    pub revision: Option<i32>,
+}
+
+impl DescribeConfigurationRevisionOutput {
+    pub const M_CONFIGURATION_ID: ::aws_smithy_schema::Schema =
+        super::shared_types::mq_member_schema(
+            "com.amazonaws.mq#DescribeConfigurationRevisionResponse$configurationId",
+            "configurationId",
+            ::aws_smithy_schema::ShapeType::String,
+            0,
+        );
+    pub const M_CREATED: ::aws_smithy_schema::Schema =
+        super::shared_types::mq_member_schema(
+            "com.amazonaws.mq#DescribeConfigurationRevisionResponse$created",
+            "created",
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            1,
+        );
+    pub const M_DATA: ::aws_smithy_schema::Schema = super::shared_types::mq_member_schema(
+        "com.amazonaws.mq#DescribeConfigurationRevisionResponse$data",
+        "data",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    pub const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+        super::shared_types::mq_member_schema(
+            "com.amazonaws.mq#DescribeConfigurationRevisionResponse$description",
+            "description",
+            ::aws_smithy_schema::ShapeType::String,
+            3,
+        );
+    /// The member the model does not declare, appended after the modelled ones.
+    pub const M_REVISION: ::aws_smithy_schema::Schema =
+        super::shared_types::mq_member_schema(
+            "com.amazonaws.mq#DescribeConfigurationRevisionResponse$revision",
+            "revision",
+            ::aws_smithy_schema::ShapeType::Integer,
+            4,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.mq#DescribeConfigurationRevisionResponse",
+            "com.amazonaws.mq",
+            "DescribeConfigurationRevisionResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_CONFIGURATION_ID,
+            &Self::M_CREATED,
+            &Self::M_DATA,
+            &Self::M_DESCRIPTION,
+            &Self::M_REVISION,
+        ],
+    );
+}
+
+pub static DESCRIBE_CONFIGURATION_REVISION_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &DescribeConfigurationRevisionOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DescribeConfigurationRevisionOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // Every member of this shape is optional, so each one is written only when
+        // the handler supplied it — the derive's `is_option` split.
+        if let ::std::option::Option::Some(configuration_id) = self.configuration_id.as_ref() {
+            s.write_string(&Self::M_CONFIGURATION_ID, configuration_id.as_str())?;
+        }
+        if let ::std::option::Option::Some(created) = self.created.as_ref() {
+            s.write_timestamp(&Self::M_CREATED, created)?;
+        }
+        if let ::std::option::Option::Some(data) = self.data.as_ref() {
+            s.write_string(&Self::M_DATA, data.as_str())?;
+        }
+        if let ::std::option::Option::Some(description) = self.description.as_ref() {
+            s.write_string(&Self::M_DESCRIPTION, description.as_str())?;
+        }
+        if let ::std::option::Option::Some(revision) = self.revision {
+            s.write_integer(&Self::M_REVISION, revision)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for DescribeConfigurationRevisionOutput {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    out.configuration_id = Some(d.read_string(&Self::M_CONFIGURATION_ID)?);
+                }
+                Some(1) => out.created = Some(d.read_timestamp(&Self::M_CREATED)?),
+                Some(2) => out.data = Some(d.read_string(&Self::M_DATA)?),
+                Some(3) => out.description = Some(d.read_string(&Self::M_DESCRIPTION)?),
+                Some(4) => out.revision = Some(d.read_integer(&Self::M_REVISION)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 

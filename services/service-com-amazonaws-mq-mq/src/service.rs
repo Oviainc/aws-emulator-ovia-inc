@@ -35,6 +35,11 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! A sixth seam, `override_protocol`, is the one this service DOES take: it serves the
+//! model's `restJson1` codec with every timestamp of a modelled response in the
+//! ISO-8601 `date-time` form this model's only timestamp shape declares (see
+//! [`iso8601_timestamps`]).
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
@@ -45,6 +50,10 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// How a timestamp of a modelled response is rendered — the one difference from the
+/// model's own `restJson1` codec this service takes.
+pub mod iso8601_timestamps;
+
 /// The `com-amazonaws-mq-mq` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -52,6 +61,9 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol, built ONCE here because
+    /// [`Service::override_protocol`] hands back a borrow of it.
+    protocol: iso8601_timestamps::Iso8601TimestampRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +73,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: iso8601_timestamps::Iso8601TimestampRestJson::new(),
         }
     }
 }
@@ -146,5 +159,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own restJson1 codec, with the ONE difference the generic
+        // renderer cannot express: a timestamp is written in the ISO-8601 date-time
+        // form this model's only timestamp shape declares, rather than in the
+        // protocol's default epoch-seconds form (see `iso8601_timestamps`).
+        // Borrowed from the field built in `new`, never constructed per request.
+        Some(&self.protocol)
     }
 }

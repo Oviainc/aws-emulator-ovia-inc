@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurationRevisions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfigurationRevisions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the revisions of the configuration an id names, out of this service's state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfigurationRevisions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The page is a window on the configuration's own revision chain, oldest first; a
+//! `ConfigurationId` that names no configuration is answered with the modelled
+//! `NotFoundException` (HTTP 404). This operation only reports: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +76,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,18 +149,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfigurationRevisions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfigurationRevisionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfigurationRevisions"))
+        let _ = ctx;
+        let Some(service_state) = state::service_state(&*self.engine) else {
+            return Err(
+                ListConfigurationRevisionsErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some("the service state store is unavailable".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        };
+
+        if let Some(max_results) = input.max_results {
+            state::validate_range(
+                "maxResults",
+                max_results,
+                state::MIN_MAX_RESULTS,
+                state::MAX_MAX_RESULTS,
+            )
+            .map_err(bad_request)?;
+        }
+
+        // Only a token this service issued names an offset; anything else is a
+        // client error, not an empty page — as on every listing of this service.
+        let offset = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            None => 0,
+            Some(token) => match state::decode_page_token(token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(bad_request(state::Invalid::new(
+                        "nextToken",
+                        state::invalid_page_token_message(token),
+                    )));
+                }
+            },
+        };
+
+        let store = service_state.lock();
+        let Some(configuration) = store.configurations.get(&input.configuration_id) else {
+            return Err(ListConfigurationRevisionsErrorModeled::NotFoundException(
+                NotFoundException {
+                    error_attribute: Some(state::CONFIGURATION_ID_ATTRIBUTE.to_string()),
+                    message: Some(state::configuration_not_found_message(
+                        &input.configuration_id,
+                    )),
+                    resource_share_errors: None,
+                },
+            )
+            .into());
+        };
+
+        // The record holds its revisions oldest first, which is the order this
+        // listing pages through: an offset a `NextToken` carries then names the
+        // same revision on a later call. The page is taken from the chain the
+        // record holds and only the page's own elements are built.
+        let page = state::page_of(configuration.revisions.len(), input.max_results, offset);
+        let revisions = state::page_slice(&configuration.revisions, &page)
+            .iter()
+            .map(|revision| ConfigurationRevision {
+                created: ::aws_smithy_types::DateTime::from(revision.created),
+                description: Some(revision.description.clone()),
+                revision: revision.revision,
+                is_invalid: revision.is_invalid,
+            })
+            .collect();
+
+        Ok(ListConfigurationRevisionsOutput {
+            configuration_id: Some(configuration.configuration_id.clone()),
+            // The page size this answer was built with: the one the request asked
+            // for, else the default every listing of this service uses.
+            max_results: Some(
+                input
+                    .max_results
+                    .unwrap_or(state::DEFAULT_MAX_RESULTS as i32),
+            ),
+            next_token: page.next_token,
+            revisions: Some(revisions),
+        })
     }
+}
+
+/// Lift a refused value into this operation's modelled `BadRequestException` (HTTP 400).
+fn bad_request(invalid: state::Invalid) -> ListConfigurationRevisionsError {
+    ListConfigurationRevisionsErrorModeled::BadRequestException(BadRequestException {
+        error_attribute: invalid.attribute,
+        message: Some(invalid.message),
+        resource_share_errors: None,
+    })
+    .into()
 }

@@ -21,6 +21,8 @@ mod broker_lifecycle;
 mod configuration_lifecycle;
 #[path = "all/configuration_name.rs"]
 mod configuration_name;
+#[path = "all/configuration_wire_form.rs"]
+mod configuration_wire_form;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

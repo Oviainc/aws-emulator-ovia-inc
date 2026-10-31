@@ -126,15 +126,33 @@ pub const MAX_TAGS: usize = 50;
 /// number of creates a caller makes.
 pub const MAX_CONFIGURATIONS: usize = 50;
 
-/// The engine versions Amazon MQ publishes for ActiveMQ, oldest first, so the
-/// last entry is the latest available one. From the Developer Guide's ActiveMQ
-/// version-support page; `DescribeBrokerInstanceOptions` reports the same list,
-/// and `CreateConfiguration` defaults `EngineVersion` to its last entry.
-pub const ACTIVEMQ_ENGINE_VERSIONS: &[&str] = &["5.15.16", "5.16.7", "5.17.6", "5.18.4"];
+/// How many revisions one configuration record may hold.
+///
+/// Amazon MQ publishes no maximum for a configuration's revision chain, and each
+/// `UpdateConfiguration` appends one revision carrying the document it was sent,
+/// so that an update loop cannot grow one record without bound the emulator
+/// applies a RESOURCE bound of its own — not an AWS one, and deliberately far
+/// above the number of revisions a real configuration workflow makes, so it
+/// bounds the record without refusing a revision a real rollout would ask for.
+/// An update past it is refused rather than stored.
+pub const MAX_CONFIGURATION_REVISIONS: usize = 1_000;
 
-/// The engine versions Amazon MQ publishes for RabbitMQ, oldest first — see
-/// [`ACTIVEMQ_ENGINE_VERSIONS`].
-pub const RABBITMQ_ENGINE_VERSIONS: &[&str] = &["3.11.28", "3.12.13", "3.13.7"];
+/// The engine versions Amazon MQ offers for ActiveMQ, oldest first, so the last
+/// entry is the latest available one.
+///
+/// Amazon MQ publishes the versions it offers for creation at MAJOR.MINOR
+/// granularity and retires the older ones as it releases new ones: the recorded
+/// `DescribeBrokerInstanceOptions` catalog carries `["5.19", "5.18"]` for
+/// ActiveMQ. A patch-level string from a retired release is not a version a
+/// create may be defaulted to, which is why the list holds the offered ones
+/// only. `DescribeBrokerInstanceOptions` reports the same list, and
+/// `CreateConfiguration` defaults `EngineVersion` to its last entry.
+pub const ACTIVEMQ_ENGINE_VERSIONS: &[&str] = &["5.18", "5.19"];
+
+/// The engine versions Amazon MQ offers for RabbitMQ, oldest first — see
+/// [`ACTIVEMQ_ENGINE_VERSIONS`] for the granularity and where it comes from (the
+/// same recorded catalog carries `["3.13"]` for RabbitMQ).
+pub const RABBITMQ_ENGINE_VERSIONS: &[&str] = &["3.13"];
 
 /// The engine versions published for `engine_type`, or none for a value outside
 /// the model's `EngineType` set — a handler refuses such a value before it gets
@@ -303,18 +321,101 @@ pub fn optional_tag_map(
     if tags.is_empty() {
         None
     } else {
-        Some(tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        Some(tag_map(tags))
     }
 }
 
-/// One revision of a configuration: the revision number, when it was made, and
-/// its description. A configuration holds its revisions oldest first, so the
-/// last one is its latest.
+/// A stored tag map as the modelled `__mapOf__string`, whether or not it holds
+/// anything — the form a resource whose answer always carries the member
+/// reports (see [`ConfigurationRecord::reported_tags`]).
+pub fn tag_map(tags: &BTreeMap<String, String>) -> std::collections::HashMap<String, String> {
+    tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// The product spelling Amazon MQ publishes for each engine the model's
+/// `EngineType` declares, paired with the modelled value a request sends.
+///
+/// Source: the modelled values (`ENGINE_TYPE_VALUES`) and the engine names
+/// Amazon MQ's own documentation spells out for them ("Amazon MQ for ActiveMQ",
+/// "Amazon MQ for RabbitMQ"), which is the spelling the recorded configuration
+/// responses carry.
+const ENGINE_TYPE_PRODUCT_SPELLINGS: &[(&str, &str)] = &[
+    (ENGINE_TYPE_ACTIVEMQ, "ActiveMQ"),
+    (ENGINE_TYPE_RABBITMQ, "RabbitMQ"),
+];
+
+/// How a configuration's `EngineType` is spelled on the wire.
+///
+/// The broker surface answers in the modelled enum spelling (`ACTIVEMQ`), but
+/// the configuration surface answers with the engine's product spelling
+/// (`ActiveMQ`), which is what a recorded Amazon MQ answer for a configuration
+/// carries. The stored record keeps the modelled value a request has to send, so
+/// this is the one place the reported spelling is derived and the two cannot
+/// drift; a value outside the modelled set is reported exactly as stored rather
+/// than rewritten into a spelling nothing published.
+pub fn reported_configuration_engine_type(engine_type: &str) -> String {
+    ENGINE_TYPE_PRODUCT_SPELLINGS
+        .iter()
+        .find(|(modelled, _)| *modelled == engine_type)
+        .map_or_else(|| engine_type.to_string(), |(_, spelled)| (*spelled).to_string())
+}
+
+/// How a configuration's `AuthenticationStrategy` is spelled on the wire: the
+/// modelled value lower-cased (`SIMPLE` -> `simple`), which is what a recorded
+/// Amazon MQ answer for a configuration carries. As with
+/// [`reported_configuration_engine_type`], the stored record keeps the modelled
+/// value.
+pub fn reported_configuration_authentication_strategy(strategy: &str) -> String {
+    strategy.to_ascii_lowercase()
+}
+
+/// One revision of a configuration: the revision number, when it was made, the
+/// description it was made with and the configuration document it carries. A
+/// configuration holds its revisions oldest first, so the last one is its
+/// latest.
 #[derive(Debug, Clone)]
 pub struct ConfigurationRevisionRecord {
     pub revision: i32,
     pub created: SystemTime,
+    /// The description the revision was made with: the sentence Amazon MQ
+    /// generates for the revision a create makes, or the `Description` an update
+    /// supplied — the EMPTY description for an update that supplied none, which
+    /// is the one representation every read of this record reports (the modelled
+    /// `Configuration$Description` a listing carries is required, so an absent
+    /// member is not a form every read could agree on).
     pub description: String,
+    /// The configuration document the revision carries, as the update sent it
+    /// (base64). `None` for the revision a create makes: that one holds the
+    /// engine's own default settings, which no request supplied.
+    pub data: Option<String>,
+    /// Whether the engine judged this revision's document unusable, reported as
+    /// `ConfigurationRevision$isInvalid`. A revision is only ever made from a
+    /// document this service ACCEPTED — a malformed one is refused before any
+    /// revision exists ([`ConfigurationRevisionRecord::accepted`]) — so a stored
+    /// revision is a usable one.
+    pub is_invalid: bool,
+}
+
+impl ConfigurationRevisionRecord {
+    /// A revision made from a configuration document this service accepted: the
+    /// revision is usable, so it reports no invalidity. Both producers of a
+    /// revision — the create that generates the first one and the update that
+    /// makes the next — go through here, so neither can record a revision whose
+    /// document was never checked.
+    pub fn accepted(
+        revision: i32,
+        created: SystemTime,
+        description: String,
+        data: Option<String>,
+    ) -> Self {
+        Self {
+            revision,
+            created,
+            description,
+            data,
+            is_invalid: false,
+        }
+    }
 }
 
 /// A configuration, as `CreateConfiguration` persisted it. Named `*Record` so it
@@ -342,18 +443,26 @@ impl ConfigurationRecord {
     /// This configuration's latest revision — the last one made. A configuration
     /// always has one, so a record that somehow holds none reports its first.
     pub fn latest_revision(&self) -> ConfigurationRevisionRecord {
-        self.revisions
-            .last()
-            .cloned()
-            .unwrap_or_else(|| ConfigurationRevisionRecord {
-                revision: FIRST_CONFIGURATION_REVISION,
-                created: self.created,
-                description: default_configuration_description(
+        self.revisions.last().cloned().unwrap_or_else(|| {
+            ConfigurationRevisionRecord::accepted(
+                FIRST_CONFIGURATION_REVISION,
+                self.created,
+                default_configuration_description(
                     &self.name,
                     &self.engine_type,
                     &self.engine_version,
                 ),
-            })
+                None,
+            )
+        })
+    }
+
+    /// The number the NEXT revision of this configuration carries: Amazon MQ
+    /// numbers revisions from one and an update makes the next one, so the
+    /// number is derived from the chain the record already holds rather than
+    /// from a counter beside it that could disagree with it.
+    pub fn next_revision_number(&self) -> i32 {
+        self.latest_revision().revision.saturating_add(1)
     }
 
     /// `Created`, in the modelled `__timestampIso8601` type.
@@ -361,9 +470,12 @@ impl ConfigurationRecord {
         ::aws_smithy_types::DateTime::from(self.created)
     }
 
-    /// `Tags`, as the modelled map, or `None` when the configuration carries none.
-    pub fn optional_tags(&self) -> Option<std::collections::HashMap<String, String>> {
-        optional_tag_map(&self.tags)
+    /// `Tags`, as the modelled map — EMPTY when the configuration carries no
+    /// tag, rather than absent: the recorded Amazon MQ answer for an untagged
+    /// configuration carries `tags: {}`, so a client iterating the member finds
+    /// a map on every configuration it reads.
+    pub fn reported_tags(&self) -> Option<std::collections::HashMap<String, String>> {
+        Some(tag_map(&self.tags))
     }
 }
 
@@ -372,12 +484,19 @@ impl ConfigurationRecord {
 /// settings (`CreateConfiguration`: "Amazon MQ uses the default configuration
 /// (the engine type and version)"), so the sentence is built from the stored
 /// record — never from a request member this operation does not carry.
+///
+/// The engine is named in the spelling the configuration surface reports it in
+/// ([`reported_configuration_engine_type`]), so the sentence and the
+/// `engineType` member of the same answer agree.
 pub fn default_configuration_description(
     name: &str,
     engine_type: &str,
     engine_version: &str,
 ) -> String {
-    format!("Auto-generated default for {name} on {engine_type} {engine_version}")
+    format!(
+        "Auto-generated default for {name} on {} {engine_version}",
+        reported_configuration_engine_type(engine_type)
+    )
 }
 
 /// Per-service state for com-amazonaws-mq-mq. A handler reaches it through [`service_state`].
@@ -702,6 +821,35 @@ pub fn broker_not_found_message(broker_id: &str) -> String {
     format!(
         "Cannot find broker ID [{broker_id}]. Verify that your broker exists or check \
          broker permissions."
+    )
+}
+
+/// The input member a refusal names when the `ConfigurationId` of the request
+/// resolved to no configuration, for `NotFoundException$errorAttribute` ("The
+/// attribute which caused the error").
+pub const CONFIGURATION_ID_ATTRIBUTE: &str = "configuration-id";
+
+/// The sentence Amazon MQ answers a `ConfigurationId` that resolves to no
+/// configuration with, on every operation that resolves one — the requested id
+/// is interpolated, so the answer names which configuration was not found.
+/// Shared for the same reason [`broker_not_found_message`] is.
+pub fn configuration_not_found_message(configuration_id: &str) -> String {
+    format!("Configuration ID [{configuration_id}] can't be found. Make sure it exists.")
+}
+
+/// The input member a refusal names when the `ConfigurationRevision` of the
+/// request resolved to no revision of the configuration it named.
+pub const CONFIGURATION_REVISION_ATTRIBUTE: &str = "configuration-revision";
+
+/// The sentence this service answers a `ConfigurationRevision` that resolves to
+/// no revision of the configuration with. No recorded response covers this
+/// refusal, so it is worded the way this service words the resource-not-found it
+/// does have recorded ([`configuration_not_found_message`]), naming the revision
+/// asked for and the configuration it was asked of — both from the request.
+pub fn configuration_revision_not_found_message(configuration_id: &str, revision: &str) -> String {
+    format!(
+        "Configuration revision [{revision}] of configuration ID [{configuration_id}] can't be \
+         found. Make sure it exists."
     )
 }
 

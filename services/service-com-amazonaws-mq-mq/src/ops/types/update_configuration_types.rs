@@ -19,7 +19,19 @@ pub struct UpdateConfigurationInput {
     pub description: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.mq#UpdateConfigurationResponse")]
+// `UpdateConfigurationResponse`'s schema and codec are written out by hand rather than
+// derived with `#[smithy_macros::smithy(shape = ...)]`, for the reason the note on
+// `ConfigurationRevision` in `types/shared_types.rs` states at length: a recorded
+// Amazon MQ answer carries a member the on-disk model does not declare — here
+// `authenticationStrategy`, the strategy of the configuration the update revised, which
+// the rest of the configuration surface reports too — and the derive admits exactly the
+// model's member list.
+//
+// The model's own members keep the names, order and indices the model gives them
+// (`smithy_query(query="operation", operation="UpdateConfiguration")`), and the
+// unmodelled member is appended LAST. Each member schema carries the wire name as its
+// member name, which is this shape's `@jsonName` for every member, and no constraint
+// trait: the validating walk reads an operation's INPUT schema only.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateConfigurationOutput {
     pub arn: Option<String>,
@@ -28,6 +40,157 @@ pub struct UpdateConfigurationOutput {
     pub latest_revision: Option<ConfigurationRevision>,
     pub name: Option<String>,
     pub warnings: Option<Vec<SanitizationWarning>>,
+    /// `authenticationStrategy`: the member the recorded answer carries and the model
+    /// does not declare.
+    pub authentication_strategy: Option<String>,
+}
+
+impl UpdateConfigurationOutput {
+    pub const M_ARN: ::aws_smithy_schema::Schema = super::shared_types::mq_member_schema(
+        "com.amazonaws.mq#UpdateConfigurationResponse$arn",
+        "arn",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    pub const M_CREATED: ::aws_smithy_schema::Schema = super::shared_types::mq_member_schema(
+        "com.amazonaws.mq#UpdateConfigurationResponse$created",
+        "created",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        1,
+    );
+    pub const M_ID: ::aws_smithy_schema::Schema = super::shared_types::mq_member_schema(
+        "com.amazonaws.mq#UpdateConfigurationResponse$id",
+        "id",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    pub const M_LATEST_REVISION: ::aws_smithy_schema::Schema =
+        super::shared_types::mq_member_schema(
+        "com.amazonaws.mq#UpdateConfigurationResponse$latestRevision",
+        "latestRevision",
+        ::aws_smithy_schema::ShapeType::Structure,
+        3,
+    );
+    pub const M_NAME: ::aws_smithy_schema::Schema = super::shared_types::mq_member_schema(
+        "com.amazonaws.mq#UpdateConfigurationResponse$name",
+        "name",
+        ::aws_smithy_schema::ShapeType::String,
+        4,
+    );
+    pub const M_WARNINGS: ::aws_smithy_schema::Schema = super::shared_types::mq_member_schema(
+        "com.amazonaws.mq#UpdateConfigurationResponse$warnings",
+        "warnings",
+        ::aws_smithy_schema::ShapeType::List,
+        5,
+    );
+    /// The member the model does not declare, appended after the modelled ones.
+    pub const M_AUTHENTICATION_STRATEGY: ::aws_smithy_schema::Schema =
+        super::shared_types::mq_member_schema(
+            "com.amazonaws.mq#UpdateConfigurationResponse$authenticationStrategy",
+            "authenticationStrategy",
+            ::aws_smithy_schema::ShapeType::String,
+            6,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.mq#UpdateConfigurationResponse",
+            "com.amazonaws.mq",
+            "UpdateConfigurationResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ARN,
+            &Self::M_CREATED,
+            &Self::M_ID,
+            &Self::M_LATEST_REVISION,
+            &Self::M_NAME,
+            &Self::M_WARNINGS,
+            &Self::M_AUTHENTICATION_STRATEGY,
+        ],
+    );
+}
+
+pub static UPDATE_CONFIGURATION_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &UpdateConfigurationOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for UpdateConfigurationOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // Every member of this shape is optional, so each one is written only when
+        // the handler supplied it — the derive's `is_option` split.
+        if let ::std::option::Option::Some(arn) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, arn.as_str())?;
+        }
+        if let ::std::option::Option::Some(created) = self.created.as_ref() {
+            s.write_timestamp(&Self::M_CREATED, created)?;
+        }
+        if let ::std::option::Option::Some(id) = self.id.as_ref() {
+            s.write_string(&Self::M_ID, id.as_str())?;
+        }
+        if let ::std::option::Option::Some(latest_revision) = self.latest_revision.as_ref() {
+            s.write_struct(&Self::M_LATEST_REVISION, latest_revision)?;
+        }
+        if let ::std::option::Option::Some(name) = self.name.as_ref() {
+            s.write_string(&Self::M_NAME, name.as_str())?;
+        }
+        if let ::std::option::Option::Some(warnings) = self.warnings.as_ref() {
+            // A list of structures writes each element against the ELEMENT shape's
+            // own schema, as the generator does.
+            s.write_list(&Self::M_WARNINGS, &|sl| {
+                for warning in warnings.iter() {
+                    sl.write_struct(SANITIZATION_WARNING_SCHEMA, warning)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let ::std::option::Option::Some(strategy) = self.authentication_strategy.as_ref() {
+            s.write_string(&Self::M_AUTHENTICATION_STRATEGY, strategy.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for UpdateConfigurationOutput {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        let mut warnings: Vec<SanitizationWarning> = Vec::new();
+        let mut saw_warnings = false;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.arn = Some(d.read_string(&Self::M_ARN)?),
+                Some(1) => out.created = Some(d.read_timestamp(&Self::M_CREATED)?),
+                Some(2) => out.id = Some(d.read_string(&Self::M_ID)?),
+                Some(3) => {
+                    out.latest_revision = Some(<ConfigurationRevision as
+                        ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?);
+                }
+                Some(4) => out.name = Some(d.read_string(&Self::M_NAME)?),
+                Some(5) => {
+                    saw_warnings = true;
+                    d.read_list(&Self::M_WARNINGS, &mut |dl| {
+                        warnings.push(<SanitizationWarning as
+                            ::aws_smithy_schema_server::DeserializableStruct>::deserialize(dl)?);
+                        Ok(())
+                    })?;
+                }
+                Some(6) => {
+                    out.authentication_strategy =
+                        Some(d.read_string(&Self::M_AUTHENTICATION_STRATEGY)?);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        if saw_warnings {
+            out.warnings = Some(warnings);
+        }
+        Ok(out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.mq#SanitizationWarning")]

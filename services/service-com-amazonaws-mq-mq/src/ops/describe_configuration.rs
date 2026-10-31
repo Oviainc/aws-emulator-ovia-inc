@@ -172,12 +172,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = service_state.lock();
         // An id that names no configuration is a resource this service does not
-        // hold, answered with the sentence it answers every such request with.
+        // hold: the refusal names the member at fault and the id that resolved to
+        // nothing, both read from the request.
         let Some(configuration) = store.configurations.get(&input.configuration_id) else {
             return Err(DescribeConfigurationErrorModeled::NotFoundException(
                 NotFoundException {
-                    error_attribute: None,
-                    message: Some(state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    error_attribute: Some(state::CONFIGURATION_ID_ATTRIBUTE.to_string()),
+                    message: Some(state::configuration_not_found_message(
+                        &input.configuration_id,
+                    )),
                     resource_share_errors: None,
                 },
             )
@@ -185,23 +188,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every member is read out of the stored record; `Description` is the
-        // latest revision's, which is what a revision changes.
+        // latest revision's, which is what a revision changes. `EngineType` and
+        // `AuthenticationStrategy` go out in the spelling the configuration
+        // surface reports them in, derived from the modelled value the record
+        // holds.
         let latest = configuration.latest_revision();
         Ok(DescribeConfigurationOutput {
             arn: Some(configuration.configuration_arn.clone()),
-            authentication_strategy: Some(configuration.authentication_strategy.clone()),
+            authentication_strategy: Some(state::reported_configuration_authentication_strategy(
+                &configuration.authentication_strategy,
+            )),
             created: Some(configuration.created_timestamp()),
             description: Some(latest.description.clone()),
-            engine_type: Some(configuration.engine_type.clone()),
+            engine_type: Some(state::reported_configuration_engine_type(
+                &configuration.engine_type,
+            )),
             engine_version: Some(configuration.engine_version.clone()),
             id: Some(configuration.configuration_id.clone()),
             latest_revision: Some(ConfigurationRevision {
                 created: ::aws_smithy_types::DateTime::from(latest.created),
                 description: Some(latest.description),
                 revision: latest.revision,
+                is_invalid: latest.is_invalid,
             }),
             name: Some(configuration.name.clone()),
-            tags: configuration.optional_tags(),
+            tags: configuration.reported_tags(),
         })
     }
 }
