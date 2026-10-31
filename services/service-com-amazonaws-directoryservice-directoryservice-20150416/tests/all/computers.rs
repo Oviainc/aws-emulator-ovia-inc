@@ -12,8 +12,10 @@
 //! The rules under test, each asserted over a TABLE rather than one recorded call:
 //!
 //! * a create persists a computer account on the directory the request named and reports
-//!   that account back: the name as spelled, the LDAP attributes the request applied and
-//!   nothing else, and a `ComputerId` that is the account's Windows SID — the directory's
+//!   that account back: the name as spelled, the account's own LDAP attributes (the
+//!   sibling suite `computer_attributes` is what asserts the rule those follow, reached
+//!   here through its `expected_attributes`), and a `ComputerId` that is the account's
+//!   Windows SID — the directory's
 //!   own domain SID, shared by every account of that directory and different for another,
 //!   plus a relative identifier from 1000 up, unique within the directory;
 //! * an account name is unique within the directory and compared case-insensitively, the
@@ -138,13 +140,16 @@ fn split_computer_id(id: &str, case: &str) -> (String, u64) {
     (domain, rid)
 }
 
-/// One row of the directory table: how the directory is created, and the domain name it
-/// carries (its `Name`, which is what a distinguished name in it ends with).
+/// One row of the directory table: how the directory is created, the domain name it
+/// carries (its `Name`, which is what a distinguished name in it ends with), and the
+/// container its computer accounts land in when a create names no organizational unit —
+/// which follows from whether the directory carries a NetBIOS short name.
 struct DirectoryCase {
     case: &'static str,
     operation: &'static str,
     body: Value,
     domain: &'static str,
+    container: String,
 }
 
 /// One row of the computer table: what the create asks for.
@@ -170,6 +175,7 @@ fn directory_rows() -> Vec<DirectoryCase> {
             operation: "CreateDirectory",
             body: minimal_create("simple.example.com"),
             domain: "simple.example.com",
+            container: format!("CN=Computers,{}", domain_components("simple.example.com")),
         },
         DirectoryCase {
             case: "a large Simple AD directory with a dual-stack network",
@@ -181,12 +187,20 @@ fn directory_rows() -> Vec<DirectoryCase> {
                 "NetworkType": "Dual-stack"
             }),
             domain: "large.simple.example.com",
+            container: format!(
+                "CN=Computers,{}",
+                domain_components("large.simple.example.com")
+            ),
         },
         DirectoryCase {
             case: "a minimal Managed Microsoft AD directory",
             operation: "CreateMicrosoftAD",
             body: minimal_microsoft_ad("corp.example.com"),
             domain: "corp.example.com",
+            container: format!(
+                "OU=Computers,OU=CORP,{}",
+                domain_components("corp.example.com")
+            ),
         },
         DirectoryCase {
             case: "a Standard-edition Managed Microsoft AD directory",
@@ -201,6 +215,10 @@ fn directory_rows() -> Vec<DirectoryCase> {
                 }
             }),
             domain: "standard.corp.example.com",
+            container: format!(
+                "OU=Computers,OU=STANDARD,{}",
+                domain_components("standard.corp.example.com")
+            ),
         },
     ]
 }
@@ -309,7 +327,7 @@ async fn a_computer_account_is_created_in_the_directory_the_request_names() {
         for row in &rows {
             let case = format!("{} / {}", directory.case, row.case);
             let body = create_body(directory_id, directory.domain, row);
-            let computer = create_computer(&router, body, &case).await;
+            let computer = create_computer(&router, body.clone(), &case).await;
 
             assert_eq!(
                 computer["ComputerName"].as_str(),
@@ -318,15 +336,11 @@ async fn a_computer_account_is_created_in_the_directory_the_request_names() {
                  got {computer}"
             );
 
-            // The attributes reported are exactly the ones the create applied — and a
-            // create that applied none reports the member not at all, rather than an empty
-            // list nothing recorded.
-            let expected_attributes = match &row.attributes {
-                Some(attributes) if attributes.as_array().is_some_and(|rows| !rows.is_empty()) => {
-                    attributes.clone()
-                }
-                _ => Value::Null,
-            };
+            // The attributes reported are the ACCOUNT's: the ones the create applied,
+            // under the names the directory holds them by, plus the ones the domain
+            // derives for the account itself.
+            let expected_attributes =
+                crate::computer_attributes::expected_attributes(&body, &directory.container);
             assert_eq!(
                 computer["ComputerAttributes"], expected_attributes,
                 "case {case:?}: expected ComputerAttributes {expected_attributes}, got \
@@ -455,12 +469,17 @@ async fn a_create_needs_a_directory_that_is_in_service() {
             operation: "CreateDirectory",
             body: minimal_create("pending.example.com"),
             domain: "pending.example.com",
+            container: format!("CN=Computers,{}", domain_components("pending.example.com")),
         },
         DirectoryCase {
             case: "a Managed Microsoft AD directory still being built",
             operation: "CreateMicrosoftAD",
             body: minimal_microsoft_ad("pending.corp.example.com"),
             domain: "pending.corp.example.com",
+            container: format!(
+                "OU=Computers,OU=PENDING,{}",
+                domain_components("pending.corp.example.com")
+            ),
         },
     ];
 

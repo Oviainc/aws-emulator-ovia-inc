@@ -1000,6 +1000,111 @@ pub fn parse_certificate(pem: &str) -> Option<ParsedCertificate> {
     })
 }
 
+/// The LDAP attribute names this service recognizes, as `(the name folded to lower case,
+/// the one spelling this service reports it under)`.
+///
+/// LDAP attribute names are case-insensitive, so a request may write one in any casing;
+/// the directory, however, holds each attribute of an object under the single display
+/// spelling of its name and reports the object's attributes under that spelling. So a
+/// recognized name is canonicalized through this table when it is applied, and the
+/// response describes the object rather than repeating the request's spelling.
+///
+/// The entries are the attributes of an Active Directory computer object, named as the
+/// Directory Service APIs name them (the SAM name is reported as
+/// [`ATTRIBUTE_WINDOWS_SAM_NAME`], the way this service spells it, rather than as the raw
+/// LDAP `sAMAccountName`). A name this table does not list is one this service does not
+/// recognize: it is kept exactly as the request spelled it, since there is no other
+/// spelling to report it under.
+pub const CANONICAL_LDAP_ATTRIBUTE_NAMES: &[(&str, &str)] = &[
+    ("description", "Description"),
+    ("displayname", "DisplayName"),
+    ("distinguishedname", ATTRIBUTE_DISTINGUISHED_NAME),
+    ("dnshostname", "DnsHostName"),
+    ("location", "Location"),
+    ("managedby", "ManagedBy"),
+    ("name", "Name"),
+    ("objectclass", "ObjectClass"),
+    ("objectsid", "ObjectSid"),
+    ("operatingsystem", "OperatingSystem"),
+    ("operatingsystemservicepack", "OperatingSystemServicePack"),
+    ("operatingsystemversion", "OperatingSystemVersion"),
+    ("samaccountname", ATTRIBUTE_WINDOWS_SAM_NAME),
+    ("serviceprincipalname", "ServicePrincipalName"),
+    ("userprincipalname", "UserPrincipalName"),
+    ("whenchanged", "WhenChanged"),
+    ("whencreated", "WhenCreated"),
+];
+
+/// The name this service reports a machine account's SAM (pre-Windows 2000) account name
+/// under. See [`windows_sam_name`], which is what derives its value.
+pub const ATTRIBUTE_WINDOWS_SAM_NAME: &str = "WindowsSamName";
+
+/// The name this service reports a directory object's distinguished name under. See
+/// [`Directory::computer_distinguished_name`], which is what derives its value for a
+/// computer account.
+pub const ATTRIBUTE_DISTINGUISHED_NAME: &str = "DistinguishedName";
+
+/// The attributes a domain derives for a computer account itself, rather than taking them
+/// from whoever created it: its SAM account name, which follows from the account name,
+/// and its distinguished name, which follows from where the account was placed. They are
+/// reported from the stored account ([`ComputerRecord::to_computer`]), so a create that
+/// lists one of them under any casing does not get to set it.
+pub const DERIVED_COMPUTER_ATTRIBUTES: &[&str] =
+    &[ATTRIBUTE_WINDOWS_SAM_NAME, ATTRIBUTE_DISTINGUISHED_NAME];
+
+/// `name` in the one spelling this service reports it under: its entry in
+/// [`CANONICAL_LDAP_ATTRIBUTE_NAMES`] when it names a recognized LDAP attribute (in any
+/// casing, since LDAP attribute names are case-insensitive), and `name` unchanged when it
+/// does not.
+pub fn canonical_ldap_attribute_name(name: &str) -> String {
+    let folded = name.to_lowercase();
+    CANONICAL_LDAP_ATTRIBUTE_NAMES
+        .iter()
+        .find(|(ldap_name, _)| *ldap_name == folded)
+        .map_or_else(|| name.to_string(), |(_, reported)| (*reported).to_string())
+}
+
+/// The attributes an object carries once `applied` has been applied to it: every
+/// recognized name canonicalized through [`canonical_ldap_attribute_name`], in the order
+/// they were applied, and the ones the domain derives for the object
+/// ([`DERIVED_COMPUTER_ATTRIBUTES`]) dropped, because those describe the object itself and
+/// no caller sets them.
+pub fn applied_attributes(applied: Vec<Attribute>) -> Vec<Attribute> {
+    applied
+        .into_iter()
+        .filter_map(|attribute| {
+            // An entry carrying no name at all names no LDAP attribute: there is nothing
+            // to canonicalize and nothing it can collide with, so it is kept as sent.
+            let Some(name) = attribute.name.as_deref() else {
+                return Some(attribute);
+            };
+            let name = canonical_ldap_attribute_name(name);
+            if DERIVED_COMPUTER_ATTRIBUTES.contains(&name.as_str()) {
+                return None;
+            }
+            Some(Attribute {
+                name: Some(name),
+                value: attribute.value,
+            })
+        })
+        .collect()
+}
+
+/// The SAM account name of the machine account `computer_name`: the account name with the
+/// `$` suffix every Active Directory machine account's SAM name carries, which is what
+/// separates the machine accounts of a domain from its user accounts.
+pub fn windows_sam_name(computer_name: &str) -> String {
+    format!("{computer_name}$")
+}
+
+/// One attribute of a directory object, as the modelled `Attribute` reports it.
+fn reported_attribute(name: &str, value: String) -> Attribute {
+    Attribute {
+        name: Some(name.to_string()),
+        value: Some(value),
+    }
+}
+
 /// One stored computer account: the Active Directory computer object `CreateComputer`
 /// created in a directory.
 ///
@@ -1025,28 +1130,42 @@ pub struct ComputerRecord {
     /// when the member is absent.
     pub organizational_unit_distinguished_name: Option<String>,
     /// The LDAP attributes the create applied to the account, in the order the request
-    /// listed them \u2014 which is what the modelled `Computer$ComputerAttributes` ("the LDAP
-    /// attributes that belong to the computer account") reports. Nothing else is invented
-    /// into it: an attribute this emulator did not apply is an attribute no caller set.
+    /// listed them and under the names the directory holds them by
+    /// ([`applied_attributes`]). The attributes the domain derives for the account itself
+    /// are NOT among them: they follow from the fields beside this one, and
+    /// [`Self::to_computer`] is what reports them.
     pub attributes: Vec<Attribute>,
+    /// The account's own distinguished name: its `CN=` component under the container it
+    /// was placed in, built once at creation through
+    /// [`Directory::computer_distinguished_name`] so every read reports the same one.
+    pub distinguished_name: String,
     /// When the account was created.
     pub created_at: SystemTime,
 }
 
 impl ComputerRecord {
     /// This account as the modelled `Computer`.
+    ///
+    /// `ComputerAttributes` is documented as "the LDAP attributes that belong to the
+    /// computer account", so it describes the ACCOUNT: the attributes the domain derives
+    /// for it — its SAM account name and its distinguished name — are reported alongside
+    /// the ones a create applied, which is why an account nothing was applied to still
+    /// reports a list.
     pub fn to_computer(&self) -> Computer {
+        let mut attributes = Vec::with_capacity(self.attributes.len() + 2);
+        attributes.push(reported_attribute(
+            ATTRIBUTE_WINDOWS_SAM_NAME,
+            windows_sam_name(&self.computer_name),
+        ));
+        attributes.extend(self.attributes.iter().cloned());
+        attributes.push(reported_attribute(
+            ATTRIBUTE_DISTINGUISHED_NAME,
+            self.distinguished_name.clone(),
+        ));
         Computer {
             computer_id: Some(self.computer_id.clone()),
             computer_name: Some(self.computer_name.clone()),
-            // Absent rather than an empty list when the create applied no attributes, so
-            // an account nothing was applied to does not report a list that was never
-            // recorded.
-            computer_attributes: if self.attributes.is_empty() {
-                None
-            } else {
-                Some(self.attributes.clone())
-            },
+            computer_attributes: Some(attributes),
         }
     }
 }
@@ -1548,6 +1667,49 @@ impl Directory {
     /// case, so a lookup agrees with Active Directory's case-insensitive account names.
     pub fn computer_key(computer_name: &str) -> String {
         computer_name.to_lowercase()
+    }
+
+    /// This directory's domain as the trailing components of a distinguished name in it:
+    /// one `DC=<label>` per label of the directory's own `Name`, in order and spelled the
+    /// way the create spelled them.
+    ///
+    /// [`Self::domain_name_labels`] is the folded form a requested name is COMPARED
+    /// through; this is the form a name is RENDERED in.
+    pub fn domain_distinguished_name(&self) -> String {
+        self.name
+            .split('.')
+            .filter(|label| !label.is_empty())
+            .map(|label| format!("DC={label}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// The container a computer account created in this directory is placed in when the
+    /// create names no organizational unit.
+    ///
+    /// A directory that carries a NetBIOS short name keeps the objects it holds in an
+    /// organizational unit named for it, with the computer accounts in that unit's own
+    /// `Computers` unit; one that carries none has only the domain's built-in `Computers`
+    /// container to place them in.
+    pub fn default_computers_container(&self) -> String {
+        let domain = self.domain_distinguished_name();
+        match self.short_name.as_deref() {
+            Some(short_name) => format!("OU=Computers,OU={short_name},{domain}"),
+            None => format!("CN=Computers,{domain}"),
+        }
+    }
+
+    /// The distinguished name the computer account `computer_name` carries in this
+    /// directory: its own `CN=` component under the organizational unit the create named,
+    /// or under [`Self::default_computers_container`] when it named none.
+    pub fn computer_distinguished_name(
+        &self,
+        computer_name: &str,
+        organizational_unit: Option<&str>,
+    ) -> String {
+        let container = organizational_unit
+            .map_or_else(|| self.default_computers_container(), str::to_string);
+        format!("CN={computer_name},{container}")
     }
 
     /// Hand out the next computer account SID of this directory's domain: its

@@ -6,6 +6,12 @@
 //! that directory's record in [`crate::state`], so the account the response reports is
 //! the account the store holds.
 //!
+//! The account the response reports is the ACCOUNT, not the request body: the attributes
+//! a create applies are held under the one name the directory holds each recognized LDAP
+//! attribute by ([`crate::state::applied_attributes`]), and the attributes the domain
+//! derives for a new machine account — its SAM account name and its distinguished name —
+//! are reported beside them from the stored record.
+//!
 //! The account's `ComputerId` is its Windows SID: the directory's own domain SID
 //! ([`crate::state::Directory::domain_sid`], derived from the directory id, so every
 //! account of one directory shares it) plus the next RID of that directory's pool
@@ -272,14 +278,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The one-time join `Password` is NOT stored: the model marks it `@sensitive`,
         // nothing reports it back, and no later call of this service verifies it.
         let computer_id = directory.mint_computer_sid();
+        // The account's own distinguished name, fixed at creation: its `CN=` component
+        // under the unit the request named, or under the directory's default computers
+        // container when it named none.
+        let distinguished_name = directory.computer_distinguished_name(
+            &input.computer_name,
+            input.organizational_unit_distinguished_name.as_deref(),
+        );
         let record = crate::state::ComputerRecord {
             computer_id,
+            distinguished_name,
+            // The attributes the request applied, in the order it listed them, under the
+            // names the directory holds them by: a recognized LDAP attribute name is
+            // written in any casing and held under one
+            // ([`crate::state::applied_attributes`]).
+            attributes: crate::state::applied_attributes(
+                input.computer_attributes.unwrap_or_default(),
+            ),
             computer_name: input.computer_name,
             organizational_unit_distinguished_name: input
                 .organizational_unit_distinguished_name,
-            // The attributes the request applied, in the order it listed them. Nothing is
-            // added to them: an attribute this emulator did not apply is one no caller set.
-            attributes: input.computer_attributes.unwrap_or_default(),
             created_at: now,
         };
         directory.computers.insert(key.clone(), record);
