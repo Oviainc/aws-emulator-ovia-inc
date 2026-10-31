@@ -17,9 +17,9 @@
 //! country the submitted address names (the type's own country in three
 //! spellings, countries on three other continents, and four countries whose own
 //! per-country rules would otherwise claim the entry), the FORM of the address
-//! (the members the model requires of one, and every member it accepts), and both
-//! writers of a `TaxRegistrationEntry` — `PutTaxRegistration` and
-//! `BatchPutTaxRegistration`, which share the validator.
+//! (the members the model requires of one, and every member these jurisdictions
+//! accept), and both writers of a `TaxRegistrationEntry` — `PutTaxRegistration`
+//! and `BatchPutTaxRegistration`, which share the validator.
 //!
 //! The harness (`emulator`, `call`, `field_list`, `Answer`) lives in
 //! `tax_registration_lifecycle.rs` and the writer fan-out (`WRITERS`, `write`) in
@@ -65,7 +65,9 @@ const SUBMITTED_ADDRESS_COUNTRIES: &[(&str, &str)] = &[
 ];
 
 /// The address forms a row is tried with: the members `Address` requires of one,
-/// and every member it accepts.
+/// and every member these jurisdictions accept (`addressLine3` is accepted only
+/// for Saudi Arabia, which is none of them — see
+/// `crate::address_member_jurisdictions`).
 fn address_forms(country_code: &str) -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -77,7 +79,6 @@ fn address_forms(country_code: &str) -> Vec<(&'static str, Value)> {
             json!({
                 "addressLine1": "1 Example Street",
                 "addressLine2": "Example Floor",
-                "addressLine3": "Example Block",
                 "city": "Example City",
                 "stateOrRegion": "Example Region",
                 "districtOrCounty": "Example District",

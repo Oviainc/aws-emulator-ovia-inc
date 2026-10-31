@@ -29,6 +29,13 @@
 //! SHAPE rather than its jurisdiction (not two letters, or absent) is refused
 //! by the request walk before this handler runs.
 //!
+//! The ADDRESS itself is judged by the one checker every operation that takes an
+//! `Address` shares ([`crate::state::check_address`]): the model's non-blank
+//! pattern on each line, and the members the model documents the API as accepting
+//! only for certain jurisdictions
+//! ([`crate::state::ADDRESS_MEMBER_JURISDICTIONS`]), which an address held
+//! anywhere else may not carry.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

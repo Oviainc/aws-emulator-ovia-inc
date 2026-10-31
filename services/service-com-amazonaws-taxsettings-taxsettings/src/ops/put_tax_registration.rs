@@ -63,6 +63,13 @@
 //! * the model's non-blank pattern `^(?!\s*$)[\s\S]+$` is a negative lookahead
 //!   the boundary validator's regex engine cannot compile, so this handler
 //!   applies it to `registrationId`, `legalName` and every address line.
+//! * an address member the model documents the API as accepting only for certain
+//!   jurisdictions (`crate::state::ADDRESS_MEMBER_JURISDICTIONS`) is refused as a
+//!   field violation when the address that carries it is held anywhere else: the
+//!   restriction is stated per country, which no constraint on the shared
+//!   `Address` shape can express. Applied by
+//!   [`crate::state::check_address`], so every operation that takes an address
+//!   judges it the same way.
 //! * a write aimed at an account whose stored TRN is still `Pending` is refused
 //!   with the modelled `ConflictException`: the model documents "You can't set a
 //!   TRN if there's a pending TRN. You'll need to delete the pending TRN first",

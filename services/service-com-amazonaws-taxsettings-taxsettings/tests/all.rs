@@ -19,6 +19,8 @@ mod account_meta_data;
 mod additional_info_blocks;
 #[path = "all/address_country_requirements.rs"]
 mod address_country_requirements;
+#[path = "all/address_member_jurisdictions.rs"]
+mod address_member_jurisdictions;
 #[path = "all/batch_get_tax_exemptions_failed_accounts.rs"]
 mod batch_get_tax_exemptions_failed_accounts;
 #[path = "all/batch_row_error_codes.rs"]

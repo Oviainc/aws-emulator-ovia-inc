@@ -94,8 +94,10 @@ struct Case {
 /// answers `["VAT"]`), so the dimensions this table spans are the ones the model
 /// leaves open: `registrationId` and `legalName` from one character to the
 /// 1..=200 bound, and the `Address` from only its two required members
-/// (`postalCode`, `countryCode`) to every optional line filled in, in both cases
-/// of the two-letter country code.
+/// (`postalCode`, `countryCode`) to every optional line this jurisdiction accepts
+/// filled in (`addressLine3` the API accepts only for Saudi Arabia — see
+/// `crate::address_member_jurisdictions`), in both cases of the two-letter
+/// country code.
 ///
 /// Every row registers a Swiss address: which jurisdictions a supplemental TRN
 /// may be registered for is a SEPARATE rule, with its own recording and its own
@@ -115,7 +117,7 @@ fn round_trip_cases() -> Vec<Case> {
             }),
         },
         Case {
-            name: "every optional address member filled in",
+            name: "every optional address member this jurisdiction accepts filled in",
             entry: json!({
                 "registrationId": "CHE-987.654.321",
                 "registrationType": "VAT",
@@ -123,7 +125,6 @@ fn round_trip_cases() -> Vec<Case> {
                 "address": {
                     "addressLine1": "Bahnhofstrasse 1",
                     "addressLine2": "Floor 4",
-                    "addressLine3": "1234",
                     "districtOrCounty": "Zürich",
                     "city": "Zürich",
                     "stateOrRegion": "ZH",

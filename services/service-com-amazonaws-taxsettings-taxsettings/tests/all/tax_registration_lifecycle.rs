@@ -1259,12 +1259,11 @@ async fn values_outside_the_model_are_refused_and_values_inside_it_are_served() 
             "",
         ),
         (
-            "legal address with every line filled",
+            "legal address with every line this jurisdiction accepts filled",
             "legalAddress",
             json!({
                 "addressLine1": "1 Example Street",
                 "addressLine2": "Floor 3",
-                "addressLine3": "1234",
                 "districtOrCounty": "Mitte",
                 "city": "Berlin",
                 "stateOrRegion": "Berlin",

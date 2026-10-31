@@ -94,7 +94,10 @@ pub(crate) fn country_block_as_stored(country: &str, submitted: &Value) -> Value
 /// in the jurisdiction the address is held in.
 ///
 /// Every country here is one the service's per-country rules state no extra
-/// requirement for, so what decides each answer is the default rule alone.
+/// requirement for, so what decides each answer is the default rule alone. None
+/// of them carries `addressLine3`, the one member the API accepts only for a
+/// named jurisdiction (`crate::address_member_jurisdictions` covers that rule);
+/// it declares no default either way.
 fn address_rows() -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -126,7 +129,6 @@ fn address_rows() -> Vec<(&'static str, Value)> {
             "only members that declare no default submitted",
             json!({
                 "addressLine2": "Floor 4",
-                "addressLine3": "1234",
                 "districtOrCounty": "Shibuya",
                 "stateOrRegion": "Tokyo",
                 "postalCode": "1500001",
@@ -134,11 +136,10 @@ fn address_rows() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "every member of the shape submitted",
+            "every member these jurisdictions accept submitted",
             json!({
                 "addressLine1": "1 Example Street",
                 "addressLine2": "Floor 4",
-                "addressLine3": "1234",
                 "districtOrCounty": "Centrum",
                 "city": "Amsterdam",
                 "stateOrRegion": "Noord-Holland",

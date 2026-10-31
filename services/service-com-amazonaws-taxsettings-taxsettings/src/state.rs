@@ -212,7 +212,9 @@ pub const LEGAL_ADDRESS_ROLE: &str = "TaxAddress";
 /// Country rules that make a member REQUIRED (Saudi Arabia's `addressLine3`,
 /// Turkey's `districtOrCounty`, Kenya's `personType`, …) are a different class:
 /// they are the per-country business rules [`COUNTRY_RULES`] carries and
-/// [`check_country_requirements`] applies.
+/// [`check_country_requirements`] applies. A member the API accepts only for
+/// certain jurisdictions is a third class, in
+/// [`ADDRESS_MEMBER_JURISDICTIONS`].
 pub const TYPES_WITH_DERIVED_LEGAL_ADDRESS: &[&str] = &["PAN"];
 
 /// The country each country-specific `TaxRegistrationType` value belongs to: the
@@ -2203,8 +2205,14 @@ pub fn check_not_blank(member: &str, value: &str) -> Result<(), ValidationExcept
 }
 
 /// Apply [`check_not_blank`] to every `Address` member the model constrains with
-/// the non-blank pattern. `countryCode`'s own pattern (`^[a-zA-Z]+$`) is
-/// lookahead-free, so the boundary validator already enforces it.
+/// the non-blank pattern, then the jurisdictions each member is accepted for
+/// ([`check_address_member_jurisdictions`]). `countryCode`'s own pattern
+/// (`^[a-zA-Z]+$`) is lookahead-free, so the boundary validator already enforces
+/// it.
+///
+/// The one place an `Address` this service is asked to store is judged, so every
+/// operation that takes one — the legal address of a `TaxRegistrationEntry` and
+/// the address of a `SupplementalTaxRegistrationEntry` — judges it the same way.
 pub fn check_address(member_path: &str, address: &Address) -> Result<(), ValidationException> {
     let members: [(&str, Option<&String>); 7] = [
         ("addressLine1", address.address_line1.as_ref()),
@@ -2219,6 +2227,100 @@ pub fn check_address(member_path: &str, address: &Address) -> Result<(), Validat
         if let Some(value) = value {
             check_not_blank(&format!("{member_path}.{name}"), value)?;
         }
+    }
+    check_address_member_jurisdictions(member_path, address)
+}
+
+/// One `Address` member the model documents the API as accepting only for
+/// certain jurisdictions: the member as the wire spells it, the
+/// `Address$countryCode`s of the countries whose address accepts it, those
+/// countries as a refusal names them, and whether a submitted address carries
+/// the member.
+///
+/// A restriction of this kind is not one the SHAPE can carry, because every
+/// country's address is the same shape, so it is a per-country rule of this
+/// service like the rows of [`COUNTRY_RULES`] — and, where one sentence states
+/// both halves, it is the other half of a rule that table already carries: a
+/// member only one country's address accepts is also the member that country's
+/// registration must specify.
+#[derive(Debug, Clone, Copy)]
+pub struct AddressMemberJurisdiction {
+    /// The member the rule is about, as the wire spells it. Appended to the
+    /// address's own member path, so the refusal names the parameter the request
+    /// carried it in — see [`parameter_name`].
+    pub member: &'static str,
+    /// The `Address$countryCode`s whose address the API accepts the member for.
+    pub country_codes: &'static [&'static str],
+    /// Those countries' names, as the refusal states them.
+    pub countries: &'static str,
+    /// Whether a submitted address carries the member.
+    pub submitted: fn(&Address) -> bool,
+}
+
+impl AddressMemberJurisdiction {
+    /// Whether an address held in `country_code` accepts this member. Compared
+    /// case-insensitively, as every reader of an `Address$countryCode` here is:
+    /// the member's own pattern (`^[a-zA-Z]+$`) admits either case.
+    pub fn accepts(&self, country_code: &str) -> bool {
+        self.country_codes
+            .iter()
+            .any(|code| code.eq_ignore_ascii_case(country_code))
+    }
+
+    /// The refusal's message: the rule as the member's own documentation states
+    /// it, naming the member and the jurisdictions whose address accepts it.
+    pub fn message(&self) -> String {
+        format!(
+            "The Tax Settings API accepts the {} parameter only for {}.",
+            self.member, self.countries
+        )
+    }
+}
+
+/// Every `Address` member the model documents the API as accepting only for
+/// certain jurisdictions.
+///
+/// `addressLine3` is the only member of the shape whose documentation states
+/// such a restriction
+/// (`smithy_query(query="shape",shape="com.amazonaws.taxsettings#Address")`):
+/// "Currently, the Tax Settings API accepts the `addressLine3` parameter only
+/// for Saudi Arabia. When you specify a TRN in Saudi Arabia, you must enter the
+/// `addressLine3` …". The requiring half of that sentence is the Saudi row of
+/// [`COUNTRY_RULES`]; this is the accepting half. `districtOrCounty` names a
+/// country too ("For addresses in Brazil, this parameter uses the name of the
+/// neighborhood"), but that sentence says what the member MEANS there, not which
+/// countries may send it, so it is no row here.
+pub const ADDRESS_MEMBER_JURISDICTIONS: &[AddressMemberJurisdiction] =
+    &[AddressMemberJurisdiction {
+        member: "addressLine3",
+        country_codes: &["SA"],
+        countries: "Saudi Arabia",
+        submitted: |address: &Address| address.address_line3.is_some(),
+    }];
+
+/// Refuse an address that carries a member the API accepts only for
+/// jurisdictions other than the one that address names
+/// ([`ADDRESS_MEMBER_JURISDICTIONS`]).
+///
+/// The jurisdiction is the address's OWN `countryCode`, because the rule is
+/// about the address the member belongs to: a member carried at all where the
+/// API does not accept it is a value that member may not take there, hence
+/// [`ERROR_CODE_FIELD_VALIDATION_FAILED`], naming the parameter the request
+/// carried it in — the same refusal class as the other rules of this service
+/// about a member a jurisdiction does not admit.
+pub fn check_address_member_jurisdictions(
+    member_path: &str,
+    address: &Address,
+) -> Result<(), ValidationException> {
+    for rule in ADDRESS_MEMBER_JURISDICTIONS {
+        if !(rule.submitted)(address) || rule.accepts(&address.country_code) {
+            continue;
+        }
+        return Err(validation(
+            ERROR_CODE_FIELD_VALIDATION_FAILED,
+            &format!("{member_path}.{}", rule.member),
+            rule.message(),
+        ));
     }
     Ok(())
 }
@@ -2795,7 +2897,10 @@ pub const COUNTRY_RULES: &[CountryRule] = &[
         applies: always,
         satisfied: sector_is_business_or_individual,
     },
-    // Saudi Arabia: "For address, you must specify addressLine3."
+    // Saudi Arabia: "For address, you must specify addressLine3." The other
+    // half of the member's rule — that the API accepts it ONLY there — is
+    // [`ADDRESS_MEMBER_JURISDICTIONS`], because it is about the address rather
+    // than about this country's entry.
     CountryRule {
         country_code: "SA",
         member_path: "taxRegistrationEntry.legalAddress.addressLine3",
