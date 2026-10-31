@@ -89,6 +89,8 @@ mod list_compositions;
 mod list_encoder_configurations;
 #[path = "all/list_ingest_configurations.rs"]
 mod list_ingest_configurations;
+#[path = "all/list_participant_events_token_participant_scope.rs"]
+mod list_participant_events_token_participant_scope;
 #[path = "all/list_participant_replicas_paging.rs"]
 mod list_participant_replicas_paging;
 #[path = "all/list_participant_replicas_token_publisher_scope.rs"]
