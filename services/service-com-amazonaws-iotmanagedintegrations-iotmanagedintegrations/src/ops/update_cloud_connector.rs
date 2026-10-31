@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCloudConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCloudConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//!
+//! Applies the members the request names to the cloud connector the signing region's store
+//! holds under the `Identifier`, leaving every member it does not name as it was, and
+//! answers 200 with no body. An identifier that region holds no connector for is the
+//! modelled `ResourceNotFoundException` (HTTP 404).
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCloudConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +170,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCloudConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCloudConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCloudConnector"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateCloudConnectorErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the cloud-connector store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // A cloud connector is regional: only the region that created it resolves it.
+        let region = crate::state::request_region(ctx.parts());
+        let connector = store
+            .cloud_connector_in_mut(&region, &input.identifier)
+            .ok_or_else(|| {
+                // A mutation states the reason from the identifier the request carried,
+                // through the one formatter every mutating path of this service shares.
+                UpdateCloudConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::cloud_connector_not_found_on_mutation(&input.identifier),
+                )
+            })?;
+
+        // Each member the request names REPLACES the stored one; a member it does not name
+        // is left alone, so an update of one member does not drop the rest of the record.
+        if let Some(name) = input.name {
+            connector.name = name;
+        }
+        if input.description.is_some() {
+            connector.description = input.description;
+        }
+
+        Ok(UpdateCloudConnectorOutput)
     }
 }

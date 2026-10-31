@@ -139,6 +139,12 @@ pub const CLOUD_CONNECTOR_RESOURCE_TYPE: &str = "CloudConnector";
 /// ([`resource_not_found_message`]).
 pub const CLOUD_CONNECTOR_RESOURCE_NAME: &str = "Cloud Connector";
 
+/// The cloud-connector resource as a MUTATION's reason names it: the same name in SENTENCE
+/// case, because that reason is a sentence about it ([`cannot_be_found_message`]) rather
+/// than a label like the read's — exactly as its sibling of the C2C surface words its own
+/// ([`CONNECTOR_DESTINATION_RESOURCE_SUBJECT`]).
+pub const CLOUD_CONNECTOR_RESOURCE_SUBJECT: &str = "Cloud connector";
+
 /// One stored connector destination: the record `CreateConnectorDestination` inserts —
 /// "a connector destination for connecting a cloud-to-cloud (C2C) connector to the
 /// customer's Amazon Web Services account" — and `GetConnectorDestination` projects onto
@@ -1305,6 +1311,13 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
             .filter(|connector| connector.region == region)
     }
 
+    /// [`Self::cloud_connector_in`], mutably.
+    pub fn cloud_connector_in_mut(&mut self, region: &str, id: &str) -> Option<&mut CloudConnector> {
+        self.cloud_connectors
+            .get_mut(id)
+            .filter(|connector| connector.region == region)
+    }
+
     /// The connector destination `region`'s endpoint holds under `id`, if any. A
     /// destination created in another region is not visible here, as for every regional
     /// resource.
@@ -2216,6 +2229,23 @@ pub fn bare_resource_not_found() -> ResourceNotFoundException {
 pub fn cloud_connector_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(resource_not_found_message(CLOUD_CONNECTOR_RESOURCE_NAME)),
+        ..resource_not_found(CLOUD_CONNECTOR_RESOURCE_TYPE, identifier)
+    }
+}
+
+/// The modelled `ResourceNotFoundException` a MUTATION answers for a cloud connector the
+/// store does not hold under the `Identifier` a request named: the mutating path's reason
+/// ([`cannot_be_found_message`]) plus the `ResourceId` and `ResourceType` members every 404
+/// of this service reports the same way.
+///
+/// A 404 of this service is worded by the PATH that resolved the resource, not by the
+/// operation: a read of this same identifier states which KIND of resource is missing
+/// ([`cloud_connector_not_found_on_read`]), where a mutation states a sentence about the
+/// resource itself, as the recorded mutating 404 of the other half of the C2C surface does
+/// ([`connector_destination_not_found_on_mutation`]).
+pub fn cloud_connector_not_found_on_mutation(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(cannot_be_found_message(CLOUD_CONNECTOR_RESOURCE_SUBJECT)),
         ..resource_not_found(CLOUD_CONNECTOR_RESOURCE_TYPE, identifier)
     }
 }
