@@ -689,6 +689,21 @@ pub const STATEMENT_EFFECT_ALLOW: &str = "Allow";
 /// is too large") for a call that would push the policy past it. Not adjustable.
 pub const MAX_POLICY_SIZE_BYTES: usize = 20_480;
 
+/// The refusal a grant that would push a resource policy past [`MAX_POLICY_SIZE_BYTES`]
+/// gets: the fixed sentence `PolicyLengthExceededException` carries, whose variables are
+/// the size the policy WOULD have reached and the quota it may not pass.
+///
+/// It states the outcome of the call rather than the resource it was made on — the request
+/// already names that — so one sentence serves every policy this service holds, and a
+/// caller can read off how much too large the result was.
+#[must_use]
+pub fn policy_length_exceeded_message(final_size: usize) -> String {
+    format!(
+        "The final policy size ({final_size}) is bigger than the limit \
+         ({MAX_POLICY_SIZE_BYTES})."
+    )
+}
+
 /// The message every resource-policy operation states when the ARN it was given names
 /// no policy: a resource of a kind this store holds no records of, or one nobody has
 /// attached a policy to. It states the fact and nothing from the request, so the two
@@ -1161,6 +1176,14 @@ const POLICY_STATEMENT_MEMBER: &str = "Statement";
 /// names it; it is the `StatementId` an `AddPermission` grant was made under.
 const STATEMENT_ID_MEMBER: &str = "Sid";
 
+/// The refusal a value that is not a policy document gets, on the operations that take one
+/// as a string member.
+///
+/// The `Policy` member is "formatted as a JSON string", and what is wrong with a value that
+/// is not one is that it does not PARSE as the policy language's document: the sentence
+/// states that and nothing of the request, so it reads the same whatever was submitted.
+pub const POLICY_SYNTAX_ERROR_MESSAGE: &str = "Policy has syntax errors.";
+
 /// Whether `document` is a policy document.
 ///
 /// The `ResourcePolicy` member is "formatted as a JSON string", and the policy language
@@ -1221,7 +1244,7 @@ pub struct PolicyRecord {
     /// The statements, in the order they were added, so the document reports them
     /// deterministically. Empty for a policy held as a whole [`PolicyRecord::document`].
     pub statements: Vec<PolicyStatement>,
-    /// The whole policy document a caller supplied, exactly as it was supplied.
+    /// The whole policy document a caller supplied, in the form this service reports it.
     ///
     /// `PutResourcePolicy` "replaces any existing policy on the Lambda resource. If you
     /// previously added permissions using the AddPermission operation, the new policy
@@ -1248,11 +1271,21 @@ impl Default for PolicyRecord {
 
 impl PolicyRecord {
     /// The policy a caller supplied as a whole document, at a fresh revision.
+    ///
+    /// The document is STORED as this service reports it, which is not the caller's bytes:
+    /// a resource policy is reported in the one rendering every service that attaches an
+    /// IAM policy document reports it in (`service_common::iam_policy_rendering`) — the
+    /// insignificant whitespace between its JSON tokens dropped, and an element the policy
+    /// language types as a string or an array of them written as the string when the caller
+    /// wrote a one-element array. Everything else is the caller's: member order, the
+    /// spelling of every value, and every byte inside a string literal. So the policy a
+    /// caller reads back is the same text whatever layout it was submitted in, and putting
+    /// back what was read stores the same bytes again.
     #[must_use]
     pub fn of_document(document: String) -> Self {
         Self {
             statements: Vec::new(),
-            document: Some(document),
+            document: Some(::service_common::iam_policy_rendering::rendered(&document)),
             revision_id: mint_revision_id(),
         }
     }

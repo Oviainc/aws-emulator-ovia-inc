@@ -323,11 +323,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 AddLayerVersionPermissionErrorModeled::PolicyLengthExceededException(
                     PolicyLengthExceededException {
                         r#type: None,
-                        message: Some(format!(
-                            "The resource policy of {resource} would be {size} bytes, past the \
-                             maximum of {} bytes.",
-                            crate::state::MAX_POLICY_SIZE_BYTES
-                        )),
+                        message: Some(crate::state::policy_length_exceeded_message(size)),
                     },
                 )
                 .into(),

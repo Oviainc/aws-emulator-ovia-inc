@@ -104,6 +104,14 @@ pub mod fault_class;
 /// module's own header.
 mod opaque_members;
 
+/// Whether the resource-based policy a policy READ reports grants public access, which that
+/// read states beside the document; see the module's own header.
+pub mod public_access;
+
+/// The size a request to one operation of this service may reach, and the `413` refusal for
+/// one that passes it; see the module's own header.
+mod request_quota;
+
 /// The largest single value ONE clause of this service's validation refusal quotes back.
 ///
 /// An AWS constraint message always quotes the value it refused in full, and the shared
@@ -462,6 +470,15 @@ where
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
+            // A request whose BODY is past the quota published for this operation is
+            // refused on its size alone, before it is read as an input at all: that is
+            // what makes the refusal a 413 about the request rather than a 400 about what
+            // the request would have stored (see [`request_quota`]).
+            if let Some(refusal) =
+                request_quota::refusing_body(O::NAME, req.body().bytes().map_or(0, <[u8]>::len))
+            {
+                return fault_class::with_fault_class(O::NAME, refusal);
+            }
             // The definition is read, used and dropped inside this statement:
             // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
             // below would make this future non-`Send`.
@@ -477,10 +494,16 @@ where
                 return if names_no_fault_class {
                     response
                 } else {
-                    fault_class::with_fault_class(response)
+                    fault_class::with_fault_class(O::NAME, response)
                 };
             }
-            fault_class::with_fault_class(self.operation.run(svc, req, ctx).await)
+            // A policy read also states whether the policy it reports grants public
+            // access (see [`public_access`]); every other answer passes through.
+            let answered = public_access::with_public_access_allowed(
+                O::NAME,
+                self.operation.run(svc, req, ctx).await,
+            );
+            fault_class::with_fault_class(O::NAME, answered)
         })
     }
 

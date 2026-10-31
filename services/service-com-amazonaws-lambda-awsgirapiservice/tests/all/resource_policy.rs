@@ -775,11 +775,12 @@ async fn a_policy_cannot_grow_past_its_published_quota() {
     let router = router_on(&engine);
     create_function(&router, "bulky", false).await;
 
-    // One statement of about 11 KB: the action and the source ARN are each within their
-    // modelled length and pattern, so the boundary validator accepts them and the
-    // quota is what refuses the second one.
-    let action = format!("lambda:{}", "A".repeat(9_000));
-    let source_arn = format!("arn:aws:s3:::{}", "b".repeat(1_500));
+    // One statement of about 4.5 KB: the action and the source ARN are each within their
+    // modelled length and pattern, and the request carrying them stays inside the
+    // operation's own 5 KB request quota, so the POLICY quota is what refuses the
+    // statement that crosses it.
+    let action = format!("lambda:{}", "A".repeat(3_800));
+    let source_arn = format!("arn:aws:s3:::{}", "b".repeat(600));
     let body = |sid: &str| {
         json!({
             "StatementId": sid,
@@ -789,44 +790,73 @@ async fn a_policy_cannot_grow_past_its_published_quota() {
         })
     };
 
-    let first = add_permission(&router, "bulky", None, &body("first")).await;
-    assert_eq!(
-        first.status,
-        201,
-        "case {:?}: expected HTTP 201 while the policy fits, got {} {}",
-        "one large statement",
-        first.status,
-        first.text()
-    );
-    let one_statement = policy_of("one large statement", &get_policy(&router, "bulky", None).await);
-    let size = one_statement.to_string().len();
+    // Grant until one grant is refused: the quota bounds the DOCUMENT, so how many
+    // statements fit is the quota divided by their size rather than a fixed count.
+    let mut accepted = 0_usize;
+    let mut refusal = None;
+    for index in 0..8 {
+        let sid = format!("stmt-{index}");
+        let answer = add_permission(&router, "bulky", None, &body(&sid)).await;
+        if answer.status == 201 {
+            accepted += 1;
+            continue;
+        }
+        refusal = Some((sid, answer));
+        break;
+    }
     assert!(
-        size <= MAX_POLICY_SIZE_BYTES && size * 2 > MAX_POLICY_SIZE_BYTES,
-        "case {:?}: this test needs one statement to fit and two not to, but the document \
-         is {size} bytes against a {MAX_POLICY_SIZE_BYTES} byte quota",
-        "one large statement"
+        accepted > 1,
+        "case {:?}: expected several statements to fit inside the quota, got {accepted}",
+        "statements that fit"
     );
-
-    let second = add_permission(&router, "bulky", None, &body("second")).await;
+    let (refused_sid, refused) = refusal.unwrap_or_else(|| {
+        panic!(
+            "case {:?}: a document past the {MAX_POLICY_SIZE_BYTES} byte quota must be refused",
+            "the statement that crosses the quota"
+        )
+    });
+    let fitting = policy_of(
+        "the statements that fit",
+        &get_policy(&router, "bulky", None).await,
+    );
     assert_eq!(
-        second.status,
+        refused.status,
         400,
-        "case {:?}: expected HTTP 400 past the quota, got {} {}",
-        "a second large statement",
-        second.status,
-        second.text()
+        "case {refused_sid:?}: expected HTTP 400 past the quota, got {} {}",
+        refused.status,
+        refused.text()
     );
     assert!(
-        second.error_code().contains("PolicyLengthExceededException"),
-        "case {:?}: expected PolicyLengthExceededException, got {}",
-        "a second large statement",
-        second.error_code()
+        refused.error_code().contains("PolicyLengthExceededException"),
+        "case {refused_sid:?}: expected PolicyLengthExceededException, got {}",
+        refused.error_code()
+    );
+    // The refusal states the size the document would have reached and the quota it may
+    // not pass, so a caller can read off how much too large the result was.
+    let stated = refused.string("message").unwrap_or_default();
+    assert!(
+        stated.starts_with("The final policy size (")
+            && stated.ends_with(&format!("is bigger than the limit ({MAX_POLICY_SIZE_BYTES}).")),
+        "case {refused_sid:?}: expected the final-policy-size refusal, got {stated:?}"
+    );
+    let reported_size: usize = stated
+        .trim_start_matches("The final policy size (")
+        .split(')')
+        .next()
+        .unwrap_or_default()
+        .parse()
+        .unwrap_or_default();
+    let fitting_size = fitting.to_string().len();
+    assert!(
+        reported_size > MAX_POLICY_SIZE_BYTES && reported_size > fitting_size,
+        "case {refused_sid:?}: expected a final size past the {MAX_POLICY_SIZE_BYTES} byte \
+         quota and larger than the {fitting_size} bytes the stored document holds, got \
+         {reported_size} in {stated:?}"
     );
 
     let after = policy_of("after the refusal", &get_policy(&router, "bulky", None).await);
     assert_eq!(
-        after, one_statement,
-        "case {:?}: the refused grant changed the policy, which is now {after}",
-        "after the refusal"
+        after, fitting,
+        "case {refused_sid:?}: the refused grant changed the policy, which is now {after}"
     );
 }

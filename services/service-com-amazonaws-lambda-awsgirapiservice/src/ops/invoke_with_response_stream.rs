@@ -220,6 +220,7 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         ctx: &OperationContext<'_>,
     ) -> RtResponse {
         let response = crate::service::fault_class::with_fault_class(
+            OPERATION_NAME,
             match self.invoke(protocol, req, ctx) {
                 Ok(response) => response,
                 Err(error) => error_response(protocol, &error),

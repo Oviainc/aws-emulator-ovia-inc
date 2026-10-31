@@ -196,11 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(PutResourcePolicyErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     r#type: None,
-                    message: Some(
-                        "The Policy parameter must be a policy document formatted as a JSON \
-                         object."
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::POLICY_SYNTAX_ERROR_MESSAGE.to_string()),
                 },
             )
             .into());

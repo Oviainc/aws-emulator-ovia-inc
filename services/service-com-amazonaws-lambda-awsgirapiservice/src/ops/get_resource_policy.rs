@@ -7,6 +7,12 @@
 //! `PutResourcePolicy` stored, or the one the statements `AddPermission` added make up,
 //! at the revision the last change to it minted.
 //!
+//! A request that resolves to no policy — an ARN naming a resource this store holds no
+//! record of, a function or version that does not exist, or one nobody has attached a
+//! policy to — is one `ResourceNotFoundException` whose sentence names nothing of the
+//! request (`crate::state::NO_RESOURCE_POLICY_MESSAGE`): a read reports what it found, and
+//! all three cases are the same finding.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -175,11 +181,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
             }
-            crate::state::ResolveFailure::NotFound(message) => {
+            // A READ of a resource's policy names nothing of what it could not find: a
+            // resource this store holds no record of and a resource holding no policy are
+            // both "there is no policy to retrieve here", so both are the one fixed
+            // sentence below rather than the resource-identifying refusal the resolver
+            // words for an operation that acts ON the resource.
+            crate::state::ResolveFailure::NotFound(_) => {
                 GetResourcePolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         r#type: None,
-                        message: Some(message),
+                        message: Some(crate::state::NO_RESOURCE_POLICY_MESSAGE.to_string()),
                     },
                 )
             }

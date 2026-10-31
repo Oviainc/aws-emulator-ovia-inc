@@ -17,6 +17,11 @@
 //! while a `FunctionName` that resolves to nothing keeps the resource-identifying form
 //! `crate::state::resolve_function` builds, so a caller can tell the two apart.
 //!
+//! The answer also states whether the policy it reports grants PUBLIC access, which is a
+//! property of that document and is named on the rendered response because the on-disk
+//! `GetPolicyResponse` models no member for it
+//! (`crate::service::public_access`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

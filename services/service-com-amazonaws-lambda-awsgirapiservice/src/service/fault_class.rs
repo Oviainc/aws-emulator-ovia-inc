@@ -68,9 +68,10 @@
 //! on them through [`with_fault_class`] itself
 //! (`crate::ops::invoke_with_response_stream`).
 //!
-//! And one answer inside that surface is held back from it deliberately: the OPAQUE
-//! refusal of a service-minted token (`crate::service::opaque_members`), whose recorded
-//! body is its fixed sentence and no other member at all.
+//! And two answers inside that surface are held back from it deliberately: the OPAQUE
+//! refusal of a service-minted token (`crate::service::opaque_members`), whose recorded body
+//! is its fixed sentence and no other member at all, and the refusals listed in
+//! [`NAMES_NO_CLASS`], whose recorded bodies carry their message alone.
 
 use aws_smithy_runtime_api::http::Response as RtResponse;
 use aws_smithy_types::body::SdkBody;
@@ -89,6 +90,65 @@ const FAULT_CLASS_MEMBER: &str = "Type";
 /// The response header a renderer uses to advertise its body's length.
 const CONTENT_LENGTH: &str = "content-length";
 
+/// The member every error body of this service names its error shape in.
+const SHAPE_MEMBER: &str = "__type";
+
+/// One refusal whose recorded body names NO class of fault.
+struct NamesNoClass {
+    /// The operation that answers it, as the model names it.
+    operation: &'static str,
+    /// The error shape it is answered as, as the model names it.
+    shape: &'static str,
+}
+
+/// Every refusal of this service that carries its message ALONE, one row each.
+///
+/// The member is optional on every error shape this model declares, and AWS populates it on
+/// most of this service's refusals but not on all of them, so which refusals name a class is
+/// recorded rather than derived: a row here is a refusal whose recorded body has no `Type`
+/// member at all.
+///
+/// The rows are the REVISION PRECONDITION of the resource-policy operations — the refusal
+/// for a `RevisionId` that is not the stored policy's, which both operations taking that
+/// precondition answer identically (corpus `simparity-wire-aws-v1`, fixtures
+/// `lambda-resource-policy-revision-mismatch`,
+/// `lambda-resource-policy-conditional-update-and-stale-revision` and
+/// `lambda-resource-policy-precondition-conflict`). The same shape raised by another
+/// operation of this service — the `RevisionId` precondition of `AddPermission` and
+/// `RemovePermission`, recorded WITH the member — is not matched by these rows, which is
+/// why a row names the operation as well as the shape.
+const NAMES_NO_CLASS: &[NamesNoClass] = &[
+    NamesNoClass {
+        operation: "PutResourcePolicy",
+        shape: "PreconditionFailedException",
+    },
+    NamesNoClass {
+        operation: "DeleteResourcePolicy",
+        shape: "PreconditionFailedException",
+    },
+];
+
+/// The error shape `body` names, as the model names it: the shape member every error body of
+/// this service carries, with the namespace a renderer may qualify it with dropped.
+fn named_shape(body: &Value) -> Option<&str> {
+    let named = body.get(SHAPE_MEMBER)?.as_str()?;
+    Some(match named.rsplit_once('#') {
+        Some((_, shape)) => shape,
+        None => named,
+    })
+}
+
+/// Whether the answer `operation` gave, whose body is `body`, is one of the refusals that
+/// names no class of fault ([`NAMES_NO_CLASS`]).
+fn names_no_class(operation: &str, body: &Value) -> bool {
+    let Some(shape) = named_shape(body) else {
+        return false;
+    };
+    NAMES_NO_CLASS
+        .iter()
+        .any(|refusal| refusal.operation == operation && refusal.shape == shape)
+}
+
 /// The class of fault a response at `status` reports, or `None` for a status that reports
 /// no failure at all.
 ///
@@ -104,12 +164,16 @@ pub fn fault_class(status: u16) -> Option<&'static str> {
 }
 
 /// The error body with `class` named in its [`FAULT_CLASS_MEMBER`], or `None` when there
-/// is nothing to name it on: the body is not a JSON object, or it already names one.
+/// is nothing to name it on: the body is not a JSON object, it already names one, or it is
+/// one of the refusals `operation` answers with its message alone ([`NAMES_NO_CLASS`]).
 ///
 /// Idempotent, and non-destructive: a body that already carries the member keeps the value
 /// it carries, so a handler that states the class itself always wins.
-fn naming_the_fault_class(body: &[u8], class: &str) -> Option<Vec<u8>> {
+fn naming_the_fault_class(operation: &str, body: &[u8], class: &str) -> Option<Vec<u8>> {
     let mut document: Value = serde_json::from_slice(body).ok()?;
+    if names_no_class(operation, &document) {
+        return None;
+    }
     let object = document.as_object_mut()?;
     if object.contains_key(FAULT_CLASS_MEMBER) {
         return None;
@@ -123,11 +187,14 @@ fn naming_the_fault_class(body: &[u8], class: &str) -> Option<Vec<u8>> {
 
 /// The response as this service answers it: an error body naming the class of its fault.
 ///
+/// `operation` is the operation that answered, because which refusals name a class is
+/// recorded per refusal ([`NAMES_NO_CLASS`]).
+///
 /// A response that reports no failure, or whose body is not a JSON object (a streamed
 /// body, an empty one, a download the service served), is returned untouched — status,
 /// headers and every byte of the body exactly as the renderer wrote them.
 #[must_use]
-pub fn with_fault_class(mut resp: RtResponse) -> RtResponse {
+pub fn with_fault_class(operation: &str, mut resp: RtResponse) -> RtResponse {
     let Some(class) = fault_class(resp.status().as_u16()) else {
         return resp;
     };
@@ -137,7 +204,7 @@ pub fn with_fault_class(mut resp: RtResponse) -> RtResponse {
         let Some(bytes) = resp.body().bytes() else {
             return resp;
         };
-        match naming_the_fault_class(bytes, class) {
+        match naming_the_fault_class(operation, bytes, class) {
             Some(rewritten) => rewritten,
             None => return resp,
         }
@@ -217,7 +284,8 @@ mod tests {
 
     /// One row per class of error body this service can answer with — a modelled
     /// exception at each status, and the two bodies the framework renders itself — so the
-    /// member is a property of the error envelope rather than of one refusal.
+    /// member is a property of the error envelope rather than of one refusal. Every row is
+    /// answered by an operation that is not among [`NAMES_NO_CLASS`].
     #[test]
     fn every_error_body_names_the_class_of_its_fault() {
         let cases: &[(u16, &str, &str, &str)] = &[
@@ -269,7 +337,7 @@ mod tests {
         ];
         for (status, code, text, expected) in cases {
             let body = format!(r#"{{"__type":"{code}","message":"{text}"}}"#);
-            let answered = with_fault_class(response(*status, &body));
+            let answered = with_fault_class("AddPermission", response(*status, &body));
             let document = decoded(answered.body().bytes().expect("an in-memory body"));
             assert_eq!(
                 document.get(FAULT_CLASS_MEMBER).and_then(Value::as_str),
@@ -289,13 +357,63 @@ mod tests {
         }
     }
 
+    /// The refusals recorded WITHOUT the member keep their message alone, and the SAME
+    /// error shape raised by any other operation still names its class — one row per
+    /// listed refusal, plus the operations that share its shape and its status.
+    #[test]
+    fn a_refusal_recorded_without_the_member_keeps_its_message_alone() {
+        let mut cases: Vec<(String, &str, &str, Option<&str>)> = Vec::new();
+        for refusal in NAMES_NO_CLASS {
+            cases.push((
+                format!("{} answering {}", refusal.operation, refusal.shape),
+                refusal.operation,
+                refusal.shape,
+                None,
+            ));
+            // The same operation answering another shape, and another operation answering
+            // the same shape, both still name the class: a row is the pair, not either
+            // half of it.
+            cases.push((
+                format!("{} answering another shape", refusal.operation),
+                refusal.operation,
+                "ResourceNotFoundException",
+                Some(USER_FAULT),
+            ));
+        }
+        for operation in ["AddPermission", "RemovePermission"] {
+            cases.push((
+                format!("{operation} answering the same shape"),
+                operation,
+                "PreconditionFailedException",
+                Some(USER_FAULT),
+            ));
+        }
+        for (case, operation, shape, expected) in cases {
+            let text = "The value of RevisionId provided doesn't match the policy's latest \
+                        revision ID.";
+            let body = format!(r#"{{"__type":"{shape}","message":"{text}"}}"#);
+            let answered = with_fault_class(operation, response(412, &body));
+            let document = decoded(answered.body().bytes().expect("an in-memory body"));
+            assert_eq!(
+                document.get(FAULT_CLASS_MEMBER).and_then(Value::as_str),
+                expected,
+                "case {case:?}: expected the class {expected:?}, got {document}"
+            );
+            assert_eq!(
+                document.get("message").and_then(Value::as_str),
+                Some(text),
+                "case {case:?}: the message must survive, got {document}"
+            );
+        }
+    }
+
     /// Nothing to name a class on: a body that already names one keeps it, a body that is
     /// not an object and one that is not JSON at all are left alone, and so is every
     /// success.
     #[test]
     fn a_body_that_names_no_class_of_its_own_is_left_alone() {
         let already = r#"{"__type":"ResourceInUseException","Type":"Service","Message":"busy"}"#;
-        let answered = with_fault_class(response(400, already));
+        let answered = with_fault_class("GetFunction", response(400, already));
         assert_eq!(
             answered.body().bytes().expect("an in-memory body"),
             already.as_bytes(),
@@ -313,7 +431,7 @@ mod tests {
             ),
             ("an empty success", 204, ""),
         ] {
-            let answered = with_fault_class(response(status, body));
+            let answered = with_fault_class("GetFunction", response(status, body));
             assert_eq!(
                 answered.body().bytes().expect("an in-memory body"),
                 body.as_bytes(),
@@ -329,7 +447,7 @@ mod tests {
         let mut resp = response(400, body);
         resp.headers_mut()
             .insert(CONTENT_LENGTH, body.len().to_string());
-        let answered = with_fault_class(resp);
+        let answered = with_fault_class("GetFunction", resp);
         let bytes = answered.body().bytes().expect("an in-memory body").to_vec();
         assert_eq!(
             answered.headers().get(CONTENT_LENGTH),

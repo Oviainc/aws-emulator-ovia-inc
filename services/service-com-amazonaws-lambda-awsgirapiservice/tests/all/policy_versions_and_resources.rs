@@ -1049,10 +1049,12 @@ async fn function_policy_is_per_qualifier_and_bounded() {
     }
 
     // AWS's published quota bounds the whole document, not one statement: each of these
-    // statements carries a ~9 KB SourceArn, so the third crosses the 20 KB limit.
-    let long_source_arn = format!("arn:aws:s3:::{}", "a".repeat(9_000));
+    // statements carries a ~4 KB SourceArn — which keeps every request itself inside the
+    // operation's own 5 KB request quota — so the document crosses the 20 KB limit after
+    // four of them.
+    let long_source_arn = format!("arn:aws:s3:::{}", "a".repeat(4_000));
     let mut refused = 0_usize;
-    for index in 0..3 {
+    for index in 0..6 {
         let answer = add_permission(
             &router,
             "scoped",

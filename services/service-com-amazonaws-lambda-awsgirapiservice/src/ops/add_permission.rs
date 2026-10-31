@@ -25,6 +25,12 @@
 //! depends on the account's block-public-access setting, which this emulator does not
 //! model, so no call is refused for a setting nothing holds.
 //!
+//! One refusal of this operation is NOT here, because it is not about what the request
+//! asked for: a request whose BODY is past the quota published for this operation is
+//! refused `413` on its size alone, before it is read as an input at all
+//! (`crate::service::request_quota`). The refusal below is the one about the resulting
+//! POLICY's size, which is a different condition at a different status.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -357,11 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(AddPermissionErrorModeled::PolicyLengthExceededException(
                 PolicyLengthExceededException {
                     r#type: None,
-                    message: Some(format!(
-                        "The resource policy of {resource} would be {size} bytes, past the \
-                         maximum of {} bytes.",
-                        crate::state::MAX_POLICY_SIZE_BYTES
-                    )),
+                    message: Some(crate::state::policy_length_exceeded_message(size)),
                 },
             )
             .into());
