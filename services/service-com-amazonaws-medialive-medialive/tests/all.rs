@@ -89,6 +89,9 @@ mod channel_thumbnails;
 #[path = "all/channel_update.rs"]
 mod channel_update;
 
+#[path = "all/channel_used_engine_versions.rs"]
+mod channel_used_engine_versions;
+
 #[path = "all/claim_device.rs"]
 mod claim_device;
 

@@ -160,7 +160,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         // Reporting only: `settle` materialises transitions the clock already made
         // due, so a channel whose delete has come due is not listed.
-        state.settle(::std::time::SystemTime::now());
+        let now = ::std::time::SystemTime::now();
+        state.settle(now);
         let state = &*state;
 
         // `NextToken` is the id the next page starts at, and ids sort in mint
@@ -178,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let channels: Vec<ChannelSummary> = remaining
             .by_ref()
             .take(page_size)
-            .map(|(_, channel)| state.channel_summary(channel))
+            .map(|(_, channel)| state.channel_summary(channel, now))
             .collect();
         // Absent on the last page: a token is handed out only when a channel is
         // left over after this one.

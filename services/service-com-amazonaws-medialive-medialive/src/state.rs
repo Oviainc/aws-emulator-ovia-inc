@@ -3548,10 +3548,79 @@ impl ComAmazonawsMedialiveMedialiveState {
         self.channel_engine_versions.described(version)
     }
 
+    /// The engine version this account's catalogue offers as its DEFAULT at
+    /// `now` — the engine a channel that pinned none runs on.
+    ///
+    /// `ChannelEngineVersionRequest$Version` is "The build identifier of the
+    /// engine version to use for this channel. Specify 'DEFAULT' to reset to the
+    /// default version", so the model states that an account HAS a default engine
+    /// version and never which build identifier it is. It is therefore DERIVED
+    /// from the catalogue rather than stored beside it: the newest version still
+    /// available to the account, which is the entry
+    /// [`ChannelEngineVersionCatalog::available_at`] reports first (it orders the
+    /// available versions newest release first), because the engine a service puts
+    /// a channel on when the caller pins none is its current release. An account
+    /// the service has published no engine version to has no default version, and
+    /// then there is none to report.
+    fn default_engine_version(
+        &self,
+        now: SystemTime,
+    ) -> Option<crate::ops::types::ChannelEngineVersionResponse> {
+        self.channel_engine_versions
+            .available_at(now)
+            .into_iter()
+            .next()
+    }
+
+    /// The engine versions a channel's RUNNING pipelines are using, as
+    /// `ChannelSummary$UsedChannelEngineVersions` reports them ("The engine
+    /// version that the running pipelines are using").
+    ///
+    /// Derived from the two facts the store already holds about a running
+    /// channel — the same two the sibling `PipelinesRunningCount` and
+    /// `ChannelEngineVersion` members are derived from: which of its pipelines
+    /// are up ([`ChannelRecord::healthy_pipelines`]) and which engine build it is
+    /// pinned to. A channel with no pipeline up is using no engine version, so it
+    /// reports none; while a pipeline is up, the engine those pipelines run is
+    /// the channel's pinned build, or the account's default version
+    /// ([`Self::default_engine_version`]) when the channel pinned none — and
+    /// nothing at all when the channel pinned none and the account has no default
+    /// version to run it on, because then there is no identifier to name.
+    ///
+    /// Every pipeline of one channel runs that one engine, and the member reports
+    /// the versions in USE rather than one entry per pipeline, so a running
+    /// channel reports exactly that one version — with the expiry the catalogue
+    /// stores for it ([`Self::described_engine_version`]), the same instant
+    /// `ChannelEngineVersion` and `ListVersions` report for that identifier.
+    fn used_engine_versions(
+        &self,
+        channel: &ChannelRecord,
+        now: SystemTime,
+    ) -> Vec<crate::ops::types::ChannelEngineVersionResponse> {
+        if channel.healthy_pipelines().is_empty() {
+            return Vec::new();
+        }
+        channel
+            .channel_engine_version
+            .as_deref()
+            .map(|version| self.described_engine_version(version))
+            .or_else(|| self.default_engine_version(now))
+            .into_iter()
+            .collect()
+    }
+
     /// The `ChannelSummary` projection of one stored channel — the same stored
     /// record as [`Self::channel_description`], minus the members the summary
-    /// shape does not carry (`EncoderSettings`, `PipelineDetails`).
-    pub fn channel_summary(&self, channel: &ChannelRecord) -> ChannelSummary {
+    /// shape does not carry (`EncoderSettings`, `PipelineDetails`) and plus the
+    /// one it carries beyond that description, `UsedChannelEngineVersions`, which
+    /// [`Self::used_engine_versions`] derives from the channel's healthy
+    /// pipelines and its engine version pin.
+    ///
+    /// `now` is the instant of the call, for the one member whose value the clock
+    /// bears on: an account's default engine version is the newest of the
+    /// versions still available to it, and which of them are available is a
+    /// question for the clock.
+    pub fn channel_summary(&self, channel: &ChannelRecord, now: SystemTime) -> ChannelSummary {
         ChannelSummary {
             arn: Some(channel.arn.clone()),
             cdi_input_specification: channel.cdi_input_specification.clone(),
@@ -3575,7 +3644,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .channel_engine_version
                 .as_deref()
                 .map(|version| self.described_engine_version(version)),
-            used_channel_engine_versions: None,
+            used_channel_engine_versions: Some(self.used_engine_versions(channel, now)),
             linked_channel_settings: channel
                 .linked_channel_settings
                 .as_ref()
