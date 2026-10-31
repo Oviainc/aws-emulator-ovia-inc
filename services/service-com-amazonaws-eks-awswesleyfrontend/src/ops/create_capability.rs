@@ -511,6 +511,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modified_at: now,
             delete_propagation_policy: input.delete_propagation_policy.clone(),
             client_request_token: input.client_request_token.clone(),
+            // A capability takes no update until `UpdateCapability` starts one.
+            pending_update: None,
         };
 
         let capability = record.to_capability();

@@ -1,0 +1,488 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! What this service answers BEFORE a refusal of the request body: the pass-role
+//! authorization of a role the request hands Amazon EKS, and the resolution of the
+//! cluster the request is addressed to.
+//!
+//! Every handler in `crate::ops` already keeps that order — the pass-role question
+//! is decided from the value alone and needs no state, and the `@httpLabel` cluster
+//! names the resource being acted on, so both are answered before any member of the
+//! body is judged. The framework's own walk does not: it validates the whole input
+//! against the operation's generated schema and refuses a modelled constraint
+//! BEFORE `handle` runs (`vendor/smithy-server-runtime/src/operation.rs`), so for a
+//! request that breaks one of those constraints the body refusal reached the caller
+//! first and the two earlier answers were never given. A client keying on the
+//! missing cluster to create it and retry, or on the pass-role denial to fix its
+//! policy, saw a parameter complaint instead.
+//!
+//! This layer restores the order for exactly those requests. It runs in the one seam
+//! a service has BEFORE dispatch (`smithy_server_runtime::Service::override_operation`),
+//! the same seam the tag and resolve-conflicts contracts beside it use, and it claims
+//! a request only when ALL of:
+//!
+//! * the operation it was sent to is one of the operations below — each takes a role
+//!   it asks Amazon EKS to pass, or addresses a cluster by `@httpLabel` and answers an
+//!   unknown one with [`crate::state::cluster_not_found`], or both;
+//! * the framework's validating walk would refuse the body. The walk is run HERE,
+//!   through the same `aws_smithy_schema_server::constraints::validate` and the same
+//!   generated input schema the dispatch sequence runs, so this layer cannot disagree
+//!   with the walk that would otherwise follow it. A request whose body the walk
+//!   accepts is NOT claimed: its handler already answers both questions in the right
+//!   order, and nothing here may change what it reports;
+//! * one of the two earlier answers actually fires — the value names no role this
+//!   caller can pass, or the store holds no such cluster. Otherwise the request falls
+//!   through to the modelled operation, which refuses the body exactly as before.
+//!
+//! The two answers are the service's own modelled shapes, rendered through the same
+//! protocol call the framework's error tail makes: `AccessDeniedException` (403) for
+//! the pass-role denial and `ResourceNotFoundException` (404) for the missing
+//! cluster. Each claimed operation answers that same shape and status from its own
+//! handler, so a refusal worded here and one worded there are indistinguishable on
+//! the wire.
+
+use std::sync::Arc;
+
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema::serde::SerializableStruct;
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::constraints::validate;
+use aws_smithy_schema_server::ProtocolError;
+use smithy_server_runtime::{
+    BoxFuture, DeserializableStruct, ErasedOperation, ErasedServiceDefinition, OperationContext,
+    OperationError, Refused, ServerHttpProtocol, Service,
+};
+
+use crate::ops::types::{
+    AccessDeniedException, AssociateIdentityProviderConfigInput, CreateAccessEntryInput,
+    CreateAddonInput, CreateCapabilityInput, CreateClusterInput, CreateFargateProfileInput,
+    CreateNodegroupInput, CreatePodIdentityAssociationInput, ListAddonsInput,
+    ListCapabilitiesInput, ListNodegroupsInput, ListUpdatesInput, ResourceNotFoundException,
+    UpdateClusterConfigInput, ASSOCIATE_IDENTITY_PROVIDER_CONFIG_INPUT_SCHEMA,
+    CREATE_ACCESS_ENTRY_INPUT_SCHEMA, CREATE_ADDON_INPUT_SCHEMA, CREATE_CAPABILITY_INPUT_SCHEMA,
+    CREATE_CLUSTER_INPUT_SCHEMA, CREATE_FARGATE_PROFILE_INPUT_SCHEMA,
+    CREATE_NODEGROUP_INPUT_SCHEMA, CREATE_POD_IDENTITY_ASSOCIATION_INPUT_SCHEMA,
+    LIST_ADDONS_INPUT_SCHEMA, LIST_CAPABILITIES_INPUT_SCHEMA, LIST_NODEGROUPS_INPUT_SCHEMA,
+    LIST_UPDATES_INPUT_SCHEMA, SCHEMA_ACCESS_DENIED_EXCEPTION,
+    SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION, UPDATE_CLUSTER_CONFIG_INPUT_SCHEMA,
+};
+
+/// The error code a request that may not pass the role it names is refused with.
+const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
+/// The error code a request addressed to a cluster that does not exist is refused
+/// with.
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// What the operation a claimed request was sent to answers before it judges the
+/// body: the roles the request asks Amazon EKS to pass, in the order its handler
+/// judges them, and the cluster it is addressed to.
+///
+/// Both are read from the request the dispatch sequence would have handed the
+/// handler, so this layer reads exactly the values the handler would.
+#[derive(Debug, Default)]
+pub struct Addressed {
+    passed_roles: Vec<String>,
+    cluster: Option<String>,
+}
+
+/// One answer this layer gives, as the shape and status the service models for it.
+#[derive(Debug)]
+enum Answer {
+    /// The value names no role this caller may have Amazon EKS assume.
+    PassRoleDenied(AccessDeniedException),
+    /// The cluster the request is addressed to does not exist.
+    ClusterMissing(ResourceNotFoundException),
+}
+
+impl OperationError for Answer {
+    fn as_serializable(&self) -> &dyn SerializableStruct {
+        match self {
+            Self::PassRoleDenied(exception) => exception,
+            Self::ClusterMissing(exception) => exception,
+        }
+    }
+
+    fn variant_schema(&self) -> &'static Schema {
+        match self {
+            Self::PassRoleDenied(_) => &SCHEMA_ACCESS_DENIED_EXCEPTION,
+            Self::ClusterMissing(_) => &SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+        }
+    }
+
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::PassRoleDenied(_) => ACCESS_DENIED_EXCEPTION,
+            Self::ClusterMissing(_) => RESOURCE_NOT_FOUND_EXCEPTION,
+        }
+    }
+
+    /// The statuses the model pins on the two shapes: `@httpError 403` on
+    /// `AccessDeniedException` and `@httpError 404` on `ResourceNotFoundException`
+    /// (`smithy_query(query="operation",operation="UpdateCapability",…)` reports both).
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::PassRoleDenied(_) => 403,
+            Self::ClusterMissing(_) => 404,
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        // This service speaks restJson1, which carries no `awsQueryError` code at
+        // all; both shapes are reported by their own name.
+        None
+    }
+}
+
+impl std::fmt::Display for Answer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PassRoleDenied(exception) => write!(f, "{exception}"),
+            Self::ClusterMissing(exception) => write!(f, "{exception}"),
+        }
+    }
+}
+
+impl std::error::Error for Answer {}
+
+impl Answer {
+    /// This answer as a response in the service's own protocol envelope, serialized
+    /// through the same protocol call the framework's error tail makes.
+    ///
+    /// FAIL CLOSED: a request is claimed only when this answer fires, so it must
+    /// never fall through to a handler that would report something else. Where the
+    /// modelled envelope cannot be rendered at all, the same code and message are
+    /// answered through the service's framework-refusal envelope instead.
+    fn response(self, definition: &dyn ErasedServiceDefinition) -> RtResponse {
+        let code = self.shape_name().to_string();
+        let message = match &self {
+            Self::PassRoleDenied(exception) => exception.message.clone(),
+            Self::ClusterMissing(exception) => exception.message.clone(),
+        }
+        .unwrap_or_default();
+        definition
+            .protocol()
+            .serialize_error(
+                self.as_serializable(),
+                self.variant_schema(),
+                self.shape_name(),
+                self.http_status(),
+            )
+            .ok()
+            .unwrap_or_else(|| {
+                definition.refusal_response(
+                    ProtocolError::Invalid(Vec::new()),
+                    Some(Refused { code, message }),
+                )
+            })
+    }
+}
+
+/// Read the request into `T` through the protocol and schema the dispatch sequence
+/// uses, so this layer reads exactly the value the handler would be given, or `None`
+/// for a body it cannot read at all — which is the framework's refusal, not this
+/// layer's question.
+fn read<T: DeserializableStruct>(
+    protocol: &dyn ServerHttpProtocol,
+    schema: &'static Schema,
+    req: &RtRequest,
+) -> Option<T> {
+    let mut deserializer = protocol.deserialize_input(req, schema).ok()?;
+    T::deserialize(&mut *deserializer).ok()
+}
+
+/// Whether the framework's own validating walk would refuse this input, which is the
+/// only case this layer has a question about: it is what would otherwise be answered
+/// BEFORE the two checks the operation performs first.
+fn boundary_refuses(input: &dyn SerializableStruct, schema: &'static Schema) -> bool {
+    !validate(input, schema).is_empty()
+}
+
+/// Read one claimed operation's request and name what its handler answers before it
+/// judges the body, or `None` when the walk accepts the body (so there is no
+/// question) or the body cannot be read at all.
+fn addressed_with<T: DeserializableStruct + SerializableStruct>(
+    protocol: &dyn ServerHttpProtocol,
+    schema: &'static Schema,
+    req: &RtRequest,
+    members: impl FnOnce(&T) -> Addressed,
+) -> Option<Addressed> {
+    let input: T = read(protocol, schema, req)?;
+    if !boundary_refuses(&input, schema) {
+        return None;
+    }
+    Some(members(&input))
+}
+
+/// One role the request hands Amazon EKS, and no cluster to resolve.
+fn passes_roles(roles: Vec<String>) -> Addressed {
+    Addressed {
+        passed_roles: roles,
+        cluster: None,
+    }
+}
+
+/// The cluster the request is addressed to, and no role to authorize.
+fn addresses_cluster(cluster: &str) -> Addressed {
+    Addressed {
+        passed_roles: Vec::new(),
+        cluster: Some(cluster.to_string()),
+    }
+}
+
+/// Both: a role to authorize first, then the cluster the request is addressed to —
+/// the order every handler that does both keeps.
+fn passes_roles_and_addresses_cluster(roles: Vec<String>, cluster: &str) -> Addressed {
+    Addressed {
+        passed_roles: roles,
+        cluster: Some(cluster.to_string()),
+    }
+}
+
+/// What the operation `key` names answers before it judges the body, for this
+/// request.
+///
+/// The table is this layer's whole scope. An operation is in it because its handler
+/// makes one of those two checks first and its body carries a modelled constraint
+/// the walk can refuse; `None` for every other operation, which keeps the generated
+/// routing table as its only source. On this service's restJson1 protocol a routing
+/// key is the operation's own shape name.
+fn addressed(
+    key: &str,
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<Addressed> {
+    match key {
+        // `roleArn` is the cluster's own role and `computeConfig.nodeRoleArn` the one
+        // its Auto Mode nodes take; the handler judges them in that order. The
+        // operation creates the cluster, so there is no cluster to resolve.
+        "CreateCluster" => addressed_with(
+            protocol,
+            CREATE_CLUSTER_INPUT_SCHEMA,
+            req,
+            |input: &CreateClusterInput| {
+                passes_roles(
+                    [
+                        Some(input.role_arn.clone()),
+                        input
+                            .compute_config
+                            .as_ref()
+                            .and_then(|compute| compute.node_role_arn.clone()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+                )
+            },
+        ),
+        "CreateNodegroup" => addressed_with(
+            protocol,
+            CREATE_NODEGROUP_INPUT_SCHEMA,
+            req,
+            |input: &CreateNodegroupInput| {
+                passes_roles_and_addresses_cluster(
+                    vec![input.node_role.clone()],
+                    &input.cluster_name,
+                )
+            },
+        ),
+        "CreateCapability" => addressed_with(
+            protocol,
+            CREATE_CAPABILITY_INPUT_SCHEMA,
+            req,
+            |input: &CreateCapabilityInput| {
+                passes_roles_and_addresses_cluster(
+                    vec![input.role_arn.clone()],
+                    &input.cluster_name,
+                )
+            },
+        ),
+        "CreateFargateProfile" => addressed_with(
+            protocol,
+            CREATE_FARGATE_PROFILE_INPUT_SCHEMA,
+            req,
+            |input: &CreateFargateProfileInput| {
+                passes_roles_and_addresses_cluster(
+                    vec![input.pod_execution_role_arn.clone()],
+                    &input.cluster_name,
+                )
+            },
+        ),
+        "UpdateClusterConfig" => addressed_with(
+            protocol,
+            UPDATE_CLUSTER_CONFIG_INPUT_SCHEMA,
+            req,
+            |input: &UpdateClusterConfigInput| addresses_cluster(&input.name),
+        ),
+        "CreateAddon" => addressed_with(
+            protocol,
+            CREATE_ADDON_INPUT_SCHEMA,
+            req,
+            |input: &CreateAddonInput| addresses_cluster(&input.cluster_name),
+        ),
+        "CreateAccessEntry" => addressed_with(
+            protocol,
+            CREATE_ACCESS_ENTRY_INPUT_SCHEMA,
+            req,
+            |input: &CreateAccessEntryInput| addresses_cluster(&input.cluster_name),
+        ),
+        "CreatePodIdentityAssociation" => addressed_with(
+            protocol,
+            CREATE_POD_IDENTITY_ASSOCIATION_INPUT_SCHEMA,
+            req,
+            |input: &CreatePodIdentityAssociationInput| addresses_cluster(&input.cluster_name),
+        ),
+        "AssociateIdentityProviderConfig" => addressed_with(
+            protocol,
+            ASSOCIATE_IDENTITY_PROVIDER_CONFIG_INPUT_SCHEMA,
+            req,
+            |input: &AssociateIdentityProviderConfigInput| addresses_cluster(&input.cluster_name),
+        ),
+        // The listings of a cluster's resources: each bounds `maxResults`, so the walk
+        // can refuse the body of a read too, and each answers an unknown cluster with
+        // the same 404.
+        "ListNodegroups" => addressed_with(
+            protocol,
+            LIST_NODEGROUPS_INPUT_SCHEMA,
+            req,
+            |input: &ListNodegroupsInput| addresses_cluster(&input.cluster_name),
+        ),
+        "ListAddons" => addressed_with(
+            protocol,
+            LIST_ADDONS_INPUT_SCHEMA,
+            req,
+            |input: &ListAddonsInput| addresses_cluster(&input.cluster_name),
+        ),
+        "ListCapabilities" => addressed_with(
+            protocol,
+            LIST_CAPABILITIES_INPUT_SCHEMA,
+            req,
+            |input: &ListCapabilitiesInput| addresses_cluster(&input.cluster_name),
+        ),
+        "ListUpdates" => addressed_with(
+            protocol,
+            LIST_UPDATES_INPUT_SCHEMA,
+            req,
+            |input: &ListUpdatesInput| addresses_cluster(&input.name),
+        ),
+        _ => None,
+    }
+}
+
+/// Whether this layer has a question about the request `key` names — the decision
+/// `crate::service::EmulatedService::override_operation` makes, with no store in
+/// hand.
+///
+/// It is deliberately the cheap half: the answer itself needs the store and the
+/// request's signing region, which are only reachable once the claimed operation
+/// runs (see [`PrecedenceFirst::run`]).
+pub fn has_a_question(key: &str, protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> bool {
+    addressed(key, protocol, req).is_some()
+}
+
+/// The operation this service serves for a request whose body the walk refuses and
+/// whose operation answers something else first.
+///
+/// An [`ErasedOperation`] rather than a response built in
+/// `Service::override_operation`, because that seam hands the router a BORROWED
+/// operation. It holds the shared engine, because the missing-cluster half of the
+/// question is answered from this service's store.
+pub struct PrecedenceFirst<Eng> {
+    engine: Arc<Eng>,
+}
+
+impl<Eng> PrecedenceFirst<Eng> {
+    /// Hold the shared engine, the same one every operation of this service is
+    /// constructed from — never a store of its own.
+    pub fn new(engine: Arc<Eng>) -> Self {
+        Self { engine }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> std::fmt::Debug for PrecedenceFirst<Eng> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrecedenceFirst").finish_non_exhaustive()
+    }
+}
+
+impl<Eng: Send + Sync + 'static> PrecedenceFirst<Eng> {
+    /// The answer this layer owes `addressed`, or `None` when neither check fires and
+    /// the modelled operation should serve the request after all.
+    fn answer(
+        &self,
+        addressed: &Addressed,
+        ctx: &OperationContext<'_>,
+    ) -> Option<Answer> {
+        // AUTHORIZATION FIRST, in the order the handler judges the roles: the
+        // question needs no state at all ([`crate::state::pass_role_refusal`]).
+        for role_arn in &addressed.passed_roles {
+            if let Some(why) = crate::state::pass_role_refusal(role_arn) {
+                return Some(Answer::PassRoleDenied(AccessDeniedException {
+                    message: Some(why),
+                }));
+            }
+        }
+        // THE CLUSTER NEXT. A cluster name identifies a cluster only within one
+        // region, so it is resolved in the region the request is signed for — the same
+        // key every handler reads. A store this layer cannot reach answers nothing:
+        // the modelled operation runs and reports what it always did.
+        let cluster_name = addressed.cluster.as_deref()?;
+        let store = crate::state::service_state(&*self.engine)?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = std::time::SystemTime::now();
+        let mut guard = store.lock();
+        guard.materialize_due_transitions(now);
+        if guard
+            .clusters
+            .contains_key(&(region, cluster_name.to_string()))
+        {
+            return None;
+        }
+        Some(Answer::ClusterMissing(crate::state::cluster_not_found(
+            cluster_name,
+        )))
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for PrecedenceFirst<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The service's model-derived half is read inside this block and not held
+            // past it: `&dyn ErasedServiceDefinition` is not `Sync`, and the future
+            // returned here is `Send`. Only the modelled operation — which is
+            // `Send + Sync` — crosses the await below.
+            let served = {
+                let definition = svc.definition();
+                let protocol = definition.protocol();
+                let key = protocol.routing_key(req).ok();
+                // The same decision `override_operation` made, re-derived from the
+                // same request, and then the answer it owes. When neither check
+                // fires, the modelled operation the routing key names serves the
+                // request exactly as it would have.
+                match key
+                    .and_then(|key| addressed(key, protocol, req))
+                    .and_then(|addressed| self.answer(&addressed, ctx))
+                {
+                    Some(answer) => Ok(answer.response(definition)),
+                    None => match key.and_then(|key| definition.routing_table().get(key)) {
+                        Some(operation) => Err(operation),
+                        None => Ok(definition.routing_error_response(req)),
+                    },
+                }
+            };
+            match served {
+                Ok(response) => response,
+                Err(operation) => operation.run(svc, req, ctx).await,
+            }
+        })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // `None` is "defer to the modelled operation the routing key names", so this
+        // layer cannot weaken the schemes the model declares for it.
+        None
+    }
+}

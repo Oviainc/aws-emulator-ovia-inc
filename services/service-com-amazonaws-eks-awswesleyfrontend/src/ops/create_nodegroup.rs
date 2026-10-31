@@ -814,6 +814,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect::<BTreeMap<_, _>>(),
             warm_pool_config: input.warm_pool_config.clone(),
             client_request_token: input.client_request_token.clone(),
+            // A node group takes no configuration update until
+            // `UpdateNodegroupConfig` starts one.
+            pending_config: None,
         };
 
         let nodegroup = record.to_nodegroup();

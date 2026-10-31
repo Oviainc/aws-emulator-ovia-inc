@@ -39,6 +39,18 @@
 //! It also holds the managed-capability slice that hangs off a cluster:
 //! `CreateCapability` writes a [`CapabilityRecord`], and `DescribeCapability`,
 //! `ListCapabilities` and `DeleteCapability` compute their responses from it.
+//! `UpdateCapability` does not write the change it is asked for onto that record
+//! straight away: the update it starts is asynchronous, so the change waits on
+//! the record as a [`PendingCapabilityUpdate`] until the clock completes that
+//! update — the same way an add-on update waits.
+//!
+//! It also holds the EKS Anywhere subscription slice
+//! ([`EksAnywhereSubscriptionRecord`]), which hangs off NO cluster: a
+//! subscription is an account-level support contract, so
+//! `CreateEksAnywhereSubscription` writes one into
+//! [`ComAmazonawsEksAwswesleyfrontendState::eks_anywhere_subscriptions`] and
+//! `DescribeEksAnywhereSubscription` computes its whole response from that
+//! record.
 //!
 //! It also holds the access-entry slice, as part of the cluster record rather than
 //! beside it: an access entry belongs to exactly one cluster, so
@@ -104,12 +116,14 @@ use crate::ops::types::{
     AddonIssue,
     AddonNamespaceConfigResponse, AddonPodIdentityAssociations, AddonPodIdentityConfiguration,
     AddonVersionInfo,
+    ArgoCdNetworkAccessConfigResponse, ArgoCdRoleMapping,
     AssociatedAccessPolicy, BadRequestException, Cancellation,
     Capability, Compatibility,
     CapabilityConfigurationResponse, CapabilityHealth, CapabilityIssue, CapabilitySummary,
     Certificate, ClientException, Cluster, ClusterVersionInformation, ComputeConfigResponse,
     ConnectorConfigResponse,
-    ControlPlaneScalingConfig, EncryptionConfig, FargateProfile, FargateProfileHealth,
+    ControlPlaneScalingConfig, EksAnywhereSubscription, EksAnywhereSubscriptionTerm,
+    EncryptionConfig, FargateProfile, FargateProfileHealth,
     FargateProfileSelector, Identity, KubeApiServerConfigResponse,
     KubeControllerManagerConfigResponse, KubeSchedulerConfigResponse,
     InsightStatus, InsightSummary, Insight, InsightResourceDetail,
@@ -278,6 +292,14 @@ pub const UPDATE_PARAM_VERSION: &str = "Version";
 /// at the Kubernetes version a version update moves it to.
 pub const UPDATE_PARAM_PLATFORM_VERSION: &str = "PlatformVersion";
 
+/// The `UpdateParamType` keys a node group VERSION update reports the members it
+/// changes under (`smithy_query query="shape" shape="UpdateParamType"`).
+pub const UPDATE_PARAM_RELEASE_VERSION: &str = "ReleaseVersion";
+/// See [`UPDATE_PARAM_RELEASE_VERSION`].
+pub const UPDATE_PARAM_LAUNCH_TEMPLATE_NAME: &str = "LaunchTemplateName";
+/// See [`UPDATE_PARAM_RELEASE_VERSION`].
+pub const UPDATE_PARAM_LAUNCH_TEMPLATE_VERSION: &str = "LaunchTemplateVersion";
+
 /// The `ControlPlaneEgressModeType` members
 /// (`smithy_query query="shape" shape="ControlPlaneEgressModeType"`). "Once set
 /// to `CUSTOMER_ROUTED`, this setting cannot be changed back to `AWS_MANAGED` on
@@ -337,6 +359,37 @@ pub const CAPABILITY_STATUS_CREATING: &str = "CREATING";
 pub const CAPABILITY_STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`CAPABILITY_STATUS_CREATING`].
 pub const CAPABILITY_STATUS_DELETING: &str = "DELETING";
+/// See [`CAPABILITY_STATUS_CREATING`] — the status a capability reports while the
+/// asynchronous update `UpdateCapability` started is still in flight: "When you
+/// update a capability, Amazon EKS applies the changes and may restart capability
+/// components as needed" (`UpdateCapability`).
+pub const CAPABILITY_STATUS_UPDATING: &str = "UPDATING";
+
+/// The `CapabilityStatus` members a capability can take an update FROM: the ones in
+/// which it has SETTLED.
+///
+/// A capability still being created or already being deleted is not settled, so it
+/// cannot take a change; one that is running — healthy or `DEGRADED` — can.
+pub const CAPABILITY_STATUSES_AN_UPDATE_STARTS_FROM: &[&str] =
+    &[CAPABILITY_STATUS_ACTIVE, "DEGRADED"];
+
+/// The `UpdateType` an `UpdateCapability` call reports on the `Update` it answers
+/// with (`smithy_query query="shape" shape="UpdateType"`).
+pub const UPDATE_TYPE_CAPABILITY: &str = "CapabilityUpdate";
+
+/// The `UpdateParamType` keys a capability update reports the members it changes
+/// under (`smithy_query query="shape" shape="UpdateParamType"`).
+pub const UPDATE_PARAM_ROLE_ARN: &str = "RoleArn";
+/// See [`UPDATE_PARAM_ROLE_ARN`].
+pub const UPDATE_PARAM_ROLE_MAPPINGS_TO_ADD_OR_UPDATE: &str = "RoleMappingsToAddOrUpdate";
+/// See [`UPDATE_PARAM_ROLE_ARN`].
+pub const UPDATE_PARAM_ROLE_MAPPINGS_TO_REMOVE: &str = "RoleMappingsToRemove";
+/// See [`UPDATE_PARAM_ROLE_ARN`].
+pub const UPDATE_PARAM_NETWORK_ACCESS: &str = "NetworkAccess";
+/// See [`UPDATE_PARAM_ROLE_ARN`].
+pub const UPDATE_PARAM_ENABLE_CROSS_NAMESPACE: &str = "EnableCrossNamespace";
+/// See [`UPDATE_PARAM_ROLE_ARN`].
+pub const UPDATE_PARAM_DISABLED_SERVICES: &str = "DisabledServices";
 
 /// How long a newly created capability reports `CREATING` before the clock owes it
 /// `ACTIVE`.
@@ -725,6 +778,42 @@ pub const DEFAULT_SCALING_DESIRED_SIZE: i32 = 2;
 /// (its modelled range is 1..): one node at a time.
 pub const DEFAULT_MAX_UNAVAILABLE: i32 = 1;
 
+/// The `UpdateParamType` keys a node group configuration update reports the
+/// members it changes under (`smithy_query query="shape"
+/// shape="UpdateParamType"`).
+pub const UPDATE_PARAM_LABELS_TO_ADD: &str = "LabelsToAdd";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_LABELS_TO_REMOVE: &str = "LabelsToRemove";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_TAINTS_TO_ADD: &str = "TaintsToAdd";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_TAINTS_TO_REMOVE: &str = "TaintsToRemove";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_MIN_SIZE: &str = "MinSize";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_MAX_SIZE: &str = "MaxSize";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_DESIRED_SIZE: &str = "DesiredSize";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_MAX_UNAVAILABLE: &str = "MaxUnavailable";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_MAX_UNAVAILABLE_PERCENTAGE: &str = "MaxUnavailablePercentage";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_UPDATE_STRATEGY: &str = "UpdateStrategy";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_NODE_REPAIR_CONFIG: &str = "NodeRepairConfig";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_WARM_POOL_ENABLED: &str = "WarmPoolEnabled";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_WARM_POOL_MIN_SIZE: &str = "WarmPoolMinSize";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_WARM_POOL_MAX_GROUP_PREPARED_CAPACITY: &str =
+    "WarmPoolMaxGroupPreparedCapacity";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_WARM_POOL_STATE: &str = "WarmPoolState";
+/// See [`UPDATE_PARAM_LABELS_TO_ADD`].
+pub const UPDATE_PARAM_WARM_POOL_REUSE_ON_SCALE_IN: &str = "WarmPoolReuseOnScaleIn";
+
 /// The number of managed node groups one cluster holds before `CreateNodegroup`
 /// answers `ResourceLimitExceededException`.
 ///
@@ -766,6 +855,10 @@ pub fn default_disk_size_gib(ami_type: &str) -> i32 {
 pub const FARGATE_PROFILE_STATUS_CREATING: &str = "CREATING";
 /// See [`FARGATE_PROFILE_STATUS_CREATING`].
 pub const FARGATE_PROFILE_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`FARGATE_PROFILE_STATUS_CREATING`] — the status a profile reports once
+/// `DeleteFargateProfile` has taken it off its cluster, which is the final status
+/// that call answers with.
+pub const FARGATE_PROFILE_STATUS_DELETING: &str = "DELETING";
 
 /// How long a newly created Fargate profile reports `CREATING` before the clock
 /// owes it `ACTIVE`.
@@ -1311,10 +1404,19 @@ pub const IDENTITY_PROVIDER_CONFIG_TYPE_OIDC: &str = "oidc";
 pub const CONFIG_STATUS_CREATING: &str = "CREATING";
 /// See [`CONFIG_STATUS_CREATING`].
 pub const CONFIG_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`CONFIG_STATUS_CREATING`] — the status a configuration reports while the
+/// asynchronous update `DisassociateIdentityProviderConfig` started is still in
+/// flight, before that update takes it off the cluster.
+pub const CONFIG_STATUS_DELETING: &str = "DELETING";
 
 /// The `UpdateType` an `AssociateIdentityProviderConfig` call reports on the
 /// `Update` it answers with (`smithy_query query="shape" shape="UpdateType"`).
 pub const UPDATE_TYPE_ASSOCIATE_IDENTITY_PROVIDER_CONFIG: &str = "AssociateIdentityProviderConfig";
+
+/// The `UpdateType` a `DisassociateIdentityProviderConfig` call reports on the
+/// `Update` it answers with (`smithy_query query="shape" shape="UpdateType"`).
+pub const UPDATE_TYPE_DISASSOCIATE_IDENTITY_PROVIDER_CONFIG: &str =
+    "DisassociateIdentityProviderConfig";
 
 /// The `UpdateParamType` key an identity-provider association reports the
 /// configuration it associates under (`smithy_query query="shape"
@@ -2188,6 +2290,12 @@ pub struct PendingClusterConfig {
     /// the record stays on the cluster reporting `DELETING` distribution until the
     /// clock completes that update.
     pub certificate_authority_removal: Option<String>,
+    /// The identity provider configuration a
+    /// `DisassociateIdentityProviderConfig` update takes off the cluster when it
+    /// completes, by name. The disassociation is asynchronous, so the record
+    /// stays on the cluster reporting [`CONFIG_STATUS_DELETING`] until the clock
+    /// completes that update.
+    pub identity_provider_config_removal: Option<String>,
 }
 
 impl PendingClusterConfig {
@@ -2246,6 +2354,9 @@ impl PendingClusterConfig {
         }
         if let Some(removed) = self.certificate_authority_removal {
             record.certificate_authorities.remove(&removed);
+        }
+        if let Some(removed) = self.identity_provider_config_removal {
+            record.identity_provider_configs.remove(&removed);
         }
     }
 }
@@ -2599,16 +2710,138 @@ pub struct NodegroupRecord {
     pub tags: BTreeMap<String, String>,
     pub warm_pool_config: Option<WarmPoolConfig>,
     pub client_request_token: Option<String>,
+    /// The change the asynchronous update this node group is taking puts on it
+    /// when the clock completes that update; `None` when it is taking none.
+    ///
+    /// The update itself is a record on the cluster ([`ClusterRecord::updates`]),
+    /// which is where its own due instant and status live; this is the part of it
+    /// that belongs to the node group, applied at [`Self::active_at`] — the
+    /// instant the node group is owed its `ACTIVE` status back, which is the
+    /// instant that update is owed its `Successful` one.
+    pub pending_config: Option<PendingNodegroupConfig>,
+}
+
+/// The change an in-flight node group update will put on its node group when it
+/// completes.
+///
+/// Both operations that update a node group are asynchronous — `UpdateNodegroupConfig`
+/// ("you can update... the Kubernetes labels... and the scaling and version update
+/// configuration") and `UpdateNodegroupVersion` ("updates the Kubernetes version or
+/// AMI version"), each answering with an `Update` rather than with the node group —
+/// so the values the request asked for are held HERE until the clock completes that
+/// update, and only then written onto the [`NodegroupRecord`]. A member left `None`
+/// (or an empty label/taint change) is one the request did not ask to change.
+#[derive(Debug, Clone, Default)]
+pub struct PendingNodegroupConfig {
+    /// The id of the update that carries this change, so a caller tracking the
+    /// update and the node group it changes sees one resource, not two copies.
+    pub update_id: String,
+    /// The Kubernetes labels to add or replace, by key.
+    pub add_or_update_labels: BTreeMap<String, String>,
+    /// The Kubernetes label keys to remove.
+    pub remove_labels: Vec<String>,
+    /// The taints to add or replace, matched on the `(key, effect)` pair a taint
+    /// is identified by.
+    pub add_or_update_taints: Vec<Taint>,
+    /// The taints to remove, matched the same way.
+    pub remove_taints: Vec<Taint>,
+    pub scaling_config: Option<NodegroupScalingConfig>,
+    pub update_config: Option<NodegroupUpdateConfig>,
+    pub node_repair_config: Option<NodeRepairConfig>,
+    pub warm_pool_config: Option<WarmPoolConfig>,
+    /// The Kubernetes version an `UpdateNodegroupVersion` update moves the node
+    /// group to — "the Kubernetes version to update to"
+    /// (`UpdateNodegroupVersionRequest$version`) — so the node group reports the
+    /// new version only once the clock completes that update.
+    pub version: Option<String>,
+    /// The AMI version that same update moves it to: "the AMI version of the
+    /// Amazon EKS optimized AMI to use for the update" (`$releaseVersion`).
+    pub release_version: Option<String>,
+}
+
+/// Whether two taints name the same taint of a node group: "The key of the
+/// taint" and "the effect of the taint" are what a node group's scheduler keys
+/// on, so a taint added for a `(key, effect)` pair replaces the one already
+/// there and the `value` is what the change carries.
+fn same_taint(left: &Taint, right: &Taint) -> bool {
+    left.key == right.key && left.effect == right.effect
+}
+
+impl PendingNodegroupConfig {
+    /// Whether this change asks for anything at all — what tells a request that
+    /// names no member from one that asks for a change.
+    pub fn is_empty(&self) -> bool {
+        self.add_or_update_labels.is_empty()
+            && self.remove_labels.is_empty()
+            && self.add_or_update_taints.is_empty()
+            && self.remove_taints.is_empty()
+            && self.scaling_config.is_none()
+            && self.update_config.is_none()
+            && self.node_repair_config.is_none()
+            && self.warm_pool_config.is_none()
+            && self.version.is_none()
+            && self.release_version.is_none()
+    }
+
+    /// Write this change onto `record`, which is what completing the update
+    /// does. `at` is the instant the update was owed its completion, so
+    /// `modifiedAt` is the same value whenever the read that materialises it
+    /// comes.
+    fn apply(self, record: &mut NodegroupRecord, at: SystemTime) {
+        for (key, value) in self.add_or_update_labels {
+            record.labels.insert(key, value);
+        }
+        for key in &self.remove_labels {
+            record.labels.remove(key);
+        }
+        for requested in self.add_or_update_taints {
+            match record
+                .taints
+                .iter_mut()
+                .find(|taint| same_taint(taint, &requested))
+            {
+                Some(existing) => existing.value = requested.value.clone(),
+                None => record.taints.push(requested),
+            }
+        }
+        record
+            .taints
+            .retain(|taint| !self.remove_taints.iter().any(|removed| same_taint(taint, removed)));
+        if let Some(scaling_config) = self.scaling_config {
+            record.scaling_config = scaling_config;
+        }
+        if let Some(update_config) = self.update_config {
+            record.update_config = update_config;
+        }
+        if let Some(node_repair_config) = self.node_repair_config {
+            record.node_repair_config = Some(node_repair_config);
+        }
+        if let Some(warm_pool_config) = self.warm_pool_config {
+            record.warm_pool_config = Some(warm_pool_config);
+        }
+        if let Some(version) = self.version {
+            record.version = version;
+        }
+        if let Some(release_version) = self.release_version {
+            record.release_version = Some(release_version);
+        }
+        record.modified_at = at;
+    }
 }
 
 impl NodegroupRecord {
-    /// Materialise the status move the clock already owes at `now`. See
+    /// Materialise the status move the clock already owes at `now`, and write the
+    /// change an update owed this record at the instant it was owed. See
     /// [`ClusterRecord::materialize_due_transitions`].
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
-        if self.active_at.is_some_and(|due| now >= due) {
-            self.status = STATUS_ACTIVE.to_string();
-            self.active_at = None;
+        let Some(due) = self.active_at.filter(|due| now >= *due) else {
+            return;
+        };
+        self.active_at = None;
+        if let Some(pending) = self.pending_config.take() {
+            pending.apply(self, due);
         }
+        self.status = STATUS_ACTIVE.to_string();
     }
 
     /// This record as the modelled `Nodegroup` shape.
@@ -3139,6 +3372,97 @@ impl AddonRecord {
     }
 }
 
+/// The change an in-flight capability update will put on its capability when it
+/// completes.
+///
+/// `UpdateCapability` is asynchronous — it answers with an `Update` rather than
+/// with the capability — so the values the request asked for are held HERE until
+/// the clock completes that update, and only then written onto the
+/// [`CapabilityRecord`]. A member left `None` is one the request did not ask to
+/// change: applying the change leaves whatever the capability already reports
+/// for it.
+#[derive(Debug, Clone, Default)]
+pub struct PendingCapabilityUpdate {
+    /// The id of the update that carries this change, so a caller tracking the
+    /// update and the capability it changes sees one resource, not two copies.
+    pub update_id: String,
+    pub role_arn: Option<String>,
+    /// The Argo CD role mappings to add or replace, keyed by the `role` they
+    /// assign: "A mapping between an Argo CD role and IAM Identity Center
+    /// identities" (`ArgoCdRoleMapping`), so one role carries one mapping and a
+    /// mapping for a role the capability already maps REPLACES it.
+    pub add_or_update_role_mappings: Vec<ArgoCdRoleMapping>,
+    /// The Argo CD role mappings to drop, by the `role` they assign.
+    pub remove_role_mappings: Vec<String>,
+    pub network_access: Option<ArgoCdNetworkAccessConfigResponse>,
+    pub enable_cross_namespace: Option<bool>,
+    pub disabled_services: Option<Vec<String>>,
+    pub delete_propagation_policy: Option<String>,
+}
+
+impl PendingCapabilityUpdate {
+    /// Whether this change carries nothing for the `argoCd` half of a
+    /// capability's configuration, which is what decides whether applying it
+    /// touches that half at all.
+    fn touches_argo_cd(&self) -> bool {
+        !self.add_or_update_role_mappings.is_empty()
+            || !self.remove_role_mappings.is_empty()
+            || self.network_access.is_some()
+    }
+
+    /// Whether this change carries nothing for the `ack` half.
+    fn touches_ack(&self) -> bool {
+        self.enable_cross_namespace.is_some() || self.disabled_services.is_some()
+    }
+
+    /// Write this change onto `record`, which is what completing the update
+    /// does. `at` is the instant the update was owed its completion, so
+    /// `modifiedAt` is the same value whenever the read that materialises it
+    /// comes.
+    fn apply(self, record: &mut CapabilityRecord, at: SystemTime) {
+        if let Some(role_arn) = self.role_arn.clone() {
+            record.role_arn = role_arn;
+        }
+        if let Some(policy) = self.delete_propagation_policy.clone() {
+            record.delete_propagation_policy = policy;
+        }
+        if self.touches_argo_cd() || self.touches_ack() {
+            let mut configuration = record.configuration.clone().unwrap_or_default();
+            if self.touches_argo_cd() {
+                let mut argo_cd = configuration.argo_cd.clone().unwrap_or_default();
+                let mut mappings = argo_cd.rbac_role_mappings.clone().unwrap_or_default();
+                for requested in &self.add_or_update_role_mappings {
+                    match mappings
+                        .iter_mut()
+                        .find(|mapping| mapping.role == requested.role)
+                    {
+                        Some(existing) => existing.identities = requested.identities.clone(),
+                        None => mappings.push(requested.clone()),
+                    }
+                }
+                mappings.retain(|mapping| !self.remove_role_mappings.contains(&mapping.role));
+                argo_cd.rbac_role_mappings = Some(mappings);
+                if let Some(network_access) = self.network_access.clone() {
+                    argo_cd.network_access = Some(network_access);
+                }
+                configuration.argo_cd = Some(argo_cd);
+            }
+            if self.touches_ack() {
+                let mut ack = configuration.ack.clone().unwrap_or_default();
+                if let Some(enable_cross_namespace) = self.enable_cross_namespace {
+                    ack.enable_cross_namespace = Some(enable_cross_namespace);
+                }
+                if let Some(disabled_services) = self.disabled_services.clone() {
+                    ack.disabled_services = Some(disabled_services);
+                }
+                configuration.ack = Some(ack);
+            }
+            record.configuration = Some(configuration);
+        }
+        record.modified_at = at;
+    }
+}
+
 /// One managed capability of one cluster, as this service stores it.
 ///
 /// Everything a [`Capability`] reports is held here — including the
@@ -3169,19 +3493,33 @@ pub struct CapabilityRecord {
     /// A `CapabilityDeletePropagationPolicy` wire token (only `RETAIN` is modelled).
     pub delete_propagation_policy: String,
     pub client_request_token: Option<String>,
+    /// The change the asynchronous update this capability is taking puts on it
+    /// when the clock completes that update; `None` when it is taking none.
+    ///
+    /// The update itself is a record on the cluster ([`ClusterRecord::updates`]),
+    /// which is where its own due instant and status live; this is the part of it
+    /// that belongs to the capability, applied at [`Self::active_at`] — the
+    /// instant the capability is owed its `ACTIVE` status back, which is the
+    /// instant that update is owed its `Successful` one.
+    pub pending_update: Option<PendingCapabilityUpdate>,
 }
 
 impl CapabilityRecord {
-    /// Materialise the status move the clock already owes at `now`.
+    /// Materialise the status move the clock already owes at `now`, and write the
+    /// change an update owed this record at the instant it was owed.
     ///
     /// The only write a reporting operation may make: the transition was due at
     /// `active_at` whether or not anybody called, so applying it on read does not
     /// change what a later caller sees.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
-        if self.active_at.is_some_and(|due| now >= due) {
-            self.status = CAPABILITY_STATUS_ACTIVE.to_string();
-            self.active_at = None;
+        let Some(due) = self.active_at.filter(|due| now >= *due) else {
+            return;
+        };
+        self.active_at = None;
+        if let Some(pending) = self.pending_update.take() {
+            pending.apply(self, due);
         }
+        self.status = CAPABILITY_STATUS_ACTIVE.to_string();
     }
 
     /// This record as the modelled `Capability` shape.
@@ -5350,6 +5688,20 @@ pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// because the catalog has a publication ORDER (add-on name order, see
     /// [`seed_addon_catalog`]) that the listing reports it in.
     pub addon_catalog: Vec<AddonCatalogRecord>,
+    /// EKS Anywhere subscriptions by `(region, id)`.
+    ///
+    /// A subscription is an ACCOUNT-level support contract rather than a resource
+    /// of a cluster, and it is addressed by the id the create mints
+    /// (`DescribeEksAnywhereSubscription$id`), so the key is the Region the
+    /// request is signed for plus that id — the Region because the name must be
+    /// "unique in your Amazon Web Services account in the Amazon Web Services
+    /// Region you're creating the subscription in"
+    /// (`CreateEksAnywhereSubscriptionRequest$name`), so a subscription belongs to
+    /// one Region as every other record here does. A `BTreeMap` so a listing walks
+    /// one Region's subscriptions as a contiguous, sorted range. Its size is
+    /// bounded by [`MAX_STORED_SUBSCRIPTIONS`], which
+    /// `CreateEksAnywhereSubscription` enforces.
+    pub eks_anywhere_subscriptions: BTreeMap<(String, String), EksAnywhereSubscriptionRecord>,
     /// How many update ids this store has minted. Mixed into the next one (see
     /// [`new_update_id`]) so two updates minted in the same nanosecond cannot
     /// collide.
@@ -5370,6 +5722,7 @@ impl Default for ComAmazonawsEksAwswesleyfrontendState {
             addons: BTreeMap::new(),
             capabilities: BTreeMap::new(),
             pod_identity_associations: BTreeMap::new(),
+            eks_anywhere_subscriptions: BTreeMap::new(),
             minted_associations: 0,
             cluster_versions: seed_cluster_versions(),
             addon_catalog: seed_addon_catalog(),
@@ -5416,6 +5769,9 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         }
         for capability in self.capabilities.values_mut() {
             capability.materialize_due_transitions(now);
+        }
+        for subscription in self.eks_anywhere_subscriptions.values_mut() {
+            subscription.materialize_due_transitions(now);
         }
         self.resettle_addon_replicas(now);
     }
@@ -6550,8 +6906,26 @@ impl ComAmazonawsEksAwswesleyfrontendState {
             .map(|(_, record)| record)
     }
 
-    /// The names `ListClusters` projects for `region`, in sorted order.
+    /// The EKS Anywhere subscriptions one Region holds, in subscription-id order.
     ///
+    /// The map is keyed `(region, id)`, so one Region's subscriptions are a
+    /// contiguous, id-sorted RANGE of it — the walk
+    /// `ListEksAnywhereSubscriptions` pages and `CreateEksAnywhereSubscription`
+    /// checks a name against.
+    pub fn eks_anywhere_subscriptions_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a EksAnywhereSubscriptionRecord> + 'a {
+        self.eks_anywhere_subscriptions
+            .range((
+                std::ops::Bound::Included((region.to_string(), String::new())),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(move |((key_region, _), _)| key_region == region)
+            .map(|(_, record)| record)
+    }
+
+    /// The names `ListClusters` projects for `region`, in sorted order.    ///
     /// A connected cluster is listed only when the caller asked for it:
     /// `include` "indicates whether external clusters are included in the
     /// returned list. Use 'all' to return connected clusters, or blank to return
@@ -7144,6 +7518,9 @@ pub const UPDATES_LISTING: &str = "updates";
 /// The scope `ListInsights`'s tokens carry, over the ids of the insights of one
 /// cluster. See [`CLUSTERS_LISTING`].
 pub const INSIGHTS_LISTING: &str = "insights";
+/// The scope `ListEksAnywhereSubscriptions`'s tokens carry, over the ids of one
+/// Region's subscriptions. See [`CLUSTERS_LISTING`].
+pub const EKS_ANYWHERE_SUBSCRIPTIONS_LISTING: &str = "eks-anywhere-subscriptions";
 
 /// Encode a page token for `listing` that resumes AFTER `last_returned`.
 ///
@@ -8283,6 +8660,255 @@ pub async fn release_cluster_security_group(
             error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
             "the cluster security group could not be deleted from EC2"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The EKS Anywhere subscription slice.
+//
+// A subscription is NOT a resource of a cluster: it is an account-level support
+// contract ("a contract agreement for the length of the term specified in the
+// request", `CreateEksAnywhereSubscription`), so everything about it — its
+// spans, its record, its projection and the rules its term and license count are
+// held to — is collected here and the records live in a map of their own on the
+// store.
+// ---------------------------------------------------------------------------
+
+/// The `EksAnywhereSubscriptionStatus` members this slice uses. The model's enum
+/// (`smithy_query query="shape" shape="EksAnywhereSubscriptionStatus"`) is
+/// `CREATING | ACTIVE | UPDATING | EXPIRING | EXPIRED | DELETING`;
+/// `EksAnywhereSubscription$status` is a plain string member, so the status is
+/// stored as the wire token. `UPDATING`, `EXPIRING` and `DELETING` belong to the
+/// operations that update and delete a subscription, each with its own gap
+/// issue.
+pub const SUBSCRIPTION_STATUS_CREATING: &str = "CREATING";
+/// See [`SUBSCRIPTION_STATUS_CREATING`].
+pub const SUBSCRIPTION_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`SUBSCRIPTION_STATUS_CREATING`] — the status a subscription reports once
+/// its term has run out, which the clock owes it at its expiration date.
+pub const SUBSCRIPTION_STATUS_EXPIRED: &str = "EXPIRED";
+
+/// The only `EksAnywhereSubscriptionTermUnit` the API defines: "The term unit of
+/// the subscription. Valid value is `MONTHS`"
+/// (`EksAnywhereSubscriptionTerm$unit`).
+pub const SUBSCRIPTION_TERM_UNIT_MONTHS: &str = "MONTHS";
+
+/// The term durations a subscription may be created for: "Valid values are 12
+/// and 36, indicating a 12 month or 36 month subscription"
+/// (`EksAnywhereSubscriptionTerm$duration`).
+pub const SUBSCRIPTION_TERM_DURATIONS: &[i32] = &[12, 36];
+
+/// The license counts a subscription may be created with: "The number of
+/// licenses to purchase with the subscription. Valid values are between 1 and
+/// 100" (`CreateEksAnywhereSubscriptionRequest$licenseQuantity`). The member
+/// carries a `@default` of 0 and no modelled range, so a count outside the
+/// published one reaches the handler.
+pub const MIN_SUBSCRIPTION_LICENSE_QUANTITY: i32 = 1;
+/// See [`MIN_SUBSCRIPTION_LICENSE_QUANTITY`].
+pub const MAX_SUBSCRIPTION_LICENSE_QUANTITY: i32 = 100;
+
+/// The only `EksAnywhereSubscriptionLicenseType` the API defines: "The license
+/// type for all licenses in the subscription. Valid value is CLUSTER"
+/// (`CreateEksAnywhereSubscriptionRequest$licenseType`). The model's enum member
+/// is `Cluster` (`smithy_query query="shape"
+/// shape="EksAnywhereSubscriptionLicenseType"`), which is the token this slice
+/// stores and reports.
+pub const SUBSCRIPTION_LICENSE_TYPE_CLUSTER: &str = "Cluster";
+
+/// How long a new subscription reports `CREATING` before the clock owes it
+/// `ACTIVE`.
+///
+/// `CreateEksAnywhereSubscription` publishes no duration for the provisioning it
+/// starts (the licenses "are provisioned in Amazon Web Services License
+/// Manager"), so this span is CHOSEN rather than cited, and matches
+/// [`CLUSTER_ACTIVATION_DELAY`]: long enough that a caller which describes the
+/// subscription straight after creating it still observes `CREATING`, short
+/// enough to be worth waiting for. The due instant is stored on the record;
+/// nothing sleeps for it.
+pub const SUBSCRIPTION_ACTIVATION_DELAY: Duration = CLUSTER_ACTIVATION_DELAY;
+
+/// The number of days in the month a subscription term is counted in.
+///
+/// A term is a count of MONTHS ([`SUBSCRIPTION_TERM_UNIT_MONTHS`]) and the
+/// expiration date is "the Unix timestamp in seconds for when the subscription
+/// will expire or auto renew" (`EksAnywhereSubscription$expirationDate`), so the
+/// term has to be turned into a duration. Calendar months differ in length and
+/// the API publishes no rule for which ones a term covers, so one month is taken
+/// as 30 days — the span this emulator states once here rather than in each
+/// caller.
+pub const SUBSCRIPTION_MONTH: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The number of subscriptions this store holds, across every Region, before
+/// `CreateEksAnywhereSubscription` answers `ResourceLimitExceededException`.
+///
+/// AWS publishes no quota for EKS Anywhere subscriptions, so the ceiling is
+/// CHOSEN: it bounds the store, so repeated creates cannot grow it without
+/// limit, and it is far above the handful of support contracts an account holds.
+pub const MAX_STORED_SUBSCRIPTIONS: usize = 100;
+
+/// One EKS Anywhere subscription, as this service stores it.
+///
+/// Everything an `EksAnywhereSubscription` reports is held here — including the
+/// server-generated parts (`id`, `arn`, `createdAt`, the effective and
+/// expiration dates and the licenses) — so a later read returns exactly what the
+/// create wrote rather than recomputing anything per request.
+#[derive(Debug, Clone)]
+pub struct EksAnywhereSubscriptionRecord {
+    pub id: String,
+    pub name: String,
+    pub arn: String,
+    pub created_at: SystemTime,
+    /// "The Unix timestamp in seconds for when the subscription is effective"
+    /// (`EksAnywhereSubscription$effectiveDate`): a subscription is a contract
+    /// that starts when it is bought, so this is the instant of the create.
+    pub effective_date: SystemTime,
+    /// "The Unix timestamp in seconds for when the subscription will expire or
+    /// auto renew": the effective date plus the term the request asked for.
+    pub expiration_date: SystemTime,
+    pub license_quantity: i32,
+    pub license_type: String,
+    pub term_duration: i32,
+    pub term_unit: String,
+    pub status: String,
+    /// When set, the instant at which the clock owes this subscription the move
+    /// from `CREATING` to `ACTIVE`. Cleared once the move is materialised.
+    pub active_at: Option<SystemTime>,
+    pub auto_renew: bool,
+    pub tags: BTreeMap<String, String>,
+    pub client_request_token: Option<String>,
+}
+
+impl EksAnywhereSubscriptionRecord {
+    /// Materialise the status moves the clock already owes at `now`: the move out
+    /// of `CREATING` once the licenses are provisioned, and the move to `EXPIRED`
+    /// once the term has run out on a subscription that does not auto renew.
+    ///
+    /// Both were due at their stored instant whether or not anybody called, so
+    /// applying them on read does not change what a later caller sees. A
+    /// subscription that DOES auto renew is renewed at the same instant — "a
+    /// boolean indicating whether or not a subscription will auto renew when it
+    /// expires" (`EksAnywhereSubscription$autoRenew`) — so its term rolls
+    /// forward instead of ending.
+    pub fn materialize_due_transitions(&mut self, now: SystemTime) {
+        if self.active_at.is_some_and(|due| now >= due) {
+            self.status = SUBSCRIPTION_STATUS_ACTIVE.to_string();
+            self.active_at = None;
+        }
+        if now < self.expiration_date {
+            return;
+        }
+        let term = self.term();
+        // A term of no length cannot be rolled forward — it would name the same
+        // instant again — so such a subscription is reported as expired whatever its
+        // auto-renew says. The term of every record this slice writes is one of the
+        // published durations ([`SUBSCRIPTION_TERM_DURATIONS`]), so this is the
+        // guard rather than the case.
+        if !self.auto_renew || term.is_zero() {
+            self.status = SUBSCRIPTION_STATUS_EXPIRED.to_string();
+            return;
+        }
+        // The renewal the clock owes is computed rather than looped: however many
+        // whole terms have passed since the last expiration, the next one is the
+        // first instant after `now`. A clock so far past the representable range
+        // that it cannot be placed leaves the date where it is rather than wrapping.
+        let Ok(overdue) = now.duration_since(self.expiration_date) else {
+            return;
+        };
+        let terms_passed = overdue.as_secs() / term.as_secs() + 1;
+        let skipped = u32::try_from(terms_passed)
+            .ok()
+            .and_then(|terms| term.checked_mul(terms));
+        if let Some(renewed) = skipped.and_then(|skipped| self.expiration_date.checked_add(skipped))
+        {
+            self.expiration_date = renewed;
+        }
+    }
+
+    /// The duration this subscription's term covers.
+    ///
+    /// Zero for a term whose duration is not a positive count of months, which no
+    /// record this slice writes carries: `CreateEksAnywhereSubscription` refuses
+    /// every duration outside [`SUBSCRIPTION_TERM_DURATIONS`] before it writes one.
+    fn term(&self) -> Duration {
+        let months = u32::try_from(self.term_duration.max(0)).unwrap_or(0);
+        SUBSCRIPTION_MONTH
+            .checked_mul(months)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// This record as the modelled `EksAnywhereSubscription` shape.
+    pub fn to_subscription(&self) -> EksAnywhereSubscription {
+        EksAnywhereSubscription {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            effective_date: Some(::aws_smithy_types::DateTime::from(self.effective_date)),
+            expiration_date: Some(::aws_smithy_types::DateTime::from(self.expiration_date)),
+            license_quantity: self.license_quantity,
+            license_type: Some(self.license_type.clone()),
+            term: Some(EksAnywhereSubscriptionTerm {
+                duration: self.term_duration,
+                unit: Some(self.term_unit.clone()),
+            }),
+            status: Some(self.status.clone()),
+            auto_renew: self.auto_renew,
+            // `licenseArns` names the Amazon Web Services License Manager ARN
+            // the subscription's licenses live under and `licenses` carries "all
+            // of the claims in the license token necessary to validate the
+            // license for extended support". This emulator provisions nothing in
+            // License Manager and signs no license token, so it reports neither
+            // rather than naming a license nothing issued. Both are optional in
+            // the model.
+            license_arns: None,
+            licenses: None,
+            // `TagMap` is bounded 1..50, so a subscription with no tags reports
+            // no map rather than an empty one.
+            tags: (!self.tags.is_empty()).then(|| {
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// The ARN of the subscription `id` in `region`: "The Amazon Resource Name (ARN)
+/// for the subscription" (`EksAnywhereSubscription$arn`), in the same
+/// `eks`-namespace form every other ARN this service mints takes.
+pub fn eks_anywhere_subscription_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("eks", region, &format!("eksanywheresubscription/{id}"))
+}
+
+/// Why `term` is not a term a subscription may be created for, or `None` when it
+/// is one.
+///
+/// The rule is the one the model states for the member: "Valid values are MONTHS
+/// for term unit and 12 or 36 for term duration"
+/// (`EksAnywhereSubscriptionTerm`). The `unit` member targets an enum, so a
+/// value outside it is already refused before a handler runs, and an ABSENT unit
+/// is not: a term that names no unit names no length. The duration carries no
+/// modelled range at all.
+pub fn subscription_term_refusal(term: &EksAnywhereSubscriptionTerm) -> Option<String> {
+    if !SUBSCRIPTION_TERM_DURATIONS.contains(&term.duration) {
+        return Some(format!(
+            "term duration not one of: {}",
+            SUBSCRIPTION_TERM_DURATIONS
+                .iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    match term.unit.as_deref() {
+        Some(unit) if unit == SUBSCRIPTION_TERM_UNIT_MONTHS => None,
+        Some(unit) => Some(format!(
+            "term unit not one of: {SUBSCRIPTION_TERM_UNIT_MONTHS}, got {}",
+            elided_value(unit, MAX_ECHOED_VALUE)
+        )),
+        None => Some(format!(
+            "term unit must be {SUBSCRIPTION_TERM_UNIT_MONTHS}"
+        )),
     }
 }
 

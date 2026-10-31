@@ -23,10 +23,12 @@
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. EDITED HERE: it claims a tag request the model's own tag contract
 //!   refuses, so that refusal is stated in the error code the called operation
-//!   declares (see [`tag_contract`]), and an add-on request whose `resolveConflicts`
+//!   declares (see [`tag_contract`]), an add-on request whose `resolveConflicts`
 //!   is outside the modelled enum, so that refusal names the operation it was sent
-//!   to (see [`resolve_conflicts_contract`]). Every other request resolves through
-//!   the generated routing table.
+//!   to (see [`resolve_conflicts_contract`]), and a request whose body the
+//!   framework's walk refuses but whose operation answers the pass-role
+//!   authorization or the missing cluster first (see [`precedence`]). Every other
+//!   request resolves through the generated routing table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -44,6 +46,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+pub mod precedence;
 pub mod resolve_conflicts_contract;
 pub mod tag_contract;
 
@@ -70,6 +73,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// value (see [`resolve_conflicts_contract`]). Held on the service for the
     /// same reason the refused tag request is.
     refused_addon_request: resolve_conflicts_contract::RefusedAddonRequest,
+    /// Answers a request whose body the framework's validating walk refuses but
+    /// whose operation answers something else FIRST — the pass-role
+    /// authorization of a role it hands Amazon EKS, or the cluster it is
+    /// addressed to (see [`precedence`]). Held on the service for the same reason
+    /// the two above are, and holding the shared engine because the
+    /// missing-cluster half is answered from this service's store.
+    precedence_first: precedence::PrecedenceFirst<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -78,9 +88,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             refused_tag_request: tag_contract::RefusedTagRequest::new(),
             refused_addon_request: resolve_conflicts_contract::RefusedAddonRequest::new(),
+            precedence_first: precedence::PrecedenceFirst::new(engine),
         }
     }
 }
@@ -135,6 +146,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
         if resolve_conflicts_contract::refusal_for(key, protocol, req).is_some() {
             return Some(&self.refused_addon_request as &dyn ErasedOperation);
+        }
+        // ALSO EDITED HERE, and for the same reason — the decision needs the
+        // operation, which only this seam knows: a request whose body the
+        // framework's validating walk would refuse, sent to an operation that
+        // answers the pass-role authorization of a role it hands Amazon EKS, or the
+        // cluster it is addressed to, BEFORE it judges the body. The walk runs
+        // before any handler does, so without this seam the body refusal pre-empts
+        // both. See [`precedence`], which claims nothing else.
+        if precedence::has_a_question(key, protocol, req) {
+            return Some(&self.precedence_first as &dyn ErasedOperation);
         }
         None
     }

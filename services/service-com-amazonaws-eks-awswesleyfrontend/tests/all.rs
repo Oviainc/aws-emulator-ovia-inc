@@ -41,6 +41,8 @@ mod addon_versions;
 mod cancel_update;
 #[path = "all/capability_lifecycle.rs"]
 mod capability_lifecycle;
+#[path = "all/capability_update.rs"]
+mod capability_update;
 #[path = "all/catalog_discovery.rs"]
 mod catalog_discovery;
 #[path = "all/certificate_authority.rs"]
@@ -57,6 +59,8 @@ mod certificate_authority_listing_order;
 mod certificate_authority_trust_list;
 #[path = "all/child_create_resolves_the_cluster_first.rs"]
 mod child_create_resolves_the_cluster_first;
+#[path = "all/child_resource_deletion.rs"]
+mod child_resource_deletion;
 #[path = "all/cluster_config_update.rs"]
 mod cluster_config_update;
 #[path = "all/cluster_lifecycle.rs"]
@@ -73,6 +77,8 @@ mod cluster_versions;
 mod connected_cluster_gate;
 #[path = "all/connected_clusters.rs"]
 mod connected_clusters;
+#[path = "all/eks_anywhere_subscriptions.rs"]
+mod eks_anywhere_subscriptions;
 #[path = "all/encryption_config_association.rs"]
 mod encryption_config_association;
 #[path = "all/error_class_selection.rs"]
@@ -85,12 +91,16 @@ mod identity_provider_config;
 mod identity_provider_config_not_found;
 #[path = "all/identity_provider_configs.rs"]
 mod identity_provider_configs;
+#[path = "all/identity_provider_disassociation.rs"]
+mod identity_provider_disassociation;
 #[path = "all/insights_listing.rs"]
 mod insights_listing;
 #[path = "all/insights_refresh.rs"]
 mod insights_refresh;
 #[path = "all/list_pod_identity_associations.rs"]
 mod list_pod_identity_associations;
+#[path = "all/nodegroup_config_update.rs"]
+mod nodegroup_config_update;
 #[path = "all/nodegroup_lifecycle.rs"]
 mod nodegroup_lifecycle;
 #[path = "all/not_found_payload.rs"]
@@ -111,5 +121,7 @@ mod tag_map_constraint_message;
 mod untag_resource;
 #[path = "all/update_listing.rs"]
 mod update_listing;
+#[path = "all/validation_precedence.rs"]
+mod validation_precedence;
 #[path = "all/wire.rs"]
 mod wire;
