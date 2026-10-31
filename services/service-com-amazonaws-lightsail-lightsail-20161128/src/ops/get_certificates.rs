@@ -242,11 +242,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::records_from(&store.certificates, &page_token)
                     .filter(|(_, certificate)| matches_status(Some(certificate.status))),
                 crate::state::CERTIFICATE_PAGE_SIZE,
+                // The page renders each record through the store's ONE
+                // certificate renderer, the same one the named read above
+                // reaches: the record is already in hand, so this is that
+                // helper without the name lookup in front of it.
                 |name, certificate| {
-                    certificate.view(
-                        store.certificate_in_use_resource_count(name),
-                        include_details,
-                    )
+                    store.certificate_record_view(name, certificate, include_details)
                 },
             );
             Ok(GetCertificatesOutput {

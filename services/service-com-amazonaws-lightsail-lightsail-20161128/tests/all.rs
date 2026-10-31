@@ -67,6 +67,8 @@ mod certificate_alternate_domain_dedupe;
 mod certificate_delete;
 #[path = "all/certificate_in_use_resources.rs"]
 mod certificate_in_use_resources;
+#[path = "all/certificate_render_parity.rs"]
+mod certificate_render_parity;
 #[path = "all/certificate_request.rs"]
 mod certificate_request;
 #[path = "all/cloud_formation_stack.rs"]

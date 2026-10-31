@@ -15573,10 +15573,28 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// view needs the whole store, not just the certificate.
     pub fn certificate_view(&self, name: &str, include_details: bool) -> Option<CertificateSummary> {
         let certificate = self.certificates.get(name)?;
-        Some(certificate.view(
+        Some(self.certificate_record_view(name, certificate, include_details))
+    }
+
+    /// [`Self::certificate_view`] for a caller that already HOLDS the record —
+    /// a page walk, which took the record from the store to decide it belongs
+    /// on the page and so has nothing left to look up.
+    ///
+    /// This is where the assembly itself lives, and [`Self::certificate_view`]
+    /// is the name lookup in front of it, so the single-record read and the
+    /// listing render a certificate through ONE pairing of the record with the
+    /// count only the whole store knows: a change to how a reported certificate
+    /// is assembled is made here once and reaches both.
+    pub fn certificate_record_view(
+        &self,
+        name: &str,
+        certificate: &StoredCertificate,
+        include_details: bool,
+    ) -> CertificateSummary {
+        certificate.view(
             self.certificate_in_use_resource_count(name),
             include_details,
-        ))
+        )
     }
 
     /// The distribution `name` names, for an operation the spec says mutates it
