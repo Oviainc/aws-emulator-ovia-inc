@@ -261,23 +261,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(|| "SELF".to_string());
 
-        let filters = input.filter_list.unwrap_or_default();
-        let mut predicates: Vec<(String, Vec<String>)> = Vec::with_capacity(filters.len());
-        for filter in filters {
-            // The same shared rule `ListChangeSets` judges its filters by, over
-            // the attributes this list publishes.
-            let (name, values) = match crate::state::filter_predicate(
-                Self::NAME,
-                crate::state::ENTITY_FILTER_NAMES,
-                filter,
-            ) {
-                Ok(predicate) => predicate,
-                Err(fault) => {
-                    return Err(ListEntitiesErrorModeled::ValidationException(fault).into())
-                }
-            };
-            predicates.push((name, values));
-        }
+        // The same shared rule `ListChangeSets` judges its `FilterList` by, over
+        // the attributes this list publishes: each filter names one of them and
+        // carries values that attribute can hold — an `EntityId` value that is
+        // not an entity id at all is refused here, as every member of this
+        // service that names an entity is — and no attribute is named twice.
+        let predicates = match crate::state::filter_predicates(
+            Self::NAME,
+            crate::state::ENTITY_FILTER_NAMES,
+            input.filter_list.unwrap_or_default(),
+        ) {
+            Ok(predicates) => predicates,
+            Err(fault) => return Err(ListEntitiesErrorModeled::ValidationException(fault).into()),
+        };
 
         let sort = input.sort.unwrap_or_default();
         let sort_by = sort

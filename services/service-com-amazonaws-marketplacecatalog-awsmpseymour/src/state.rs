@@ -104,14 +104,25 @@ pub const CHANGE_SET_FILTER_NAMES: &[&str] = &[
     "AfterStartTime",
     "BeforeEndTime",
     "BeforeStartTime",
-    "ChangeSetName",
-    "EntityId",
-    "Status",
+    CHANGE_SET_NAME_FILTER_NAME,
+    ENTITY_ID_FILTER_NAME,
+    CHANGE_SET_STATUS_FILTER_NAME,
 ];
 
 /// The `Filter$Name` values `ListEntities` accepts: `Filter$Name` documents
 /// "For `ListEntities`, the supported value for this is an `EntityId`".
-pub const ENTITY_FILTER_NAMES: &[&str] = &["EntityId"];
+pub const ENTITY_FILTER_NAMES: &[&str] = &[ENTITY_ID_FILTER_NAME];
+
+/// The `Filter$Name` that selects on the id of an entity, which both lists
+/// filter on: `Filter$Name` names it the one attribute `ListEntities` filters
+/// on, and `Filter$ValueList` lists it among the attributes `ListChangeSets`
+/// does.
+pub const ENTITY_ID_FILTER_NAME: &str = "EntityId";
+
+/// The `Filter$Name` that selects `ListChangeSets` on the name a change set was
+/// started with (`Filter$ValueList`: "`ChangeSetName` - ... These are defined
+/// when you call the `StartChangeSet` action").
+pub const CHANGE_SET_NAME_FILTER_NAME: &str = "ChangeSetName";
 
 /// The `ListChangeSets` filters whose `ValueList` is a single instant rather
 /// than a set of values to match: each one is documented as "all change sets
@@ -145,6 +156,70 @@ pub fn filter_value_set(name: &str) -> Option<(&'static str, &'static [&'static 
         CHANGE_SET_STATUS_FILTER_NAME => Some(("status", CHANGE_STATUS_VALUES)),
         _ => None,
     }
+}
+
+/// The FORM the values of one filter attribute take: the predicate that judges a
+/// value and the refusal built for one outside it.
+#[derive(Debug, Clone, Copy)]
+pub struct ValueForm {
+    /// Whether a value is of this form.
+    pub well_formed: fn(&str) -> bool,
+    /// The modelled `ValidationException` for a value outside it, built from the
+    /// value — the same fault the member carrying such a value answers
+    /// elsewhere in this service.
+    pub refusal: fn(&str) -> ValidationException,
+}
+
+/// The FORM a `Filter$ValueList` entry of the filter `name` has to take, and
+/// `None` for a filter whose values this service states no form for.
+///
+/// A filter selects on an attribute, so a value that the attribute's own values
+/// can never be names nothing the attribute holds. This service states the form
+/// of each kind of value it keeps ([`is_entity_id`], [`is_change_set_name`]) and
+/// refuses a member carrying one outside it wherever such a member appears, so
+/// the same decision is made on a filter value: it is refused with that form's
+/// own `ValidationException`, quoting the value and the syntax it had to
+/// satisfy, rather than silently selecting the empty page it would match.
+///
+/// [`filter_value_set`] is the other half of the same question: a closed SET
+/// bounds the attributes the model enumerates, and a stated FORM bounds the ids
+/// and names a caller chooses.
+pub fn filter_value_form(name: &str) -> Option<ValueForm> {
+    match name {
+        ENTITY_ID_FILTER_NAME => Some(ValueForm {
+            well_formed: is_entity_id,
+            refusal: invalid_entity_id,
+        }),
+        CHANGE_SET_NAME_FILTER_NAME => Some(ValueForm {
+            well_formed: is_change_set_name,
+            refusal: invalid_change_set_name,
+        }),
+        _ => None,
+    }
+}
+
+/// Whether the `ValueList` of the filter `name` is a list of UNIQUE values.
+///
+/// `Filter$ValueList` states it per filter: the `EntityId` list is "a list of
+/// unique `EntityId`s" while the `ChangeSetName` list is "a list of NON-unique
+/// `ChangeSetName`s", so a value repeated in the first is a request the
+/// documentation forbids and one repeated in the second is not. A filter the
+/// documentation says nothing about is left unconstrained.
+pub fn filter_values_unique(name: &str) -> bool {
+    name == ENTITY_ID_FILTER_NAME
+}
+
+/// The first entry of `values` that an earlier entry already carries, and `None`
+/// when every entry is distinct.
+///
+/// A `ValueList` is `@length(min: 1, max: 10)`, so the pairwise comparison is
+/// over a list the model already bounds.
+fn first_repeated(values: &[String]) -> Option<&String> {
+    values
+        .iter()
+        .enumerate()
+        .find(|(at, value)| values[..*at].contains(value))
+        .map(|(_, value)| value)
 }
 
 /// The `Sort$SortBy` values `ListChangeSets` accepts, from `Sort$SortBy`'s doc
@@ -186,8 +261,13 @@ pub fn sorts_descending(sort_order: &str) -> bool {
 /// a filter naming no attribute, one naming an attribute this list does not
 /// filter on, and one carrying no value to match are three ways a filter is
 /// refused, each under the member it is about. The fourth is a value the
-/// attribute cannot hold: where the model enumerates that attribute's values
-/// ([`filter_value_set`]), a value outside the published set is refused too.
+/// attribute cannot hold, in either of the two ways this service bounds one:
+/// where the model enumerates that attribute's values ([`filter_value_set`]), a
+/// value outside the published set is refused, and where the service states the
+/// FORM those values take ([`filter_value_form`]), a value outside that form is
+/// refused with the same fault the member carrying such a value answers
+/// anywhere else. The fifth is a value repeated in a `ValueList` the
+/// documentation states to be a list of unique values ([`filter_values_unique`]).
 /// This is the one place those decisions are made, so every list operation
 /// judges the same `Filter` shape the same way: `operation` is the list being
 /// called and `filtered_on` the attributes it publishes.
@@ -223,7 +303,56 @@ pub fn filter_predicate(
             return Err(invalid_choice(noun, outside, published));
         }
     }
+    if let Some(form) = filter_value_form(&name) {
+        if let Some(malformed) = values.iter().find(|value| !(form.well_formed)(value)) {
+            return Err((form.refusal)(malformed));
+        }
+    }
+    if filter_values_unique(&name) {
+        if let Some(repeated) = first_repeated(&values) {
+            return Err(validation(
+                "FilterList.ValueList",
+                format!(
+                    "filter {name} matches a list of unique values, and '{repeated}' is \
+                     named twice"
+                ),
+            ));
+        }
+    }
     Ok((name, values))
+}
+
+/// The attributes a whole `FilterList` selects on and the values each matches,
+/// or the modelled `ValidationException` that refuses the list.
+///
+/// Every filter is judged by [`filter_predicate`], and the list as a whole by
+/// the one rule that is about the list rather than one filter: `Filter$Name` is
+/// "the name of the filter, which is unique for each filter that you want to
+/// apply", so a `FilterList` naming one attribute twice is a request the
+/// documentation forbids — refused rather than accepted as two predicates
+/// conjoined into a page neither filter asked for. This is the one place a list
+/// operation turns its `FilterList` into predicates, so every list refuses the
+/// same list the same way.
+pub fn filter_predicates(
+    operation: &str,
+    filtered_on: &[&str],
+    filters: Vec<Filter>,
+) -> Result<Vec<(String, Vec<String>)>, ValidationException> {
+    let mut predicates: Vec<(String, Vec<String>)> = Vec::with_capacity(filters.len());
+    for filter in filters {
+        let (name, values) = filter_predicate(operation, filtered_on, filter)?;
+        if predicates.iter().any(|(applied, _)| applied == &name) {
+            return Err(validation(
+                "FilterList.Name",
+                format!(
+                    "filter name '{name}' is named twice, and a filter name is unique for \
+                     each filter a request applies"
+                ),
+            ));
+        }
+        predicates.push((name, values));
+    }
+    Ok(predicates)
 }
 
 /// The details members an entity's `Name` is read from.
@@ -901,7 +1030,9 @@ impl ChangeSetRecord {
     ///
     /// A name outside [`CHANGE_SET_FILTER_NAMES`] never reaches here, and
     /// neither does a value outside the set a filter's attribute publishes
-    /// ([`filter_value_set`]): the shared filter rule refuses the request first.
+    /// ([`filter_value_set`]) or outside the form that attribute's values take
+    /// ([`filter_value_form`]): the shared filter rule refuses the request
+    /// first, so what reaches here is only ever compared with the state.
     pub fn matches_filter(&self, name: &str, values: &[String]) -> bool {
         let bound = values.first().map(String::as_str).unwrap_or_default();
         match name {

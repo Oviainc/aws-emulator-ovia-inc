@@ -168,26 +168,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListChangeSetsErrorModeled::ValidationException(fault).into());
         }
 
-        // Each filter has to name one of the attributes this list filters on
-        // and carry values that attribute can hold — a value outside the set
-        // the model publishes for it is refused by the shared filter rule —
-        // and a before/after filter one instant to compare against.
-        let filters = input.filter_list.unwrap_or_default();
-        let mut predicates: Vec<(String, Vec<String>)> = Vec::with_capacity(filters.len());
-        for filter in filters {
-            // The attribute-and-values rule every list of this service judges a
-            // `Filter` by lives in `crate::state`, so both lists refuse the same
-            // filter the same way.
-            let (name, values) = match crate::state::filter_predicate(
-                Self::NAME,
-                crate::state::CHANGE_SET_FILTER_NAMES,
-                filter,
-            ) {
-                Ok(predicate) => predicate,
-                Err(fault) => {
-                    return Err(ListChangeSetsErrorModeled::ValidationException(fault).into())
-                }
-            };
+        // Each filter has to name one of the attributes this list filters on,
+        // once (a filter name is unique for each filter a request applies), and
+        // carry values that attribute can hold — a value outside the set the
+        // model publishes for it, and one outside the form this service states
+        // for it, are both refused by the shared filter rule — and a
+        // before/after filter one instant to compare against.
+        //
+        // The attribute-and-values rule every list of this service judges a
+        // `FilterList` by lives in `crate::state`, so both lists refuse the same
+        // filter the same way.
+        let predicates = match crate::state::filter_predicates(
+            Self::NAME,
+            crate::state::CHANGE_SET_FILTER_NAMES,
+            input.filter_list.unwrap_or_default(),
+        ) {
+            Ok(predicates) => predicates,
+            Err(fault) => {
+                return Err(ListChangeSetsErrorModeled::ValidationException(fault).into())
+            }
+        };
+        for (name, values) in &predicates {
             if crate::state::CHANGE_SET_TIME_FILTER_NAMES.contains(&name.as_str()) {
                 // A before/after filter compares against one instant, and only
                 // another `DateTimeISO8601` is an instant this list can compare
@@ -216,7 +217,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 }
             }
-            predicates.push((name, values));
         }
 
         // `Sort$SortBy` names the attribute to order by and `Sort$SortOrder`

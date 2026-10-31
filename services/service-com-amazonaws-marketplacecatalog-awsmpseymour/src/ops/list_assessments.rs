@@ -183,6 +183,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // entity or change set" — both members are optional, and one the filter
         // leaves absent constrains nothing (`AssessmentRecord::matches_target`), so
         // an empty filter structure selects everything rather than being refused.
+        //
+        // `AssessmentTargetFilter$EntityId` NAMES an entity, and it targets the
+        // wider `ResourceId` (`^[\w\-]+$`), which admits strings no entity id can
+        // be — so the id is judged against the form the model's own `EntityId`
+        // shape states before anything is selected, as every other member of this
+        // service naming an entity is, rather than selecting the empty page a
+        // string that is not an entity id would match.
+        if let Some(entity_id) = input
+            .assessment_target_filter
+            .as_ref()
+            .and_then(|filter| filter.entity_id.as_deref())
+        {
+            if !crate::state::is_entity_id(entity_id) {
+                return Err(ListAssessmentsErrorModeled::ValidationException(
+                    crate::state::invalid_entity_id(entity_id),
+                )
+                .into());
+            }
+        }
 
         // The token is the offset the next page resumes at; one this service
         // never issued names no page, and neither does one outside the modelled

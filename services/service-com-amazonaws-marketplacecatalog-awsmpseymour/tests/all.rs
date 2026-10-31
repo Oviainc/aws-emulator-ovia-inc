@@ -47,6 +47,8 @@ mod entity_reads;
 mod entity_type_projections;
 #[path = "all/filter_validation.rs"]
 mod filter_validation;
+#[path = "all/filter_value_forms.rs"]
+mod filter_value_forms;
 #[path = "all/model_declared_sort_attributes.rs"]
 mod model_declared_sort_attributes;
 #[path = "all/modelled_member_lengths.rs"]
