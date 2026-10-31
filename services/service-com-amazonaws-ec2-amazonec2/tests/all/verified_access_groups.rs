@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for the Verified Access GROUP slice: `CreateVerifiedAccessGroup`, driven
-//! over the wire the service actually speaks — `ec2Query`, through the crate's shared
-//! [`super::ec2_query`] harness.
+//! End-to-end cover for the Verified Access GROUP slice: `CreateVerifiedAccessGroup` and
+//! `DeleteVerifiedAccessGroup`, driven over the wire the service actually speaks — `ec2Query`,
+//! through the crate's shared [`super::ec2_query`] harness.
 //!
 //! The rules under test are:
 //!
@@ -20,6 +20,17 @@
 //! 5. the group is in the STORE rather than echoed: `CreateVerifiedAccessEndpoint` resolves
 //!    it and reports the instance read off it, and `DescribeVerifiedAccessEndpoints` narrows
 //!    by it.
+//! 6. `DeleteVerifiedAccessGroup` REMOVES THE GROUP THE REQUEST NAMES and answers the record
+//!    it removed, which is the group as the STORE held it — so a description no caller set
+//!    reads as empty text — plus the instant it was deleted; the operations that resolve a
+//!    group no longer find it, the group beside it is left alone, and the bytes the record
+//!    held go back to the store's budget;
+//! 7. a delete naming an id the account holds no group for is refused at HTTP 400 with the
+//!    group's own `Invalid<Kind>.NotFound` code and REMOVES NOTHING, and a `DryRun` reports
+//!    the outcome the delete would have had while removing nothing either way;
+//! 8. one delete `ClientToken` names the one delete it performed, so a retry under it answers
+//!    what the first call answered and removes no second group, and the deletes a store
+//!    remembers for their tokens are bounded.
 //!
 //! Each table row is a distinct input along what the rule generalises over — which optional
 //! members the request carries, which instance it names, which reference is unresolvable and
@@ -34,13 +45,14 @@
 use ec2::ops::types::{VerifiedAccessGroup, VerifiedAccessInstance};
 use ec2::state::{
     availability_zones_in_region, ComAmazonawsEc2Amazonec2State as Ec2State, SecurityGroupSpec,
-    SubnetSpec, VerifiedAccessGroupRecord, MAX_CLIENT_TOKEN_CHARS, MAX_TAGS_PER_RESOURCE,
+    SubnetSpec, VerifiedAccessGroupRecord, MAX_CLIENT_TOKEN_CHARS,
+    MAX_REMEMBERED_VERIFIED_ACCESS_GROUP_DELETIONS, MAX_TAGS_PER_RESOURCE,
     MAX_VERIFIED_ACCESS_GROUPS,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, element, elements, error_code, error_message, indexed};
+use super::ec2_query::{as_timestamp, call, element, elements, error_code, error_message, indexed};
 
 /// The Region every call here is signed for: the group's ARN names it, so a Region that is
 /// not the emulator's default is the stronger case.
@@ -793,5 +805,604 @@ async fn the_created_group_is_reachable_through_the_operations_that_resolve_one(
             "InvalidVerifiedAccessGroupId.NotFound",
             "case {case:?}: expected the group's own NotFound code, got {refused}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The delete: what leaves the store, what the answer reports, and what a retry of the
+// same call sees.
+// ---------------------------------------------------------------------------
+
+/// One `DeleteVerifiedAccessGroup` call.
+async fn delete(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
+    call(router, REGION, "DeleteVerifiedAccessGroup", params).await
+}
+
+/// How many caller-chosen bytes the store has charged against its budget.
+fn stored_bytes(engine: &engine::InMemoryEngine) -> usize {
+    engine.state::<Ec2State>().lock().stored_bytes()
+}
+
+/// The ids of the groups the store holds, in the order it keeps them.
+fn held_group_ids(engine: &engine::InMemoryEngine) -> Vec<String> {
+    engine
+        .state::<Ec2State>()
+        .lock()
+        .verified_access_groups
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// Seed one group on `instance_id` through the insert seam `CreateVerifiedAccessGroup` lands
+/// on, and answer the id it was given — the way the store-ceiling case above seeds groups.
+fn seed_group(engine: &engine::InMemoryEngine, instance_id: &str) -> String {
+    engine
+        .state::<Ec2State>()
+        .lock()
+        .insert_verified_access_group(
+            VerifiedAccessGroupRecord {
+                view: VerifiedAccessGroup {
+                    verified_access_instance_id: Some(instance_id.to_string()),
+                    ..VerifiedAccessGroup::default()
+                },
+                ..VerifiedAccessGroupRecord::default()
+            },
+            REGION,
+            None,
+        )
+}
+
+/// The members every reported group carries besides its description, its tags, its SSE block
+/// and the deletion time only a delete sets, so two reports of the SAME group can be compared
+/// member for member (`smithy_query(query="shape",shape="VerifiedAccessGroup")`).
+const GROUP_MEMBERS: [&str; 6] = [
+    "verifiedAccessGroupId",
+    "verifiedAccessInstanceId",
+    "verifiedAccessGroupArn",
+    "owner",
+    "creationTime",
+    "lastUpdatedTime",
+];
+
+/// Assert that `right` reports the same group `left` did, member for member — the tags and the
+/// SSE block included, so a report that dropped one would fail the case.
+fn assert_same_group(case: &str, left_label: &str, left: &str, right_label: &str, right: &str) {
+    for member in GROUP_MEMBERS
+        .iter()
+        .chain(["customerManagedKeyEnabled", "kmsKeyArn"].iter())
+    {
+        assert_eq!(
+            element(left, member),
+            element(right, member),
+            "case {case:?}: expected the {right_label} to report the {left_label}'s \
+             {member}={:?}, got {:?}",
+            element(left, member),
+            element(right, member)
+        );
+    }
+    for member in ["key", "value"] {
+        assert_eq!(
+            elements(left, member),
+            elements(right, member),
+            "case {case:?}: expected the {right_label} to report the {left_label}'s tag \
+             {member}s {:?}, got {:?}",
+            elements(left, member),
+            elements(right, member)
+        );
+    }
+}
+
+/// The parameters of an endpoint on `group_id`, the reader that RESOLVES a group: it is
+/// accepted while the group is stored and refused once the group is gone.
+fn endpoint_params(group_id: &str, fixture: &Fixture) -> Params {
+    [
+        vec![
+            p("VerifiedAccessGroupId", group_id.to_string()),
+            p("EndpointType", "cidr"),
+            p("AttachmentType", "vpc"),
+            p("CidrOptions.Protocol", "tcp"),
+            p("CidrOptions.Cidr", "10.0.0.0/24"),
+            p("CidrOptions.PortRange.1.FromPort", "5000"),
+            p("CidrOptions.PortRange.1.ToPort", "5000"),
+        ],
+        indexed("CidrOptions.SubnetId", &[fixture.subnet_id.as_str()]),
+        indexed("SecurityGroupId", &[fixture.security_group_id.as_str()]),
+    ]
+    .concat()
+}
+
+/// RULE 6 over the request shapes a group can have been created with: "Delete an Amazon Web
+/// Services Verified Access group" (`DeleteVerifiedAccessGroup`) — the group the request names
+/// LEAVES the store, the answer reports the record that was removed ("Details about the
+/// Verified Access group", `DeleteVerifiedAccessGroupResult$VerifiedAccessGroup`) with "The
+/// deletion time" (`VerifiedAccessGroup$DeletionTime`) on it, the operations that resolve a
+/// group no longer find it, and the caller-chosen bytes it held go back to the store's budget.
+///
+/// Each row is a group created with a different set of the optional members a group carries —
+/// which is what the answer generalises over — so no one request's members are the
+/// specification. A second group nobody deletes is created beside each one, so a delete that
+/// emptied the store would fail the case.
+#[tokio::test]
+async fn the_delete_removes_the_group_and_answers_the_record_it_removed() {
+    // (case, the optional members the created group carries, the description the delete must
+    // report for it, whether the record holds caller-chosen bytes the delete has to give
+    // back).
+    let rows: Vec<(&str, Params, &str, bool)> = vec![
+        ("nothing but the required instance", Vec::new(), "", false),
+        (
+            "a description",
+            vec![p("Description", "the sales group")],
+            "the sales group",
+            true,
+        ),
+        (
+            "a policy document the group shape carries no member for",
+            vec![p("PolicyDocument", "permit(principal, action, resource);")],
+            "",
+            true,
+        ),
+        (
+            "a customer managed key",
+            vec![
+                p("SseSpecification.CustomerManagedKeyEnabled", "true"),
+                p(
+                    "SseSpecification.KmsKeyArn",
+                    "arn:aws:kms:us-west-2:000000000000:key/0a1b2c3d",
+                ),
+            ],
+            "",
+            true,
+        ),
+        ("two tags", tag_params(2), "", true),
+    ];
+
+    for (case, extra, expected_description, frees_bytes) in rows {
+        let (router, engine, fixture) = emulator();
+        let instance_id = fixture.instance_ids[0].clone();
+        let (status, created) = create(&router, &create_params(&instance_id, extra)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the create must succeed, got {status} with body {created}"
+        );
+        let group_id = element(&created, "verifiedAccessGroupId").unwrap_or_default();
+        let bystander = seed_group(&engine, &fixture.instance_ids[1]);
+
+        let bytes_before = stored_bytes(&engine);
+        let (status, deleted) = delete(&router, &[p("VerifiedAccessGroupId", group_id.clone())]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DeleteVerifiedAccessGroup, got {status} \
+             with body {deleted}"
+        );
+
+        // The answer is the record that was removed, member for member as the create
+        // reported it.
+        assert_same_group(case, "create", &created, "delete", &deleted);
+
+        // Plus the one member only a delete sets, which must be an instant no earlier than
+        // the creation it follows, and the description the STORE held for the group — empty
+        // text for a group whose create named none, rather than a member left off the answer.
+        let deletion_time = element(&deleted, "deletionTime").unwrap_or_default();
+        assert!(
+            is_iso8601_utc(&deletion_time),
+            "case {case:?}: expected an ISO 8601 deletionTime on the removed group, got \
+             {deletion_time:?} in {deleted}"
+        );
+        let creation_time = element(&created, "creationTime").unwrap_or_default();
+        assert!(
+            as_timestamp(&deletion_time) >= as_timestamp(&creation_time),
+            "case {case:?}: expected the deletion time {deletion_time:?} at or after the \
+             creation time {creation_time:?}"
+        );
+        assert_eq!(
+            element(&deleted, "description").as_deref(),
+            Some(expected_description),
+            "case {case:?}: expected the delete to report the description the store held, \
+             got {:?}",
+            element(&deleted, "description")
+        );
+
+        // The store, not just the answer: the deleted group is gone, the group nobody
+        // deleted is untouched, and the bytes the record held are back.
+        assert_eq!(
+            held_group_ids(&engine),
+            vec![bystander.clone()],
+            "case {case:?}: expected only the group nobody deleted to be held, got {:?}",
+            held_group_ids(&engine)
+        );
+        if frees_bytes {
+            assert!(
+                stored_bytes(&engine) < bytes_before,
+                "case {case:?}: expected the removed record's caller-chosen bytes back, \
+                 still charged {} of {bytes_before}",
+                stored_bytes(&engine)
+            );
+        } else {
+            assert_eq!(
+                stored_bytes(&engine),
+                bytes_before,
+                "case {case:?}: a record that held no caller-chosen bytes frees none, got {} \
+                 of {bytes_before}",
+                stored_bytes(&engine)
+            );
+        }
+
+        // The operations that RESOLVE a group answer the account as the delete left it: the
+        // deleted id resolves to nothing, the group beside it still does.
+        let (status, refused) = call(
+            &router,
+            REGION,
+            "CreateVerifiedAccessEndpoint",
+            &endpoint_params(&group_id, &fixture),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected an endpoint on the deleted group to be refused, got \
+             {status} with body {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "InvalidVerifiedAccessGroupId.NotFound",
+            "case {case:?}: expected the group's own NotFound code, got {refused}"
+        );
+        let (status, refused) = call(
+            &router,
+            REGION,
+            "DescribeVerifiedAccessEndpoints",
+            &[p("VerifiedAccessGroupId", group_id.clone())],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the describe of the deleted group to be refused, got \
+             {status} with body {refused}"
+        );
+        let (status, described) = call(
+            &router,
+            REGION,
+            "DescribeVerifiedAccessEndpoints",
+            &[p("VerifiedAccessGroupId", bystander.clone())],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the group nobody deleted to still resolve, got {status} \
+             with body {described}"
+        );
+    }
+}
+
+/// RULE 7 over the forms an unresolvable id takes: whatever the id looks like, a delete that
+/// names no group of the account is refused — HTTP 400 `InvalidVerifiedAccessGroupId.NotFound`
+/// naming the id the request gave — and the store is left alone, so a caller that deletes
+/// twice can tell the deletion it performed from one it did not.
+#[tokio::test]
+async fn a_delete_of_an_id_the_account_does_not_hold_is_refused() {
+    let (router, engine, fixture) = emulator();
+    let kept = seed_group(&engine, &fixture.instance_ids[0]);
+    let (status, body) = delete(
+        &router,
+        &[p("VerifiedAccessGroupId", seed_group(&engine, &fixture.instance_ids[1]))],
+    )
+    .await;
+    assert_eq!(status, 200, "the first delete must succeed, got {status}: {body}");
+    let spent = element(&body, "verifiedAccessGroupId").unwrap_or_default();
+
+    // (case, the id the request names) — the long and the short EC2 id form of a group that
+    // was never minted, another Verified Access resource kind's id, a value that is no EC2
+    // id at all, and the id of a group this caller already deleted.
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "an unminted long-form group id",
+            "vagr-0123456789abcdef0".to_string(),
+        ),
+        ("an unminted short-form group id", "vagr-01234567".to_string()),
+        (
+            "a trust provider id",
+            "vatp-0123456789abcdef0".to_string(),
+        ),
+        ("an instance id", "vai-0123456789abcdef0".to_string()),
+        ("an id of no EC2 resource", "not-a-group".to_string()),
+        ("a group this caller already deleted", spent),
+    ];
+
+    for (case, group_id) in rows {
+        let (status, body) = delete(&router, &[p("VerifiedAccessGroupId", group_id.clone())]).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 for an unresolvable group, got {status} with \
+             body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidVerifiedAccessGroupId.NotFound",
+            "case {case:?}: expected the group's own NotFound code, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("The verified-access-group ID '{group_id}' does not exist"),
+            "case {case:?}: expected the refusal to name the id the request gave, got {}",
+            error_message(&body)
+        );
+        assert_eq!(
+            held_group_ids(&engine),
+            vec![kept.clone()],
+            "case {case:?}: a refused delete removes nothing, got {:?}",
+            held_group_ids(&engine)
+        );
+    }
+}
+
+/// RULE 7's `DryRun`: "Checks whether you have the required permissions for the action,
+/// without actually making the request" (`DeleteVerifiedAccessGroupRequest$DryRun`) — the dry
+/// run is answered with the outcome the delete WOULD have had, never with a success status,
+/// and removes nothing either way.
+#[tokio::test]
+async fn a_dry_run_of_the_delete_reports_the_outcome_and_removes_nothing() {
+    // (case, whether the request names a group the account holds, the HTTP status, the error
+    // code).
+    let rows: Vec<(&str, bool, u16, &str)> = vec![
+        ("a delete that would have succeeded", true, 412, "DryRunOperation"),
+        (
+            "a delete that would have been refused",
+            false,
+            400,
+            "InvalidVerifiedAccessGroupId.NotFound",
+        ),
+    ];
+
+    for (case, resolvable, expected_status, expected_code) in rows {
+        let (router, engine, fixture) = emulator();
+        let held = seed_group(&engine, &fixture.instance_ids[0]);
+        let group_id = if resolvable {
+            held.clone()
+        } else {
+            "vagr-0123456789abcdef0".to_string()
+        };
+        let (status, body) = delete(
+            &router,
+            &[p("VerifiedAccessGroupId", group_id), p("DryRun", "true")],
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "case {case:?}: expected the {expected_code} refusal, got {body}"
+        );
+        assert_eq!(
+            held_group_ids(&engine),
+            vec![held.clone()],
+            "case {case:?}: a dry run removes nothing, got {:?}",
+            held_group_ids(&engine)
+        );
+    }
+}
+
+/// RULE 8: "A unique, case-sensitive token that you provide to ensure idempotency of your
+/// modification request" (`DeleteVerifiedAccessGroupRequest$ClientToken`) — one token names
+/// the ONE delete it performed, so a retry under it answers what that delete answered rather
+/// than refusing an id its own call removed, and removes no second group. The published client
+/// token bound holds here as it does on the create: on the bound and one past it.
+#[tokio::test]
+async fn one_client_token_names_one_delete() {
+    let (router, engine, fixture) = emulator();
+    let instance_id = fixture.instance_ids[0].clone();
+    let first = seed_group(&engine, &instance_id);
+    let second = seed_group(&engine, &instance_id);
+    let third = seed_group(&engine, &instance_id);
+    let survivor = seed_group(&engine, &fixture.instance_ids[1]);
+
+    let (status, answered) = delete(
+        &router,
+        &[
+            p("VerifiedAccessGroupId", first.clone()),
+            p("ClientToken", "the-first-delete"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "the first delete must succeed, got {status}: {answered}");
+
+    // (case, the parameters of the next call, the group it must report, the groups the store
+    // must hold afterwards).
+    let rows: Vec<(&str, Params, String, Vec<String>)> = vec![
+        (
+            "the same token naming the same group",
+            vec![
+                p("VerifiedAccessGroupId", first.clone()),
+                p("ClientToken", "the-first-delete"),
+            ],
+            first.clone(),
+            vec![second.clone(), third.clone(), survivor.clone()],
+        ),
+        (
+            "the same token naming another group, which is a request of its own",
+            vec![
+                p("VerifiedAccessGroupId", second.clone()),
+                p("ClientToken", "the-first-delete"),
+            ],
+            second.clone(),
+            vec![third.clone(), survivor.clone()],
+        ),
+        (
+            "a token the store has not seen",
+            vec![
+                p("VerifiedAccessGroupId", third.clone()),
+                p("ClientToken", "a-token-of-its-own"),
+            ],
+            third.clone(),
+            vec![survivor.clone()],
+        ),
+    ];
+
+    for (case, params, expected_id, expected_held) in rows {
+        let (status, body) = delete(&router, &params).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {body}"
+        );
+        assert_eq!(
+            element(&body, "verifiedAccessGroupId").as_deref(),
+            Some(expected_id.as_str()),
+            "case {case:?}: expected the answer to report {expected_id}, got {body}"
+        );
+        if expected_id == first {
+            // A retry of a remembered delete answers exactly what that delete answered,
+            // down to the instant it recorded.
+            assert_same_group(case, "first delete", &answered, "retry", &body);
+            assert_eq!(
+                element(&body, "deletionTime"),
+                element(&answered, "deletionTime"),
+                "case {case:?}: expected the retry to report the instant the delete it \
+                 repeats recorded, got {:?}",
+                element(&body, "deletionTime")
+            );
+            assert_eq!(
+                element(&body, "description"),
+                element(&answered, "description"),
+                "case {case:?}: expected the retry to report the description the delete it \
+                 repeats reported, got {:?}",
+                element(&body, "description")
+            );
+        }
+        let mut held = held_group_ids(&engine);
+        held.sort();
+        let mut expected = expected_held.clone();
+        expected.sort();
+        assert_eq!(
+            held, expected,
+            "case {case:?}: expected the store to hold {expected:?}, got {held:?}"
+        );
+    }
+
+    // The token's own bound, counted in characters the way the create counts it.
+    for (case, chars, expected_status, expected_code) in [
+        ("as long a client token as the service takes", MAX_CLIENT_TOKEN_CHARS, 200, ""),
+        (
+            "one client token character too many",
+            MAX_CLIENT_TOKEN_CHARS + 1,
+            400,
+            "InvalidParameterValue",
+        ),
+    ] {
+        let group_id = seed_group(&engine, &instance_id);
+        let (status, body) = delete(
+            &router,
+            &[
+                p("VerifiedAccessGroupId", group_id.clone()),
+                p("ClientToken", "t".repeat(chars)),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        if expected_status == 200 {
+            assert!(
+                !held_group_ids(&engine).contains(&group_id),
+                "case {case:?}: an accepted delete removes its group, still held"
+            );
+        } else {
+            assert_eq!(
+                error_code(&body),
+                expected_code,
+                "case {case:?}: expected the {expected_code} refusal, got {body}"
+            );
+            assert!(
+                held_group_ids(&engine).contains(&group_id),
+                "case {case:?}: a refused delete removes nothing, {group_id} is gone"
+            );
+        }
+    }
+}
+
+/// RULE 8's bound: the deletes this store remembers for their idempotency tokens are BOUNDED.
+/// A delete frees the live record's slot, so nothing else caps a history that outlives the
+/// resource: the store keeps the most recent
+/// [`MAX_REMEMBERED_VERIFIED_ACCESS_GROUP_DELETIONS`] of them and drops the oldest, so a retry
+/// of a delete still remembered is answered while one of a delete long since displaced sees
+/// the id as gone — and a delete is never refused because the history is full.
+#[tokio::test]
+async fn the_remembered_deletes_are_bounded_and_drop_the_oldest() {
+    let (router, engine, fixture) = emulator();
+    let instance_id = fixture.instance_ids[0].clone();
+
+    // One delete past the bound, each under its own token, so the FIRST one is the entry the
+    // last delete displaces.
+    let mut deleted: Vec<(String, String)> = Vec::new();
+    for nth in 0..=MAX_REMEMBERED_VERIFIED_ACCESS_GROUP_DELETIONS {
+        let group_id = seed_group(&engine, &instance_id);
+        let token = format!("delete-token-{nth}");
+        let (status, body) = delete(
+            &router,
+            &[
+                p("VerifiedAccessGroupId", group_id.clone()),
+                p("ClientToken", token.clone()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case \"delete {nth} of {MAX_REMEMBERED_VERIFIED_ACCESS_GROUP_DELETIONS}\": a \
+             full history must not refuse a delete, got {status} with body {body}"
+        );
+        deleted.push((token, group_id));
+    }
+    assert!(
+        held_group_ids(&engine).is_empty(),
+        "expected every seeded group to have been deleted, still holding {:?}",
+        held_group_ids(&engine)
+    );
+
+    // (case, the delete to retry, whether the history still answers it).
+    for (case, (token, group_id), remembered) in [
+        (
+            "the oldest delete, displaced by the newest",
+            deleted.first().cloned().unwrap_or_default(),
+            false,
+        ),
+        (
+            "the newest delete",
+            deleted.last().cloned().unwrap_or_default(),
+            true,
+        ),
+    ] {
+        let (status, body) = delete(
+            &router,
+            &[
+                p("VerifiedAccessGroupId", group_id.clone()),
+                p("ClientToken", token.clone()),
+            ],
+        )
+        .await;
+        if remembered {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the retry to be answered, got {status} with body \
+                 {body}"
+            );
+            assert_eq!(
+                element(&body, "verifiedAccessGroupId").as_deref(),
+                Some(group_id.as_str()),
+                "case {case:?}: expected the retry to report {group_id}, got {body}"
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected a displaced delete's token to see the id as gone, \
+                 got {status} with body {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidVerifiedAccessGroupId.NotFound",
+                "case {case:?}: expected the group's own NotFound code, got {body}"
+            );
+        }
     }
 }

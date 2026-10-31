@@ -362,6 +362,17 @@
 //! An endpoint resolves the group it is attached to here, and reads the instance the group
 //! belongs to off that record, so one endpoint cannot name an instance its group does not.
 //!
+//! [`ComAmazonawsEc2Amazonec2State::remove_verified_access_group`] is the one way a group
+//! LEAVES that store, on the same terms a trust provider leaves its own: the create token
+//! that minted it goes with it, the record's caller-chosen bytes go back to the byte budget,
+//! the removed record is stamped with the instant it was deleted (the group shape's
+//! `DeletionTime`, which only a delete sets), and a delete that named an idempotency token
+//! keeps that record under it
+//! ([`ComAmazonawsEc2Amazonec2State::verified_access_group_deletion`]) so a retried delete
+//! answers what the first one answered. That report is of the group as the store HELD it, so
+//! a description no caller ever set reads as empty text there rather than as an absent
+//! member, while the create answers the request it was given.
+//!
 //! [`ComAmazonawsEc2Amazonec2State::verified_access_endpoints`] holds the account's Verified
 //! Access endpoints as [`VerifiedAccessEndpointRecord`]s, keyed by
 //! `VerifiedAccessEndpointId` in a [`BTreeMap`] — the same stable order every other store
@@ -3359,6 +3370,13 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVerifiedAccessGroup` `ClientToken` and the group id it minted, so a repeat
     /// of the same request answers with that group instead of creating a second one.
     pub verified_access_group_client_tokens: HashMap<String, String>,
+    /// A `DeleteVerifiedAccessGroup` `ClientToken` and the group that call removed, newest
+    /// LAST, so a retry of the same delete answers what the first one answered instead of an
+    /// id that names nothing. The record itself is kept, because the group is gone from
+    /// [`Self::verified_access_groups`] and the answer reports it; the history holds at most
+    /// [`MAX_REMEMBERED_VERIFIED_ACCESS_GROUP_DELETIONS`] of them, the arrangement
+    /// [`Self::verified_access_trust_provider_deletions`] holds for that resource.
+    pub verified_access_group_deletions: VecDeque<(String, VerifiedAccessGroupRecord)>,
     /// Every Verified Access endpoint the account holds, by `VerifiedAccessEndpointId`, as
     /// [`VerifiedAccessEndpointRecord`]s — see the module docs. Ordered by id, which is the
     /// order `DescribeVerifiedAccessEndpoints` reports and pages over.
@@ -4478,6 +4496,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             verified_access_instance_modification_client_tokens: HashMap::new(),
             verified_access_groups: BTreeMap::new(),
             verified_access_group_client_tokens: HashMap::new(),
+            verified_access_group_deletions: VecDeque::new(),
             verified_access_endpoints: BTreeMap::new(),
             verified_access_endpoint_client_tokens: HashMap::new(),
             local_gateway_route_table_virtual_interface_group_associations: BTreeMap::new(),
@@ -16680,6 +16699,16 @@ pub const VERIFIED_ACCESS_GROUP_TAGGABLE_RESOURCE: &str = "verified-access-group
 /// ([`verified_access_group_payload_bytes`]).
 pub const MAX_VERIFIED_ACCESS_GROUPS: usize = 1_000;
 
+/// How many answered `DeleteVerifiedAccessGroup` calls this store remembers for their
+/// idempotency tokens.
+///
+/// The same terms as [`MAX_REMEMBERED_VERIFIED_ACCESS_TRUST_PROVIDER_DELETIONS`], and for
+/// the same reason: a delete FREES a live record's slot, so [`MAX_VERIFIED_ACCESS_GROUPS`]
+/// does not bound a history that outlives the resource. The newest deletes are kept and the
+/// oldest dropped, so a create-and-delete loop cannot grow the history without end and a
+/// delete is never refused because it is full.
+pub const MAX_REMEMBERED_VERIFIED_ACCESS_GROUP_DELETIONS: usize = 200;
+
 /// EC2's code for a Verified Access instance id that names no instance of the account,
 /// named the way [`INVALID_VERIFIED_ACCESS_GROUP_ID_NOT_FOUND`] is.
 pub const INVALID_VERIFIED_ACCESS_INSTANCE_ID_NOT_FOUND: &str =
@@ -17280,6 +17309,98 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         self.verified_access_groups.insert(group_id.clone(), record);
         group_id
+    }
+
+    /// Remove the Verified Access group `group_id` and answer it as this call leaves it —
+    /// "The deletion time" (`VerifiedAccessGroup$DeletionTime`) set to `at` — or `None` when
+    /// the store holds no such group.
+    ///
+    /// The one way a group leaves the store, so the delete's answer and what a later read of
+    /// the account reports cannot disagree. The `CreateVerifiedAccessGroup` token that minted
+    /// it goes with it — a token must never answer with a group that is no longer stored —
+    /// and the bytes the record held go back to the store's budget on the terms
+    /// [`verified_access_group_payload_bytes`] took them on.
+    ///
+    /// `client_token` is the DELETE's own token: when the caller gave one, the removed record
+    /// is kept under it ([`Self::verified_access_group_deletions`]) so a retry of that delete
+    /// answers what the first one answered, and the bytes it keeps are charged again under
+    /// that token. That history is bounded by
+    /// [`MAX_REMEMBERED_VERIFIED_ACCESS_GROUP_DELETIONS`] entries, the oldest dropped (and
+    /// its bytes given back) to make room; a delete that names no token frees the record
+    /// outright.
+    pub fn remove_verified_access_group(
+        &mut self,
+        group_id: &str,
+        client_token: Option<&str>,
+        at: SystemTime,
+    ) -> Option<crate::ops::types::VerifiedAccessGroup> {
+        let mut record = self.verified_access_groups.remove(group_id)?;
+        let minting_token = self
+            .verified_access_group_client_tokens
+            .iter()
+            .find(|(_, minted)| minted.as_str() == group_id)
+            .map(|(token, _)| token.clone());
+        if let Some(token) = &minting_token {
+            self.verified_access_group_client_tokens.remove(token);
+        }
+        self.release_stored_bytes(verified_access_group_payload_bytes(
+            &record,
+            minting_token.as_deref(),
+        ));
+        // The group's own record is what carries the deletion instant, so every report of
+        // this delete — the answer and a retry's answer — names the same one.
+        record.view.deletion_time = Some(iso8601_utc(at));
+        // A report of the STORED group reports the record, in which "A description for the
+        // Amazon Web Services Verified Access group" (`VerifiedAccessGroup$Description`) a
+        // caller never set is empty text rather than an absent member — the create is what
+        // echoes the request it was given, and this is a report of what was held.
+        if record.view.description.is_none() {
+            record.view.description = Some(String::new());
+        }
+        if let Some(token) = client_token {
+            // One token names ONE delete, so a token used again replaces what it named
+            // rather than leaving the history two entries to answer with.
+            if let Some(position) = self
+                .verified_access_group_deletions
+                .iter()
+                .position(|(remembered, _)| remembered == token)
+            {
+                self.forget_verified_access_group_deletion(position);
+            }
+            self.add_stored_bytes(verified_access_group_payload_bytes(&record, Some(token)));
+            self.verified_access_group_deletions
+                .push_back((token.to_string(), record.clone()));
+            while self.verified_access_group_deletions.len()
+                > MAX_REMEMBERED_VERIFIED_ACCESS_GROUP_DELETIONS
+            {
+                self.forget_verified_access_group_deletion(0);
+            }
+        }
+        Some(record.view)
+    }
+
+    /// The group the delete that carried `client_token` removed, while this store still
+    /// remembers that delete.
+    ///
+    /// The history is bounded ([`MAX_REMEMBERED_VERIFIED_ACCESS_GROUP_DELETIONS`]), so a
+    /// token whose delete has been dropped answers `None` — the same answer as a token no
+    /// delete of this store ever carried.
+    pub fn verified_access_group_deletion(
+        &self,
+        client_token: &str,
+    ) -> Option<&crate::ops::types::VerifiedAccessGroup> {
+        self.verified_access_group_deletions
+            .iter()
+            .find(|(remembered, _)| remembered == client_token)
+            .map(|(_, record)| &record.view)
+    }
+
+    /// Drop the remembered deletion at `position`, giving the bytes it held back to the
+    /// store's budget: the record leaves the history on the same terms it entered it on.
+    fn forget_verified_access_group_deletion(&mut self, position: usize) {
+        if let Some((token, record)) = self.verified_access_group_deletions.remove(position) {
+            self.release_stored_bytes(verified_access_group_payload_bytes(&record, Some(&token)));
+        }
     }
 
     /// Whether another Verified Access endpoint fits inside the store's ceiling
