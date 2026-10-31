@@ -53,6 +53,8 @@ mod environment_update_apply_phase;
 mod environment_update_status_sequence;
 #[path = "all/environment_webserver_access_mode_version_floor.rs"]
 mod environment_webserver_access_mode_version_floor;
+#[path = "all/list_environments_cursor_framing.rs"]
+mod list_environments_cursor_framing;
 #[path = "all/list_environments_cursor_scope.rs"]
 mod list_environments_cursor_scope;
 #[path = "all/published_metrics.rs"]

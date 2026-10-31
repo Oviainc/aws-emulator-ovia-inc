@@ -1883,11 +1883,30 @@ pub struct MalformedCursor;
 /// decode into a usable position.
 const CURSOR_PREFIX: &str = "mwaa-after-environment:";
 
-/// Separates the scope a cursor was issued for from the position it names. Neither
-/// segment can carry it, so the split is unambiguous: a Region code (the shape
-/// `EnvironmentArn`'s own Region segment, `[a-z0-9\-]+`) and an `EnvironmentName`
-/// (`^[a-zA-Z][0-9a-zA-Z-_]*$`) both exclude it.
-const CURSOR_SCOPE_SEPARATOR: char = ':';
+/// The field of the cursor body naming the SCOPE the page was computed over.
+const CURSOR_SCOPE_FIELD: &str = "scope";
+
+/// The field of the cursor body naming the POSITION the page ended at.
+const CURSOR_POSITION_FIELD: &str = "after";
+
+/// The cursor body carries the scope and the position as a JSON object, so neither
+/// segment's own characters can be read as the other's.
+///
+/// Both segments are variable-length strings this crate does not get to choose the
+/// alphabet of: the position is an environment name, and the scope is whatever
+/// [`request_region`] read out of the request's SigV4 credential scope, verbatim and
+/// unconstrained. Framing two such strings by a separator character is only unambiguous
+/// when neither can carry it, which nothing here establishes — so the framing is left to
+/// the JSON encoder this crate already depends on, which escapes whatever either string
+/// holds. That is what makes [`decode_cursor`] give back exactly the pair
+/// [`encode_cursor`] was handed, for every scope and every position, so a listing always
+/// resumes from the token it issued itself.
+fn cursor_body(region: &str, name: &str) -> ::serde_json::Value {
+    ::serde_json::json!({
+        CURSOR_SCOPE_FIELD: region,
+        CURSOR_POSITION_FIELD: name,
+    })
+}
 
 /// Encode the resume cursor that follows the environment named `name` in the listing of
 /// `region`.
@@ -1907,9 +1926,7 @@ const CURSOR_SCOPE_SEPARATOR: char = ':';
 /// never has to record the tokens it issued — which matters because `ListEnvironments` is
 /// a reporting operation: remembering an issued token would make a read mutate state.
 pub fn encode_cursor(region: &str, name: &str) -> String {
-    ::hex::encode(format!(
-        "{CURSOR_PREFIX}{region}{CURSOR_SCOPE_SEPARATOR}{name}"
-    ))
+    ::hex::encode(format!("{CURSOR_PREFIX}{}", cursor_body(region, name)))
 }
 
 /// Decode a cursor minted by [`encode_cursor`] for the listing of `region`; `None` starts
@@ -1932,11 +1949,19 @@ pub fn decode_cursor(
     }
     let bytes = ::hex::decode(token).map_err(|_| MalformedCursor)?;
     let text = String::from_utf8(bytes).map_err(|_| MalformedCursor)?;
-    let position = text.strip_prefix(CURSOR_PREFIX).ok_or(MalformedCursor)?;
-    let (issued_for, name) = position
-        .split_once(CURSOR_SCOPE_SEPARATOR)
+    let body = text.strip_prefix(CURSOR_PREFIX).ok_or(MalformedCursor)?;
+    let body: ::serde_json::Value = ::serde_json::from_str(body).map_err(|_| MalformedCursor)?;
+    let issued_for = body
+        .get(CURSOR_SCOPE_FIELD)
+        .and_then(::serde_json::Value::as_str)
         .ok_or(MalformedCursor)?;
-    if issued_for != region {
+    let name = body
+        .get(CURSOR_POSITION_FIELD)
+        .and_then(::serde_json::Value::as_str)
+        .ok_or(MalformedCursor)?;
+    // An `EnvironmentName` is at least one character, so a body naming an empty position
+    // is not one this listing minted either.
+    if issued_for != region || name.is_empty() {
         return Err(MalformedCursor);
     }
     Ok(Some(name.to_string()))
