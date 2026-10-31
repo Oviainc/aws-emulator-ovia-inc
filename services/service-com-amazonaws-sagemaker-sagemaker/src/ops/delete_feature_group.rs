@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFeatureGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFeatureGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFeatureGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts the deletion of the feature group `CreateFeatureGroup` registered
+//! under the requested `FeatureGroupName` and refuses a name this account holds no group
+//! under with the modelled `ResourceNotFound`. The group reports `FeatureGroupStatus`'s
+//! `Deleting` from this call until the clock completes its removal (see
+//! [`crate::state::FEATURE_GROUP_RELEASED_AFTER`]), past which every reader answers as if
+//! it were gone and the name and quota slot it held are free again. The registration in
+//! the shared feature-group directory ([`crate::state::feature_group_directory`]) is
+//! dropped straight away, so the FeatureStore Runtime data plane stops resolving the name
+//! — "Data cannot be accessed from the OnlineStore immediately after DeleteFeatureGroup
+//! is called". This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +158,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFeatureGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFeatureGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFeatureGroup"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The removals the clock already completed are materialised first, so a group
+        // whose deletion is done is gone here too and the name and quota slot it held are
+        // free again. Each was due at its stored instant whether or not anybody called,
+        // so this call's observer makes no difference to the result.
+        store.release_deleted_feature_groups(now);
+
+        // `FeatureGroupName` is the bare name here (not the `FeatureGroupNameOrArn` the
+        // readers take), resolved through the crate's one feature-group lookup — which
+        // answers nothing for a group whose removal the clock already completed. A group
+        // whose deletion has already been asked for is held back the same way: it is on
+        // its way out, so there is nothing left for a second delete to delete.
+        let deletable = store
+            .feature_group_mut(&input.feature_group_name)
+            .filter(|group| !group.is_deleting());
+        let Some(group) = deletable else {
+            // Never a 200 for a group this account holds no deletable group under: a
+            // caller cannot tell that from a deletion that happened. `ResourceNotFound`
+            // is the one error this operation models.
+            return Err(DeleteFeatureGroupErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::feature_group_not_found(&input.feature_group_name)),
+            })
+            .into());
+        };
+        // The record is kept until the clock completes the removal, so the `Deleting`
+        // status a caller reads straight after this call is observable; past that instant
+        // every lookup answers as if the group were gone.
+        group.begin_deletion(now);
+        let arn = group.arn.clone();
+        let name = group.name.clone();
+        drop(store);
+
+        // LOCK ORDER (`crate::state::feature_group_directory`): this service's own store
+        // first, the shared directory second. The registration goes NOW rather than when
+        // the clock completes the removal, because "Data cannot be accessed from the
+        // OnlineStore immediately after DeleteFeatureGroup is called": the data plane
+        // resolves a feature group only through that directory, so dropping the record is
+        // what withdraws the OnlineStore from it.
+        if let Some(directory) = crate::state::feature_group_directory(&*self.engine) {
+            directory.lock().forget(&name);
+        }
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(DeleteFeatureGroupOutput)
     }
 }

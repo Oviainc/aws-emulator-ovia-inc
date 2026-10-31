@@ -514,6 +514,10 @@ mod guardduty_runtime_coverage;
 // conflicts with all of them, while these neighbouring lines are stable.
 #[path = "all/sagemaker_feature_store_control_plane_handoff.rs"]
 mod sagemaker_feature_store_control_plane_handoff;
+// Declared beside the hand-off suite whose harness it drives, rather than appended at the
+// end of this file, for the same reason the line above gives.
+#[path = "all/sagemaker_feature_store_group_deletion.rs"]
+mod sagemaker_feature_store_group_deletion;
 // Declared beside the feature-store hand-off suite it is the counterpart of, rather than
 // appended at the end of this file, for the same reason the line above gives: the tail is
 // where every concurrently landing router suite appends its line.

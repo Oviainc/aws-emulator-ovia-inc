@@ -3,7 +3,8 @@
 //! @op DescribeFeatureGroup
 //! IMPLEMENTED: replays the feature group `CreateFeatureGroup` stored under the name or
 //! ARN the request names, materialising the `Creating` -> `Created` transition the clock
-//! already owes, and refuses an unknown group with the modelled `ResourceNotFound`. The
+//! already owes, and refuses an unknown group — or one whose `DeleteFeatureGroup` the
+//! clock has already completed — with the modelled `ResourceNotFound`. The
 //! input `NextToken` resumes the list of features, and one response here carries every
 //! `FeatureDefinition` a group can hold, so the only token this operation issues — and
 //! the only one it accepts — is the empty one. This is the ONLY file to touch for this
@@ -212,14 +213,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = crate::state::name_from_arn_or_name(&input.feature_group_name);
 
         let mut store = state.lock();
-        let Some(group) = store.feature_groups.get_mut(name) else {
+        let Some(group) = store.feature_group_mut(name) else {
             // Never a 200 with empty fields: a caller cannot tell that from a group that
-            // exists and carries nothing. `ResourceNotFound` is the modelled refusal.
+            // exists and carries nothing. `ResourceNotFound` is the modelled refusal, and
+            // it is also what a group whose deletion the clock already completed answers:
+            // past that instant the group is gone.
             return Err(DescribeFeatureGroupErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Resource Not Found: Amazon SageMaker can't find a FeatureGroup with \
-                     name {name}."
-                )),
+                message: Some(crate::state::feature_group_not_found(name)),
             })
             .into());
         };

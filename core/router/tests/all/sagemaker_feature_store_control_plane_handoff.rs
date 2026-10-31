@@ -34,7 +34,11 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// The control plane and the FeatureStore runtime, mounted on one engine as
 /// `core/router/src/lib.rs` mounts them.
-fn build_router(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+///
+/// `pub(crate)` so the deletion counterpart suite
+/// (`sagemaker_feature_store_group_deletion`) drives the same two services on the same
+/// router rather than assembling a second copy of it.
+pub(crate) fn build_router(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(service_com_amazonaws_sagemaker_sagemaker::EmulatedService::new(
@@ -49,15 +53,15 @@ fn build_router(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 }
 
 /// One answer: the status and the parsed JSON body.
-struct Answer {
-    status: u16,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The wire error code: restJson1 and awsJson1_1 both carry it as the body's
     /// `__type`.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.body
             .get("__type")
             .and_then(Value::as_str)
@@ -70,7 +74,7 @@ impl Answer {
 }
 
 /// Send one request through the whole router.
-async fn dispatch(
+pub(crate) async fn dispatch(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -100,7 +104,7 @@ async fn dispatch(
 }
 
 /// `CreateFeatureGroup` on the control plane, in its awsJson1_1 RPC form.
-async fn create_feature_group(
+pub(crate) async fn create_feature_group(
     router: &MultiServiceRouter,
     name: &str,
     enable_online_store: bool,
@@ -126,12 +130,12 @@ async fn create_feature_group(
 }
 
 /// One `FeatureValue` with a scalar value.
-fn feature(name: &str, value: &str) -> Value {
+pub(crate) fn feature(name: &str, value: &str) -> Value {
     json!({ "FeatureName": name, "ValueAsString": value })
 }
 
 /// The record a `PutRecord`/`UpdateRecord` row writes.
-fn record(identifier: &str, event_time: &str, feature_a: &str) -> Value {
+pub(crate) fn record(identifier: &str, event_time: &str, feature_a: &str) -> Value {
     json!([
         feature("record_id", identifier),
         feature("event_time", event_time),

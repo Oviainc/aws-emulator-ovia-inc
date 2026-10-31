@@ -393,7 +393,14 @@ fn stored_property_names(
             }
         }
         "FeatureGroup" => {
-            for group in store.feature_groups.values() {
+            // A feature group whose removal the clock already completed is gone, so none
+            // of its tag keys is a property name to suggest.
+            let now = ::std::time::SystemTime::now();
+            for group in store
+                .feature_groups
+                .values()
+                .filter(|group| !group.is_released(now))
+            {
                 for tag in &group.tags {
                     push("Tags", &tag.key);
                 }

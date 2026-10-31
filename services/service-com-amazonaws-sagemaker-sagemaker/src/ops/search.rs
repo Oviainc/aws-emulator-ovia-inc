@@ -1467,6 +1467,10 @@ fn settle_due(
             }
         }
         "FeatureGroup" => {
+            // A group whose removal the clock already completed is gone, so it is dropped
+            // before the rest are settled: a search must not report a resource a
+            // `Describe*` at this same instant answers nothing for.
+            settled.extend(store.release_deleted_feature_groups(now));
             for group in store.feature_groups.values_mut() {
                 if group.settle_status(now) {
                     settled.push(group.arn.clone());

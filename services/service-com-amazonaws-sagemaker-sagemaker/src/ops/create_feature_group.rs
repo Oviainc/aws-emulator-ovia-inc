@@ -210,11 +210,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored: a refused create leaves the state exactly as it was.
         validate_schema(&input)?;
 
+        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
         let arn =
             crate::state::resource_arn(&region, FEATURE_GROUP_ARN_KIND, &input.feature_group_name);
 
         let mut store = state.lock();
+        // The removals the clock already completed are materialised first, so the name and
+        // the quota slot a group whose deletion is done still held are free again. Each
+        // was due at its stored instant whether or not anybody called.
+        store.release_deleted_feature_groups(now);
         // "The name must be unique within an Amazon Web Services Region in an Amazon Web
         // Services account" (`FeatureGroupName`), so a name already in use is refused
         // with the modelled in-use error and the stored group is left untouched — never
@@ -250,7 +255,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let now = ::std::time::SystemTime::now();
         // The FeatureStore Runtime data plane resolves a `FeatureGroupName` against the
         // groups this service holds, and reads the two feature names this definition
         // fixes, so the definition goes into the SHARED directory as well as this
@@ -290,6 +294,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 creation_time: now,
                 last_modified_time: now,
                 created_due_at: now + crate::state::FEATURE_GROUP_CREATED_AFTER,
+                // Nothing has asked for this group's deletion yet.
+                removal_due_at: None,
             },
         );
         drop(store);
