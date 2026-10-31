@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeNetworkInterfaceAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeNetworkInterfaceAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeNetworkInterfaceAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE attribute of one stored elastic network interface.
+//!
+//! "Describes a network interface attribute. You can specify only one attribute at a
+//! time": the request names an interface and one `NetworkInterfaceAttribute` member, and
+//! the response carries the interface's id and the value the STORE holds for that one
+//! attribute — no other member of the result is filled in. Every value is read off the
+//! stored `NetworkInterface` record `CreateNetworkInterface` wrote and
+//! `DescribeNetworkInterfaces` reports, so one interface cannot be described two ways.
+//!
+//! This is a pure READ: nothing is written, so two describes of an interface report the
+//! same attribute and a describe changes nothing a later caller sees.
+//!
+//! The refusals, in the order this handler makes them — the order `DescribeVpcAttribute`
+//! and `DeleteNetworkInterface` already keep for an attribute describe and for an
+//! interface id:
+//!
+//! * `MissingParameter` (HTTP 400) for a request naming no attribute at all. The model
+//!   leaves `Attribute` optional, while the member documents "This parameter is
+//!   required", so the requirement is this handler's to enforce.
+//! * `InvalidNetworkInterfaceId.Malformed` (HTTP 400) for a value that is not a network
+//!   interface id at all ([`crate::state::network_interface_id_is_well_formed`]) — there
+//!   is nothing to look up.
+//! * `InvalidNetworkInterfaceID.NotFound` (HTTP 400) for a well-formed id this account
+//!   holds no interface for.
+//! * `DryRunOperation` (HTTP 412) for a dry run of a request that would have succeeded.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +97,64 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state;
+
+/// The `NetworkInterfaceAttribute` enum's `description` member.
+///
+/// The five members are named here, in the one file that reads them, so this handler and
+/// this operation's tests spell one attribute one way; the generated catalog of every
+/// member is [`NETWORK_INTERFACE_ATTRIBUTE_VALUES`], which [`ATTRIBUTE_NAMES`] below is
+/// pinned against.
+pub const ATTRIBUTE_DESCRIPTION: &str = "description";
+
+/// The `NetworkInterfaceAttribute` enum's `groupSet` member (see
+/// [`ATTRIBUTE_DESCRIPTION`] for the generated catalog these come from).
+pub const ATTRIBUTE_GROUP_SET: &str = "groupSet";
+
+/// The `NetworkInterfaceAttribute` enum's `sourceDestCheck` member.
+pub const ATTRIBUTE_SOURCE_DEST_CHECK: &str = "sourceDestCheck";
+
+/// The `NetworkInterfaceAttribute` enum's `attachment` member.
+pub const ATTRIBUTE_ATTACHMENT: &str = "attachment";
+
+/// The `NetworkInterfaceAttribute` enum's `associatePublicIpAddress` member.
+pub const ATTRIBUTE_ASSOCIATE_PUBLIC_IP_ADDRESS: &str = "associatePublicIpAddress";
+
+/// Every attribute this operation reports, each named by the constants above — the set
+/// the result's members correspond to one for one.
+pub const ATTRIBUTE_NAMES: [&str; 5] = [
+    ATTRIBUTE_DESCRIPTION,
+    ATTRIBUTE_GROUP_SET,
+    ATTRIBUTE_SOURCE_DEST_CHECK,
+    ATTRIBUTE_ATTACHMENT,
+    ATTRIBUTE_ASSOCIATE_PUBLIC_IP_ADDRESS,
+];
+
+/// The `IpOwnerId` a public IPv4 address AWS itself assigned to a network interface
+/// reports: AWS owns an auto-assigned public address, where an Elastic IP the account
+/// allocated reports that account's own id ("The ID of the Elastic IP address owner",
+/// `NetworkInterfaceAssociation$IpOwnerId`).
+///
+/// So this value is what distinguishes the two kinds of public IPv4 address a stored
+/// interface can hold, which is what [`associates_public_ip_address`] reads.
+pub const AMAZON_ASSIGNED_IP_OWNER_ID: &str = "amazon";
+
+/// Whether this network interface is one AWS assigns a public IPv4 address to:
+/// "Indicates whether to assign a public IPv4 address to a network interface"
+/// (`DescribeNetworkInterfaceAttributeResult$AssociatePublicIpAddress`).
+///
+/// What a stored interface holds about an AWS-assigned public IPv4 address is its
+/// association's owner: an address AWS assigned is owned by AWS
+/// ([`AMAZON_ASSIGNED_IP_OWNER_ID`]), where an Elastic IP associated with the interface is
+/// owned by the account that allocated it. So an interface holding an AWS-owned public
+/// address associates one, and an interface holding an Elastic IP of the account, or no
+/// public address at all, does not.
+pub fn associates_public_ip_address(interface: &NetworkInterface) -> bool {
+    interface.association.as_ref().is_some_and(|association| {
+        association.ip_owner_id.as_deref() == Some(AMAZON_ASSIGNED_IP_OWNER_ID)
+    })
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -147,18 +222,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeNetworkInterfaceAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeNetworkInterfaceAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeNetworkInterfaceAttribute"))
+        // `ctx` carries request metadata only; this operation reads none of it — the
+        // interface is named by id. The store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        // "The attribute of the network interface. This parameter is required"
+        // (`DescribeNetworkInterfaceAttributeRequest$Attribute`), which the model itself
+        // leaves optional — so a request that names no attribute names nothing to
+        // describe, and is refused here rather than answered with a result carrying no
+        // attribute at all.
+        let Some(attribute) = input.attribute.as_deref() else {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter attribute",
+            ));
+        };
+        // "You can specify only one attribute at a time" — `Attribute` is one
+        // `NetworkInterfaceAttribute` member, and the response carries only the member it
+        // names. The modelled enum constraint is already refused by the request walk
+        // before this handler runs, so this is the same belt-and-braces check
+        // `DescribeVpcAttribute` and `DescribeVolumeAttribute` keep: without it an
+        // attribute no result member corresponds to would be answered with a response
+        // carrying no attribute at all.
+        if !NETWORK_INTERFACE_ATTRIBUTE_VALUES.contains(&attribute) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({}) for parameter attribute is invalid. Unknown attribute.",
+                state::echoed_resource_id(attribute)
+            )));
+        }
+
+        let network_interface_id = input.network_interface_id.as_str();
+        // A value that is not a network interface id at all is refused BEFORE the store is
+        // asked about it, the way the service orders the two for every interface id
+        // (`DeleteNetworkInterface`): there is nothing to look up.
+        if !state::network_interface_id_is_well_formed(network_interface_id) {
+            return Err(state::invalid_network_interface_id_malformed(
+                network_interface_id,
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let store = state_handle.lock();
+        // "Describes a network interface attribute": a well-formed id this account holds
+        // no interface for has no attribute to report, so it is a refusal rather than an
+        // empty result.
+        let Some(interface) = store.network_interfaces.get(network_interface_id) else {
+            return Err(state::invalid_network_interface_id_not_found(
+                network_interface_id,
+            ));
+        };
+
+        // The request is one that would have succeeded, so a dry run stops HERE, having
+        // read the interface and written nothing: "If you have the required permissions,
+        // the error response is DryRunOperation" (`DryRun`). This is where
+        // `DescribeVpcAttribute` answers the same question for an attribute describe.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Each member of the result reports the attribute of the same name, so only the
+        // one the request named is filled in — and each is read off the stored record, so
+        // this answers what the interface holds rather than recomputing it here.
+        Ok(DescribeNetworkInterfaceAttributeOutput {
+            network_interface_id: Some(network_interface_id.to_string()),
+            // "The description of the network interface": reported as the value the record
+            // holds, which is the empty string for an interface created without one.
+            description: (attribute == ATTRIBUTE_DESCRIPTION).then(|| AttributeValue {
+                value: interface.description.clone(),
+            }),
+            // "The security groups associated with the network interface": the list the
+            // interface carries, reported empty rather than omitted when it carries none,
+            // because `groupSet` is an attribute every interface has.
+            groups: (attribute == ATTRIBUTE_GROUP_SET)
+                .then(|| interface.groups.clone().unwrap_or_default()),
+            // "Indicates whether source/destination checking is enabled".
+            source_dest_check: (attribute == ATTRIBUTE_SOURCE_DEST_CHECK).then_some(
+                AttributeBooleanValue {
+                    value: interface.source_dest_check,
+                },
+            ),
+            // "The attachment (if any) of the network interface": an interface attached to
+            // nothing has no attachment to report, so the member is left out for it rather
+            // than reported as an empty attachment.
+            attachment: (attribute == ATTRIBUTE_ATTACHMENT)
+                .then(|| interface.attachment.clone())
+                .flatten(),
+            // "Indicates whether to assign a public IPv4 address to a network interface",
+            // which the stored interface holds as the owner of the public IPv4 address it
+            // is associated with ([`associates_public_ip_address`]).
+            associate_public_ip_address: (attribute == ATTRIBUTE_ASSOCIATE_PUBLIC_IP_ADDRESS)
+                .then(|| associates_public_ip_address(interface)),
+        })
     }
 }

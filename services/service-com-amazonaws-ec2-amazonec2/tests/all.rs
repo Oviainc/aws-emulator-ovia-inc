@@ -704,6 +704,8 @@ mod nat_gateway_addresses;
 mod network_insights_access_scope_analyses;
 #[path = "all/network_insights_access_scopes.rs"]
 mod network_insights_access_scopes;
+#[path = "all/network_interface_attributes.rs"]
+mod network_interface_attributes;
 #[path = "all/network_interfaces.rs"]
 mod network_interfaces;
 #[path = "all/network_interface_permissions.rs"]
