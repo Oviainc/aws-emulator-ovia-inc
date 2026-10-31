@@ -45,6 +45,8 @@ mod cluster_structure;
 mod cluster_transition_convergence;
 #[path = "all/cluster_versions.rs"]
 mod cluster_versions;
+#[path = "all/configuration_refusal_wording.rs"]
+mod configuration_refusal_wording;
 #[path = "all/copy_cluster_snapshot.rs"]
 mod copy_cluster_snapshot;
 #[path = "all/custom_domain_and_partners.rs"]

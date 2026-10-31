@@ -201,8 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DescribeClusterParameterGroupsErrorModeled::ClusterParameterGroupNotFoundFault(
                         ClusterParameterGroupNotFoundFault {
-                            message: Some(format!(
-                                "Cluster parameter group not found: {wanted}"
+                            message: Some(st::cluster_parameter_group_not_found_message(
+                                st::ClusterParameterGroupNotFoundWording::NameThenNotFound,
+                                wanted,
                             )),
                         },
                     )

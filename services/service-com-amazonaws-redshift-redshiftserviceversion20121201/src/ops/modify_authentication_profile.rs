@@ -6,7 +6,10 @@
 //! already holds and reports back what it persisted: the name as given and the
 //! new content, which every later read reports from then on. A name that
 //! identifies no profile is refused with `AuthenticationProfileNotFoundFault`
-//! and writes nothing.
+//! and writes nothing, and so is a profile map the service cannot read —
+//! content that is no JSON document, no map, or a map with no setting in it —
+//! which is refused with `InvalidAuthenticationProfileRequestFault` before the
+//! name is resolved.
 //!
 //! ## Shape of an operation
 //!
@@ -201,9 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyAuthenticationProfileErrorModeled::AuthenticationProfileNotFoundFault(
                     AuthenticationProfileNotFoundFault {
-                        message: Some(st::authentication_profile_not_found_message(
-                            &input.authentication_profile_name,
-                        )),
+                        message: Some(st::AUTHENTICATION_PROFILE_NOT_FOUND.to_string()),
                     },
                 )
                 .into(),

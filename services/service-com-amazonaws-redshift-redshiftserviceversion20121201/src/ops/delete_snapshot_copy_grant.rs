@@ -189,6 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DeleteSnapshotCopyGrantErrorModeled::SnapshotCopyGrantNotFoundFault(
                     SnapshotCopyGrantNotFoundFault {
                         message: Some(st::snapshot_copy_grant_not_found_message(
+                            st::SnapshotCopyGrantNotFoundWording::NotFoundThenName,
                             &input.snapshot_copy_grant_name,
                         )),
                     },

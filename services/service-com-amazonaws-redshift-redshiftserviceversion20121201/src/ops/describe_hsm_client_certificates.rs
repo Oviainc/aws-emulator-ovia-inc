@@ -210,7 +210,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             DescribeHsmClientCertificatesErrorModeled::HsmClientCertificateNotFoundFault(
                                 HsmClientCertificateNotFoundFault {
                                     message: Some(
-                                        st::hsm_client_certificate_not_found_message(requested),
+                                        st::hsm_client_certificate_not_found_message(
+                                            st::HsmClientCertificateNotFoundWording::IdentifierThenNotFound,
+                                            requested,
+                                        ),
                                     ),
                                 },
                             )

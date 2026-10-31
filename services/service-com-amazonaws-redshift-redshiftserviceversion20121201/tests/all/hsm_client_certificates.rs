@@ -248,7 +248,11 @@ async fn a_created_certificate_is_reported_with_the_key_the_service_minted() {
     assert_eq!(
         unknown.text("Message").as_deref(),
         Some(
-            state::hsm_client_certificate_not_found_message("hsm-cert-never-made").as_str()
+            state::hsm_client_certificate_not_found_message(
+                state::HsmClientCertificateNotFoundWording::IdentifierThenNotFound,
+                "hsm-cert-never-made",
+            )
+            .as_str()
         ),
         "case an unknown identifier: expected the message to name it, got {:?}",
         unknown.text("Message")

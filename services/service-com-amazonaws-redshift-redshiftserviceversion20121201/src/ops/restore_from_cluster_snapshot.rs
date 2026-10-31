@@ -665,8 +665,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
                     return Err(
                         RestoreFromClusterSnapshotErrorModeled::ClusterParameterGroupNotFoundFault(
                             ClusterParameterGroupNotFoundFault {
-                                message: Some(format!(
-                                    "ClusterParameterGroup not found: {requested}"
+                                message: Some(st::cluster_parameter_group_not_found_message(
+                                    st::ClusterParameterGroupNotFoundWording::ShapeNameThenName,
+                                    requested,
                                 )),
                             },
                         )

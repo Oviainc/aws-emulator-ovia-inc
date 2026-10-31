@@ -332,7 +332,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     EnableSnapshotCopyErrorModeled::SnapshotCopyGrantNotFoundFault(
                         SnapshotCopyGrantNotFoundFault {
-                            message: Some(st::snapshot_copy_grant_not_found_message(grant_name)),
+                            message: Some(st::snapshot_copy_grant_not_found_message(
+                                st::SnapshotCopyGrantNotFoundWording::NameThenNotFound,
+                                grant_name,
+                            )),
                         },
                     )
                     .into(),

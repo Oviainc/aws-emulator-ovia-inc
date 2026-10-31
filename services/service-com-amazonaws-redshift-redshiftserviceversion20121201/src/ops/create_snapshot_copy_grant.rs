@@ -282,9 +282,7 @@ fn refusal_from_state(
         return Some(
             CreateSnapshotCopyGrantErrorModeled::SnapshotCopyGrantAlreadyExistsFault(
                 SnapshotCopyGrantAlreadyExistsFault {
-                    message: Some(format!(
-                        "Cannot create the snapshot copy grant because a grant with the name {name} already exists."
-                    )),
+                    message: Some(st::snapshot_copy_grant_already_exists_message(name)),
                 },
             )
             .into(),

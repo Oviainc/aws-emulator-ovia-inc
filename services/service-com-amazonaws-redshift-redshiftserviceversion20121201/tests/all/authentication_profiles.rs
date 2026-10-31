@@ -167,15 +167,15 @@ fn content_of_length(len: usize) -> String {
 
 /// The create table: rows differing along everything the rule generalises over —
 /// the shape of the name (letters, mixed case, digits, hyphens, the modelled
-/// length bound) and the shape of the JSON content (an empty object, one
-/// setting, a nested document, an array, text needing XML escaping, a large
-/// document).
+/// length bound) and the shape of the profile map the content carries (one
+/// setting, several, a nested document, a value that is an array, text needing
+/// XML escaping, a large document).
 fn create_table() -> Vec<ProfileCase> {
     vec![
         ProfileCase {
-            case: "an empty JSON object",
+            case: "a map carrying a single setting",
             name: "profile".to_string(),
-            content: "{}".to_string(),
+            content: r#"{"App_ID":"example"}"#.to_string(),
         },
         ProfileCase {
             case: "one setting, a mixed-case hyphenated name",
@@ -188,9 +188,9 @@ fn create_table() -> Vec<ProfileCase> {
             content: r#"{"AuthProfile":{"Region":"eu-central-1","Ports":[5439,5440]}}"#.to_string(),
         },
         ProfileCase {
-            case: "a JSON array at the top level",
+            case: "a setting whose value is an array",
             name: "arrayform".to_string(),
-            content: r#"[{"Key":"a"},{"Key":"b"}]"#.to_string(),
+            content: r#"{"Keys":[{"Key":"a"},{"Key":"b"}]}"#.to_string(),
         },
         ProfileCase {
             case: "content whose text needs XML escaping",
@@ -306,7 +306,7 @@ async fn a_second_create_under_one_name_is_refused_and_overwrites_nothing() {
     for (case, content) in [
         ("the same content again", first),
         ("different content", r#"{"Original":"2"}"#),
-        ("an empty object", "{}"),
+        ("another setting entirely", r#"{"Replacement":"3"}"#),
     ] {
         let answer = create(&emulator, "taken", content).await;
         assert_refused(
@@ -333,12 +333,13 @@ async fn a_second_create_under_one_name_is_refused_and_overwrites_nothing() {
 
 /// A name that identifies no profile this account owns is refused by every
 /// operation that looks one up — the read, the modify and the delete — and never
-/// served as an empty report.
+/// served as an empty report. The sentence each one answers is pinned in
+/// [`crate::configuration_refusal_wording`].
 #[tokio::test]
 async fn a_name_that_identifies_no_profile_is_refused_by_every_lookup() {
     let emulator = Emulator::new();
     create(&emulator, "present", r#"{"Present":"1"}"#).await;
-    create(&emulator, "removed", "{}").await;
+    create(&emulator, "removed", r#"{"Who":"removed"}"#).await;
     delete_one(&emulator, "removed").await;
 
     // Rows differing along WHY the name identifies nothing: never created, one
@@ -353,7 +354,7 @@ async fn a_name_that_identifies_no_profile_is_refused_by_every_lookup() {
             ("DescribeAuthenticationProfiles", describe_one(&emulator, name).await),
             (
                 "ModifyAuthenticationProfile",
-                modify(&emulator, name, "{}").await,
+                modify(&emulator, name, r#"{"Who":"nobody"}"#).await,
             ),
             (
                 "DeleteAuthenticationProfile",
@@ -394,13 +395,14 @@ async fn a_modify_replaces_the_content_and_keeps_the_profile_where_it_was() {
     create(&emulator, "last", r#"{"Who":"last"}"#).await;
 
     // Rows differing along the shape of the replacement: fewer settings, more
-    // settings, a nested document, an array and an empty object.
+    // settings, a nested document, a value that is an array and one setting
+    // again.
     for (case, content) in [
         ("one setting", r#"{"Step":"1"}"#),
         ("several settings", r#"{"Step":"2","Extra":true,"Count":7}"#),
         ("a nested document", r#"{"Step":{"Phase":"3"}}"#),
-        ("an array at the top level", r#"["4"]"#),
-        ("an empty object", "{}"),
+        ("a setting whose value is an array", r#"{"Steps":["4"]}"#),
+        ("one setting again", r#"{"Step":"5"}"#),
     ] {
         let answer = modify(&emulator, "target", content).await;
         assert_eq!(
@@ -519,18 +521,19 @@ async fn a_delete_frees_the_name_and_leaves_every_other_record_where_it_was() {
     );
 }
 
-/// Content outside the documented JSON form is refused by the create and by the
-/// modify, and nothing is written: the create stores no profile and the modify
-/// leaves the content the profile already held.
+/// Content outside the documented profile-map form is refused by the create and
+/// by the modify, and nothing is written: the create stores no profile and the
+/// modify leaves the content the profile already held.
 #[tokio::test]
 async fn content_outside_the_documented_json_form_is_refused_with_nothing_written() {
     let emulator = Emulator::new();
     let kept = r#"{"Kept":"1"}"#;
     create(&emulator, "existing", kept).await;
 
-    // Rows differing along HOW the content fails to be one JSON document: not
-    // JSON at all, truncated, missing a value, empty, two documents, and
-    // single-quoted (which JSON does not admit).
+    // Rows differing along HOW the content fails to be one profile map: not
+    // JSON at all, truncated, missing a value, empty, two documents,
+    // single-quoted (which JSON does not admit), a document that is no map, and
+    // a map carrying no setting.
     for (case, content) in [
         ("plain text", "not json at all"),
         ("a truncated object", "{"),
@@ -538,6 +541,8 @@ async fn content_outside_the_documented_json_form_is_refused_with_nothing_writte
         ("an empty string", ""),
         ("two documents", "{} {}"),
         ("single-quoted text", "'quoted'"),
+        ("a JSON array rather than a map", r#"[{"Key":"a"}]"#),
+        ("a map carrying no setting", "{}"),
     ] {
         let created = create(&emulator, "rejected", content).await;
         assert_refused(
@@ -600,7 +605,7 @@ async fn a_name_outside_the_modelled_syntax_is_refused_before_anything_is_writte
         ("a space", "bad name".to_string()),
         ("a dot", "bad.name".to_string()),
     ] {
-        let answer = create(&emulator, &name, "{}").await;
+        let answer = create(&emulator, &name, r#"{"App_ID":"example"}"#).await;
         assert_refused(case, &answer, 400, "ValidationError");
         assert!(
             stored_names(&emulator).is_empty(),

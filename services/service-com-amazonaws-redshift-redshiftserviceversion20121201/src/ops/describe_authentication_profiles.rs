@@ -175,9 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         DescribeAuthenticationProfilesErrorModeled::AuthenticationProfileNotFoundFault(
                             AuthenticationProfileNotFoundFault {
-                                message: Some(st::authentication_profile_not_found_message(
-                                    requested,
-                                )),
+                                message: Some(
+                                    st::AUTHENTICATION_PROFILE_NOT_FOUND.to_string(),
+                                ),
                             },
                         )
                         .into(),

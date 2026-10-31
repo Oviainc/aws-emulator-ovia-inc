@@ -938,7 +938,7 @@ async fn deleting_an_identifier_that_names_no_configuration_is_refused() {
         // The fixed text of the fault as this service words a DELETE's
         // not-found refusal — the resource, then the identifier the REQUEST
         // carried, which is its only variable part (the same shape as
-        // `DeleteClusterParameterGroup`'s "Cluster parameter group not found:
+        // `DeleteClusterParameterGroup`'s "ParameterGroup not found:
         // <name>"). The READ of the same identifier words the same fault its
         // own way, so both are pinned here.
         let expected = format!("HSM configuration not found: {missing}");

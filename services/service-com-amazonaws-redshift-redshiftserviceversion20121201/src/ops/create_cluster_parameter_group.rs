@@ -239,7 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateClusterPara
             return Err(
                 CreateClusterParameterGroupErrorModeled::ClusterParameterGroupAlreadyExistsFault(
                     ClusterParameterGroupAlreadyExistsFault {
-                        message: Some(format!("Cluster parameter group already exists: {name}")),
+                        message: Some(st::cluster_parameter_group_already_exists_message(
+                            &input.parameter_group_name,
+                        )),
                     },
                 )
                 .into(),

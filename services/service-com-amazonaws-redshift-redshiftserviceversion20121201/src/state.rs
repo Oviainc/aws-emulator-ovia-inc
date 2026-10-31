@@ -709,6 +709,64 @@ pub fn minimum_engine_version() -> Option<String> {
 /// Redshift owns are outside it — the quota bounds what a caller can add.
 pub const PARAMETER_GROUP_QUOTA: usize = 1_000;
 
+/// Which sentence a `ClusterParameterGroupNotFoundFault` is worded with.
+///
+/// The same split as [`ClusterNotFoundWording`]: the fault's status (404) and
+/// awsQuery code (`ClusterParameterGroupNotFound`) are what the model fixes,
+/// while the fixed text around the `ParameterGroupName` the request named is an
+/// attribute of the OPERATION. Recorded refusals show the three sentences below
+/// in use, so naming each one here keeps the choice at the handler that makes
+/// it and no operation can quietly inherit another one's sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterParameterGroupNotFoundWording {
+    /// `ClusterParameterGroup not found: <ParameterGroupName>` — what the
+    /// operations that DEREFERENCE a group they do not own answer: the read of
+    /// a group's parameters (`DescribeClusterParameters`) and the cluster
+    /// operations configured from a group (`CreateCluster`,
+    /// `RestoreFromClusterSnapshot`).
+    ShapeNameThenName,
+    /// `ParameterGroup not found: <ParameterGroupName>` — what the operations
+    /// whose TARGET is the group itself answer
+    /// (`DeleteClusterParameterGroup`, and with it the two writes that change a
+    /// group's parameters, `ModifyClusterParameterGroup` and
+    /// `ResetClusterParameterGroup`).
+    ShortNameThenName,
+    /// `ClusterParameterGroup <ParameterGroupName> not found.` — what the
+    /// group LISTING, `DescribeClusterParameterGroups`, answers when its
+    /// `ParameterGroupName` filter names no group: the identifier is embedded
+    /// and the sentence ends in a period.
+    NameThenNotFound,
+}
+
+/// The `ClusterParameterGroupNotFoundFault` message `wording` words, naming the
+/// `ParameterGroupName` the request carried.
+pub fn cluster_parameter_group_not_found_message(
+    wording: ClusterParameterGroupNotFoundWording,
+    parameter_group_name: &str,
+) -> String {
+    match wording {
+        ClusterParameterGroupNotFoundWording::ShapeNameThenName => {
+            format!("ClusterParameterGroup not found: {parameter_group_name}")
+        }
+        ClusterParameterGroupNotFoundWording::ShortNameThenName => {
+            format!("ParameterGroup not found: {parameter_group_name}")
+        }
+        ClusterParameterGroupNotFoundWording::NameThenNotFound => {
+            format!("ClusterParameterGroup {parameter_group_name} not found.")
+        }
+    }
+}
+
+/// Why a create under a name the account already holds a parameter group under
+/// is refused, naming the `ParameterGroupName` the request carried.
+///
+/// The NAME is what an account's parameter groups are unique on, so the refusal
+/// names it and nothing is overwritten. The sentence carries no trailing
+/// punctuation.
+pub fn cluster_parameter_group_already_exists_message(parameter_group_name: &str) -> String {
+    format!("Parameter group {parameter_group_name} already exists")
+}
+
 /// The maintenance track a cluster joins when the request names none.
 ///
 /// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
@@ -2011,14 +2069,51 @@ pub const HSM_CONFIGURATION_QUOTA: usize = 10_000;
 /// `DeleteSnapshotCopyGrant`.
 pub const SNAPSHOT_COPY_GRANT_QUOTA: usize = 10_000;
 
-/// Why a request naming no snapshot copy grant is refused, naming the grant it
-/// could not find.
+/// Which sentence a `SnapshotCopyGrantNotFoundFault` is worded with.
 ///
-/// The wording Amazon Redshift answers a missing snapshot copy grant with, shared
-/// by every operation that looks one up so a client sees one message for one
-/// condition.
-pub fn snapshot_copy_grant_not_found_message(name: &str) -> String {
-    format!("Snapshot copy grant '{name}' not found.")
+/// The same split as [`ClusterNotFoundWording`]: the fault's status (400) and
+/// awsQuery code (`SnapshotCopyGrantNotFoundFault`) are what the model fixes,
+/// while the fixed text around the `SnapshotCopyGrantName` is an attribute of
+/// the OPERATION.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotCopyGrantNotFoundWording {
+    /// `Snapshot copy grant '<SnapshotCopyGrantName>' not found.` — what the
+    /// operations that DEREFERENCE a grant answer: the read
+    /// (`DescribeSnapshotCopyGrants`) and the cluster write configured from a
+    /// grant (`EnableSnapshotCopy`).
+    NameThenNotFound,
+    /// `Snapshot copy grant not found: '<SnapshotCopyGrantName>'.` — what the
+    /// operation whose TARGET is the grant itself, `DeleteSnapshotCopyGrant`,
+    /// answers.
+    NotFoundThenName,
+}
+
+/// The `SnapshotCopyGrantNotFoundFault` message `wording` words, naming the
+/// grant the request asked about.
+pub fn snapshot_copy_grant_not_found_message(
+    wording: SnapshotCopyGrantNotFoundWording,
+    name: &str,
+) -> String {
+    match wording {
+        SnapshotCopyGrantNotFoundWording::NameThenNotFound => {
+            format!("Snapshot copy grant '{name}' not found.")
+        }
+        SnapshotCopyGrantNotFoundWording::NotFoundThenName => {
+            format!("Snapshot copy grant not found: '{name}'.")
+        }
+    }
+}
+
+/// Why a create under a name the account already holds a snapshot copy grant
+/// under is refused, naming the grant the request asked for.
+///
+/// The NAME is what an account's grants are unique on, so the refusal names it —
+/// single-quoted, as this family words an identifier it reports back inside a
+/// sentence.
+pub fn snapshot_copy_grant_already_exists_message(name: &str) -> String {
+    format!(
+        "Cannot create the snapshot copy grant because a grant with the identifier '{name}' already exists."
+    )
 }
 
 /// How many event notification subscriptions the store holds before
@@ -2052,14 +2147,14 @@ pub const EVENT_SUBSCRIPTION_QUOTA: usize = 10_000;
 /// released by `DeleteAuthenticationProfile`.
 pub const AUTHENTICATION_PROFILE_QUOTA: usize = 10_000;
 
-/// Why a request naming no authentication profile is refused, naming the profile
-/// it could not find.
+/// Why a request naming no authentication profile is refused.
 ///
 /// Shared by every operation that looks one up — the read, the modify and the
-/// delete — so a client sees one message for one condition.
-pub fn authentication_profile_not_found_message(name: &str) -> String {
-    format!("Authentication profile not found: {name}")
-}
+/// delete — so a client sees one message for one condition. The sentence has NO
+/// variable part: it names neither the profile the request asked about nor
+/// anything else about the request, and tells the caller what to check instead.
+pub const AUTHENTICATION_PROFILE_NOT_FOUND: &str =
+    "The authentication profile does not exist. Check the name and try the operation again.";
 
 /// Why a create under a name the account already holds a profile under is
 /// refused, naming that profile.
@@ -2070,14 +2165,18 @@ pub fn authentication_profile_exists_message(name: &str) -> String {
     format!("Authentication profile already exists: {name}")
 }
 
-/// Why a request carrying authentication profile content this service cannot
-/// read is refused.
+/// Why a write carrying a profile map this service cannot read is refused: the
+/// document the request carried is not one profile map — a JSON object of
+/// settings — so there is nothing to store under the profile.
 ///
 /// Source: `smithy_query(query="doc", shape="CreateAuthenticationProfileMessage",
 /// member="AuthenticationProfileContent")` — "The content of the authentication
-/// profile in JSON format."
-pub const AUTHENTICATION_PROFILE_CONTENT_NOT_JSON: &str =
-    "The content of the authentication profile must be in JSON format.";
+/// profile in JSON format." The sentence has no variable part: it describes the
+/// FORM a profile map must carry and how to supply it, not the content the
+/// request sent.
+pub const AUTHENTICATION_PROFILE_MAP_NOT_JSON: &str = "The profile map file doesn't contain valid content in JSON format. \
+Edit the map file to add valid content in JSON format or specify another map file that contains valid content in JSON format. \
+You can include a path to the file. Instead of a file, you can specify a JSON string.";
 
 /// How long one authentication profile's content may be, in characters, before a
 /// write refuses it with the modelled
@@ -2102,8 +2201,8 @@ pub const MAX_AUTHENTICATION_PROFILE_CONTENT_LEN: usize = 8_000;
 /// hold content the other would have refused.
 #[derive(Debug)]
 pub enum AuthenticationProfileContentRefusal {
-    /// Content that is not one JSON document — the form the member is
-    /// documented to carry, so this is
+    /// Content that is not one profile map — a JSON object of settings, the
+    /// form the member is documented to carry — so this is
     /// `InvalidAuthenticationProfileRequestFault`.
     NotJson(String),
     /// Content longer than this service stores under one profile —
@@ -2116,9 +2215,13 @@ pub enum AuthenticationProfileContentRefusal {
 ///
 /// The content is kept and reported back VERBATIM, so a write can only check its
 /// SIZE and its FORM: it has to be at most
-/// [`MAX_AUTHENTICATION_PROFILE_CONTENT_LEN`] characters, and it has to parse as
-/// one JSON document. The size is checked FIRST, so a request cannot make the
-/// service parse more than it would ever store.
+/// [`MAX_AUTHENTICATION_PROFILE_CONTENT_LEN`] characters, and it has to be one
+/// profile map CARRYING CONTENT — a JSON object with at least one setting in
+/// it. That is what the member is documented to hold, and what the service's own
+/// refusal asks a caller to supply: text that is no JSON document, a document
+/// that is not an object, and an object with nothing in it all leave the profile
+/// with no settings to apply. The size is checked FIRST, so a request cannot
+/// make the service parse more than it would ever store.
 pub fn check_authentication_profile_content(
     content: &str,
 ) -> Result<(), AuthenticationProfileContentRefusal> {
@@ -2128,9 +2231,16 @@ pub fn check_authentication_profile_content(
             "The content of the authentication profile is {length} characters long, which exceeds the maximum of {MAX_AUTHENTICATION_PROFILE_CONTENT_LEN} characters."
         )));
     }
-    if serde_json::from_str::<serde_json::Value>(content).is_err() {
+    let carries_settings = serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|document| match document {
+            serde_json::Value::Object(settings) => Some(settings),
+            _ => None,
+        })
+        .is_some_and(|settings| !settings.is_empty());
+    if !carries_settings {
         return Err(AuthenticationProfileContentRefusal::NotJson(
-            AUTHENTICATION_PROFILE_CONTENT_NOT_JSON.to_string(),
+            AUTHENTICATION_PROFILE_MAP_NOT_JSON.to_string(),
         ));
     }
     Ok(())
@@ -7897,10 +8007,41 @@ pub fn hsm_client_certificate_public_key(identifier: &str) -> String {
     format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n")
 }
 
-/// What every operation on an HSM client certificate answers when the
-/// identifier it resolves names none.
-pub fn hsm_client_certificate_not_found_message(identifier: &str) -> String {
-    format!("HsmClientCertificate not found: {identifier}")
+/// Which sentence an `HsmClientCertificateNotFoundFault` is worded with.
+///
+/// The same split as [`ClusterNotFoundWording`], and the same one the sibling
+/// HSM configuration family answers with: the fault's status (400) and awsQuery
+/// code (`HsmClientCertificateNotFoundFault`) are what the model fixes, while
+/// the fixed text around the `HsmClientCertificateIdentifier` is an attribute of
+/// the OPERATION. The resource is named as a reader would write it ("HSM client
+/// certificate"), not by its shape name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HsmClientCertificateNotFoundWording {
+    /// `HSM client certificate not found: <HsmClientCertificateIdentifier>` —
+    /// what the operation whose TARGET is the certificate itself,
+    /// `DeleteHsmClientCertificate`, answers.
+    NotFoundThenIdentifier,
+    /// `HSM client certificate '<HsmClientCertificateIdentifier>' not found.` —
+    /// what the READ, `DescribeHsmClientCertificates`, answers when its
+    /// identifier names no certificate: embedded, single-quoted and ending in a
+    /// period.
+    IdentifierThenNotFound,
+}
+
+/// The `HsmClientCertificateNotFoundFault` message `wording` words, naming the
+/// identifier the request carried.
+pub fn hsm_client_certificate_not_found_message(
+    wording: HsmClientCertificateNotFoundWording,
+    identifier: &str,
+) -> String {
+    match wording {
+        HsmClientCertificateNotFoundWording::NotFoundThenIdentifier => {
+            format!("HSM client certificate not found: {identifier}")
+        }
+        HsmClientCertificateNotFoundWording::IdentifierThenNotFound => {
+            format!("HSM client certificate '{identifier}' not found.")
+        }
+    }
 }
 
 /// How many zero-ETL integrations the store holds before `CreateIntegration`
