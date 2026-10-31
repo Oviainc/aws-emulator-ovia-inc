@@ -47,6 +47,8 @@ mod harness_lifecycle;
 mod harness_version_listing;
 #[path = "all/memory_lifecycle.rs"]
 mod memory_lifecycle;
+#[path = "all/memory_mutation.rs"]
+mod memory_mutation;
 #[path = "all/registry_lifecycle.rs"]
 mod registry_lifecycle;
 #[path = "all/service_claim.rs"]

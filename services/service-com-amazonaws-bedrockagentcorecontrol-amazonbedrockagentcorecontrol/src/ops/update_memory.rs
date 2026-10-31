@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMemory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMemory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMemory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a partial update to the AgentCore Memory `CreateMemory` persisted in
+//! [`crate::state`]: every member the request carries replaces the stored one,
+//! every member it omits keeps the stored one, `addIndexedKeys` is MERGED into
+//! the keys already indexed while `namespaceKeys` REPLACES the stored set, and
+//! the requested strategies are added, modified and removed. The memory then
+//! carries the `UPDATING` -> `ACTIVE` transition the clock owes it, and every
+//! later read of the memory comes from that same record.
 //!
 //! ## Shape of an operation
 //!
@@ -98,6 +97,286 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `fieldList` member name a refused `namespaceKeys` replacement is reported
+/// under.
+const NAMESPACE_KEYS_MEMBER: &str = "namespaceKeys";
+
+/// The `fieldList` member name a refused `addIndexedKeys` merge is reported
+/// under.
+const ADD_INDEXED_KEYS_MEMBER: &str = "addIndexedKeys";
+
+/// The `fieldList` member name a modified strategy's record expiry is reported
+/// under: the path to it through the request, so a caller sees which member of
+/// the nested union failed.
+const MODIFY_RECORD_EXPIRY_DAYS_MEMBER: &str =
+    "memoryStrategies.modifyMemoryStrategies.recordExpirySpecification.recordExpiryDurationDays";
+
+/// The most metadata keys one memory indexes: `IndexedKeysList` is
+/// `length 1..10` on both this request's `addIndexedKeys` and the `indexedKeys`
+/// `Memory` reports (`smithy_query shape=IndexedKeysList`), so a merge past ten
+/// could not be rendered back either.
+const MAX_INDEXED_KEYS: usize = 10;
+
+/// The keys a memory indexes after this request, which may only GROW:
+/// "Additional metadata keys to index. Previously indexed keys cannot be
+/// removed." A key already indexed keeps the type it was declared with — that
+/// declaration cannot be removed, so it is not re-declared either — and only a
+/// key the memory does not index yet is appended.
+fn merged_indexed_keys(
+    stored: Option<Vec<IndexedKey>>,
+    added: Option<Vec<IndexedKey>>,
+) -> Result<Option<Vec<IndexedKey>>, ValidationException> {
+    let Some(added) = added else {
+        return Ok(stored);
+    };
+    let mut merged = stored.unwrap_or_default();
+    for one in added {
+        if merged.iter().any(|indexed| indexed.key == one.key) {
+            continue;
+        }
+        merged.push(one);
+    }
+    if merged.len() > MAX_INDEXED_KEYS {
+        return Err(crate::state::field_validation_failed(
+            ADD_INDEXED_KEYS_MEMBER,
+            &format!(
+                "a memory indexes at most {MAX_INDEXED_KEYS} metadata keys, and this request \
+                 would index {}",
+                merged.len()
+            ),
+        ));
+    }
+    Ok(Some(merged))
+}
+
+/// `MemoryStrategy.recordExpiryDurationDays` for a strategy being MODIFIED.
+///
+/// Unlike the create path, `action` applies here: the model says "Set to REMOVE
+/// to remove a previously configured time-to-live so that newer records no
+/// longer expire", so the stored duration is cleared. A duration shorter than
+/// [`crate::state::MIN_RECORD_EXPIRY_DURATION_DAYS`] is refused, and an absent
+/// specification leaves the stored one alone.
+fn modified_record_expiry_duration_days(
+    stored: Option<i32>,
+    requested: Option<RecordExpirySpecification>,
+) -> Result<Option<i32>, ValidationException> {
+    match requested {
+        None => Ok(stored),
+        Some(RecordExpirySpecification::recordExpiryDurationDays(days)) => {
+            if days < crate::state::MIN_RECORD_EXPIRY_DURATION_DAYS {
+                return Err(crate::state::field_validation_failed(
+                    MODIFY_RECORD_EXPIRY_DAYS_MEMBER,
+                    &format!(
+                        "must be at least {} days, got {days}",
+                        crate::state::MIN_RECORD_EXPIRY_DURATION_DAYS
+                    ),
+                ));
+            }
+            Ok(Some(days))
+        }
+        Some(RecordExpirySpecification::Action(_)) => Ok(None),
+    }
+}
+
+/// A requested `ModifyExtractionConfiguration` as the `ExtractionConfiguration`
+/// a stored strategy reports, one override per member of the union the request
+/// carried.
+fn extraction_configuration(requested: ModifyExtractionConfiguration) -> ExtractionConfiguration {
+    let ModifyExtractionConfiguration::customExtractionConfiguration(custom) = requested;
+    ExtractionConfiguration::customExtractionConfiguration(match custom {
+        CustomExtractionConfigurationInput::semanticExtractionOverride(override_input) => {
+            CustomExtractionConfiguration::semanticExtractionOverride(SemanticExtractionOverride {
+                append_to_prompt: override_input.append_to_prompt,
+                model_id: override_input.model_id,
+            })
+        }
+        CustomExtractionConfigurationInput::userPreferenceExtractionOverride(override_input) => {
+            CustomExtractionConfiguration::userPreferenceExtractionOverride(
+                UserPreferenceExtractionOverride {
+                    append_to_prompt: override_input.append_to_prompt,
+                    model_id: override_input.model_id,
+                },
+            )
+        }
+        CustomExtractionConfigurationInput::episodicExtractionOverride(override_input) => {
+            CustomExtractionConfiguration::episodicExtractionOverride(EpisodicExtractionOverride {
+                append_to_prompt: override_input.append_to_prompt,
+                model_id: override_input.model_id,
+            })
+        }
+    })
+}
+
+/// A requested `ModifyConsolidationConfiguration` as the
+/// `ConsolidationConfiguration` a stored strategy reports.
+fn consolidation_configuration(
+    requested: ModifyConsolidationConfiguration,
+) -> ConsolidationConfiguration {
+    let ModifyConsolidationConfiguration::customConsolidationConfiguration(custom) = requested;
+    ConsolidationConfiguration::customConsolidationConfiguration(match custom {
+        CustomConsolidationConfigurationInput::semanticConsolidationOverride(override_input) => {
+            CustomConsolidationConfiguration::semanticConsolidationOverride(
+                SemanticConsolidationOverride {
+                    append_to_prompt: override_input.append_to_prompt,
+                    model_id: override_input.model_id,
+                },
+            )
+        }
+        CustomConsolidationConfigurationInput::summaryConsolidationOverride(override_input) => {
+            CustomConsolidationConfiguration::summaryConsolidationOverride(
+                SummaryConsolidationOverride {
+                    append_to_prompt: override_input.append_to_prompt,
+                    model_id: override_input.model_id,
+                },
+            )
+        }
+        CustomConsolidationConfigurationInput::userPreferenceConsolidationOverride(
+            override_input,
+        ) => CustomConsolidationConfiguration::userPreferenceConsolidationOverride(
+            UserPreferenceConsolidationOverride {
+                append_to_prompt: override_input.append_to_prompt,
+                model_id: override_input.model_id,
+            },
+        ),
+        CustomConsolidationConfigurationInput::episodicConsolidationOverride(override_input) => {
+            CustomConsolidationConfiguration::episodicConsolidationOverride(
+                EpisodicConsolidationOverride {
+                    append_to_prompt: override_input.append_to_prompt,
+                    model_id: override_input.model_id,
+                },
+            )
+        }
+    })
+}
+
+/// A requested `ModifyReflectionConfiguration` as the `ReflectionConfiguration`
+/// a stored strategy reports.
+fn reflection_configuration(requested: ModifyReflectionConfiguration) -> ReflectionConfiguration {
+    match requested {
+        ModifyReflectionConfiguration::episodicReflectionConfiguration(reflection) => {
+            ReflectionConfiguration::episodicReflectionConfiguration(
+                EpisodicReflectionConfiguration {
+                    namespaces: reflection.namespaces,
+                    namespace_templates: reflection.namespace_templates,
+                    memory_record_schema: reflection.memory_record_schema,
+                },
+            )
+        }
+        ModifyReflectionConfiguration::customReflectionConfiguration(custom) => {
+            let CustomReflectionConfigurationInput::episodicReflectionOverride(override_input) =
+                custom;
+            ReflectionConfiguration::customReflectionConfiguration(
+                CustomReflectionConfiguration::episodicReflectionOverride(
+                    EpisodicReflectionOverride {
+                        append_to_prompt: override_input.append_to_prompt,
+                        model_id: override_input.model_id,
+                        namespaces: override_input.namespaces,
+                        namespace_templates: override_input.namespace_templates,
+                        memory_record_schema: override_input.memory_record_schema,
+                    },
+                ),
+            )
+        }
+    }
+}
+
+/// The self-managed configuration a strategy carries after the request: every
+/// member `ModifySelfManagedConfiguration` supplies replaces the stored one, and
+/// every member it omits keeps the stored one.
+fn self_managed_configuration(
+    stored: Option<SelfManagedConfiguration>,
+    requested: ModifySelfManagedConfiguration,
+) -> SelfManagedConfiguration {
+    let mut configuration = stored.unwrap_or_default();
+    if let Some(triggers) = requested.trigger_conditions {
+        configuration.trigger_conditions = triggers
+            .into_iter()
+            .map(crate::state::trigger_condition)
+            .collect();
+    }
+    if let Some(invocation) = requested.invocation_configuration {
+        if let Some(topic_arn) = invocation.topic_arn {
+            configuration.invocation_configuration.topic_arn = topic_arn;
+        }
+        if let Some(bucket) = invocation.payload_delivery_bucket_name {
+            configuration
+                .invocation_configuration
+                .payload_delivery_bucket_name = bucket;
+        }
+    }
+    if let Some(window) = requested.historical_context_window_size {
+        configuration.historical_context_window_size = window;
+    }
+    configuration
+}
+
+/// The configuration a strategy carries after the request: each of the four
+/// members `ModifyStrategyConfiguration` carries replaces the stored one, and
+/// `type` is left as stored — the shape carries no `type`, so the override a
+/// custom strategy was created with still names what it overrides.
+fn modified_strategy_configuration(
+    stored: Option<StrategyConfiguration>,
+    requested: ModifyStrategyConfiguration,
+) -> StrategyConfiguration {
+    let mut configuration = stored.unwrap_or_default();
+    if let Some(extraction) = requested.extraction {
+        configuration.extraction = Some(extraction_configuration(extraction));
+    }
+    if let Some(consolidation) = requested.consolidation {
+        configuration.consolidation = Some(consolidation_configuration(consolidation));
+    }
+    if let Some(reflection) = requested.reflection {
+        configuration.reflection = Some(reflection_configuration(reflection));
+    }
+    if let Some(self_managed) = requested.self_managed_configuration {
+        configuration.self_managed_configuration = Some(self_managed_configuration(
+            configuration.self_managed_configuration.take(),
+            self_managed,
+        ));
+    }
+    configuration
+}
+
+/// Apply one `ModifyMemoryStrategyInput` to the strategy it names: every member
+/// the request carries replaces the stored one, every member it omits keeps the
+/// stored one, and the namespace list is replaced under BOTH names the shape
+/// reports it under (`namespaceTemplates` wins when the request carries both, as
+/// on the create path).
+fn apply_strategy_modification(
+    strategy: &mut MemoryStrategy,
+    requested: ModifyMemoryStrategyInput,
+    now: ::std::time::SystemTime,
+) -> Result<(), ValidationException> {
+    strategy.record_expiry_duration_days = modified_record_expiry_duration_days(
+        strategy.record_expiry_duration_days,
+        requested.record_expiry_specification,
+    )?;
+    if requested.description.is_some() {
+        strategy.description = requested.description;
+    }
+    for namespaces in [requested.namespace_templates, requested.namespaces]
+        .into_iter()
+        .flatten()
+    {
+        if !namespaces.is_empty() {
+            strategy.namespaces = namespaces.clone();
+            strategy.namespace_templates = namespaces;
+            break;
+        }
+    }
+    if let Some(configuration) = requested.configuration {
+        strategy.configuration = Some(modified_strategy_configuration(
+            strategy.configuration.take(),
+            configuration,
+        ));
+    }
+    if requested.memory_record_schema.is_some() {
+        strategy.memory_record_schema = requested.memory_record_schema;
+    }
+    strategy.updated_at = Some(crate::state::timestamp(now));
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -136,6 +415,23 @@ impl From<UpdateMemoryErrorModeled> for UpdateMemoryError {
     }
 }
 
+/// The modelled validation refusal, lifted into this operation's error channel.
+fn invalid(invalid: ValidationException) -> UpdateMemoryError {
+    UpdateMemoryErrorModeled::ValidationException(invalid).into()
+}
+
+/// The modelled not-found refusal for a memory strategy this memory does not
+/// hold: a `memoryStrategyId` the request names is a resource reference, so an
+/// unknown one is reported in the one sentence this service gives a missing
+/// resource.
+fn no_such_strategy(action: &str) -> UpdateMemoryError {
+    UpdateMemoryErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        action,
+        "memory strategy",
+    ))
+    .into()
+}
+
 /// The `UpdateMemory` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -172,18 +468,238 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMemory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMemoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMemory"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateMemoryErrorModeled::ServiceException(ServiceException {
+                message: Some("the memory store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let requested = input.memory_strategies.unwrap_or_default();
+        let to_modify = requested.modify_memory_strategies.unwrap_or_default();
+        let to_delete = requested.delete_memory_strategies.unwrap_or_default();
+
+        // Neither `ModifyMemoryStrategiesList` nor `DeleteMemoryStrategiesList`
+        // carries a `length` constraint, so the boundary walk bounds neither:
+        // a list naming more strategies than one memory can hold is refused
+        // here, before the guard below, so the per-request scan each entry
+        // implies is bounded by that ceiling and none of it runs while this
+        // service's one store is locked.
+        for (member, named) in [
+            ("memoryStrategies.modifyMemoryStrategies", to_modify.len()),
+            ("memoryStrategies.deleteMemoryStrategies", to_delete.len()),
+        ] {
+            if named > crate::state::MAX_STRATEGIES_PER_MEMORY {
+                return Err(UpdateMemoryErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "a memory holds at most {} strategies, and this request named {named} \
+                             under {member}",
+                            crate::state::MAX_STRATEGIES_PER_MEMORY
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The strategies this request ADDS go through the same walk the create
+        // path runs, so the two cannot report one requested strategy
+        // differently. Done before the guard below, so none of the caller-sized
+        // work a strategy list implies runs while this service's one store is
+        // locked.
+        let prepared =
+            crate::state::prepared_strategies(requested.add_memory_strategies).map_err(
+                |refusal| match refusal {
+                    crate::state::StrategyRefusal::Validation(why) => invalid(why),
+                    crate::state::StrategyRefusal::QuotaExceeded(exceeded) => {
+                        UpdateMemoryErrorModeled::ServiceQuotaExceededException(exceeded).into()
+                    }
+                },
+            )?;
+
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the
+        // memory the first one produced instead of applying the change twice:
+        // the token "is used for keeping track of idempotent requests".
+        if let Some(memory_id) =
+            store.replayed_memory_result(Self::NAME, input.client_token.as_deref())
+        {
+            // `replayed_memory_result` answers only for a memory the store still
+            // holds, so this lookup cannot miss.
+            if let Some(record) = store.memories.get(&memory_id) {
+                return Ok(UpdateMemoryOutput {
+                    memory: Some(record.memory(now)),
+                });
+            }
+        }
+
+        // Updated on a COPY of the record, which is put back only once every
+        // part of the request is accepted: a refused update leaves the stored
+        // memory exactly as it was.
+        let mut record = store
+            .memories
+            .get(&input.memory_id)
+            .cloned()
+            .ok_or_else(|| {
+                UpdateMemoryErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(crate::state::ACTION_RETRIEVE, "memory"),
+                )
+            })?;
+
+        // A memory still being created cannot be updated: its configuration is
+        // not in place yet, so the request conflicts with the operation already
+        // running on it.
+        let status = record.status_at(now).to_string();
+        if status == crate::state::MEMORY_STATUS_CREATING {
+            return Err(UpdateMemoryErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Cannot perform operation {} when memory is in {status} status",
+                    Self::NAME
+                )),
+            })
+            .into());
+        }
+
+        // A strategy a previous update removed is gone once its own removal
+        // deadline has passed, so this request addresses only what the memory
+        // still holds — and the record stops carrying the rest.
+        record.prune_settled_strategy_deletions(now);
+
+        let mut deleting = record.deleting_strategy_ids.clone();
+        let held = |record: &crate::state::MemoryRecord, strategy_id: &str| {
+            record
+                .strategies
+                .iter()
+                .any(|strategy| strategy.strategy_id == strategy_id)
+        };
+
+        for one in to_delete {
+            if !held(&record, &one.memory_strategy_id)
+                || deleting.contains_key(&one.memory_strategy_id)
+            {
+                return Err(no_such_strategy(crate::state::ACTION_DELETE));
+            }
+            // Each removal gets its OWN deadline, so a later update of this
+            // memory cannot defer it by re-arming the record's transition.
+            deleting.insert(
+                one.memory_strategy_id,
+                now + crate::state::MEMORY_SETTLE_DELAY,
+            );
+        }
+
+        for one in to_modify {
+            if deleting.contains_key(&one.memory_strategy_id) {
+                return Err(no_such_strategy(crate::state::ACTION_UPDATE));
+            }
+            let strategy = record
+                .strategies
+                .iter_mut()
+                .find(|strategy| strategy.strategy_id == one.memory_strategy_id)
+                .ok_or_else(|| no_such_strategy(crate::state::ACTION_UPDATE))?;
+            apply_strategy_modification(strategy, one, now).map_err(invalid)?;
+        }
+
+        // What the record would RETAIN is bounded by the same ceiling the create
+        // path applies — the strategies being removed are counted until their own
+        // deadline drops them, so a delete-and-add cycle cannot grow the record
+        // past it however often it is repeated.
+        let retained = record.strategies.len() + prepared.len();
+        if retained > crate::state::MAX_STRATEGIES_PER_MEMORY {
+            return Err(UpdateMemoryErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "a memory holds at most {} strategies, and this request would leave it \
+                         holding {retained}",
+                        crate::state::MAX_STRATEGIES_PER_MEMORY
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Each added strategy gets its own `strategyId`, minted against every id
+        // this memory already carries so no two of them collide. The list is
+        // capped above, so this is the only caller-sized work under the guard
+        // and it is bounded.
+        let mut minted_ids: ::std::collections::BTreeSet<String> = record
+            .strategies
+            .iter()
+            .map(|strategy| strategy.strategy_id.clone())
+            .collect();
+        let mut created_ids: ::std::collections::BTreeSet<String> =
+            ::std::collections::BTreeSet::new();
+        for one in prepared {
+            let strategy_id = store.mint_memory_strategy_id(&one.name, now, &minted_ids);
+            minted_ids.insert(strategy_id.clone());
+            created_ids.insert(strategy_id.clone());
+            record
+                .strategies
+                .push(crate::state::memory_strategy(one, strategy_id, now));
+        }
+
+        // Every member the request carries replaces the stored one; every member
+        // it omits keeps the stored one.
+        if input.description.is_some() {
+            record.description = input.description;
+        }
+        if let Some(event_expiry_duration) = input.event_expiry_duration {
+            record.event_expiry_duration = event_expiry_duration;
+        }
+        if input.memory_execution_role_arn.is_some() {
+            record.memory_execution_role_arn = input.memory_execution_role_arn;
+        }
+        if input.stream_delivery_resources.is_some() {
+            record.stream_delivery_resources = input.stream_delivery_resources;
+        }
+
+        // "Additional metadata keys to index. Previously indexed keys cannot be
+        // removed" — the indexed keys MERGE.
+        record.indexed_keys =
+            merged_indexed_keys(record.indexed_keys.take(), input.add_indexed_keys)
+                .map_err(invalid)?;
+
+        record.deleting_strategy_ids = deleting;
+
+        // "This value fully replaces the existing set — any key you omit is
+        // removed. Any referenced namespaceKey omission will throw
+        // ValidationException" — the namespace keys REPLACE, and a replacement
+        // that drops a variable a strategy's namespace template still resolves
+        // through is refused.
+        if let Some(namespace_keys) = input.namespace_keys {
+            for (variable, strategy_id) in record.referenced_namespace_variables() {
+                if namespace_keys.iter().any(|entry| entry.key == variable) {
+                    continue;
+                }
+                return Err(invalid(crate::state::field_validation_failed(
+                    NAMESPACE_KEYS_MEMBER,
+                    &format!(
+                        "the namespace variable {variable} is referenced by a namespaceTemplate \
+                         of memory strategy {strategy_id} and cannot be omitted"
+                    ),
+                )));
+            }
+            record.namespace_keys = Some(namespace_keys);
+        }
+
+        // An updated memory is not active again until the clock says so, and the
+        // strategies this request minted are `CREATING` (and the ones it removed
+        // `DELETING`) for exactly as long.
+        record.updated_at = now;
+        record.transient_status = crate::state::MEMORY_STATUS_UPDATING.to_string();
+        record.settled_status = crate::state::MEMORY_STATUS_ACTIVE.to_string();
+        record.settles_at = now + crate::state::MEMORY_SETTLE_DELAY;
+        record.creating_strategy_ids = created_ids;
+
+        let output = UpdateMemoryOutput {
+            memory: Some(record.memory(now)),
+        };
+
+        store.remember_memory_client_token(Self::NAME, input.client_token, &record.id);
+        store.memories.insert(record.id.clone(), record);
+
+        Ok(output)
     }
 }
