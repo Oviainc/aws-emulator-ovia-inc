@@ -654,10 +654,10 @@ pub fn blank_member_problem(member: &str, value: Option<&str>) -> Option<String>
 /// resource the request addressed: one sentence for a reference that resolves to nothing,
 /// whichever modelled error carries it.
 ///
-/// Its scope is a reference a NAMED member carries. The three doors that address their
-/// resource by ARN state the value instead, through
-/// [`resource_not_found_message`] — one sentence there too, and the only other wording
-/// this crate gives a resource that is not there.
+/// Its scope is EVERY reference this service resolves, whatever the member carries: a
+/// name, an id, or the ARN the tagging and certificate doors address their resource by
+/// (`arn`), whose refusal names that member too rather than the ARN the caller sent. One
+/// sentence for the whole crate, so no door can word a missing resource its own way.
 pub fn not_found_message(member: &str) -> String {
     format!("The resource you specified in {member} was not found.")
 }
@@ -1671,34 +1671,19 @@ pub trait TagWriteRefusalError: Sized {
     fn forbidden(message: String) -> Self;
 
     /// The modelled error a door answers `refusal` with, stated ONCE for every door: an
-    /// ARN naming nothing this store holds is [`resource_not_found_message`] on the
+    /// ARN naming nothing this store holds is the crate's one [`not_found_message`] on the
     /// operation's `NotFoundException`, and an ARN naming a built-in resource is the
     /// modification refusal [`system_resource_modify_message`] words on its
-    /// `ForbiddenException`. `member` is the request member the ARN arrived in, named in
-    /// the refusal the way every other member-naming refusal here names it, and `arn` the
-    /// value it carried.
-    fn of_tag_write_refusal(refusal: TagWriteRefusal, member: &str, arn: &str) -> Self {
+    /// `ForbiddenException`. `member` is the request member the ARN arrived in, which both
+    /// sentences name the way every other member-naming refusal here names it.
+    fn of_tag_write_refusal(refusal: TagWriteRefusal, member: &str) -> Self {
         match refusal {
-            TagWriteRefusal::NotFound => Self::not_found(resource_not_found_message(arn)),
+            TagWriteRefusal::NotFound => Self::not_found(not_found_message(member)),
             TagWriteRefusal::SystemResource => {
                 Self::forbidden(system_resource_modify_message(member))
             }
         }
     }
-}
-
-/// How the tagging doors word an `Arn` that names no resource this store holds, built from
-/// the value the request carried: one sentence for all three of them, so a client cannot
-/// tell the same missing resource apart by which door it asked.
-///
-/// These three doors address their resource by ARN rather than by a name the request
-/// member carries, so the sentence states the value that resolved to nothing; the doors
-/// that resolve a reference out of a NAMED member word theirs with
-/// [`not_found_message`], which names that member instead. Two wordings because the two
-/// kinds of request say what is missing differently, not because any door is free to
-/// choose.
-pub fn resource_not_found_message(arn: &str) -> String {
-    format!("Resource {arn} not found.")
 }
 
 /// How this service words the refusal of a tag whose key carries no characters.
@@ -1846,6 +1831,18 @@ pub fn parse_resource_arn(arn: &str) -> Option<TaggedResource> {
     }
 }
 
+/// How this service words the refusal of an `Arn` that is not a MediaConvert resource ARN
+/// ([`parse_resource_arn`] reads none from it).
+///
+/// One sentence for every door that resolves such an ARN, exactly as
+/// [`certificate_arn_message`] is the one sentence of the certificate pair, so the three
+/// tagging doors cannot drift from each other. It names the member, the value the request
+/// carried, and the resource kinds the operation accepts — the four `TagResource`
+/// documents as taggable, which are the kinds [`parse_resource_arn`] reads.
+pub fn resource_arn_message(arn: &str) -> String {
+    format!("Arn {arn} is not the ARN of a MediaConvert queue, preset, job or job template.")
+}
+
 /// Whether a value is the ARN of an ACM certificate.
 ///
 /// True for `arn:<partition>:acm:<region>:<account>:certificate/<id>` with a non-empty
@@ -1874,8 +1871,8 @@ pub fn is_acm_certificate_arn(arn: &str) -> bool {
 /// How this service words the refusal of an `Arn` that is not an ACM certificate ARN.
 ///
 /// Built from the value the request carried, as [`not_found_message`] is built from the
-/// member it arrived in, and worded like the ARN refusal `TagResource` already answers: it
-/// names the member, the value, and the kind of ARN the operation accepts.
+/// member it arrived in, and worded like [`resource_arn_message`], the refusal the tagging
+/// doors answer: it names the member, the value, and the kind of ARN the operation accepts.
 pub fn certificate_arn_message(arn: &str) -> String {
     format!("Arn {arn} is not the ARN of an ACM certificate.")
 }

@@ -182,14 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // A value that is not a MediaConvert resource ARN is a problem in the request,
-        // not a resource that is missing.
+        // not a resource that is missing. One sentence for all three tagging doors, worded
+        // where the ARN is parsed.
         let Some(resource) = crate::state::parse_resource_arn(&input.arn) else {
             return Err(UntagResourceErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "Arn {} is not the ARN of a MediaConvert queue, preset, job or job \
-                     template.",
-                    input.arn
-                )),
+                message: Some(crate::state::resource_arn_message(&input.arn)),
             })
             .into());
         };
@@ -205,10 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags = match state.tags_for_write(&resource) {
             Ok(tags) => tags,
             Err(refusal) => {
-                return Err(
-                    UntagResourceErrorModeled::of_tag_write_refusal(refusal, "arn", &input.arn)
-                        .into(),
-                );
+                return Err(UntagResourceErrorModeled::of_tag_write_refusal(refusal, "arn").into());
             }
         };
         for key in input.tag_keys.unwrap_or_default() {

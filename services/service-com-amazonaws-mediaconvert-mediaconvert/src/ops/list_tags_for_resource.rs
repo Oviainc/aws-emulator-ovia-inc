@@ -172,15 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // A value that is not a MediaConvert resource ARN is a problem in the request,
-        // not a resource that is missing.
+        // not a resource that is missing. One sentence for all three tagging doors, worded
+        // where the ARN is parsed.
         let Some(resource) = crate::state::parse_resource_arn(&input.arn) else {
             return Err(ListTagsForResourceErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(format!(
-                        "Arn {} is not the ARN of a MediaConvert queue, preset, job or job \
-                         template.",
-                        input.arn
-                    )),
+                    message: Some(crate::state::resource_arn_message(&input.arn)),
                 },
             )
             .into());
@@ -192,10 +189,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handler takes the store to read it and writes nothing at all.
         let state = state.lock();
 
+        // A resource the store does not hold is refused with the crate's ONE sentence for
+        // a reference that resolves to nothing, naming the request member the reference
+        // arrived in — `arn` here, as every other door names the member it read.
         let Some(tags) = state.tags(&resource) else {
             return Err(ListTagsForResourceErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::resource_not_found_message(&input.arn)),
+                    message: Some(crate::state::not_found_message("arn")),
                 },
             )
             .into());

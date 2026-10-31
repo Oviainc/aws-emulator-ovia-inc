@@ -129,6 +129,8 @@ mod resource_share;
 mod resource_tagging;
 #[path = "all/shared_next_token_refusal.rs"]
 mod shared_next_token_refusal;
+#[path = "all/shared_not_found_refusal.rs"]
+mod shared_not_found_refusal;
 #[path = "all/shared_paging.rs"]
 mod shared_paging;
 #[path = "all/shared_set_selection.rs"]
