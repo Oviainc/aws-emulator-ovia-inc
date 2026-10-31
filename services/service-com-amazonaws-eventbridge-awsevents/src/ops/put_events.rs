@@ -2537,10 +2537,10 @@ async fn dead_letter(
 /// Count what came of ONE handover on the rule's own invocation metrics.
 ///
 /// WHICH metric follows from the outcome: a target whose API call accepted the
-/// event is counted on `Invocations`, and one whose invocation was permanently
-/// refused on `FailedInvocations`. A handover that was NOT ATTEMPTED is counted
-/// on neither — nothing was invoked, and a gap in this emulator is not a failure
-/// AWS reports.
+/// event is counted on `Invocations` and on `SuccessfulInvocationAttempts`, and
+/// one whose invocation was permanently refused on `FailedInvocations`. A
+/// handover that was NOT ATTEMPTED is counted on neither — nothing was invoked,
+/// and a gap in this emulator is not a failure AWS reports.
 ///
 /// The decision is EventBridge's; where the metric LIVES and how it is appended
 /// is CloudWatch's, so the write itself is [`crate::state::count_invocation`] /

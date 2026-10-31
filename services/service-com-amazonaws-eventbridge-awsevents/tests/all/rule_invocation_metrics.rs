@@ -2,19 +2,20 @@
 
 //! What came of every target handover is counted on the MATCHED RULE's own
 //! AWS/Events invocation metrics, dimensioned by the bus the rule is on and the
-//! rule's name.
+//! rule's name, and by the rule's name on its own.
 //!
 //! The RULE asserted here: for each target of a rule whose `EventPattern`
 //! matched a published event, EventBridge publishes exactly one AWS/Events
-//! datapoint of value 1 for that delivery, dimensioned by BOTH the event bus and
-//! the rule name — `Invocations` when the target's API call was made, and
-//! `FailedInvocations` when the invocation was permanently refused (the same
-//! refusal that sends the event to the target's dead-letter queue) — and
-//! attributes it to that one rule, so a sibling rule on the same bus, matched by
-//! the same event, is counted only for its own deliveries. The dimension set is
-//! the rule's whole identity because a rule's name alone does not name a rule
-//! ("CloudWatch treats each unique combination of dimensions as a separate
-//! metric", `GetMetricStatistics$Dimensions`).
+//! datapoint of value 1 for that delivery — `Invocations` AND
+//! `SuccessfulInvocationAttempts` when the target's API call was made and
+//! accepted, and `FailedInvocations` when the invocation was permanently refused
+//! (the same refusal that sends the event to the target's dead-letter queue) —
+//! and attributes it to that one rule, so a sibling rule on the same bus, matched
+//! by the same event, is counted only for its own deliveries. A handover counter
+//! is published under the rule's whole identity, because a rule's name alone does
+//! not name a rule ("CloudWatch treats each unique combination of dimensions as a
+//! separate metric", `GetMetricStatistics$Dimensions`), and under the rule name
+//! alone beside it.
 //!
 //! The table spans the class rather than the one recorded case: its rows differ
 //! along the BUS the rules live on (a custom bus and the default one), along HOW
@@ -30,13 +31,14 @@
 use serde_json::json;
 use service_com_amazonaws_eventbridge_awsevents::state::{
     DEFAULT_EVENT_BUS_NAME, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC, MATCHED_EVENTS_METRIC,
-    NO_PERMISSIONS, SERVICE_PRINCIPAL, TRIGGERED_RULES_METRIC,
+    NO_PERMISSIONS, SERVICE_PRINCIPAL, SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
+    TRIGGERED_RULES_METRIC,
 };
 
 use crate::target_dispatch::{
-    drain, emulator, events, given_queue, given_state_machine, iam, metric_sum, ordered,
-    published_series, rule_series, sfn, trust_policy, xml_text, Emulator, DETAIL_TYPE, REGION,
-    SOURCE,
+    drain, emulator, events, given_queue, given_state_machine, iam, metric_sum, metric_sum_over,
+    ordered, published_series, rule_name_dimensions, rule_series, sfn, trust_policy, xml_text,
+    Emulator, DETAIL_TYPE, REGION, SOURCE,
 };
 
 /// The rule whose target role lets the invocation through, and the one whose
@@ -405,9 +407,15 @@ async fn each_delivery_is_counted_on_its_own_rules_invocation_metric() {
         let expected = f64::from(u32::try_from(row.events).unwrap_or(u32::MAX));
         let rows = [
             (INVOCATIONS_METRIC, DELIVERING_RULE, expected),
+            (
+                SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
+                DELIVERING_RULE,
+                expected,
+            ),
             (FAILED_INVOCATIONS_METRIC, DELIVERING_RULE, 0.0),
             (FAILED_INVOCATIONS_METRIC, REFUSED_RULE, expected),
             (INVOCATIONS_METRIC, REFUSED_RULE, 0.0),
+            (SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, REFUSED_RULE, 0.0),
         ];
         for (metric, rule, want) in rows {
             let got = metric_sum(&emulator, metric, row.bus, rule).await;
@@ -417,19 +425,28 @@ async fn each_delivery_is_counted_on_its_own_rules_invocation_metric() {
                  got {got}",
                 row.bus
             );
+            // The same count under the other dimension set a handover counter is
+            // published under: the rule name on its own.
+            let by_name = metric_sum_over(&emulator, metric, &rule_name_dimensions(rule)).await;
+            assert_eq!(
+                by_name, want,
+                "case {case:?}: expected {metric} for rule {rule} under the rule name alone \
+                 to sum to {want}, got {by_name}"
+            );
         }
 
-        // And the series themselves: each metric is published under the bus AND
-        // the rule and under the rule name alone, so the two rules of one bus —
-        // and the same rule name on another bus — are separate metrics. Both
-        // rules matched every event, so both carry the match series; only the
-        // delivery series differ.
+        // And the series themselves: each counter under the dimension set(s) it
+        // is published under, so the two rules of one bus — and the same rule
+        // name on another bus — are separate metrics. Both rules matched every
+        // event, so both carry the routing series; only the handover series
+        // differ.
         let series = published_series(&emulator).await;
         let mut expected_series = rule_series(
             row.bus,
             DELIVERING_RULE,
             &[
                 INVOCATIONS_METRIC,
+                SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
                 MATCHED_EVENTS_METRIC,
                 TRIGGERED_RULES_METRIC,
             ],

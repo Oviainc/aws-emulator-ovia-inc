@@ -103,6 +103,8 @@ mod rule_invocation_metrics;
 mod rule_lifecycle;
 #[path = "all/rule_match_metrics.rs"]
 mod rule_match_metrics;
+#[path = "all/rule_metric_dimension_sets.rs"]
+mod rule_metric_dimension_sets;
 #[path = "all/rule_state_control.rs"]
 mod rule_state_control;
 #[path = "all/state_machine_execution_naming.rs"]

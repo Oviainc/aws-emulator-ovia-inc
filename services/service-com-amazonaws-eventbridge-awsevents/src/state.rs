@@ -24,7 +24,8 @@
 //! the matched rule's own `MatchedEvents` and `TriggeredRules` metrics
 //! ([`count_rule_matches`]) and what came of each
 //! handover is counted on the
-//! rule's own `Invocations` or `FailedInvocations` metric in the CloudWatch store
+//! rule's own `Invocations` and `SuccessfulInvocationAttempts`, or on its
+//! `FailedInvocations`, in the CloudWatch store
 //! ([`count_invocation`], [`count_failed_invocation`]) — both reached through the
 //! same shared engine this service's store lives in, so there is one copy of each
 //! fact.
@@ -881,6 +882,12 @@ pub const FAILED_INVOCATIONS_METRIC: &str = "FailedInvocations";
 
 /// The EventBridge metric counting the target invocations a rule made.
 pub const INVOCATIONS_METRIC: &str = "Invocations";
+
+/// The EventBridge metric counting the invocation attempts a rule's target
+/// ACCEPTED: one per handover whose target API call went through, which is the
+/// counterpart of [`FAILED_INVOCATIONS_METRIC`] on the attempt series and the
+/// only way a client can tell "delivery succeeded" from "nothing is counted".
+pub const SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC: &str = "SuccessfulInvocationAttempts";
 
 /// The EventBridge metric counting the events a rule's `EventPattern` matched.
 pub const MATCHED_EVENTS_METRIC: &str = "MatchedEvents";
@@ -3498,15 +3505,21 @@ pub fn count_failed_invocation(cloudwatch: &mut CloudWatchState, bus: &str, rule
     count_handover(cloudwatch, FAILED_INVOCATIONS_METRIC, bus, rule);
 }
 
-/// Count ONE invocation a rule's target accepted on the rule's `Invocations`
-/// metric.
+/// Count ONE invocation a rule's target accepted, on both counters an accepted
+/// handover is reported on: the rule's `Invocations` and its
+/// `SuccessfulInvocationAttempts`.
 ///
 /// "Invocations: the number of times a target is invoked for a rule in response
-/// to an event" (EventBridge's published metrics) — the counterpart of
-/// [`count_failed_invocation`], so a rule that is delivering and one that is
-/// failing are both visible in the same namespace.
+/// to an event" and "SuccessfulInvocationAttempts: the number of invocation
+/// attempts that were successful" (EventBridge's published metrics) are both
+/// facts about the SAME accepted handover — the target's API call was made and
+/// the target took the event — so one acceptance counts once on each, and
+/// neither is counted for a handover that was refused ([`count_failed_invocation`])
+/// or never attempted. Counting both is what lets a client read delivery success
+/// off either series rather than inferring it from the absence of a failure.
 pub fn count_invocation(cloudwatch: &mut CloudWatchState, bus: &str, rule: &str) {
     count_handover(cloudwatch, INVOCATIONS_METRIC, bus, rule);
+    count_handover(cloudwatch, SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, bus, rule);
 }
 
 /// Count what came of ONE handover on `metric` for the rule `rule` of `bus`.
@@ -3626,11 +3639,12 @@ pub async fn count_rule_matches(
 /// bus `bus`.
 ///
 /// The series live in the `AWS/Events` namespace, and the observation is appended
-/// to EACH of the dimension sets a rule's counters are published under
+/// to EACH of the dimension sets THAT counter is published under
 /// ([`rule_dimension_sets`]), because "CloudWatch treats each unique combination
 /// of dimensions as a separate metric" (`GetMetricStatistics$Dimensions`): a
-/// reader naming the rule's whole identity and one naming the rule alone ask for
-/// two different series, and EventBridge answers both.
+/// dimension set nothing is appended to is a series a reader finds no datapoint
+/// for at all, which is what EventBridge publishing one counter under one
+/// dimension set and another under two LOOKS like to a client.
 ///
 /// The datapoint is appended to the CloudWatch store directly rather than sent
 /// through `PutMetricData`: CloudWatch reserves the `AWS/` namespaces for the
@@ -3652,7 +3666,7 @@ fn count_rule_metric(
 ) {
     use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as metrics;
 
-    for dimensions in rule_dimension_sets(bus, rule) {
+    for dimensions in rule_dimension_sets(metric, bus, rule) {
         let key = metrics::MetricKey {
             namespace: METRIC_NAMESPACE.to_string(),
             metric_name: metric.to_string(),
@@ -3683,27 +3697,44 @@ fn count_rule_metric(
     }
 }
 
-/// The dimension sets ONE per-rule series of a rule is published under: the
-/// rule's whole identity (the bus it belongs to and its name) and the rule name
-/// on its own.
+/// The counters EventBridge reports for a rule ONLY under the rule's whole
+/// identity — the event bus the rule belongs to together with the rule's name.
 ///
-/// Both are how a client reads one rule's counters: the name alone is what the
-/// metric is dimensioned by where the bus is implied, and the pair is what tells
-/// two buses' rules of the same name apart. They are separate series, so the two
-/// are published side by side rather than one standing in for the other.
+/// These two count what the bus's ROUTING TABLE did with an event, so the bus is
+/// part of what the count is about and the rule name on its own is not a series
+/// EventBridge publishes them under: a reader naming the rule name alone finds no
+/// datapoint for them, not a zero.
+const ROUTING_COUNTERS: [&str; 2] = [MATCHED_EVENTS_METRIC, TRIGGERED_RULES_METRIC];
+
+/// The dimension sets ONE per-rule series of `metric` is published under, which
+/// is a property of the COUNTER rather than of the rule.
+///
+/// The rule's whole identity — the bus it belongs to and its name — is a series
+/// every per-rule counter is published under, and it is what tells two buses'
+/// rules of the same name apart. The rule name ON ITS OWN is a second series, and
+/// EventBridge publishes the counters of a HANDOVER (what became of a delivery)
+/// under it as well, while the counters of the MATCH ([`ROUTING_COUNTERS`]) are
+/// published under the whole identity only. They are separate metrics, so a
+/// counter published under both is appended to both rather than one standing in
+/// for the other.
 fn rule_dimension_sets(
+    metric: &str,
     bus: &str,
     rule: &str,
-) -> [::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::DimensionSet; 2] {
-    let by_rule_name = [(RULE_NAME_DIMENSION.to_string(), rule.to_string())];
+) -> Vec<::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::DimensionSet> {
     let whole_identity = [
         (EVENT_BUS_NAME_DIMENSION.to_string(), bus.to_string()),
         (RULE_NAME_DIMENSION.to_string(), rule.to_string()),
-    ];
-    [
-        whole_identity.into_iter().collect(),
-        by_rule_name.into_iter().collect(),
     ]
+    .into_iter()
+    .collect();
+    if ROUTING_COUNTERS.contains(&metric) {
+        return vec![whole_identity];
+    }
+    let by_rule_name = [(RULE_NAME_DIMENSION.to_string(), rule.to_string())]
+        .into_iter()
+        .collect();
+    vec![whole_identity, by_rule_name]
 }
 
 /// The most policy documents the delivery gate reads for ONE role.

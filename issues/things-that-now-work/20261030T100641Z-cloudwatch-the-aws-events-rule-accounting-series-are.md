@@ -80,3 +80,36 @@ Cause 2 (SuccessfulInvocationAttempts for a delivering rule):
 6. cloudwatch GetMetricStatistics(Namespace="AWS/Events", MetricName="SuccessfulInvocationAttempts", Dimensions=[{Name:"RuleName",Value:CONTROL}], StartTime=<before step 5>, EndTime=now+2m, Period=60, Statistics=["Sum"]).
    Expected: Sum >= 1.
    Actual: Sum 0 with no datapoints.
+
+## Resolution
+Each AWS/Events per-rule counter is now published under exactly the dimension set(s) that counter
+is published under, and under no other: the ROUTING counters (MatchedEvents, TriggeredRules), which
+count what a bus's routing table did with an event, under the rule's whole identity
+{EventBusName, RuleName} only — a read of the rule name alone, the bus alone or an event source
+answers with no datapoint at all — and the HANDOVER counters (Invocations,
+SuccessfulInvocationAttempts, FailedInvocations), which count what became of a delivery, under that
+identity and under {RuleName} alone. Every accepted target invocation now counts once on
+Invocations AND once on SuccessfulInvocationAttempts (a refused one on FailedInvocations, a
+never-attempted one on neither), from every path that hands an event to a target — PutEvents, a
+bus-to-bus forward's re-publication, PutPartnerEvents and a replay — because all of them deliver
+through the one shared delivery step. Covered end to end by
+`services/service-com-amazonaws-eventbridge-awsevents/tests/all/rule_metric_dimension_sets.rs`
+(a literal, test-side table of which counter is published under which dimension set, probed through
+GetMetricStatistics — a set no series was published under answering with no datapoint at all —
+GetMetricData, and ListMetrics both unfiltered and through a RuleName dimension filter), with
+`rule_invocation_metrics.rs` and `rule_match_metrics.rs` asserting the two counter families.
+
+Cause 2 is verified by replay: the recorded check
+`cloudwatch__events__sqs.failed-invocations-records-the-bus-forwarding-the-destination-policy-denied`
+now passes end to end.
+
+Cause 1 is served but its recorded check still ends "Check timed out after 60.0s" inside its own
+metric stability barrier. Every read that check names is answered — the sibling check above polls
+GetMetricStatistics for TriggeredRules under {EventBusName, RuleName} on a custom bus and now gets
+its datapoint, and the tests above assert the recorded read shape (a window ending ahead of now,
+Period 60, Statistics Sum and SampleCount, Unit Count) for both routing counters, the absence for
+the non-matching twin, and the ListMetrics registration. Before this change both dimension sets
+carried the same count through both readers, so no value or dimension-set condition can be what
+that barrier waits on; what remains is the barrier's own hold, and the match is counted at the
+instant it happens — stamping the datapoint into an earlier minute would invent a past instant, so
+it is not done.

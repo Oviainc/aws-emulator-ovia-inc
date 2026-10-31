@@ -5,14 +5,15 @@
 //!
 //! The RULE asserted here: for every enabled rule whose `EventPattern` matches a
 //! published event, EventBridge publishes one AWS/Events datapoint of value 1 for
-//! that event on BOTH `MatchedEvents` and `TriggeredRules`, under each dimension
-//! set a rule's counters are read by — the rule's whole identity
-//! (`EventBusName` + `RuleName`) and the rule name alone — and attributes it to
-//! that one rule, so a sibling rule on the same bus whose pattern did NOT match
-//! sums to zero over the same window. The match is counted because the pattern
-//! selected the event, not because anything was delivered: a matched rule
-//! carrying no target at all counts its matches, and a rule that did deliver
-//! counts them beside its `Invocations`.
+//! that event on BOTH `MatchedEvents` and `TriggeredRules`, under the ONE
+//! dimension set those two routing counters are published under — the rule's
+//! whole identity, `EventBusName` together with `RuleName` — and under no looser
+//! dimension set, so a reader naming the rule name alone finds no datapoint for
+//! them at all; and it attributes the count to that one rule, so a sibling rule
+//! on the same bus whose pattern did NOT match sums to zero over the same window.
+//! The match is counted because the pattern selected the event, not because
+//! anything was delivered: a matched rule carrying no target at all counts its
+//! matches, and a rule that did deliver counts them beside its handover counters.
 //!
 //! The table spans the class rather than the one recorded case: its rows differ
 //! along the BUS the rules live on (two custom buses and the default one), along
@@ -26,13 +27,13 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    DEFAULT_EVENT_BUS_NAME, INVOCATIONS_METRIC, MATCHED_EVENTS_METRIC, TRIGGERED_RULES_METRIC,
+    DEFAULT_EVENT_BUS_NAME, INVOCATIONS_METRIC, MATCHED_EVENTS_METRIC,
+    SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, TRIGGERED_RULES_METRIC,
 };
 
 use crate::target_dispatch::{
-    drain, emulator, events, given_queue, metric_sum, metric_sum_over,
-    metric_sum_over_last_minute, ordered, published_series, rule_dimensions, rule_name_dimensions,
-    rule_series, Emulator,
+    drain, emulator, events, given_queue, metric_sum_over, metric_sum_over_last_minute, ordered,
+    published_series, rule_dimensions, rule_name_dimensions, rule_series, Emulator,
 };
 
 /// The rule whose pattern the published events match, and the one on the same bus
@@ -217,61 +218,77 @@ async fn every_pattern_match_is_counted_on_the_matched_rules_own_metrics() {
 
         let expected = f64::from(u32::try_from(row.events).unwrap_or(u32::MAX));
         // The match itself: counted once per matching event on each of the two
-        // metrics, for the rule whose pattern selected it and for no other —
-        // under the rule's whole identity and under its name alone, which are
-        // two series of the same count.
+        // routing metrics, for the rule whose pattern selected it and for no
+        // other — under the rule's whole identity, which is the one dimension
+        // set those two counters are published under.
         for metric in MATCH_METRICS {
-            for (dimensioned, dimensions) in [
-                ("the bus and the rule", rule_dimensions(row.bus, MATCHING_RULE)),
-                ("the rule name alone", rule_name_dimensions(MATCHING_RULE)),
-            ] {
-                let got = metric_sum_over(&emulator, metric, &dimensions).await;
-                assert_eq!(
-                    got, expected,
-                    "case {case:?}: expected {metric} for the matching rule under \
-                     {dimensioned} to sum to {expected}, got {got}"
-                );
-                // The same count read at the granularity the series is published
-                // at: the one 60-second period ending now, which is where a
-                // datapoint of a just-published event belongs.
-                let aligned =
-                    metric_sum_over_last_minute(&emulator, metric, &dimensions).await;
-                assert_eq!(
-                    aligned, expected,
-                    "case {case:?}: expected {metric} for the matching rule under \
-                     {dimensioned} to sum to {expected} over the minute ending now, \
-                     got {aligned}"
-                );
-            }
-            for (dimensioned, dimensions) in [
-                ("the bus and the rule", rule_dimensions(row.bus, SIBLING_RULE)),
-                ("the rule name alone", rule_name_dimensions(SIBLING_RULE)),
+            let dimensions = rule_dimensions(row.bus, MATCHING_RULE);
+            let got = metric_sum_over(&emulator, metric, &dimensions).await;
+            assert_eq!(
+                got, expected,
+                "case {case:?}: expected {metric} for the matching rule under the bus and \
+                 the rule to sum to {expected}, got {got}"
+            );
+            // The same count read at the granularity the series is published
+            // at: the one 60-second period ending now, which is where a
+            // datapoint of a just-published event belongs.
+            let aligned = metric_sum_over_last_minute(&emulator, metric, &dimensions).await;
+            assert_eq!(
+                aligned, expected,
+                "case {case:?}: expected {metric} for the matching rule under the bus and \
+                 the rule to sum to {expected} over the minute ending now, got {aligned}"
+            );
+            // And under no looser dimension set: a routing counter is not
+            // published under the rule name on its own, so that series holds
+            // nothing — for the matching rule as much as for the sibling.
+            for (whose, dimensions) in [
+                ("the matching rule", rule_name_dimensions(MATCHING_RULE)),
+                ("the rule the events did not match", rule_name_dimensions(SIBLING_RULE)),
             ] {
                 let got = metric_sum_over(&emulator, metric, &dimensions).await;
                 assert_eq!(
                     got, 0.0,
-                    "case {case:?}: expected {metric} for the rule the events did not match, \
-                     under {dimensioned}, to sum to 0, got {got}"
+                    "case {case:?}: expected no {metric} datapoint for {whose} under the rule \
+                     name alone, got a sum of {got}"
                 );
             }
+            let got = metric_sum_over(&emulator, metric, &rule_dimensions(row.bus, SIBLING_RULE))
+                .await;
+            assert_eq!(
+                got, 0.0,
+                "case {case:?}: expected {metric} for the rule the events did not match, \
+                 under the bus and the rule, to sum to 0, got {got}"
+            );
         }
 
         // What became of the match is a different fact, counted separately: a
         // matched rule with no target invokes nothing and still counts every
         // match above, and one whose queue target accepted the events counts an
-        // invocation per delivery beside them.
-        let invoked = metric_sum(&emulator, INVOCATIONS_METRIC, row.bus, MATCHING_RULE).await;
+        // accepted handover per delivery beside them — on both counters an
+        // accepted handover is reported on, and under the rule name alone as
+        // well as under the rule's whole identity.
         let delivered = if let Some((url, _)) = &target {
             drain(&emulator, url).await.len()
         } else {
             0
         };
         let expected_invocations = if row.targeted { expected } else { 0.0 };
-        assert_eq!(
-            invoked, expected_invocations,
-            "case {case:?}: expected {INVOCATIONS_METRIC} for the matching rule to sum to \
-             {expected_invocations}, got {invoked}"
-        );
+        for metric in [INVOCATIONS_METRIC, SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC] {
+            for (dimensioned, dimensions) in [
+                (
+                    "the bus and the rule",
+                    rule_dimensions(row.bus, MATCHING_RULE),
+                ),
+                ("the rule name alone", rule_name_dimensions(MATCHING_RULE)),
+            ] {
+                let invoked = metric_sum_over(&emulator, metric, &dimensions).await;
+                assert_eq!(
+                    invoked, expected_invocations,
+                    "case {case:?}: expected {metric} for the matching rule under \
+                     {dimensioned} to sum to {expected_invocations}, got {invoked}"
+                );
+            }
+        }
         assert_eq!(
             delivered,
             if row.targeted { row.events } else { 0 },
@@ -279,13 +296,15 @@ async fn every_pattern_match_is_counted_on_the_matched_rules_own_metrics() {
              got {delivered} message(s)"
         );
 
-        // And the series CloudWatch holds: the matched rule's two match series
-        // per dimension set, plus its delivery series where it delivered, and
-        // nothing at all for the rule that did not match.
+        // And the series CloudWatch holds: the matched rule's two routing series
+        // under its whole identity, plus its accepted-handover series under both
+        // dimension sets where it delivered, and nothing at all for the rule
+        // that did not match.
         let series = published_series(&emulator).await;
         let mut metrics = MATCH_METRICS.to_vec();
         if row.targeted {
             metrics.push(INVOCATIONS_METRIC);
+            metrics.push(SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC);
         }
         assert_eq!(
             ordered(&series),

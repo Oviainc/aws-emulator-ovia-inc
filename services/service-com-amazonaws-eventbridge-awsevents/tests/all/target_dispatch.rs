@@ -36,7 +36,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
     ComAmazonawsEventbridgeAwseventsState, InvocationOutcome, DEFAULT_EVENT_BUS_NAME,
     EVENT_BUS_NAME_DIMENSION, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC, MATCHED_EVENTS_METRIC,
-    METRIC_NAMESPACE, RULE_NAME_DIMENSION, SERVICE_PRINCIPAL, TRIGGERED_RULES_METRIC,
+    METRIC_NAMESPACE, RULE_NAME_DIMENSION, SERVICE_PRINCIPAL,
+    SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, TRIGGERED_RULES_METRIC,
 };
 use service_com_amazonaws_eventbridge_awsevents::EmulatedService;
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
@@ -163,7 +164,7 @@ pub(crate) async fn sfn(emulator: &Emulator, operation: &str, body: &Value) -> (
     .await
 }
 
-async fn cloudwatch(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn cloudwatch(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
     rpc(
         emulator,
         "monitoring",
@@ -854,19 +855,59 @@ pub(crate) fn rule_dimensions(bus: &str, rule: &str) -> Value {
     ])
 }
 
-/// The other dimension set the same metrics are reported under: the rule's name
-/// on its own.
+/// The other dimension set a HANDOVER counter of the same rule is reported
+/// under: the rule's name on its own.
 pub(crate) fn rule_name_dimensions(rule: &str) -> Value {
     json!([{ "Name": RULE_NAME_DIMENSION, "Value": rule }])
 }
 
+/// The dimensions a reader names when it asks for a bus-wide series: the event
+/// bus on its own, with no rule.
+pub(crate) fn bus_dimensions(bus: &str) -> Value {
+    json!([{ "Name": EVENT_BUS_NAME_DIMENSION, "Value": bus }])
+}
+
+/// The AWS/Events counters EventBridge publishes under the rule's WHOLE identity
+/// and under nothing looser: the two that count what a bus's routing table did
+/// with an event.
+///
+/// Stated HERE, in the test, rather than read from the service: a golden that
+/// asked the service which dimension sets it publishes under would move with a
+/// regression instead of catching it.
+pub(crate) const ROUTING_COUNTERS: [&str; 2] = [MATCHED_EVENTS_METRIC, TRIGGERED_RULES_METRIC];
+
+/// The AWS/Events counters EventBridge publishes under the rule's whole identity
+/// AND under the rule name on its own: the three that count what became of a
+/// handover. Stated here for the same reason as [`ROUTING_COUNTERS`].
+pub(crate) const HANDOVER_COUNTERS: [&str; 3] = [
+    INVOCATIONS_METRIC,
+    SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
+    FAILED_INVOCATIONS_METRIC,
+];
+
+/// Whether `metric` is one of the counters published under the rule name ALONE
+/// beside the rule's whole identity, by the test's own table above. Panics for a
+/// counter neither table names, so a new counter cannot slip past these goldens.
+pub(crate) fn published_under_rule_name_alone(metric: &str) -> bool {
+    assert!(
+        ROUTING_COUNTERS.contains(&metric) || HANDOVER_COUNTERS.contains(&metric),
+        "the counter {metric} is in neither the routing nor the handover table"
+    );
+    HANDOVER_COUNTERS.contains(&metric)
+}
+
 /// Every series the metrics `metrics` of the rule `rule` on `bus` are published
-/// as: each metric under the rule's whole identity AND under its name alone, so
-/// each one is two series.
+/// as: the rule's whole identity for every counter, plus the rule name alone for
+/// a handover counter, by the test's OWN table
+/// ([`ROUTING_COUNTERS`] / [`HANDOVER_COUNTERS`]).
 pub(crate) fn rule_series(bus: &str, rule: &str, metrics: &[&str]) -> Vec<Value> {
     let mut series = Vec::new();
     for metric in metrics {
-        for dimensions in [rule_dimensions(bus, rule), rule_name_dimensions(rule)] {
+        let mut dimension_sets = vec![rule_dimensions(bus, rule)];
+        if published_under_rule_name_alone(metric) {
+            dimension_sets.push(rule_name_dimensions(rule));
+        }
+        for dimensions in dimension_sets {
             series.push(json!({
                 "Namespace": METRIC_NAMESPACE,
                 "MetricName": metric,
@@ -961,6 +1002,29 @@ pub(crate) async fn published_series(emulator: &Emulator) -> Vec<Value> {
         emulator,
         "ListMetrics",
         &json!({ "Namespace": METRIC_NAMESPACE }),
+    )
+    .await;
+    assert_eq!(status, 200, "ListMetrics answered {status} {listed}");
+    listed["Metrics"].as_array().cloned().unwrap_or_default()
+}
+
+/// The series CloudWatch holds in EventBridge's namespace that carry the
+/// dimension `name` with the value `value` — a `DimensionFilter`, which matches a
+/// series whose dimension set CONTAINS that dimension: "If you specify one
+/// dimension name and a metric has that dimension and also other dimensions, it
+/// will be returned." (`ListMetricsInput$Dimensions`)
+pub(crate) async fn series_filtered_by(
+    emulator: &Emulator,
+    name: &str,
+    value: &str,
+) -> Vec<Value> {
+    let (status, listed) = cloudwatch(
+        emulator,
+        "ListMetrics",
+        &json!({
+            "Namespace": METRIC_NAMESPACE,
+            "Dimensions": [{ "Name": name, "Value": value }],
+        }),
     )
     .await;
     assert_eq!(status, 200, "ListMetrics answered {status} {listed}");
@@ -1131,11 +1195,12 @@ async fn a_delivery_the_targets_role_bars_is_dead_lettered_and_counted() {
                         "guarded",
                         &[
                             INVOCATIONS_METRIC,
+                            SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
                             MATCHED_EVENTS_METRIC,
                             TRIGGERED_RULES_METRIC,
                         ],
                     )),
-                    "case {:?}: expected the rule's own match and Invocations series, \
+                    "case {:?}: expected the rule's own match and accepted-handover series, \
                      got {series:?}",
                     row.case
                 );
