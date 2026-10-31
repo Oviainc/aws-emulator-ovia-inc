@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFlowVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFlowVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFlowVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the numbered versions stored for one flow, read from
+//! [`crate::state`], in version order and in pages. A pure read: it writes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +156,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFlowVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFlowVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFlowVersions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFlowVersionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The modelled `FlowIdentifier` admits a flow ARN or a bare flow id and
+        // nothing else. The boundary validator lets other values through — the
+        // pattern's top-level alternation leaves the second branch anchored only
+        // at its end — so an identifier of neither form is refused here as the
+        // bad request it is, rather than reported as a missing flow.
+        let Some(flow_id) = crate::state::flow_id_from_identifier(&input.flow_identifier) else {
+            return Err(ListFlowVersionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::flow_identifier_pattern_message(
+                        &input.flow_identifier,
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        };
+
+        // A token this service did not hand out names no position in the listing.
+        let after_version = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::flow_version_after_token(token) {
+                Some(version) => Some(version),
+                None => {
+                    return Err(ListFlowVersionsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "nextToken is not a pagination token this service issued"
+                                    .to_string(),
+                            ),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: "not a pagination token this service issued".to_string(),
+                            }]),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `maxResults` truncates the page, but the modelled
+        // `flowVersionSummaries` length bound (..10) caps it however large
+        // `maxResults` is.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_FLOW_VERSIONS_PER_PAGE, |requested| {
+                usize::try_from(requested).unwrap_or(crate::state::MAX_FLOW_VERSIONS_PER_PAGE)
+            })
+            .min(crate::state::MAX_FLOW_VERSIONS_PER_PAGE);
+
+        // A read: the stored versions are reported as they stand, and nothing
+        // about the flow or its versions changes because somebody asked for them.
+        let state = state.lock();
+        if !state.flows.contains_key(flow_id) {
+            return Err(ListFlowVersionsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::flow_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        }
+
+        let (flow_version_summaries, next_token) =
+            state.page_of_flow_versions(flow_id, after_version, page_size);
+
+        Ok(ListFlowVersionsOutput {
+            flow_version_summaries,
+            next_token,
+        })
     }
 }

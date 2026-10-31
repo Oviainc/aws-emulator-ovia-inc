@@ -19,6 +19,8 @@ mod data_source_lifecycle;
 mod flow_definition_validation;
 #[path = "all/flow_lifecycle.rs"]
 mod flow_lifecycle;
+#[path = "all/flow_version_listing.rs"]
+mod flow_version_listing;
 #[path = "all/immutable_configuration_members.rs"]
 mod immutable_configuration_members;
 #[path = "all/ingestion_job_lifecycle.rs"]

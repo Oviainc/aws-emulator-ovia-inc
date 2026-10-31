@@ -15,6 +15,13 @@
 //! [`FlowRecord::to_update_output`] / [`FlowRecord::to_get_output`] as its single
 //! projections.
 //!
+//! A flow's numbered versions (`ListFlowVersions`) are backed by the
+//! [`flow_versions`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::flow_versions)
+//! map, keyed by the flow and the version number it was cut as, with
+//! [`FlowVersionRecord::to_summary`] as its single projection and
+//! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::page_of_flow_versions`]
+//! as the one place the listing's order and paging live.
+//!
 //! The knowledge-base lifecycle (`CreateKnowledgeBase`, `UpdateKnowledgeBase`,
 //! `GetKnowledgeBase`) is backed by the
 //! [`knowledge_bases`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::knowledge_bases)
@@ -47,7 +54,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Agent, AgentSummary, CreateFlowOutput, CustomOrchestration, DataSource,
-    DataSourceConfiguration, FlowDefinition, FlowValidation, GetFlowOutput,
+    DataSourceConfiguration, FlowDefinition, FlowValidation, FlowVersionSummary, GetFlowOutput,
     GuardrailConfiguration, IngestionJob, IngestionJobStatistics, KnowledgeBase,
     KnowledgeBaseConfiguration, MemoryConfiguration, PromptOverrideConfiguration,
     ServerSideEncryptionConfiguration, StorageConfiguration, UpdateFlowOutput,
@@ -416,6 +423,61 @@ pub fn flow_not_found_message(operation: &str) -> String {
         "Couldn't perform {operation} operation. Failed to retrieve resource type \
          Flow because it doesn't exist. Check the resource ID and retry your request."
     )
+}
+
+/// The most flow versions one `ListFlowVersions` page can carry: the response
+/// member `flowVersionSummaries` is modelled `length ..10`, so a page never
+/// exceeds it however large `maxResults` is.
+pub const MAX_FLOW_VERSIONS_PER_PAGE: usize = 10;
+
+/// Digits a version number is written with on the wire: the modelled
+/// `NumericalVersion` is `pattern ^[0-9]{1,5}$`.
+const NUMERICAL_VERSION_DIGITS: usize = 5;
+
+/// One stored version of a flow: the single source of truth for every
+/// flow-version operation.
+///
+/// The version number is held as the integer it counts rather than as the wire
+/// string, so one flow's versions order by the sequence they were cut in
+/// (`CreateFlowVersion$version` is documented "Versions are numbered
+/// incrementally, starting from 1") instead of lexically, which would put `10`
+/// before `9`. The modelled `NumericalVersion` is that integer rendered.
+#[derive(Debug, Clone)]
+pub struct FlowVersionRecord {
+    /// The flow this version belongs to.
+    pub flow_id: String,
+    /// The ARN of that flow, as `FlowVersionSummary$arn` reports it.
+    pub arn: String,
+    pub version: u32,
+    pub status: FlowStatus,
+    pub created_at: SystemTime,
+}
+
+impl FlowVersionRecord {
+    /// This record projected onto the modelled `FlowVersionSummary` shape, the
+    /// `ListFlowVersions` item: every member comes from the stored record,
+    /// never from the request being served.
+    pub fn to_summary(&self) -> FlowVersionSummary {
+        FlowVersionSummary {
+            id: self.flow_id.clone(),
+            arn: self.arn.clone(),
+            status: self.status.as_wire().to_string(),
+            created_at: to_date_time(self.created_at),
+            version: self.version.to_string(),
+        }
+    }
+}
+
+/// The version a `ListFlowVersions` page resumes after, or `None` when the
+/// token is not one this listing handed out.
+///
+/// A page's `nextToken` is the version number the page stopped at, so the next
+/// page starts at the first version of the same flow above it — stable even if
+/// the version the token names has since been deleted.
+pub fn flow_version_after_token(token: &str) -> Option<u32> {
+    let numeric = (1..=NUMERICAL_VERSION_DIGITS).contains(&token.len())
+        && token.bytes().all(|byte| byte.is_ascii_digit());
+    numeric.then(|| token.parse::<u32>().ok()).flatten()
 }
 
 /// The most knowledge bases this store holds; past it `CreateKnowledgeBase`
@@ -1021,6 +1083,10 @@ pub struct ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// `clientToken` -> `flowId`, so a retried `CreateFlow` carrying the same
     /// `@idempotencyToken` returns the flow it already created.
     pub flow_client_tokens: HashMap<String, String>,
+    /// Every numbered flow version that exists, keyed by the `flowId` it was cut
+    /// from and its version number. The pair is the version's identity, so one
+    /// flow never reports another flow's versions.
+    pub flow_versions: HashMap<(String, u32), FlowVersionRecord>,
     /// Every knowledge base that exists, keyed by its 10-character
     /// `knowledgeBaseId`.
     pub knowledge_bases: HashMap<String, KnowledgeBaseRecord>,
@@ -1280,6 +1346,33 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             .then(|| page.last().map(|record| record.page_cursor()))
             .flatten();
         (page.iter().map(|record| record.to_summary()).collect(), next_token)
+    }
+
+    /// One `ListFlowVersions` page: this flow's versions above `after_version`
+    /// in version order, at most `page_size` of them, plus the token to resume
+    /// from when more remain.
+    pub fn page_of_flow_versions(
+        &self,
+        flow_id: &str,
+        after_version: Option<u32>,
+        page_size: usize,
+    ) -> (Vec<FlowVersionSummary>, Option<String>) {
+        let mut ordered: Vec<&FlowVersionRecord> = self
+            .flow_versions
+            .values()
+            .filter(|record| record.flow_id == flow_id)
+            .filter(|record| after_version.is_none_or(|after| record.version > after))
+            .collect();
+        ordered.sort_by_key(|record| record.version);
+
+        let page: Vec<&FlowVersionRecord> = ordered.iter().take(page_size).copied().collect();
+        let next_token = (ordered.len() > page.len())
+            .then(|| page.last().map(|record| record.version.to_string()))
+            .flatten();
+        (
+            page.iter().map(|record| record.to_summary()).collect(),
+            next_token,
+        )
     }
 
     /// Forget an agent and every index that pointed at it.
