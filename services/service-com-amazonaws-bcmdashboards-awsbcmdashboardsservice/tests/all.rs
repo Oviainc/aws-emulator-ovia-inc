@@ -23,6 +23,8 @@ mod create_report_client_token;
 mod create_report_conflict_message;
 #[path = "all/create_time_tag_merge.rs"]
 mod create_time_tag_merge;
+#[path = "all/cursor_spelling.rs"]
+mod cursor_spelling;
 #[path = "all/dashboard_lifecycle.rs"]
 mod dashboard_lifecycle;
 #[path = "all/dashboard_name_uniqueness.rs"]

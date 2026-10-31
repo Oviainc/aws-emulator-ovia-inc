@@ -2257,6 +2257,10 @@ pub fn widget_list_refusal(widgets: &[Widget]) -> Option<String> {
 }
 
 /// Encode the ARN a listing page resumes at as an opaque `nextToken`.
+///
+/// One ARN has exactly ONE cursor: the prefix followed by the ARN's bytes in lower-case
+/// hex. That makes this function the whole definition of the cursor format, which
+/// [`decode_page_token`] reads a token back against.
 pub fn encode_page_token(arn: &str) -> String {
     format!("{PAGE_TOKEN_PREFIX}{}", hex::encode(arn))
 }
@@ -2337,11 +2341,18 @@ pub fn names_resource_arn(value: &str, resource_type: &str) -> bool {
 /// by a listing over the other resource type, or a hand-written body that merely carries
 /// the pattern's segments somewhere in it — is rejected rather than read as a resume
 /// point past every stored record.
+///
+/// Naming the right ARN is necessary but not sufficient: the token has to be the EXACT
+/// string [`encode_page_token`] writes for that ARN. A cursor is one spelling per resume
+/// point, so a body that decodes to the same bytes in some other spelling — the same hex
+/// digits in upper or mixed case, which the decoder underneath accepts as readily as the
+/// lower case the encoder emits — is a token this service could not have issued, and is
+/// refused like any other.
 pub fn decode_page_token(token: &str, resource_type: &str) -> Option<String> {
     let body = token.strip_prefix(PAGE_TOKEN_PREFIX)?;
     let bytes = hex::decode(body).ok()?;
     let arn = String::from_utf8(bytes).ok()?;
-    names_resource_arn(&arn, resource_type).then_some(arn)
+    (token == encode_page_token(&arn) && names_resource_arn(&arn, resource_type)).then_some(arn)
 }
 
 /// One page of a listing over an ARN-keyed resource map: the records of the page,
