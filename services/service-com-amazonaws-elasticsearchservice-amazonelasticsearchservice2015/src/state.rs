@@ -6,8 +6,9 @@
 //! [`Domain`] record is the single source of truth for every answer the domain
 //! operations give: `CreateElasticsearchDomain` inserts it,
 //! `UpdateElasticsearchDomainConfig` merges into it,
-//! `DescribeElasticsearchDomain` / `DescribeElasticsearchDomainConfig` /
-//! `ListDomainNames` read it, and `DeleteElasticsearchDomain` removes it.
+//! `DescribeElasticsearchDomain` / `DescribeElasticsearchDomains` /
+//! `DescribeElasticsearchDomainConfig` / `ListDomainNames` read it, and
+//! `DeleteElasticsearchDomain` removes it.
 //!
 //! Every per-option `*Status` wrapper the model declares is BUILT FROM the
 //! stored [`OptionRecord`] (its creation date, its update date, the config

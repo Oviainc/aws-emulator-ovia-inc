@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeElasticsearchDomains
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeElasticsearchDomains`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeElasticsearchDomains::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored domains the request NAMES, and only those: one
+//! `ElasticsearchDomainStatus` per requested name the store holds in the
+//! request's Region, in the order the request lists them, and no entry at all
+//! for a name it does not hold. A pure read, built from the same stored record
+//! `DescribeElasticsearchDomain` answers from, so the two agree and neither
+//! changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +141,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeElasticsearchDomains` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeElasticsearchDomainsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeElasticsearchDomains"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeElasticsearchDomainsErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Elasticsearch domain store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let store = state.lock();
+
+        // A batch describe is SCOPED to the names it was given: it reports no domain
+        // the request did not name, and a name no stored domain carries is simply
+        // absent from the answer rather than a failure — unlike the single-domain
+        // describe, this call has the other requested domains to report. The answer
+        // carries the status of each requested DOMAIN, so a name the request repeats
+        // is still one domain and is reported once.
+        let mut requested = ::std::collections::BTreeSet::new();
+        let mut domain_status_list = Vec::new();
+        for domain_name in &input.domain_names {
+            if !requested.insert(domain_name.as_str()) {
+                continue;
+            }
+            if let Some(domain) = store
+                .domains
+                .get(&crate::state::domain_key(&region, domain_name))
+            {
+                domain_status_list.push(domain.domain_status(now));
+            }
+        }
+
+        Ok(DescribeElasticsearchDomainsOutput { domain_status_list })
     }
 }
