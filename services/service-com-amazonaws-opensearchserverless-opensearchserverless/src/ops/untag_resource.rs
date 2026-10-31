@@ -174,11 +174,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due_transitions();
 
-        // A tag belongs to a LIVE resource this account holds, whichever KIND of resource
-        // the `resourceArn` addresses: a collection whose deletion has been accepted is on
-        // its way out and its tags are no longer addressable, so it answers the same
-        // not-found refusal as a resource that was never there.
-        if !store.is_taggable(&input.resource_arn) {
+        // A `resourceArn` addresses an ACTIVE resource this account holds, whichever KIND
+        // of resource it names: a collection whose deletion has been accepted is on its way
+        // out and its tags are no longer addressable, so it answers the same not-found
+        // refusal as a resource that was never there.
+        if !store.is_tag_addressable(&input.resource_arn) {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message(

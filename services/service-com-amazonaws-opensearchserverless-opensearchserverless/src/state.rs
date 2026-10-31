@@ -3105,13 +3105,18 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
         }
     }
 
-    /// Whether the resource `arn` addresses may be TAGGED: a resource this account holds
-    /// that is not on its way out.
+    /// Whether the TAGGING plane's `resourceArn` addresses a resource at all: one this
+    /// account holds that is not on its way out.
     ///
-    /// A tag belongs to a LIVE resource, so a collection whose deletion has been accepted
-    /// is no longer taggable; a collection group has no accepted-deletion state of its own
-    /// (its delete removes the record), so holding one is enough.
-    pub fn is_taggable(&self, arn: &str) -> bool {
+    /// Every operation that takes a `resourceArn` documents the same precondition for it —
+    /// the resource "must be active (not in the `DELETING` state), and must be owned by the
+    /// account ID included in the request" (the member's own documentation on
+    /// `TagResourceRequest`, `UntagResourceRequest` and `ListTagsForResourceRequest`) — so
+    /// this is what the tag reads and the tag writes alike resolve an ARN through, and a
+    /// collection whose deletion has been accepted is addressable by none of them. A
+    /// collection group has no accepted-deletion state of its own (its delete removes the
+    /// record), so holding one is enough.
+    pub fn is_tag_addressable(&self, arn: &str) -> bool {
         match parse_resource_arn(arn) {
             Some((ArnResourceKind::Collection, _)) => self
                 .collection_by_arn(arn)

@@ -3,9 +3,9 @@
 //! @op ListTagsForResource
 //! IMPLEMENTED: reports the tags stored on the resource whose stored ARN is
 //! `resourceArn` — a collection or a collection group, whichever kind the ARN addresses.
-//! A `resourceArn` that names no resource this account holds is refused
-//! with `ResourceNotFoundException`; a collection whose deletion has been accepted is
-//! still read, as every other read of it is, until its purge.
+//! A `resourceArn` that names no resource this account holds, or one whose deletion has
+//! already been accepted, is refused with `ResourceNotFoundException`: the member takes
+//! the ARN of an active resource, as the tag writes' does.
 //!
 //! ## Shape of an operation
 //!
@@ -153,12 +153,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due_transitions();
 
-        // A collection whose deletion has been accepted is still a collection every read
-        // reports (`BatchGetCollection` answers it in `DELETING` until the purge), so its
-        // stored tags are still readable: only the tag WRITES are refused while it is on
-        // its way out. A `resourceArn` that names no resource this account holds — of
-        // whichever kind the ARN addresses — is the modelled not-found.
-        let Some(tags) = store.tags_by_arn(&input.resource_arn) else {
+        // The `resourceArn` this read takes addresses an ACTIVE resource this account
+        // holds, exactly as the tag writes' does: a collection whose deletion has been
+        // accepted is on its way out and its tags are no longer addressable, so it answers
+        // the same not-found refusal as a resource that was never there — of whichever kind
+        // the ARN addresses. The tags are read through the SAME resolution, so the answer
+        // is never a stored record the precondition refused nor an empty set standing in
+        // for one that is not there.
+        let addressable = store
+            .is_tag_addressable(&input.resource_arn)
+            .then(|| store.tags_by_arn(&input.resource_arn).cloned())
+            .flatten();
+        let Some(tags) = addressable else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message(
@@ -171,8 +177,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Answered from the STORED record: the tags a read reports are the ones the create
         // and the tag writes left on it.
-        Ok(ListTagsForResourceOutput {
-            tags: Some(tags.clone()),
-        })
+        Ok(ListTagsForResourceOutput { tags: Some(tags) })
     }
 }

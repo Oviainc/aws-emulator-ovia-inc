@@ -1034,9 +1034,9 @@ async fn tags_round_trip_and_a_deleted_collection_cannot_be_tagged() {
         );
     }
 
-    // And the collection whose deletion has been ACCEPTED: its tags can no longer be
-    // WRITTEN, while the read still answers them for as long as every other read of the
-    // collection does — and once it is purged nothing addresses it at all.
+    // And the collection whose deletion has been ACCEPTED: its `resourceArn` addresses no
+    // resource the tagging plane serves any more, so the writes AND the read are refused
+    // alike — and once it is purged nothing addresses it either.
     let (status, code, answer) = call(&router, "TagResource", json!({ "resourceArn": arn, "tags": [{ "key": "team", "value": "search" }] })).await;
     assert_eq!(
         status, 200,
@@ -1047,26 +1047,23 @@ async fn tags_round_trip_and_a_deleted_collection_cannot_be_tagged() {
         status, 200,
         "case DeleteCollection(tagged collection): expected 200, got {status} {code} with {answer}"
     );
-    // While DELETING: the writes are refused, the read still answers the stored tags.
+    // While DELETING: every tagging operation is refused, the read included.
     for (operation, extra) in &tagging {
         let mut request = extra.clone();
         request["resourceArn"] = json!(arn);
         let (status, code, answer) = call(&router, operation, request).await;
-        let expected = if *operation == "ListTagsForResource" {
-            (200, "")
-        } else {
-            (CLIENT_ERROR, "ResourceNotFoundException")
-        };
         assert_eq!(
             (status, code.as_str()),
-            expected,
-            "case {operation}(while DELETING): expected {expected:?}, got {status} {code} with {answer}"
+            (CLIENT_ERROR, "ResourceNotFoundException"),
+            "case {operation}(while DELETING): expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}"
         );
     }
+    // The collection itself is still READ in `DELETING` until its purge, so the refusal
+    // above is the tagging plane's precondition and not the record having gone early.
     assert_eq!(
-        listed_tags(&router, &arn).await,
-        vec![("team".to_string(), "search".to_string())],
-        "case ListTagsForResource(while DELETING): the stored tags are still reported"
+        text(&read_collection(&router, &id).await, "status"),
+        "DELETING",
+        "case BatchGetCollection(while DELETING): the collection is still reported in DELETING"
     );
     // After the purge nothing addresses it, for any of the three.
     tokio::time::sleep(SETTLE_WAIT).await;

@@ -83,6 +83,8 @@ mod tag_key_uniqueness;
 mod tag_write_timestamps;
 #[path = "all/tagging_plane_resource_kinds.rs"]
 mod tagging_plane_resource_kinds;
+#[path = "all/tagging_resource_arn_precondition.rs"]
+mod tagging_resource_arn_precondition;
 #[path = "all/update_collection_token_scope.rs"]
 mod update_collection_token_scope;
 #[path = "all/vpc_endpoint.rs"]
