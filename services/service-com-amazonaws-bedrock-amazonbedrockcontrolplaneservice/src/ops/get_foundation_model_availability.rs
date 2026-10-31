@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFoundationModelAvailability
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFoundationModelAvailability`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFoundationModelAvailability::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports whether this account can use one published foundation model
+//! ([`crate::state::FoundationModelCatalog`], the catalog `ops/list_foundation_models.rs`
+//! lists), as the four statuses the response declares — each read off the catalog row and
+//! the model's agreement state rather than written per request.
+//!
+//! `modelId` names a row of the catalog, in the qualified form `BedrockModelId` admits, and
+//! an id the catalog resolves to no OFFERED model is refused for the REASON it names none
+//! ([`crate::state::unoffered_foundation_model`]), the reading
+//! `ops/get_foundation_model.rs` refuses an identifier by: a model this service recognises
+//! and offers no longer is a resource that is gone (404 `ResourceNotFoundException` with the
+//! end-of-life reason), while an id naming no model at all is a value this service cannot
+//! read as a model (400 `ValidationException`).
+//!
+//! For a row the catalog carries:
+//!
+//! * `regionAvailability` is [`crate::state::AVAILABILITY_AVAILABLE`]: the published catalog
+//!   is the same in every region this emulator serves, so a model it carries is offered in
+//!   the region the request addressed.
+//! * `agreementAvailability.status` is the account's standing with the model's terms. A
+//!   model offered under its provider's own end-user license agreement has an OUTSTANDING
+//!   offer until the account accepts it ([`crate::state::model_agreement_outstanding`], read
+//!   off the very offers `ListFoundationModelAgreementOffers` reports), so its status is
+//!   `NOT_AVAILABLE`; a model AWS publishes itself is offered under no such agreement and
+//!   so needs none. `errorMessage` is carried by neither: it is optional, and nothing here
+//!   failed.
+//! * `entitlementAvailability` and `authorizationStatus` follow that same standing: the
+//!   entitlement a caller would invoke the model under exists, and the account is
+//!   authorized to use it, exactly while no agreement is outstanding.
+//!
+//! A pure read: the catalog and the offers behind it are published rather than created, so
+//! no call of this operation writes anything and two reads of one model answer alike —
+//! asking about a model is not accepting its terms.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +182,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFoundationModelAvailability` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFoundationModelAvailabilityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFoundationModelAvailability"))
+        // Availability is about the account's standing with a published model, which carries
+        // nothing of the request beyond the model it names.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetFoundationModelAvailabilityErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the foundation model catalog is not available on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let store = state.lock();
+
+        // `modelId` is a `BedrockModelId`, so it names a base model by its id alone, in the
+        // qualified form that pattern admits. An id the catalog resolves to no OFFERED model
+        // is refused for the REASON it names none, exactly as a read of the catalog itself is
+        // ([`crate::state::unoffered_foundation_model`]): a model this service recognises and
+        // offers no longer is a resource that is gone (404, with the end-of-life reason),
+        // while an id naming no model at all is a value this service cannot read as a model
+        // (400 `ValidationException`).
+        let model = match store.foundation_models.resolve_base_model(&input.model_id) {
+            crate::state::BaseModelIdentity::Offered(model) => *model,
+            _ => {
+                let refusal = crate::state::unoffered_foundation_model(&input.model_id);
+                let message = Some(refusal.message(&input.model_id));
+                return Err(match refusal {
+                    crate::state::UnofferedFoundationModel::UnreadableIdentifier => {
+                        GetFoundationModelAvailabilityErrorModeled::ValidationException(
+                            ValidationException { message },
+                        )
+                    }
+                    _ => GetFoundationModelAvailabilityErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException { message },
+                    ),
+                }
+                .into());
+            }
+        };
+
+        // ONE standing, reported through the three members that describe it: while the terms
+        // the model is offered under are unaccepted there is no agreement, no entitlement
+        // and no authorization to use it.
+        let (agreement_status, entitlement, authorization) =
+            if crate::state::model_agreement_outstanding(&model) {
+                (
+                    crate::state::AGREEMENT_STATUS_NOT_AVAILABLE,
+                    crate::state::AVAILABILITY_NOT_AVAILABLE,
+                    crate::state::AUTHORIZATION_STATUS_NOT_AUTHORIZED,
+                )
+            } else {
+                (
+                    crate::state::AGREEMENT_STATUS_AVAILABLE,
+                    crate::state::AVAILABILITY_AVAILABLE,
+                    crate::state::AUTHORIZATION_STATUS_AUTHORIZED,
+                )
+            };
+
+        Ok(GetFoundationModelAvailabilityOutput {
+            // The id the request named, which is the model this standing is about.
+            model_id: input.model_id.clone(),
+            agreement_availability: AgreementAvailability {
+                status: agreement_status.to_string(),
+                // Optional, and nothing about this read failed.
+                error_message: None,
+            },
+            authorization_status: authorization.to_string(),
+            entitlement_availability: entitlement.to_string(),
+            // The published catalog does not vary by region, so a model it carries is
+            // offered in the region the request addressed.
+            region_availability: crate::state::AVAILABILITY_AVAILABLE.to_string(),
+        })
     }
 }

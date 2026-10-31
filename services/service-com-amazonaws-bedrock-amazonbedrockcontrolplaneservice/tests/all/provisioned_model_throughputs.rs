@@ -21,10 +21,11 @@
 //!    bounds), addressed by either `ProvisionedModelId` spelling (its ARN or its name).
 //! 3. **Model units are bought out of the quota the account has been GRANTED for them**,
 //!    and which quota applies depends on whether the request carries a
-//!    `commitmentDuration`: a no-commitment create is refused with
-//!    `ServiceQuotaExceededException` naming the model it asked for and handing over the
-//!    documented service-limit-increase support case form for the region it addressed, and
-//!    a committed one is admitted up to the granted units and refused past them.
+//!    `commitmentDuration`: a no-commitment create over a model AWS offers a no-commitment
+//!    purchase for is refused with `ServiceQuotaExceededException` naming the model it
+//!    asked for and handing over the documented service-limit-increase support case form
+//!    for the region it addressed, and a committed one is admitted up to the granted units
+//!    and refused past them.
 //! 4. **`modelId` must name a base model the account's catalog offers with Provisioned
 //!    Throughput**: a model the catalog does not carry is 404 `ResourceNotFoundException`,
 //!    one it carries but offers on demand only is 400 `ValidationException`.
@@ -60,6 +61,20 @@ const PROVISIONABLE_MODELS: &[&str] = &[
     "anthropic.claude-3-haiku-20240307-v1:0",
     "cohere.command-text-v14",
     "meta.llama3-70b-instruct-v1:0",
+];
+
+/// Base models the same catalog offers with Provisioned Throughput and NO commitment term:
+/// the ids
+/// `service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::NO_COMMITMENT_PROVISIONED_MODELS`
+/// carries, which is where a no-commitment purchase reaches the account's no-commitment
+/// model-unit quota at all. Over a model offered only UNDER a term there is no such
+/// purchase to make, which is its own refusal (asserted in
+/// `tests/all/foundation_model_catalogue_resolution.rs`).
+const NO_COMMITMENT_MODELS: &[&str] = &[
+    "amazon.titan-text-lite-v1",
+    "cohere.command-text-v14",
+    "cohere.command-light-text-v14",
+    "amazon.titan-image-generator-v1",
 ];
 
 /// Base models the same catalog offers ON DEMAND ONLY, so no Provisioned Throughput can be
@@ -428,16 +443,16 @@ async fn model_units_are_bought_out_of_the_granted_quota() {
     // for (`modelUnits` is `range 1..`) is refused, and the refusal names the model the
     // request asked for.
     let refused: Vec<(&str, &str, i32)> = vec![
-        ("one unit, no commitment", PROVISIONABLE_MODELS[0], 1),
-        ("two units, no commitment", PROVISIONABLE_MODELS[1], 2),
+        ("one unit, no commitment", NO_COMMITMENT_MODELS[0], 1),
+        ("two units, no commitment", NO_COMMITMENT_MODELS[1], 2),
         (
             "every granted committed unit, but no commitment",
-            PROVISIONABLE_MODELS[2],
+            NO_COMMITMENT_MODELS[2],
             GRANTED_COMMITTED_UNITS,
         ),
         (
             "more units than any quota grants, no commitment",
-            PROVISIONABLE_MODELS[3],
+            NO_COMMITMENT_MODELS[3],
             GRANTED_COMMITTED_UNITS + 1,
         ),
     ];
@@ -569,29 +584,29 @@ async fn the_no_commitment_quota_refusal_hands_over_the_service_limit_increase_c
     let rows: Vec<(&str, String, &str, &str, i32)> = vec![
         (
             "a bare model id in the suite's region, one unit",
-            PROVISIONABLE_MODELS[0].to_string(),
-            PROVISIONABLE_MODELS[0],
+            NO_COMMITMENT_MODELS[0].to_string(),
+            NO_COMMITMENT_MODELS[0],
             REGION,
             1,
         ),
         (
             "the model ARN spelling, a second region, several units",
-            model_arn("us-east-1", PROVISIONABLE_MODELS[1]),
-            PROVISIONABLE_MODELS[1],
+            model_arn("us-east-1", NO_COMMITMENT_MODELS[1]),
+            NO_COMMITMENT_MODELS[1],
             "us-east-1",
             4,
         ),
         (
             "a third base model in a third region, every granted committed unit",
-            PROVISIONABLE_MODELS[2].to_string(),
-            PROVISIONABLE_MODELS[2],
+            NO_COMMITMENT_MODELS[2].to_string(),
+            NO_COMMITMENT_MODELS[2],
             "eu-central-1",
             GRANTED_COMMITTED_UNITS,
         ),
         (
             "a fourth base model, ARN spelling, past any granted units",
-            model_arn("ap-northeast-1", PROVISIONABLE_MODELS[3]),
-            PROVISIONABLE_MODELS[3],
+            model_arn("ap-northeast-1", NO_COMMITMENT_MODELS[3]),
+            NO_COMMITMENT_MODELS[3],
             "ap-northeast-1",
             GRANTED_COMMITTED_UNITS + 1,
         ),

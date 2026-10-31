@@ -9,15 +9,15 @@
 //!
 //! `modelIdentifier` names a base model either by its `modelId` or by its
 //! `foundation-model` ARN (`GetFoundationModelIdentifier` admits both spellings), and both
-//! resolve to the same row through [`crate::state::base_model_id_of`]. The row is the one
-//! the catalog publishes under that exact `modelId`: a `:`-qualified variant the catalog
-//! publishes no row for is not a model this service offers, which is why this resolves
-//! exactly rather than through [`crate::state::FoundationModelCatalog::qualified_model`]
-//! (that one reads the base model out of an id embedded in a RESOURCE's ARN, where the
-//! caller names a resource rather than asking what the catalog publishes). An identifier
-//! the catalog has no row for names a model this service does not offer, which is
-//! `ResourceNotFoundException` (404) — the same refusal the inference plane answers for an
-//! identifier that resolves to no model it serves.
+//! resolve to the same row through
+//! [`crate::state::FoundationModelCatalog::resolve_base_model`]. An identifier the catalog
+//! resolves to no OFFERED model is refused for the REASON it names none
+//! ([`crate::state::unoffered_foundation_model`]): a model this service recognises and
+//! offers no longer, and a model ARN naming nothing, are resources to report missing — 404
+//! `ResourceNotFoundException`, the first carrying the end-of-life reason the inference
+//! plane states for the same class — while a bare model id naming no model at all is a
+//! value this service cannot read as a model, which is 400 `ValidationException` carrying
+//! [`crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE`].
 //!
 //! The response is [`crate::state::foundation_model_details`], the one mapping of a
 //! catalog row that `ops/list_foundation_models.rs` also reports a model through, so a
@@ -180,23 +180,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // Both spellings `GetFoundationModelIdentifier` admits — the bare `modelId` and
-        // the model's `foundation-model` ARN — name the same catalog row.
-        let Some(model) = store
+        // the model's `foundation-model` ARN — name the same catalog row, and an identifier
+        // the catalog resolves to no OFFERED model is refused for the reason it names none
+        // ([`crate::state::unoffered_foundation_model`]): a model past its end of life and a
+        // model ARN naming nothing are resources to report missing (404), while a bare id
+        // naming no model at all is an identifier this service cannot read, which is a 400
+        // `ValidationException` about the request rather than a report about a resource.
+        let model = match store
             .foundation_models
-            .model(crate::state::base_model_id_of(&input.model_identifier))
-        else {
-            return Err(GetFoundationModelErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::foundation_model_not_found(
-                        &input.model_identifier,
-                    )),
-                },
-            )
-            .into());
+            .resolve_base_model(&input.model_identifier)
+        {
+            crate::state::BaseModelIdentity::Offered(model) => *model,
+            _ => {
+                let refusal = crate::state::unoffered_foundation_model(&input.model_identifier);
+                let message = Some(refusal.message(&input.model_identifier));
+                return Err(match refusal {
+                    crate::state::UnofferedFoundationModel::UnreadableIdentifier => {
+                        GetFoundationModelErrorModeled::ValidationException(ValidationException {
+                            message,
+                        })
+                    }
+                    _ => GetFoundationModelErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException { message },
+                    ),
+                }
+                .into());
+            }
         };
 
         Ok(GetFoundationModelOutput {
-            model_details: Some(crate::state::foundation_model_details(model, &region)),
+            model_details: Some(crate::state::foundation_model_details(&model, &region)),
         })
     }
 }

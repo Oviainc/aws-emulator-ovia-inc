@@ -18,10 +18,11 @@
 //! 3. **The reported ARN is the `foundation-model` ARN for the region the request
 //!    addresses**, with the EMPTY account field `FoundationModelArn` declares, and the
 //!    catalog itself does not vary by region.
-//! 4. **An identifier that names no model the service offers is refused with 404
-//!    `ResourceNotFoundException`** — a bare id and an ARN of a model the catalog has no
-//!    row for, including the ids of models past their end of life, which are offered by
-//!    nobody and so appear in no listing either.
+//! 4. **An identifier that names no model the service offers is refused for the REASON it
+//!    names none**: a model past its end of life, which the service still recognises, and
+//!    a model ARN naming nothing are resources to report missing (404
+//!    `ResourceNotFoundException`), while a bare model id naming no model at all is a
+//!    value the service cannot read as a model (400 `ValidationException`).
 //! 5. **A value the identifier's own constraints exclude is refused with 400
 //!    `ValidationException`**, never read around and never reported as a missing resource.
 //! 6. **Reading is a pure read**: two reads of the same identifier answer identically, a
@@ -94,6 +95,17 @@ fn details(case: &str, reply: &Reply) -> Value {
 /// The `FoundationModelDetails` a read of `model` in `region` must report, read off the
 /// catalog row itself.
 fn expected_details(model: &FoundationModel, region: &str) -> Value {
+    let mut lifecycle = json!({
+        "status": model.lifecycle_status,
+        // Every offered model has launched, so a read reports its launch instant.
+        "startOfLifeTime": model.start_of_life_time,
+    });
+    // Both ends of the legacy window AWS publishes, for a deprecated model and for no
+    // other; `publicExtendedAccessTime` is published for none.
+    if let Some(window) = model.legacy_window {
+        lifecycle["legacyTime"] = json!(window.entered_at);
+        lifecycle["endOfLifeTime"] = json!(window.end_of_life_at);
+    }
     json!({
         "modelArn": format!("arn:aws:bedrock:{region}::foundation-model/{}", model.model_id),
         "modelId": model.model_id,
@@ -104,9 +116,7 @@ fn expected_details(model: &FoundationModel, region: &str) -> Value {
         "responseStreamingSupported": model.response_streaming_supported,
         "customizationsSupported": model.customizations_supported,
         "inferenceTypesSupported": model.inference_types_supported,
-        // Only `status`: no page publishes a launch, legacy or end-of-life instant per
-        // model, so a read reports none of the four.
-        "modelLifecycle": { "status": model.lifecycle_status },
+        "modelLifecycle": lifecycle,
     })
 }
 
@@ -188,19 +198,11 @@ async fn a_read_reports_the_arn_of_the_region_the_request_addresses() {
 
 #[tokio::test]
 async fn an_identifier_naming_no_offered_model_is_not_found() {
-    // The rows differ along WHY the identifier names no offered model: a provider the
-    // catalog has no row from, a known provider with an unknown model, a model past its
-    // end of life (by bare id and by ARN), and an ARN whose model the catalog has no row
-    // for — including one minted for another region.
+    // A resource to report MISSING: the rows differ along why the identifier names a model
+    // that is gone or an ARN that resolves to nothing — a model past its end of life (by
+    // bare id and by ARN), and an ARN of a model the catalog has no row for, including one
+    // minted for another region.
     let mut rows: Vec<(String, String)> = vec![
-        (
-            "a provider the catalog carries nothing from".to_string(),
-            "nonesuch.model-v1:0".to_string(),
-        ),
-        (
-            "a known provider with a model the catalog has no row for".to_string(),
-            "amazon.nova-sonic-v9:0".to_string(),
-        ),
         (
             "an ARN of a model the catalog has no row for".to_string(),
             model_arn(REGION, "nonesuch.model-v1:0"),
@@ -234,6 +236,40 @@ async fn an_identifier_naming_no_offered_model_is_not_found() {
             code, "ResourceNotFoundException",
             "case {case:?} ({identifier:?}): expected ResourceNotFoundException, got {code:?} \
              {:?}",
+            reply.body
+        );
+    }
+}
+
+/// A BARE model id naming no model at all is a value the service cannot read as a model, so
+/// it is refused as an input fault rather than reported as a missing resource. Rows differ
+/// along why no model answers to it: a provider the catalog carries nothing from, and a
+/// known provider with a model it has no row for.
+#[tokio::test]
+async fn a_bare_identifier_naming_no_model_at_all_is_refused_as_invalid() {
+    let rows = [
+        (
+            "a provider the catalog carries nothing from",
+            "nonesuch.model-v1:0",
+        ),
+        (
+            "a known provider with a model the catalog has no row for",
+            "amazon.nova-sonic-v9:0",
+        ),
+    ];
+
+    let emu = emulator();
+    for (case, identifier) in rows {
+        let reply = get(&emu, identifier).await;
+        assert_eq!(
+            reply.status, 400,
+            "case {case:?} ({identifier:?}): expected 400, got {} {:?}",
+            reply.status, reply.body
+        );
+        let code = reply.error.as_deref().map(error_code).unwrap_or("none");
+        assert_eq!(
+            code, "ValidationException",
+            "case {case:?} ({identifier:?}): expected ValidationException, got {code:?} {:?}",
             reply.body
         );
     }

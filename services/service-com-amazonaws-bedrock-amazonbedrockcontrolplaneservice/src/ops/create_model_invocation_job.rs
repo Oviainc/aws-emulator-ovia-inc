@@ -284,14 +284,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `custom-model` ARN and an inference profile ARN
             // (`smithy_query(query="operation",operation="CreateModelInvocationJob")`: its
             // pattern carries all three), so each of those families is asked in turn,
-            // through the very index its own reads resolve an identifier through. A value
-            // naming none of them names no model there is anything to invoke, reported
-            // absent exactly as `ops/create_model_customization_job.rs` reports a base
-            // model the catalog does not carry.
-            let names_a_model = store
-                .foundation_models
-                .qualified_model(crate::state::base_model_id_of(&input.model_id))
-                .is_some()
+            // through the very index its own reads resolve an identifier through. A
+            // foundation model this service recognises counts whether or not it is still
+            // OFFERED (`crate::state::FoundationModelCatalog::resolve_base_model`): a
+            // retired model's id names a model, so the submission is judged on what it
+            // asks for rather than reported as naming nothing. A value naming none of
+            // these families names no model there is anything to invoke, reported absent
+            // exactly as `ops/create_model_customization_job.rs` reports a base model the
+            // catalog does not carry.
+            let names_a_model = !matches!(
+                store.foundation_models.resolve_base_model(&input.model_id),
+                crate::state::BaseModelIdentity::Unknown
+            )
                 || store.custom_model(&input.model_id, &region, now).is_some()
                 || store
                     .inference_profile_arn_of(&input.model_id, &region)

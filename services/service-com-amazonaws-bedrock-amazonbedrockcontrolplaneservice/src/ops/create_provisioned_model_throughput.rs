@@ -12,17 +12,24 @@
 //! * model units come out of the quota the account has been GRANTED for them, and which
 //!   quota that is depends on whether the request carries a `commitmentDuration`
 //!   ([`crate::state::granted_model_units`]): a create asking for more model units than
-//!   are granted is refused with 400 `ServiceQuotaExceededException`.
+//!   are granted is refused with 400 `ServiceQuotaExceededException`. That quota is only
+//!   reached for a purchase the model can back at all: a request that omits
+//!   `commitmentDuration` asks for a no-commitment Provisioned Throughput, which AWS
+//!   offers only over the base models it publishes one for
+//!   ([`crate::state::supports_no_commitment_provisioned_throughput`]), so over any other
+//!   model that purchase is refused with 400 `ValidationException`.
 //! * `provisionedModelName` is the OTHER spelling of `ProvisionedModelId`
 //!   (`smithy_query(query="operation",operation="GetProvisionedModelThroughput")`), so two
 //!   live Provisioned Throughputs of one name in one region could not both be addressed by
 //!   it: a second create of a live name is refused with 400 `ValidationException`.
 //! * `modelId` names the base model the throughput is bought over, as a model ARN or a bare
-//!   model id ([`crate::state::base_model_id_of`]). A model this account's published
-//!   catalog does not carry is no resource to provision — 404 `ResourceNotFoundException` —
-//!   and one the catalog carries but does not offer with Provisioned Throughput
-//!   ([`crate::state::supports_provisioned_throughput`]) is refused with 400
-//!   `ValidationException`.
+//!   model id ([`crate::state::FoundationModelCatalog::resolve_base_model`]). A model no
+//!   model id of this service names is no resource to provision — 404
+//!   `ResourceNotFoundException` — while a model that EXISTS and is offered under no
+//!   Provisioned Throughput is refused with 400 `ValidationException`: one the catalog
+//!   carries without it ([`crate::state::supports_provisioned_throughput`]), and one this
+//!   service recognises and offers no longer
+//!   ([`crate::state::RETIRED_FOUNDATION_MODELS`]), which is offered under nothing at all.
 //! * `commitmentDuration` names a term, so the stored record carries the instant that term
 //!   ends ([`crate::state::commitment_term`]) and a read reports it as
 //!   `commitmentExpirationTime`.
@@ -252,35 +259,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let Some(model) = store
-            .foundation_models
-            .model(crate::state::base_model_id_of(&input.model_id))
-            .copied()
-        else {
-            return Err(
-                CreateProvisionedModelThroughputErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "modelId {} does not name a model in this account",
-                            input.model_id
-                        )),
-                    },
+        // What the `modelId` names decides WHICH refusal a model that cannot back this
+        // purchase gets: a model the catalog offers without Provisioned Throughput, and a
+        // model this service recognises and offers no longer, are both models that exist
+        // and are offered under no Provisioned Throughput — one 400 `ValidationException`
+        // about the purchase ([`crate::state::MODEL_NOT_SUPPORTED_FOR_PROVISIONED_THROUGHPUT`])
+        // — while only an identifier naming no model at all is a resource to report missing.
+        let not_provisionable = || {
+            CreateProvisionedModelThroughputErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        crate::state::MODEL_NOT_SUPPORTED_FOR_PROVISIONED_THROUGHPUT.to_string(),
+                    ),
+                },
+            )
+        };
+        let model = match store.foundation_models.resolve_base_model(&input.model_id) {
+            crate::state::BaseModelIdentity::Offered(model) => *model,
+            crate::state::BaseModelIdentity::Retired => return Err(not_provisionable().into()),
+            crate::state::BaseModelIdentity::Unknown => {
+                return Err(
+                    CreateProvisionedModelThroughputErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "modelId {} does not name a model in this account",
+                                input.model_id
+                            )),
+                        },
+                    )
+                    .into(),
                 )
-                .into(),
-            );
+            }
         };
         if !crate::state::supports_provisioned_throughput(&model) {
-            return Err(
-                CreateProvisionedModelThroughputErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "model {} is not offered with Provisioned Throughput",
-                            model.model_id
-                        )),
-                    },
-                )
-                .into(),
-            );
+            return Err(not_provisionable().into());
+        }
+        // A purchase that omits `commitmentDuration` asks for a no-commitment Provisioned
+        // Throughput, which only the base models AWS offers one for can back
+        // (`crate::state::supports_no_commitment_provisioned_throughput`): over any other
+        // model there is no such purchase to make, so the refusal is the same
+        // not-supported one rather than a report about the account's no-commitment quota.
+        if input.commitment_duration.is_none()
+            && !crate::state::supports_no_commitment_provisioned_throughput(&model)
+        {
+            return Err(not_provisionable().into());
         }
 
         // Model units are bought out of the quota the account has been GRANTED for them,

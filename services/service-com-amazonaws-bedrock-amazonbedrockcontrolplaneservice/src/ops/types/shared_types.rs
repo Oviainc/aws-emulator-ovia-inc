@@ -1422,7 +1422,14 @@ pub struct ModelInvocationJobS3OutputDataConfig {
     pub s3_bucket_owner: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#FoundationModelLifecycle")]
+/// `FoundationModelLifecycle`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because all four of its instants carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="FoundationModelLifecycle")`), which the derive does
+/// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct FoundationModelLifecycle {
     pub status: String,
@@ -1431,6 +1438,40 @@ pub struct FoundationModelLifecycle {
     pub legacy_time: Option<::aws_smithy_types::DateTime>,
     pub public_extended_access_time: Option<::aws_smithy_types::DateTime>,
 }
+
+bedrock_schema_and_codec!(
+    FoundationModelLifecycle,
+    FOUNDATION_MODEL_LIFECYCLE_SCHEMA,
+    "com.amazonaws.bedrock#FoundationModelLifecycle",
+    "com.amazonaws.bedrock",
+    "FoundationModelLifecycle",
+    (M_STATUS, status, "status", 0, req, string),
+    (
+        M_START_OF_LIFE_TIME,
+        start_of_life_time,
+        "startOfLifeTime",
+        1,
+        opt,
+        date_time
+    ),
+    (
+        M_END_OF_LIFE_TIME,
+        end_of_life_time,
+        "endOfLifeTime",
+        2,
+        opt,
+        date_time
+    ),
+    (M_LEGACY_TIME, legacy_time, "legacyTime", 3, opt, date_time),
+    (
+        M_PUBLIC_EXTENDED_ACCESS_TIME,
+        public_extended_access_time,
+        "publicExtendedAccessTime",
+        4,
+        opt,
+        date_time
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrock#PromptRouterTargetModel")]
 #[derive(Debug, Clone, Default)]

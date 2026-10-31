@@ -897,6 +897,18 @@ pub fn service_limit_increase_case_url(region: &str) -> String {
     )
 }
 
+/// What a Provisioned Throughput purchase answers as its `ValidationException` message when
+/// the `modelId` names a model no Provisioned Throughput can be bought over.
+///
+/// RECORDED behaviour, and a FIXED sentence: it quotes no part of the request, so the model
+/// the caller named is not echoed back. ONE sentence for every model that cannot back such a
+/// purchase, because the reason is the same in each case — the model is offered under no
+/// Provisioned Throughput: a model the catalog offers on demand only
+/// ([`supports_provisioned_throughput`]) and a model this service recognises and offers no
+/// longer ([`RETIRED_FOUNDATION_MODELS`]), which is offered under nothing at all.
+pub const MODEL_NOT_SUPPORTED_FOR_PROVISIONED_THROUGHPUT: &str =
+    "The provided model is not supported for provisioned throughput.";
+
 /// `InferenceType` — the inference a Provisioned Throughput buys, as
 /// `crate::ops::types::INFERENCE_TYPE_VALUES` (`[ON_DEMAND, PROVISIONED]`) spells it.
 ///
@@ -6133,6 +6145,48 @@ pub fn supports_provisioned_throughput(model: &FoundationModel) -> bool {
         .contains(&INFERENCE_TYPE_PROVISIONED)
 }
 
+/// The base models offered with Provisioned Throughput and NO commitment term.
+///
+/// Whether a purchase may omit `commitmentDuration` is a property of the MODEL, not of the
+/// account: that member's own documentation sends a caller to "Supported Regions and models
+/// for Provisioned Throughput" for "which base models support no commitment"
+/// (`smithy_query(query="doc",shape="CreateProvisionedModelThroughputRequest",member="commitmentDuration")`,
+/// which also states that custom models support every level of commitment). The base models
+/// that page lists a no-commitment purchase for are the earlier generations — the Amazon
+/// Titan family, the Cohere models, Mixtral and SDXL — so a later model is offered with
+/// Provisioned Throughput only under a term, and a no-commitment purchase over one of those
+/// is refused rather than drawn against the no-commitment model-unit quota
+/// ([`granted_model_units`]).
+///
+/// Kept as a list of ids rather than a column of [`FOUNDATION_MODELS`] because it is a
+/// different published table from the per-model attributes those rows carry. Every id here
+/// is a row of that catalog whose `inferenceTypesSupported` carries
+/// [`INFERENCE_TYPE_PROVISIONED`], which is what
+/// [`supports_no_commitment_provisioned_throughput`] holds it to.
+pub const NO_COMMITMENT_PROVISIONED_MODELS: &[&str] = &[
+    "amazon.titan-embed-image-v1",
+    "amazon.titan-embed-text-v2:0",
+    "amazon.titan-image-generator-v1",
+    "amazon.titan-text-lite-v1",
+    "cohere.command-light-text-v14",
+    "cohere.command-text-v14",
+    "cohere.embed-english-v3",
+    "mistral.mixtral-8x7b-instruct-v0:1",
+    "stability.stable-diffusion-xl-v1",
+];
+
+/// Whether a Provisioned Throughput over `model` can be bought with NO commitment term
+/// ([`NO_COMMITMENT_PROVISIONED_MODELS`]).
+///
+/// A model that is offered with no Provisioned Throughput at all is offered with none
+/// without a commitment either, so this answers for the catalog row as a whole rather than
+/// for the id alone.
+#[must_use]
+pub fn supports_no_commitment_provisioned_throughput(model: &FoundationModel) -> bool {
+    supports_provisioned_throughput(model)
+        && NO_COMMITMENT_PROVISIONED_MODELS.contains(&model.model_id)
+}
+
 /// The `ProvisionedModelSummary` a listing reports for a stored Provisioned Throughput.
 ///
 /// Lives here rather than in `ops/list_provisioned_model_throughputs.rs` because every
@@ -7021,6 +7075,35 @@ pub struct FoundationModel {
     /// for one that is deprecated
     /// (`crate::ops::types::FOUNDATION_MODEL_LIFECYCLE_STATUS_VALUES`).
     pub lifecycle_status: &'static str,
+    /// `FoundationModelLifecycle$startOfLifeTime` — "Launch time when the model first
+    /// becomes available" (`smithy_query(query="shape",shape="FoundationModelLifecycle")`),
+    /// as an RFC 3339 instant: the day AWS made the model available on Amazon Bedrock, taken
+    /// from that model's launch, at midnight UTC because what is published for it is a day
+    /// rather than an instant. Every offered model has one — a model that is offered has
+    /// launched — so this is not an `Option`.
+    pub start_of_life_time: &'static str,
+    /// `FoundationModelLifecycle$legacyTime` and `$endOfLifeTime` — the legacy window AWS
+    /// publishes for a deprecated model ([`LegacyWindow`]), carried by a row whose
+    /// [`FoundationModel::lifecycle_status`] is [`LIFECYCLE_LEGACY`] and by no other: a
+    /// model that is still available has entered no legacy state and is scheduled for no
+    /// end of life, and an instant for one is not something to invent.
+    pub legacy_window: Option<LegacyWindow>,
+}
+
+/// The legacy window AWS publishes for a deprecated base model ("Model lifecycle" in the
+/// Amazon Bedrock User Guide): a model enters legacy state on one date and stops being
+/// available on another, and a caller is expected to move off it in between.
+///
+/// The two instants travel together because they are two ends of ONE window: a model that
+/// has entered legacy state has an end of life, and one that has not has neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyWindow {
+    /// `FoundationModelLifecycle$legacyTime` — "Time when the model enters legacy state"
+    /// (`smithy_query(query="shape",shape="FoundationModelLifecycle")`), as RFC 3339.
+    pub entered_at: &'static str,
+    /// `FoundationModelLifecycle$endOfLifeTime` — "Time when the model is no longer
+    /// available for use", the far end of the window, as RFC 3339.
+    pub end_of_life_at: &'static str,
 }
 
 /// `ModelModality` — a model that takes text only.
@@ -7094,6 +7177,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-08-22T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "amazon.nova-canvas-v1:0",
@@ -7105,6 +7190,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-12-03T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "amazon.nova-lite-v1:0",
@@ -7116,6 +7203,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: FINE_TUNING_AND_DISTILLATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-12-03T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "amazon.nova-micro-v1:0",
@@ -7127,6 +7216,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: FINE_TUNING_AND_DISTILLATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-12-03T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "amazon.nova-pro-v1:0",
@@ -7138,6 +7229,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: FINE_TUNING_AND_DISTILLATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-12-03T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "amazon.titan-embed-image-v1",
@@ -7149,6 +7242,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2023-11-29T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "amazon.titan-embed-text-v2:0",
@@ -7160,6 +7255,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-04-30T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "amazon.titan-image-generator-v1",
@@ -7171,6 +7268,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2023-11-29T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "amazon.titan-text-lite-v1",
@@ -7182,6 +7281,11 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: FINE_TUNING_AND_PRE_TRAINING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2023-09-28T00:00:00Z",
+        legacy_window: Some(LegacyWindow {
+            entered_at: "2025-04-30T00:00:00Z",
+            end_of_life_at: "2027-04-30T00:00:00Z",
+        }),
     },
     FoundationModel {
         model_id: "amazon.titan-text-premier-v1:0",
@@ -7193,6 +7297,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-04-30T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0",
@@ -7204,6 +7310,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-10-22T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "anthropic.claude-3-haiku-20240307-v1:0",
@@ -7215,6 +7323,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-03-13T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "anthropic.claude-3-sonnet-20240229-v1:0",
@@ -7226,6 +7336,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-03-04T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "cohere.command-light-text-v14",
@@ -7237,6 +7349,11 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2023-09-28T00:00:00Z",
+        legacy_window: Some(LegacyWindow {
+            entered_at: "2025-04-30T00:00:00Z",
+            end_of_life_at: "2027-06-30T00:00:00Z",
+        }),
     },
     FoundationModel {
         model_id: "cohere.command-text-v14",
@@ -7248,6 +7365,11 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2023-09-28T00:00:00Z",
+        legacy_window: Some(LegacyWindow {
+            entered_at: "2025-04-30T00:00:00Z",
+            end_of_life_at: "2027-06-30T00:00:00Z",
+        }),
     },
     FoundationModel {
         model_id: "cohere.embed-english-v3",
@@ -7259,6 +7381,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2023-11-29T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "meta.llama3-1-8b-instruct-v1:0",
@@ -7270,6 +7394,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-07-23T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "meta.llama3-70b-instruct-v1:0",
@@ -7281,6 +7407,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-04-18T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "mistral.mistral-large-2402-v1:0",
@@ -7292,6 +7420,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-04-02T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "mistral.mixtral-8x7b-instruct-v0:1",
@@ -7303,6 +7433,21 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2024-03-01T00:00:00Z",
+        legacy_window: None,
+    },
+    FoundationModel {
+        model_id: "moonshotai.kimi-k2.5",
+        model_name: "Kimi K2.5",
+        provider_name: "Moonshot AI",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2025-12-09T00:00:00Z",
+        legacy_window: None,
     },
     FoundationModel {
         model_id: "stability.stable-diffusion-xl-v1",
@@ -7314,6 +7459,8 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time: "2023-11-29T00:00:00Z",
+        legacy_window: None,
     },
 ];
 
@@ -7370,7 +7517,73 @@ impl FoundationModelCatalog {
             candidate = candidate.rsplit_once(':')?.0;
         }
     }
+
+    /// What a `ModelIdentifier` naming a BASE model names: a model this account's catalog
+    /// offers, a model this service still recognises and offers no longer
+    /// ([`RETIRED_FOUNDATION_MODELS`]), or no model at all.
+    ///
+    /// Both spellings the member admits are read — the bare model id and the model's
+    /// `foundation-model` ARN ([`base_model_id_of`]) — and the id is resolved the way a base
+    /// model id embedded in a resource is ([`Self::qualified_model`]), so a `:`-qualified
+    /// variant names the published model it is a variant of.
+    ///
+    /// The three answers are what let an operation refuse a model it cannot act on for the
+    /// right REASON: a model that exists but may not back this request is an eligibility or
+    /// authorization decision of that operation, while only an identifier naming no model at
+    /// all is a missing resource.
+    #[must_use]
+    pub fn resolve_base_model(&self, model_identifier: &str) -> BaseModelIdentity<'_> {
+        let base_model_id = base_model_id_of(model_identifier);
+        if let Some(model) = self.qualified_model(base_model_id) {
+            return BaseModelIdentity::Offered(model);
+        }
+        if RETIRED_FOUNDATION_MODELS.contains(&base_model_id) {
+            return BaseModelIdentity::Retired;
+        }
+        BaseModelIdentity::Unknown
+    }
 }
+
+/// What a `modelId` naming a base model resolves to
+/// ([`FoundationModelCatalog::resolve_base_model`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseModelIdentity<'a> {
+    /// A model the published catalog offers: the row itself.
+    Offered(&'a FoundationModel),
+    /// A model this service recognises and no longer offers, so there is no row to read and
+    /// nothing it is offered under.
+    Retired,
+    /// No model of this service: the identifier resolves to nothing at all.
+    Unknown,
+}
+
+/// The base model ids this service still RECOGNISES although it offers the model no longer:
+/// the ids AWS publishes as past their end of life ("Model lifecycle" in the Amazon Bedrock
+/// User Guide).
+///
+/// A model past its end of life is OFFERED by nobody, which is why [`FOUNDATION_MODELS`]
+/// carries no row for one — no listing reports it and no read of the catalog resolves it.
+/// Its id goes on naming a model this service knows, though, so a request that names one is
+/// not a request whose identifier cannot be read: an operation deciding whether a model may
+/// back what it is being asked for refuses it on THAT ground — the model is offered under
+/// nothing — rather than reporting that the identifier names no model
+/// ([`FoundationModelCatalog::resolve_base_model`]). This emulator's bedrock-runtime plane
+/// keeps the same ids in its own inventory for the same reason, where they are answered with
+/// the end-of-life refusal rather than an unreadable-identifier one.
+pub const RETIRED_FOUNDATION_MODELS: &[&str] = &[
+    "ai21.j2-grande-instruct",
+    "ai21.j2-jumbo-instruct",
+    "ai21.j2-mid-v1",
+    "ai21.j2-ultra-v1",
+    "amazon.titan-text-express-v1",
+    "anthropic.claude-instant-v1",
+    "anthropic.claude-v1",
+    "anthropic.claude-v2",
+    "anthropic.claude-v2:1",
+    "meta.llama2-13b-chat-v1",
+    "meta.llama2-70b-chat-v1",
+    "stability.stable-diffusion-xl-v0",
+];
 
 /// The `foundation-model` ARN of `model_id` in `region`:
 /// `arn:aws:bedrock:<region>::foundation-model/<modelId>`.
@@ -7410,9 +7623,12 @@ pub fn provider_matches(model: &FoundationModel, by_provider: &str) -> bool {
 /// ([`foundation_model_details`], which is built out of it), and the two must agree about
 /// them: a listed summary is the same row the read of that one model finds.
 ///
-/// `modelLifecycle` reports the row's `status` and none of the four lifecycle instants:
-/// nothing publishes a launch, legacy or end-of-life date per model, and a date is not
-/// something to invent.
+/// `modelLifecycle` reports the row's `status`, the row's launch instant
+/// ([`FoundationModel::start_of_life_time`], which every offered model has) and, for a
+/// deprecated model, both ends of the legacy window AWS publishes for it
+/// ([`FoundationModel::legacy_window`]): when it entered that state and when it stops being
+/// available. `publicExtendedAccessTime` is left out, because nothing publishes it per
+/// model: it is part of a legacy window AWS states no instant for.
 #[must_use]
 pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> FoundationModelSummary {
     let list = |values: &[&str]| values.iter().map(|value| (*value).to_string()).collect();
@@ -7428,12 +7644,27 @@ pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> Founda
         inference_types_supported: Some(list(model.inference_types_supported)),
         model_lifecycle: Some(FoundationModelLifecycle {
             status: model.lifecycle_status.to_string(),
-            start_of_life_time: None,
-            end_of_life_time: None,
-            legacy_time: None,
+            start_of_life_time: published_instant(model.start_of_life_time),
+            end_of_life_time: model
+                .legacy_window
+                .and_then(|window| published_instant(window.end_of_life_at)),
+            legacy_time: model
+                .legacy_window
+                .and_then(|window| published_instant(window.entered_at)),
             public_extended_access_time: None,
         }),
     }
+}
+
+/// A PUBLISHED instant of the catalog — one written in this file as the RFC 3339 day AWS
+/// publishes for it — as the wire timestamp type the response shapes carry.
+///
+/// `None` only for a value that is not an instant at all, which no row of
+/// [`FOUNDATION_MODELS`] carries: a row's instants are pinned by this crate's own suites, so
+/// a misspelled one fails there rather than being reported as an absent date.
+fn published_instant(published: &str) -> Option<::aws_smithy_types::DateTime> {
+    ::aws_smithy_types::DateTime::from_str(published, ::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
 }
 
 /// The same catalog row as the `FoundationModelDetails` a `GetFoundationModel` response
@@ -7523,6 +7754,41 @@ pub fn model_agreement_offers(model: &FoundationModel, offer_type: Option<&str>)
     }]
 }
 
+/// Whether this account has still to accept an agreement before it may use `model`.
+///
+/// An OUTSTANDING offer is exactly that statement: a model published under its provider's
+/// own end-user license agreement is offered to the account until the account accepts those
+/// terms, while a model AWS publishes itself is offered under none and so has no offer to
+/// accept ([`model_agreement_offers`]). Read off the same offers a listing reports, so the
+/// agreement a read of the model's availability describes is the one a caller can act on.
+#[must_use]
+pub fn model_agreement_outstanding(model: &FoundationModel) -> bool {
+    !model_agreement_offers(model, None).is_empty()
+}
+
+/// `AgreementStatus` — the agreement this account needs for the model is in place, which
+/// includes a model that needs none.
+pub const AGREEMENT_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// `AgreementStatus` — the account holds no agreement for the model, so an offer of the
+/// model's terms is still outstanding ([`model_agreement_outstanding`]).
+pub const AGREEMENT_STATUS_NOT_AVAILABLE: &str = "NOT_AVAILABLE";
+
+/// `AuthorizationStatus` — the account may use the model.
+pub const AUTHORIZATION_STATUS_AUTHORIZED: &str = "AUTHORIZED";
+
+/// `AuthorizationStatus` — the account may not use the model, because the terms it is
+/// offered under have not been accepted.
+pub const AUTHORIZATION_STATUS_NOT_AUTHORIZED: &str = "NOT_AUTHORIZED";
+
+/// `EntitlementAvailability` and `RegionAvailability` both spell their positive value this
+/// way: the entitlement the account would use the model under exists, and the model is
+/// offered in the region the request addressed.
+pub const AVAILABILITY_AVAILABLE: &str = "AVAILABLE";
+
+/// The same value set's negative: no entitlement, or no offering in the region.
+pub const AVAILABILITY_NOT_AVAILABLE: &str = "NOT_AVAILABLE";
+
 /// The `offerId` of the public offer of `model_id`.
 ///
 /// Derived from the model the offer is FOR, so the id a listing reports for a model is the
@@ -7564,6 +7830,78 @@ pub fn model_offer_token(model_id: &str, offer_id: &str) -> String {
 pub fn foundation_model_not_found(identifier: &str) -> String {
     format!("Could not resolve the model from the provided model identifier: {identifier}")
 }
+
+/// Why a `modelIdentifier` names no model the catalog offers, and so WHICH refusal the read
+/// of it answers.
+///
+/// Three different faults hide behind "the catalog has no row for it", and Amazon Bedrock
+/// tells them apart rather than reporting one of them for all three:
+///
+/// * a model the service recognises and no longer offers is a resource that EXISTED and is
+///   gone: `ResourceNotFoundException` (404), carrying the end-of-life reason;
+/// * an ARN naming no model is an ARN to report missing: `ResourceNotFoundException` (404),
+///   which is what that error documents itself as ("The specified resource Amazon Resource
+///   Name (ARN) was not found");
+/// * a bare model id naming no model is a value this service cannot read as a model at all,
+///   which is an INPUT fault: `ValidationException` (400) carrying the fixed
+///   [`INVALID_MODEL_IDENTIFIER_MESSAGE`].
+///
+/// Keeping them apart is what lets a caller act on the answer: 400 says "fix the request",
+/// where 404 is routinely retried as eventual consistency. It is the same split the
+/// inference plane makes for the same member, read here off the published catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnofferedFoundationModel {
+    /// A model past its end of life ([`RETIRED_FOUNDATION_MODELS`]).
+    PastEndOfLife,
+    /// A `foundation-model` ARN of this service's namespace naming no model.
+    MissingArn,
+    /// A bare model id naming no model.
+    UnreadableIdentifier,
+}
+
+impl UnofferedFoundationModel {
+    /// The sentence this refusal carries. Fixed text for the two readings whose fault is
+    /// the CLASS of the identifier rather than the value in it; the missing ARN echoes the
+    /// ARN the request addressed, because that is the resource it reports absent.
+    #[must_use]
+    pub fn message(self, identifier: &str) -> String {
+        match self {
+            Self::PastEndOfLife => FOUNDATION_MODEL_END_OF_LIFE_MESSAGE.to_string(),
+            Self::MissingArn => foundation_model_not_found(identifier),
+            Self::UnreadableIdentifier => INVALID_MODEL_IDENTIFIER_MESSAGE.to_string(),
+        }
+    }
+}
+
+/// How `identifier` — a `modelIdentifier` the catalog resolved to no offered model
+/// ([`FoundationModelCatalog::resolve_base_model`]) — is refused.
+///
+/// Stated once because the reading belongs to the published CATALOG rather than to one
+/// operation: every read that resolves a model identifier against it refuses an identifier
+/// it cannot resolve the same way.
+#[must_use]
+pub fn unoffered_foundation_model(identifier: &str) -> UnofferedFoundationModel {
+    if RETIRED_FOUNDATION_MODELS.contains(&base_model_id_of(identifier)) {
+        UnofferedFoundationModel::PastEndOfLife
+    } else if names_arn_of(identifier, FOUNDATION_MODEL_RESOURCE_TYPE) {
+        UnofferedFoundationModel::MissingArn
+    } else {
+        UnofferedFoundationModel::UnreadableIdentifier
+    }
+}
+
+/// The resource type a `foundation-model` ARN names, as `FoundationModelArn`'s pattern
+/// spells it (`…::foundation-model/<modelId>`) — what tells that spelling of a
+/// `modelIdentifier` from the bare model id the same member admits ([`names_arn_of`]).
+pub const FOUNDATION_MODEL_RESOURCE_TYPE: &str = "foundation-model";
+
+/// What this control plane answers for a model id whose model has reached end of life.
+///
+/// Taken from the Bedrock Runtime emulator, which states the same refusal for the same
+/// class on the inference surface, rather than spelled a second time here: one wording for
+/// one sentence, exactly as [`INVALID_MODEL_IDENTIFIER_MESSAGE`] is shared.
+pub const FOUNDATION_MODEL_END_OF_LIFE_MESSAGE: &str =
+    ::service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::state::END_OF_LIFE_MESSAGE;
 
 // =============================================================================
 // The published default prompt router catalog

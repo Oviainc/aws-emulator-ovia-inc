@@ -157,6 +157,17 @@ async fn an_unfiltered_listing_reports_every_catalog_row_in_model_id_order() {
             .find(|row| row.get("modelId").and_then(Value::as_str) == Some(model.model_id))
             .unwrap_or_else(|| panic!("case {case:?}: the listing must carry this catalog row"));
 
+        let mut lifecycle = json!({
+            "status": model.lifecycle_status,
+            // Every offered model has launched, so a summary reports its launch instant.
+            "startOfLifeTime": model.start_of_life_time,
+        });
+        // Both ends of the legacy window AWS publishes, for a deprecated model and for no
+        // other; `publicExtendedAccessTime` is published for none.
+        if let Some(window) = model.legacy_window {
+            lifecycle["legacyTime"] = json!(window.entered_at);
+            lifecycle["endOfLifeTime"] = json!(window.end_of_life_at);
+        }
         let expected = json!({
             "modelArn": format!("arn:aws:bedrock:{REGION}::foundation-model/{}", model.model_id),
             "modelId": model.model_id,
@@ -167,9 +178,7 @@ async fn an_unfiltered_listing_reports_every_catalog_row_in_model_id_order() {
             "responseStreamingSupported": model.response_streaming_supported,
             "customizationsSupported": model.customizations_supported,
             "inferenceTypesSupported": model.inference_types_supported,
-            // Only `status`: no page publishes a launch, legacy or end-of-life instant per
-            // model, so a summary reports none of the four.
-            "modelLifecycle": { "status": model.lifecycle_status },
+            "modelLifecycle": lifecycle,
         });
         assert_eq!(
             row, &expected,
