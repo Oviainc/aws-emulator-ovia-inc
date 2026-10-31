@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAddressListImportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAddressListImportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: mints a `JobId`, stores an import job for the address list the request
+//! names — in the one `ImportJobStatus` a job that has imported nothing carries — and
+//! answers with that id and the URL its input file is uploaded to. An `AddressListId` that
+//! names no stored address list is refused with the modelled `ResourceNotFoundException`,
+//! and `ClientToken` (`@idempotencyToken`) makes a retry return the id the first call
+//! minted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAddressListImportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The upload target it hands out is served by this service itself (see
+//! `crate::service`): a client can really write the input file to it.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +153,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAddressListImportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAddressListImportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAddressListImportJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the service is always mounted on the shared
+            // `InMemoryEngine`. Answered with a modelled retryable error rather than a
+            // 501, which would claim the operation is unwritten.
+            return Err(CreateAddressListImportJobErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let host = crate::state::request_endpoint_host(ctx, &region);
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+
+        let fingerprint = crate::state::create_import_job_fingerprint(
+            &input.address_list_id,
+            &input.name,
+            &input.import_data_format.import_data_type,
+        );
+
+        // `ClientToken` is `@idempotencyToken`: a retry must observe the first call's
+        // outcome, so it is resolved FIRST — the job the earlier call minted comes back
+        // with the upload target it was minted with, rather than a second job. A token
+        // presented with a DIFFERENT request is not a retry and is refused rather than
+        // answered with the first request's job; this operation models no
+        // `ConflictException`, so that refusal is the modelled `ValidationException`.
+        if let Some(recorded) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.import_job_idempotency.get(token))
+        {
+            if recorded.fingerprint != fingerprint {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "ClientToken was already used to create import job {} with different \
+                     parameters.",
+                    recorded.resource_id
+                )));
+            }
+            if let Some(job) = store.import_jobs.get(&recorded.resource_id) {
+                return Ok(CreateAddressListImportJobOutput {
+                    job_id: job.job_id.clone(),
+                    pre_signed_url: job.pre_signed_url.clone(),
+                });
+            }
+        }
+
+        // An import job imports INTO an address list, so the list has to exist: the
+        // modelled `ResourceNotFoundException` ("Occurs when a requested resource is not
+        // found") is what says the named one does not.
+        if !store.address_lists.contains_key(&input.address_list_id) {
+            return Err(
+                CreateAddressListImportJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Address list {} not found.",
+                            input.address_list_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The emulator's own ceiling on retained import jobs, checked AFTER the
+        // idempotency lookup — so a retry of a create that already succeeded is never
+        // refused by a ceiling it did not consume — and BEFORE any insert, so a refused
+        // create stores nothing.
+        if store.import_jobs.len() >= crate::state::MAX_IMPORT_JOBS {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "This emulator retains at most {} address list import jobs.",
+                crate::state::MAX_IMPORT_JOBS
+            )));
+        }
+
+        let job_id = store.mint_import_job_id(now);
+        let record = crate::state::ImportJobRecord {
+            pre_signed_url: crate::state::import_job_upload_url(&host, &job_id),
+            job_id: job_id.clone(),
+            address_list_id: input.address_list_id,
+            name: input.name,
+            // Creating the job imports nothing — it hands back the target the input file
+            // is uploaded to — so the job is in the status that has run no import, and
+            // carries neither a timestamp nor a count of one.
+            status: crate::state::IMPORT_JOB_STATUS_CREATED.to_string(),
+            import_data_type: input.import_data_format.import_data_type,
+            created_at_millis: now,
+            uploaded_file: None,
+            started_at_millis: None,
+            completed_at_millis: None,
+            imported_items_count: None,
+            failed_items_count: None,
+            error: None,
+        };
+        let pre_signed_url = record.pre_signed_url.clone();
+
+        if let Some(token) = input.client_token {
+            store.import_job_idempotency.insert(
+                token,
+                crate::state::IdempotentCreate {
+                    resource_id: job_id.clone(),
+                    fingerprint,
+                },
+            );
+        }
+        store.import_jobs.insert(job_id.clone(), record);
+
+        Ok(CreateAddressListImportJobOutput {
+            job_id,
+            pre_signed_url,
+        })
     }
 }

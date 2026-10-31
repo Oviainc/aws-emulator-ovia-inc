@@ -106,15 +106,83 @@ pub struct AddressListRecord {
     pub tags: Vec<Tag>,
 }
 
+/// The `ImportJobStatus` a created address-list import job carries.
+///
+/// `CreateAddressListImportJob` creates the job and hands back the URL its input file is
+/// uploaded to, so nothing has been imported when the call returns; `CREATED` is the one
+/// `ImportJobStatus` (see `crate::ops::types::IMPORT_JOB_STATUS_VALUES`, generated from
+/// the model's enum) that says exactly that, and the model's `ImportJob$Status` leaves
+/// `StartTimestamp`, `CompletedTimestamp` and both item counts optional precisely because
+/// a job in it has none of them yet.
+pub const IMPORT_JOB_STATUS_CREATED: &str = "CREATED";
+
+/// The most address-list import jobs this emulator keeps.
+///
+/// A resource guard this emulator OWNS, not an AWS-published quota:
+/// `CreateAddressListImportJob` models no quota error at all, so a create past this
+/// ceiling is refused with the modelled `ValidationException`. It bounds both the job
+/// records and the input files uploaded against them, so the store holds at most this
+/// many times [`MAX_IMPORT_FILE_BYTES`] of caller-supplied bytes.
+pub const MAX_IMPORT_JOBS: usize = 100;
+
+/// The most bytes one import job's uploaded input file is retained as.
+///
+/// The bytes live in this process's heap for as long as the job record does, so the upload
+/// plane bounds them: a larger body is refused there rather than stored. A resource guard
+/// this emulator owns, not an AWS-published limit; an import file is a list of addresses,
+/// so this holds tens of thousands of them.
+pub const MAX_IMPORT_FILE_BYTES: usize = 1024 * 1024;
+
+/// The input file that was uploaded to one import job's pre-signed URL: the bytes, and
+/// when they arrived.
+#[derive(Debug, Clone)]
+pub struct UploadedImportFile {
+    pub content: Vec<u8>,
+    pub uploaded_at_millis: i64,
+}
+
+/// One stored address-list import job: "an import job for an address list" (the model's
+/// `CreateAddressListImportJob` doc).
+///
+/// The single source of truth for every import-job operation:
+/// `CreateAddressListImportJob` writes it and `GetAddressListImportJob` reads it back. The
+/// members the model leaves optional are the ones only a RUNNING import fills
+/// ([`Self::started_at_millis`] and below), so a created job carries none of them.
+#[derive(Debug, Clone)]
+pub struct ImportJobRecord {
+    pub job_id: String,
+    pub address_list_id: String,
+    pub name: String,
+    /// One of `crate::ops::types::IMPORT_JOB_STATUS_VALUES`;
+    /// [`IMPORT_JOB_STATUS_CREATED`] until an import runs.
+    pub status: String,
+    /// The `ImportDataFormat$ImportDataType` the job was created for, one of
+    /// `crate::ops::types::IMPORT_DATA_TYPE_VALUES`.
+    pub import_data_type: String,
+    /// The URL the input file is uploaded to, minted once when the job was created: a
+    /// caller that reads the job back gets the same target it was first handed.
+    pub pre_signed_url: String,
+    pub created_at_millis: i64,
+    /// What the upload plane received at [`Self::pre_signed_url`], if anything yet.
+    pub uploaded_file: Option<UploadedImportFile>,
+    pub started_at_millis: Option<i64>,
+    pub completed_at_millis: Option<i64>,
+    pub imported_items_count: Option<i32>,
+    pub failed_items_count: Option<i32>,
+    pub error: Option<String>,
+}
+
 /// Per-service state for com-amazonaws-mailmanager-mailmanagersvc. A handler reaches it through [`service_state`].
 ///
 /// Every map is a `BTreeMap`, so `ListArchives` walks the archives in one stable,
 /// deterministic order and a pagination token can name the next key to resume from.
 ///
 /// BOUNDED: `CreateArchive` refuses a create that would take `archives` past
-/// [`MAX_ARCHIVES`] and `CreateAddressList` one that would take `address_lists` past
-/// [`MAX_ADDRESS_LISTS`]; every other map carries at most one entry per live archive or
-/// address list, so no caller can grow this store without limit.
+/// [`MAX_ARCHIVES`], `CreateAddressList` one that would take `address_lists` past
+/// [`MAX_ADDRESS_LISTS`] and `CreateAddressListImportJob` one that would take
+/// `import_jobs` past [`MAX_IMPORT_JOBS`]; every other map carries at most one entry per
+/// live archive, address list or import job, so no caller can grow this store without
+/// limit.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMailmanagerMailmanagersvcState {
     /// Archives by `ArchiveId`.
@@ -141,6 +209,16 @@ pub struct ComAmazonawsMailmanagerMailmanagersvcState {
     /// [`ComAmazonawsMailmanagerMailmanagersvcState::mint_address_list_id`]; see
     /// [`Self::archive_sequence`].
     pub address_list_sequence: u64,
+    /// Address-list import jobs by `JobId`.
+    pub import_jobs: BTreeMap<String, ImportJobRecord>,
+    /// `ClientToken` -> the `CreateAddressListImportJob` it completed. Separate from the
+    /// other two token maps so a token recorded for one resource is never read as a retry
+    /// of a create of another.
+    pub import_job_idempotency: BTreeMap<String, IdempotentCreate>,
+    /// Monotonic counter feeding
+    /// [`ComAmazonawsMailmanagerMailmanagersvcState::mint_import_job_id`]; see
+    /// [`Self::archive_sequence`].
+    pub import_job_sequence: u64,
 }
 
 impl ComAmazonawsMailmanagerMailmanagersvcState {
@@ -192,6 +270,14 @@ impl ComAmazonawsMailmanagerMailmanagersvcState {
     pub fn mint_address_list_id(&mut self, now_millis: i64) -> String {
         self.address_list_sequence = self.address_list_sequence.wrapping_add(1);
         mint_id(self.address_list_sequence, now_millis)
+    }
+
+    /// Mint a fresh import-job `JobId`, the same way [`Self::mint_archive_id`] mints an
+    /// archive id: 32 lowercase hex characters, which satisfy `JobId`'s modelled 1..255
+    /// length and `^[a-zA-Z0-9-]+$` pattern.
+    pub fn mint_import_job_id(&mut self, now_millis: i64) -> String {
+        self.import_job_sequence = self.import_job_sequence.wrapping_add(1);
+        mint_id(self.import_job_sequence, now_millis)
     }
 }
 
@@ -250,6 +336,16 @@ pub fn create_archive_fingerprint(
 /// [`create_archive_fingerprint`] for what it is compared against and why.
 pub fn create_address_list_fingerprint(address_list_name: &str, tags: Option<&[Tag]>) -> String {
     format!("{address_list_name}\u{1e}{}", render_tags(tags))
+}
+
+/// A stable description of the members an address-list import job is created from; see
+/// [`create_archive_fingerprint`] for what it is compared against and why.
+pub fn create_import_job_fingerprint(
+    address_list_id: &str,
+    name: &str,
+    import_data_type: &str,
+) -> String {
+    format!("{address_list_id}\u{1e}{name}\u{1e}{import_data_type}")
 }
 
 /// The tags of a create request, rendered into one unambiguous string for a fingerprint.
@@ -337,6 +433,91 @@ pub fn address_list_arn(region: &str, address_list_id: &str) -> String {
         "ses",
         region,
         &format!("mailmanager-address-list/{address_list_id}"),
+    )
+}
+
+/// The segment that names THIS service's upload plane behind the reserved data-plane path
+/// namespace (`::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`), so the
+/// locator [`import_job_upload_url`] hands out and the route that accepts the upload
+/// (`crate::service`) cannot drift, and so the path collides with no modelled route of any
+/// service.
+pub const IMPORT_JOB_UPLOAD_PLANE: &str = "address-list-import-jobs";
+
+/// The path the input file of `job_id` is uploaded at:
+/// `/_aws/{plane}/{resource}`, the reserved shape for a data plane this emulator serves on
+/// its one endpoint.
+pub fn import_job_upload_path(job_id: &str) -> String {
+    format!(
+        "/{}/{IMPORT_JOB_UPLOAD_PLANE}/{job_id}",
+        ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE
+    )
+}
+
+/// The job whose upload target `path` addresses, or `None` for every other path.
+///
+/// Reads the same namespace and plane segments the locator is built from. The id has to
+/// have the FORM this service mints one in, so a path of the same shape addressed to
+/// another mounted service is not mistaken for a locator this service published.
+pub fn parse_import_job_upload_path(path: &str) -> Option<&str> {
+    use ::service_common::data_plane_addressing::{first_segment, EMULATOR_PATH_NAMESPACE};
+
+    let (namespace, rest) = first_segment(path)?;
+    if namespace != EMULATOR_PATH_NAMESPACE {
+        return None;
+    }
+    let (plane, rest) = first_segment(rest)?;
+    if plane != IMPORT_JOB_UPLOAD_PLANE {
+        return None;
+    }
+    let job_id = rest.strip_prefix('/')?;
+    is_job_id_shaped(job_id).then_some(job_id)
+}
+
+/// Whether `candidate` could be a `JobId` at all: the modelled length 1..255 and pattern
+/// `^[a-zA-Z0-9-]+$` (`smithy_query(query="shape",shape="JobId")`).
+fn is_job_id_shaped(candidate: &str) -> bool {
+    (1..=255).contains(&candidate.len())
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// Where a client uploads the input file of the import job `job_id`:
+/// `CreateAddressListImportJobResponse$PreSignedUrl`, "The pre-signed URL target for
+/// uploading the input file".
+///
+/// AWS answers an Amazon S3 pre-signed URL here. This emulator provisions no object store,
+/// so the URL names THIS job's input file on the endpoint THIS REQUEST ARRIVED AT, and
+/// this service accepts the upload on that path itself (see `crate::service`) — a URL a
+/// client can really write the file to, rather than one pointing at the real service. NO
+/// signature is attached: this emulator signs no URLs, and a fabricated signature would
+/// claim a computation nothing performed; the minted, unguessable `JobId` is what names
+/// the target.
+pub fn import_job_upload_url(host: &str, job_id: &str) -> String {
+    format!("https://{host}{}", import_job_upload_path(job_id))
+}
+
+/// The endpoint host this request reached the emulator on, so a URL this service hands out
+/// resolves back to where the caller is already talking rather than naming a host nothing
+/// serves.
+///
+/// The reading is the workspace's one
+/// (`::service_common::data_plane_addressing::reached_endpoint_host`): the host the request
+/// addressed — its `Host` header, or the authority of an absolute-form URI for a request
+/// that carries its endpoint there — when it is shaped like a host, and this service's
+/// published endpoint for the region it was signed for otherwise.
+pub fn request_endpoint_host(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> String {
+    ::service_common::data_plane_addressing::reached_endpoint_host(
+        &ctx.parts().uri.to_string(),
+        ctx.parts()
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
+        crate::service::ENDPOINT_PREFIX,
+        region,
     )
 }
 
