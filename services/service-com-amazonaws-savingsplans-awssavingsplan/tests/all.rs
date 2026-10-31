@@ -45,6 +45,8 @@ mod return_window_bound;
 mod savings_plans_lifecycle;
 #[path = "all/shared_catalog_paging.rs"]
 mod shared_catalog_paging;
+#[path = "all/shared_page_cursor_rule.rs"]
+mod shared_page_cursor_rule;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_key_round_trip.rs"]

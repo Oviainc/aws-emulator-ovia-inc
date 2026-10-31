@@ -156,12 +156,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         /// Which paginator minted a token: see [`crate::state::encode_page_token`].
         const PAGE_KIND: &str = "planRates";
 
-        let offset = match input.next_token.as_deref() {
-            Some(token) => crate::state::decode_page_token(PAGE_KIND, token).ok_or_else(|| {
-                validation("nextToken is not a token this operation issued".to_string())
-            })?,
-            None => 0,
-        };
+        // The cursor rule — absent means the first result, foreign means this
+        // operation's `ValidationException` — is the one every paginated
+        // operation of this service shares.
+        let offset = crate::state::page_offset(PAGE_KIND, input.next_token.as_deref())
+            .map_err(validation)?;
         // `maxResults` is optional here (1..1000), and an absent one is "no page
         // size asked for": the rate card is computed from a catalog the service
         // owns, so a caller that names no size gets the service's own page,

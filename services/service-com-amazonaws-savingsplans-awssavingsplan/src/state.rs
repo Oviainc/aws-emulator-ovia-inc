@@ -417,6 +417,24 @@ pub fn decode_page_token(kind: &str, token: &str) -> Option<usize> {
     text.strip_prefix(kind)?.strip_prefix(':')?.parse().ok()
 }
 
+/// The offset a request's `nextToken` resumes a `kind` walk at, or the message
+/// with which this service refuses a cursor that paginator never minted.
+///
+/// One rule in ONE place, on top of the token format
+/// [`encode_page_token`]/[`decode_page_token`] own: an absent `nextToken` means
+/// the first result, and a token no `kind` page handed out is refused with this
+/// sentence. Like [`savings_plan_id_or_refusal`] below, it hands back the
+/// MESSAGE and each paginated handler only wraps it in its own operation's
+/// `ValidationException` variant, so the default, the error and the wording
+/// cannot drift between the operations that page.
+pub fn page_offset(kind: &str, next_token: Option<&str>) -> Result<usize, String> {
+    match next_token {
+        Some(token) => decode_page_token(kind, token)
+            .ok_or_else(|| "nextToken is not a token this operation issued".to_string()),
+        None => Ok(0),
+    }
+}
+
 /// One page of `items` starting at `offset`, plus the offset of the next page
 /// when one remains. `limit` of `None` means "every remaining item".
 pub fn paginate<T: Clone>(
