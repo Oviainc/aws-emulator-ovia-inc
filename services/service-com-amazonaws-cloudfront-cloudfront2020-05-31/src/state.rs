@@ -7611,6 +7611,38 @@ pub fn is_distribution_tenant_id(value: &str) -> bool {
         .is_some_and(is_token_body)
 }
 
+/// Whether `value` has the shape of an Anycast static IP list id this service mints
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::allocate_anycast_ip_list_id`]): the
+/// [`ANYCAST_IP_LIST_ID_PREFIX`] namespace, followed by a body.
+///
+/// The PREFIX is the whole of the shape. `AnycastIpList$Id` carries no pattern in the model,
+/// so nothing documents the body's width or its alphabet: the ids this emulator mints are
+/// [`ANYCAST_IP_LIST_ID_HEX_LEN`] lowercase hex digits because that is what one observed id
+/// is, which is no claim that CloudFront never writes another width or another alphabet —
+/// and recorded behaviour has an `ipl-` id of another form answered as a list that is ABSENT
+/// rather than as an identifier that cannot be read. What the prefix DOES decide is the
+/// namespace: a value carrying none of it was never an id of this resource kind, which is a
+/// property of the value alone and therefore decidable without consulting the store.
+pub fn is_anycast_ip_list_id(value: &str) -> bool {
+    value
+        .strip_prefix(ANYCAST_IP_LIST_ID_PREFIX)
+        .is_some_and(|body| !body.is_empty())
+}
+
+/// Whether `value` has the shape of a key group id this service mints
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::allocate_key_group_id`] draws a UUID),
+/// for the reason [`is_anycast_ip_list_id`] exists.
+pub fn is_key_group_id(value: &str) -> bool {
+    is_minted_uuid(value)
+}
+
+/// Whether `value` has the shape of a continuous deployment policy id this service mints
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::allocate_continuous_deployment_policy_id`]
+/// draws a UUID), for the reason [`is_anycast_ip_list_id`] exists.
+pub fn is_continuous_deployment_policy_id(value: &str) -> bool {
+    is_minted_uuid(value)
+}
+
 /// Whether `value` has the shape of a version token (`ETag`) this service mints.
 ///
 /// `If-Match` carries one, and the model constrains it no further than `string`: a value
@@ -9518,6 +9550,65 @@ pub fn invalid_max_items() -> crate::ops::types::InvalidArgument {
     }
 }
 
+/// The sentence CloudFront refuses a path identifier that is not in the shape its resource
+/// type's ids take with — the ONE producer of that sentence in this crate.
+///
+/// `member` is the MODEL's name for the request member that carried the identifier, which
+/// is the only variable part of the text: an operation that addresses its resource by `Id`
+/// answers "Id format is invalid", while `GetInvalidationForDistributionTenant` — whose
+/// tenant arrives in `DistributionTenantId` — names that member instead. Nothing the
+/// request SUPPLIED reaches the wire; the offending value is never echoed back.
+///
+/// [`RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE`] is this sentence's `Id` form as a
+/// `&'static str`, for the suites that assert it in a const table; nothing builds a refusal
+/// from it any more.
+pub fn id_format_invalid_message(member: &str) -> String {
+    format!("{member} format is invalid")
+}
+
+/// The modelled `InvalidArgument` (HTTP 400) for a path identifier outside the shape its
+/// resource type's ids take, naming the member that carried it
+/// ([`id_format_invalid_message`]).
+///
+/// The shape of an identifier is a property of the REQUEST, so an operation decides it
+/// before it resolves the identifier against the store: a value that was never an id of
+/// that resource kind is an argument CloudFront cannot read, not a resource that is
+/// absent.
+pub fn invalid_id_format(member: &str) -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(id_format_invalid_message(member)),
+    }
+}
+
+/// The modelled `EntityNotFound` (HTTP 404) for the same argument defect
+/// [`invalid_id_format`] reports, on an operation whose model serves no `InvalidArgument`:
+/// the code and the status are then the operation's own, and the MESSAGE is all that tells
+/// an unreadable identifier from a resource that is simply not there.
+pub fn entity_not_found_id_format(member: &str) -> EntityNotFound {
+    EntityNotFound {
+        message: Some(id_format_invalid_message(member)),
+    }
+}
+
+/// The modelled `NoSuchResource` (HTTP 404) an operation that ADDRESSES a key group by `Id`
+/// answers when no stored group answers to it.
+///
+/// `GetKeyGroup`'s model declares this one error, so one code and one status cover both
+/// outcomes and the MESSAGE is what tells them apart — the same split
+/// [`unresolved_response_headers_policy_id`] makes: an `Id` outside the shape every key
+/// group id takes ([`is_key_group_id`]) is refused as an unreadable identifier, while a
+/// well-formed id the store holds no group for is the absent-group sentence
+/// ([`no_such_key_group`]). Both are fixed text.
+pub fn unresolved_key_group_id(id: &str) -> NoSuchResource {
+    if is_key_group_id(id) {
+        no_such_key_group()
+    } else {
+        NoSuchResource {
+            message: Some(id_format_invalid_message("Id")),
+        }
+    }
+}
+
 /// The sentence a read of a key value store the store does not hold answers with: the
 /// CONDITION, carrying nothing from the request, as every other not-found sentence of this
 /// service states its own condition. CloudFront names the resource by its MODELLED shape
@@ -10059,7 +10150,7 @@ pub fn unresolved_response_headers_policy_id(id: &str) -> NoSuchResponseHeadersP
         no_such_response_headers_policy()
     } else {
         NoSuchResponseHeadersPolicy {
-            message: Some(RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE.to_string()),
+            message: Some(id_format_invalid_message("Id")),
         }
     }
 }
@@ -10076,6 +10167,11 @@ pub fn unresolved_response_headers_policy_id(id: &str) -> NoSuchResponseHeadersP
 /// Only an operation that ADDRESSES the policy resource by the identifier serves it, through
 /// [`unresolved_response_headers_policy_id`]: the precheck belongs to that operation, not to
 /// the error code.
+///
+/// The one PRODUCER of the sentence is [`id_format_invalid_message`], which spells it for any
+/// member name; this constant is its `Id` form, kept for the suites that assert the sentence
+/// as a `&'static str`, and `id_format_invalid_message_matches_the_constant_form` below pins
+/// the two together so neither can drift.
 pub const RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE: &str = "Id format is invalid";
 
 /// The modelled `InvalidArgument` (HTTP 400) for a `ListResponseHeadersPolicies` `Marker`
@@ -11080,6 +11176,95 @@ fn render_token(value: u64, len: usize) -> String {
 mod tests {
     use super::*;
     use crate::ops::types::{Aliases, Origin, Origins};
+
+    /// The one producer of the identifier-shape sentence and the `&'static str` form the
+    /// test suites assert cannot drift apart: both spell the same text for `Id`, and the
+    /// producer spells it for any other member name the same way.
+    #[test]
+    fn id_format_invalid_message_matches_the_constant_form() {
+        assert_eq!(
+            id_format_invalid_message("Id"),
+            RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
+            "case Id: expected the constant form {RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE:?}, \
+             got {:?}",
+            id_format_invalid_message("Id")
+        );
+        assert_eq!(
+            id_format_invalid_message("DistributionTenantId"),
+            "DistributionTenantId format is invalid",
+            "case DistributionTenantId: expected the member's own sentence, got {:?}",
+            id_format_invalid_message("DistributionTenantId")
+        );
+    }
+
+    /// Each resource kind's id predicate admits exactly what this service MINTS for it and
+    /// nothing else: an id of another kind, the right prefix at the wrong length and the
+    /// right characters in the wrong case are all outside the shape.
+    #[test]
+    fn an_id_predicate_admits_only_the_shape_its_mint_renders() {
+        let mut state = ComAmazonawsCloudfrontCloudfront20200531State::default();
+        for _ in 0..100 {
+            let list = state.allocate_anycast_ip_list_id();
+            assert!(
+                is_anycast_ip_list_id(&list),
+                "case allocate_anycast_ip_list_id: expected {list:?} to be a list id"
+            );
+            assert!(
+                !is_anycast_ip_list_id(&list.to_uppercase()),
+                "case upper-cased: expected {list:?} upper-cased not to be a list id, since the \
+                 prefix names the namespace"
+            );
+            assert!(
+                is_anycast_ip_list_id(&list[..list.len() - 1]),
+                "case one digit short: expected {list:?} truncated to still be a list id, since \
+                 the width is one observed id's rather than the rule"
+            );
+
+            let tenant = state.allocate_distribution_tenant_id();
+            assert!(
+                is_distribution_tenant_id(&tenant),
+                "case allocate_distribution_tenant_id: expected {tenant:?} to be a tenant id"
+            );
+            assert!(
+                !is_distribution_tenant_id(&tenant.to_lowercase()),
+                "case lower-cased: expected {tenant:?} lower-cased not to be a tenant id"
+            );
+
+            let group = state.allocate_key_group_id();
+            assert!(
+                is_key_group_id(&group),
+                "case allocate_key_group_id: expected {group:?} to be a key group id"
+            );
+            assert!(
+                !is_key_group_id(&group.to_uppercase()),
+                "case upper-cased: expected {group:?} upper-cased not to be a key group id"
+            );
+
+            let policy = state.allocate_continuous_deployment_policy_id();
+            assert!(
+                is_continuous_deployment_policy_id(&policy),
+                "case allocate_continuous_deployment_policy_id: expected {policy:?} to be a \
+                 policy id"
+            );
+        }
+
+        // Across the kinds: no id of one kind is read as an id of another, and no bare word
+        // is read as an id at all.
+        for value in ["EDFDVBD6EXAMPLE", "nope", "-", ""] {
+            assert!(
+                !is_anycast_ip_list_id(value),
+                "case {value:?}: expected it not to be an Anycast static IP list id"
+            );
+            assert!(
+                !is_distribution_tenant_id(value),
+                "case {value:?}: expected it not to be a distribution tenant id"
+            );
+            assert!(
+                !is_key_group_id(value),
+                "case {value:?}: expected it not to be a key group id"
+            );
+        }
+    }
 
     /// The mint never repeats a token: distinct counter values render distinctly, which
     /// is what makes two creates two distributions and every mutation a fresh version.

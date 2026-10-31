@@ -210,6 +210,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Everything below is a property of the request alone, and every list the request
         // carries is bounded here: a caller-chosen length never drives work while the
         // single store lock is held, and never reaches the record that is stored.
+        //
+        // The SHAPE of the id belongs to exactly that class: a value that was never a
+        // distribution tenant id is an argument this operation cannot read, not a tenant
+        // that is absent, so it is refused without consulting the store.
+        if !crate::state::is_distribution_tenant_id(&input.id) {
+            return Err(UpdateDistributionTenantErrorModeled::InvalidArgument(
+                crate::state::invalid_id_format("Id"),
+            )
+            .into());
+        }
         let stated_domains: Option<Vec<String>> = input
             .domains
             .as_ref()

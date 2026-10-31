@@ -4,7 +4,10 @@
 //!
 //! Reports one key group: "Gets a key group, including the date and time when the key
 //! group was last modified" — the record `CreateKeyGroup` stored, read by the id the
-//! request names. A REPORTING operation: it writes nothing of its own.
+//! request names. A REPORTING operation: it writes nothing of its own. `NoSuchResource` is
+//! the only error the model declares, so it covers both an `Id` outside the shape a key
+//! group id takes and a well-formed one no stored group carries, and the MESSAGE is what
+//! tells them apart.
 //!
 //! ## Shape of an operation
 //!
@@ -141,12 +144,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let store = state.lock();
 
-        // "The identifier of the key group that you are getting": an id no stored group
-        // carries names no key group, whatever shape it has.
+        // "The identifier of the key group that you are getting": one code and one status
+        // cover both ways an id can fail to name a readable group, so the MESSAGE is what
+        // tells them apart — an id outside the shape every key group id takes is reported
+        // as the unreadable argument it is, which is decided from the request alone and so
+        // never depends on what the store happens to hold.
         let Some(stored) = store.key_group(&input.id) else {
-            return Err(
-                GetKeyGroupErrorModeled::NoSuchResource(crate::state::no_such_key_group()).into(),
-            );
+            return Err(GetKeyGroupErrorModeled::NoSuchResource(
+                crate::state::unresolved_key_group_id(&input.id),
+            )
+            .into());
         };
 
         Ok(GetKeyGroupOutput {

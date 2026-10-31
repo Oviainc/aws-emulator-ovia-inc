@@ -5,8 +5,11 @@
 //! Updates the Anycast static IP list `Id` names: the address type and the IPAM CIDR
 //! ranges it runs under become the ones submitted, the list re-enters its transient status
 //! while they reach the edge locations, and a fresh version token is minted. An id no
-//! stored list carries is `EntityNotFound`; an `If-Match` that is not the list's current
-//! version is refused before anything is written.
+//! stored list carries is `EntityNotFound` WHATEVER shape it takes: this operation resolves
+//! the id rather than reading its shape first, which is its own recorded behaviour and
+//! differs from the read of the same resource (`GetAnycastIpList`), so do not "correct"
+//! either side into the other. An `If-Match` that is not the list's current version is
+//! refused before anything is written.
 //!
 //! ## Shape of an operation
 //!

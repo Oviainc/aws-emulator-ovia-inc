@@ -211,6 +211,8 @@ mod origin_request_policy_lifecycle;
 mod origin_request_policy_list;
 #[path = "all/origin_request_policy_update.rs"]
 mod origin_request_policy_update;
+#[path = "all/path_identifier_shape.rs"]
+mod path_identifier_shape;
 #[path = "all/public_key_lifecycle.rs"]
 mod public_key_lifecycle;
 #[path = "all/public_key_update.rs"]

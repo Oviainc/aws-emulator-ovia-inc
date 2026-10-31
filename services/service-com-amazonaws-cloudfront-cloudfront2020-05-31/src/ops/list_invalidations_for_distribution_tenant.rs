@@ -176,6 +176,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports the status its invalidation has at this instant.
         store.settle(SystemTime::now());
 
+        // The SHAPE of the id is a property of the request alone, so it is decided before
+        // the store is consulted: a value that was never a distribution tenant id is an
+        // argument this operation cannot read, not a tenant that is absent.
+        if !crate::state::is_distribution_tenant_id(&input.id) {
+            return Err(
+                ListInvalidationsForDistributionTenantErrorModeled::InvalidArgument(
+                    crate::state::invalid_id_format("Id"),
+                )
+                .into(),
+            );
+        }
+
         let Some(tenant) = store.distribution_tenant(&input.id) else {
             return Err(
                 ListInvalidationsForDistributionTenantErrorModeled::EntityNotFound(

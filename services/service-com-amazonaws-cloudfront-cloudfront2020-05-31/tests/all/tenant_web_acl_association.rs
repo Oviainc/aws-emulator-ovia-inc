@@ -569,18 +569,29 @@ async fn the_tenants_version_is_a_required_precondition() {
     }
 }
 
-/// A tenant the store does not hold is `EntityNotFound` on both calls, whatever the id
-/// looks like. The `If-Match` stated is a well-formed version token, so only the absence of
-/// the tenant can decide the answer.
+/// A tenant id in the shape a tenant id takes but holding no tenant is `EntityNotFound` on
+/// both calls, while an id outside that shape was never a tenant id at all and is
+/// `InvalidArgument`. The `If-Match` stated is a well-formed version token, so only the id
+/// can decide the answer.
 #[tokio::test]
 async fn an_unheld_tenant_is_not_found() {
     let router = emulator();
     let web_acl = WEB_ACLS[0].1;
 
-    for (case, id) in [
-        ("never-minted-tenant-shape", "dt_1a2b3c4d5e6f7"),
-        ("not-an-id-at-all", "nope"),
-        ("a-distribution-id", "EDFDVBD6EXAMPLE"),
+    for (case, id, status, code) in [
+        (
+            "never-minted-tenant-shape",
+            "dt_1A2B3C4D5E6F7",
+            404,
+            "EntityNotFound",
+        ),
+        ("not-an-id-at-all", "nope", 400, "InvalidArgument"),
+        (
+            "a-distribution-id",
+            "EDFDVBD6EXAMPLE",
+            400,
+            "InvalidArgument",
+        ),
     ] {
         for (which, answer) in [
             (
@@ -593,14 +604,14 @@ async fn an_unheld_tenant_is_not_found() {
             ),
         ] {
             assert_eq!(
-                answer.status, 404,
-                "case {case}/{which}: expected HTTP 404 for tenant {id:?}, got {} with {}",
+                answer.status, status,
+                "case {case}/{which}: expected HTTP {status} for tenant {id:?}, got {} with {}",
                 answer.status, answer.raw
             );
             assert_eq!(
                 answer.error_code(),
-                "EntityNotFound",
-                "case {case}/{which}: expected EntityNotFound for tenant {id:?}, got {:?}",
+                code,
+                "case {case}/{which}: expected {code} for tenant {id:?}, got {:?}",
                 answer.error_code()
             );
         }

@@ -149,6 +149,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the status it has at this instant.
         store.settle(SystemTime::now());
 
+        // The SHAPE of the identifier is a property of the request alone, so it is decided
+        // before the store is consulted. This operation's model serves no `InvalidArgument`,
+        // so the argument defect is reported under its own not-found code and the message is
+        // what tells it from a tenant that is simply absent — and it names the member that
+        // carried the identifier, which here is `DistributionTenantId`.
+        if !crate::state::is_distribution_tenant_id(&input.distribution_tenant_id) {
+            return Err(
+                GetInvalidationForDistributionTenantErrorModeled::EntityNotFound(
+                    crate::state::entity_not_found_id_format("DistributionTenantId"),
+                )
+                .into(),
+            );
+        }
+
         let Some(tenant) = store.distribution_tenant(&input.distribution_tenant_id) else {
             return Err(
                 GetInvalidationForDistributionTenantErrorModeled::EntityNotFound(

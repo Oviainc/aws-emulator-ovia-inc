@@ -3,8 +3,10 @@
 //! @op GetAnycastIpList
 //!
 //! Reports the Anycast static IP list `Id` names, read from the one record
-//! `CreateAnycastIpList` stored, together with the version token of that record. An id no
-//! stored list carries is `EntityNotFound`.
+//! `CreateAnycastIpList` stored, together with the version token of that record. An `Id`
+//! outside the shape an Anycast static IP list id takes is `InvalidArgument`, decided
+//! before the store is consulted; a well-formed id no stored list carries is
+//! `EntityNotFound`.
 //!
 //! A REPORTING operation: it writes nothing of its own, and materialises only the
 //! deployment the clock already owes, which was owed at this instant whether or not
@@ -148,6 +150,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::store_unavailable());
         };
         let _ = ctx;
+
+        // The SHAPE of the id is a property of the request alone, so it is decided before
+        // the store is consulted: a value that was never an Anycast static IP list id is an
+        // argument this operation cannot read, not a list that is absent.
+        if !crate::state::is_anycast_ip_list_id(&input.id) {
+            return Err(GetAnycastIpListErrorModeled::InvalidArgument(
+                crate::state::invalid_id_format("Id"),
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         // Materialise the deployment the clock already owes, so the status this read
         // reports is the one the list has at this instant.

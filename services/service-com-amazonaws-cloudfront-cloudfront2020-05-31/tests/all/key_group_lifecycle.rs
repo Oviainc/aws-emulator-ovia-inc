@@ -37,9 +37,10 @@
 use std::collections::BTreeSet;
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    KEY_GROUP_ALREADY_EXISTS_MESSAGE, KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE, MAX_KEY_GROUPS,
-    MAX_KEY_GROUP_COMMENT, MAX_PUBLIC_KEYS_IN_KEY_GROUP, NO_SUCH_KEY_GROUP_MESSAGE,
-    TOO_MANY_KEY_GROUPS_MESSAGE, TOO_MANY_PUBLIC_KEYS_IN_KEY_GROUP_MESSAGE,
+    id_format_invalid_message, KEY_GROUP_ALREADY_EXISTS_MESSAGE,
+    KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE, MAX_KEY_GROUPS, MAX_KEY_GROUP_COMMENT,
+    MAX_PUBLIC_KEYS_IN_KEY_GROUP, NO_SUCH_KEY_GROUP_MESSAGE, TOO_MANY_KEY_GROUPS_MESSAGE,
+    TOO_MANY_PUBLIC_KEYS_IN_KEY_GROUP_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -582,14 +583,33 @@ async fn an_id_no_key_group_holds_is_not_found() {
     let created = create_group(&router, &row.xml()).await;
     let stored_id = created.root().text_at("Id").unwrap_or_default().to_string();
 
-    // Every id no group holds is the modelled not-found, whatever shape it has.
+    // Every id no group holds is the modelled not-found, whatever shape it has — one code
+    // and one status for both conditions, so the MESSAGE is what tells an id in the shape a
+    // key group id takes from a value that was never one.
+    let id_format_invalid = id_format_invalid_message("Id");
     let cases = [
-        ("a UUID no group holds", "f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c3e".to_string()),
-        ("an id from the public key namespace", minted[0].clone()),
-        ("an id from the distribution namespace", "E1AAAAAAAAAAAA".to_string()),
-        ("a value that is no id at all", "nope".to_string()),
+        (
+            "a UUID no group holds",
+            "f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c3e".to_string(),
+            NO_SUCH_KEY_GROUP_MESSAGE,
+        ),
+        (
+            "an id from the public key namespace",
+            minted[0].clone(),
+            id_format_invalid.as_str(),
+        ),
+        (
+            "an id from the distribution namespace",
+            "E1AAAAAAAAAAAA".to_string(),
+            id_format_invalid.as_str(),
+        ),
+        (
+            "a value that is no id at all",
+            "nope".to_string(),
+            id_format_invalid.as_str(),
+        ),
     ];
-    for (case, id) in &cases {
+    for (case, id, expected) in &cases {
         let answer = get_group(&router, id).await;
         assert_eq!(
             answer.status, 404,
@@ -605,9 +625,8 @@ async fn an_id_no_key_group_holds_is_not_found() {
         // The sentence names the resource the operation ADDRESSES: a key group.
         let message = answer.root().find_text("Message").unwrap_or_default();
         assert_eq!(
-            message, NO_SUCH_KEY_GROUP_MESSAGE,
-            "case {case}: expected the key group not-found message for {id}, got {message:?} \
-             in {}",
+            message, *expected,
+            "case {case}: expected {expected:?} for {id}, got {message:?} in {}",
             answer.raw
         );
     }

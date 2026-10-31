@@ -16,8 +16,9 @@
 //!   version of this resource with it too, so what the header has to carry is the policy's
 //!   current token. The form of the header is a property of the request, so a header no
 //!   version could make valid is answered before the id is resolved
-//!   ([`crate::state::if_match_version`]);
-//! * an id no stored policy holds — `NoSuchContinuousDeploymentPolicy` (HTTP 404);
+//!   ([`crate::state::if_match_version`]) — and so is a header carrying a version for an id
+//!   no stored policy holds, since such an id has no current version for any header to
+//!   carry;
 //! * a policy a stored distribution still attaches — `ContinuousDeploymentPolicyInUse`
 //!   (HTTP 409), "You cannot delete a continuous deployment policy that is associated with
 //!   a primary distribution. First update your distribution to remove the continuous
@@ -27,10 +28,13 @@
 //! `PreconditionFailed` is modelled but not reachable here: the one precondition this
 //! operation evaluates is the `If-Match` version, which recorded behaviour refuses with
 //! `InvalidIfMatchVersion` whether it is unusable or merely out of date.
-//! `InvalidArgument` is not reachable either: the only parameter beside the header is the
-//! `{Id}` label, and an id this store does not hold is the modelled 404 rather than a bad
-//! argument. `AccessDenied` is unreachable here, as it is from every other operation in
-//! this service: the emulator authorizes no caller.
+//! `NoSuchContinuousDeploymentPolicy` is reachable for an id that ADDRESSES a policy — one in
+//! the shape a policy id takes, which the store simply holds nothing for — and unreachable
+//! for an id outside that shape, which is answered on the header instead.
+//! `InvalidArgument` is not reachable: the only parameter beside the header is the `{Id}`
+//! label, and an id this store does not hold is answered either as the absent policy or on
+//! the header rather than as a bad argument. `AccessDenied` is unreachable here, as it is
+//! from every other operation in this service: the emulator authorizes no caller.
 //!
 //! ## Shape of an operation
 //!
@@ -221,9 +225,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .continuous_deployment_policy(&input.id)
             .map(|stored| stored.etag.clone())
         else {
+            // The header is evaluated against THE RESOURCE'S current version, so what it
+            // has to be is the current version of a policy this id could name. An id that
+            // is not even in the shape a policy id takes names no policy for any version to
+            // belong to, so nothing the request could carry would be valid for it — which
+            // is what "missing or not valid for the resource" states, and the refusal
+            // recorded behaviour answers such a request with. A well-formed policy id the
+            // store holds nothing for IS addressable, so that one is the absent policy.
+            if crate::state::is_continuous_deployment_policy_id(&input.id) {
+                return Err(
+                    DeleteContinuousDeploymentPolicyErrorModeled::NoSuchContinuousDeploymentPolicy(
+                        crate::state::no_such_continuous_deployment_policy(),
+                    )
+                    .into(),
+                );
+            }
             return Err(
-                DeleteContinuousDeploymentPolicyErrorModeled::NoSuchContinuousDeploymentPolicy(
-                    crate::state::no_such_continuous_deployment_policy(),
+                DeleteContinuousDeploymentPolicyErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
                 )
                 .into(),
             );

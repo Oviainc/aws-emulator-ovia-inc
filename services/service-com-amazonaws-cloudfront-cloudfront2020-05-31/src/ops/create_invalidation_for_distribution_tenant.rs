@@ -166,6 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // The SHAPE of the id is a property of the request alone, so it is decided before
+        // the store is consulted: a value that was never a distribution tenant id is an
+        // argument this operation cannot read, not a tenant that is absent.
+        if !crate::state::is_distribution_tenant_id(&input.id) {
+            return Err(
+                CreateInvalidationForDistributionTenantErrorModeled::InvalidArgument(
+                    crate::state::invalid_id_format("Id"),
+                )
+                .into(),
+            );
+        }
+
         // "The ID of the distribution tenant": an invalidation is created under a tenant
         // this store holds, and the record it is stored on is the one every later read of
         // that tenant's invalidations answers from.

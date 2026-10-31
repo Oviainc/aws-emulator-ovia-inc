@@ -19,7 +19,8 @@
 //! * an update is a mutation: it mints a fresh version token, so the token the caller
 //!   matched on no longer satisfies an `If-Match`, and the list re-enters its transient
 //!   status with the CLOCK owing it the terminal one;
-//! * an id no list carries is `EntityNotFound` (404), an `If-Match` that is no version
+//! * an id no list carries is `EntityNotFound` (404) whatever its shape — this operation's
+//!   own recorded answer, which differs from the read's — an `If-Match` that is no version
 //!   token is `InvalidIfMatchVersion` (400) and one that is not the current version is
 //!   `PreconditionFailed` (412) — and each refusal leaves the list exactly as it was.
 //!
@@ -476,12 +477,19 @@ async fn an_update_is_refused_on_an_absent_list_and_on_a_version_that_is_not_cur
     let (id, etag) = created(&router, "update-refusals", Some(IP_ADDRESS_TYPE_IPV4), Vec::new())
         .await;
 
-    // An id no list carries names nothing to update, whatever shape it takes, and the
-    // sentence is the one this error class states for every form of it.
+    // An id no list carries names nothing to update, WHATEVER shape it takes: this operation
+    // resolves the id rather than reading its shape first, which is its own recorded answer
+    // and differs from the read of the same resource. The rows span the forms an unusable id
+    // takes all the same, so the one answer is asserted over the class.
     for (case, candidate) in [
         ("an id never minted", "ipl-00000000000000000".to_string()),
+        (
+            "an id of the same namespace with another body",
+            "ipl-notaminted-id".to_string(),
+        ),
         ("the stored id upper-cased", id.to_uppercase()),
         ("the list's name", "update-refusals".to_string()),
+        ("a value of no id's namespace", "not-an-id".to_string()),
     ] {
         let answer = update_anycast_ip_list(
             &router,

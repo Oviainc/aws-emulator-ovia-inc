@@ -170,6 +170,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at this instant reports.
         store.settle(now);
 
+        // The SHAPE of the id is a property of the request alone, so it is decided before
+        // the store is consulted: a value that was never a distribution tenant id is an
+        // argument this operation cannot read, not a tenant that is absent.
+        if !crate::state::is_distribution_tenant_id(&input.id) {
+            return Err(AssociateDistributionTenantWebACLErrorModeled::InvalidArgument(
+                crate::state::invalid_id_format("Id"),
+            )
+            .into());
+        }
+
         // The association is a change to ONE stored tenant, so the record has to be there:
         // `EntityNotFound` is the error this operation models for an entity it cannot find.
         // `Id` is "the ID of the distribution tenant", so the id is what resolves it.

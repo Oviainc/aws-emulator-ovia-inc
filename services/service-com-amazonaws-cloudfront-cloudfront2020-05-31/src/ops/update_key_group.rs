@@ -198,6 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The group being updated is looked up first: every refusal below is about the
         // record this id names, and nothing is minted for an id the store does not hold.
+        // An id no group carries is the absent-group sentence whatever shape it has, as
+        // this operation's own recorded behaviour has it rather than `GetKeyGroup`'s.
         let Some(current_etag) = store.key_group(&input.id).map(|stored| stored.etag.clone())
         else {
             return Err(UpdateKeyGroupErrorModeled::NoSuchResource(

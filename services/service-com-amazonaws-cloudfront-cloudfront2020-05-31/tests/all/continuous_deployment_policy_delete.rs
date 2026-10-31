@@ -15,14 +15,16 @@
 //! * an `If-Match` that is absent, carries no version token at all, or carries a
 //!   well-formed token that is not the policy's current one is "missing or not valid" (HTTP
 //!   400 `InvalidIfMatchVersion`) — what the header has to carry is this policy's current
-//!   version; a header no version could make usable is answered for an id no policy holds
-//!   too, since it is a property of the REQUEST, and the current token is accepted bare,
-//!   quoted or weak;
+//!   version; the FORM of the header is a property of the request, so a header no version
+//!   could make usable is answered before the id is resolved, and so is a header for an id
+//!   that is not even in the shape a policy id takes, which names no policy for any version
+//!   to belong to; the current token is accepted bare, quoted or weak;
 //! * a policy a distribution still names through its `ContinuousDeploymentPolicyId` is
 //!   `ContinuousDeploymentPolicyInUse` (HTTP 409) and stays readable until the distribution
 //!   is updated to drop it, after which the same delete lands;
-//! * an id no stored policy holds is `NoSuchContinuousDeploymentPolicy` (HTTP 404), and
-//!   every refused delete leaves the policy and its version token exactly as they were.
+//! * a well-formed policy id no stored policy holds is `NoSuchContinuousDeploymentPolicy`
+//!   (HTTP 404), and every refused delete leaves the policy and its version token exactly as
+//!   they were.
 //!
 //! The rows differ along everything these rules generalise over: how many staging
 //! distribution domain names a policy names, whether it is enabled, which of the two traffic
@@ -142,7 +144,8 @@ async fn an_accepted_delete_removes_the_policy() {
         );
 
         // Gone means gone: the id names no policy, and a second delete of it is the
-        // modelled 404 rather than another 204.
+        // modelled 404 rather than another 204 — the id is still in the shape a policy id
+        // takes, so it is addressable and what the refusal reports is the absent policy.
         let read = get_policy(&router, &id).await;
         assert_eq!(
             read.status, 404,
@@ -177,7 +180,8 @@ async fn an_accepted_delete_removes_the_policy() {
 /// token at all, or is a well-formed token that is not the policy's is `InvalidIfMatchVersion`
 /// (HTTP 400) — "the If-Match version is missing or not valid" covers a version that is not
 /// this resource's. A header no version could make usable is answered even for an id no
-/// policy holds, since the header is the REQUEST's; a usable one is answered on the id.
+/// policy holds, since the header is the REQUEST's; a usable one is answered on the id, which
+/// is addressable as long as it is in the shape a policy id takes.
 #[tokio::test]
 async fn an_if_match_the_policy_cannot_satisfy_is_refused() {
     let router = emulator();
@@ -230,11 +234,15 @@ async fn an_if_match_the_policy_cannot_satisfy_is_refused() {
         );
         assert_still_stored(&router, &id, subject, &etag, case).await;
 
-        // The same header against an id no policy holds: a form no version could make
-        // usable is answered on the header, a usable one on the id — which is what a caller
-        // deleting an unknown policy with a bogus version is told.
-        let unknown = delete_policy(&router, "00000000-0000-0000-0000-000000000000", if_match.as_deref())
-            .await;
+        // The same header against a well-formed policy id no policy holds: a form no
+        // version could make usable is answered on the header, a usable one on the id —
+        // which is what a caller deleting an unknown policy with a bogus version is told.
+        let unknown = delete_policy(
+            &router,
+            "00000000-0000-0000-0000-000000000000",
+            if_match.as_deref(),
+        )
+        .await;
         let (expected_status, expected_code) = if *usable_form {
             (404, "NoSuchContinuousDeploymentPolicy")
         } else {
@@ -361,8 +369,10 @@ async fn a_policy_a_distribution_names_cannot_be_deleted() {
 }
 
 /// An id no stored policy holds is `NoSuchContinuousDeploymentPolicy` (HTTP 404) with the
-/// modelled sentence, whatever shape the id takes, and the policy that does exist is
-/// untouched.
+/// modelled sentence on the READ, whatever shape the id takes. The DELETE of the same id
+/// answers on the `If-Match` where the id is not even in the shape a policy id takes — such
+/// an id names no policy for any version to belong to — and on the absent policy where it
+/// is. The policy that does exist is untouched either way.
 #[tokio::test]
 async fn an_id_no_policy_holds_is_refused() {
     let router = emulator();
@@ -373,36 +383,64 @@ async fn an_id_no_policy_holds_is_refused() {
     let mut flipped: Vec<char> = id.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'a' { 'b' } else { 'a' };
-    let rows: [(&str, String); 4] = [
+    let rows: [(&str, String, u16, &str); 4] = [
         (
             "a UUID never minted",
             "00000000-0000-0000-0000-000000000000".to_string(),
+            404,
+            "NoSuchContinuousDeploymentPolicy",
         ),
         (
             "the existing id with one character changed",
             flipped.into_iter().collect(),
+            404,
+            "NoSuchContinuousDeploymentPolicy",
         ),
-        ("the existing id in upper case", id.to_uppercase()),
-        ("a token that is no UUID", "not-a-policy-id".to_string()),
+        (
+            "the existing id in upper case",
+            id.to_uppercase(),
+            400,
+            "InvalidIfMatchVersion",
+        ),
+        (
+            "a token that is no UUID",
+            "not-a-policy-id".to_string(),
+            400,
+            "InvalidIfMatchVersion",
+        ),
     ];
 
-    for (case, candidate) in &rows {
+    for (case, candidate, delete_status, delete_code) in &rows {
+        let read = get_policy(&router, candidate).await;
+        assert_eq!(
+            read.status, 404,
+            "case {case}: expected HTTP 404 for {candidate:?}, got {} with {}",
+            read.status, read.raw
+        );
+        assert_eq!(
+            read.error_code(),
+            "NoSuchContinuousDeploymentPolicy",
+            "case {case}: expected NoSuchContinuousDeploymentPolicy for {candidate:?}, got {}",
+            read.raw
+        );
+        assert_eq!(
+            read.root().find_text("Message").unwrap_or_default(),
+            NO_SUCH_CONTINUOUS_DEPLOYMENT_POLICY_MESSAGE,
+            "case {case}: expected the modelled message, got {}",
+            read.raw
+        );
+
         let answer = delete_policy(&router, candidate, Some(&etag)).await;
         assert_eq!(
-            answer.status, 404,
-            "case {case}: expected HTTP 404 for {candidate:?}, got {} with {}",
+            answer.status, *delete_status,
+            "case {case}: expected HTTP {delete_status} from the delete of {candidate:?}, got \
+             {} with {}",
             answer.status, answer.raw
         );
         assert_eq!(
             answer.error_code(),
-            "NoSuchContinuousDeploymentPolicy",
-            "case {case}: expected NoSuchContinuousDeploymentPolicy for {candidate:?}, got {}",
-            answer.raw
-        );
-        assert_eq!(
-            answer.root().find_text("Message").unwrap_or_default(),
-            NO_SUCH_CONTINUOUS_DEPLOYMENT_POLICY_MESSAGE,
-            "case {case}: expected the modelled message, got {}",
+            *delete_code,
+            "case {case}: expected {delete_code} for {candidate:?}, got {}",
             answer.raw
         );
     }

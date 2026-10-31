@@ -146,7 +146,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // "The identifier of the key group whose configuration you are getting": an id no
-        // stored group carries names no key group, whatever shape it has.
+        // stored group carries names no key group, whatever shape it has — this read's own
+        // recorded behaviour, which differs from `GetKeyGroup`'s, so the sentence is not
+        // shared between the two.
         let Some(stored) = store.key_group(&input.id) else {
             return Err(GetKeyGroupConfigErrorModeled::NoSuchResource(
                 crate::state::no_such_key_group(),

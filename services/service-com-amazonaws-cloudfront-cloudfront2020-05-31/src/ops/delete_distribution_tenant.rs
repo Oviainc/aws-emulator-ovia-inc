@@ -123,11 +123,20 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteDistributionTenant
 // here — hence the `DeleteDistributionTenantError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudfront#DeleteDistributionTenant")]
+// `InvalidArgument` is widened in through `extra_errors`: this SERVICE models it (HTTP 400,
+// "An argument is invalid") and its sibling tenant operations declare it, but this
+// operation's own `errors` list omits it — so an `Id` that is not in the shape a
+// distribution tenant id takes has nothing else to be reported as, and recorded behaviour
+// answers exactly that argument failure for one.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudfront#DeleteDistributionTenant",
+    extra_errors = ["InvalidArgument"]
+)]
 #[derive(Debug)]
 pub enum DeleteDistributionTenantErrorModeled {
     AccessDenied(AccessDenied),
     EntityNotFound(EntityNotFound),
+    InvalidArgument(InvalidArgument),
     InvalidIfMatchVersion(InvalidIfMatchVersion),
     PreconditionFailed(PreconditionFailed),
     ResourceNotDisabled(ResourceNotDisabled),
@@ -193,6 +202,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reads it, so the version this precondition is evaluated against is the one a read
         // at this instant reports.
         store.settle(::std::time::SystemTime::now());
+
+        // The SHAPE of the id is a property of the request alone, so it is decided before
+        // the store is consulted: a value that was never a distribution tenant id is an
+        // argument this operation cannot read, not a tenant that is absent.
+        if !crate::state::is_distribution_tenant_id(&input.id) {
+            return Err(DeleteDistributionTenantErrorModeled::InvalidArgument(
+                crate::state::invalid_id_format("Id"),
+            )
+            .into());
+        }
 
         // The delete removes ONE stored tenant, so the record has to be there:
         // `EntityNotFound` is the error this operation models for an entity it cannot find.

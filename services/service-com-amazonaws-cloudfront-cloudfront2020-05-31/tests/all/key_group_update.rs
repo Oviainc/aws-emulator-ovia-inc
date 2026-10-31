@@ -629,7 +629,8 @@ async fn an_update_lands_only_on_the_current_version() {
 // ---------------------------------------------------------------------------
 
 /// An id no key group holds is `NoSuchResource`, whatever the request says about the
-/// version — and nothing the account holds is touched.
+/// version, with the absent-group sentence whatever the id's shape — this operation's own
+/// recorded answer, which differs from `GetKeyGroup`'s. Nothing the account holds is touched.
 #[tokio::test]
 async fn an_id_no_key_group_holds_is_refused() {
     let router = emulator();
@@ -648,10 +649,22 @@ async fn an_id_no_key_group_holds_is_refused() {
 
     // Ids no key group holds: a UUID of the shape this service mints key group ids in, one
     // from another entity family, and one that is no id at all.
-    for (case, missing) in [
-        ("a UUID no group holds", "f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c3e"),
-        ("an id from the distribution namespace", "E1AAAAAAAAAAAA"),
-        ("a value that is no id at all", "no-such-key-group"),
+    for (case, missing, expected) in [
+        (
+            "a UUID no group holds",
+            "f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c3e",
+            NO_SUCH_KEY_GROUP_MESSAGE,
+        ),
+        (
+            "an id from the distribution namespace",
+            "E1AAAAAAAAAAAA",
+            NO_SUCH_KEY_GROUP_MESSAGE,
+        ),
+        (
+            "a value that is no id at all",
+            "no-such-key-group",
+            NO_SUCH_KEY_GROUP_MESSAGE,
+        ),
     ] {
         for (version_case, if_match) in [
             ("no-if-match", None),
@@ -673,9 +686,8 @@ async fn an_id_no_key_group_holds_is_refused() {
             );
             let message = answer.root().find_text("Message").unwrap_or_default();
             assert_eq!(
-                message, NO_SUCH_KEY_GROUP_MESSAGE,
-                "case {case}/{version_case}: expected the key group not-found sentence, got \
-                 {message:?} in {}",
+                message, expected,
+                "case {case}/{version_case}: expected {expected:?}, got {message:?} in {}",
                 answer.raw
             );
         }

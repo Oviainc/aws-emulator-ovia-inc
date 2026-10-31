@@ -15,8 +15,9 @@
 //! * the version token the last mutation handed back is the precondition: a value that is no
 //!   version token at all is `InvalidIfMatchVersion` (HTTP 400) and a well-formed token that
 //!   is not the tenant's is `PreconditionFailed` (HTTP 412), both before anything is removed;
-//! * an id no stored tenant holds is `EntityNotFound` (HTTP 404) with the one sentence every
-//!   read of an unknown tenant carries;
+//! * a well-formed id no stored tenant holds is `EntityNotFound` (HTTP 404) with the one
+//!   sentence every read of an unknown tenant carries, while an id outside the shape a
+//!   tenant id takes is `InvalidArgument` (HTTP 400) naming the member that carried it;
 //! * a delete of a disabled tenant at its current version answers 204 with no body and
 //!   REMOVES the record: the tenant is no longer readable by id, no longer resolved by any
 //!   domain it claimed, its managed certificate is gone with it, and its name and domains
@@ -28,7 +29,9 @@
 //! [`crate::distribution_lifecycle`]'s and the tenant helpers
 //! [`crate::distribution_tenant_lifecycle`]'s.
 
-use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::DISTRIBUTION_TENANT_NOT_DISABLED_MESSAGE;
+use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
+    id_format_invalid_message, DISTRIBUTION_TENANT_NOT_DISABLED_MESSAGE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{call, emulator, Answer, API_VERSION};
@@ -412,8 +415,10 @@ async fn a_disabled_tenant_is_deleted_at_its_current_version() {
     }
 }
 
-/// An id no stored tenant holds is `EntityNotFound` (HTTP 404) whatever shape the id takes,
-/// and the tenant that does exist is untouched.
+/// An id in the shape a distribution tenant id takes but holding no tenant is
+/// `EntityNotFound` (HTTP 404); an id outside that shape was never a tenant id at all, which
+/// is `InvalidArgument` (HTTP 400) naming the member that carried it — decided before the
+/// store is consulted. The tenant that does exist is untouched either way.
 #[tokio::test]
 async fn an_id_no_tenant_holds_is_refused() {
     let router = emulator();
@@ -440,38 +445,61 @@ async fn an_id_no_tenant_holds_is_refused() {
     );
     let etag = created.header("etag").to_string();
 
+    let id_format_invalid = id_format_invalid_message("Id");
     let mut flipped: Vec<char> = id.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'A' { 'B' } else { 'A' };
-    let rows: [(&str, String); 4] = [
-        ("an id never minted", "dt_NEVERMINTED1".to_string()),
+    let rows: [(&str, String, u16, &str, &str); 4] = [
+        (
+            "an id never minted",
+            "dt_NEVERMINTED12".to_string(),
+            404,
+            "EntityNotFound",
+            TENANT_NOT_FOUND_MESSAGE,
+        ),
         (
             "the existing id with one character changed",
             flipped.into_iter().collect(),
+            404,
+            "EntityNotFound",
+            TENANT_NOT_FOUND_MESSAGE,
         ),
         // `Id` is "the ID of the distribution tenant to delete", so neither the name nor the
-        // ARN the reads also accept resolves one here.
-        ("the tenant's name", present.name.clone()),
-        ("a value of no id's shape", "not-a-tenant".to_string()),
+        // ARN the reads also accept resolves one here — and neither is in the shape a tenant
+        // id takes, so each is reported as the unreadable argument it is.
+        (
+            "the tenant's name",
+            present.name.clone(),
+            400,
+            "InvalidArgument",
+            &id_format_invalid,
+        ),
+        (
+            "a value of no id's shape",
+            "not-a-tenant".to_string(),
+            400,
+            "InvalidArgument",
+            &id_format_invalid,
+        ),
     ];
 
-    for (case, candidate) in &rows {
+    for (case, candidate, status, code, message) in &rows {
         let answer = delete_tenant(&router, candidate, Some(&etag)).await;
         assert_eq!(
-            answer.status, 404,
-            "case {case}: expected HTTP 404 for {candidate:?}, got {} with {}",
+            answer.status, *status,
+            "case {case}: expected HTTP {status} for {candidate:?}, got {} with {}",
             answer.status, answer.raw
         );
         assert_eq!(
             answer.error_code(),
-            "EntityNotFound",
-            "case {case}: expected EntityNotFound for {candidate:?}, got {}",
+            *code,
+            "case {case}: expected {code} for {candidate:?}, got {}",
             answer.raw
         );
         assert_eq!(
             answer.root().find_text("Message").unwrap_or_default(),
-            TENANT_NOT_FOUND_MESSAGE,
-            "case {case}: expected the unknown-tenant sentence, got {}",
+            *message,
+            "case {case}: expected {message:?}, got {}",
             answer.raw
         );
     }

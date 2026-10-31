@@ -40,7 +40,8 @@
 use std::time::Duration;
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    MAX_INVALIDATION_PATHS, MAX_ITEMS, PROPAGATION_DELAY, TOO_MANY_INVALIDATIONS_MESSAGE,
+    id_format_invalid_message, MAX_INVALIDATION_PATHS, MAX_ITEMS, PROPAGATION_DELAY,
+    TOO_MANY_INVALIDATIONS_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -623,10 +624,14 @@ async fn unusable_arguments_and_unknown_tenants_are_refused() {
     }
 
     // A tenant id of the right shape that no create ever handed out, and a value that is
-    // no tenant identifier at all.
-    for (case, unknown) in [
-        ("never-created", "dt_1111111111111"),
-        ("not-an-id-at-all", "nope"),
+    // no tenant identifier at all. The first names no tenant. The second was never a tenant
+    // id: the two operations whose model serves `InvalidArgument` report it as the argument
+    // failure it is, while the READ — whose model serves none — reports it under its own
+    // not-found code with the sentence that names the member the identifier arrived in.
+    let tenant_id_format_invalid = id_format_invalid_message("DistributionTenantId");
+    for (case, unknown, well_formed) in [
+        ("never-created", "dt_1111111111111", true),
+        ("not-an-id-at-all", "nope", false),
     ] {
         for (operation, answer) in [
             ("list", list_invalidations_for_tenant(&router, unknown, "").await),
@@ -640,17 +645,31 @@ async fn unusable_arguments_and_unknown_tenants_are_refused() {
                 get_invalidation_for_tenant(&router, unknown, "I1111111111111").await,
             ),
         ] {
+            let (status, code) = if well_formed || operation == "read" {
+                (404, "EntityNotFound")
+            } else {
+                (400, "InvalidArgument")
+            };
             assert_eq!(
-                answer.status, 404,
-                "case {case}/{operation}: expected HTTP 404, got {} with {}",
+                answer.status, status,
+                "case {case}/{operation}: expected HTTP {status}, got {} with {}",
                 answer.status, answer.raw
             );
             assert_eq!(
                 answer.error_code(),
-                "EntityNotFound",
-                "case {case}/{operation}: expected EntityNotFound, got {:?}",
+                code,
+                "case {case}/{operation}: expected {code}, got {:?}",
                 answer.error_code()
             );
+            if !well_formed && operation == "read" {
+                let message = answer.root().find_text("Message").unwrap_or_default();
+                assert_eq!(
+                    message, tenant_id_format_invalid,
+                    "case {case}/{operation}: expected {tenant_id_format_invalid:?}, got \
+                     {message:?} in {}",
+                    answer.raw
+                );
+            }
         }
     }
 }

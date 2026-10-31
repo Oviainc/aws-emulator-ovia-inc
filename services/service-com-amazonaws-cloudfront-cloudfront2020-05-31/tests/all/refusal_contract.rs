@@ -248,15 +248,19 @@ async fn a_not_found_refusal_states_the_fixed_sentence_of_its_error_class() {
 
     let mut rows: Vec<NotFound> = Vec::new();
 
-    // GetAnycastIpList: ids of every form that names no stored list — the shape this
-    // service mints but never minted, the stored id in another case, a prefix of it, the
-    // list's NAME (a list is addressed by its id), and no id shape at all.
+    // GetAnycastIpList: ids in the shape an Anycast static IP list id takes that name no
+    // stored list — one this service never minted, and the stored id with one hex digit
+    // changed. An id OUTSIDE that shape is an argument failure rather than a not-found, so
+    // it belongs to the suite that pins the shape rule, not to this one.
+    let mut flipped: Vec<char> = list_id.chars().collect();
+    let last_digit = flipped.len() - 1;
+    flipped[last_digit] = if flipped[last_digit] == '0' { '1' } else { '0' };
     for (case, candidate) in [
-        ("an id never minted", "aip_AAAAAAAAAAAAAAAAAAAAAA".to_string()),
-        ("the stored id upper-cased", list_id.to_uppercase()),
-        ("a prefix of the stored id", list_id[..9].to_string()),
-        ("the stored list's name", "refusal-contract-list".to_string()),
-        ("a value of no id shape", "not-an-id".to_string()),
+        ("an id never minted", "ipl-00000000000000000".to_string()),
+        (
+            "the stored id with one digit changed",
+            flipped.into_iter().collect::<String>(),
+        ),
     ] {
         rows.push(NotFound {
             case: format!("GetAnycastIpList/{case}"),

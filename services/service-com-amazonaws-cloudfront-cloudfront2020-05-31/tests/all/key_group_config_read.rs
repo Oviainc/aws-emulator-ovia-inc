@@ -9,7 +9,8 @@
 //! payload and the `ETag` header are the same ones `CreateKeyGroup` handed back and
 //! `GetKeyGroup` reports around the group's identity, a `Comment` the create left out stays
 //! absent rather than becoming an empty element, and an id no group holds is
-//! `NoSuchResource` (HTTP 404).
+//! `NoSuchResource` (HTTP 404) with the absent-group sentence whatever shape the id takes —
+//! this read's own recorded answer, which differs from `GetKeyGroup`'s.
 //!
 //! The rows are the key group table of `key_group_lifecycle.rs`, reused rather than copied:
 //! they span what the rule generalises over — how many public key ids a group names (one,
@@ -115,8 +116,10 @@ async fn the_config_read_reports_the_stored_configuration_and_its_version() {
     }
 }
 
-/// An id no key group holds is `NoSuchResource` (HTTP 404), whatever shape the id takes —
-/// and the refusals leave the group that does exist readable at its stored version.
+/// An id no key group holds is `NoSuchResource` (HTTP 404) with the absent-group sentence,
+/// whatever shape the id takes — this read's own recorded answer, which differs from
+/// `GetKeyGroup`'s. The refusals leave the group that does exist readable at its stored
+/// version.
 #[tokio::test]
 async fn the_config_read_refuses_an_id_no_key_group_holds() {
     let router = emulator();
@@ -144,7 +147,9 @@ async fn the_config_read_refuses_an_id_no_key_group_holds() {
 
     // Rows: a UUID never minted, the existing id with one character changed, the existing
     // id in upper case, an id from the public key namespace, one from the distribution
-    // namespace, a token that is no id at all, and the group's NAME rather than its id.
+    // namespace, a token that is no id at all, and the group's NAME rather than its id. The
+    // first two are key group ids the store holds nothing for; the rest were never key
+    // group ids at all.
     let mut flipped: Vec<char> = id.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'a' { 'b' } else { 'a' };
@@ -164,10 +169,7 @@ async fn the_config_read_refuses_an_id_no_key_group_holds() {
             "E1AAAAAAAAAAAA".to_string(),
         ),
         ("a token that is no id at all", "not-a-key-group".to_string()),
-        (
-            "a key group name rather than an id",
-            present.name.clone(),
-        ),
+        ("a key group name rather than an id", present.name.clone()),
     ];
 
     for (case, candidate) in &absent {

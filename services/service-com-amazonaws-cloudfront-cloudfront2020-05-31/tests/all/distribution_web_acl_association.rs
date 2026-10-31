@@ -18,11 +18,14 @@
 //!   version it replaced no longer satisfies an `If-Match`, and asking again for what is
 //!   already true is the same answer again;
 //! * `If-Match` is the OPTIONAL conditional header the model declares: absent, it states
-//!   no precondition; stating the current version (bare or quoted) it lands; stating a
-//!   version that is not current fails the precondition (HTTP 412); stating a value that
-//!   is no version token at all is refused as an invalid `If-Match` version (HTTP 400);
-//!   and a distribution the store does not hold is `EntityNotFound` (HTTP 404). No
-//!   refusal writes anything a later read can see.
+//!   no precondition on a distribution the store HOLDS; stating the current version (bare
+//!   or quoted) it lands; stating a version that is not current fails the precondition
+//!   (HTTP 412); stating a value that is no version token at all is refused as an invalid
+//!   `If-Match` version (HTTP 400); an id that ADDRESSES a distribution the store does not
+//!   hold is `EntityNotFound` (HTTP 404); and because the header is evaluated against the
+//!   current version of a distribution the id can address, an id that addresses none earns
+//!   `InvalidIfMatchVersion` (HTTP 400) instead. No refusal writes anything a later read
+//!   can see.
 //!
 //! Every assertion travels the router, so each case exercises routing, the restXml
 //! reader, the handler, the persisted state and serialization.
@@ -298,14 +301,24 @@ struct Refusal {
     message: Option<&'static str>,
 }
 
-/// Every condition the disassociation refuses: a distribution the store does not hold
-/// (whatever the id looks like, and whether or not a version is stated), a well-formed
-/// version that is not current, and four values that are no version token at all.
+/// Every condition the disassociation refuses: a distribution the store does not hold under
+/// an id that could ADDRESS one (whether or not a version is stated), an id that addresses
+/// none at all (the header is evaluated first, and no version could be valid for such an
+/// id), a well-formed version that is not current, and four values that are no version token
+/// at all.
 const REFUSALS: &[Refusal] = &[
     Refusal {
         case: "never-minted-id",
         id: Some("EDFDVBD6EXAMPLE"),
         precondition: Stated::Absent,
+        status: 400,
+        code: "InvalidIfMatchVersion",
+        message: Some(INVALID_IF_MATCH_VERSION),
+    },
+    Refusal {
+        case: "an-addressable-id-no-distribution-carries",
+        id: Some("E1ABCDEFGHIJKL"),
+        precondition: Stated::Literal("E1STALEVERSION"),
         status: 404,
         code: "EntityNotFound",
         message: None,
@@ -314,9 +327,9 @@ const REFUSALS: &[Refusal] = &[
         case: "not-an-id-at-all",
         id: Some("nope"),
         precondition: Stated::Literal("E1STALEVERSION"),
-        status: 404,
-        code: "EntityNotFound",
-        message: None,
+        status: 400,
+        code: "InvalidIfMatchVersion",
+        message: Some(INVALID_IF_MATCH_VERSION),
     },
     Refusal {
         case: "stale-version",

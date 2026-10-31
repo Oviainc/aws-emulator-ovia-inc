@@ -685,8 +685,10 @@ async fn the_clock_settles_deploying_to_deployed() {
     );
 }
 
-/// An id no list carries is not found - `EntityNotFound` (HTTP 404) - whatever shape the
-/// id takes, and a create under one id leaves every other id unfound.
+/// An id no list carries is not found - `EntityNotFound` (HTTP 404) - where the id is in
+/// the shape an Anycast static IP list id takes, and an argument this operation cannot
+/// read - `InvalidArgument` (HTTP 400) - where it is not; a create under one id leaves
+/// every other id unfound.
 #[tokio::test]
 async fn a_read_refuses_an_id_no_list_holds() {
     let router = emulator();
@@ -706,30 +708,50 @@ async fn a_read_refuses_an_id_no_list_holds() {
     );
     let id = member(created.root(), "Id", present.case, &created.raw);
 
-    // Rows: an id in the shape this service mints but never minted, the existing id in
-    // another case (an id is lowercase hex, so an upper-cased one names nothing), a prefix
-    // of it, and the NAME of the list that does exist - a list is addressed by its id,
-    // never by its name.
-    let absent: [(&str, String); 4] = [
+    // Rows: an id in the shape this service mints but never minted, one of the same
+    // namespace with a body of another form (the width and the alphabet of the body are one
+    // observed id's, not the rule), the existing id in another case (the prefix names the
+    // namespace, so an upper-cased id is in none), and the NAME of the list that does exist
+    // - a list is addressed by its id, never by its name. The first two carry the namespace,
+    // so they are answered as a list that is absent; the rest are refused as the unreadable
+    // argument they are, before the store is consulted at all.
+    let absent: [(&str, String, u16, &str); 4] = [
         (
             "an id never minted",
             format!("{ANYCAST_IP_LIST_ID_PREFIX}0123456789abcdef0"),
+            404,
+            "EntityNotFound",
         ),
-        ("the existing id in upper case", id.to_uppercase()),
-        ("a prefix of the existing id", id[..9].to_string()),
-        ("the name of the list that exists", present.name.clone()),
+        (
+            "an id of the same namespace with another body",
+            format!("{ANYCAST_IP_LIST_ID_PREFIX}notaminted-id"),
+            404,
+            "EntityNotFound",
+        ),
+        (
+            "the existing id in upper case",
+            id.to_uppercase(),
+            400,
+            "InvalidArgument",
+        ),
+        (
+            "the name of the list that exists",
+            present.name.clone(),
+            400,
+            "InvalidArgument",
+        ),
     ];
-    for (case, candidate) in absent {
+    for (case, candidate, status, code) in absent {
         let answer = get_anycast_ip_list(&router, &candidate).await;
         assert_eq!(
-            answer.status, 404,
-            "case {case}: expected HTTP 404 for {candidate:?}, got {} with {}",
+            answer.status, status,
+            "case {case}: expected HTTP {status} for {candidate:?}, got {} with {}",
             answer.status, answer.raw
         );
         assert_eq!(
             answer.error_code(),
-            "EntityNotFound",
-            "case {case}: expected EntityNotFound for {candidate:?}, got {}",
+            code,
+            "case {case}: expected {code} for {candidate:?}, got {}",
             answer.raw
         );
     }

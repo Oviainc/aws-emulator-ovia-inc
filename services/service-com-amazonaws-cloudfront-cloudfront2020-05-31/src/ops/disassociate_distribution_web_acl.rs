@@ -7,7 +7,9 @@
 //! is what names the web ACL a distribution is associated with — and the distribution is
 //! versioned and re-propagated the way every configuration change is. So a later read of
 //! the distribution answers from the record this call wrote rather than from the one it
-//! replaced.
+//! replaced. The `If-Match` is evaluated against the resource's CURRENT version before that
+//! resource's existence is reported, so an `Id` no stored distribution carries is
+//! `InvalidIfMatchVersion`.
 //!
 //! ## Shape of an operation
 //!
@@ -155,16 +157,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        // This operation's model names `EntityNotFound` — not `NoSuchDistribution` — for
-        // an id no stored distribution carries, so that is what an unknown id answers.
+        // `If-Match` carries the version this disassociation runs under, and CloudFront
+        // evaluates the header before it reports on the resource: what the header has to be
+        // is the current version of a distribution the id can ADDRESS. An `Id` outside the
+        // shape a distribution id takes addresses none, so nothing a request could send
+        // would be valid for it — "the If-Match version is missing or not valid for the
+        // resource", the refusal recorded behaviour answers such a request with. An id of
+        // the right shape IS addressable, so that one is reported as the absent distribution
+        // this operation's model names (`EntityNotFound`, not `NoSuchDistribution`).
         let Some((current_etag, mut config)) = store
             .distribution(&input.id)
             .map(|stored| (stored.etag.clone(), stored.config.clone()))
         else {
-            return Err(DisassociateDistributionWebACLErrorModeled::EntityNotFound(
-                crate::state::distribution_not_found(),
-            )
-            .into());
+            if crate::state::is_distribution_id(&input.id) {
+                return Err(DisassociateDistributionWebACLErrorModeled::EntityNotFound(
+                    crate::state::distribution_not_found(),
+                )
+                .into());
+            }
+            return Err(
+                DisassociateDistributionWebACLErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into(),
+            );
         };
 
         // `If-Match` is a conditional header the model leaves optional, so an absent one
