@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPackageGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPackageGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPackageGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers one page of the package groups the addressed domain holds, in pattern order,
+//! narrowed to the groups whose pattern starts with the requested `prefix` when one is
+//! given. A read: the listing projects the stored records and writes nothing. An unknown
+//! domain is a `ResourceNotFoundException` (404), and a `nextToken` this listing did not
+//! mint is a `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +157,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPackageGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPackageGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPackageGroupsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A `nextToken` this service did not mint for THIS domain's package-group listing
+        // cannot name a place in the key order.
+        let scope = crate::state::package_group_cursor_scope(&input.domain);
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_token(&scope, token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListPackageGroupsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken is not a pagination token this service issued \
+                                      for this listing"
+                                .to_string(),
+                            reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let store = state.lock();
+        let Some(domain) = store.domain(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(ListPackageGroupsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::domain_not_found_message(
+                        &input.domain,
+                        input.domain_owner.as_deref(),
+                    ),
+                    resource_id: Some(input.domain.clone()),
+                    resource_type: Some(crate::state::DOMAIN_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Filter first, then page: a page is `maxResults` MATCHING groups, so a prefix that
+        // excludes most of the domain does not return short pages.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPackageGroups"))
+        // `prefix` keeps "only package groups with patterns that match the prefix"
+        // (`smithy_query(query="doc", shape="ListPackageGroupsRequest", member="prefix")`),
+        // matched against the group's own stored pattern. An absent filter — and the
+        // modelled zero-length one — keeps every group the domain holds, the root group
+        // included.
+        let (package_groups, next_token) = crate::state::page_of(
+            &domain.package_groups,
+            &scope,
+            cursor.as_deref(),
+            input.max_results,
+            |_key, group| {
+                input
+                    .prefix
+                    .as_deref()
+                    .is_none_or(|prefix| group.pattern.starts_with(prefix))
+            },
+            |group| domain.package_group_summary(group),
+        );
+
+        Ok(ListPackageGroupsOutput {
+            package_groups: Some(package_groups),
+            next_token,
+        })
     }
 }

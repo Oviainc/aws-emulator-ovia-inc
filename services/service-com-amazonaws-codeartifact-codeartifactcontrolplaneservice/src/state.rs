@@ -2970,6 +2970,15 @@ pub fn repository_cursor_scope(domain: &str) -> String {
     format!("repositories/{domain}")
 }
 
+/// The cursor scope of `ListPackageGroups` for one domain. Scoped PER DOMAIN, so a cursor
+/// minted while listing one domain's package groups cannot resolve as a key in another
+/// domain's listing (or in any other listing). The `prefix` filter is NOT part of the
+/// scope: like every other filtered listing on this service, the cursor names a place in
+/// the domain's key order, so narrowing the filter on a later page resumes at the same key.
+pub fn package_group_cursor_scope(domain: &str) -> String {
+    format!("package-groups/{domain}")
+}
+
 /// The cursor scope of `ListSubPackageGroups` for one domain's one package group. Scoped
 /// per domain AND per parent pattern, because each group has its own set of children: a
 /// cursor minted while listing one group's children must not resolve as a key in

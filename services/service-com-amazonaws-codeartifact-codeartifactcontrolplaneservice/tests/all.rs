@@ -93,3 +93,5 @@ mod repository_authorization;
 mod copy_from_upstream;
 #[path = "all/service_rule_refusals.rs"]
 mod service_rule_refusals;
+#[path = "all/package_group_listing.rs"]
+mod package_group_listing;
