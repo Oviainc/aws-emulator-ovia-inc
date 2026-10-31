@@ -9,9 +9,13 @@
 //! entity stored under it — and a write refuses a key no such path could name, so every
 //! entity the API stores can be read, changed and deleted through it again.
 //!
+//! A key no path could name is one of two things: a key the split a path is read through
+//! carries no segment for (an empty one), and a key so long that every path naming it is
+//! outside the modelled `Path` bound. Both are refused at the write.
+//!
 //! Rows differ along how many separators a key carries, where they sit, the characters
-//! around them, the entity kind and the method applied to it; a key with no separator at
-//! all is the control row.
+//! around them, the key's length against the bound a path can carry, the entity kind and
+//! the method applied to it; a key with no separator at all is the control row.
 
 use std::sync::Arc;
 
@@ -476,6 +480,260 @@ async fn a_key_no_path_can_address_is_refused_at_the_write() {
             json!(expected),
             "case {collection:?}: a refused write must store nothing, got {}",
             listed.document()
+        );
+    }
+}
+
+/// The upper bound of this operation's modelled path member — `RestApiPath`
+/// `@length(1, 64)`, from
+/// `smithy_query(query="shape",shape="RestApiPath",model_path="services/service-com-amazonaws-mwaa-amazonmwaa/smithy-model/com-amazonaws-mwaa-amazonmwaa.json")`
+/// — counted in characters, as `@length` on a string is. It is the longest `Path` any call
+/// can carry, and so the longest path an entity stored here can be addressed through again.
+const LONGEST_PATH: usize = 64;
+
+/// The longest key the collection hanging under `/{segment}` can hold and still be named by
+/// a path: what is left of [`LONGEST_PATH`] once `/{segment}/` has taken its share — 53
+/// characters under `/variables/`, 57 under `/pools/`.
+fn longest_key(segment: &str) -> usize {
+    LONGEST_PATH - format!("/{segment}/").chars().count()
+}
+
+/// One collection this API addresses an entity of by key: the segment it hangs under (so
+/// how long a key a path can name under it), the member its entity's identity travels in,
+/// and how a write that creates or changes one is spelled.
+struct KeyedCollection {
+    segment: &'static str,
+    identity: &'static str,
+    write: fn(&str) -> Value,
+    change: fn(&str) -> Value,
+}
+
+/// Both collections whose entities are keyed, so the rule is asserted over the family
+/// rather than over one of them: they differ in the length of their own path segment, in
+/// the member carrying the key and in the body their writes take.
+fn keyed_collections() -> Vec<KeyedCollection> {
+    vec![
+        KeyedCollection {
+            segment: "variables",
+            identity: "key",
+            write: |key| json!({"key": key, "value": "first"}),
+            change: |key| json!({"key": key, "value": "second"}),
+        },
+        KeyedCollection {
+            segment: "pools",
+            identity: "name",
+            write: |name| json!({"name": name, "slots": 3}),
+            change: |name| json!({"name": name, "slots": 5}),
+        },
+    ]
+}
+
+/// A key of exactly `length` characters carrying the path separator between its segments:
+/// one-character segments joined by it. An even `length` would otherwise close with the
+/// separator, which is the OTHER unaddressable shape, so the last character is always a
+/// segment's.
+fn separated_key(length: usize) -> String {
+    let mut key: String = (0..length)
+        .map(|index| if index % 2 == 1 { '/' } else { 'k' })
+        .collect();
+    if key.ends_with('/') {
+        key.pop();
+        key.push('k');
+    }
+    key
+}
+
+/// A key at the longest a path can name is stored AND reachable: read, changed and deleted
+/// through the path that names it, whatever characters it is built from.
+///
+/// Rows differ along the collection (so along the ceiling itself), and along what the key
+/// at that ceiling is made of: one segment, separators between many segments, and
+/// characters outside ASCII (the bound counts characters, not bytes).
+#[tokio::test]
+async fn a_key_at_the_longest_a_path_can_name_is_stored_and_addressable() {
+    let harness = Harness::with_environment().await;
+
+    for collection in keyed_collections() {
+        let longest = longest_key(collection.segment);
+        for (shape, key) in [
+            ("one segment", "k".repeat(longest)),
+            ("separators between segments", separated_key(longest)),
+            ("characters outside ASCII", "ü".repeat(longest)),
+        ] {
+            let case = format!("{} under /{} at {longest}", shape, collection.segment);
+            let path = format!("/{}/{key}", collection.segment);
+            assert!(
+                path.chars().count() <= LONGEST_PATH,
+                "case {case:?}: the path naming the key must be one a call can carry, got \
+                 {} characters",
+                path.chars().count()
+            );
+
+            let created = harness
+                .invoke(call_with_body(
+                    "POST",
+                    &format!("/{}", collection.segment),
+                    (collection.write)(&key),
+                ))
+                .await;
+            assert_eq!(
+                created.airflow_status(),
+                200,
+                "case {case:?}: the write must be served, got {}",
+                created.text()
+            );
+            assert_eq!(
+                created.member(collection.identity),
+                json!(key),
+                "case {case:?}: the stored entity must carry the key written, got {}",
+                created.document()
+            );
+
+            let read = harness.invoke(call("GET", &path)).await;
+            assert_eq!(
+                read.airflow_status(),
+                200,
+                "case {case:?}: GET {path} must read the stored entity, got {}",
+                read.text()
+            );
+
+            let changed = harness
+                .invoke(call_with_body("PATCH", &path, (collection.change)(&key)))
+                .await;
+            assert_eq!(
+                changed.airflow_status(),
+                200,
+                "case {case:?}: PATCH must change the stored entity, got {}",
+                changed.text()
+            );
+            let reread = harness.invoke(call("GET", &path)).await;
+            assert_eq!(
+                reread.document(),
+                changed.document(),
+                "case {case:?}: the change must be visible to the next read, got {}",
+                reread.document()
+            );
+
+            let deleted = harness.invoke(call("DELETE", &path)).await;
+            assert_eq!(
+                deleted.airflow_status(),
+                204,
+                "case {case:?}: DELETE must remove the stored entity, got {}",
+                deleted.text()
+            );
+            let gone = harness.invoke(call("GET", &path)).await;
+            assert_eq!(
+                gone.airflow_status(),
+                404,
+                "case {case:?}: the deleted entity must be gone, got {}",
+                gone.text()
+            );
+        }
+    }
+}
+
+/// A key longer than any path could name is refused at the write — as a client error of
+/// the Apache Airflow call, naming the length it was held to — and nothing is stored, so no
+/// entity the API could never reach again occupies a slot of the collection's budget.
+///
+/// Rows differ along the collection, along how far past the ceiling the key reaches (one
+/// character, the store's own key ceiling, past that ceiling too) and along what it is made
+/// of (one segment, separators, characters outside ASCII).
+#[tokio::test]
+async fn a_key_longer_than_any_path_could_name_is_refused_at_the_write() {
+    let harness = Harness::with_environment().await;
+
+    for collection in keyed_collections() {
+        let longest = longest_key(collection.segment);
+        let listing = call("GET", &format!("/{}", collection.segment));
+        let before = harness.invoke(listing.clone()).await.member("total_entries");
+
+        for (shape, key) in [
+            ("one character past the ceiling", "k".repeat(longest + 1)),
+            (
+                "separators between segments, one character past it",
+                separated_key(longest + 1),
+            ),
+            (
+                "characters outside ASCII, one character past it",
+                "ü".repeat(longest + 1),
+            ),
+            (
+                // The store's own key ceiling, which a path cannot reach any part of.
+                "the longest key this store would hold",
+                "k".repeat(state::MAX_AIRFLOW_KEY_LENGTH),
+            ),
+            (
+                "past the store's own ceiling too",
+                "k".repeat(state::MAX_AIRFLOW_KEY_LENGTH + 1),
+            ),
+        ] {
+            let length = key.chars().count();
+            let case = format!(
+                "{shape} under /{} ({length} characters, ceiling {longest})",
+                collection.segment
+            );
+
+            // The path that would name such an entity is one no call can carry: the
+            // boundary refuses it on the modelled bound, which is why the write must not
+            // store it.
+            let addressed = harness
+                .invoke(call("GET", &format!("/{}/{key}", collection.segment)))
+                .await;
+            assert_eq!(
+                addressed.error_code(),
+                "ValidationException",
+                "case {case:?}: the path naming this key must be outside the modelled \
+                 bound, got {} {}",
+                addressed.status,
+                addressed.text()
+            );
+
+            let refused = harness
+                .invoke(call_with_body(
+                    "POST",
+                    &format!("/{}", collection.segment),
+                    (collection.write)(&key),
+                ))
+                .await;
+            assert_eq!(
+                refused.status, 400,
+                "case {case:?}: a refused call is the modelled exception's own HTTP 400, \
+                 got {} {}",
+                refused.status,
+                refused.text()
+            );
+            assert_eq!(
+                refused.error_code(),
+                "RestApiClientException",
+                "case {case:?}: expected RestApiClientException, got {}",
+                refused.text()
+            );
+            assert_eq!(
+                refused.airflow_status(),
+                400,
+                "case {case:?}: expected RestApiStatusCode 400, got {}",
+                refused.text()
+            );
+            let document = refused.document();
+            let detail = document
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                detail.contains(&format!("of {length} characters"))
+                    && detail.contains(&format!("at most {longest} characters")),
+                "case {case:?}: the detail must state the length refused and the length a \
+                 path can name, got {detail:?}"
+            );
+        }
+
+        let after = harness.invoke(listing).await.member("total_entries");
+        assert_eq!(
+            after, before,
+            "case {:?}: a refused write must store nothing, expected {before} entries, got \
+             {after}",
+            collection.segment
         );
     }
 }

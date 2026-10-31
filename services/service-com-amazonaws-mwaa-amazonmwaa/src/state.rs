@@ -137,6 +137,10 @@ pub const MAX_AIRFLOW_POOLS: usize = 500;
 /// The longest key (a variable's key, a pool's name) this store keeps, in characters. The
 /// emulator's own ceiling, for the same reason as the counts above: the stored size of one
 /// entry is otherwise whatever a request carries.
+///
+/// A key also has to be one a later path can name again, which bounds it independently and
+/// lower; the key a write accepts is held to whichever of the two is lower (the
+/// `InvokeRestApi` handler's `longest_key`).
 pub const MAX_AIRFLOW_KEY_LENGTH: usize = 250;
 
 /// The longest Apache Airflow variable value (or description) this store keeps, in

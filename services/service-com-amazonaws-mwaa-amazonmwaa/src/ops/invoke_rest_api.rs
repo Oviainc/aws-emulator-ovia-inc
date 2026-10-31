@@ -42,8 +42,9 @@
 //! * Neither collection holds a sub-resource, so the entity a path addresses is named by
 //!   the WHOLE remainder of that path after the collection's own segment: a key that
 //!   itself carries the path separator addresses the entity stored under it, and the
-//!   writes refuse a key no such path can name, so nothing is stored that a later read,
-//!   change or delete cannot reach.
+//!   writes refuse a key no such path can name — one no path splits into, and one the
+//!   modelled `Path` is too short to carry under its collection — so nothing is stored
+//!   that a later read, change or delete cannot reach.
 //! * `GET /dags` — the environment's DAG inventory, which is EMPTY and whose
 //!   `total_entries` is therefore 0, so every path under `/dags/{dag_id}` resolves to
 //!   nothing: a DAG and its `dag_id` are defined by the Python DAG file the environment
@@ -333,6 +334,22 @@ struct AirflowAnswer {
 /// collection's own are rejoined with it to name the entity inside that collection.
 const SEPARATOR: &str = "/";
 
+/// The longest `Path` a call to this operation can carry, in characters: the upper bound of
+/// the modelled path member (`smithy_query(query="shape",shape="RestApiPath")` —
+/// `@length(1, 64)`), which the request boundary enforces — counting characters, as
+/// `@length` on a string does — before this handler runs.
+///
+/// So it is also the longest path anything stored here can be ADDRESSED through again, and
+/// therefore what bounds the key a write may store ([`longest_key`]).
+const LONGEST_PATH: usize = 64;
+
+/// The path segment the variables collection is addressed under, and the member its
+/// collection answer carries its entries in.
+const VARIABLES: &str = "variables";
+
+/// The same for the slot pools collection.
+const POOLS: &str = "pools";
+
 /// Apache Airflow's `GET` method, the only one its read-only endpoints serve.
 const GET: &str = "GET";
 /// Apache Airflow's `POST` method, which creates an entity in a collection.
@@ -388,14 +405,14 @@ fn serve(environment: &mut EnvironmentRecord, call: &Call<'_>) -> AirflowAnswer 
             GET => airflow_version(environment),
             _ => method_not_allowed(call),
         },
-        ["variables"] => match call.method {
+        [VARIABLES] => match call.method {
             GET => list_variables(&environment.airflow, query),
             POST => set_variable(&mut environment.airflow, call),
             _ => method_not_allowed(call),
         },
         // Every segment after `variables` belongs to the KEY, because this collection
         // holds no sub-resource a further segment could address: see [`entity_key`].
-        ["variables", key @ ..] => {
+        [VARIABLES, key @ ..] => {
             let key = entity_key(key);
             match call.method {
                 GET => read_variable(&environment.airflow, &key),
@@ -404,13 +421,13 @@ fn serve(environment: &mut EnvironmentRecord, call: &Call<'_>) -> AirflowAnswer 
                 _ => method_not_allowed(call),
             }
         }
-        ["pools"] => match call.method {
+        [POOLS] => match call.method {
             GET => list_pools(&environment.airflow, query),
             POST => create_pool(&mut environment.airflow, call),
             _ => method_not_allowed(call),
         },
         // A pool's name is addressed the same way, and for the same reason.
-        ["pools", name @ ..] => {
+        [POOLS, name @ ..] => {
             let name = entity_key(name);
             match call.method {
                 GET => read_pool(&environment.airflow, &name),
@@ -544,7 +561,7 @@ fn list_variables(metadata: &AirflowMetadata, query: Option<&Document>) -> Airfl
         Err(refusal) => return refusal,
     };
     let entries = metadata.variables.values().map(variable_document).collect();
-    collection("variables", entries, &window)
+    collection(VARIABLES, entries, &window)
 }
 
 /// `POST /variables`: set the variable the body names, whether or not the key is already
@@ -610,7 +627,7 @@ fn list_pools(metadata: &AirflowMetadata, query: Option<&Document>) -> AirflowAn
         Err(refusal) => return refusal,
     };
     let entries = metadata.pools.values().map(pool_document).collect();
-    collection("pools", entries, &window)
+    collection(POOLS, entries, &window)
 }
 
 /// `POST /pools`: create the pool the body names. A pool's name is its identity, so a
@@ -820,8 +837,7 @@ fn requested_variable(body: Option<&Document>) -> Result<AirflowVariable, Airflo
     let key = required_text(body, "key")?;
     let value = required_text(body, "value")?;
     let description = optional_text(body, "description")?;
-    bounded(&key, "key", crate::state::MAX_AIRFLOW_KEY_LENGTH)?;
-    addressable(&key, "key")?;
+    addressable(&key, "key", VARIABLES)?;
     bounded(&value, "value", crate::state::MAX_AIRFLOW_VALUE_LENGTH)?;
     bounded_description(description.as_deref())?;
     Ok(AirflowVariable {
@@ -848,8 +864,7 @@ fn requested_pool(body: Option<&Document>) -> Result<AirflowPool, AirflowAnswer>
         )));
     }
     let description = optional_text(body, "description")?;
-    bounded(&name, "name", crate::state::MAX_AIRFLOW_KEY_LENGTH)?;
-    addressable(&name, "name")?;
+    addressable(&name, "name", POOLS)?;
     bounded_description(description.as_deref())?;
     let include_deferred = match member(body, "include_deferred") {
         Some(Document::Bool(include)) => *include,
@@ -926,15 +941,45 @@ fn optional_text(body: &Document, name: &str) -> Result<Option<String>, AirflowA
     }
 }
 
+/// The longest key an entity of the collection whose path segment is `collection` may be
+/// stored under, in characters.
+///
+/// A key is reached again only through the path `/{collection}/{key}`, so what a legal path
+/// can still carry under that collection — [`LONGEST_PATH`] less the collection's own
+/// segment and the two [`SEPARATOR`]s around it — is one ceiling on the key; the store's own
+/// ([`crate::state::MAX_AIRFLOW_KEY_LENGTH`]) is the other, and a key has to satisfy both to
+/// be a key this API both holds and can address, so the lower of the two is the ceiling.
+fn longest_key(collection: &str) -> usize {
+    let addressable =
+        LONGEST_PATH.saturating_sub(2 * SEPARATOR.chars().count() + collection.chars().count());
+    addressable.min(crate::state::MAX_AIRFLOW_KEY_LENGTH)
+}
+
 /// Refuse a key this API could store but no path of it could name again.
 ///
 /// An entity is addressed by the segments of its path, which carry no empty one
 /// ([`Call::new`]), so a key with an empty [`SEPARATOR`]-delimited segment — one that
 /// opens or closes with the separator, or carries two in a row — is a key no path splits
-/// into: storing it would put an entity in the collection that the API's own read, change
-/// and delete could never reach, and whose slot nothing could free. Every other key,
-/// including one that carries the separator between segments, is addressable and taken.
-fn addressable(value: &str, name: &str) -> Result<(), AirflowAnswer> {
+/// into. A key longer than [`longest_key`] is unreachable for the other reason: every path
+/// that names it is longer than the modelled path member admits, so the boundary refuses
+/// the call before this API is asked. Either way storing it would put an entity in the
+/// collection that the API's own read, change and delete could never reach, and whose slot
+/// nothing could free. Every other key, including one that carries the separator between
+/// segments, is addressable and taken.
+///
+/// The length is judged FIRST, and its refusal states the lengths rather than echoing the
+/// value: a value past that ceiling is longer than any path that could carry it, so a
+/// refusal echoing it would answer with a document whose size the request decides.
+fn addressable(value: &str, name: &str, collection: &str) -> Result<(), AirflowAnswer> {
+    let longest = longest_key(collection);
+    let length = value.chars().count();
+    if length > longest {
+        return Err(AirflowAnswer::bad_request(format!(
+            "a {name} of {length} characters is not one this API could address again: it is \
+             addressed through {SEPARATOR}{collection}{SEPARATOR}{{{name}}}, so only a \
+             {name} of at most {longest} characters can be named by a path"
+        )));
+    }
     if value.split(SEPARATOR).any(str::is_empty) {
         return Err(AirflowAnswer::bad_request(format!(
             "the {name} {value:?} is not one this API could address again: a {name} must \
