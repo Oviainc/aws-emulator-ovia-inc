@@ -7,7 +7,10 @@
 //! The ARN is resolved through [`crate::state::parse_resource_arn`], the same way the
 //! write path resolves it, so a value that is not an ARN of a resource this service
 //! holds is an `InvalidParameterException` and a well-formed ARN naming a budget or
-//! action nobody created is a `NotFoundException`. A resource that holds no tags has an
+//! action nobody created is a `NotFoundException`. An ARN whose account field is not the
+//! account this emulator answers for is an `AccessDeniedException`
+//! ([`crate::state::foreign_account_refusal`]), refused before the store is read at all.
+//! A resource that holds no tags has an
 //! empty tag list, which is not the same answer as "no such resource".
 //!
 //! A pure READ: it reports what the store holds and writes nothing.
@@ -164,6 +167,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(message),
             })
         })?;
+
+        // The budgets control plane is scoped to the account the caller signed with, and
+        // the account this request names is the `ResourceARN`'s own account field, so an
+        // ARN naming any other account is refused with the modelled 403 before anything
+        // is read — exactly as the `AccountId`-bearing operations refuse it
+        // (`crate::state::foreign_account_refusal`).
+        if let Some(message) = crate::state::foreign_account_refusal(target.account_id()) {
+            return Err(ListTagsForResourceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let now = ::std::time::SystemTime::now();
         let store = crate::state::store_at(&state, now);

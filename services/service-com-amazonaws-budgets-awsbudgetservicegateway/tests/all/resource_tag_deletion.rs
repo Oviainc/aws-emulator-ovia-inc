@@ -41,7 +41,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
 };
 
 use super::budget_action_execution::{seed_action, seed_budget};
-use super::budget_lifecycle::{account, call, caller_account, is_error, router};
+use super::budget_lifecycle::{call, caller_account, is_error, router};
 use super::resource_tags::{action_arn, budget_arn, list_tags, many_tags, pair, reported, tag_list};
 
 /// One `TagResource` call, for the setup each row starts from.
@@ -341,7 +341,7 @@ async fn a_deleted_key_written_again_is_a_new_tag() {
 /// RULE 3: the ARN is the whole identity of the resource, so an ARN naming no resource of
 /// this service is refused and deletes nothing.
 ///
-/// The not-found rows differ along which part of the identity is wrong (the account, the
+/// The not-found rows differ along which part of the identity is wrong (the
 /// budget name, its case, the action id, the budget an action id belongs to); the invalid
 /// rows along how the value departs from the ARN form.
 #[tokio::test]
@@ -366,11 +366,11 @@ async fn an_arn_that_names_no_resource_of_this_service_deletes_nothing() {
     }
 
     let absent_action = "11111111-2222-3333-4444-555555555555";
+    // An ARN naming an account that is not the caller's is not a lookup at all: the one
+    // account gate refuses it before the store is consulted, so those rows live in
+    // `account_scoping.rs`. Every row here carries the caller's own account and differs
+    // in the rest of the identity.
     let not_found = [
-        (
-            "an account that holds no budget",
-            budget_arn(&account(868_686_868), "owning"),
-        ),
         (
             "a budget name nobody created",
             budget_arn(&owner, "never-created"),

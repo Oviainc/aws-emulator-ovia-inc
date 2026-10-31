@@ -15,10 +15,14 @@
 //! alike) × a set of foreign account ids that each satisfy `AccountId`'s modelled
 //! `@length(12, 12)` and `^\d{12}$`, so the refusal comes from the handler rather than
 //! from request validation. The operations still scaffolded answer 501 and are covered
-//! by `client_error_envelopes.rs`. The tag plane (`TagResource` /
-//! `ListTagsForResource`) carries no `AccountId` member at all — it names its resource
-//! by ARN, and an ARN whose account field is not this service's holds no resource, which
-//! `resource_tags.rs` asserts.
+//! by `client_error_envelopes.rs`.
+//!
+//! The tag plane (`TagResource`, `UntagResource`, `ListTagsForResource`) carries no
+//! `AccountId` member: it names the account inside its `ResourceARN`, whose account
+//! field is the account half of the identity the store is keyed by. The same rule
+//! therefore holds for it, over its own table below, and its account field is not a
+//! lookup — an ARN of another account is refused before the store is consulted, not
+//! answered "no such resource".
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -28,6 +32,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::ComAmazonawsBu
 
 use super::budget_action_execution::{email_subscriber, simple_create_body};
 use super::budget_lifecycle::{account, caller_account, call, is_error, router_with_engine};
+use super::resource_tags::{action_arn, budget_arn, reported, tag_list};
 
 /// The status `AccessDeniedException` is answered with: its modelled `@httpError`
 /// (`smithy_query(query="shape",shape="AccessDeniedException")`), which this service
@@ -407,5 +412,189 @@ async fn the_same_request_for_the_callers_own_account_is_served() {
             "case {operation:?}: expected no AccessDeniedException for the caller's own \
              account, got {body}"
         );
+    }
+}
+
+/// The tag the ARN-addressed rows below write, read and delete.
+const TAG_KEY: &str = "team";
+
+/// Every ARN-ADDRESSED operation of this service: the tag plane, which names the account
+/// it acts in inside its `ResourceARN` rather than as an `AccountId` member. Each request
+/// satisfies every modelled constraint on its input, and each would do real work under
+/// the caller's own account.
+fn every_arn_addressed_operation(resource_arn: &str) -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "TagResource",
+            json!({
+                "ResourceARN": resource_arn,
+                "ResourceTags": tag_list(&[(TAG_KEY.to_string(), "cost".to_string())])
+            }),
+        ),
+        (
+            "UntagResource",
+            json!({"ResourceARN": resource_arn, "ResourceTagKeys": [TAG_KEY]}),
+        ),
+        (
+            "ListTagsForResource",
+            json!({"ResourceARN": resource_arn}),
+        ),
+    ]
+}
+
+/// The `ResourceARN`s an ARN-addressed row is run against, under `account_id`: both kinds
+/// of taggable resource, each named once as a resource the caller's own account really
+/// holds (`held` true) and once as one nobody created — so the answer cannot depend on
+/// whether the store happens to hold the resource under the caller's account.
+fn arn_rows(account_id: &str, action_id: &str) -> Vec<(&'static str, String, bool)> {
+    vec![
+        ("the budget", budget_arn(account_id, BUDGET), true),
+        (
+            "a budget nobody created",
+            budget_arn(account_id, "never-created"),
+            false,
+        ),
+        (
+            "the budget's action",
+            action_arn(account_id, BUDGET, action_id),
+            true,
+        ),
+        (
+            "an action nobody created",
+            action_arn(account_id, BUDGET, UNMINTED_ACTION_ID),
+            false,
+        ),
+    ]
+}
+
+/// RULE, over the tag plane: the account a request names is refused the same way whether
+/// it arrives as an `AccountId` member or as the account field of a `ResourceARN`. An ARN
+/// of an account that is not the caller's is answered `AccessDeniedException` at HTTP 403
+/// — not the `NotFoundException` a lookup under that account would produce — and it
+/// neither reports nor changes anything.
+#[tokio::test]
+async fn the_tag_plane_refuses_an_arn_whose_account_is_not_the_callers() {
+    let (router, engine, action_id) = seeded().await;
+    let own = caller_account();
+    let before = stored_keys(&engine);
+
+    // The caller's own resources carry a tag, so a refusal that wrote or deleted
+    // something on the key it named would show.
+    let held = [(TAG_KEY.to_string(), "platform".to_string())];
+    for (case, arn) in [
+        ("the budget", budget_arn(&own, BUDGET)),
+        (
+            "the budget's action",
+            action_arn(&own, BUDGET, &action_id),
+        ),
+    ] {
+        let (status, body) = call(
+            &router,
+            "TagResource",
+            &json!({"ResourceARN": &arn, "ResourceTags": tag_list(&held)}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "setup: expected {case} to be tagged, got {status} {body}"
+        );
+    }
+
+    for foreign in foreign_accounts() {
+        for (resource, arn, _held_by_the_caller) in arn_rows(&foreign, &action_id) {
+            for (operation, request) in every_arn_addressed_operation(&arn) {
+                let case = format!("{operation} on {resource} of {foreign}");
+                let (status, body) = call(&router, operation, &request).await;
+                assert_eq!(
+                    status, REFUSAL_STATUS,
+                    "case {case:?}: expected the refusal at {REFUSAL_STATUS}, got {status} {body}"
+                );
+                assert!(
+                    is_error(&body, "AccessDeniedException"),
+                    "case {case:?}: expected AccessDeniedException, got {body}"
+                );
+                assert!(
+                    !is_error(&body, "NotFoundException"),
+                    "case {case:?}: expected the account gate rather than a lookup, got {body}"
+                );
+                let message = body
+                    .get("Message")
+                    .or_else(|| body.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                assert!(
+                    !message.is_empty(),
+                    "case {case:?}: expected a message a caller can read, got {body}"
+                );
+                assert!(
+                    body.get("ResourceTags").is_none(),
+                    "case {case:?}: expected no ResourceTags in a refusal, got {body}"
+                );
+
+                let after = stored_keys(&engine);
+                assert_eq!(
+                    after, before,
+                    "case {case:?}: expected the refusal to leave the store at {before:?}, \
+                     got {after:?}"
+                );
+            }
+        }
+    }
+
+    // Not one of those refusals touched the tags of the caller's own resources.
+    for (case, arn) in [
+        ("the budget", budget_arn(&own, BUDGET)),
+        (
+            "the budget's action",
+            action_arn(&own, BUDGET, &action_id),
+        ),
+    ] {
+        let (status, body) = call(
+            &router,
+            "ListTagsForResource",
+            &json!({"ResourceARN": &arn}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the caller's own resource to stay readable, \
+             got {status} {body}"
+        );
+        assert_eq!(
+            reported(&body),
+            held.to_vec(),
+            "case {case:?}: expected the refusals to leave this resource's tags alone"
+        );
+    }
+}
+
+/// RULE, the other side over the tag plane: the gate refuses ONLY a foreign account. The
+/// same requests, with the ARN carrying the caller's OWN account and naming a resource
+/// the store holds, are served.
+#[tokio::test]
+async fn the_tag_plane_serves_an_arn_of_the_callers_own_account() {
+    let (router, _engine, action_id) = seeded().await;
+    let own = caller_account();
+
+    for (resource, arn, held_by_the_caller) in arn_rows(&own, &action_id) {
+        // Only the rows naming a resource that EXISTS can be served; the rest are the
+        // not-found rows the tag suites own.
+        if !held_by_the_caller {
+            continue;
+        }
+        for (operation, request) in every_arn_addressed_operation(&arn) {
+            let case = format!("{operation} on {resource}");
+            let (status, body) = call(&router, operation, &request).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the caller's own account to be served, \
+                 got {status} {body}"
+            );
+            assert!(
+                !is_error(&body, "AccessDeniedException"),
+                "case {case:?}: expected no AccessDeniedException for the caller's own \
+                 account, got {body}"
+            );
+        }
     }
 }

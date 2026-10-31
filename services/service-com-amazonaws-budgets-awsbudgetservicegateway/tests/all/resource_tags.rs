@@ -46,7 +46,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
 use super::budget_action_execution::{
     create_body, email_subscriber, iam_definition, seed_action, seed_budget,
 };
-use super::budget_lifecycle::{account, caller_account, call, is_error, router};
+use super::budget_lifecycle::{caller_account, call, is_error, router};
 
 /// The ARN of a budget. AWS names a budget
 /// `arn:{partition}:budgets::{account}:budget/{BudgetName}` — a global service, so the
@@ -402,7 +402,7 @@ async fn a_tag_set_naming_one_key_twice_is_refused_and_writes_nothing() {
 /// `InvalidParameterException`. Both halves are asserted for the write AND for the read,
 /// and neither leaves a mark on the resources the ARNs nearly named.
 ///
-/// The not-found rows differ along which part of the identity is wrong (the account, the
+/// The not-found rows differ along which part of the identity is wrong (the
 /// budget name, the action id, the budget an action id belongs to); the invalid rows along
 /// how the ARN departs from the form (not an ARN, another service's ARN, a region where a
 /// global service has none, an account that is not 12 digits, no `budget/` collection, an
@@ -433,15 +433,12 @@ async fn an_arn_that_names_no_resource_of_this_service_is_refused() {
     }
 
     let absent_action = "11111111-2222-3333-4444-555555555555";
+    // The account field is part of the identity too, but an ARN naming an account that
+    // is not the caller's is not a lookup at all: it is refused by the one account gate
+    // before the store is consulted, so those rows live in `account_scoping.rs`. Every
+    // row here therefore carries the caller's own account and differs in the rest of the
+    // identity.
     let not_found = [
-        // The account field is part of the identity too, and this service holds a budget
-        // under no account but the one it answers for — a request that names another
-        // account in an `AccountId` MEMBER is refused before any lookup
-        // (`account_scoping.rs`).
-        (
-            "an account that holds no budget",
-            budget_arn(&account(868_686_868), "owning"),
-        ),
         ("a budget name nobody created", budget_arn(&owner, "never-created")),
         (
             "a stored budget name in another case",

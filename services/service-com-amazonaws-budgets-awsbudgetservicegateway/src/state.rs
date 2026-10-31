@@ -1749,11 +1749,13 @@ pub fn store_at(
     store
 }
 
-/// The refusal message a request whose `AccountId` is not the caller's own account
+/// The refusal message a request that names an account other than the caller's own
 /// takes, or `None` when it names the caller's account.
 ///
 /// The budgets control plane is scoped to the account the request is signed by: every
-/// operation takes the `AccountId` "that is associated with the budget" and declares
+/// operation names the account "that is associated with the budget" — as an `AccountId`
+/// member, or, on the ARN-addressed tagging operations, as the account field of the
+/// `ResourceARN` ([`TaggedResource::account_id`]) — and declares
 /// `AccessDeniedException` ("You are not authorized to use this operation with the
 /// given parameters.", HTTP 403), and a caller reaches no account but its own through
 /// it. This emulator answers for exactly one account
@@ -2459,6 +2461,20 @@ pub enum TaggedResource {
         budget_name: String,
         action_id: String,
     },
+}
+
+impl TaggedResource {
+    /// The account that owns the resource — the ARN's account field, which is half of
+    /// the identity the store is keyed by and so the account this request names.
+    ///
+    /// What the ARN-addressed operations hand to [`foreign_account_refusal`], so the one
+    /// account gate reads the same account whether the request spells it as an
+    /// `AccountId` member or inside a `ResourceARN`.
+    pub fn account_id(&self) -> &str {
+        match self {
+            Self::Budget { account_id, .. } | Self::Action { account_id, .. } => account_id,
+        }
+    }
 }
 
 /// The resource `arn` names, or `Err` with the sentence that goes in

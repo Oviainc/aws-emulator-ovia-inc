@@ -7,7 +7,9 @@
 //! through [`crate::state::parse_resource_arn`]: the account and the budget name (and,
 //! for an action, the action id below it) come out of the ARN and address the store the
 //! create operations already key by. A value that is not an ARN of a resource this
-//! service holds is an `InvalidParameterException`; a well-formed ARN naming a budget or
+//! service holds is an `InvalidParameterException`; an ARN whose account field is not
+//! the account this emulator answers for is an `AccessDeniedException`
+//! ([`crate::state::foreign_account_refusal`]); a well-formed ARN naming a budget or
 //! action nobody created is a `NotFoundException`.
 //!
 //! A resource holds at most one tag per key, so a key it already carries takes the
@@ -170,6 +172,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(message),
             })
         })?;
+
+        // The budgets control plane is scoped to the account the caller signed with, and
+        // the account this request names is the `ResourceARN`'s own account field, so an
+        // ARN naming any other account is refused with the modelled 403 before anything
+        // is read or written — exactly as the `AccountId`-bearing operations refuse it
+        // (`crate::state::foreign_account_refusal`).
+        if let Some(message) = crate::state::foreign_account_refusal(target.account_id()) {
+            return Err(TagResourceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // One key cannot be given two values in one call, since a resource holds at most
         // one tag per key. Checked before the resource is looked up, so a request that is
