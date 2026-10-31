@@ -3840,6 +3840,9 @@ pub fn delivery_refusal(
 ///
 /// `policy` is the bus's policy document ([`BusPolicy::document`]), and `None`
 /// — a bus nothing has installed a statement on — shows nothing either.
+/// `context` is the publication's own condition context
+/// ([`publication_condition_context`]), so a statement scoped to one event's
+/// `Source` decides that event and no other.
 ///
 /// The decision is the SAME-ACCOUNT one, which is what this emulator's single
 /// account can hold: a principal of ANOTHER account, for which AWS requires an
@@ -3849,11 +3852,14 @@ pub fn publication_refusal(
     policy: Option<&str>,
     role_arn: Option<&str>,
     attempt: &DeliveryAttempt<'_>,
+    context: &[(String, String)],
 ) -> Option<(String, String)> {
     let document = policy?;
     let principals = publication_principals(role_arn, attempt);
     let (action, resource) = (attempt.action, attempt.resource);
-    let request = ::service_common::iam_authorization::Request::new(action, resource, &principals);
+    let request = ::service_common::iam_authorization::Request::new(action, resource, &principals)
+        .with_context(context)
+        .with_published_keys(&PUBLICATION_CONDITION_KEYS);
     if ::service_common::iam_authorization::resource_decision(document, &request)
         != ::service_common::iam_authorization::Decision::Denied
     {
@@ -3861,11 +3867,197 @@ pub fn publication_refusal(
     }
     Some((
         NO_PERMISSIONS.to_string(),
-        format!(
-            "User: {} is not authorized to perform: {action} on resource: {resource} \
-             with an explicit deny in a resource-based policy",
-            publication_principal(role_arn, attempt)
+        explicit_resource_policy_deny(
+            &publication_principal(role_arn, attempt),
+            action,
+            resource,
         ),
+    ))
+}
+
+/// The IAM action publishing an event onto an event bus performs — the action an
+/// event bus's resource policy grants or denies a publisher, and the one
+/// `PutPermission` installs a grant for.
+pub const PUT_EVENTS_ACTION: &str = "events:PutEvents";
+
+/// `events:source`: the condition key carrying the `Source` of the event being
+/// published.
+pub const SOURCE_CONDITION_KEY: &str = "events:source";
+
+/// `events:detail-type`: the condition key carrying the `DetailType` of the
+/// event being published.
+pub const DETAIL_TYPE_CONDITION_KEY: &str = "events:detail-type";
+
+/// `events:detail.service`.
+pub const DETAIL_SERVICE_CONDITION_KEY: &str = "events:detail.service";
+
+/// `events:detail.eventTypeCode`.
+pub const DETAIL_EVENT_TYPE_CODE_CONDITION_KEY: &str = "events:detail.eventTypeCode";
+
+/// `events:detail.userIdentity.principalId`.
+pub const DETAIL_PRINCIPAL_ID_CONDITION_KEY: &str = "events:detail.userIdentity.principalId";
+
+/// The condition keys read out of the published event's `Detail` document, each
+/// with the member path inside that document whose value it carries.
+///
+/// The key names the path: `events:detail.service` is `Detail`'s `service`
+/// member and `events:detail.userIdentity.principalId` the `principalId` member
+/// of its `userIdentity` object, so the table says in one place what each key
+/// reads.
+const DETAIL_CONDITION_KEYS: [(&str, &[&str]); 3] = [
+    (DETAIL_SERVICE_CONDITION_KEY, &["service"]),
+    (DETAIL_EVENT_TYPE_CODE_CONDITION_KEY, &["eventTypeCode"]),
+    (
+        DETAIL_PRINCIPAL_ID_CONDITION_KEY,
+        &["userIdentity", "principalId"],
+    ),
+];
+
+/// Every condition key a publication onto an event bus carries a value for — the
+/// EVENT-CONTENT keys AWS publishes for `events:PutEvents`, which is what a
+/// statement about that action can be scoped by.
+///
+/// Each reads one member of the event being published: the entry's `Source`
+/// ([`SOURCE_CONDITION_KEY`]) and `DetailType`
+/// ([`DETAIL_TYPE_CONDITION_KEY`]), and the three members of its `Detail`
+/// document [`DETAIL_CONDITION_KEYS`] names. They are DECLARED on the request
+/// ([`::service_common::iam_authorization::Request::with_published_keys`]), so a
+/// key this list carries and the event provides no value for is a key the
+/// publication really has no value for rather than one this emulator cannot
+/// decide — which is what lets a clause written with IAM's `IfExists` suffix, or
+/// a `Null` clause, be answered for it.
+pub const PUBLICATION_CONDITION_KEYS: [&str; 5] = [
+    SOURCE_CONDITION_KEY,
+    DETAIL_TYPE_CONDITION_KEY,
+    DETAIL_SERVICE_CONDITION_KEY,
+    DETAIL_EVENT_TYPE_CODE_CONDITION_KEY,
+    DETAIL_PRINCIPAL_ID_CONDITION_KEY,
+];
+
+/// The condition context ONE publication carries: a `(key, value)` pair for
+/// every key of [`PUBLICATION_CONDITION_KEYS`] the event provides a value for.
+///
+/// `detail` is the event's `Detail` as a parse tree ([`parse_detail`], or the
+/// `detail` member of an envelope being re-published), because the keys under it
+/// are members of that document rather than text of the request. Only a STRING
+/// member contributes a value: a member of any other JSON type names no text a
+/// string comparison could read.
+#[must_use]
+pub fn publication_condition_context(
+    source: Option<&str>,
+    detail_type: Option<&str>,
+    detail: Option<&::serde_json::Value>,
+) -> Vec<(String, String)> {
+    let mut context: Vec<(String, String)> = [
+        (SOURCE_CONDITION_KEY, source),
+        (DETAIL_TYPE_CONDITION_KEY, detail_type),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|value| (key.to_string(), value.to_string())))
+    .collect();
+    for (key, path) in DETAIL_CONDITION_KEYS {
+        let member = path
+            .iter()
+            .fold(detail, |at, step| at.and_then(|value| value.get(step)));
+        if let Some(text) = member.and_then(::serde_json::Value::as_str) {
+            context.push((key.to_string(), text.to_string()));
+        }
+    }
+    context
+}
+
+/// The condition context of a publication made from an event ENVELOPE rather
+/// than from a request entry — the shape a bus-to-bus forward re-publishes, whose
+/// members [`event_envelope`] names.
+#[must_use]
+pub fn envelope_publication_context(
+    envelope: &::serde_json::Map<String, ::serde_json::Value>,
+) -> Vec<(String, String)> {
+    let text = |field: &str| {
+        envelope
+            .get(field)
+            .and_then(::serde_json::Value::as_str)
+    };
+    publication_condition_context(text("source"), text("detail-type"), envelope.get("detail"))
+}
+
+/// The sentence AWS refuses a request with when the resource it names carries a
+/// statement that explicitly DENIES the calling principal the action: the
+/// principal that asked, the action it asked for, the resource it asked on, and
+/// the clause naming the kind of statement the deny came from.
+///
+/// The counterpart of the shared sentence for a resource policy that merely
+/// grants nothing
+/// (`::service_common::iam_authorization::not_authorized_by_resource_policy`),
+/// stated once here so both publication gates of this service — the one in front
+/// of a client's `PutEvents` ([`caller_publication_refusal`]) and the one in
+/// front of a bus-to-bus forward ([`publication_refusal`]) — word a deny
+/// identically.
+fn explicit_resource_policy_deny(principal: &str, action: &str, resource: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} \
+         with an explicit deny in a resource-based policy"
+    )
+}
+
+/// The IAM principal every request to this emulator speaks for — the one the
+/// account holds and `sts:GetCallerIdentity` reports — which is the principal a
+/// publication a CLIENT makes is authorized as, and the one an authorization
+/// refusal names.
+///
+/// Read from the shared definition, so this service refuses in the name of the
+/// same principal every other service of this emulator names.
+#[must_use]
+pub fn caller_principal() -> String {
+    ::service_common::caller_principal::ambient_user_arn()
+}
+
+/// Why the event bus `bus_arn` names does not accept a publication THIS CALLER
+/// makes onto it, given that bus's resource policy `policy`, or `None` when the
+/// policy shows nothing against it.
+///
+/// A client's `PutEvents` is a publication onto the bus the entry names, so it is
+/// authorized against that bus's own resource policy exactly as a bus-to-bus
+/// forward is ([`publication_refusal`]) — the difference is only the identity it
+/// is made as, which for a client request is [`caller_principal`] rather than a
+/// rule target's role session. The statements are evaluated with the
+/// publication's own condition context ([`publication_condition_context`]), so a
+/// statement scoped to one event's `Source` decides that event and no other.
+///
+/// What is refused is an explicit DENY and nothing else, for the reason
+/// [`publication_refusal`] gives: within one account "the resource-based policy
+/// and the identity-based policy are evaluated together, and access is granted if
+/// either allows it", so a policy that states nothing about the publication
+/// withholds nothing from the account's own principal.
+#[must_use]
+pub fn caller_publication_refusal(
+    policy: Option<&str>,
+    bus_arn: &str,
+    context: &[(String, String)],
+) -> Option<String> {
+    let document = policy?;
+    let caller = caller_principal();
+    // Every spelling a statement may name the caller by. The ACCOUNT's spellings
+    // are included because this decides a deny, and a statement that denies an
+    // account refuses each of its principals — the same reading
+    // [`publication_principals`] takes.
+    let mut principals = vec![caller.clone()];
+    principals.extend(::service_common::iam_authorization::account_principals(
+        &caller,
+    ));
+    let request =
+        ::service_common::iam_authorization::Request::new(PUT_EVENTS_ACTION, bus_arn, &principals)
+            .with_context(context)
+            .with_published_keys(&PUBLICATION_CONDITION_KEYS);
+    if ::service_common::iam_authorization::resource_decision(document, &request)
+        != ::service_common::iam_authorization::Decision::Denied
+    {
+        return None;
+    }
+    Some(explicit_resource_policy_deny(
+        &caller,
+        PUT_EVENTS_ACTION,
+        bus_arn,
     ))
 }
 

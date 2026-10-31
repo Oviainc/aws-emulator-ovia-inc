@@ -4,6 +4,17 @@
 //! Publishes events onto an event bus, routes each one, and delivers it to the
 //! targets of every rule it matched.
 //!
+//! A publication onto a bus is AUTHORIZED against that bus's own resource policy
+//! before any entry of the request is published: a statement of it that
+//! explicitly denies the calling identity `events:PutEvents` on the bus refuses
+//! the publication ([`crate::state::caller_publication_refusal`]), and because an
+//! authorization verdict is about the REQUEST rather than about one entry, the
+//! whole request is refused with `AccessDeniedException` and nothing of it is
+//! published — not even an entry whose own `Source` no statement names. The
+//! statements are evaluated with the publication's own condition context
+//! ([`crate::state::PUBLICATION_CONDITION_KEYS`]), so a statement scoped to one
+//! event's `Source` decides that event and no other.
+//!
 //! Every accepted entry is matched against the stored rules of the bus it names:
 //! an enabled rule whose `EventPattern` matches the event envelope is recorded
 //! as a match, together with the `Arn` of each of its targets, in
@@ -104,6 +115,9 @@
 //!
 //! ## Errors
 //!
+//! * `AccessDeniedException` (HTTP 400) — You do not have the necessary permissions for this
+//!   action. Widened in through `extra_errors` (see below): the refusal a publication the
+//!   bus's resource policy explicitly denies answers with.
 //! * `InternalException` (HTTP 500) — This exception occurs due to unexpected causes.
 
 #[allow(unused_imports)]
@@ -120,9 +134,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridge-awsevents.j
 // here — hence the `PutEventsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridge#PutEvents")]
+//
+// `AccessDeniedException` is widened in with `extra_errors`: this SERVICE models
+// the shape ("You do not have the necessary permissions for this action", HTTP
+// 400) while this OPERATION's own `errors` list does not name it, and it is the
+// refusal a publication the destination bus's resource policy denies answers with
+// (see the authorization pass in the handler below).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridge#PutEvents",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum PutEventsErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalException(InternalException),
 }
 
@@ -240,6 +264,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::required_member_violation(member),
             ));
+        }
+
+        // PASS 1b — AUTHORIZE the publication, before an `EventId` is minted for
+        // any entry. Publishing onto an event bus is an action the bus's own
+        // resource policy governs ("the policy that enables the external account
+        // to send events to your account", `DescribeEventBus$Policy`), so a
+        // statement of that policy explicitly denying this caller
+        // `events:PutEvents` on that bus refuses the publication — and the
+        // refusal is on the REQUEST, which is where an authorization verdict
+        // lands: the operation's per-entry failure channel reports what is wrong
+        // with an entry, not who may publish. So nothing of the request is
+        // published, not even an entry whose own `Source` no statement names.
+        //
+        // The decision is taken per entry, because the condition keys a
+        // statement scopes itself by are properties of the EVENT
+        // ([`crate::state::PUBLICATION_CONDITION_KEYS`]), and the first entry it
+        // refuses refuses the whole request.
+        if let Some(message) = publication_refused(&state, &region, &screened) {
+            return Err(PutEventsErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: Some(message),
+            })
+            .into());
         }
 
         // PASS 2 — under the lock, and only for as long as reading takes:
@@ -637,6 +683,73 @@ fn all_entries_incomplete(screened: &[Screened]) -> Option<&'static str> {
         first = first.or(Some(missing));
     }
     first
+}
+
+/// The refusal a resource policy of a bus this request publishes onto states
+/// against it, or `None` when no bus the request names denies this caller the
+/// publication.
+///
+/// The documents are READ under the store's guard and nothing is decided while
+/// it is held: one document per DISTINCT bus the request's accepted entries name
+/// (at most `Entries`' modelled ten). A bus this account does not hold carries no
+/// policy, so it refuses nothing — the same reading routing takes of an entry
+/// naming one.
+///
+/// Each accepted entry is then decided on its own, in the request's order,
+/// because the condition keys a statement scopes itself by are properties of the
+/// EVENT ([`crate::state::publication_condition_context`]); the first entry the
+/// policy denies is the refusal the whole request carries. The entry's `Detail`
+/// is parsed only when its bus actually has a policy, so a publication onto a
+/// bus nobody has installed a statement on costs nothing here.
+fn publication_refused(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsEventbridgeAwseventsState>,
+    region: &str,
+    screened: &[Screened],
+) -> Option<String> {
+    let mut policies: ::std::collections::BTreeMap<String, Option<String>> =
+        ::std::collections::BTreeMap::new();
+    {
+        let store = state.lock();
+        for slot in screened {
+            let Screened::Accepted(accepted) = slot else {
+                continue;
+            };
+            policies.entry(accepted.bus.clone()).or_insert_with(|| {
+                store
+                    .bus(region, &accepted.bus)
+                    .and_then(|bus| bus.policy.document())
+            });
+        }
+    }
+    if policies.values().all(Option::is_none) {
+        return None;
+    }
+    for slot in screened {
+        let Screened::Accepted(accepted) = slot else {
+            continue;
+        };
+        let Some(policy) = policies.get(&accepted.bus).and_then(Option::as_deref) else {
+            continue;
+        };
+        let detail = accepted
+            .detail
+            .as_deref()
+            .and_then(crate::state::parse_detail);
+        let context = crate::state::publication_condition_context(
+            accepted.source.as_deref(),
+            accepted.detail_type.as_deref(),
+            detail.as_ref(),
+        );
+        let refusal = crate::state::caller_publication_refusal(
+            Some(policy),
+            &crate::state::event_bus_arn(region, &accepted.bus),
+            &context,
+        );
+        if refusal.is_some() {
+            return refusal;
+        }
+    }
+    None
 }
 
 /// An entry that passed the state-free checks, with the members routing needs.
@@ -1552,10 +1665,6 @@ fn transformed(handover: &Handover<'_>) -> Result<Option<String>, String> {
     }
 }
 
-/// The IAM action re-publishing an event onto another bus performs, which is
-/// what the target's role has to be allowed to do.
-const PUT_EVENTS_ACTION: &str = "events:PutEvents";
-
 /// How many event-bus targets ONE published event may be re-published through.
 ///
 /// This operation's OWN bound, not a limit AWS publishes. A bus whose target is
@@ -1652,7 +1761,7 @@ async fn republish(
     let attempt = crate::state::DeliveryAttempt {
         rule: handover.rule,
         target_id: &target.id,
-        action: PUT_EVENTS_ACTION,
+        action: crate::state::PUT_EVENTS_ACTION,
         resource: &target.arn,
     };
     if let Some((code, message)) = role_refusal(iam, target.role_arn.as_deref(), &attempt) {
@@ -1701,9 +1810,16 @@ async fn republish(
             .collect();
         (record.policy.document(), rules)
     };
-    if let Some((code, message)) =
-        crate::state::publication_refusal(policy.as_deref(), target.role_arn.as_deref(), &attempt)
-    {
+    // The forward's own condition context: the statements of the destination
+    // policy are scoped by the members of the EVENT being published, so the copy
+    // is decided against its own envelope rather than against nothing.
+    let context = crate::state::envelope_publication_context(&envelope);
+    if let Some((code, message)) = crate::state::publication_refusal(
+        policy.as_deref(),
+        target.role_arn.as_deref(),
+        &attempt,
+        &context,
+    ) {
         return crate::state::InvocationOutcome::Failed { code, message };
     }
     // The copy's OWN event id, minted once the publication is authorized: a
