@@ -341,7 +341,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next_job_run_seq: 0,
                 sessions: ::std::collections::BTreeMap::new(),
                 session_tokens: ::std::collections::HashMap::new(),
-                next_session_seq: 0,
                 // The idle span `autoStopConfiguration` bounds is measured from the
                 // application's last activity, and it has just been created.
                 last_activity_at: now,

@@ -38,16 +38,32 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! A sixth seam, `override_protocol`, is one this service DOES take: the codec every
+//!   modelled response is rendered through. It is the model's own `restJson1` in every
+//!   respect but one — a read of an application or a session carries the whole
+//!   effective-configuration projection the service's wire response carries, including
+//!   the keys the model does not declare. See [`read_projection`] for that rule; it is
+//!   applied here, at the one place every response of this service passes through,
+//!   rather than per operation, because no handler can reach the rendering of its own
+//!   output.
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+mod read_projection;
+
+use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
+use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+use read_projection::ReadProjection;
 
 /// The wire error code every input refusal this service words carries.
 ///
@@ -234,6 +250,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         None
     }
 
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own protocol, with the read projection below applied to every
+        // modelled response. Implemented on the service itself, so the protocol it
+        // delegates to is the generated entry's own and there is no second routing table
+        // to drift from the model.
+        Some(self)
+    }
+
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
@@ -269,7 +293,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_framework_error(
         &self,
-        error: &aws_smithy_schema_server::ProtocolError,
+        error: &ProtocolError,
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this on a transport-level failure it detects up front —
         // before (or instead of) naming an operation — such as a malformed
@@ -279,5 +303,95 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+/// The protocol this service answers modelled requests in: the model's own, with the one
+/// read projection [`read_projection`] states.
+///
+/// Implemented on the service itself because the model-derived protocol it delegates to
+/// is owned by the generated entry and reached by reference (`self.entry.protocol()`),
+/// and [`Service::override_protocol`] hands back a borrow of `&self` — so there is one
+/// protocol instance, the generated one, and no second routing table to drift from the
+/// model.
+impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
+    type Request = WireRequest;
+    type Response = WireResponse;
+
+    fn protocol_id(&self) -> &aws_smithy_schema::ShapeId {
+        self.entry.protocol().protocol_id()
+    }
+
+    fn routing_key<'a>(&self, request: &'a WireRequest) -> Result<&'a str, ProtocolError> {
+        self.entry.protocol().routing_key(request)
+    }
+
+    fn deserialize_input<'a>(
+        &self,
+        request: &'a WireRequest,
+        input_schema: &Schema,
+    ) -> Result<Box<dyn aws_smithy_schema::serde::ShapeDeserializer + 'a>, ProtocolError> {
+        // The REQUEST side is the framework's own: the projection is about what a read
+        // reports, and no input member of this model carries any of it.
+        self.entry
+            .protocol()
+            .deserialize_input(request, input_schema)
+    }
+
+    fn serialize_output(
+        &self,
+        output: &dyn aws_smithy_schema::serde::SerializableStruct,
+        output_schema: &Schema,
+        operation_name: &str,
+        success_status: u16,
+    ) -> Result<WireResponse, ProtocolError> {
+        // The status, the headers and every modelled member stay the framework's: only
+        // the resource a read carries gains the rest of its effective-configuration
+        // projection, from the record the handler already returned.
+        self.entry.protocol().serialize_output(
+            &ReadProjection::new(output),
+            output_schema,
+            operation_name,
+            success_status,
+        )
+    }
+
+    fn serialize_error(
+        &self,
+        error: &dyn aws_smithy_schema::serde::SerializableStruct,
+        error_schema: &Schema,
+        error_code: &str,
+        http_status: u16,
+    ) -> Result<WireResponse, ProtocolError> {
+        // No error shape of this model carries a configuration block, so a failure is
+        // rendered exactly as the framework renders it.
+        self.entry
+            .protocol()
+            .serialize_error(error, error_schema, error_code, http_status)
+    }
+
+    fn serialize_event_stream_message(
+        &self,
+        event_type: &str,
+        is_exception: bool,
+        event: &dyn aws_smithy_schema::serde::SerializableStruct,
+        event_schema: &Schema,
+    ) -> Result<WireResponse, ProtocolError> {
+        self.entry.protocol().serialize_event_stream_message(
+            event_type,
+            is_exception,
+            event,
+            event_schema,
+        )
+    }
+}
+
+/// `ServerProtocol` requires `Debug`; the generated entry is not `Debug`, so this names
+/// the protocol being served rather than the service's internals.
+impl<Eng: Send + Sync + 'static> std::fmt::Debug for EmulatedService<Eng> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmulatedService")
+            .field("protocol", self.entry.protocol().protocol_id())
+            .finish()
     }
 }

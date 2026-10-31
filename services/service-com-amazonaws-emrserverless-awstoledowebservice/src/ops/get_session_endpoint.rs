@@ -200,8 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every id reported is the STORED session's own, never the request's.
         let application_id = session.session.application_id.clone();
         let session_id = session.session.session_id.clone();
-        let endpoint =
-            crate::state::session_endpoint_url(ctx.parts(), &region, &application_id, &session_id);
+        let endpoint = crate::state::session_endpoint_url(&region, &session_id);
         drop(store);
 
         // A fresh token per call, which is what "Call this operation again when the

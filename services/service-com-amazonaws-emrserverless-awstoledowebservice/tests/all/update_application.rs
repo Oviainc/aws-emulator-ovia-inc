@@ -132,6 +132,20 @@ fn seconds(application: &Value, member: &str) -> f64 {
         .unwrap_or_default()
 }
 
+/// The OTHER key a read reports one configuration member under, for the two blocks the
+/// service's response carries twice, or `None` for a member reported once.
+///
+/// Source: the read projection in
+/// `src/service/read_projection.rs`, pinned end to end by
+/// `effective_configuration_projection`.
+fn other_spelling(member: &str) -> Option<&'static str> {
+    match member {
+        "autoStartConfiguration" => Some("autoStartConfig"),
+        "autoStopConfiguration" => Some("autoStopConfig"),
+        _ => None,
+    }
+}
+
 /// Rule 1: an update applies exactly the members it names, leaves the rest as stored,
 /// and every later read reports the updated record.
 ///
@@ -174,15 +188,28 @@ async fn an_update_applies_the_members_it_names_and_leaves_the_rest_as_stored() 
         (
             // The block REPLACES the stored one: the member the update leaves out comes
             // back as `AutoStopConfig$enabled`'s documented default (true), not as the
-            // `false` the create stored.
+            // `false` the create stored. The read reports the idle timeout under both of
+            // the names the block carries it under.
             "a configuration block naming one of its members",
             json!({ "autoStopConfiguration": { "idleTimeoutMinutes": 1 } }),
-            json!({ "autoStopConfiguration": { "enabled": true, "idleTimeoutMinutes": 1 } }),
+            json!({
+                "autoStopConfiguration": {
+                    "enabled": true,
+                    "idleTimeoutMinutes": 1,
+                    "idleTimeout": 1,
+                },
+            }),
         ),
         (
             "the idle timeout at its published maximum",
             json!({ "autoStopConfiguration": { "enabled": true, "idleTimeoutMinutes": 10080 } }),
-            json!({ "autoStopConfiguration": { "enabled": true, "idleTimeoutMinutes": 10080 } }),
+            json!({
+                "autoStopConfiguration": {
+                    "enabled": true,
+                    "idleTimeoutMinutes": 10080,
+                    "idleTimeout": 10080,
+                },
+            }),
         ),
         (
             "an initial capacity of one worker type",
@@ -392,8 +419,21 @@ async fn an_update_applies_the_members_it_names_and_leaves_the_rest_as_stored() 
         );
 
         // Every member the update did NOT name is exactly as it was stored. `updatedAt`
-        // is excluded: the update is what moved it.
-        let named: BTreeSet<&String> = members.as_object().into_iter().flatten().map(|(name, _)| name).collect();
+        // is excluded: the update is what moved it. A member named here also moves the
+        // OTHER spelling the read projection reports it under, so that spelling counts as
+        // named too (`effective_configuration_projection` pins the pair).
+        let named: BTreeSet<String> = members
+            .as_object()
+            .into_iter()
+            .flatten()
+            .flat_map(|(name, _)| {
+                let mut spellings = vec![name.clone()];
+                if let Some(other) = other_spelling(name) {
+                    spellings.push(other.to_string());
+                }
+                spellings
+            })
+            .collect();
         let after = read_back.at("/application");
         for (member, stored) in before.as_object().into_iter().flatten() {
             if named.contains(member) || member == "updatedAt" {

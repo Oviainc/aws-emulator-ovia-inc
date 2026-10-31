@@ -39,8 +39,8 @@ use crate::ops::types::{
     Configuration, ConflictException, CreateApplicationInput, DiskEncryptionConfiguration,
     IdentityCenterConfiguration, IdentityCenterConfigurationInput, ImageConfiguration,
     ImageConfigurationInput, JobRun, JobRunSummary, JobLevelCostAllocationConfiguration,
-    MonitoringConfiguration, ResourceNotFoundException, Session, WorkerTypeSpecification,
-    WorkerTypeSpecificationInput,
+    ManagedPersistenceMonitoringConfiguration, MonitoringConfiguration,
+    ResourceNotFoundException, Session, WorkerTypeSpecification, WorkerTypeSpecificationInput,
 };
 
 /// This service's ARN namespace, and the `sigv4Name` the model declares
@@ -110,6 +110,41 @@ pub const DEFAULT_AUTO_STOP_ENABLED: bool = true;
 /// minutes after which your application will automatically stop. Defaults to 15
 /// minutes."
 pub const DEFAULT_IDLE_TIMEOUT_MINUTES: i32 = 15;
+
+/// Whether an application's logs are kept in managed log persistence, when its
+/// `monitoringConfiguration` names no `managedPersistenceMonitoringConfiguration`.
+///
+/// `ManagedPersistenceMonitoringConfiguration$enabled` documents it: "Enables managed
+/// logging and defaults to true. If set to false, managed logging will be turned off."
+pub const DEFAULT_MANAGED_PERSISTENCE_ENABLED: bool = true;
+
+/// Whether an application allocates cost per job run, when `CreateApplication` names no
+/// `jobLevelCostAllocationConfiguration`.
+///
+/// `JobLevelCostAllocationConfiguration$enabled` "enables job level cost allocation for
+/// the application" and the model declares no default, so it is the opt-in member it
+/// reads as: an application created without it runs with it off, and a read reports that
+/// rather than omitting the flag.
+pub const DEFAULT_JOB_LEVEL_COST_ALLOCATION_ENABLED: bool = false;
+
+/// Whether an application runs under Amazon EMR extended support.
+///
+/// No operation this service models carries an `extendedSupportConfiguration` member —
+/// neither `CreateApplicationRequest` nor `UpdateApplicationRequest` declares one
+/// (`smithy_query(query="operation",operation="CreateApplication,UpdateApplication")`) —
+/// so no request reaching this emulator turns it on, and every application it holds runs
+/// under the account-level setting, which is off. The sessions an application serves run
+/// under the application's setting, so they report the same flag.
+pub const EXTENDED_SUPPORT_ENABLED: bool = false;
+
+/// Which level the extended-support setting an application runs under was set at: the
+/// account, since nothing sets it per application (see [`EXTENDED_SUPPORT_ENABLED`]).
+pub const EXTENDED_SUPPORT_SOURCE: &str = "ACCOUNT";
+
+/// The domain EMR Serverless publishes an interactive session's endpoint under, between
+/// the label naming the session and the region: a session is reached at
+/// `https://<sessionId>.<this>.<region>.amazonaws.com`.
+pub const SESSION_ENDPOINT_DOMAIN: &str = "s.emr-serverless-services";
 
 /// How long a resource stays in the state the call that started the work returned
 /// (`CREATING` after a create, `STARTING` after a start, `STOPPING` after a stop,
@@ -752,8 +787,6 @@ pub struct ApplicationRecord {
     /// A `StartSession` `clientToken` to the session that token started, so a retried
     /// start answers with the first session instead of a second one.
     pub session_tokens: HashMap<String, String>,
-    /// The counter session ids are minted from.
-    pub next_session_seq: u64,
     /// When this application was last ACTIVE: the instant it was created, the instant a
     /// start brought it up, and the instant its last job run or session was started or
     /// finished.
@@ -902,18 +935,6 @@ impl ApplicationRecord {
         }
     }
 
-    /// Mint an unused session id matching `SessionId`'s `^[0-9a-z]+$`, the same way
-    /// [`Self::mint_job_run_id`] mints a job run id.
-    pub fn mint_session_id(&mut self) -> String {
-        loop {
-            self.next_session_seq = self.next_session_seq.wrapping_add(1);
-            let id = format!("{:016x}", self.next_session_seq);
-            if !self.sessions.contains_key(&id) {
-                return id;
-            }
-        }
-    }
-
     /// Whether interactive sessions are enabled on this application.
     ///
     /// `InteractiveConfiguration$sessionEnabled` documents it: "Enables interactive
@@ -992,6 +1013,13 @@ pub struct ComAmazonawsEmrserverlessAwstoledowebserviceState {
     pub create_application_tokens: HashMap<String, CreateApplicationReplay>,
     /// The counter application ids are minted from.
     pub next_application_seq: u64,
+    /// The counter session ids are minted from.
+    ///
+    /// Store-wide rather than per application, because a session id names ONE session:
+    /// the endpoint a client is handed for a session is a host built from that id
+    /// ([`session_endpoint_url`]), so two sessions carrying the same id would be reached
+    /// at the same host.
+    pub next_session_seq: u64,
 }
 
 impl ComAmazonawsEmrserverlessAwstoledowebserviceState {
@@ -1004,6 +1032,27 @@ impl ComAmazonawsEmrserverlessAwstoledowebserviceState {
                 return id;
             }
         }
+    }
+
+    /// Mint a session id matching `SessionId`'s `^[0-9a-z]+$` that NO application holds
+    /// a session under, the same way [`Self::mint_application_id`] mints an application
+    /// id: sixteen lowercase hex digits, with the loop skipping an id already taken,
+    /// which is what makes the counter's wrap safe.
+    pub fn mint_session_id(&mut self) -> String {
+        loop {
+            self.next_session_seq = self.next_session_seq.wrapping_add(1);
+            let id = format!("{:016x}", self.next_session_seq);
+            if !self.holds_session(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Whether any application in the store holds a session under `session_id`.
+    fn holds_session(&self, session_id: &str) -> bool {
+        self.applications
+            .values()
+            .any(|record| record.sessions.contains_key(session_id))
     }
 
     /// The application `id` names, with every state change the clock owes it (and its
@@ -1435,28 +1484,31 @@ pub fn mint_session_auth_token(store: &::emulator_server::CredentialStore) -> Op
     token
 }
 
-/// The URL a client connects to one interactive session on: the endpoint this request
-/// reached the emulator on, and the path of the session it names.
+/// The endpoint a client connects a Livy or Spark Connect client to one interactive
+/// session on: an https ORIGIN whose host names that session under the EMR Serverless
+/// session-endpoint domain of the region the call was signed for, and nothing else — no
+/// port, no path, no query.
 ///
-/// The emulator serves no interactive session data plane — it runs no Spark statement —
-/// so the URL names a path on the endpoint the caller is already talking to rather than
-/// a session host nothing here answers for. It is derived from the STORED session's own
-/// ids, so every call for one session reports the same endpoint.
-pub fn session_endpoint_url(
-    parts: &::http::request::Parts,
-    region: &str,
-    application_id: &str,
-    session_id: &str,
-) -> String {
-    let path = format!("/applications/{application_id}/sessions/{session_id}/connect");
-    let url = format!("{}{path}", request_endpoint(parts, region));
+/// A client reads this value to build a connection: it takes the host out of it for an
+/// SNI or `Host` header, or hands the whole origin to a client library that appends its
+/// own protocol path. So the value is an origin naming the session, derived from the
+/// STORED session's own id and the request's region — every call for one session reports
+/// the same endpoint, and two sessions never share one.
+pub fn session_endpoint_url(region: &str, session_id: &str) -> String {
+    let url = session_endpoint_origin(region, session_id);
     if url.chars().count() <= ENDPOINT_URL_MAX_LENGTH {
         return url;
     }
-    // A request that reached the emulator on an authority long enough to push the URL
-    // past `EndpointUrl`'s bound is answered with the regional endpoint, whose length no
-    // request can influence.
-    format!("https://{ARN_NAMESPACE}.{region}.amazonaws.com{path}")
+    // A request signed for a region name long enough to push the origin past
+    // `EndpointUrl`'s bound is answered for this service's default region, whose length
+    // no request can influence.
+    session_endpoint_origin(DEFAULT_REGION, session_id)
+}
+
+/// The one place the session-endpoint host is spelled: the session's label, the
+/// session-endpoint domain, the region, and the AWS suffix.
+fn session_endpoint_origin(region: &str, session_id: &str) -> String {
+    format!("https://{session_id}.{SESSION_ENDPOINT_DOMAIN}.{region}.amazonaws.com")
 }
 
 /// The endpoint this request arrived on, falling back to the public EMR Serverless
@@ -1560,25 +1612,49 @@ pub fn adopt_architecture(architecture: Option<String>) -> Option<String> {
     Some(architecture.unwrap_or_else(|| DEFAULT_ARCHITECTURE.to_string()))
 }
 
-/// The `monitoringConfiguration` to persist: the caller's, or the empty configuration
-/// an application created without one runs under.
+/// The `monitoringConfiguration` to persist: the caller's, with the managed log
+/// persistence every application runs under materialised inside it.
 ///
 /// `Application$monitoringConfiguration` reports "the configuration setting for
 /// monitoring" THIS application has, which every application has — nothing in it is
 /// required — so a read reports the configuration the service applied rather than
-/// omitting the block.
+/// omitting the block, down to the blocks INSIDE it that carry a documented default.
 pub fn adopt_monitoring(
     config: Option<MonitoringConfiguration>,
 ) -> Option<MonitoringConfiguration> {
-    Some(config.unwrap_or_default())
+    let mut config = config.unwrap_or_default();
+    config.managed_persistence_monitoring_configuration = Some(adopt_managed_persistence(
+        config.managed_persistence_monitoring_configuration.take(),
+    ));
+    Some(config)
 }
 
-/// The `jobLevelCostAllocationConfiguration` to persist, on the same rule: the
-/// caller's, or the empty configuration an application created without one carries.
+/// The `managedPersistenceMonitoringConfiguration` to persist: the caller's, with
+/// [`DEFAULT_MANAGED_PERSISTENCE_ENABLED`] filled in. The encryption key stays whatever
+/// the caller named; there is no default key.
+fn adopt_managed_persistence(
+    config: Option<ManagedPersistenceMonitoringConfiguration>,
+) -> ManagedPersistenceMonitoringConfiguration {
+    let config = config.unwrap_or_default();
+    ManagedPersistenceMonitoringConfiguration {
+        enabled: Some(config.enabled.unwrap_or(DEFAULT_MANAGED_PERSISTENCE_ENABLED)),
+        encryption_key_arn: config.encryption_key_arn,
+    }
+}
+
+/// The `jobLevelCostAllocationConfiguration` to persist, on the same rule: the caller's,
+/// with [`DEFAULT_JOB_LEVEL_COST_ALLOCATION_ENABLED`] filled in.
 pub fn adopt_job_level_cost_allocation(
     config: Option<JobLevelCostAllocationConfiguration>,
 ) -> Option<JobLevelCostAllocationConfiguration> {
-    Some(config.unwrap_or_default())
+    let config = config.unwrap_or_default();
+    Some(JobLevelCostAllocationConfiguration {
+        enabled: Some(
+            config
+                .enabled
+                .unwrap_or(DEFAULT_JOB_LEVEL_COST_ALLOCATION_ENABLED),
+        ),
+    })
 }
 
 /// The `imageConfiguration` to persist for the `ImageConfigurationInput` a request

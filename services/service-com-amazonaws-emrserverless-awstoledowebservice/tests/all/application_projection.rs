@@ -446,7 +446,8 @@ async fn a_read_reports_the_members_the_application_carries() {
         }
 
         // Every configuration block an application carries is REPORTED, with whatever
-        // the create put in it — never omitted for a caller to guess at.
+        // the create put in it — and, for the members the create left out, with the
+        // default the service applies, which `effective_configuration_projection` pins.
         for member in [
             "/application/monitoringConfiguration",
             "/application/jobLevelCostAllocationConfiguration",
@@ -457,11 +458,14 @@ async fn a_read_reports_the_members_the_application_carries() {
                 "case {case:?}: GetApplication{member} must report the configuration the \
                  application carries, got {actual:?}"
             );
-            if let Some(given) = request.get(member.rsplit('/').next().unwrap_or_default()) {
+            let given = request.get(member.rsplit('/').next().unwrap_or_default());
+            for (named, expected) in given.and_then(Value::as_object).into_iter().flatten() {
                 assert_eq!(
-                    &actual, given,
-                    "case {case:?}: GetApplication{member} must report what the create \
-                     gave ({given:?}), got {actual:?}"
+                    actual.get(named).unwrap_or(&Value::Null),
+                    expected,
+                    "case {case:?}: GetApplication{member}/{named} must report what the \
+                     create gave ({expected:?}), got {:?}",
+                    actual.get(named)
                 );
             }
         }

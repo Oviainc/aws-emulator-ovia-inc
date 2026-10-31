@@ -15,6 +15,8 @@
 mod application_lifecycle;
 #[path = "all/application_projection.rs"]
 mod application_projection;
+#[path = "all/effective_configuration_projection.rs"]
+mod effective_configuration_projection;
 #[path = "all/idempotency_and_idle_lifecycle.rs"]
 mod idempotency_and_idle_lifecycle;
 #[path = "all/refusal_wording.rs"]

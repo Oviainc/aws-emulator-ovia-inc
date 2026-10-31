@@ -279,7 +279,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let session_id = record.mint_session_id();
+        // A session id names ONE session in the store, so it is minted from the store's
+        // own counter rather than from the application's — which is why the record is
+        // re-reached here: it cannot stay borrowed while the store mints. Everything the
+        // checks above wrote to it is already applied, and settling again at the same
+        // instant changes nothing.
+        let session_id = store.mint_session_id();
+        let record = store
+            .settled_mut(&input.application_id, now)
+            .ok_or_else(|| {
+                StartSessionErrorModeled::ResourceNotFoundException(
+                    crate::state::application_not_found(),
+                )
+            })?;
         let arn = crate::state::session_arn(&record.application.arn, &session_id);
         let created_at = crate::state::now_timestamp(now);
         let session = Session {

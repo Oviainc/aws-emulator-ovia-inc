@@ -208,7 +208,7 @@ async fn get_session_endpoint_reports_the_stored_session_and_a_fresh_token() {
             "case {label:?}: endpoint must be a URL a client can connect to, got {endpoint:?}"
         );
         assert!(
-            endpoint.contains(&application_id) && endpoint.contains(&session_id),
+            endpoint.contains(&session_id),
             "case {label:?}: endpoint must name the session it is for, got {endpoint:?}"
         );
 
