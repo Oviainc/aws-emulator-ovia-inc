@@ -161,10 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.security_configurations.get(&input.name) else {
             return Err(
                 DescribeSecurityConfigurationErrorModeled::InvalidRequestException(
-                    crate::state::resource_not_found(format!(
-                        "Security configuration with name '{}' does not exist.",
-                        input.name
-                    )),
+                    crate::state::unknown_security_configuration(&input.name),
                 )
                 .into(),
             );

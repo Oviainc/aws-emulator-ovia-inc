@@ -16,7 +16,7 @@
 //! account default, `PutBlockPublicAccessConfiguration` replaces it whole, and
 //! `GetBlockPublicAccessConfiguration` reports it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -249,8 +249,40 @@ pub fn resource_not_found(message: String) -> InvalidRequestException {
     }
 }
 
-/// How a cluster-scoped operation refuses a `ClusterId` the service holds no cluster
-/// for: Amazon EMR's own wording for that refusal, which names the id the caller asked
+/// How the security-configuration surface words a `Name` the account holds no
+/// configuration under: Amazon EMR's own sentence for that refusal, which quotes the name
+/// the request sent with DOUBLE quotes.
+///
+/// Recorded behavior for the text, shared by `DescribeSecurityConfiguration` and
+/// `DeleteSecurityConfiguration`: one template in one place, so the two operations cannot
+/// come to word the same refusal differently. The class is an ABSENT resource, so the
+/// refusal is built through [`resource_not_found`] and carries that discriminator.
+pub fn unknown_security_configuration(name: &str) -> InvalidRequestException {
+    resource_not_found(format!(
+        "Security configuration with name \"{name}\" does not exist."
+    ))
+}
+
+/// How `CreateSecurityConfiguration` words a `Name` the account already holds a
+/// configuration under: Amazon EMR's own sentence for that refusal, which names the
+/// SHAPE (`SecurityConfiguration`) and single-quotes the name the request sent.
+///
+/// Recorded behavior for the text. The class is a conflict rather than an absent
+/// resource, so the refusal carries no discriminator — Amazon EMR publishes none for it.
+pub fn security_configuration_exists_message(name: &str) -> String {
+    format!("SecurityConfiguration with name '{name}' already exists.")
+}
+
+/// How `CreateSecurityConfiguration` refuses a `SecurityConfiguration` document that is
+/// not JSON: Amazon EMR's own CONSTANT sentence for that refusal.
+///
+/// Recorded behavior for the text. It is constant by design — it names neither the
+/// parser, nor the position it stopped at, nor anything the document carried — so a
+/// caller matching it recognises every malformed document the same way.
+pub const MALFORMED_SECURITY_CONFIGURATION_MESSAGE: &str =
+    "Invalid security configuration; Malformed Json string.";
+
+
 /// for. What IS the contract beside the text is the refusal itself — HTTP 400, with the
 /// client error the operation models — rather than an empty success.
 ///
@@ -278,6 +310,13 @@ pub fn unknown_cluster(cluster_id: &str) -> InvalidRequestException {
 /// How the LEGACY job-flow surface refuses a cluster id it holds no cluster for: the
 /// operations that reach a cluster as a "job flow" answer one fixed sentence, naming
 /// neither the id nor the `ClusterId` member.
+///
+/// Recorded behavior: the sentence is CONSTANT — no operation of this surface appends
+/// the id it rejected. Which surface an operation belongs to is not read off its input
+/// member: the managed-scaling MUTATORS take a `ClusterId` and answer this sentence,
+/// while `GetManagedScalingPolicy` beside them reports a cluster id
+/// ([`unknown_cluster_message`]), and `SetUnhealthyNodeReplacement` takes `JobFlowIds`
+/// and reports a cluster id too.
 pub fn unknown_job_flow_message() -> String {
     "Specified job flow ID not valid.".to_string()
 }
@@ -444,14 +483,47 @@ pub fn unknown_ec2_instance_message(instance_id: &str) -> String {
 }
 
 /// How a session-scoped operation refuses a session id the named cluster carries no
-/// session for: the id the caller sent and the cluster it was looked for on, since a
-/// session is addressed by both.
+/// session for: Amazon EMR's own sentence for that refusal, which names the SESSION id
+/// the request sent and nothing else — no cluster id, and no clause about where the
+/// session was looked for.
 ///
-/// AWS does not document the wording, so the text is built from the request. What IS the
-/// contract is the refusal itself — HTTP 400 with the operation's client error — rather
-/// than an empty success.
-pub fn unknown_session_message(session_id: &str, cluster_id: &str) -> String {
-    format!("Session id '{session_id}' is not valid or does not exist on cluster '{cluster_id}'.")
+/// Recorded behavior for the text: the cluster the lookup ran against is already the one
+/// the request named, so Amazon EMR states only the id that did not resolve. A cluster
+/// that resolves no cluster at all is the OTHER refusal, worded by
+/// [`unknown_cluster_message`] and reached before this one.
+pub fn unknown_session_message(session_id: &str) -> String {
+    format!("Session id {}", not_valid_message(session_id))
+}
+
+/// The characters a session id is drawn from, beside ASCII letters and digits.
+///
+/// Amazon EMR mints a session id as an opaque identifier — a prefix, a hyphen and a body
+/// of letters and digits — so these two symbols are the only non-alphanumerics one can
+/// carry. The Smithy model constrains `SessionId` by length alone (`len 0..256`, no
+/// `@pattern`), so the boundary validator passes anything that fits, and this class is
+/// what the service itself then enforces ([`is_session_id_shaped`]).
+const SESSION_ID_PUNCTUATION: [char; 2] = ['-', '_'];
+
+/// Whether `session_id` could be a session id at all: every character is an ASCII letter
+/// or digit, or one of [`SESSION_ID_PUNCTUATION`].
+///
+/// A value carrying anything else — a space, a slash, a control character, punctuation
+/// outside the class — names no session Amazon EMR could ever have minted, so it is
+/// refused on its SHAPE rather than looked up (see [`malformed_session_id_message`]).
+pub fn is_session_id_shaped(session_id: &str) -> bool {
+    session_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || SESSION_ID_PUNCTUATION.contains(&c))
+}
+
+/// How a session-scoped operation refuses a `SessionId` that is not a session id at all.
+///
+/// Recorded behavior for the text: Amazon EMR states the session's QUALIFIED path — the
+/// cluster id, the `session` segment and the session id, exactly as the request sent
+/// them — and that it is not valid. The member name leads the sentence in the casing the
+/// wire uses for it.
+pub fn malformed_session_id_message(cluster_id: &str, session_id: &str) -> String {
+    format!("sessionId '{cluster_id}/session/{session_id}' is not valid.")
 }
 
 /// How many tags one Amazon EMR resource carries at the most.
@@ -591,23 +663,47 @@ pub fn validate_tags(tags: &[Tag]) -> Result<(), String> {
 /// replaces its value rather than adding a second entry — which is what makes adding the
 /// same tag twice leave the resource exactly as the first call did.
 ///
-/// The merge is computed on a copy and committed only once it fits
-/// [`MAX_TAGS_PER_RESOURCE`], so a refused request leaves the resource's tags as they
-/// were rather than half merged.
+/// The SIZE the merge would leave behind is computed first, in one pass over the two
+/// lists and without copying either of them: the set a merge leaves is what the resource
+/// holds plus the DISTINCT submitted keys it does not, so a request that would take the
+/// resource past [`MAX_TAGS_PER_RESOURCE`] is refused before anything is allocated for
+/// it, and the resource's tags are left exactly as they were rather than half merged.
+/// The count is the exact resulting one rather than the submitted length, because a list
+/// that repeats one key adds one tag however long it is.
+///
+/// Both passes are keyed lookups, so the work is linear in the submitted list a caller
+/// already sent rather than quadratic in it, and the list that IS built is bounded by
+/// the ceiling checked above.
 pub fn merge_tags(held: &mut Vec<Tag>, submitted: &[Tag]) -> Result<(), String> {
-    let mut merged = held.clone();
-    for tag in submitted {
-        match merged.iter().position(|existing| existing.key == tag.key) {
-            Some(at) => merged[at].value = tag.value.clone(),
-            None => merged.push(tag.clone()),
-        }
-    }
-    if merged.len() > MAX_TAGS_PER_RESOURCE {
+    let carried: HashSet<Option<&str>> = held.iter().map(|tag| tag.key.as_deref()).collect();
+    let added: HashSet<Option<&str>> = submitted
+        .iter()
+        .map(|tag| tag.key.as_deref())
+        .filter(|key| !carried.contains(key))
+        .collect();
+    let resulting = held.len() + added.len();
+    if resulting > MAX_TAGS_PER_RESOURCE {
         return Err(format!(
-            "These tags would leave the resource carrying {} tags; a resource carries at \
-             most {MAX_TAGS_PER_RESOURCE} tags",
-            merged.len()
+            "These tags would leave the resource carrying {resulting} tags; a resource \
+             carries at most {MAX_TAGS_PER_RESOURCE} tags"
         ));
+    }
+
+    let mut merged = held.clone();
+    // Where each key sits in `merged`, so a re-submitted key is found by lookup rather
+    // than by scanning the list again for every entry submitted.
+    let mut position: HashMap<Option<String>, usize> = HashMap::new();
+    for (at, tag) in merged.iter().enumerate() {
+        position.entry(tag.key.clone()).or_insert(at);
+    }
+    for tag in submitted {
+        match position.get(&tag.key) {
+            Some(&at) => merged[at].value = tag.value.clone(),
+            None => {
+                position.insert(tag.key.clone(), merged.len());
+                merged.push(tag.clone());
+            }
+        }
     }
     *held = merged;
     Ok(())
@@ -1200,7 +1296,6 @@ impl ComAmazonawsEmrElasticmapreduceState {
                 Some(session) => Ok(TagSetMut::Optional(&mut session.tags)),
                 None => Err(TagTargetRefusal::NotValid(unknown_session_message(
                     resource_id,
-                    cluster_id,
                 ))),
             };
         }

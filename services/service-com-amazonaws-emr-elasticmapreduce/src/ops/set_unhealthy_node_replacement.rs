@@ -184,13 +184,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Resolve every id BEFORE changing anything, so a request naming one unknown
         // id changes no cluster at all. This operation models no client error, so the
-        // refusal is the 400 `ValidationException` channel — the same one
-        // `TerminateJobFlows` answers an unknown job flow id with.
+        // refusal is the 400 `ValidationException` channel. Amazon EMR words this one as
+        // a CLUSTER id — the same sentence `DescribeCluster` answers for the same id —
+        // rather than with the legacy job-flow surface's constant, even though the
+        // member is named `JobFlowIds`.
         for job_flow_id in &input.job_flow_ids {
             if !store.clusters.contains_key(job_flow_id) {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Specified job flow ID not valid: '{job_flow_id}'"
-                )));
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::unknown_cluster_message(job_flow_id),
+                ));
             }
         }
 

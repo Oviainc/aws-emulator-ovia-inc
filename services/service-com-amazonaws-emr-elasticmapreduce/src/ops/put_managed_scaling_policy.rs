@@ -151,9 +151,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // This operation models no client error, so a request it must refuse is answered
         // with the 400 `ValidationException` channel rather than a 501 or an empty 200.
+        // The MUTATING managed-scaling calls reach a cluster as a job flow and answer
+        // that surface's constant sentence, which names no id; only the reporting
+        // `GetManagedScalingPolicy` words the refusal as a cluster id.
         let Some(cluster) = store.clusters.get_mut(&input.cluster_id) else {
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::unknown_cluster_message(&input.cluster_id),
+                crate::state::unknown_job_flow_message(),
             ));
         };
 

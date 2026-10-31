@@ -2,8 +2,10 @@
 
 //! @op GetSession
 //! Resolves the session id against the sessions the named cluster carries in the
-//! shared engine and answers with the one it names. A cluster id no cluster carries,
-//! and a session id the cluster carries no session under, are both refused with
+//! shared engine and answers with the one it names. A `SessionId` that is not a session
+//! id at all is refused on its shape — `ValidationException`, HTTP 400 — before any
+//! cluster is resolved; a cluster id no cluster carries, and a well-formed session id
+//! the cluster carries no session under, are both refused with
 //! `InvalidRequestException` — the one client error this operation models.
 //!
 //! `StartSession` is what puts a session on a cluster, and it is still a scaffold stub
@@ -142,6 +144,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
+        // The SHAPE of the session id is settled BEFORE any resource is resolved: a
+        // value carrying characters no session id is drawn from names no session on any
+        // cluster, so it is a bad REQUEST rather than a bad target, and it is refused as
+        // one — `ValidationException`, HTTP 400, naming the session's qualified path —
+        // whether or not the cluster beside it exists. A well-formed id reaches the
+        // lookups below, which is where "no such cluster" and "no such session" are
+        // told apart.
+        if !crate::state::is_session_id_shaped(&input.session_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_session_id_message(&input.cluster_id, &input.session_id),
+            ));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetSessionErrorModeled::InternalServerException(
                 InternalServerException {
@@ -166,10 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetSessionErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     error_code: None,
-                    message: Some(crate::state::unknown_session_message(
-                        &input.session_id,
-                        &input.cluster_id,
-                    )),
+                    message: Some(crate::state::unknown_session_message(&input.session_id)),
                 },
             )
             .into());

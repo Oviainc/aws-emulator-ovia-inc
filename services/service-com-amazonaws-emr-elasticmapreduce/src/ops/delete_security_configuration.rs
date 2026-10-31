@@ -152,10 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::audit(Self::NAME, &input.name, ctx, AuditOutcome::NotFound);
             return Err(
                 DeleteSecurityConfigurationErrorModeled::InvalidRequestException(
-                    crate::state::resource_not_found(format!(
-                        "Security configuration with name '{}' does not exist.",
-                        input.name
-                    )),
+                    crate::state::unknown_security_configuration(&input.name),
                 )
                 .into(),
             );

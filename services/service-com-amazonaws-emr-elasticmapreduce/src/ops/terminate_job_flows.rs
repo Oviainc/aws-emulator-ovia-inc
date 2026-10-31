@@ -175,12 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Resolve every id BEFORE changing anything, so a request naming one unknown id
-        // terminates nothing.
+        // terminates nothing. The legacy job-flow surface's sentence is CONSTANT: it
+        // names no id.
         for job_flow_id in &input.job_flow_ids {
             if !store.clusters.contains_key(job_flow_id) {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Specified job flow ID not valid: '{job_flow_id}'"
-                )));
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::unknown_job_flow_message(),
+                ));
             }
         }
 

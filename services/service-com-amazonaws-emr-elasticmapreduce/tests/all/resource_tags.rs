@@ -269,6 +269,18 @@ fn cases() -> Vec<Case> {
             calls: vec![full_set.clone()],
             expected: full_set,
         },
+        Case {
+            // The ceiling is counted on the SET a merge leaves behind, so a call longer
+            // than the ceiling that names ONE key adds one tag and is accepted.
+            label: "one key repeated more times than a resource carries tags",
+            calls: vec![(0..=MAX_TAGS_PER_RESOURCE)
+                .map(|at| pair("stack", Some(&format!("value-{at:02}"))))
+                .collect()],
+            expected: vec![pair(
+                "stack",
+                Some(&format!("value-{MAX_TAGS_PER_RESOURCE:02}")),
+            )],
+        },
     ]
 }
 
@@ -510,7 +522,7 @@ async fn cluster_id_scopes_the_tag_operation() {
     }
 
     // A `ResourceId` that is neither the scoping cluster nor a session of it: the
-    // session sentence, naming both ids.
+    // session sentence, naming the id that did not resolve.
     for unknown in ["s-SESSIONZZZZZ", "es-NOPE", ""] {
         let case = format!("ResourceId {unknown:?} scoped to a cluster");
         let (status, payload) = emr
@@ -526,7 +538,7 @@ async fn cluster_id_scopes_the_tag_operation() {
         assert_refused(&case, status, &payload, "InvalidRequestException");
         assert_eq!(
             message(&case, &payload),
-            format!("Session id '{unknown}' is not valid or does not exist on cluster '{cluster}'."),
+            format!("Session id '{unknown}' is not valid."),
             "case {case:?}: unexpected message in {payload}"
         );
     }

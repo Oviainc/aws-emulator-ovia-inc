@@ -117,11 +117,7 @@ fn assert_refused(case: &str, status: u16, payload: &Value, must_name: &str) {
         code.contains("ValidationException"),
         "case {case:?}: expected error code ValidationException, got {code:?} in {payload}"
     );
-    let message = payload
-        .get("message")
-        .or_else(|| payload.get("Message"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let message = crate::input_refusals::error_message(payload);
     assert!(
         !message.is_empty(),
         "case {case:?}: the refusal must say what was wrong, got {payload}"
@@ -345,7 +341,10 @@ async fn get_is_a_read_and_clusters_are_independent() {
 }
 
 /// Every managed-scaling-policy operation REFUSES a cluster the service holds no record
-/// for, with HTTP 400 `ValidationException` — never a 501, and never an empty success.
+/// for, with HTTP 400 `ValidationException` — never a 501, and never an empty success —
+/// and each one answers the sentence its own surface words: the reporting operation
+/// reports the cluster id it was given, while the two mutators answer the legacy
+/// job-flow surface's constant sentence, which names no id.
 #[tokio::test]
 async fn unknown_clusters_are_refused_by_every_operation() {
     let emr = Emr::new();
@@ -363,10 +362,13 @@ async fn unknown_clusters_are_refused_by_every_operation() {
     ];
 
     for (label, cluster_id) in unknown {
+        // The reporting operation reports the id; the mutators answer the constant.
+        let job_flow_sentence = "Specified job flow ID not valid.".to_string();
         let requests = [
             (
                 "GetManagedScalingPolicy",
                 json!({ "ClusterId": cluster_id }),
+                format!("Cluster id '{cluster_id}' is not valid."),
             ),
             (
                 "PutManagedScalingPolicy",
@@ -374,16 +376,23 @@ async fn unknown_clusters_are_refused_by_every_operation() {
                     "ClusterId": cluster_id,
                     "ManagedScalingPolicy": policy_table()[0].1,
                 }),
+                job_flow_sentence.clone(),
             ),
             (
                 "RemoveManagedScalingPolicy",
                 json!({ "ClusterId": cluster_id }),
+                job_flow_sentence,
             ),
         ];
-        for (operation, body) in requests {
+        for (operation, body, expected) in requests {
             let case = format!("{operation} with {label}");
             let (status, payload) = emr.call(operation, body).await;
-            assert_refused(&case, status, &payload, &cluster_id);
+            assert_refused(&case, status, &payload, "");
+            assert_eq!(
+                crate::input_refusals::error_message(&payload),
+                expected,
+                "case {case:?}: expected {expected:?}, got {payload}"
+            );
         }
     }
 

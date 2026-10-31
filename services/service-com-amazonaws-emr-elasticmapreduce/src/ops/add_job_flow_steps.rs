@@ -168,11 +168,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // This operation models no client error, so a request it must refuse is answered
         // with the 400 `ValidationException` channel rather than a 501 or an empty 200.
+        // The legacy job-flow surface's sentence is CONSTANT: it names no id.
         let Some(cluster) = store.cluster_mut(&input.job_flow_id, now) else {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Specified job flow ID not valid: '{}'",
-                input.job_flow_id
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::unknown_job_flow_message(),
+            ));
         };
         let cluster_state_now = cluster.status.state.clone();
         let already_held = cluster.steps.len();

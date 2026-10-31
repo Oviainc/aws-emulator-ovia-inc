@@ -379,7 +379,7 @@ async fn cluster_id_scopes_the_tag_removal() {
     }
 
     // A `ResourceId` that is neither the scoping cluster nor a session of it: the
-    // session sentence, naming both ids.
+    // session sentence, naming the id that did not resolve.
     for unknown in ["s-SESSIONZZZZZ", "es-NOPE", ""] {
         let case = format!("ResourceId {unknown:?} scoped to a cluster");
         let (status, payload) = emr
@@ -395,7 +395,7 @@ async fn cluster_id_scopes_the_tag_removal() {
         assert_refused(&case, status, &payload, INVALID_REQUEST_EXCEPTION);
         assert_eq!(
             message(&case, &payload),
-            format!("Session id '{unknown}' is not valid or does not exist on cluster '{cluster}'."),
+            format!("Session id '{unknown}' is not valid."),
             "case {case:?}: unexpected message in {payload}"
         );
     }

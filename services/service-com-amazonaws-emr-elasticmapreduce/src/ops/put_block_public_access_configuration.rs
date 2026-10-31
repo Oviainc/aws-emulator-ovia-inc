@@ -247,7 +247,10 @@ fn configuration_violation(
 
     // O(n). "To specify a single port, use the same value for MinRange and MaxRange."
     // (`PortRange` doc.) A range therefore runs upwards, and a range given without a
-    // `MaxRange` is that single port. The bounds themselves are NOT checked here: both
+    // `MaxRange` is that single port. The refusal is Amazon EMR's own sentence for this
+    // class — the pair it rejected, in the order the request sent it, and the rule the
+    // two values broke — rather than a sentence naming the member that carried them.
+    // The bounds themselves are NOT checked here: both
     // target `Port`, whose `range { min: -1, max: 65535 }` the framework's validate
     // phase refuses before this handler runs, so every port reaching this function is
     // already inside PORT_MIN..=PORT_MAX — which is what makes the length cap above a
@@ -255,8 +258,8 @@ fn configuration_violation(
     for range in ranges {
         if last_port(range) < range.min_range {
             return Some(refuse(format!(
-                "PermittedPublicSecurityGroupRuleRanges carries the port range {}-{}: \
-                 MaxRange must be at least MinRange",
+                "The specified port range ({}, {}) is not valid. Min Range must be less \
+                 than or equal to Max Range.",
                 range.min_range,
                 last_port(range),
             )));

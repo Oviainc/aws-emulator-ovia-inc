@@ -187,10 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(existing) = store.security_configurations.get(&input.name) {
             if existing.security_configuration != input.security_configuration {
                 crate::state::audit(Self::NAME, &input.name, ctx, AuditOutcome::Conflict);
-                return Err(invalid_request(format!(
-                    "Security configuration with name '{}' already exists.",
-                    input.name
-                )));
+                return Err(invalid_request(
+                    crate::state::security_configuration_exists_message(&input.name),
+                ));
             }
             // Nothing changed, so the record attributes a call that stored nothing
             // rather than a second create.
@@ -273,8 +272,12 @@ const CERTIFICATE_PROVIDER_TYPES: [&str; 2] = ["PEM", "Custom"];
 /// encryption mode it names must be one EMR defines. Anything else is a client error,
 /// not something to store.
 fn validate_security_configuration(document: &str) -> Result<(), String> {
-    let parsed: ::serde_json::Value = ::serde_json::from_str(document)
-        .map_err(|error| format!("SecurityConfiguration is not valid JSON: {error}"))?;
+    // A document that does not parse is refused with Amazon EMR's constant sentence for
+    // that class: the parser's own diagnostic varies with the input and names internals
+    // no caller can act on, so none of it reaches the wire.
+    let parsed: ::serde_json::Value = ::serde_json::from_str(document).map_err(|_| {
+        crate::state::MALFORMED_SECURITY_CONFIGURATION_MESSAGE.to_string()
+    })?;
     let root = parsed
         .as_object()
         .ok_or_else(|| "SecurityConfiguration must be a JSON object.".to_string())?;

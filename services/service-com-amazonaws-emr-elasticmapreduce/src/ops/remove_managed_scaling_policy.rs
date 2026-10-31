@@ -146,10 +146,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // This operation models no client error, so an unknown cluster is refused with
-        // the 400 `ValidationException` channel rather than a 501 or an empty 200.
+        // the 400 `ValidationException` channel rather than a 501 or an empty 200. Like
+        // `PutManagedScalingPolicy`, this mutator reaches a cluster as a job flow and
+        // answers that surface's constant sentence, which names no id.
         let Some(cluster) = store.clusters.get_mut(&input.cluster_id) else {
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::unknown_cluster_message(&input.cluster_id),
+                crate::state::unknown_job_flow_message(),
             ));
         };
 

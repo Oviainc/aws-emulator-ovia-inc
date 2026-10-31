@@ -110,7 +110,7 @@ async fn an_absent_security_configuration_is_refused_with_the_not_found_code() {
             assert_not_found(&case, status, &payload);
             assert_eq!(
                 message(&case, &payload),
-                format!("Security configuration with name '{name}' does not exist."),
+                format!("Security configuration with name \"{name}\" does not exist."),
                 "case {case:?}: unexpected message in {payload}"
             );
         }
@@ -130,7 +130,7 @@ async fn an_absent_security_configuration_is_refused_with_the_not_found_code() {
             assert_not_found(&case, status, &payload);
             assert_eq!(
                 message(&case, &payload),
-                format!("Security configuration with name '{name}' does not exist."),
+                format!("Security configuration with name \"{name}\" does not exist."),
                 "case {case:?}: unexpected message in {payload}"
             );
         }

@@ -547,7 +547,10 @@ async fn every_row_reports_its_family_and_generation_class() {
 /// the newest it offers, a version far outside every line, a missing or extra
 /// component, a missing prefix, a non-numeric component, a padded component, trailing
 /// whitespace and an empty label.
-const BAD_RELEASE_LABELS: &[&str] = &[
+///
+/// `pub(crate)` so a sibling suite refuses the same labels through one list rather than
+/// its own copy.
+pub(crate) const BAD_RELEASE_LABELS: &[&str] = &[
     "emr-6.99.0",
     "emr-5.13.0",
     "emr-6.15.1",

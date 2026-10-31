@@ -177,7 +177,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DescribeReleaseLabelErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     error_code: None,
-                    message: Some(format!("Invalid release label: {requested}")),
+                    // Amazon EMR's own sentence for this class on THIS operation, and it
+                    // is constant: the label the request sent is deliberately not echoed
+                    // back. `ListSupportedInstanceTypes` words the same class its own
+                    // way, so neither sentence is shared.
+                    message: Some("The release label isn't valid.".to_string()),
                 },
             )
             .into());
