@@ -84,8 +84,22 @@ fn put_request(name: &str, region: &str, extra: &Value) -> Value {
 }
 
 /// The stream `name` as `GetMetricStream` reports it, requiring the read to succeed.
+///
+/// A metric stream lives in the Region its write was signed for, so the read is signed for
+/// the same one: the same NAME in another Region is another stream.
 async fn stream_of(router: &MultiServiceRouter, name: &str) -> Value {
-    ok(router, "GetMetricStream", &json!({"Name": name})).await
+    stream_of_in_region(router, DEFAULT_REGION, name).await
+}
+
+/// The same read, signed for `region`.
+async fn stream_of_in_region(router: &MultiServiceRouter, region: &str, name: &str) -> Value {
+    let (status, body) =
+        call_in_region(router, region, "GetMetricStream", &json!({"Name": name})).await;
+    assert_eq!(
+        status, 200,
+        "GetMetricStream in {region}: expected HTTP 200, got {status} with body {body}"
+    );
+    body
 }
 
 /// Assert that `name` names no stream: a refused configuration stores nothing.
@@ -220,7 +234,7 @@ async fn an_arn_outside_the_streams_account_or_region_is_refused_and_stores_noth
                     "case {case:?}: a configuration in the stream's own scope must be accepted, \
                      got {status} {body}"
                 );
-                let got = stream_of(&router, name).await;
+                let got = stream_of_in_region(&router, region, name).await;
                 assert_eq!(
                     (
                         got.get("FirehoseArn").and_then(Value::as_str),
@@ -642,12 +656,19 @@ async fn a_value_outside_a_modelled_enum_is_refused_with_this_services_validatio
              {body}"
         );
         let message = error_message(&body);
-        for expected in [VALIDATION_ENVELOPE, path, value] {
+        for expected in [VALIDATION_ENVELOPE, path] {
             assert!(
                 message.contains(expected),
                 "case {case:?}: expected the refusal to state {expected:?}, got {message:?}"
             );
         }
+        // The refusal names the member and the set the type admits, and NOT the value that
+        // was submitted: the set is what a client repairs the request from.
+        assert!(
+            !message.contains(value),
+            "case {case:?}: the refusal must not quote the submitted value {value:?} back, got \
+             {message:?}"
+        );
     }
 
     // Each value the metric-stream enum DOES declare is accepted, so the refusal above is

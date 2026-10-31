@@ -613,12 +613,18 @@ pub fn windows_by_unit<'a>(
 }
 
 /// Fold one series' datapoints into the `period`-wide windows of `[start, end)`, keyed by the
-/// window's index from `start`, with the units of one window TOGETHER.
+/// window's index from `start`, as ONE unit's series.
 ///
-/// [`windows_by_unit`] for a reader that answers one series per query however many units the
-/// range holds, so the per-unit groups of one window are one span to it; every rule about
-/// what a window holds — the range's ends, the caller's unit filter and the retention tier of
-/// `period` — is that function's, so the two readers cannot disagree about what is in range.
+/// [`windows_by_unit`] for a reader that answers ONE series per query: a query naming a unit
+/// reads that unit's datapoints, and a query naming NONE resolves to a single unit all the
+/// same — the alphabetically first unit name the range holds — because a series is identified
+/// by its unit and no read returns the sum across two of them. Every rule about what a window
+/// holds — the range's ends, the caller's unit filter, the granularity the datapoint is stored
+/// at and the retention tier of `period` — is [`windows_by_unit`]'s, so the two readers cannot
+/// disagree about what is in range.
+///
+/// Which unit that is does not depend on the order the data was published in or on the window
+/// it is read at, so two reads of one range resolve the same series.
 pub fn windows_of<'a>(
     data: &'a [StoredDatum],
     start: f64,
@@ -627,8 +633,18 @@ pub fn windows_of<'a>(
     unit: Option<&str>,
     now: f64,
 ) -> BTreeMap<i64, Vec<&'a StoredDatum>> {
+    let by_unit = windows_by_unit(data, start, end, period, unit, now);
+    let resolved = unit.map(ToString::to_string).or_else(|| {
+        by_unit
+            .keys()
+            .map(|(_index, unit)| (*unit).to_string())
+            .min()
+    });
     let mut windows: BTreeMap<i64, Vec<&StoredDatum>> = BTreeMap::new();
-    for ((index, _unit), data) in windows_by_unit(data, start, end, period, unit, now) {
+    for ((index, held), data) in by_unit {
+        if resolved.as_deref() != Some(held) {
+            continue;
+        }
         windows.entry(index).or_default().extend(data);
     }
     windows
@@ -1106,8 +1122,17 @@ pub struct StoredAlarm {
     /// starts one of the alarm's own evaluation periods instead: the state it forces stands
     /// until the alarm's next evaluation is due
     /// ([`alarm_evaluation::forced_state_span_secs`]), and a datapoint of the series the alarm
-    /// watches brings that evaluation forward ([`Self::make_alarms_due`]).
+    /// watches brings that evaluation forward ([`Self::make_alarms_due`]) — except while a
+    /// forced state still stands ([`Self::forced_state_until_secs`]).
     pub evaluation_due_secs: f64,
+    /// The instant, in epoch seconds, until which a state `SetAlarmState` forced on this alarm
+    /// stands; `0.0` for an alarm whose state no caller has forced.
+    ///
+    /// A force is a state the caller asked to be visible for its span
+    /// ([`alarm_evaluation::forced_state_span_secs`]), so nothing brings the evaluation that
+    /// takes it back FORWARD of that instant — not an arriving datapoint of the series the
+    /// alarm watches, which would otherwise leave the forced state visible to nobody at all.
+    pub forced_state_until_secs: f64,
 }
 
 /// A stored composite alarm: the modelled shape `DescribeAlarms` returns, plus what the
@@ -1806,8 +1831,8 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     pub alarm_history: HashMap<String, Vec<StoredHistoryItem>>,
     /// The sequence number the next recorded history item takes.
     pub next_history_sequence: u64,
-    /// Metric streams by stream name.
-    pub metric_streams: HashMap<String, StoredMetricStream>,
+    /// Metric streams by the Region they live in and their name ([`MetricStreamKey`]).
+    pub metric_streams: HashMap<MetricStreamKey, StoredMetricStream>,
     /// Contributor Insights rules by rule name.
     pub insight_rules: HashMap<String, StoredInsightRule>,
     /// The managed Contributor Insights rule templates this account can enable rules from, as
@@ -2143,17 +2168,59 @@ pub fn names_default_dataset(identifier: &str, region: &str) -> bool {
 /// What a dataset is called in the `ResourceType` member of a refusal that names one.
 pub const DATASET_RESOURCE_TYPE: &str = "Dataset";
 
-/// The `ResourceNotFoundException` body every dataset operation refuses an identifier naming
-/// no dataset this endpoint serves with ([`names_default_dataset`]).
+/// The ARN namespace of this service's own IAM actions, as an authorization failure names the
+/// action it refused (`cloudwatch:GetDataset`).
+const IAM_ACTION_NAMESPACE: &str = "cloudwatch";
+
+/// How AWS states a request the caller is not allowed to make: who was refused, which action,
+/// on which resource, and that nothing granted it.
 ///
-/// Built here once so the readers and the writers of a dataset's key association cannot
-/// disagree about what a dataset that is not there is reported as.
-pub fn unknown_dataset(identifier: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        resource_type: Some(DATASET_RESOURCE_TYPE.to_string()),
-        resource_id: Some(identifier.to_string()),
-        message: Some(format!("the dataset {identifier} does not exist")),
+/// The authorization layer in front of a service answers this for a resource the caller has no
+/// grant for, which is a DIFFERENT answer from the resource not existing: a caller that may not
+/// see a resource is never told whether it is there. The principal is the one this emulator's
+/// credential speaks for (`service_common::caller_principal`), so the sentence names the
+/// identity that really made the call, and the resource is the identifier the request carried.
+///
+/// Which POLICY the sentence says granted nothing follows from where the resource lives: a
+/// resource in ANOTHER account can only be reached through a policy on the resource itself, so
+/// such a request is refused as the RESOURCE policy allowing nothing — the sentence the shared
+/// `service_common::iam_authorization::not_authorized_by_resource_policy` writes for every
+/// service — while a resource of the caller's own account is reached through an identity-based
+/// policy, which is the same sentence with that one clause replaced.
+pub fn unauthorized_message(operation: &str, resource: &str) -> String {
+    let principal = ::service_common::caller_principal::ambient_user_arn();
+    let action = format!("{IAM_ACTION_NAMESPACE}:{operation}");
+    let refused = ::service_common::iam_authorization::not_authorized_by_resource_policy(
+        &principal, &action, resource,
+    );
+    if names_another_account(resource) {
+        return refused;
     }
+    // The one clause that differs, applied to the shared sentence rather than written again:
+    // which kind of policy granted nothing.
+    refused.replace("no resource-based policy", "no identity-based policy")
+}
+
+/// Whether `resource` is an ARN whose account field is not the account this emulator serves.
+///
+/// A value that is no ARN at all, or one carrying this account, names nothing in another
+/// account. The account every ARN this emulator mints carries is the account contract's own
+/// (`emulator_server::emulator_account_id`), so the comparison is against that rather than
+/// against a literal.
+fn names_another_account(resource: &str) -> bool {
+    ::service_common::arn::parse(resource).is_some_and(|arn| {
+        !arn.account.is_empty() && arn.account != ::emulator_server::emulator_account_id()
+    })
+}
+
+/// How CloudWatch states a dataset that carries no customer managed KMS key, for the operation
+/// that can only act on one that does.
+///
+/// A fixed sentence carrying the dataset the REQUEST named — `DisassociateDatasetKmsKey` is
+/// documented to fail "if the dataset has no associated KMS key", and the identifier is the
+/// only part of the sentence a caller can vary.
+pub fn no_dataset_kms_key_message(identifier: &str) -> String {
+    format!("No CMK association found for dataset {identifier}.")
 }
 
 /// Why `value` is not the ARN of an IAM role, or `None` when it is one.
@@ -2252,6 +2319,34 @@ pub fn schedule_expression_error(expression: &str) -> Option<String> {
 /// `running` and `stopped`." (`GetMetricStreamOutput$State`) — `PutMetricStream` creates a
 /// stream in this state, and only `StopMetricStreams` moves it out of it.
 pub const METRIC_STREAM_RUNNING: &str = "running";
+
+/// The identity of one metric stream: the Region it lives in and its name.
+///
+/// A metric stream is a REGIONAL resource — its ARN carries the Region
+/// (`arn:aws:cloudwatch:Region:account-id:metric-stream/metric-stream-name`,
+/// `TagResourceInput$ResourceARN`) and its name "must be unique within the account and Region"
+/// (`PutMetricStreamInput$Name`) — so one name in two Regions is two independent streams, with
+/// their own filters, their own state and their own ARN. The Region is therefore part of the
+/// key the store holds a stream under rather than merely part of what it reports, so a write
+/// in one Region cannot reach another's stream.
+///
+/// Ordered by Region and then by name, which is the order a listing of ONE Region's streams
+/// walks them in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MetricStreamKey {
+    /// The Region the stream lives in, as the request that wrote it was signed for.
+    pub region: String,
+    /// The stream's name, unique within that Region.
+    pub name: String,
+}
+
+/// The key the metric stream `name` of `region` is held under.
+pub fn metric_stream_key(region: &str, name: &str) -> MetricStreamKey {
+    MetricStreamKey {
+        region: region.to_string(),
+        name: name.to_string(),
+    }
+}
 
 /// A stopped metric stream: the other of the two values
 /// (`GetMetricStreamOutput$State`) — `StopMetricStreams` moves a stream into this state and
@@ -2363,7 +2458,21 @@ pub const MAX_ALARMS: usize = 5_000;
 /// never left telling an empty list from an absent one. Shared by the alarm writers so one
 /// rule answers them all.
 pub fn configured_actions(actions: Option<&[String]>) -> Option<Vec<String>> {
-    Some(actions.unwrap_or_default().to_vec())
+    configured_list(actions)
+}
+
+/// One list member of a request as the stored resource carries it, and so as every reader of
+/// that resource reports it: the entries the request named, and the EMPTY list when it named
+/// none.
+///
+/// The protocols this service is served over cannot express the difference: on the query
+/// protocol an omitted list and an empty one are the same bytes — neither carries a
+/// `<member>.member.N` key — so a reader that reported them differently would show a caller a
+/// change between two requests that were identical on the wire. A list member whose model
+/// admits none of its entries (`length 0..n`) therefore reads back as the list it names, and
+/// "none" is a list of none rather than no list.
+pub fn configured_list<T: Clone>(entries: Option<&[T]>) -> Option<Vec<T>> {
+    Some(entries.unwrap_or_default().to_vec())
 }
 
 /// The Region segment of `value` when it is an ARN that names a Region, else `None`.
@@ -2760,14 +2869,18 @@ impl TaggableKind {
     }
 }
 
-/// The taggable resource one ARN names: its kind, and the name the store holding that kind
-/// keys on.
+/// The taggable resource one ARN names: its kind, the name the store holding that kind
+/// keys on, and the Region the ARN scopes it to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaggableResource<'a> {
     /// Which of this service's resources the ARN names.
     pub kind: TaggableKind,
     /// The resource's name, as the ARN's resource part carries it.
     pub name: &'a str,
+    /// The Region field of the ARN, EMPTY for a resource whose ARN carries none (a dashboard
+    /// is global). It is part of the identity only of the kinds this store keys by Region
+    /// ([`MetricStreamKey`]).
+    pub region: &'a str,
 }
 
 /// The resource-part prefix each taggable kind's ARN carries: "The ARN format of an alarm is
@@ -2793,15 +2906,21 @@ const ARN_NAMESPACE: &str = "cloudwatch";
 ///
 /// The ARN itself is read by the one shared parse, so this service cannot disagree with
 /// another about what an ARN is; only the resource-part prefixes above are this service's.
-/// The resource is resolved from its KIND and NAME, which is what every store here keys on;
-/// the partition, region and account fields are not part of that key.
+/// The resource is resolved from its KIND, its NAME and — for the kinds this store keys by
+/// Region — the ARN's own Region field; the partition and account fields are not part of that
+/// key.
 pub fn parse_taggable_arn(arn: &str) -> Option<TaggableResource<'_>> {
-    let resource = ::service_common::arn::parse_of(arn, ARN_NAMESPACE)?.resource;
+    let parsed = ::service_common::arn::parse_of(arn, ARN_NAMESPACE)?;
+    let resource = parsed.resource;
     TAGGABLE_ARN_PREFIXES.iter().find_map(|(prefix, kind)| {
         resource
             .strip_prefix(prefix)
             .filter(|name| !name.is_empty())
-            .map(|name| TaggableResource { kind: *kind, name })
+            .map(|name| TaggableResource {
+                kind: *kind,
+                name,
+                region: parsed.region,
+            })
     })
 }
 
@@ -2868,6 +2987,16 @@ pub fn remove_tags(held: &mut Vec<Tag>, keys: &[String]) {
 /// than growing without limit once it is reached; updating a stream that already exists adds
 /// none, so it is unaffected.
 pub const MAX_METRIC_STREAMS: usize = 10_000;
+
+/// The largest number of dataset KMS-key associations this in-memory store holds.
+///
+/// A capacity bound, not an AWS quota: the default dataset is "implicit for every account in
+/// every Region", so this map holds one entry per REGION a caller has associated a key in, and
+/// the Region a request names is the caller's own. The records live in this process's memory,
+/// so their number has to be finite: `AssociateDatasetKmsKey` answers its server fault rather
+/// than growing without limit once the bound is reached, and replacing the key of a Region that
+/// already carries one adds no entry.
+pub const MAX_DATASET_KMS_KEYS: usize = 1_000;
 
 /// How long an alarm history item is retained: CloudWatch keeps alarm history for 14 days.
 pub const ALARM_HISTORY_RETENTION_SECS: f64 = 14.0 * 24.0 * 60.0 * 60.0;
@@ -2976,7 +3105,7 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
                 }),
             TaggableKind::MetricStream => self
                 .metric_streams
-                .get(resource.name)
+                .get(&metric_stream_key(resource.region, resource.name))
                 .map(|stored| stored.tags.as_slice()),
             TaggableKind::InsightRule => self
                 .insight_rules
@@ -3009,7 +3138,7 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
             }
             TaggableKind::MetricStream => self
                 .metric_streams
-                .get_mut(resource.name)
+                .get_mut(&metric_stream_key(resource.region, resource.name))
                 .map(|stored| &mut stored.tags),
             TaggableKind::InsightRule => self
                 .insight_rules
@@ -3020,6 +3149,35 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
                 .get_mut(resource.name)
                 .map(|stored| &mut stored.tags),
         }
+    }
+
+    /// Move the metric stream `name` of `region` into `state`, or do nothing when this store
+    /// holds no such stream.
+    ///
+    /// "Starts the streaming of metrics for one or more of your metric streams."
+    /// (`StartMetricStreams`) / "Stops the streaming of metrics for one or more of your metric
+    /// streams." (`StopMetricStreams`) — a transition is a change to the stream, so it stamps
+    /// `LastUpdateDate` ("The date that the configuration of this metric stream was most
+    /// recently updated.", `GetMetricStreamOutput$LastUpdateDate`): an audit trail reading that
+    /// member sees when the stream was last started or stopped. Asking for the state a stream
+    /// is already in changes nothing, so it stamps nothing either.
+    ///
+    /// Both writers share it, so one rule decides what a transition leaves behind.
+    pub fn set_metric_stream_state(
+        &mut self,
+        region: &str,
+        name: &str,
+        state: &str,
+        now_secs: f64,
+    ) {
+        let Some(stored) = self.metric_streams.get_mut(&metric_stream_key(region, name)) else {
+            return;
+        };
+        if stored.stream.state.as_deref() == Some(state) {
+            return;
+        }
+        stored.stream.state = Some(state.to_string());
+        stored.stream.last_update_date = Some(to_timestamp(now_secs));
     }
 
     /// Append `data` to the series `key` names, creating it when it does not exist.
@@ -3116,13 +3274,12 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// pulled forward: an alarm whose series this write did not touch keeps the instant it
     /// carries.
     ///
-    /// This is also what takes back a state `SetAlarmState` forced on an alarm whose metric is
-    /// really being published, which is why such an alarm "returns to [its] actual state
-    /// quickly, often within seconds" (`SetAlarmState`) while one over a metric nothing writes
-    /// keeps the forced state until its next scheduled pass
-    /// ([`alarm_evaluation::forced_state_span_secs`]). The evaluation is still owed a span, not
-    /// the instant of the write, so the forced state is never cut short by the datapoint that
-    /// arrives with it.
+    /// A state `SetAlarmState` forced is NOT cut short by it: a force stands for its own span
+    /// ([`alarm_evaluation::forced_state_span_secs`]) whatever the series holds, so the
+    /// evaluation that takes it back is never brought forward of the instant the force stands
+    /// until ([`StoredAlarm::forced_state_until_secs`]) — a forced state an arriving datapoint
+    /// could reclaim at once would be a state nothing could read, neither the caller that
+    /// forced it nor the composite alarm whose rule is evaluated over it.
     ///
     /// An alarm is matched on the datapoints it would GRADE: the series it names — namespace,
     /// metric name and dimension set, the identity its own evaluation reads, or the identities
@@ -3146,7 +3303,10 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
                 })
             });
             if grades {
-                stored.evaluation_due_secs = stored.evaluation_due_secs.min(due);
+                stored.evaluation_due_secs = stored
+                    .evaluation_due_secs
+                    .min(due)
+                    .max(stored.forced_state_until_secs);
             }
         }
     }

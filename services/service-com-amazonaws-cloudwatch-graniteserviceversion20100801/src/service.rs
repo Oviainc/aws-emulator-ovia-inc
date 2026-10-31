@@ -186,29 +186,54 @@ fn parameter_fault(refusal: &Refusal) -> Option<Refused> {
         .or_else(|| scalar_enum_refusal(violations))
 }
 
-/// The refusal of a SCALAR member carrying a value outside the enumerated type it is
-/// modelled as, or `None` when no violation of the refusal is one.
+/// The refusal of a SCALAR member carrying a value outside the enumerated type it is modelled
+/// as, or `None` when no violation of the refusal is one.
 ///
-/// CloudWatch judges a request against its model before any handler runs and answers what it
-/// found under its OWN validation code ([`VALIDATION_ERROR`], the code
+/// CloudWatch judges a request against its model before any handler runs and answers a value
+/// outside an enumerated type under its OWN validation code ([`VALIDATION_ERROR`], the code
 /// [`crate::scaffolded::Scaffolded::validation_error`] already answers this service's
 /// handler-side validation refusals with), so a client branches on one code whichever layer
-/// refused the request. Only the code is this service's: the message is the framework's own
-/// counting envelope, naming the member path and the values the type admits, so the two
-/// cannot drift.
+/// refused the request.
+///
+/// Only the code and two RENDERINGS are this service's; the envelope, the clauses and the
+/// member paths are the shared ones, so this and the walk behind it cannot drift:
+///
+/// * the clause states NO submitted value, exactly as this service's own parameter sentences
+///   do ([`crate::state::value_in_set_message`] — "the member path and the whole accepted set,
+///   and nothing of the submitted value"): what locates the repair is the member and the set
+///   the type admits;
+/// * that set is stated SORTED
+///   ([`service_common::validation_message::in_sorted_enum_order`]), which is how AWS states a
+///   value set whose model declares its members in an order of its own.
 fn scalar_enum_refusal(violations: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
-    if !violations.iter().any(|violation| {
-        matches!(
-            violation.kind,
-            aws_smithy_schema_server::ViolationKind::EnumValue(_)
-        ) && !is_list_element(&violation.path)
-    }) {
+    if !violations.iter().any(is_scalar_enum_violation) {
         return None;
     }
+    let stated = Refusal::Invalid(
+        violations
+            .iter()
+            .map(service_common::validation_message::in_sorted_enum_order)
+            .collect(),
+    );
+    // The whole envelope is the shared renderer's, with the value half dropped from every
+    // clause; only the CODE is this service's.
+    let message =
+        service_common::validation_message::aws_validation_refusal_withholding(&stated, |_| true)?
+            .message;
     Some(Refused {
         code: VALIDATION_ERROR.to_string(),
-        message: aws_smithy_schema_server::envelope(violations)?,
+        message,
     })
+}
+
+/// Whether `violation` is a SCALAR member outside the enumerated type it is modelled as — the
+/// one class this service restates ([`scalar_enum_refusal`]); a value inside a LIST is the
+/// class [`list_element_enum_refusal`] answers instead.
+fn is_scalar_enum_violation(violation: &aws_smithy_schema_server::Violation) -> bool {
+    matches!(
+        violation.kind,
+        aws_smithy_schema_server::ViolationKind::EnumValue(_)
+    ) && !is_list_element(&violation.path)
 }
 
 /// The refusal of a `Dimensions` collection longer than the dimensions it may carry, or

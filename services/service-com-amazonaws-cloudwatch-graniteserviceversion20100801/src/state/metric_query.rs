@@ -205,11 +205,10 @@ pub fn retrieved_series(
     );
 
     // "If Label is omitted, CloudWatch generates a default": the metric the query names,
-    // which is the label every read of one series reports it under.
-    let label = query
-        .label
-        .clone()
-        .unwrap_or_else(|| key.metric_name.clone());
+    // which is the label every read of one series reports it under. The label the REQUEST
+    // names is applied by the reader that answers the request, not here: it may be a dynamic
+    // label, and `${LABEL}` inside one stands for exactly this default.
+    let label = key.metric_name.clone();
 
     // The series still IS this metric's series, which is what an anomaly detector is created
     // for, so the identity it was retrieved under travels with it.

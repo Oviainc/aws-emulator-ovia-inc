@@ -160,7 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A metric stream is a regional resource, so the streams this request moves are the
+        // ones of the Region it was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartMetricStreamsErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the CloudWatch metric stream store is unavailable".into()),
@@ -182,11 +184,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        let now = crate::state::now_secs();
         let mut store = state.lock();
         for name in &input.names {
-            if let Some(stored) = store.metric_streams.get_mut(name) {
-                stored.stream.state = Some(crate::state::METRIC_STREAM_RUNNING.to_string());
-            }
+            store.set_metric_stream_state(
+                &region,
+                name,
+                crate::state::METRIC_STREAM_RUNNING,
+                now,
+            );
         }
 
         Ok(StartMetricStreamsOutput {})

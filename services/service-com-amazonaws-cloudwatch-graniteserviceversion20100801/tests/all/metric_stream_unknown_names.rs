@@ -31,8 +31,8 @@ const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 
 /// The code a value outside its own modelled bound is refused with: the boundary validator
 /// refuses it before any handler runs, and this service keeps that wording for a scalar (only
-/// a collection cap and a list element outside an enumerated type are restated as one of its
-/// own parameter faults — `crate::EmulatedService`'s refusal override).
+/// a collection cap, a list element outside an enumerated type and a SCALAR outside one are
+/// restated — `crate::EmulatedService`'s refusal override).
 const VALIDATION_CODE: &str = "ValidationException";
 
 /// The two states a metric stream can be in: "The state of the metric stream. The possible
@@ -426,10 +426,23 @@ async fn an_unknown_name_in_a_batch_is_ignored_and_never_materialised() {
              {body}"
         );
 
-        // Only `State` may differ, and only for the stream the batch actually named.
+        // Only `State` may differ, and only for the stream the batch actually named — beside
+        // the `LastUpdateDate` a transition stamps ("The date that the configuration of this
+        // metric stream was most recently updated.", `GetMetricStreamOutput$LastUpdateDate`),
+        // which a batch that moved the stream nowhere leaves alone.
         let after = stream_of(&router, REAL).await;
         let mut expected = before.clone();
         expected["State"] = json!(after_state);
+        if after_state != baseline {
+            // Two calls inside one millisecond stamp the same instant, which the timestamp
+            // type cannot tell apart, so the date never moves BACKWARDS.
+            assert!(
+                after.get("LastUpdateDate").and_then(Value::as_f64)
+                    >= before.get("LastUpdateDate").and_then(Value::as_f64),
+                "case {case:?}: a transition must not move LastUpdateDate back, got {after}"
+            );
+            expected["LastUpdateDate"] = after["LastUpdateDate"].clone();
+        }
         assert_eq!(
             after, expected,
             "case {case:?}: expected the real stream to be reported as {expected}, got {after}"
@@ -448,8 +461,10 @@ async fn an_unknown_name_in_a_batch_is_ignored_and_never_materialised() {
              got {listed:?}"
         );
 
-        // The same call naming the real stream alone asks for the state it is already in, so
-        // it answers 200 and reports exactly the same stream.
+        // The same call naming the real stream alone asks for the state its own operation
+        // owns: it answers 200 and reports exactly the stream the batch above left, except
+        // where the batch did not move it there — a transition stamps `LastUpdateDate`, and a
+        // call that moves the stream nowhere stamps nothing.
         let (again_status, again_body) = call(&router, operation, &json!({"Names": [REAL]})).await;
         assert_eq!(
             again_status, 200,
@@ -457,12 +472,16 @@ async fn an_unknown_name_in_a_batch_is_ignored_and_never_materialised() {
              {again_body}"
         );
         let repeated = stream_of(&router, REAL).await;
-        let mut expected = before.clone();
-        expected["State"] = json!(if operation == "StartMetricStreams" {
+        let solo_state = if operation == "StartMetricStreams" {
             RUNNING
         } else {
             STOPPED
-        });
+        };
+        let mut expected = after.clone();
+        expected["State"] = json!(solo_state);
+        if after.get("State").and_then(Value::as_str) != Some(solo_state) {
+            expected["LastUpdateDate"] = repeated["LastUpdateDate"].clone();
+        }
         assert_eq!(
             repeated, expected,
             "case {case:?}: the solo {operation} must leave {expected}, got {repeated}"

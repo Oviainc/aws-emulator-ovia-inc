@@ -170,7 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A pure read: the stream is reported exactly as `PutMetricStream` /
         // `StartMetricStreams` / `StopMetricStreams` last left it, and nothing is written.
-        let _ = ctx;
+        // A stream is a regional resource, so the one this request names is the one of the
+        // Region it was signed for: the same NAME in another Region is another stream.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetMetricStreamErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the CloudWatch metric stream store is unavailable".into()),
@@ -194,18 +196,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let store = state.lock();
-        let stored = store.metric_streams.get(&input.name).ok_or_else(|| {
-            // "The named resource does not exist." is what the SHAPE documents, and the
-            // refusal itself carries an EMPTY message: the recorded refusal's `Message`
-            // member is present and empty, and the resource is named by the two members
-            // that carry it rather than by a sentence. The `Some(String::new())` is that
-            // empty member rather than an absent one.
-            GetMetricStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                resource_type: Some("MetricStream".to_string()),
-                resource_id: Some(input.name.clone()),
-                message: Some(String::new()),
-            })
-        })?;
+        let stored = store
+            .metric_streams
+            .get(&crate::state::metric_stream_key(&region, &input.name))
+            .ok_or_else(|| {
+                // "The named resource does not exist." is what the SHAPE documents, and the
+                // refusal itself carries an EMPTY message: the recorded refusal's `Message`
+                // member is present and empty, and the resource is named by the two members
+                // that carry it rather than by a sentence. The `Some(String::new())` is that
+                // empty member rather than an absent one.
+                GetMetricStreamErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        resource_type: Some("MetricStream".to_string()),
+                        resource_id: Some(input.name.clone()),
+                        message: Some(String::new()),
+                    },
+                )
+            })?;
         Ok(stored.stream.clone())
     }
 }

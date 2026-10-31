@@ -13,7 +13,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
 
-use crate::harness::{build_router_with_engine, call, error_code, ok};
+use crate::harness::{build_router_with_engine, call, error_code, ok, DEFAULT_REGION};
 
 /// The two states a metric stream can be in: "The state of the metric stream. The possible
 /// values are `running` and `stopped`." (`GetMetricStreamOutput$State`).
@@ -51,7 +51,7 @@ fn force_stopped(engine: &engine::InMemoryEngine, name: &str) {
     let mut store = state.lock();
     let stored = store
         .metric_streams
-        .get_mut(name)
+        .get_mut(&cloudwatch::state::metric_stream_key(DEFAULT_REGION, name))
         .unwrap_or_else(|| panic!("the stream {name} must be configured before it is stopped"));
     stored.stream.state = Some(STOPPED.to_string());
 }
@@ -160,11 +160,25 @@ async fn start_metric_streams_runs_exactly_the_configured_streams_it_names() {
 
         for (index, (name, _)) in STREAMS.iter().enumerate() {
             let after = stream_of(&router, name).await;
-            // Only `State` may differ: starting a stream updates no configuration member, so
-            // the ARN, the destination, the format, the filters, the creation date and the
-            // last configuration update date are all exactly what they were.
+            // Only `State` may differ, beside the `LastUpdateDate` a TRANSITION stamps
+            // ("The date that the configuration of this metric stream was most recently
+            // updated.", `GetMetricStreamOutput$LastUpdateDate`): starting a stream updates no
+            // configuration member, so the ARN, the destination, the format, the filters and
+            // the creation date are all exactly what they were, and a stream the call moved
+            // nowhere keeps its update date too.
             let mut expected = before[index].clone();
             expected["State"] = json!(after_states[index]);
+            if before_states[index] != after_states[index] {
+                // Two calls inside one millisecond stamp the same instant, which the
+                // timestamp type cannot tell apart, so the date never moves BACKWARDS.
+                assert!(
+                    after.get("LastUpdateDate").and_then(Value::as_f64)
+                        >= before[index].get("LastUpdateDate").and_then(Value::as_f64),
+                    "case {case:?}: starting {name} transitioned it, so LastUpdateDate must \
+                     not move back, got {after}"
+                );
+                expected["LastUpdateDate"] = after["LastUpdateDate"].clone();
+            }
             assert_eq!(
                 after, expected,
                 "case {case:?}: expected {name} to be reported as {expected}, got {after}"

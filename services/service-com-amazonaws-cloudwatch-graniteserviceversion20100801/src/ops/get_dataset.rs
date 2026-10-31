@@ -168,11 +168,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account in every Region", so its identity comes from the request's own
         // credential scope rather than from a stored record.
         let region = crate::state::request_region(ctx.parts());
+        // An identifier that is not this account's and Region's default dataset names a
+        // dataset in a scope this caller has no grant on — another account's, or another
+        // Region's — and a caller that may not see a resource is never told whether it is
+        // there: the authorization layer refuses such a call before the lookup, so the answer
+        // is `AccessDenied` rather than a not-found.
         if !crate::state::names_default_dataset(&input.dataset_identifier, &region) {
-            return Err(GetDatasetErrorModeled::ResourceNotFoundException(
-                crate::state::unknown_dataset(&input.dataset_identifier),
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::unauthorized_message(Self::NAME, &input.dataset_identifier),
+            ));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

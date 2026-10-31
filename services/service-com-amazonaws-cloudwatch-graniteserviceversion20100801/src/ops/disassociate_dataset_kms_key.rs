@@ -165,14 +165,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "Only the default dataset is supported", and it is the dataset of the account and
-        // Region the request was signed for, so an identifier naming any other scope names no
-        // dataset this endpoint serves — the same resolution `GetDataset` makes.
+        // Region the request was signed for — so an identifier naming any other scope names a
+        // dataset this caller has no grant on, which the authorization layer refuses before
+        // the association is touched: the same resolution, and the same refusal, every other
+        // operation over this dataset makes (`GetDataset`, `AssociateDatasetKmsKey`). A caller
+        // that may not see a resource is never told whether it is there.
         let region = crate::state::request_region(ctx.parts());
         if !crate::state::names_default_dataset(&input.dataset_identifier, &region) {
-            return Err(DisassociateDatasetKmsKeyErrorModeled::ResourceNotFoundException(
-                crate::state::unknown_dataset(&input.dataset_identifier),
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::unauthorized_message(Self::NAME, &input.dataset_identifier),
+            ));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -192,9 +194,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ResourceNotFoundException {
                     resource_type: Some(crate::state::DATASET_RESOURCE_TYPE.to_string()),
                     resource_id: Some(input.dataset_identifier.clone()),
-                    message: Some(format!(
-                        "the dataset {} has no associated customer managed KMS key",
-                        input.dataset_identifier
+                    message: Some(crate::state::no_dataset_kms_key_message(
+                        &input.dataset_identifier,
                     )),
                 },
             )

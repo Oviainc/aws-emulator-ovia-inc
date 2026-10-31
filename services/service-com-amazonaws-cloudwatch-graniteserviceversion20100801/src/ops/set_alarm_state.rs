@@ -335,26 +335,35 @@ fn force_state(
         input.state_value
     );
 
-    store.record_history(
-        &input.alarm_name,
-        now,
-        AlarmHistoryItem {
-            alarm_name: Some(input.alarm_name.clone()),
-            alarm_contributor_id: None,
-            alarm_type: Some(alarm_type.to_string()),
-            timestamp: Some(crate::state::to_timestamp(now)),
-            history_item_type: Some("StateUpdate".to_string()),
-            history_summary: Some(history_summary),
-            // "Data about the alarm, in JSON format."
-            // (`AlarmHistoryItem$HistoryData`) — for a state update, the alarm's state
-            // before and after this write, read off the stored alarm rather than off the
-            // request.
-            history_data: Some(crate::state::state_transition_history_data(
-                &previous, &updated,
-            )),
-            alarm_contributor_attributes: None,
-        },
-    );
+    // A `StateUpdate` history item records a TRANSITION: "the alarm history" is the record of
+    // the state changes an alarm went through (`DescribeAlarmHistory`, whose
+    // `HistoryItemType` tells a state update from a configuration update and from an action),
+    // so a write that sets the alarm to the state it is already in records nothing — it moved
+    // the alarm nowhere, which is also why it fires no action. The state update itself still
+    // stamps `StateUpdatedTimestamp` above, while `StateTransitionedTimestamp` stays where the
+    // last real transition left it.
+    if previous.state_value.as_deref() != Some(input.state_value.as_str()) {
+        store.record_history(
+            &input.alarm_name,
+            now,
+            AlarmHistoryItem {
+                alarm_name: Some(input.alarm_name.clone()),
+                alarm_contributor_id: None,
+                alarm_type: Some(alarm_type.to_string()),
+                timestamp: Some(crate::state::to_timestamp(now)),
+                history_item_type: Some("StateUpdate".to_string()),
+                history_summary: Some(history_summary),
+                // "Data about the alarm, in JSON format."
+                // (`AlarmHistoryItem$HistoryData`) — for a state update, the alarm's state
+                // before and after this write, read off the stored alarm rather than off the
+                // request.
+                history_data: Some(crate::state::state_transition_history_data(
+                    &previous, &updated,
+                )),
+                alarm_contributor_attributes: None,
+            },
+        );
+    }
 
     // This alarm's new state is an input to every composite alarm whose rule references
     // it, so the alarms downstream of this write are evaluated now rather than at

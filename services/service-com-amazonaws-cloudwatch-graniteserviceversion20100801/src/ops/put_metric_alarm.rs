@@ -453,6 +453,15 @@ const SEARCH_FUNCTION: &str = "SEARCH";
 /// alarm however it is called, so the message names neither the query nor the expression.
 const SEARCH_REFUSAL: &str = "SEARCH is not supported on Metric Alarms.";
 
+/// CloudWatch's refusal for a `Metrics` array that designates no query as the one the alarm
+/// watches.
+///
+/// A fixed sentence too: what is missing is the designation itself, so there is no query to
+/// name — "One item in the Metrics array is the expression that the alarm watches. You
+/// designate this expression by setting ReturnData to true for this object in the array."
+/// (`PutMetricAlarmInput$Metrics`)
+const NO_RETURNED_QUERY_REFUSAL: &str = "Exactly one element of the metrics list should return data.";
+
 /// The envelope CloudWatch wraps a metric math expression refusal in.
 ///
 /// The expression is validated by the metrics query service this operation calls, and
@@ -466,11 +475,41 @@ const EXPRESSION_REFUSAL_ENVELOPE: &str = " (Service: AmazonCloudWatch; Status C
 /// The refusal for an alarm configuration CloudWatch would not create, or `None` when this
 /// request is one it would.
 ///
-/// Everything the service checks ACROSS members, which the boundary validator cannot: the
-/// cadence an alarm can be scheduled at, the span its evaluation may cover, and whether its
-/// query array resolves to the single time series an alarm watches. Checked before anything is
-/// written, so a refused request leaves the store exactly as it was.
+/// Everything the service checks ACROSS members, which the boundary validator cannot: the two
+/// forms an alarm's series can be stated in, the cadence an alarm can be scheduled at, the span
+/// its evaluation may cover, and whether its query array resolves to the single time series an
+/// alarm watches. Checked before anything is written, so a refused request leaves the store
+/// exactly as it was.
 fn configuration_refusal(input: &PutMetricAlarmInput) -> Option<String> {
+    // "If you use the `Metrics` parameter, you cannot include the `Namespace`, `MetricName`,
+    // `Dimensions`, `Period`, `Unit`, `Statistic`, or `ExtendedStatistic` parameters of
+    // `PutMetricAlarm` in the same operation. Instead, you retrieve the metrics you are using
+    // in your math expression as part of the `Metrics` array."
+    // (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Metrics")`) — the two
+    // forms state the series the alarm watches two different ways, so a request carrying both
+    // is one no alarm can be created from.
+    //
+    // The refusal names ONE member, and which one does not depend on the order this request
+    // happened to carry them in: `MetricName` is the member that decides the single-metric form
+    // at all ("For each PutMetricAlarm operation, you must specify either MetricName, a Metrics
+    // array, or an EvaluationCriteria", `PutMetricAlarmInput$Metrics`), so a request carrying
+    // it beside a `Metrics` array is told about THAT member, and the members that only describe
+    // the metric it names follow it.
+    if input.metrics.is_some() {
+        for (member, carried) in [
+            ("MetricName", input.metric_name.is_some()),
+            ("Namespace", input.namespace.is_some()),
+            ("Dimensions", input.dimensions.is_some()),
+            ("Period", input.period.is_some()),
+            ("Unit", input.unit.is_some()),
+            ("Statistic", input.statistic.is_some()),
+            ("ExtendedStatistic", input.extended_statistic.is_some()),
+        ] {
+            if carried {
+                return Some(metrics_exclusive_refusal(member));
+            }
+        }
+    }
     if let Some(period) = input.period {
         if !is_alarm_period(period) {
             let valid = HIGH_RESOLUTION_ALARM_PERIODS
@@ -502,6 +541,15 @@ fn configuration_refusal(input: &PutMetricAlarmInput) -> Option<String> {
         }
     }
     unresolvable_metrics(input)
+}
+
+/// How CloudWatch states a single-metric member that may not be set beside a `Metrics` array:
+/// the member, and that the array is what states the series instead.
+///
+/// One sentence per member, built from the member name alone — the value it carried is not part
+/// of it, since what has to change is that the member is there at all.
+fn metrics_exclusive_refusal(member: &str) -> String {
+    format!("{member} should not be set if list of Metrics is set.")
 }
 
 /// Whether `period` is a cadence an alarm is evaluated at
@@ -536,6 +584,15 @@ fn is_alarm_period(period: i32) -> bool {
 /// multi-series expression by definition and the single-series rule does not speak about it.
 fn unresolvable_metrics(input: &PutMetricAlarmInput) -> Option<String> {
     let queries = input.metrics.as_deref()?;
+    // "One item in the Metrics array is the expression that the alarm watches. You designate
+    // this expression by setting ReturnData to true for this object in the array."
+    // (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Metrics")`) — an array
+    // that designates none designates no series for the alarm to watch, so there is nothing to
+    // grade and no alarm to create. An omitted `ReturnData` IS the designation: "If you omit
+    // this, the default of true is used." (`MetricDataQuery$ReturnData`)
+    if !queries.iter().any(|query| query.return_data != Some(false)) {
+        return Some(NO_RETURNED_QUERY_REFUSAL.to_string());
+    }
     let defined: HashSet<&str> = queries.iter().map(|query| query.id.as_str()).collect();
     for query in queries {
         let Some(expression) = query.expression.as_deref() else {
@@ -857,7 +914,7 @@ fn write_alarm(
         namespace: input.namespace.clone(),
         statistic: input.statistic.clone(),
         extended_statistic: input.extended_statistic.clone(),
-        dimensions: input.dimensions.clone(),
+        dimensions: crate::state::configured_list(input.dimensions.as_deref()),
         period: input.period,
         unit: input.unit.clone(),
         evaluation_periods: input.evaluation_periods,
@@ -906,6 +963,10 @@ fn write_alarm(
             // still reports the state it left behind, and the first evaluation against
             // the stored metric data becomes due at its end.
             evaluation_due_secs: now + crate::state::alarm_evaluation::EVALUATION_DELAY_SECS,
+            // "its state is left unchanged" by an update, but no state this write leaves is one
+            // a caller FORCED: a configuration write hands the alarm back to its own
+            // evaluation, so nothing is standing that the evaluation must not cut short.
+            forced_state_until_secs: 0.0,
         },
     );
     store.record_history(

@@ -900,11 +900,11 @@ async fn a_forced_state_holds_until_the_next_evaluation_is_due() {
          {described}"
     );
 
-    // The datapoint the alarm watches is what its next evaluation is owed from, so publishing
-    // one brings that evaluation forward and the state the evaluation computes takes the
-    // forced one back a span later: a datapoint under the threshold puts the alarm in OK.
-    // "Metric alarms returns to their actual state quickly, often within seconds."
-    // (`SetAlarmState`)
+    // The state a caller forces stands for its own span, whatever the series the alarm
+    // watches holds: a datapoint arriving meanwhile does not cut it short — it is what the
+    // evaluation at the end of that span grades. "Metric alarms returns to their actual state
+    // quickly, often within seconds." (`SetAlarmState`) — a datapoint under the threshold puts
+    // the alarm in OK once the span has passed.
     publish_in_period(
         &router,
         "forced",
@@ -912,7 +912,15 @@ async fn a_forced_state_holds_until_the_next_evaluation_is_due() {
         &[datum(1.0, 0.0)],
     )
     .await;
-    wait_for_evaluation();
+    let still_forced = ok(&router, "DescribeAlarms", &json!({"AlarmNames": ["forced"]})).await;
+    assert_eq!(
+        still_forced["MetricAlarms"][0]
+            .get("StateValue")
+            .and_then(Value::as_str),
+        Some("ALARM"),
+        "the datapoint must not cut the forced span short, got {still_forced}"
+    );
+    crate::harness::wait_for_forced_state_reclaim();
     let described = ok(&router, "DescribeAlarms", &json!({"AlarmNames": ["forced"]})).await;
     assert_eq!(
         described["MetricAlarms"][0]
@@ -941,7 +949,7 @@ async fn ignored_missing_data_maintains_the_state_but_a_datapoint_still_decides_
     )
     .await;
     // Past the span the forced state stands for, so the evaluation has taken the alarm back.
-    wait_for_evaluation();
+    crate::harness::wait_for_forced_state_reclaim();
 
     // "ignore — the current alarm state is maintained": with no datapoint to decide on, the
     // evaluation leaves the alarm in the state it has.

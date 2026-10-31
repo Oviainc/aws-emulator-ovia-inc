@@ -3012,6 +3012,9 @@ fn apply_alarms<Eng: Send + Sync + 'static>(
                 // state is set appropriately."
                 evaluation_due_secs: now
                     + cloudwatch::state::alarm_evaluation::EVALUATION_DELAY_SECS,
+                // Nothing has forced this alarm's state, so no forced span is standing that
+                // its evaluation must not cut short.
+                forced_state_until_secs: 0.0,
             },
         );
         minted.push(Alarm {

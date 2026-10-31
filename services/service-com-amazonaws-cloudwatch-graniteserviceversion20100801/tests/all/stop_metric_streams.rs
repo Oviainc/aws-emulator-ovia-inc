@@ -13,7 +13,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
 
-use crate::harness::{build_router_with_engine, call, error_code, ok};
+use crate::harness::{build_router_with_engine, call, error_code, ok, DEFAULT_REGION};
 
 /// The two states a metric stream can be in: "The state of the metric stream. The possible
 /// values are `running` and `stopped`." (`GetMetricStreamOutput$State`).
@@ -50,7 +50,7 @@ fn force_state(engine: &engine::InMemoryEngine, name: &str, state: &str) {
     let mut store = store.lock();
     let stored = store
         .metric_streams
-        .get_mut(name)
+        .get_mut(&cloudwatch::state::metric_stream_key(DEFAULT_REGION, name))
         .unwrap_or_else(|| panic!("the stream {name} must be configured before its state is set"));
     stored.stream.state = Some(state.to_string());
 }
@@ -154,11 +154,25 @@ async fn stop_metric_streams_stops_exactly_the_configured_streams_it_names() {
 
         for (index, (name, _)) in STREAMS.iter().enumerate() {
             let after = stream_of(&router, name).await;
-            // Only `State` may differ: stopping a stream updates no configuration member, so
-            // the ARN, the destination, the format, the filters, the creation date and the
-            // last configuration update date are all exactly what they were.
+            // Only `State` may differ, beside the `LastUpdateDate` a TRANSITION stamps
+            // ("The date that the configuration of this metric stream was most recently
+            // updated.", `GetMetricStreamOutput$LastUpdateDate`): stopping a stream updates no
+            // configuration member, so the ARN, the destination, the format, the filters and
+            // the creation date are all exactly what they were, and a stream the call moved
+            // nowhere keeps its update date too.
             let mut expected = before[index].clone();
             expected["State"] = json!(after_states[index]);
+            if before_states[index] != after_states[index] {
+                // Two calls inside one millisecond stamp the same instant, which the
+                // timestamp type cannot tell apart, so the date never moves BACKWARDS.
+                assert!(
+                    after.get("LastUpdateDate").and_then(Value::as_f64)
+                        >= before[index].get("LastUpdateDate").and_then(Value::as_f64),
+                    "case {case:?}: stopping {name} transitioned it, so LastUpdateDate must \
+                     not move back, got {after}"
+                );
+                expected["LastUpdateDate"] = after["LastUpdateDate"].clone();
+            }
             assert_eq!(
                 after, expected,
                 "case {case:?}: expected {name} to be reported as {expected}, got {after}"
@@ -342,6 +356,9 @@ async fn stopping_and_starting_toggles_the_state_and_nothing_else() {
             "case {case:?}: PutMetricStream creates a stream running, got {created}"
         );
 
+        // The stream the sequence has reported so far, so each step is compared against what
+        // the step before it left behind: `LastUpdateDate` moves with every transition.
+        let mut before = created.clone();
         for (operation, expected_state) in SEQUENCE {
             let (status, body) = call(&router, operation, &json!({"Names": [name]})).await;
             assert_eq!(
@@ -349,12 +366,28 @@ async fn stopping_and_starting_toggles_the_state_and_nothing_else() {
                 "case {case:?}: expected HTTP 200 from {operation}, got {status} {body}"
             );
             let after = stream_of(&router, name).await;
-            let mut expected = created.clone();
+            let mut expected = before.clone();
             expected["State"] = json!(expected_state);
+            // A transition stamps "the date that the configuration of this metric stream was
+            // most recently updated" (`GetMetricStreamOutput$LastUpdateDate`); a call that
+            // asks for the state the stream is already in moves it nowhere and stamps
+            // nothing, which is what makes both operations idempotent.
+            if before.get("State").and_then(Value::as_str) != Some(expected_state) {
+                // Two calls inside one millisecond stamp the same instant, which the
+                // timestamp type cannot tell apart, so the date never moves BACKWARDS.
+                assert!(
+                    after.get("LastUpdateDate").and_then(Value::as_f64)
+                        >= before.get("LastUpdateDate").and_then(Value::as_f64),
+                    "case {case:?}: {operation} transitioned the stream, so LastUpdateDate \
+                     must not move back, got {after} after {before}"
+                );
+                expected["LastUpdateDate"] = after["LastUpdateDate"].clone();
+            }
             assert_eq!(
                 after, expected,
                 "case {case:?}: after {operation} expected {expected}, got {after}"
             );
+            before = after;
         }
     }
 }

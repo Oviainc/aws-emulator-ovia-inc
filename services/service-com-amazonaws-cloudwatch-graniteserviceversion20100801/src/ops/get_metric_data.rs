@@ -435,7 +435,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let answers = answers(&resolution, &input, requested_start)?;
+        let answers = answers(&resolution, &input, requested_start).await?;
 
         // One datapoint budget is spent across every result, in query order, and the cursor
         // the response hands back is how many of them this and the earlier pages returned —
@@ -703,13 +703,24 @@ fn refusal(refused: crate::state::metric_query::QueryRefusal) -> GetMetricDataEr
 }
 
 /// The answer of every query of the request, in request order.
-fn answers(
+///
+/// `async`, and yielding every [`QUERY_YIELD_INTERVAL`] queries like every other per-query
+/// walk of this handler: labelling a result is caller-driven work (one pass over the label and,
+/// for a statistic token, one over the result's datapoints), so the loop has to leave a timeout
+/// and a cancellation somewhere to land.
+async fn answers(
     resolution: &crate::state::metric_query::Resolution,
     input: &GetMetricDataInput,
     requested_start: f64,
 ) -> Result<Vec<QueryAnswer>, GetMetricDataError> {
     let mut answers = Vec::with_capacity(input.metric_data_queries.len());
-    for query in &input.metric_data_queries {
+    // "The time zone to use for metric data return in this operation."
+    // (`LabelOptions$Timezone`) — the zone the instants a dynamic label states are written in.
+    let timezone = input
+        .label_options
+        .as_ref()
+        .and_then(|options| options.timezone.as_deref());
+    for (index, query) in input.metric_data_queries.iter().enumerate() {
         let value = resolution
             .value(&query.id)
             .cloned()
@@ -730,8 +741,11 @@ fn answers(
             id: query.id.clone(),
             return_data,
             dropped: resolution.dropped(&query.id),
-            series: reported_series(value, query, requested_start),
+            series: reported_series(value, query, requested_start, timezone),
         });
+        if index > 0 && index.is_multiple_of(QUERY_YIELD_INTERVAL) {
+            ::tokio::task::yield_now().await;
+        }
     }
     Ok(answers)
 }
@@ -750,10 +764,11 @@ fn reported_series(
     value: MathValue,
     query: &MetricDataQuery,
     requested_start: f64,
+    timezone: Option<&str>,
 ) -> Vec<MathSeries> {
     // An array's series each carry the label of the series they came from — a search reports
     // what it discovered — while one series or one number is the EXPRESSION's own result, so
-    // its label is the expression.
+    // its label is the expression query's own `Id`.
     let (mut series, discovered) = match value {
         MathValue::Series(series) => (vec![series], false),
         MathValue::Array(many) => (many, true),
@@ -777,17 +792,232 @@ fn reported_series(
     for one in &mut series {
         // "A human-readable label for this metric or expression. This is especially useful if
         // this is an expression, so that you know what the value represents." — the caller's
-        // label when it gave one, else the label the value carries, and for an expression
-        // that is the expression itself, which is the default CloudWatch generates.
-        if let Some(label) = query.label.clone() {
-            one.label = label;
-        } else if let Some(expression) = query.expression.clone() {
-            if one.label.is_empty() || !discovered {
-                one.label = expression;
-            }
-        }
+        // label when it gave one, else the label the value carries, and for an expression the
+        // query's own `Id`, which is the default CloudWatch generates for one.
+        let default_label = match query.expression.is_some() {
+            true if one.label.is_empty() || !discovered => query.id.clone(),
+            _ => one.label.clone(),
+        };
+        // A caller's label may be a DYNAMIC label, whose placeholders this service resolves
+        // from the data it is returning ([`resolved_label`]): the label on the wire carries
+        // numbers and names, never the `${…}` tokens the request wrote.
+        one.label = match query.label.clone() {
+            Some(label) => resolved_label(&label, one, &default_label, query, timezone),
+            None => default_label,
+        };
     }
     series
+}
+
+/// The label a result carries, with every dynamic-label placeholder of `label` RESOLVED from
+/// the series the result returns.
+///
+/// "You can use dynamic labels with your metrics to add dynamically updated values to the
+/// labels of metrics" — a dynamic label is a template a caller submits and the SERVICE fills
+/// in, so what a client reads back is the filled-in text and never the `${…}` token. The
+/// tokens are the published set (AWS CloudWatch's "Using dynamic labels" catalogue): the
+/// statistics of the returned series (`${MIN}`, `${MAX}`, `${SUM}`, `${AVG}`, `${FIRST}`,
+/// `${LAST}`) and the instants they occurred at (the same names suffixed `_TIME`), how many
+/// datapoints the series carries (`${DATAPOINT_COUNT}`), the label the result would carry
+/// without the dynamic one (`${LABEL}`), and a property of the metric the query names
+/// (`${PROP('…')}`).
+///
+/// A token this service does not resolve is left exactly as the request wrote it: filling it
+/// with something invented would report a value nothing measured.
+///
+/// `timezone` is the request's `LabelOptions$Timezone`, the zone every instant a label states
+/// is written in.
+///
+/// BOUNDED by [`MAX_RESOLVED_LABEL_TOKENS`]: a statistic token is one pass over the result's
+/// datapoints, so the work a label can ask for is the number of placeholders TIMES the length
+/// of the series, and a label is a caller-chosen string. The placeholders past the bound are
+/// left as the request wrote them, which is what every token this service does not resolve
+/// reads as, so a label cannot multiply the fold it is labelling.
+fn resolved_label(
+    label: &str,
+    series: &MathSeries,
+    default_label: &str,
+    query: &MetricDataQuery,
+    timezone: Option<&str>,
+) -> String {
+    /// What opens a placeholder.
+    const OPEN: &str = "${";
+    /// What closes one.
+    const CLOSE: char = '}';
+
+    let mut resolved = String::with_capacity(label.len());
+    let mut rest = label;
+    let mut tokens = 0usize;
+    while let Some(at) = rest.find(OPEN) {
+        let (before, from) = rest.split_at(at);
+        resolved.push_str(before);
+        let body = from.get(OPEN.len()..).unwrap_or_default();
+        let Some(end) = body.find(CLOSE) else {
+            // A `${` the label never closes is not a placeholder at all.
+            resolved.push_str(from);
+            return resolved;
+        };
+        let token = body.get(..end).unwrap_or_default();
+        tokens += 1;
+        let value = (tokens <= MAX_RESOLVED_LABEL_TOKENS)
+            .then(|| label_token(token, series, default_label, query, timezone))
+            .flatten();
+        match value {
+            Some(value) => resolved.push_str(&value),
+            None => {
+                resolved.push_str(OPEN);
+                resolved.push_str(token);
+                resolved.push(CLOSE);
+            }
+        }
+        rest = body.get(end + CLOSE.len_utf8()..).unwrap_or_default();
+    }
+    resolved.push_str(rest);
+    resolved
+}
+
+/// How many placeholders of ONE dynamic label this service resolves.
+///
+/// A bound on the work a label asks for, not an AWS limit: each statistic token walks the
+/// result's datapoints, so a label carrying thousands of them over a full result would multiply
+/// one request's work by the length of its series. CloudWatch's own documented dynamic labels
+/// carry a handful of placeholders, so a bound well above that leaves every real label resolved
+/// while the product stays bounded by this constant times the datapoints a result may hold.
+const MAX_RESOLVED_LABEL_TOKENS: usize = 32;
+
+/// What ONE dynamic-label token stands for, or `None` for a token this service does not
+/// resolve.
+fn label_token(
+    token: &str,
+    series: &MathSeries,
+    default_label: &str,
+    query: &MetricDataQuery,
+    timezone: Option<&str>,
+) -> Option<String> {
+    let values = || series.points.iter().map(|(_at, value)| *value);
+    let extreme = |pick: fn(&(f64, f64), &(f64, f64)) -> std::cmp::Ordering| {
+        series.points.iter().copied().min_by(pick)
+    };
+    let by_value = |left: &(f64, f64), right: &(f64, f64)| left.1.total_cmp(&right.1);
+    let by_value_desc = |left: &(f64, f64), right: &(f64, f64)| right.1.total_cmp(&left.1);
+    match token {
+        "MIN" => extreme(by_value).map(|(_at, value)| number_text(value)),
+        "MAX" => extreme(by_value_desc).map(|(_at, value)| number_text(value)),
+        "SUM" => Some(number_text(values().sum())),
+        "AVG" => {
+            let count = series.points.len();
+            #[allow(clippy::cast_precision_loss)]
+            let average = values().sum::<f64>() / count as f64;
+            (count > 0).then(|| number_text(average))
+        }
+        "FIRST" => series.points.first().map(|(_at, value)| number_text(*value)),
+        "LAST" => series.points.last().map(|(_at, value)| number_text(*value)),
+        "MIN_TIME" => extreme(by_value).and_then(|(at, _value)| label_instant(at, timezone)),
+        "MAX_TIME" => {
+            extreme(by_value_desc).and_then(|(at, _value)| label_instant(at, timezone))
+        }
+        "FIRST_TIME" => series
+            .points
+            .first()
+            .and_then(|(at, _value)| label_instant(*at, timezone)),
+        "LAST_TIME" => series
+            .points
+            .last()
+            .and_then(|(at, _value)| label_instant(*at, timezone)),
+        "DATAPOINT_COUNT" => Some(series.points.len().to_string()),
+        // "The original label of the metric or expression" — what the result would carry had
+        // the request named no label at all.
+        "LABEL" => Some(default_label.to_string()),
+        _ => metric_property(token, query),
+    }
+}
+
+/// What a `PROP('…')` token stands for: one property of the metric the query NAMES, or `None`
+/// for a token that is not such a call or names a property the query does not carry.
+///
+/// The properties are the ones a `MetricStat` query carries — its metric's namespace, name and
+/// dimensions, and the statistic and period it is folded by — since those are what the request
+/// states about the series being returned.
+fn metric_property(token: &str, query: &MetricDataQuery) -> Option<String> {
+    /// The dimension a `Dim.<name>` property names.
+    const DIMENSION_PREFIX: &str = "Dim.";
+
+    let property = token
+        .strip_prefix("PROP('")
+        .or_else(|| token.strip_prefix("PROP(\""))?;
+    let property = property
+        .strip_suffix("')")
+        .or_else(|| property.strip_suffix("\")"))?;
+    let stat = query.metric_stat.as_ref()?;
+    if let Some(name) = property.strip_prefix(DIMENSION_PREFIX) {
+        return stat
+            .metric
+            .dimensions
+            .iter()
+            .flatten()
+            .find(|dimension| dimension.name == name)
+            .map(|dimension| dimension.value.clone());
+    }
+    match property {
+        "Namespace" => stat.metric.namespace.clone(),
+        "MetricName" => stat.metric.metric_name.clone(),
+        "Stat" => Some(stat.stat.clone()),
+        "Period" => Some(stat.period.to_string()),
+        _ => None,
+    }
+}
+
+/// One number as a dynamic label carries it: a whole number with no fractional part, and
+/// otherwise the shortest decimal that is the value itself.
+fn number_text(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 {
+        return format!("{value:.0}");
+    }
+    format!("{value}")
+}
+
+/// One instant as a dynamic label states it, in the zone the request asked for.
+///
+/// "The time zone to use for metric data return in this operation. The format is + or -
+/// followed by four digits. The first two digits indicate the number of hours ahead or behind
+/// of UTC, and the final two digits are the number of minutes." (`LabelOptions$Timezone`) — so
+/// the option shifts the instants a label states out of UTC, and the label names the zone it
+/// wrote them in. A request naming none leaves them in UTC, where the modelled timestamp
+/// type's own rendering writes the `Z` suffix ([`crate::state::rfc3339`]). `None` for an
+/// instant that type cannot render.
+fn label_instant(secs: f64, timezone: Option<&str>) -> Option<String> {
+    let Some(offset) = timezone.and_then(utc_offset_secs) else {
+        return crate::state::rfc3339(secs);
+    };
+    let rendered = crate::state::rfc3339(secs + offset)?;
+    let zone = timezone.unwrap_or_default();
+    Some(format!(
+        "{}{zone}",
+        rendered.strip_suffix('Z').unwrap_or(rendered.as_str())
+    ))
+}
+
+/// How many seconds a `LabelOptions$Timezone` is ahead of UTC, or `None` for a value that is
+/// not one of that member's `+hhmm` / `-hhmm` forms.
+fn utc_offset_secs(timezone: &str) -> Option<f64> {
+    /// How many digits the hours field carries.
+    const HOUR_DIGITS: usize = 2;
+    /// How many seconds one hour is, and one minute.
+    const HOUR_SECS: f64 = 3_600.0;
+    const MINUTE_SECS: f64 = 60.0;
+
+    let (sign, digits) = match timezone.split_at_checked(1)? {
+        ("+", digits) => (1.0, digits),
+        ("-", digits) => (-1.0, digits),
+        _ => return None,
+    };
+    if digits.len() != HOUR_DIGITS * 2 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let (hours, minutes) = digits.split_at_checked(HOUR_DIGITS)?;
+    let hours: f64 = hours.parse().ok()?;
+    let minutes: f64 = minutes.parse().ok()?;
+    Some(sign * (hours * HOUR_SECS + minutes * MINUTE_SECS))
 }
 
 /// The messages a result carries about the points its arithmetic could not produce a number

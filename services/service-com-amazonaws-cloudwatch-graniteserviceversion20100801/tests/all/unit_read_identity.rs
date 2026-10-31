@@ -468,14 +468,19 @@ fn parameter_in_set(parameter: &str) -> String {
     crate::announced_value_sets::unit_in_set_message(parameter)
 }
 
-/// What the read whose model declares NONE of them says about the member at `path` holding
-/// `value`: this service's own validation code carries the framework's own counting clause,
-/// which names the submitted value, the member path and the whole declared set.
-fn request_validation_clause(path: &str, value: &str) -> String {
+/// What the read whose model declares NONE of them says about the member at `path` holding a
+/// value outside `StandardUnit`: this service's own validation code carries the framework's
+/// counting clause, which names the member path and the whole declared set — SORTED, which is
+/// how AWS states a value set whose model declares its members in an order of its own
+/// (`service_common::validation_message::in_sorted_enum_order`) — and nothing of the submitted
+/// value, exactly as this service's own parameter sentence does.
+fn request_validation_clause(path: &str) -> String {
+    let mut sorted: Vec<&str> = STANDARD_UNITS.to_vec();
+    sorted.sort_unstable();
     format!(
-        "1 validation error detected: Value '{value}' at '{path}' failed to satisfy constraint: \
+        "1 validation error detected: Value at '{path}' failed to satisfy constraint: \
          Member must satisfy enum value set: [{}]",
-        STANDARD_UNITS.join(", ")
+        sorted.join(", ")
     )
 }
 
@@ -553,10 +558,7 @@ async fn a_unit_outside_the_declared_set_is_refused_by_the_validator_of_the_read
             operation: "GetMetricData",
             request: data_request_with_unit_at(bucket, 1, value),
             code: "ValidationError",
-            message: request_validation_clause(
-                "metricDataQueries.1.member.metricStat.unit",
-                value,
-            ),
+            message: request_validation_clause("metricDataQueries.1.member.metricStat.unit"),
         });
         // The same value further along the query list: the index in the member path is the
         // request's, not a fixed one.
@@ -565,10 +567,7 @@ async fn a_unit_outside_the_declared_set_is_refused_by_the_validator_of_the_read
             operation: "GetMetricData",
             request: data_request_with_unit_at(bucket, 3, value),
             code: "ValidationError",
-            message: request_validation_clause(
-                "metricDataQueries.3.member.metricStat.unit",
-                value,
-            ),
+            message: request_validation_clause("metricDataQueries.3.member.metricStat.unit"),
         });
     }
 

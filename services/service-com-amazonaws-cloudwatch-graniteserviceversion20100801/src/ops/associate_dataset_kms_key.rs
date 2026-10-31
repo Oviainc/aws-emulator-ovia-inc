@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateDatasetKmsKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateDatasetKmsKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateDatasetKmsKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates the customer managed KMS key a request names with the default dataset of the
+//! account and Region the request was signed for, which `GetDataset` then reports and
+//! `DisassociateDatasetKmsKey` removes. Implemented here — this is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,10 +132,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `AssociateDatasetKmsKeyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#AssociateDatasetKmsKey")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#AssociateDatasetKmsKey",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum AssociateDatasetKmsKeyErrorModeled {
     ConflictException(ConflictException),
+    InternalServiceFault(InternalServiceFault),
     KmsAccessDeniedException(KmsAccessDeniedException),
     KmsKeyDisabledException(KmsKeyDisabledException),
     KmsKeyNotFoundException(KmsKeyNotFoundException),
@@ -198,18 +197,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateDatasetKmsKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateDatasetKmsKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateDatasetKmsKey"))
+        // "Only the default dataset is supported", and it is the dataset of the account and
+        // Region the request was signed for — so an identifier naming any other scope names a
+        // dataset this caller has no grant on, which the authorization layer refuses before
+        // the dataset is touched (the same resolution `GetDataset` makes).
+        let region = crate::state::request_region(ctx.parts());
+        if !crate::state::names_default_dataset(&input.dataset_identifier, &region) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::unauthorized_message(Self::NAME, &input.dataset_identifier),
+            ));
+        }
+
+        // "It must be in the same Amazon Web Services Region as the dataset."
+        // (`AssociateDatasetKmsKeyInput$KmsKeyArn`) — a key of another Region is one this
+        // dataset cannot be encrypted with, and that is what the not-found refusal reports, in
+        // the words its own shape documents. Whether the key EXISTS, is enabled and grants
+        // this service the operations it needs is KMS's own answer and is settled by the
+        // dry-run calls the documentation describes; nothing is invented for them here.
+        let key_region = ::service_common::arn::region_of(&input.kms_key_arn, KMS_ARN_NAMESPACE);
+        if key_region != Some(region.as_str()) {
+            return Err(AssociateDatasetKmsKeyErrorModeled::KmsKeyNotFoundException(
+                KmsKeyNotFoundException {
+                    message: KEY_NOT_FOUND_REFUSAL.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateDatasetKmsKeyErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch dataset store is unavailable".into()),
+            })
+        })?;
+        // "You can call AssociateDatasetKmsKey on a dataset that is already associated with a
+        // KMS key to replace the existing key with a different one" — so the association is
+        // written whether or not the dataset carries one, and the dataset of each Region
+        // carries its own.
+        let mut store = state.lock();
+        // A capacity bound on this in-memory store, not an AWS quota, and this operation models
+        // no limit error: a store that cannot hold the association has failed to serve the
+        // request, which is what its server fault reports. Replacing the key of a Region that
+        // already carries one adds no entry, so it is unaffected.
+        if !store.dataset_kms_keys.contains_key(&region)
+            && store.dataset_kms_keys.len() >= crate::state::MAX_DATASET_KMS_KEYS
+        {
+            return Err(
+                AssociateDatasetKmsKeyErrorModeled::InternalServiceFault(InternalServiceFault {
+                    message: Some(format!(
+                        "this emulator holds at most {} dataset key associations",
+                        crate::state::MAX_DATASET_KMS_KEYS
+                    )),
+                })
+                .into(),
+            );
+        }
+        store
+            .dataset_kms_keys
+            .insert(region, input.kms_key_arn.clone());
+        drop(store);
+
+        Ok(AssociateDatasetKmsKeyOutput {})
     }
 }
+
+/// The ARN namespace of Amazon Web Services KMS, the vendor field a `KmsKeyArn` carries.
+const KMS_ARN_NAMESPACE: &str = "kms";
+
+/// What this operation refuses a key it cannot use with, in the words its own error shape
+/// documents: "The specified Amazon Web Services Key Management Service (Amazon Web Services
+/// KMS) key could not be found. Verify that the key Amazon Resource Name (ARN) is correct, that
+/// the key exists, and that it is in the same Amazon Web Services Region as the resource."
+/// (`KmsKeyNotFoundException`).
+///
+/// A fixed sentence: it states what to check rather than echoing the key the request carried,
+/// which is the ARN the caller already has.
+const KEY_NOT_FOUND_REFUSAL: &str =
+    "The specified Amazon Web Services Key Management Service (Amazon Web Services KMS) key \
+     could not be found. Verify that the key Amazon Resource Name (ARN) is correct, that the \
+     key exists, and that it is in the same Amazon Web Services Region as the resource.";

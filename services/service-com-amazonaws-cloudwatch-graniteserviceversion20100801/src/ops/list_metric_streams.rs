@@ -144,9 +144,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A pure read: every stream is reported exactly as `PutMetricStream` /
         // `StartMetricStreams` / `StopMetricStreams` last left it, and nothing is written.
-        // The streams are keyed by name in one store, so nothing here reads the Region the
-        // request was signed for either — each entry carries the ARN its own writer minted.
-        let _ = ctx;
+        // A metric stream is a regional resource, so what this listing reports is the streams
+        // of the Region the request was signed for; a stream of the same name in another
+        // Region is another stream and belongs to that Region's listing.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListMetricStreamsErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the CloudWatch metric stream store is unavailable".into()),
@@ -185,7 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Ordered by stream name so repeated calls report the same order, and so a token
         // can simply name the stream the next page starts at: a page boundary keeps naming
         // the same stream even when streams are created or deleted between two calls.
-        let mut names: Vec<&String> = store.metric_streams.keys().collect();
+        let mut names: Vec<&String> = store
+            .metric_streams
+            .keys()
+            .filter(|key| key.region == region)
+            .map(|key| &key.name)
+            .collect();
         names.sort_unstable();
         let from = match start_at.as_deref() {
             None => 0,
@@ -202,7 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let entries: Vec<MetricStreamEntry> = page
             .iter()
             .take(page_size)
-            .filter_map(|name| store.metric_streams.get(*name))
+            .filter_map(|name| {
+                store
+                    .metric_streams
+                    .get(&crate::state::metric_stream_key(&region, name))
+            })
             .map(|stored| entry_of(&stored.stream))
             .collect();
 

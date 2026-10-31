@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for `GetDataset` and `DisassociateDatasetKmsKey`: the default dataset
-//! every account has in every Region, the customer managed KMS key the store holds for it,
-//! and what removing that association leaves behind.
+//! End-to-end cover for `AssociateDatasetKmsKey`, `GetDataset` and
+//! `DisassociateDatasetKmsKey`: the default dataset every account has in every Region, the
+//! customer managed KMS key a caller associates with it, and what removing that association
+//! leaves behind.
 //!
 //! Every table row is a distinct input along what the rule under test generalises over (the
 //! form of the identifier, the Region the request is signed for, the partition, Region and
-//! account the identifier's ARN carries, which key the Region holds, and how many callers
-//! remove it at once), so the recorded happy path is one row among many rather than the
-//! specification.
+//! account the identifier's ARN carries, the Region the key ARN names, which key the Region
+//! holds, and how many callers remove it at once), so the recorded happy path is one row among
+//! many rather than the specification.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::harness::{build_router_with_engine, call_in_region, error_code};
+use crate::harness::{build_router_with_engine, call_in_region, error_code, error_message};
 use serde_json::{json, Value};
 
 /// The account id every emulated ARN carries, which is the only account whose dataset this
@@ -62,21 +63,31 @@ fn held_keys(engine: &engine::InMemoryEngine) -> HashMap<String, String> {
     store.dataset_kms_keys.clone()
 }
 
-/// Associate every Region of [`SEEDED_REGIONS`] with its own key, and answer the associations
-/// that leaves held.
-fn seed_keys(engine: &engine::InMemoryEngine) -> HashMap<String, String> {
-    let state =
-        service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::service_state(
-            engine,
+/// Associate every Region of [`SEEDED_REGIONS`] with its own key THROUGH THE OPERATION that
+/// writes an association, and answer the associations that leaves held.
+///
+/// Driven over the wire rather than by writing the store, so what every later assertion rests
+/// on is the association `AssociateDatasetKmsKey` really made.
+async fn seed_keys(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
+) -> HashMap<String, String> {
+    for (region, key_id) in SEEDED_REGIONS {
+        let (status, body) = call_in_region(
+            router,
+            region,
+            "AssociateDatasetKmsKey",
+            &json!({
+                "DatasetIdentifier": "default",
+                "KmsKeyArn": key_arn(region, key_id),
+            }),
         )
-        .expect("the service store is reachable from the shared engine");
-    {
-        let mut store = state.lock();
-        for (region, key_id) in SEEDED_REGIONS {
-            store
-                .dataset_kms_keys
-                .insert(region.to_string(), key_arn(region, key_id));
-        }
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {region:?}: associating the key must answer HTTP 200, got {status} with \
+             body {body}"
+        );
     }
     held_keys(engine)
 }
@@ -146,14 +157,15 @@ async fn the_default_dataset_is_reported_for_every_accepted_identifier_in_every_
 }
 
 #[tokio::test]
-async fn an_identifier_outside_the_callers_own_dataset_is_not_found() {
+async fn an_identifier_outside_the_callers_own_dataset_is_refused_as_unauthorized() {
     let (router, _engine) = build_router_with_engine();
 
     // Every row satisfies the modelled `DatasetIdentifier` pattern, so the boundary validator
-    // passes it through and the handler is what decides: each names a dataset in a scope this
-    // endpoint does not serve (another Region, another account, another partition, or no
-    // Region at all), and the only error `GetDataset` models for that is
-    // `ResourceNotFoundException`.
+    // passes it through: each names a dataset in a scope this caller has no grant on (another
+    // Region, another account, another partition, or no Region at all). A caller that may not
+    // see a resource is never told whether it is there, so the authorization layer in front of
+    // the service answers `AccessDenied` — a code no shape of the model declares — rather than
+    // the not-found the operation models for a dataset of its own scope.
     let rows = [
         ("another Region", "arn:aws:cloudwatch:eu-west-1:000000000000:dataset/default"),
         ("another account", "arn:aws:cloudwatch:us-east-1:123456789012:dataset/default"),
@@ -171,13 +183,20 @@ async fn an_identifier_outside_the_callers_own_dataset_is_not_found() {
         .await;
 
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404, got {status} with body {body}"
+            status, 403,
+            "case {case:?}: expected HTTP 403, got {status} with body {body}"
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {body}"
+            "AccessDenied",
+            "case {case:?}: expected AccessDenied, got {body}"
+        );
+        let message = error_message(&body);
+        assert!(
+            message.contains("is not authorized to perform: cloudwatch:GetDataset on resource: ")
+                && message.contains(identifier),
+            "case {case:?}: the refusal must name the action and the resource it refused, got \
+             {message:?}"
         );
     }
 }
@@ -186,22 +205,25 @@ async fn an_identifier_outside_the_callers_own_dataset_is_not_found() {
 async fn the_associated_kms_key_is_reported_for_the_region_that_holds_it() {
     let (router, engine) = build_router_with_engine();
 
-    // The association itself is `AssociateDatasetKmsKey`'s to write, so the key is seeded
-    // straight into the store this reader reads — the same store that handler writes.
-    let key = "arn:aws:kms:us-east-1:000000000000:key/1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
-    let state =
-        service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::service_state(
-            &*engine,
-        )
-        .expect("the service store is reachable from the shared engine");
-    state
-        .lock()
-        .dataset_kms_keys
-        .insert("us-east-1".to_string(), key.to_string());
+    // The association is made through the operation that writes one, in ONE Region: what this
+    // reader reports is the association that call really made.
+    let key = key_arn("us-east-1", "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d");
+    let (status, body) = call_in_region(
+        &router,
+        "us-east-1",
+        "AssociateDatasetKmsKey",
+        &json!({"DatasetIdentifier": "default", "KmsKeyArn": key.clone()}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "associating the key must answer HTTP 200, got {status} with body {body}"
+    );
+    let _ = &engine;
 
     // Each row is the same read in a different Region: the key belongs to the dataset of the
     // Region it was associated in, and nowhere else.
-    let rows = [("us-east-1", Some(key)), ("eu-west-1", None)];
+    let rows = [("us-east-1", Some(key.as_str())), ("eu-west-1", None)];
     for (region, expected) in rows {
         for identifier in ["default".to_string(), dataset_arn(region)] {
             let case = format!("{region} / {identifier}");
@@ -226,8 +248,8 @@ async fn the_associated_kms_key_is_reported_for_the_region_that_holds_it() {
     }
 
     // A read reports the association; it never creates, moves or drops one, so the store holds
-    // exactly the one entry that was seeded and a later caller sees the same answer.
-    let after = state.lock().dataset_kms_keys.clone();
+    // exactly the one entry the association made and a later caller sees the same answer.
+    let after = held_keys(&engine);
     assert_eq!(
         after.len(),
         1,
@@ -235,9 +257,163 @@ async fn the_associated_kms_key_is_reported_for_the_region_that_holds_it() {
     );
     assert_eq!(
         after.get("us-east-1").map(String::as_str),
-        Some(key),
+        Some(key.as_str()),
         "reading a dataset must not change the association it reports, got {after:?}"
     );
+}
+
+#[tokio::test]
+async fn associating_writes_the_key_of_the_dataset_the_request_names() {
+    // Each row is a distinct association: which Region the request is signed for (so which
+    // dataset it names), which of the two accepted forms of `DatasetIdentifier` names it, and
+    // which key id the key ARN carries. "Only the default dataset is supported. The default
+    // dataset is implicit for every account in every Region", so every Region's dataset takes
+    // a key of its own and no Region's association reaches another.
+    let (router, engine) = build_router_with_engine();
+    let mut expected: HashMap<String, String> = HashMap::new();
+    for (index, (region, key_id)) in SEEDED_REGIONS.into_iter().enumerate() {
+        let identifier = if index % 2 == 0 {
+            "default".to_string()
+        } else {
+            dataset_arn(region)
+        };
+        let case = format!("{region} / {identifier}");
+        let key = key_arn(region, key_id);
+        let (status, body) = call_in_region(
+            &router,
+            region,
+            "AssociateDatasetKmsKey",
+            &json!({"DatasetIdentifier": identifier, "KmsKeyArn": key.clone()}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {body}"
+        );
+
+        // Round trip: the key the association wrote is the one the reader reports, for the
+        // dataset of THAT Region.
+        let reported = reported_key(&router, region).await;
+        assert_eq!(
+            reported.as_deref(),
+            Some(key.as_str()),
+            "case {case:?}: expected GetDataset to report the key just associated, got \
+             {reported:?}"
+        );
+        expected.insert(region.to_string(), key);
+        let held = held_keys(&engine);
+        assert_eq!(
+            held, expected,
+            "case {case:?}: expected the associations {expected:?}, got {held:?}"
+        );
+    }
+
+    // "You can call AssociateDatasetKmsKey on a dataset that is already associated with a KMS
+    // key to replace the existing key with a different one." — the replacement is one entry,
+    // not a second one, and it leaves every other Region's association where it was.
+    let (region, _) = SEEDED_REGIONS[0];
+    let replacement = key_arn(region, "11111111-2222-4333-8444-555555555555");
+    let (status, body) = call_in_region(
+        &router,
+        region,
+        "AssociateDatasetKmsKey",
+        &json!({"DatasetIdentifier": "default", "KmsKeyArn": replacement.clone()}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "replacing an existing association must answer HTTP 200, got {status} with body {body}"
+    );
+    expected.insert(region.to_string(), replacement.clone());
+    let held = held_keys(&engine);
+    assert_eq!(
+        held, expected,
+        "a replacement must leave one association per Region, got {held:?}"
+    );
+    let reported = reported_key(&router, region).await;
+    assert_eq!(
+        reported.as_deref(),
+        Some(replacement.as_str()),
+        "the reader must report the key the replacement wrote, got {reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_association_outside_the_callers_own_scope_is_refused_and_writes_nothing() {
+    // (case, the Region the request is signed for, the identifier, the key ARN, the HTTP
+    //  status and error code the refusal carries). The rows differ along WHICH half of the
+    //  request is out of scope: the dataset the identifier names, or the Region the key lives
+    //  in — "It must be in the same Amazon Web Services Region as the dataset."
+    //  (`AssociateDatasetKmsKeyInput$KmsKeyArn`)
+    let rows: Vec<(&str, &str, String, String, u16, &str)> = vec![
+        (
+            "a dataset of another Region",
+            "us-east-1",
+            dataset_arn("eu-west-1"),
+            key_arn("us-east-1", "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"),
+            403,
+            "AccessDenied",
+        ),
+        (
+            "a dataset of another account",
+            "us-east-1",
+            "arn:aws:cloudwatch:us-east-1:123456789012:dataset/default".to_string(),
+            key_arn("us-east-1", "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"),
+            403,
+            "AccessDenied",
+        ),
+        (
+            "a dataset of another partition",
+            "us-east-1",
+            "arn:aws-cn:cloudwatch:us-east-1:000000000000:dataset/default".to_string(),
+            key_arn("us-east-1", "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"),
+            403,
+            "AccessDenied",
+        ),
+        (
+            "a key of another Region",
+            "us-east-1",
+            "default".to_string(),
+            key_arn("eu-west-1", "f0e1d2c3-b4a5-4968-8778-69a5b4c3d2e1"),
+            400,
+            "KmsKeyNotFoundException",
+        ),
+        (
+            "a key of the Region the dataset is NOT in",
+            "ap-southeast-2",
+            "default".to_string(),
+            key_arn("us-east-1", "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"),
+            400,
+            "KmsKeyNotFoundException",
+        ),
+    ];
+
+    for (case, region, identifier, key, status_wanted, code) in rows {
+        let (router, engine) = build_router_with_engine();
+        let (status, body) = call_in_region(
+            &router,
+            region,
+            "AssociateDatasetKmsKey",
+            &json!({"DatasetIdentifier": identifier, "KmsKeyArn": key}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (status_wanted, code),
+            "case {case:?}: expected HTTP {status_wanted} {code}, got {status} with body {body}"
+        );
+        // A refused association writes nothing, so the dataset still carries no key at all.
+        let held = held_keys(&engine);
+        assert!(
+            held.is_empty(),
+            "case {case:?}: a refused association must write nothing, got {held:?}"
+        );
+        let reported = reported_key(&router, region).await;
+        assert_eq!(
+            reported, None,
+            "case {case:?}: the dataset must still report no key, got {reported:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -249,7 +425,7 @@ async fn disassociating_removes_only_the_key_of_the_dataset_the_request_names() 
         for identifier in ["default".to_string(), dataset_arn(region)] {
             let case = format!("{region} / {identifier}");
             let (router, engine) = build_router_with_engine();
-            let seeded = seed_keys(&engine);
+            let seeded = seed_keys(&router, &engine).await;
 
             let (status, body) = call_in_region(
                 &router,
@@ -299,29 +475,40 @@ async fn disassociating_removes_only_the_key_of_the_dataset_the_request_names() 
 }
 
 #[tokio::test]
-async fn disassociating_a_dataset_with_no_associated_key_is_not_found() {
+async fn disassociating_a_dataset_with_no_associated_key_is_refused_and_removes_nothing() {
     // (case, the Region the request is signed for, the identifier it names, whether every
-    // Region's dataset was associated with a key first, whether the call is made twice).
+    // Region's dataset was associated with a key first, whether the call is made twice,
+    // whether the identifier is one this caller has a grant on).
     //
-    // Rows differ along how the call finds no key to remove: the Region never had one, the
-    // Region's own key was already removed by the call before, or the identifier names a
-    // dataset in a scope this endpoint does not serve at all (another Region, another account,
-    // another partition, or no Region), which is a dataset rather than a key that is not
-    // there. Every identifier satisfies the modelled `DatasetIdentifier` pattern, so the
-    // handler is what decides.
-    let rows: [(&str, &str, String, bool, bool); 8] = [
-        ("never associated, named plainly", "us-east-1", "default".to_string(), false, false),
+    // Rows differ along WHY the call removes nothing: the Region never had a key, the Region's
+    // own key was already removed by the call before — both of which are an in-scope dataset
+    // with no association, refused as the missing KEY — or the identifier names a dataset in a
+    // scope this caller has no grant on (another Region, another account, another partition,
+    // or no Region), which is refused BEFORE the association is looked at, exactly as every
+    // other operation over this dataset refuses it. Every identifier satisfies the modelled
+    // `DatasetIdentifier` pattern, so the handler is what decides.
+    let rows: [(&str, &str, String, bool, bool, bool); 8] = [
+        (
+            "never associated, named plainly",
+            "us-east-1",
+            "default".to_string(),
+            false,
+            false,
+            true,
+        ),
         (
             "never associated, named by ARN",
             "eu-west-1",
             dataset_arn("eu-west-1"),
             false,
             false,
+            true,
         ),
         (
             "already disassociated, named plainly",
             "us-east-1",
             "default".to_string(),
+            true,
             true,
             true,
         ),
@@ -331,13 +518,22 @@ async fn disassociating_a_dataset_with_no_associated_key_is_not_found() {
             dataset_arn("ap-southeast-2"),
             true,
             true,
+            true,
         ),
-        ("another Region's dataset", "us-east-1", dataset_arn("eu-west-1"), true, false),
+        (
+            "another Region's dataset",
+            "us-east-1",
+            dataset_arn("eu-west-1"),
+            true,
+            false,
+            false,
+        ),
         (
             "another account's dataset",
             "us-east-1",
             "arn:aws:cloudwatch:us-east-1:123456789012:dataset/default".to_string(),
             true,
+            false,
             false,
         ),
         (
@@ -346,6 +542,7 @@ async fn disassociating_a_dataset_with_no_associated_key_is_not_found() {
             "arn:aws-cn:cloudwatch:us-east-1:000000000000:dataset/default".to_string(),
             true,
             false,
+            false,
         ),
         (
             "a dataset ARN with no Region",
@@ -353,13 +550,14 @@ async fn disassociating_a_dataset_with_no_associated_key_is_not_found() {
             format!("arn:aws:cloudwatch::{ACCOUNT}:dataset/default"),
             true,
             false,
+            false,
         ),
     ];
 
-    for (case, region, identifier, associate_first, call_twice) in rows {
+    for (case, region, identifier, associate_first, call_twice, in_scope) in rows {
         let (router, engine) = build_router_with_engine();
         let before = if associate_first {
-            seed_keys(&engine)
+            seed_keys(&router, &engine).await
         } else {
             held_keys(&engine)
         };
@@ -387,24 +585,45 @@ async fn disassociating_a_dataset_with_no_associated_key_is_not_found() {
             &json!({"DatasetIdentifier": identifier}),
         )
         .await;
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: expected HTTP 404 ResourceNotFoundException, got {status} with \
-             body {body}"
-        );
-        // The refusal names what it could not find, in the two members the error shape carries
-        // for it.
-        assert_eq!(
-            text(&body, "ResourceType"),
-            Some("Dataset"),
-            "case {case:?}: expected the refusal to name the resource type Dataset, got {body}"
-        );
-        assert_eq!(
-            text(&body, "ResourceId"),
-            Some(identifier.as_str()),
-            "case {case:?}: expected the refusal to name {identifier:?}, got {body}"
-        );
+        if in_scope {
+            // The dataset is this caller's own and simply carries no key: the refusal names
+            // what it could not find, in the two members the error shape carries for it.
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (404, "ResourceNotFoundException"),
+                "case {case:?}: expected HTTP 404 ResourceNotFoundException, got {status} with \
+                 body {body}"
+            );
+            assert_eq!(
+                text(&body, "ResourceType"),
+                Some("Dataset"),
+                "case {case:?}: expected the refusal to name the resource type Dataset, got \
+                 {body}"
+            );
+            assert_eq!(
+                text(&body, "ResourceId"),
+                Some(identifier.as_str()),
+                "case {case:?}: expected the refusal to name {identifier:?}, got {body}"
+            );
+        } else {
+            // The identifier names a dataset this caller has no grant on, so it is refused
+            // before the association is looked at — and the refusal says nothing about
+            // whether a key is there.
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (403, "AccessDenied"),
+                "case {case:?}: expected HTTP 403 AccessDenied, got {status} with body {body}"
+            );
+            let message = error_message(&body);
+            assert!(
+                message.contains(
+                    "is not authorized to perform: cloudwatch:DisassociateDatasetKmsKey on \
+                     resource: "
+                ) && message.contains(&identifier),
+                "case {case:?}: the refusal must name the action and the resource it refused, \
+                 got {message:?}"
+            );
+        }
 
         // A refusal removes nothing: every association the store held before the refused call
         // is still held, bar the one the row removed itself.
@@ -429,7 +648,7 @@ async fn concurrent_disassociations_of_one_dataset_converge_on_a_single_removal(
     for callers in [2usize, 3, 5, 8] {
         let region = "us-east-1";
         let (router, engine) = build_router_with_engine();
-        let seeded = seed_keys(&engine);
+        let seeded = seed_keys(&router, &engine).await;
         let router = Arc::new(router);
 
         let mut racing = Vec::new();

@@ -203,20 +203,20 @@ async fn the_missing_data_arm_decides_where_a_forced_state_is_reclaimed_to() {
         );
     }
 
-    // A datapoint of each series arrives, which is what makes that alarm's next evaluation
-    // due — stamped outside the range the evaluation grades, so that evaluation has no
-    // datapoint of its own and the arm alone decides what it computes.
+    // A datapoint of each series arrives, stamped outside the range the evaluation grades, so
+    // the evaluation at the end of the forced span has no datapoint of its own and the arm
+    // alone decides what it computes.
     for (_, name, _, _, _) in &cells {
         publish(&router, name, CLEAR, STALE_AGE_SECS).await;
     }
-    wait_for_evaluation();
+    crate::harness::wait_for_forced_state_reclaim();
 
     for (case, name, _, expected, explanation) in &cells {
         let (settled, reason) = reported(&router, name).await;
         assert_eq!(
             &settled, expected,
-            "case {case:?}: expected {expected} once the evaluation the datapoint made due is \
-             owed, got {settled:?} ({reason:?})"
+            "case {case:?}: expected {expected} once the forced span has passed, got \
+             {settled:?} ({reason:?})"
         );
         let forced = forced_reason(name);
         match explanation {
@@ -282,15 +282,12 @@ async fn the_history_tells_a_client_forced_transition_from_an_evaluated_one() {
             ],
         ),
         (
-            // A force into the state the evaluation already put the alarm in is still a write
-            // the history records, and the evaluation that follows it computes that same state,
-            // so there is nothing further to record.
+            // A force into the state the alarm already reports is no TRANSITION, so the
+            // history records nothing for it — and the evaluation that follows computes that
+            // same state, so there is nothing further to record either.
             "a force into the state the alarm already reports",
             "OK",
-            &[
-                ("INSUFFICIENT_DATA", "OK", Writer::TheEvaluation),
-                ("OK", "OK", Writer::TheClient),
-            ],
+            &[("INSUFFICIENT_DATA", "OK", Writer::TheEvaluation)],
         ),
     ];
 
@@ -319,9 +316,10 @@ async fn the_history_tells_a_client_forced_transition_from_an_evaluated_one() {
              ({right_after_reason:?})"
         );
 
-        // The metric keeps publishing, with no further control-plane call to the alarm.
+        // The metric keeps publishing, with no further control-plane call to the alarm: the
+        // evaluation at the end of the forced span is what grades it.
         publish(&router, name, CLEAR, 0.0).await;
-        wait_for_evaluation();
+        crate::harness::wait_for_forced_state_reclaim();
         let (settled, settled_reason) = reported(&router, name).await;
         assert_eq!(
             settled, "OK",

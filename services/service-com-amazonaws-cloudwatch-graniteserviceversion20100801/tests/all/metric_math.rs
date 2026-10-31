@@ -911,8 +911,8 @@ async fn a_suppressed_query_is_still_read_by_the_expression() {
     );
     assert_eq!(
         listed[0].get("Label").and_then(Value::as_str),
-        Some("m1 + m2"),
-        "case an expression without a Label: the default label is the expression, got {body}"
+        Some("e1"),
+        "case an expression without a Label: the default label is the query's own Id, got {body}"
     );
 
     // The same request with the metrics returned reports all three, in request order.

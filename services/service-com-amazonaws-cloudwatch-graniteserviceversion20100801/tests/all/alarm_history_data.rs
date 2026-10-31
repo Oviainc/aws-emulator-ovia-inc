@@ -394,10 +394,10 @@ async fn a_state_update_records_the_transition_it_made() {
     ok(&router, "PutMetricAlarm", &put_alarm(name)).await;
 
     // Rows differ along the state moved to (including moving to the state the alarm is already
-    // in) and along the FORM and SIZE of the state reason data: absent, a JSON object, a JSON
-    // array, one bulky payload, and then a second bulky one — at which point the transition's
-    // two payloads together cannot fit the modelled 4095 and the document records neither.
-    // `StateReasonData` is `@length 0..4000`
+    // in, which is no transition and records nothing) and along the FORM and SIZE of the state
+    // reason data: absent, a JSON object, a JSON array, one bulky payload, and then a second
+    // bulky one — at which point the transition's two payloads together cannot fit the modelled
+    // 4095 and the document records neither. `StateReasonData` is `@length 0..4000`
     // (`smithy_query(query="shape",shape="StateReasonData")`).
     let bulky = |marker: &str| json!({"marker": marker, "filler": "x".repeat(3_000)});
     // (case, state moved to, reason data given, whether the document can record it)
@@ -461,6 +461,20 @@ async fn a_state_update_records_the_transition_it_made() {
 
         let items = history(&router, name).await;
         let newest = items.last().cloned().unwrap_or(Value::Null);
+        if state == previous {
+            // A write that sets the state the alarm already reports moved it nowhere, so it
+            // is no transition and the history records nothing for it: the newest item is
+            // still the one the write before it made, and the reason this call gave appears
+            // nowhere in the history.
+            let document = history_data(case, &newest);
+            assert_ne!(
+                document.pointer("/newState/stateReason").and_then(Value::as_str),
+                Some(reason.as_str()),
+                "case {case:?}: a write that changed no state must record no StateUpdate, got \
+                 {document}"
+            );
+            continue;
+        }
         assert_eq!(
             newest.get("HistoryItemType").and_then(Value::as_str),
             Some("StateUpdate"),

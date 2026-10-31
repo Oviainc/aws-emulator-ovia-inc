@@ -2,24 +2,28 @@
 
 //! How long a state `SetAlarmState` FORCES on a metric alarm stands, and what takes it back.
 //!
-//! The rule: a forced state stands until the alarm's next evaluation. An alarm is evaluated
-//! from the datapoints of the metric it watches — "the length, in seconds, used each time the
-//! metric specified in `MetricName` is evaluated"
-//! (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Period")`) — so a metric that
-//! is being published is evaluated again as soon as its next datapoint lands ("Metric alarms
-//! returns to their actual state quickly, often within seconds",
-//! `smithy_query(query="operation",operation="SetAlarmState")`), while an alarm over a metric
-//! nothing writes keeps the forced state until its next SCHEDULED pass, one `Period` away.
+//! The rule: a forced state stands for its own span, whatever the series the alarm watches
+//! holds. An alarm is evaluated from the datapoints of the metric it watches — "the length, in
+//! seconds, used each time the metric specified in `MetricName` is evaluated"
+//! (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Period")`) — and what takes
+//! the forced state back is the evaluation at the end of that span ("Metric alarms returns to
+//! their actual state quickly, often within seconds",
+//! `smithy_query(query="operation",operation="SetAlarmState")`), which grades whatever the
+//! series holds by then: a datapoint arriving meanwhile does not cut the span short, because a
+//! forced state nothing could read would be no force at all.
 //!
-//! The rows differ along what the rule generalises over: the alarm's `Period` (the span
-//! itself), whether the metric the alarm watches holds a datapoint at all, whether that
-//! datapoint is inside the range the evaluation grades, whether it arrived before or after the
-//! force, and which state was forced. The recorded scenarios are two rows among them.
+//! The rows differ along what the rule generalises over: the alarm's `Period`, whether the
+//! metric the alarm watches holds a datapoint at all, whether that datapoint is inside the
+//! range the evaluation grades, whether it arrived before or after the force, and which state
+//! was forced — and where the state lands once the span has passed. The recorded scenarios are
+//! two rows among them.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{build_router, graded_window_stamp, ok, wait_for_evaluation};
+use crate::harness::{
+    build_router, graded_window_stamp, ok, wait_for_evaluation, wait_for_forced_state_reclaim,
+};
 
 /// The namespace every alarm in this suite watches.
 const NAMESPACE: &str = "Custom/ForcedLifetime";
@@ -147,70 +151,75 @@ enum Data {
 
 #[tokio::test]
 async fn a_forced_state_stands_until_the_alarms_next_evaluation() {
-    // (case, Period, what the series holds, the state forced, whether the evaluation has taken
-    //  the state back once every evaluation started before now is due)
-    let rows: &[(&str, i32, Data, &str, bool)] = &[
-        // No datapoint to grade: nothing triggers an evaluation before the alarm's own next
-        // scheduled pass, which is a whole period away — so the forced state is still what a
-        // caller reads a clock span later, whatever the period.
+    // (case, Period, what the series holds, the state forced, the state the alarm reports once
+    //  the forced span has passed — the one the evaluation computes over whatever the series
+    //  holds by then)
+    let rows: &[(&str, i32, Data, &str, &str)] = &[
+        // No datapoint to grade: the evaluation at the end of the span has nothing to decide
+        // on, so it reports insufficient data — whatever the period, and whichever state was
+        // forced.
         (
             "ALARM forced on an alarm over a metric nothing writes",
             LONG_PERIOD,
             Data::None,
             "ALARM",
-            false,
+            "INSUFFICIENT_DATA",
         ),
         (
             "OK forced on an alarm over a metric nothing writes",
             SHORT_PERIOD,
             Data::None,
             "OK",
-            false,
+            "INSUFFICIENT_DATA",
         ),
         (
             "INSUFFICIENT_DATA forced on the shortest period",
             SHORTEST_PERIOD,
             Data::None,
             "INSUFFICIENT_DATA",
-            false,
+            "INSUFFICIENT_DATA",
         ),
-        // A datapoint the evaluation can grade: the alarm is evaluated again a clock span
-        // later, whichever side of the force the datapoint arrived on.
+        // A datapoint the evaluation can grade: the state the alarm lands in once the forced
+        // span has passed is the one that datapoint decides, whichever side of the force it
+        // arrived on.
         (
             "ALARM forced on a metric already publishing",
             SHORT_PERIOD,
             Data::FreshBeforeTheForce,
             "ALARM",
-            true,
+            "OK",
         ),
         (
             "ALARM forced, then the metric publishes",
             SHORT_PERIOD,
             Data::FreshAfterTheForce,
             "ALARM",
-            true,
+            "OK",
         ),
         (
             "ALARM forced on a long period, then the metric publishes",
             LONG_PERIOD,
             Data::FreshAfterTheForce,
             "ALARM",
-            true,
+            "OK",
         ),
-        // A datapoint of the series arriving outside the range the evaluation grades still
-        // triggers that evaluation — the arrival is what the evaluation is owed from — and the
-        // state it computes is the data-less one.
+        // A datapoint of the series arriving outside the range the evaluation grades is no
+        // data for that evaluation to grade either — the state it computes is the data-less
+        // one.
         (
-            "a stale datapoint of the series still triggers the evaluation",
+            "a stale datapoint of the series is no data the evaluation grades",
             SHORT_PERIOD,
             Data::StaleAfterTheForce,
             "ALARM",
-            true,
+            "INSUFFICIENT_DATA",
         ),
     ];
 
-    for (case, period, data, state, reclaimed) in rows {
-        let router = build_router();
+    // One emulator for the whole table, so the rows are set up together and ONE clock span
+    // covers every reclaim: each row watches a series of its own and forces an alarm of its
+    // own, so nothing of one row reaches another.
+    let router = build_router();
+    for (case, period, data, state, _) in rows {
         let name = format!("row-{}", case.replace(' ', "-"));
         ok(&router, "PutMetricAlarm", &alarm_request(&name, *period)).await;
         if *data == Data::FreshBeforeTheForce {
@@ -232,29 +241,32 @@ async fn a_forced_state_stands_until_the_alarms_next_evaluation() {
             }
             Data::None | Data::FreshBeforeTheForce => {}
         }
+    }
 
-        wait_for_evaluation();
+    // Inside the span the force stands for, every row still reports the state it forced: a
+    // datapoint arriving meanwhile does not cut it short.
+    wait_for_evaluation();
+    for (case, _, _, state, _) in rows {
+        let name = format!("row-{}", case.replace(' ', "-"));
+        let (inside_the_span, reason) = reported(&router, &name).await;
+        assert_eq!(
+            &inside_the_span, state,
+            "case {case:?}: the forced state must stand for its whole span, got \
+             {inside_the_span:?} ({reason:?})"
+        );
+    }
+
+    // Past it, the evaluation owns the state again: with one datapoint under the threshold
+    // inside the range it grades it is OK, and with none INSUFFICIENT_DATA.
+    wait_for_forced_state_reclaim();
+    for (case, _, _, _, settled_state) in rows {
+        let name = format!("row-{}", case.replace(' ', "-"));
         let (settled, reason) = reported(&router, &name).await;
-        if *reclaimed {
-            // The evaluation owns the state again. With one datapoint under the threshold it
-            // is OK; with none inside the range it graded, INSUFFICIENT_DATA.
-            let expected = if *data == Data::StaleAfterTheForce {
-                "INSUFFICIENT_DATA"
-            } else {
-                "OK"
-            };
-            assert_eq!(
-                settled, expected,
-                "case {case:?}: the evaluation the datapoint made due must take the forced \
-                 state back, got {settled:?} ({reason:?})"
-            );
-        } else {
-            assert_eq!(
-                &settled, state,
-                "case {case:?}: with no datapoint to grade the forced state must stand until \
-                 the alarm's next scheduled pass, got {settled:?} ({reason:?})"
-            );
-        }
+        assert_eq!(
+            &settled, settled_state,
+            "case {case:?}: the evaluation at the end of the forced span must report the state \
+             the series decides, got {settled:?} ({reason:?})"
+        );
     }
 }
 
@@ -268,7 +280,7 @@ async fn the_reclaiming_evaluation_reports_the_datapoints_it_graded() {
     ok(&router, "PutMetricAlarm", &alarm_request(name, SHORT_PERIOD)).await;
     force(&router, name, "ALARM").await;
     publish(&router, name, SHORT_PERIOD, CLEAR, 0.0).await;
-    wait_for_evaluation();
+    wait_for_forced_state_reclaim();
 
     let (state, reason) = reported(&router, name).await;
     assert_eq!(
@@ -363,30 +375,31 @@ async fn a_configuration_write_hands_the_forced_state_back_to_the_evaluation() {
     }
 }
 
-/// The datapoints that decide whether the metric is being published are the ones the alarm's
-/// own evaluation would grade: "If you specify a unit, the operation returns only data that
-/// was collected with that unit specified." So a series published under another unit is no
-/// datapoint for THIS alarm — neither when it was already there before the force nor when it
-/// arrives after it — and the state it forced stands.
+/// The datapoints an evaluation grades are the ones the alarm's `Unit` selects: "If you specify
+/// a unit, the operation returns only data that was collected with that unit specified." So a
+/// series published under another unit is no datapoint for THIS alarm, and the evaluation that
+/// takes the forced state back at the end of its span reports insufficient data rather than the
+/// state that datapoint would decide.
 #[tokio::test]
 async fn a_datapoint_of_another_unit_is_not_data_this_alarm_grades() {
     // (case, the unit the alarm selects, the unit the datapoint carries, whether it is
-    //  published before the force, whether the evaluation has taken the forced state back a
-    //  clock span later)
+    //  published before the force, whether it is a datapoint this alarm GRADES)
     let rows: &[(&str, &str, &str, bool, bool)] = &[
         ("the unit the alarm selects, before the force", "Count", "Count", true, true),
         ("the unit the alarm selects, after the force", "Count", "Count", false, true),
         ("another unit, before the force", "Count", "Milliseconds", true, false),
         ("another unit, after the force", "Count", "Milliseconds", false, false),
         ("no unit on the datapoint", "Count", "", true, false),
-        // An alarm naming no unit grades every datapoint of the series it watches.
+        // An alarm naming no unit grades the series' own unit.
         ("an alarm naming no unit", "", "Milliseconds", false, true),
     ];
 
-    for (case, selected, published, before_the_force, reclaimed) in rows {
-        let router = build_router();
-        let name = "unit-selected";
-        let mut configured = alarm_request(name, LONG_PERIOD);
+    // One emulator for the whole table, so ONE clock span covers every row's reclaim: each row
+    // forces an alarm of its own over a series of its own.
+    let router = build_router();
+    for (index, (case, selected, published, before_the_force, _)) in rows.iter().enumerate() {
+        let name = format!("unit-selected-{index}");
+        let mut configured = alarm_request(&name, LONG_PERIOD);
         if !selected.is_empty() {
             configured["Unit"] = json!(selected);
         }
@@ -405,18 +418,30 @@ async fn a_datapoint_of_another_unit_is_not_data_this_alarm_grades() {
         if *before_the_force {
             ok(&router, "PutMetricData", &write).await;
         }
-        force(&router, name, "ALARM").await;
+        force(&router, &name, "ALARM").await;
         if !*before_the_force {
             ok(&router, "PutMetricData", &write).await;
         }
-        wait_for_evaluation();
+        let (straight_after, _) = reported(&router, &name).await;
+        assert_eq!(
+            straight_after, "ALARM",
+            "case {case:?}: the caller reading straight after the force must see the state it \
+             forced, got {straight_after:?}"
+        );
+    }
 
-        let (settled, reason) = reported(&router, name).await;
-        let expected = if *reclaimed { "OK" } else { "ALARM" };
+    wait_for_forced_state_reclaim();
+    for (index, (case, _, _, _, graded)) in rows.iter().enumerate() {
+        let name = format!("unit-selected-{index}");
+        let (settled, reason) = reported(&router, &name).await;
+        // The evaluation at the end of the forced span grades what the alarm's own unit
+        // selects: the datapoint under the threshold where it selects it, and nothing at all
+        // where it does not.
+        let expected = if *graded { "OK" } else { "INSUFFICIENT_DATA" };
         assert_eq!(
             settled, expected,
-            "case {case:?}: expected {expected} a clock span after the force, got {settled:?} \
-             ({reason:?})"
+            "case {case:?}: expected {expected} once the forced span has passed, got \
+             {settled:?} ({reason:?})"
         );
     }
 }

@@ -37,6 +37,23 @@ pub fn wait_for_evaluation() {
     std::thread::sleep(PAST_EVALUATION_DELAY);
 }
 
+/// Long enough for the evaluation that takes back a state `SetAlarmState` forced to be due.
+///
+/// A forced state stands until the alarm's next SCHEDULED evaluation
+/// (`crate::state::alarm_evaluation`'s `FORCED_STATE_SECS`), which is SECONDS rather than the
+/// sub-second window every other transition this store's clock owes: it has to outlive the
+/// evaluations the force itself makes due, so a composite alarm's rule is evaluated over the
+/// state the caller forced. A test that wants the state RECLAIMED waits past the top of that
+/// span.
+pub const PAST_FORCED_STATE_SPAN: Duration = Duration::from_millis(10_500);
+
+/// Wait for the evaluation that reclaims a forced state to be due.
+///
+/// A blocking sleep, for the same reason as [`wait_for_evaluation`].
+pub fn wait_for_forced_state_reclaim() {
+    std::thread::sleep(PAST_FORCED_STATE_SPAN);
+}
+
 /// Wait until at least `room` seconds are left of the `period`-second window the clock is in.
 ///
 /// A metric is aggregated into periods ANCHORED at multiples of the period, so the window a

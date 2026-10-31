@@ -51,6 +51,13 @@
 //! the synthetic [`Scaffolded::ValidationException`] this wrapper carries a
 //! [`Scaffolded::ValidationError`] variant, built with [`Scaffolded::validation_error`]:
 //! the same single `message`, rendered under the code a CloudWatch client branches on.
+//!
+//! ## An authorization failure
+//!
+//! The same applies to a request the caller is not ALLOWED to make: AWS answers it with the
+//! wire error code `AccessDenied` (HTTP 403), which belongs to the authorization layer in
+//! front of the service and so is declared by no shape of this model either. It is
+//! [`Scaffolded::AccessDenied`], built with [`Scaffolded::access_denied`].
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -196,6 +203,16 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// The caller is not authorized to perform the operation on the resource it named: HTTP
+    /// 403 with the wire error code `AccessDenied`.
+    ///
+    /// This is the code AWS answers an authorization failure with, and it belongs to the
+    /// authorization layer in front of a service rather than to the service's model — so no
+    /// shape of this service declares it and it cannot be a `Modeled` variant. A client
+    /// branches on the code to tell "you may not see this resource" from "this resource does
+    /// not exist", which is why it is its own variant beside the refusals below. The payload
+    /// is the same single `message`.
+    AccessDenied(ValidationException),
     /// The request was refused as invalid in CloudWatch's own wording: HTTP 400 with the
     /// wire error code `ValidationError`.
     ///
@@ -252,6 +269,15 @@ impl<E> Scaffolded<E> {
     pub fn validation_error(message: impl Into<String>) -> Self {
         Self::ValidationError(ValidationException::new(message))
     }
+
+    /// Refuse the request as unauthorized: HTTP 403 `AccessDenied`.
+    ///
+    /// For a resource the caller may not see — see the [`Self::AccessDenied`] variant. The
+    /// message states who was refused what, in the words AWS states an authorization failure
+    /// in.
+    pub fn access_denied(message: impl Into<String>) -> Self {
+        Self::AccessDenied(ValidationException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -259,6 +285,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::AccessDenied(e) => write!(f, "{e}"),
             Self::ValidationError(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
@@ -272,6 +299,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::AccessDenied(e) => e.source(),
             Self::ValidationError(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
@@ -287,7 +315,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
-            Self::ValidationError(e) | Self::ValidationException(e) => e,
+            Self::AccessDenied(e) | Self::ValidationError(e) | Self::ValidationException(e) => e,
         }
     }
 
@@ -296,9 +324,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             // The `<Code>` / `__type` on the wire comes from `shape_name` below, not from
-            // this schema, so both refusals render their one `message` member through the
-            // same synthetic shape and differ only in the code.
-            Self::ValidationError(_) | Self::ValidationException(_) => {
+            // this schema, so every refusal renders its one `message` member through the
+            // same synthetic shape and they differ only in the code.
+            Self::AccessDenied(_) | Self::ValidationError(_) | Self::ValidationException(_) => {
                 &VALIDATION_EXCEPTION_SCHEMA
             }
         }
@@ -312,6 +340,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::AccessDenied(_) => "AccessDenied",
             Self::ValidationError(_) => "ValidationError",
             Self::ValidationException(_) => "ValidationException",
         }
@@ -325,6 +354,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            // "The client is not authorized to perform the requested operation" is a 403
+            // wherever this service's siblings model it.
+            Self::AccessDenied(_) => 403,
             Self::ValidationError(_) | Self::ValidationException(_) => 400,
         }
     }
@@ -339,7 +371,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // Same reason: the synthetic shapes carry no `awsQueryError` trait, so the
             // `<Code>` falls through to `shape_name` above — which is already the code the
             // service answers.
-            Self::ValidationError(_) | Self::ValidationException(_) => None,
+            Self::AccessDenied(_) | Self::ValidationError(_) | Self::ValidationException(_) => {
+                None
+            }
         }
     }
 }

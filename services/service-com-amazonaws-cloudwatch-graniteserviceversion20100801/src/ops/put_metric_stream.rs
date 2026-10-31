@@ -233,13 +233,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can use this parameter only when you are creating a new metric stream. If
         // you are updating an existing metric stream, any tags you specify in this
         // parameter are ignored." (`PutMetricStreamInput$Tags`)
-        let existing = store.metric_streams.get(&input.name).map(|stored| {
-            (
-                stored.stream.state.clone(),
-                stored.stream.creation_date,
-                stored.tags.clone(),
-            )
-        });
+        let existing = store
+            .metric_streams
+            .get(&crate::state::metric_stream_key(&region, &input.name))
+            .map(|stored| {
+                (
+                    stored.stream.state.clone(),
+                    stored.stream.creation_date,
+                    stored.tags.clone(),
+                )
+            });
         // A capacity bound on this in-memory store, not an AWS quota, and this operation
         // models no limit error: a store that cannot hold the stream has failed to serve
         // the request, which is what its server fault reports.
@@ -264,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let arn = crate::state::metric_stream_arn(&region, &input.name);
         store.metric_streams.insert(
-            input.name.clone(),
+            crate::state::metric_stream_key(&region, &input.name),
             crate::state::StoredMetricStream {
                 // Stored as the shape its reader returns, so every member this operation
                 // accepts round-trips through `GetMetricStream` unchanged.

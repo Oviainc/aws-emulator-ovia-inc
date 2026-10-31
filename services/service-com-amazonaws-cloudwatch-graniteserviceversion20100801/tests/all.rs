@@ -85,6 +85,8 @@ mod evaluation_budget_progress;
 mod forced_state_actions;
 #[path = "all/forced_state_lifetime.rs"]
 mod forced_state_lifetime;
+#[path = "all/forced_state_propagation.rs"]
+mod forced_state_propagation;
 #[path = "all/forced_state_reclaim.rs"]
 mod forced_state_reclaim;
 #[path = "all/get_dashboard_reader.rs"]
@@ -117,6 +119,8 @@ mod managed_insight_rule_catalog;
 mod managed_insight_rules;
 #[path = "all/metric_data.rs"]
 mod metric_data;
+#[path = "all/metric_data_plane_identity.rs"]
+mod metric_data_plane_identity;
 #[path = "all/metric_math.rs"]
 mod metric_math;
 #[path = "all/metric_math_alarm_advances.rs"]
@@ -149,6 +153,8 @@ mod otel_enrichment;
 mod percentile_low_sample_alarms;
 #[path = "all/period_refusal_message.rs"]
 mod period_refusal_message;
+#[path = "all/probe_counts.rs"]
+mod probe_counts;
 #[path = "all/put_metric_data_validation.rs"]
 mod put_metric_data_validation;
 #[path = "all/query_form_metrics.rs"]

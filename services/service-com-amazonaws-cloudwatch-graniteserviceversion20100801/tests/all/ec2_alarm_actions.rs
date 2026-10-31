@@ -65,6 +65,25 @@ fn put_request(name: &str, members: &Value) -> Value {
     {
         object.insert(member.clone(), value.clone());
     }
+    // "If you use the `Metrics` parameter, you cannot include the `Namespace`, `MetricName`,
+    // `Dimensions`, `Period`, `Unit`, `Statistic`, or `ExtendedStatistic` parameters of
+    // `PutMetricAlarm` in the same operation."
+    // (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Metrics")`) — a row that
+    // states its series as a query array carries none of the single-metric members the base
+    // request above shares, since the array states the period and the statistic itself.
+    if object.contains_key("Metrics") {
+        for member in [
+            "Namespace",
+            "MetricName",
+            "Dimensions",
+            "Period",
+            "Unit",
+            "Statistic",
+            "ExtendedStatistic",
+        ] {
+            object.remove(member);
+        }
+    }
     request
 }
 

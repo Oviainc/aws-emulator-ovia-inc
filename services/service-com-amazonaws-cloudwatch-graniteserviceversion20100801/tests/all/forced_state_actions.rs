@@ -175,6 +175,11 @@ async fn switch_actions(emulator: &Emulator, region: &str, name: &str, enabled: 
 
 /// Every notification waiting on the queue at `url`, as the alarm documents SNS enveloped,
 /// with the envelope's `TopicArn` beside each one.
+///
+/// What it receives it also DELETES: a received message a consumer does not delete becomes
+/// visible again once its visibility timeout runs out ("If you don't delete the message, it is
+/// eventually redelivered", `ReceiveMessage`), so a later drain of the same queue would see a
+/// notification this one already accounted for.
 async fn notifications(emulator: &Emulator, region: &str, url: &str) -> Vec<(String, Value)> {
     let received = sqs(
         emulator,
@@ -186,10 +191,19 @@ async fn notifications(emulator: &Emulator, region: &str, url: &str) -> Vec<(Str
         &json!({"QueueUrl": url, "MaxNumberOfMessages": 10, "WaitTimeSeconds": 1}),
     )
     .await;
-    received["Messages"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+    let messages = received["Messages"].as_array().cloned().unwrap_or_default();
+    for message in &messages {
+        if let Some(receipt) = message["ReceiptHandle"].as_str() {
+            sqs(
+                emulator,
+                region,
+                "DeleteMessage",
+                &json!({"QueueUrl": url, "ReceiptHandle": receipt}),
+            )
+            .await;
+        }
+    }
+    messages
         .iter()
         .map(|message| {
             let body = message["Body"].as_str().unwrap_or_default();
@@ -226,12 +240,12 @@ async fn reported_state(emulator: &Emulator, region: &str, name: &str) -> String
 /// Publish one datapoint of the series the alarm watches, stamped far enough in the past to
 /// fall outside the alarm's evaluation range, and wait for the evaluation it makes due.
 ///
-/// An alarm's evaluation is owed from the arrival of the data it grades, so the datapoint is
-/// what brings the next evaluation forward and takes the forced state back — the alarm
-/// "returns to [its] actual state quickly, often within seconds" (`SetAlarmState`). The
-/// datapoint is older than the look-back this alarm evaluates (one period of
-/// `PERIOD_SECS`), so the state that evaluation computes is the data-less
-/// `INSUFFICIENT_DATA` rather than one this datapoint's value decided.
+/// A forced state stands for its own span whatever the series holds, so the reclaim is the
+/// evaluation owed at the END of that span — the alarm "returns to [its] actual state quickly,
+/// often within seconds" (`SetAlarmState`). The datapoint published here is older than the
+/// look-back this alarm evaluates (one period of `PERIOD_SECS`), so the state that evaluation
+/// computes is the data-less `INSUFFICIENT_DATA` rather than one this datapoint's value
+/// decided.
 async fn reclaim_the_forced_state(emulator: &Emulator, region: &str) {
     cw(
         emulator,
@@ -247,7 +261,7 @@ async fn reclaim_the_forced_state(emulator: &Emulator, region: &str) {
         }),
     )
     .await;
-    std::thread::sleep(PAST_EVALUATION_DELAY);
+    std::thread::sleep(crate::harness::PAST_FORCED_STATE_SPAN);
 }
 
 /// How far before now the datapoint [`reclaim_the_forced_state`] publishes is stamped: well

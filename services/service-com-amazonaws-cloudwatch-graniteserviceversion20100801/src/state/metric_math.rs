@@ -1110,9 +1110,20 @@ impl<'a> Evaluation<'a> {
         Ok(point_map(series))
     }
 
-    /// `operator` over the points `series` shares with the series `aligned` indexes; a time
-    /// stamp only one of them carries contributes no point, because the operator has nothing to
-    /// apply there.
+    /// `operator` over the UNION of the time stamps `series` and the series `aligned` indexes
+    /// carry: an operand with no datapoint at a time stamp the other one has is taken as 0, so
+    /// the bucket still yields a value.
+    ///
+    /// CloudWatch answers an arithmetic expression over two metrics for every period in which
+    /// ANY operand has data, with the ABSENT operand read as zero. The recorded expressions
+    /// pin that from three sides: `m1 + m2` keeps the period in which only `m1` was published
+    /// and over a metric nothing has ever written the sum is the other operand's own series,
+    /// while `m1 * m2` answers that same period with ZERO rather than with the present
+    /// operand's value (which is what ignoring the absent one would give) and rather than
+    /// leaving the period out (which is what dropping the bucket would give). So the rule is
+    /// the operand, not the operator: a period either side has data in is answered, and the
+    /// side that has none contributes 0 to whatever the operator does with it — a product with
+    /// it is zero, and a quotient by it is no finite number and so no datapoint at all.
     ///
     /// `indexed_is_left` says which side of the operator the INDEXED series is, so an operator
     /// that does not commute is applied the way the expression wrote it.
@@ -1123,22 +1134,33 @@ impl<'a> Evaluation<'a> {
         aligned: &BTreeMap<i64, f64>,
         indexed_is_left: bool,
     ) -> MathSeries {
-        let mut points = Vec::with_capacity(series.points.len());
-        for (timestamp, value) in series.points {
+        // The union of the two sides' time stamps, in time order: this series' own points,
+        // plus the keys only the indexed series carries. A `BTreeMap` is what orders them,
+        // oldest first, however the two series were spaced.
+        let mut union: BTreeMap<i64, Option<f64>> = series
+            .points
+            .iter()
+            .map(|(timestamp, value)| (time_key(*timestamp), Some(*value)))
+            .collect();
+        for key in aligned.keys() {
+            union.entry(*key).or_insert(None);
+        }
+        let mut points = Vec::with_capacity(union.len());
+        for (key, value) in union {
             if !self.charge(1) {
                 break;
             }
-            let Some(other) = aligned.get(&time_key(timestamp)) else {
-                continue;
-            };
+            // The operand with no datapoint in this bucket counts as 0 on either side.
+            let own = value.unwrap_or(0.0);
+            let other = aligned.get(&key).copied().unwrap_or(0.0);
             let (left, right) = if indexed_is_left {
-                (*other, value)
+                (other, own)
             } else {
-                (value, *other)
+                (own, other)
             };
             let computed = operator.apply(left, right);
             if computed.is_finite() {
-                points.push((timestamp, computed));
+                points.push((key_time(key), computed));
             } else {
                 self.dropped += 1;
             }

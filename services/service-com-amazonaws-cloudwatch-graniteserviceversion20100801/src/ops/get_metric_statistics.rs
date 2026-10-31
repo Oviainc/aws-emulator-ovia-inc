@@ -339,13 +339,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut datapoints = Vec::with_capacity(buckets.len());
         for ((index, unit), data) in buckets {
-            datapoints.push(aggregate(
+            let datapoint = aggregate(
                 crate::state::window_start(start, index, period),
                 &data,
                 &statistics,
                 &extended,
                 unit,
-            ));
+            );
+            // A window NONE of the requested statistics is defined over is not a datapoint at
+            // all: "CloudWatch needs raw data points to calculate percentile statistics. If
+            // you publish data using a statistic set instead, you can only retrieve percentile
+            // statistics for this data if one of the following conditions is true"
+            // (`GetMetricStatistics`) — a percentile over an aggregate that kept no
+            // distribution has no value, so the read answers with no datapoint for that period
+            // rather than with an entry carrying its instant and its unit and no measurement.
+            if !reports_a_statistic(&datapoint) {
+                continue;
+            }
+            datapoints.push(datapoint);
         }
 
         Ok(GetMetricStatisticsOutput {
@@ -391,6 +402,20 @@ fn validate_period(period: i32) -> Result<(), GetMetricStatisticsError> {
         Some(message) => Err(invalid_value(message)),
         None => Ok(()),
     }
+}
+
+/// Whether `datapoint` reports any statistic at all.
+///
+/// A `Datapoint` carries its instant and the unit of the observations it aggregated beside the
+/// statistics themselves, so neither of those is a measurement: a datapoint that states no
+/// statistic states nothing the caller asked for.
+fn reports_a_statistic(datapoint: &Datapoint) -> bool {
+    datapoint.sample_count.is_some()
+        || datapoint.average.is_some()
+        || datapoint.sum.is_some()
+        || datapoint.minimum.is_some()
+        || datapoint.maximum.is_some()
+        || datapoint.extended_statistics.is_some()
 }
 
 /// Aggregate one window's datapoints, emitting ONLY the statistics the caller asked for.
