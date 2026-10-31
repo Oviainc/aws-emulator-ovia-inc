@@ -149,6 +149,9 @@ mod property_group_refinement;
 #[path = "all/property_listing.rs"]
 mod property_listing;
 
+#[path = "all/property_value_data_type.rs"]
+mod property_value_data_type;
+
 #[path = "all/property_value_read.rs"]
 mod property_value_read;
 

@@ -1618,6 +1618,39 @@ impl Workspace {
                 .is_none()
     }
 
+    /// Why `value` cannot be written to the property `property_name` of a
+    /// component that instantiates `component_type_id` and declares
+    /// `definition` for it — `None` when it can.
+    ///
+    /// The rule is [`data_value_type_violation`], asked of the definition the
+    /// property EFFECTIVELY carries: the declaration the write itself holds,
+    /// refined over the ones it INHERITS from the component type the holder
+    /// instantiates and from the types that type extends
+    /// ([`refined_property_definition`]) — the same resolution every reader of
+    /// the property's definition makes
+    /// ([`effective_property_definition`](Self::effective_property_definition)).
+    /// A value is therefore judged against the `dataType` a read REPORTS for
+    /// the property, whether the property declares it itself or inherits it,
+    /// and a write of another type is refused rather than stored.
+    ///
+    /// The component-level counterpart of the question the time-series data
+    /// plane asks of every value it writes, shared by every writer of a
+    /// component's property value so one value is held to one rule wherever it
+    /// is written.
+    pub fn component_property_value_violation(
+        &self,
+        component_type_id: Option<&str>,
+        property_name: &str,
+        definition: Option<&crate::ops::types::PropertyDefinitionRequest>,
+        value: &crate::ops::types::DataValue,
+    ) -> Option<String> {
+        let inherited =
+            self.effective_property_definition(component_type_id, &BTreeMap::new(), property_name);
+        let effective =
+            refined_property_definition(definition.into_iter().chain(inherited.as_ref()));
+        data_value_type_violation(property_name, effective.as_ref(), value)
+    }
+
     /// The component types one component type INHERITS from: the `extendsFrom`
     /// chain behind it, nearest first, without the component type itself.
     ///
@@ -3432,6 +3465,12 @@ pub fn data_value_type(value: &crate::ops::types::DataValue) -> Option<&'static 
 /// stored, which would leave a read reporting a value of a type the definition
 /// does not declare. A definition declaring no `dataType` constrains nothing,
 /// so only the presence of a value is required there.
+///
+/// Shared by every writer of a property's value, whichever plane it writes
+/// through: the time-series data plane asks it of each value one entry carries,
+/// and a writer of an entity's components asks it through
+/// [`Workspace::component_property_value_violation`], which resolves the
+/// definition the property effectively carries first.
 pub fn data_value_type_violation(
     property_name: &str,
     definition: Option<&crate::ops::types::PropertyDefinitionRequest>,

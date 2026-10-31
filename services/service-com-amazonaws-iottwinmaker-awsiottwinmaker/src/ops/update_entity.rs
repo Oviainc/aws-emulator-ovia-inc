@@ -55,7 +55,11 @@
 //! ([`crate::state::abstract_component_type_violation`]), a property
 //! definition left with no `dataType` — neither its own nor one inherited from
 //! the component type its holder instantiates
-//! ([`crate::state::Workspace::component_property_definition_needs_data_type`])
+//! ([`crate::state::Workspace::component_property_definition_needs_data_type`]),
+//! a property `value` that is not a value of the `dataType` the property has,
+//! its own or the inherited one
+//! ([`crate::state::Workspace::component_property_value_violation`], the rule
+//! every writer of a property's value shares)
 //! — and a `parentEntityId` that names no
 //! entity of the workspace, names the entity being updated, or names an entity
 //! BELOW it (which would make the stored parent graph cyclic). The patch is
@@ -619,7 +623,9 @@ fn apply_composite_component_update(
 /// map, so one shape has one rule.
 ///
 /// `component_type_id` is the component type the holder instantiates, which is
-/// what a definition carrying no `dataType` of its own inherits one from.
+/// what a definition carrying no `dataType` of its own inherits one from, and
+/// what a value written to a property the entity declares nothing about is
+/// judged against.
 fn apply_property_updates(
     workspace: &crate::state::Workspace,
     component_type_id: Option<&str>,
@@ -677,6 +683,31 @@ fn apply_property_updates(
                     )
                 }) {
                     return Err(validation(format!("{member}.definition.dataType is required")));
+                }
+                // The value this entry writes has to be a value of the
+                // `dataType` the property ENDS UP with: the definition the
+                // entry carries where it carries one (it replaces the
+                // property's), else the property's own, refined over what the
+                // holder's component type declares — the rule
+                // `crate::state::Workspace::component_property_value_violation`
+                // every writer of a property's value shares, decided before
+                // the patch is applied so a mistyped value is refused rather
+                // than left for a read to report against a `dataType` it
+                // contradicts.
+                if let Some(value) = update.value.as_ref() {
+                    let declared = update.definition.as_ref().or_else(|| {
+                        properties
+                            .get(&property_name)
+                            .and_then(|property| property.definition.as_ref())
+                    });
+                    if let Some(violation) = workspace.component_property_value_violation(
+                        component_type_id,
+                        &property_name,
+                        declared,
+                        value,
+                    ) {
+                        return Err(validation(violation));
+                    }
                 }
                 let property = properties.entry(property_name).or_default();
                 if let Some(definition) = update.definition {

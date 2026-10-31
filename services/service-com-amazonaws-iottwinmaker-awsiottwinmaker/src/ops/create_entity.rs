@@ -7,7 +7,7 @@
 //! terminal `ACTIVE` state, which is the state recorded traffic reads a
 //! just-created entity back in.
 //!
-//! Five refusals this handler owns, each a `ValidationException` (the model
+//! Seven refusals this handler owns, each a `ValidationException` (the model
 //! declares no `ResourceNotFoundException` for `CreateEntity`):
 //!
 //! * `tags` names a key in the reserved `aws:` namespace
@@ -16,6 +16,18 @@
 //!   refused and no entity is created;
 //! * the workspace does not exist;
 //! * `parentEntityId` names an entity that does not exist in the workspace;
+//! * a requested property's definition would leave the property with no
+//!   `dataType` at all — neither its own nor one inherited from the component
+//!   type its holder instantiates
+//!   ([`crate::state::Workspace::component_property_definition_needs_data_type`]),
+//!   which is a definition no read could report;
+//! * a requested property's `value` is not a value of the `dataType` the
+//!   property has, its own or the inherited one
+//!   ([`crate::state::Workspace::component_property_value_violation`]): the
+//!   value of a property is a value of THAT type, so a mistyped one is refused
+//!   BEFORE anything is stored rather than left for a read to report a value
+//!   against a `dataType` it contradicts — the rule the time-series data plane
+//!   holds every value it writes to;
 //! * a component — top-level or composite — instantiates a component type the
 //!   workspace holds and that type is ABSTRACT
 //!   ([`crate::state::ComponentType::is_abstract`]): an abstract component type
@@ -316,13 +328,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every declared property definition must leave the property with the
         // `dataType` the modelled `PropertyDefinitionResponse` requires back —
         // its own, or the one it INHERITS from the component type the component
-        // instantiates ([`require_data_types`], the rule
+        // instantiates — and every property VALUE the request carries must be a
+        // value of that `dataType` ([`require_property_types`], the rules
         // `crate::state::Workspace::component_property_definition_needs_data_type`
-        // holds for every writer of a component's definition). Walked in
+        // and `crate::state::Workspace::component_property_value_violation`
+        // hold for every writer of a component's properties). Walked in
         // component-name then component-path order, each component's properties
         // in property-name order.
         for (component_name, component) in &components {
-            require_data_types(
+            require_property_types(
                 workspace,
                 component.component_type_id.as_deref(),
                 &format!("components.{component_name}"),
@@ -347,7 +361,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 component_path,
             )
             .ok();
-            require_data_types(
+            require_property_types(
                 workspace,
                 resolved
                     .as_ref()
@@ -601,25 +615,34 @@ fn validation(message: String) -> CreateEntityErrorModeled {
 }
 
 /// Refuse a requested property whose definition would leave the property with
-/// no `dataType` at all.
+/// no `dataType` at all, and one whose VALUE is not a value of the `dataType`
+/// the property has.
 ///
 /// `component_type_id` is the component type the properties' holder — a
 /// component or a composite component — instantiates, which is where a
-/// definition that carries no `dataType` of its own inherits one from: the rule
-/// is `crate::state::Workspace::component_property_definition_needs_data_type`,
-/// the one every writer of a component's definition shares, so a definition
-/// that REFINES an inherited one (every member of `PropertyDefinitionRequest`
-/// is optional) is accepted here exactly where a read can report it.
+/// definition that carries no `dataType` of its own inherits one from, and
+/// where a property the request declares nothing about takes its `dataType`
+/// from. Both rules are the crate's own, shared with every other writer of a
+/// component's properties: a definition no read could report a `dataType` for
+/// is `crate::state::Workspace::component_property_definition_needs_data_type`
+/// (so a definition that REFINES an inherited one — every member of
+/// `PropertyDefinitionRequest` is optional — is accepted here exactly where a
+/// read can report it), and a value of the wrong type is
+/// `crate::state::Workspace::component_property_value_violation`, the rule the
+/// time-series data plane holds every value it writes to
+/// (`crate::ops::batch_put_property_values`). A value is judged against the
+/// `dataType` a read REPORTS for the property, so one supplied against a
+/// definition the component INHERITS is judged too.
 ///
 /// `member_path` is the request member the map hangs off (`components.<name>`,
 /// `compositeComponents.<path>`), so the refusal names the exact member the
 /// caller has to fix.
 ///
 /// The requested properties are walked in property-NAME order, so a request
-/// carrying more than one definition the rule refuses is always refused for
+/// carrying more than one property the rules refuse is always refused for
 /// the first of them in key order rather than for whichever one the hash map's
 /// iteration order reached first.
-fn require_data_types(
+fn require_property_types(
     workspace: &crate::state::Workspace,
     component_type_id: Option<&str>,
     member_path: &str,
@@ -628,17 +651,29 @@ fn require_data_types(
     let properties: ::std::collections::BTreeMap<&String, &PropertyRequest> =
         properties.into_iter().flatten().collect();
     for (property_name, property) in properties {
-        let Some(definition) = property.definition.as_ref() else {
-            continue;
-        };
-        if workspace.component_property_definition_needs_data_type(
-            component_type_id,
-            property_name,
-            definition,
-        ) {
+        if property.definition.as_ref().is_some_and(|definition| {
+            workspace.component_property_definition_needs_data_type(
+                component_type_id,
+                property_name,
+                definition,
+            )
+        }) {
             return Err(validation(format!(
                 "{member_path}.properties.{property_name}.definition.dataType is required"
             )));
+        }
+        // Asked of the value the create would STORE, before anything is
+        // stored: a property with no declaration of its own is still judged
+        // against the definition it inherits.
+        if let Some(value) = property.value.as_ref() {
+            if let Some(violation) = workspace.component_property_value_violation(
+                component_type_id,
+                property_name,
+                property.definition.as_ref(),
+                value,
+            ) {
+                return Err(validation(violation));
+            }
         }
     }
     Ok(())

@@ -890,8 +890,16 @@ async fn a_request_that_addresses_nothing_is_refused() {
 const EDGE_WORKSPACE: &str = "propedges";
 
 /// A workspace holding one component type with one property, and one entity per
-/// `value` given — each writing that value to the property.
-async fn seed_values(emulator: &Emulator, property: &str, values: &[(&str, Value)]) {
+/// row given — each writing that row's value to the property.
+///
+/// A row carries the `dataType` its component DECLARES for the property beside
+/// the value, because a value written to a property is a value of the
+/// property's own `dataType`: a component's declaration refines the one it
+/// inherits from the component type (every member of
+/// `PropertyDefinitionRequest` is optional), so one component type can hold
+/// instances whose values travel in different members and each stored value is
+/// still a value of the type its property reports.
+async fn seed_values(emulator: &Emulator, property: &str, values: &[(&str, &str, Value)]) {
     let created = emulator.create_workspace(EDGE_WORKSPACE).await;
     assert_eq!(
         created.status, 200,
@@ -908,7 +916,7 @@ async fn seed_values(emulator: &Emulator, property: &str, values: &[(&str, Value
         created.status, 200,
         "CreateComponentType: expected 200, got {created:?}"
     );
-    for (entity_id, value) in values {
+    for (entity_id, data_type, value) in values {
         let created = emulator
             .create_entity(
                 EDGE_WORKSPACE,
@@ -917,7 +925,10 @@ async fn seed_values(emulator: &Emulator, property: &str, values: &[(&str, Value
                     "entityName": entity_id,
                     "components": {"Spec": {
                         "componentTypeId": "com.example.edge",
-                        "properties": {property: {"value": value}},
+                        "properties": {property: {
+                            "definition": {"dataType": {"type": data_type}},
+                            "value": value,
+                        }},
                     }},
                 }),
             )
@@ -940,10 +951,10 @@ async fn an_ordering_over_values_of_different_kinds_is_total() {
         &emulator,
         "Reading",
         &[
-            ("flag", json!({"booleanValue": true})),
-            ("number", json!({"doubleValue": 3.0})),
-            ("small", json!({"integerValue": 1})),
-            ("text", json!({"stringValue": "high"})),
+            ("flag", "BOOLEAN", json!({"booleanValue": true})),
+            ("number", "DOUBLE", json!({"doubleValue": 3.0})),
+            ("small", "INTEGER", json!({"integerValue": 1})),
+            ("text", "STRING", json!({"stringValue": "high"})),
         ],
     )
     .await;
@@ -1000,8 +1011,8 @@ async fn a_filter_compares_long_values_exactly() {
         &emulator,
         "Serial",
         &[
-            ("exact", json!({"longValue": 9_007_199_254_740_993i64})),
-            ("neighbour", json!({"longValue": 9_007_199_254_740_992i64})),
+            ("exact", "LONG", json!({"longValue": 9_007_199_254_740_993i64})),
+            ("neighbour", "LONG", json!({"longValue": 9_007_199_254_740_992i64})),
         ],
     )
     .await;
