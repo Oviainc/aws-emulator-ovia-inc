@@ -15,7 +15,8 @@ use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     ActivityTaskCancelRequestedEventAttributes, ActivityTaskCanceledEventAttributes,
-    ActivityTaskScheduledEventAttributes, ActivityType, ActivityTypeConfiguration, ActivityTypeInfo,
+    ActivityTaskScheduledEventAttributes, ActivityTaskStartedEventAttributes,
+    ActivityTaskTimedOutEventAttributes, ActivityType, ActivityTypeConfiguration, ActivityTypeInfo,
     CancelTimerFailedEventAttributes, CancelWorkflowExecutionFailedEventAttributes,
     ChildWorkflowExecutionCanceledEventAttributes, ChildWorkflowExecutionCompletedEventAttributes,
     ChildWorkflowExecutionFailedEventAttributes, ChildWorkflowExecutionStartedEventAttributes,
@@ -132,6 +133,14 @@ pub const WORKFLOW_EXECUTION_TIMEOUT_START_TO_CLOSE: &str = "START_TO_CLOSE";
 /// duration of one second or more is honoured exactly.
 pub const MIN_OPEN_EXECUTION_SPAN: Duration = Duration::from_millis(500);
 
+/// The shortest span one task's own timeout is measured over, for the same reason a
+/// run's budget has one ([`MIN_OPEN_EXECUTION_SPAN`]): every SWF task duration is "an
+/// integer greater than or equal to 0", and a zero-second one would have the task time
+/// out in the instant it was scheduled or handed over, so no caller could see the task
+/// the scheduling decision recorded or the poll answered with. Every duration of one
+/// second or more is honoured exactly.
+pub const MIN_TASK_SPAN: Duration = MIN_OPEN_EXECUTION_SPAN;
+
 /// The `cause` a `WorkflowExecutionTerminated` event carries when the SERVICE closed
 /// the run because its history reached [`MAX_HISTORY_EVENTS_PER_EXECUTION`]. One of
 /// [`crate::ops::types::WORKFLOW_EXECUTION_TERMINATED_CAUSE_VALUES`].
@@ -144,24 +153,26 @@ pub const TERMINATED_CAUSE_EVENT_LIMIT_EXCEEDED: &str = "EVENT_LIMIT_EXCEEDED";
 /// history can take however many times a caller signals or polls it.
 pub const MAX_HISTORY_EVENTS_PER_EXECUTION: usize = 25_000;
 
-/// How many simultaneous `PollForDecisionTask` long polls one task list admits. The
-/// Amazon SWF Developer Guide's "Quotas on task executions" records a maximum of 1,000
-/// pollers per task list; a poll offered past it is answered with the modelled
-/// `LimitExceededFault` ("Returned by any operation if a system imposed limitation has
-/// been reached").
+/// How many simultaneous long polls one task list admits, whichever kind of task is
+/// polled for. The Amazon SWF Developer Guide's "Quotas on task executions" records a
+/// maximum of 1,000 pollers per task list; a poll offered past it is answered with the
+/// modelled `LimitExceededFault` ("Returned by any operation if a system imposed
+/// limitation has been reached").
 pub const MAX_POLLERS_PER_TASK_LIST: usize = 1_000;
 
-/// How long a decision-task long poll holds its answer open while its task list is
-/// empty. `PollForDecisionTask`'s own doc: "If no decision task is available in the
-/// specified task list before the timeout of 60 seconds expires, an empty result is
-/// returned."
-pub const DECISION_POLL_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a long poll holds its answer open while its task list is empty. Both polling
+/// operations document the same hold: `PollForDecisionTask`'s "If no decision task is
+/// available in the specified task list before the timeout of 60 seconds expires, an
+/// empty result is returned", and `PollForActivityTask`'s "The maximum time the service
+/// holds on to the request before responding is 60 seconds. If no task is available
+/// within 60 seconds, the poll returns an empty result."
+pub const POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How often an open decision-task long poll re-reads its task list. Emulator-chosen,
-/// and small enough that a task scheduled while a poll is waiting is handed over
-/// promptly ("responds as soon a task becomes available") without the pollers one list
-/// admits spinning on the state lock between them.
-pub const DECISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How often an open long poll re-reads its task list. Emulator-chosen, and small enough
+/// that a task scheduled while a poll is waiting is handed over promptly ("responds as
+/// soon as a task becomes available") without the pollers one list admits spinning on
+/// the state lock between them.
+pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The maximum `workflowExecutionRetentionPeriodInDays` RegisterDomain accepts. The
 /// member's own doc: "The maximum workflow execution retention period is 90 days."
@@ -233,6 +244,31 @@ pub const DECISION_TASK_TIMEOUT_START_TO_CLOSE: &str = "START_TO_CLOSE";
 /// timeout, the decision task will time out"). One of
 /// [`crate::ops::types::DECISION_TASK_TIMEOUT_TYPE_VALUES`].
 pub const DECISION_TASK_TIMEOUT_SCHEDULE_TO_START: &str = "SCHEDULE_TO_START";
+
+/// The `timeoutType` of an activity task that waited in its task list longer than its
+/// `scheduleToStartTimeout` ("The maximum amount of time the activity task can wait to
+/// be assigned to a worker."). One of
+/// [`crate::ops::types::ACTIVITY_TASK_TIMEOUT_TYPE_VALUES`].
+pub const ACTIVITY_TASK_TIMEOUT_SCHEDULE_TO_START: &str = "SCHEDULE_TO_START";
+
+/// The `timeoutType` of an activity task whose `scheduleToCloseTimeout` ran out before
+/// it closed ("The maximum amount of time for this activity task."), counted from the
+/// instant it was scheduled. One of
+/// [`crate::ops::types::ACTIVITY_TASK_TIMEOUT_TYPE_VALUES`].
+pub const ACTIVITY_TASK_TIMEOUT_SCHEDULE_TO_CLOSE: &str = "SCHEDULE_TO_CLOSE";
+
+/// The `timeoutType` of an activity task a worker was handed and did not close within
+/// its `startToCloseTimeout` ("The maximum amount of time a worker may take to process
+/// the activity task."). One of
+/// [`crate::ops::types::ACTIVITY_TASK_TIMEOUT_TYPE_VALUES`].
+pub const ACTIVITY_TASK_TIMEOUT_START_TO_CLOSE: &str = "START_TO_CLOSE";
+
+/// The `timeoutType` of an activity task whose worker stopped reporting progress:
+/// `heartbeatTimeout` is "The maximum time before which the worker processing this task
+/// must report progress by calling RecordActivityTaskHeartbeat. If the timeout is
+/// exceeded, the activity task is automatically timed out." One of
+/// [`crate::ops::types::ACTIVITY_TASK_TIMEOUT_TYPE_VALUES`].
+pub const ACTIVITY_TASK_TIMEOUT_HEARTBEAT: &str = "HEARTBEAT";
 
 /// The duration value every SWF timeout member accepts for "unlimited": `NONE`, as
 /// `startToCloseTimeout`'s own doc puts it ("You can use NONE to specify unlimited
@@ -475,6 +511,8 @@ pub enum EventAttributes {
     /// size of the other variants.
     ActivityTaskScheduled(Box<ActivityTaskScheduledEventAttributes>),
     ScheduleActivityTaskFailed(ScheduleActivityTaskFailedEventAttributes),
+    ActivityTaskStarted(ActivityTaskStartedEventAttributes),
+    ActivityTaskTimedOut(ActivityTaskTimedOutEventAttributes),
     ActivityTaskCancelRequested(ActivityTaskCancelRequestedEventAttributes),
     ActivityTaskCanceled(ActivityTaskCanceledEventAttributes),
     RequestCancelActivityTaskFailed(RequestCancelActivityTaskFailedEventAttributes),
@@ -563,6 +601,8 @@ impl EventAttributes {
             Self::DecisionTaskTimedOut(_) => "DecisionTaskTimedOut",
             Self::ActivityTaskScheduled(_) => "ActivityTaskScheduled",
             Self::ScheduleActivityTaskFailed(_) => "ScheduleActivityTaskFailed",
+            Self::ActivityTaskStarted(_) => "ActivityTaskStarted",
+            Self::ActivityTaskTimedOut(_) => "ActivityTaskTimedOut",
             Self::ActivityTaskCancelRequested(_) => "ActivityTaskCancelRequested",
             Self::ActivityTaskCanceled(_) => "ActivityTaskCanceled",
             Self::RequestCancelActivityTaskFailed(_) => "RequestCancelActivityTaskFailed",
@@ -636,6 +676,21 @@ impl EventAttributes {
             },
             Self::DecisionTaskCompleted(completed) => EventEffect {
                 decision_task_closed: Some(completed.started_event_id),
+                ..Default::default()
+            },
+            // A scheduled activity task waits in its task list until a worker is handed
+            // it, or it leaves the list without ever being handed over; both events name
+            // the task by its `scheduledEventId`.
+            Self::ActivityTaskStarted(started) => EventEffect {
+                activity_task_left_task_list: Some(started.scheduled_event_id),
+                ..Default::default()
+            },
+            // A task that timed out is over however far it had got — waiting in the list
+            // or already with a worker — and the decider has to see the timeout.
+            Self::ActivityTaskTimedOut(timed_out) => EventEffect {
+                activity_task_left_task_list: Some(timed_out.scheduled_event_id),
+                activity_task_closed: Some(timed_out.scheduled_event_id),
+                needs_decision: true,
                 ..Default::default()
             },
             // A scheduled activity task that is cancelled before a worker took it both
@@ -768,6 +823,12 @@ impl HistoryEventRecord {
             }
             EventAttributes::ScheduleActivityTaskFailed(attributes) => {
                 event.schedule_activity_task_failed_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::ActivityTaskStarted(attributes) => {
+                event.activity_task_started_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::ActivityTaskTimedOut(attributes) => {
+                event.activity_task_timed_out_event_attributes = Some(attributes.clone());
             }
             EventAttributes::ActivityTaskCancelRequested(attributes) => {
                 event.activity_task_cancel_requested_event_attributes = Some(attributes.clone());
@@ -1208,9 +1269,9 @@ pub struct Execution {
     pub open_child_executions: i32,
     pub open_lambda_functions: i32,
     pub latest_execution_context: Option<String>,
-    /// When an activity task of this run was last scheduled/started — what
-    /// `DescribeWorkflowExecution`'s `latestActivityTaskTimestamp` reports. Written by
-    /// the activity-task operations, which are tracked as their own gap issues.
+    /// When an activity task of this run was last scheduled or handed to a worker — what
+    /// `DescribeWorkflowExecution`'s `latestActivityTaskTimestamp` reports. Written by the
+    /// `ScheduleActivityTask` decision and by the poll that hands a task over.
     pub latest_activity_task_timestamp: Option<DateTime>,
     /// The run that started this one as a child, and the `eventId` of the
     /// `StartChildWorkflowExecutionInitiated` event that did — what
@@ -1319,14 +1380,7 @@ impl Execution {
             &self.effective_config.execution_start_to_close_timeout,
         )?)
         .max(MIN_OPEN_EXECUTION_SPAN);
-        let nanos =
-            u64::from(self.start_timestamp.subsec_nanos()) + u64::from(budget.subsec_nanos());
-        let seconds =
-            i64::try_from(budget.as_secs().checked_add(nanos / 1_000_000_000)?).ok()?;
-        Some(DateTime::from_secs_and_nanos(
-            self.start_timestamp.secs().checked_add(seconds)?,
-            u32::try_from(nanos % 1_000_000_000).ok()?,
-        ))
+        instant_after(self.start_timestamp, budget)
     }
 
     /// The instant at which the clock already owed this run a start-to-close timeout,
@@ -1410,6 +1464,28 @@ impl Execution {
     /// a run that scheduled activity tasks on more than one list contributes to each
     /// list separately.
     pub fn pending_activity_tasks_on(&self, task_list: &str) -> usize {
+        self.waiting_activity_tasks_on(task_list).len()
+    }
+
+    /// The activity tasks of this run still WAITING in `task_list`, as the
+    /// `ActivityTaskScheduled` events that put them there — the same record
+    /// [`Execution::pending_activity_tasks_on`] counts, in the order the events were
+    /// recorded.
+    pub fn waiting_activity_tasks_on(&self, task_list: &str) -> Vec<&HistoryEventRecord> {
+        self.waiting_activity_tasks()
+            .into_iter()
+            .filter(|event| match &event.attributes {
+                EventAttributes::ActivityTaskScheduled(scheduled) => {
+                    scheduled.task_list.name == task_list
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Every activity task of this run still waiting in a task list, whichever list that
+    /// is: the `ActivityTaskScheduled` events no later event has taken out of one.
+    pub fn waiting_activity_tasks(&self) -> Vec<&HistoryEventRecord> {
         let taken: HashSet<i64> = self
             .history
             .iter()
@@ -1417,13 +1493,11 @@ impl Execution {
             .collect();
         self.history
             .iter()
-            .filter(|event| match &event.attributes {
-                EventAttributes::ActivityTaskScheduled(scheduled) => {
-                    scheduled.task_list.name == task_list && !taken.contains(&event.event_id)
-                }
-                _ => false,
+            .filter(|event| {
+                matches!(event.attributes, EventAttributes::ActivityTaskScheduled(_))
+                    && !taken.contains(&event.event_id)
             })
-            .count()
+            .collect()
     }
 
     /// The decision tasks of this run still WAITING in `task_list`, as the
@@ -1484,17 +1558,173 @@ impl Execution {
     }
 
     /// Whether the activity task scheduled by `scheduled_event_id` has been handed to a
-    /// worker. No operation of this slice hands activity tasks out yet (the
-    /// activity-task operations are tracked by their own gap issues), so a scheduled
-    /// task is never started — which is why a cancel of one cancels it outright.
+    /// worker: its history holds the `ActivityTaskStarted` event a poll of its task list
+    /// records. A task no worker has been handed is cancelled outright, while one already
+    /// assigned is told through its heartbeat and reports back itself.
     pub fn activity_task_is_started(&self, scheduled_event_id: i64) -> bool {
-        self.history.iter().any(|event| {
-            event
-                .attributes
-                .effect()
-                .activity_task_left_task_list
-                .is_some_and(|scheduled| scheduled == scheduled_event_id)
+        self.history.iter().any(|event| match &event.attributes {
+            EventAttributes::ActivityTaskStarted(started) => {
+                started.scheduled_event_id == scheduled_event_id
+            }
+            _ => false,
         })
+    }
+
+    /// The activity tasks of this run a worker holds and that are still OUTSTANDING: one
+    /// `(scheduledEventId, startedEventId, startedAt)` per `ActivityTaskStarted` event
+    /// that no later event has closed the task of.
+    ///
+    /// The record is the stored history, so a token's liveness is a property of it rather
+    /// than of a second record that could disagree
+    /// ([`Execution::activity_task_is_outstanding`]).
+    pub fn outstanding_activity_tasks(&self) -> Vec<(i64, i64, DateTime)> {
+        let closed: HashSet<i64> = self
+            .history
+            .iter()
+            .filter_map(|event| event.attributes.effect().activity_task_closed)
+            .collect();
+        self.history
+            .iter()
+            .filter_map(|event| match &event.attributes {
+                EventAttributes::ActivityTaskStarted(started)
+                    if !closed.contains(&started.scheduled_event_id) =>
+                {
+                    Some((
+                        started.scheduled_event_id,
+                        event.event_id,
+                        event.event_timestamp,
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether the activity task recorded by `ActivityTaskStarted` event
+    /// `started_event_id` is still outstanding — what makes an activity task token a live
+    /// handle rather than a stale one.
+    pub fn activity_task_is_outstanding(&self, started_event_id: i64) -> bool {
+        self.outstanding_activity_tasks()
+            .iter()
+            .any(|(_, started, _)| *started == started_event_id)
+    }
+
+    /// The `ActivityTaskScheduled` attributes of the task scheduled by event
+    /// `scheduled_event_id`, when this run's history holds one.
+    pub fn scheduled_activity_task(
+        &self,
+        scheduled_event_id: i64,
+    ) -> Option<&ActivityTaskScheduledEventAttributes> {
+        self.history
+            .iter()
+            .filter(|event| event.event_id == scheduled_event_id)
+            .find_map(|event| match &event.attributes {
+                EventAttributes::ActivityTaskScheduled(scheduled) => Some(scheduled.as_ref()),
+                _ => None,
+            })
+    }
+
+    /// Record every activity-task timeout `now` has already made due, and return how many
+    /// were recorded.
+    ///
+    /// Each of the four modelled `ActivityTaskTimeoutType`s is the task's OWN duration,
+    /// resolved when it was scheduled, measured from the instant that duration started
+    /// running: `scheduleToStartTimeout` and `scheduleToCloseTimeout` from the
+    /// `ActivityTaskScheduled` event, `startToCloseTimeout` and `heartbeatTimeout` from
+    /// the `ActivityTaskStarted` event that handed the task to a worker — so a task is
+    /// timed out at the instant its earliest due deadline ran out, whether or not anybody
+    /// polls, and the `ActivityTaskTimedOut` event is stamped there. The decider is told
+    /// by the decision task that event schedules.
+    pub fn expire_due_activity_tasks(&mut self, now: DateTime) -> usize {
+        if !self.is_open() {
+            return 0;
+        }
+        let mut due: Vec<(DateTime, &'static str, i64, i64)> = Vec::new();
+        for event in self.waiting_activity_tasks() {
+            let Some(scheduled) = self.scheduled_activity_task(event.event_id) else {
+                continue;
+            };
+            // A task still in its list has not started, so only the two durations that
+            // run from the scheduling instant can have expired.
+            let deadlines = [
+                (
+                    ACTIVITY_TASK_TIMEOUT_SCHEDULE_TO_START,
+                    scheduled.schedule_to_start_timeout.as_deref(),
+                ),
+                (
+                    ACTIVITY_TASK_TIMEOUT_SCHEDULE_TO_CLOSE,
+                    scheduled.schedule_to_close_timeout.as_deref(),
+                ),
+            ];
+            if let Some((at, timeout_type)) = earliest_due(event.event_timestamp, &deadlines, now)
+            {
+                due.push((at, timeout_type, event.event_id, 0));
+            }
+        }
+        for (scheduled_event_id, started_event_id, started_at) in self.outstanding_activity_tasks()
+        {
+            let Some(scheduled) = self.scheduled_activity_task(scheduled_event_id) else {
+                continue;
+            };
+            let scheduled_at = self
+                .history
+                .iter()
+                .find(|event| event.event_id == scheduled_event_id)
+                .map_or(started_at, |event| event.event_timestamp);
+            // The schedule-to-close budget covers the whole task, so it keeps running
+            // after a worker takes it; the other two start when the worker does.
+            let from_schedule = [(
+                ACTIVITY_TASK_TIMEOUT_SCHEDULE_TO_CLOSE,
+                scheduled.schedule_to_close_timeout.as_deref(),
+            )];
+            let from_start = [
+                (
+                    ACTIVITY_TASK_TIMEOUT_START_TO_CLOSE,
+                    scheduled.start_to_close_timeout.as_deref(),
+                ),
+                (
+                    ACTIVITY_TASK_TIMEOUT_HEARTBEAT,
+                    scheduled.heartbeat_timeout.as_deref(),
+                ),
+            ];
+            let earliest = [
+                earliest_due(scheduled_at, &from_schedule, now),
+                earliest_due(started_at, &from_start, now),
+            ]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(at, _)| instant_key(*at));
+            if let Some((at, timeout_type)) = earliest {
+                due.push((at, timeout_type, scheduled_event_id, started_event_id));
+            }
+        }
+        due.sort_by_key(|(at, _, scheduled_event_id, _)| (instant_key(*at), *scheduled_event_id));
+
+        let recorded = due.len();
+        for (at, timeout_type, scheduled_event_id, started_event_id) in due {
+            // The timeout and the decision task telling the decider about it are two
+            // events, and a run with no room for them has reached the history quota: it
+            // is left for the writer that finds it to close rather than grown past the
+            // bound.
+            if !self.has_history_room_for(2) {
+                return recorded;
+            }
+            self.append_event(
+                at,
+                EventAttributes::ActivityTaskTimedOut(ActivityTaskTimedOutEventAttributes {
+                    timeout_type: timeout_type.to_string(),
+                    scheduled_event_id,
+                    started_event_id,
+                    // `details` carries "the content of the details parameter for the
+                    // last call made by the activity to RecordActivityTaskHeartbeat",
+                    // so a task whose worker reported no progress carries none.
+                    details: None,
+                }),
+            );
+            self.open_activity_tasks = self.open_activity_tasks.saturating_sub(1);
+            self.schedule_decision_task_if_idle(at);
+        }
+        recorded
     }
 
     /// The `startedEventId` of the timer of this run with `timer_id` that is still
@@ -1849,11 +2079,70 @@ fn deadline_after(from: DateTime, timeout: Option<&str>) -> Option<DateTime> {
     ))
 }
 
-/// One decision task waiting in a task list, as the dispatcher sees it: which run it
-/// belongs to, the `DecisionTaskScheduled` event that scheduled it, and what orders it
-/// against the other tasks waiting in the same list.
+/// The instant `span` after `from`, or `None` when that instant is not representable.
+fn instant_after(from: DateTime, span: Duration) -> Option<DateTime> {
+    let nanos = u64::from(from.subsec_nanos()) + u64::from(span.subsec_nanos());
+    let seconds = i64::try_from(span.as_secs().checked_add(nanos / 1_000_000_000)?).ok()?;
+    Some(DateTime::from_secs_and_nanos(
+        from.secs().checked_add(seconds)?,
+        u32::try_from(nanos % 1_000_000_000).ok()?,
+    ))
+}
+
+/// The earliest of `timeouts` that `now` has already made due, as `(the instant it ran
+/// out, the `timeoutType` that names it)`; `None` when none of them has.
+///
+/// Each entry is one `(timeoutType, duration)` pair measured from `from`, so the caller
+/// groups the durations by the instant they start running and this picks the one that
+/// expired first — a task times out ONCE, under the budget that ran out soonest.
+fn earliest_due(
+    from: DateTime,
+    timeouts: &[(&'static str, Option<&str>)],
+    now: DateTime,
+) -> Option<(DateTime, &'static str)> {
+    timeouts
+        .iter()
+        .filter_map(|(timeout_type, timeout)| {
+            let deadline = deadline_after(from, *timeout)?;
+            // A task whose own duration is the published lower bound of zero seconds
+            // would be over in the instant it began, so the span it is measured over is
+            // floored at [`MIN_TASK_SPAN`] — the same reason a run's budget has a floor.
+            let deadline = match instant_after(from, MIN_TASK_SPAN) {
+                Some(floor) if instant_key(floor) > instant_key(deadline) => floor,
+                _ => deadline,
+            };
+            (instant_key(deadline) <= instant_key(now)).then_some((deadline, *timeout_type))
+        })
+        .min_by_key(|(deadline, _)| instant_key(*deadline))
+}
+
+/// Which kind of task a task list holds, a poller waits for, and a task token is a
+/// handle on. SWF's two task kinds live in separate lists of the same domain and are
+/// polled, counted and answered by the same rules, so the few places that differ take
+/// this rather than each being written twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TaskKind {
+    Decision,
+    Activity,
+}
+
+impl TaskKind {
+    /// The tag that separates this kind in a derived task token, so a token minted for
+    /// one kind of task can never be a handle on the other.
+    fn token_tag(self) -> &'static str {
+        match self {
+            Self::Decision => "DecisionTask",
+            Self::Activity => "ActivityTask",
+        }
+    }
+}
+
+/// One task waiting in a task list, as the dispatcher sees it: which run it belongs to,
+/// the event that scheduled it, and what orders it against the other tasks waiting in
+/// the same list. Both kinds of task list dispatch the same way, so both polls read
+/// this.
 #[derive(Debug, Clone)]
-pub struct WaitingDecisionTask {
+pub struct WaitingTask {
     pub workflow_id: String,
     pub run_id: String,
     pub scheduled_event_id: i64,
@@ -1863,7 +2152,27 @@ pub struct WaitingDecisionTask {
     pub scheduled_at: (i64, u32),
 }
 
-impl WaitingDecisionTask {
+impl WaitingTask {
+    /// One waiting task read off the `*Scheduled` event that put it in its list, for the
+    /// run `execution`.
+    fn of(execution: &Execution, event: &HistoryEventRecord) -> Self {
+        Self {
+            workflow_id: execution.workflow_id.clone(),
+            run_id: execution.run_id.clone(),
+            scheduled_event_id: event.event_id,
+            priority: match &event.attributes {
+                EventAttributes::DecisionTaskScheduled(scheduled) => {
+                    task_priority(scheduled.task_priority.as_deref())
+                }
+                EventAttributes::ActivityTaskScheduled(scheduled) => {
+                    task_priority(scheduled.task_priority.as_deref())
+                }
+                _ => DEFAULT_TASK_PRIORITY,
+            },
+            scheduled_at: instant_key(event.event_timestamp),
+        }
+    }
+
     /// The order a poll hands the waiting tasks of one list out in: higher
     /// `taskPriority` first ("Higher numbers indicate higher priority"), then
     /// first-scheduled first. The run identity and the scheduling event id break a tie
@@ -1878,6 +2187,15 @@ impl WaitingDecisionTask {
             self.scheduled_event_id,
         )
     }
+}
+
+/// A task's `taskPriority` as the number it is dispatched by, defaulting to
+/// [`DEFAULT_TASK_PRIORITY`] when the task carries none or carries one this service
+/// cannot read as an integer.
+fn task_priority(priority: Option<&str>) -> i64 {
+    priority
+        .and_then(|priority| priority.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_TASK_PRIORITY)
 }
 
 /// One registered domain and everything scoped to it.
@@ -1906,12 +2224,12 @@ pub struct Domain {
     /// [`new_run_id`]. Strictly increasing and never reused, so no two runs of this
     /// domain can be given the same `runId`.
     pub next_run_sequence: u64,
-    /// Task-list name -> how many `PollForDecisionTask` long polls are open on that
-    /// list of this domain RIGHT NOW. A poll is counted while it holds its answer
-    /// open and uncounted the instant it ends, which is what
+    /// `(which kind of task, task-list name)` -> how many long polls of that kind are
+    /// open on that list of this domain RIGHT NOW. A poll is counted while it holds its
+    /// answer open and uncounted the instant it ends, which is what
     /// [`MAX_POLLERS_PER_TASK_LIST`] is enforced against; an entry drops out of the map
     /// when its last poller leaves, so the map holds only lists with live pollers.
-    pub decision_pollers: HashMap<String, usize>,
+    pub pollers: HashMap<(TaskKind, String), usize>,
 }
 
 impl Domain {
@@ -1929,7 +2247,7 @@ impl Domain {
             executions: HashMap::new(),
             open_by_workflow_id: HashMap::new(),
             next_run_sequence: 0,
-            decision_pollers: HashMap::new(),
+            pollers: HashMap::new(),
         }
     }
 
@@ -2026,33 +2344,37 @@ impl Domain {
     }
 
     /// The decision task a poll of `task_list` is handed: the one waiting task of this
-    /// domain's OPEN runs that comes first under
-    /// [`WaitingDecisionTask::dispatch_key`], or `None` when the list holds none.
-    pub fn next_decision_task_on(&self, task_list: &str) -> Option<WaitingDecisionTask> {
+    /// domain's OPEN runs that comes first under [`WaitingTask::dispatch_key`], or
+    /// `None` when the list holds none.
+    pub fn next_decision_task_on(&self, task_list: &str) -> Option<WaitingTask> {
+        self.next_task_on(task_list, Execution::waiting_decision_tasks_on)
+    }
+
+    /// The activity task a poll of `task_list` is handed, by the same rule and the same
+    /// dispatch order as [`Domain::next_decision_task_on`]: the one activity task of
+    /// this domain's OPEN runs waiting in that list that comes first under
+    /// [`WaitingTask::dispatch_key`], or `None` when the list holds none.
+    pub fn next_activity_task_on(&self, task_list: &str) -> Option<WaitingTask> {
+        self.next_task_on(task_list, Execution::waiting_activity_tasks_on)
+    }
+
+    /// The task a poll of `task_list` is handed out of the tasks `waiting` reports for
+    /// each OPEN run of this domain.
+    fn next_task_on(
+        &self,
+        task_list: &str,
+        waiting: for<'a> fn(&'a Execution, &str) -> Vec<&'a HistoryEventRecord>,
+    ) -> Option<WaitingTask> {
         self.executions
             .values()
             .filter(|execution| execution.is_open())
             .flat_map(|execution| {
-                execution
-                    .waiting_decision_tasks_on(task_list)
+                waiting(execution, task_list)
                     .into_iter()
-                    .map(|event| WaitingDecisionTask {
-                        workflow_id: execution.workflow_id.clone(),
-                        run_id: execution.run_id.clone(),
-                        scheduled_event_id: event.event_id,
-                        priority: match &event.attributes {
-                            EventAttributes::DecisionTaskScheduled(scheduled) => scheduled
-                                .task_priority
-                                .as_deref()
-                                .and_then(|priority| priority.parse::<i64>().ok())
-                                .unwrap_or(DEFAULT_TASK_PRIORITY),
-                            _ => DEFAULT_TASK_PRIORITY,
-                        },
-                        scheduled_at: instant_key(event.event_timestamp),
-                    })
+                    .map(|event| WaitingTask::of(execution, event))
                     .collect::<Vec<_>>()
             })
-            .min_by_key(WaitingDecisionTask::dispatch_key)
+            .min_by_key(WaitingTask::dispatch_key)
     }
 
     /// The `runId` a call naming `workflow_id` addresses: the one it gave, when a run
@@ -2087,6 +2409,10 @@ impl Domain {
             // A timer due only AFTER the run's own start-to-close deadline never fires:
             // by then the run is closed and its history takes nothing more.
             execution.fire_due_timers(close_due.unwrap_or(at));
+            // An activity task's own timeouts fall due the same way, and for the same
+            // reason are materialised before any caller reads the run: a task nobody
+            // took, or took and never closed, is timed out by the service itself.
+            execution.expire_due_activity_tasks(close_due.unwrap_or(at));
             if close_due.is_some() {
                 timed_out.push((execution.workflow_id.clone(), execution.run_id.clone()));
             }
@@ -2411,16 +2737,29 @@ impl Domain {
 
     /// How many decision-task long polls are open on `task_list` of this domain.
     pub fn open_decision_pollers(&self, task_list: &str) -> usize {
-        self.decision_pollers.get(task_list).copied().unwrap_or(0)
+        self.open_pollers(TaskKind::Decision, task_list)
     }
 
-    /// Count one more decision-task poller on `task_list`, or answer `false` when that
-    /// list already holds [`MAX_POLLERS_PER_TASK_LIST`] of them — the admission a
+    /// How many activity-task long polls are open on `task_list` of this domain.
+    pub fn open_activity_pollers(&self, task_list: &str) -> usize {
+        self.open_pollers(TaskKind::Activity, task_list)
+    }
+
+    /// How many long polls of `kind` are open on `task_list` of this domain.
+    pub fn open_pollers(&self, kind: TaskKind, task_list: &str) -> usize {
+        self.pollers
+            .get(&(kind, task_list.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Count one more poller of `kind` on `task_list`, or answer `false` when that list
+    /// already holds [`MAX_POLLERS_PER_TASK_LIST`] of them — the admission a
     /// `LimitExceededFault` refuses.
-    pub fn admit_decision_poller(&mut self, task_list: &str) -> bool {
+    pub fn admit_poller(&mut self, kind: TaskKind, task_list: &str) -> bool {
         let open = self
-            .decision_pollers
-            .entry(task_list.to_string())
+            .pollers
+            .entry((kind, task_list.to_string()))
             .or_insert(0);
         if *open >= MAX_POLLERS_PER_TASK_LIST {
             return false;
@@ -2429,12 +2768,13 @@ impl Domain {
         true
     }
 
-    /// Give back one decision-task poller slot on `task_list`.
-    pub fn release_decision_poller(&mut self, task_list: &str) {
-        if let Some(open) = self.decision_pollers.get_mut(task_list) {
+    /// Give back one poller slot of `kind` on `task_list`.
+    pub fn release_poller(&mut self, kind: TaskKind, task_list: &str) {
+        let key = (kind, task_list.to_string());
+        if let Some(open) = self.pollers.get_mut(&key) {
             *open = open.saturating_sub(1);
             if *open == 0 {
-                self.decision_pollers.remove(task_list);
+                self.pollers.remove(&key);
             }
         }
     }
@@ -2456,7 +2796,7 @@ impl Domain {
     }
 }
 
-/// The task-list admission one open `PollForDecisionTask` long poll holds.
+/// The task-list admission one open long poll holds.
 ///
 /// Dropping it releases the slot, so a poll that ends — with a task, with an empty
 /// result, or because the caller hung up and the handler's future was cancelled —
@@ -2465,47 +2805,52 @@ impl Domain {
 ///
 /// NEVER drop one while holding the state lock: the drop takes that same lock to give
 /// the slot back.
-pub struct DecisionPollerSlot {
+pub struct PollerSlot {
     state: ::engine::ServiceState<ComAmazonawsSwfSimpleworkflowserviceState>,
+    kind: TaskKind,
     domain: String,
     task_list: String,
 }
 
-impl DecisionPollerSlot {
-    /// Take one poller slot on `(domain, task_list)` through the already-held `guard`,
-    /// or answer `None` when that task list is at [`MAX_POLLERS_PER_TASK_LIST`].
+impl PollerSlot {
+    /// Take one poller slot of `kind` on `(domain, task_list)` through the already-held
+    /// `guard`, or answer `None` when that task list is at
+    /// [`MAX_POLLERS_PER_TASK_LIST`].
     pub fn admit(
         state: &::engine::ServiceState<ComAmazonawsSwfSimpleworkflowserviceState>,
         guard: &mut ComAmazonawsSwfSimpleworkflowserviceState,
+        kind: TaskKind,
         domain: &str,
         task_list: &str,
     ) -> Option<Self> {
         guard
             .domains
             .get_mut(domain)?
-            .admit_decision_poller(task_list)
+            .admit_poller(kind, task_list)
             .then(|| Self {
                 state: state.clone(),
+                kind,
                 domain: domain.to_string(),
                 task_list: task_list.to_string(),
             })
     }
 }
 
-impl ::std::fmt::Debug for DecisionPollerSlot {
+impl ::std::fmt::Debug for PollerSlot {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        f.debug_struct("DecisionPollerSlot")
+        f.debug_struct("PollerSlot")
+            .field("kind", &self.kind)
             .field("domain", &self.domain)
             .field("task_list", &self.task_list)
             .finish()
     }
 }
 
-impl Drop for DecisionPollerSlot {
+impl Drop for PollerSlot {
     fn drop(&mut self) {
         let mut guard = self.state.lock();
         if let Some(domain) = guard.domains.get_mut(&self.domain) {
-            domain.release_decision_poller(&self.task_list);
+            domain.release_poller(self.kind, &self.task_list);
         }
     }
 }
@@ -2688,7 +3033,38 @@ pub fn decision_task_token(
     run_id: &str,
     started_event_id: i64,
 ) -> String {
+    task_token(TaskKind::Decision, domain, workflow_id, run_id, started_event_id)
+}
+
+/// The opaque `taskToken` an `ActivityTask` carries: a handle on ONE activity task of
+/// one run, derived the same way as a decision task's
+/// ([`decision_task_token`]) from the `ActivityTaskStarted` event that handed the task
+/// to a worker, and whose liveness is likewise a property of the stored history
+/// ([`Execution::activity_task_is_outstanding`]).
+pub fn activity_task_token(
+    domain: &str,
+    workflow_id: &str,
+    run_id: &str,
+    started_event_id: i64,
+) -> String {
+    task_token(TaskKind::Activity, domain, workflow_id, run_id, started_event_id)
+}
+
+/// The token of one task of `kind`, over the identity that task has and nothing else.
+///
+/// The kind is part of the digest, so the handle on a decision task is never also a
+/// handle on an activity task: a responder that resolves a token of its own kind refuses
+/// the other kind's token instead of acting on the wrong task.
+fn task_token(
+    kind: TaskKind,
+    domain: &str,
+    workflow_id: &str,
+    run_id: &str,
+    started_event_id: i64,
+) -> String {
     let mut digest = Sha256::new();
+    digest.update(kind.token_tag().as_bytes());
+    digest.update([0u8]);
     digest.update(domain.as_bytes());
     digest.update([0u8]);
     digest.update(workflow_id.as_bytes());

@@ -273,9 +273,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            crate::state::DecisionPollerSlot::admit(
+            crate::state::PollerSlot::admit(
                 &state,
                 &mut guard,
+                crate::state::TaskKind::Decision,
                 &input.domain,
                 &input.task_list.name,
             )
@@ -297,7 +298,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // connection open and responds as soon a task becomes available. If no decision
         // task is available in the specified task list before the timeout of 60 seconds
         // expires, an empty result is returned."
-        let waiting_until = ::tokio::time::Instant::now() + crate::state::DECISION_POLL_TIMEOUT;
+        let waiting_until = ::tokio::time::Instant::now() + crate::state::POLL_TIMEOUT;
         loop {
             let answered = {
                 let mut guard = state.lock();
@@ -310,10 +311,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if now >= waiting_until {
                 return Ok(empty_decision_task());
             }
-            ::tokio::time::sleep_until(
-                (now + crate::state::DECISION_POLL_INTERVAL).min(waiting_until),
-            )
-            .await;
+            ::tokio::time::sleep_until((now + crate::state::POLL_INTERVAL).min(waiting_until))
+                .await;
         }
     }
 }

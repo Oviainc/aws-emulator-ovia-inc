@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PollForActivityTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PollForActivityTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PollForActivityTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Hands a worker the next activity task WAITING in the named domain's activity task
+//! list, and records that hand-over in the run's history as an `ActivityTaskStarted`
+//! event carrying the caller's `identity` — the member's own doc says that is where the
+//! identity is recorded, so this is a mutating operation by specification. The answer is
+//! computed from the stored history: the `ActivityTaskScheduled` event the task came
+//! from carries its `activityId`, its `activityType` and its `input`, the new event's id
+//! is the `startedEventId`, and the token is the handle on exactly that task.
+//!
+//! The call is the documented LONG POLL: "the service holds the HTTP connection open and
+//! responds as soon as a task becomes available", and only once the list has stayed empty
+//! for the documented timeout is the EMPTY result returned — "an ActivityTask is
+//! returned, but ... the value of taskToken is an empty string". An open poll is counted
+//! against its task list, which is what bounds the pollers one list admits.
 //!
 //! ## Shape of an operation
 //!
@@ -177,20 +182,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PollForActivityTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PollForActivityTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PollForActivityTask"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PollForActivityTaskErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A task list name obeys SWF's naming rule, which the model cannot express, so
+        // the boundary validator passes it and it is refused here as a bad request.
+        crate::state::validate_name("taskList.name", &input.task_list.name)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // One poller slot per OPEN long poll, released when this handler's future ends
+        // however it ends. Taking it is what bounds the pollers one task list admits;
+        // the state lock is given back before the wait below, so a waiting poll holds
+        // nothing but its slot.
+        let slot = {
+            let mut guard = state.lock();
+            if !guard.domains.contains_key(&input.domain) {
+                return Err(PollForActivityTaskErrorModeled::UnknownResourceFault(
+                    UnknownResourceFault {
+                        message: Some(format!("Unknown domain: {}", input.domain)),
+                    },
+                )
+                .into());
+            }
+            crate::state::PollerSlot::admit(
+                &state,
+                &mut guard,
+                crate::state::TaskKind::Activity,
+                &input.domain,
+                &input.task_list.name,
+            )
+        };
+        let _slot = slot.ok_or_else(|| {
+            // The Amazon SWF Developer Guide's "Quotas on task executions" caps the
+            // simultaneous pollers of one task list; past it a poll is refused with the
+            // modelled `LimitExceededFault` ("Returned by any operation if a system
+            // imposed limitation has been reached"), never with the permission fault.
+            PollForActivityTaskErrorModeled::LimitExceededFault(LimitExceededFault {
+                message: Some(format!(
+                    "a task list admits at most {} simultaneous pollers",
+                    crate::state::MAX_POLLERS_PER_TASK_LIST
+                )),
+            })
+        })?;
+
+        // "This initiates a long poll, where the service holds the HTTP connection open
+        // and responds as soon as a task becomes available. The maximum time the service
+        // holds on to the request before responding is 60 seconds. If no task is
+        // available within 60 seconds, the poll returns an empty result."
+        let waiting_until = ::tokio::time::Instant::now() + crate::state::POLL_TIMEOUT;
+        loop {
+            let answered = {
+                let mut guard = state.lock();
+                answer_poll(&mut guard, &input)?
+            };
+            if let Some(answer) = answered {
+                return Ok(answer);
+            }
+            let now = ::tokio::time::Instant::now();
+            if now >= waiting_until {
+                return Ok(empty_activity_task());
+            }
+            ::tokio::time::sleep_until((now + crate::state::POLL_INTERVAL).min(waiting_until))
+                .await;
+        }
+    }
+}
+
+/// One attempt at answering a poll out of the stored state.
+///
+/// `Ok(None)` means the polled task list holds no waiting task YET, which is what the
+/// long poll waits on; every other outcome is this operation's answer or its refusal.
+fn answer_poll(
+    guard: &mut crate::state::ComAmazonawsSwfSimpleworkflowserviceState,
+    input: &PollForActivityTaskInput,
+) -> Result<Option<PollForActivityTaskOutput>, PollForActivityTaskError> {
+    let now = crate::state::now();
+    // The service's own clock-owed moves, materialised before the list is read: a run the
+    // clock closed and an activity task whose own `scheduleToStartTimeout` ran out while
+    // it waited have no task left in any list. Scoped to the polled domain, which is the
+    // only one this answer reports on.
+    guard.materialise_due_timeouts_in(&input.domain, now);
+    // A task list lives inside a domain, so an unregistered domain name addresses no
+    // task list at all: the modelled `UnknownResourceFault`, the same answer every other
+    // domain-scoped operation of this service gives it. A DEPRECATED domain is still a
+    // known one — deprecation stops new starts, while the runs already in it keep handing
+    // out their activity tasks.
+    let Some(domain) = guard.domains.get_mut(&input.domain) else {
+        return Err(PollForActivityTaskErrorModeled::UnknownResourceFault(
+            UnknownResourceFault {
+                message: Some(format!("Unknown domain: {}", input.domain)),
+            },
+        )
+        .into());
+    };
+
+    let Some(waiting) = domain.next_activity_task_on(&input.task_list.name) else {
+        return Ok(None);
+    };
+    let key = (waiting.workflow_id.clone(), waiting.run_id.clone());
+    let Some(execution) = domain.executions.get_mut(&key) else {
+        return Err(PollForActivityTaskErrorModeled::UnknownResourceFault(
+            UnknownResourceFault {
+                message: Some(crate::state::unknown_execution_message(
+                    &waiting.workflow_id,
+                    &waiting.run_id,
+                )),
+            },
+        )
+        .into());
+    };
+    // Amazon SWF Quotas bounds one run's history, and a run that has reached that bound
+    // is terminated by the service rather than grown: it is closed here instead of being
+    // handed out, and this poll goes on waiting.
+    if !execution.has_history_room_for(1) {
+        domain.close_run(&key, crate::state::RunClose::event_limit_exceeded(), now);
+        return Ok(None);
+    }
+    // The task's own scheduling event is what this answer reports: the `activityId` it
+    // was scheduled under, its type and the `input` "provided when the activity task was
+    // scheduled" — never anything out of the polling request.
+    let Some(scheduled) = execution
+        .scheduled_activity_task(waiting.scheduled_event_id)
+        .cloned()
+    else {
+        return Err(PollForActivityTaskErrorModeled::OperationNotPermittedFault(
+            OperationNotPermittedFault {
+                message: Some("the activity task's scheduling event is unavailable".to_string()),
+            },
+        )
+        .into());
+    };
+    // Handing the task over IS the `ActivityTaskStarted` event: it names the task it
+    // started and carries the worker's identity, and its own id is the `startedEventId`
+    // this answer reports. Recording it takes the task out of the list, so a second poll
+    // of the same list cannot be handed the same task.
+    let started_event_id = execution.append_event(
+        now,
+        crate::state::EventAttributes::ActivityTaskStarted(ActivityTaskStartedEventAttributes {
+            identity: crate::state::non_empty(&input.identity),
+            scheduled_event_id: waiting.scheduled_event_id,
+        }),
+    );
+    // `latestActivityTaskTimestamp` is "The time when the last activity task was
+    // scheduled for this workflow execution", which this hand-over is the latest of.
+    execution.latest_activity_task_timestamp = Some(now);
+
+    Ok(Some(PollForActivityTaskOutput {
+        // The handle on THIS task: derived from the run and the started event, so it
+        // names the task the worker was just given and nothing else.
+        task_token: crate::state::activity_task_token(
+            &input.domain,
+            &execution.workflow_id,
+            &execution.run_id,
+            started_event_id,
+        ),
+        activity_id: scheduled.activity_id.clone(),
+        started_event_id,
+        workflow_execution: execution.execution(),
+        activity_type: scheduled.activity_type.clone(),
+        input: scheduled.input.clone(),
+    }))
+}
+
+/// The documented EMPTY result of a poll that found no waiting activity task: "An empty
+/// result, in this context, means that an ActivityTask is returned, but that the value of
+/// taskToken is an empty string".
+///
+/// Every other member of `ActivityTask` is modelled required, so each takes the value
+/// that says "no task": no `activityId` and no activity type, the event id its own
+/// modelled default of `0`, and an unset workflow execution. Nothing here comes from the
+/// request — an empty answer identifies no task, because no task was polled out of the
+/// list.
+fn empty_activity_task() -> PollForActivityTaskOutput {
+    PollForActivityTaskOutput {
+        task_token: String::new(),
+        activity_id: String::new(),
+        started_event_id: 0,
+        workflow_execution: WorkflowExecution::default(),
+        activity_type: ActivityType::default(),
+        input: None,
     }
 }

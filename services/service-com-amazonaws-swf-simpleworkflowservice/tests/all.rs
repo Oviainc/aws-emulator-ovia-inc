@@ -45,6 +45,8 @@ mod list_closed_workflow_executions;
 mod list_open_workflow_executions;
 #[path = "all/pending_activity_task_count.rs"]
 mod pending_activity_task_count;
+#[path = "all/poll_for_activity_task.rs"]
+mod poll_for_activity_task;
 #[path = "all/poll_for_decision_task.rs"]
 mod poll_for_decision_task;
 #[path = "all/request_cancel_workflow_execution.rs"]
