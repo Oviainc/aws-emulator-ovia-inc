@@ -165,6 +165,9 @@ pub mod metric_filters;
 /// filters.
 pub mod subscription_delivery;
 
+/// The AWS-vended log record formats a log group's transformer parses.
+pub mod log_transformer;
+
 /// The transformation a log group's transformer applies to an ingested log event.
 pub mod transformer;
 
@@ -6311,6 +6314,13 @@ pub struct SubscriptionFilterRecord {
     pub field_selection_criteria: Option<String>,
     pub emit_system_fields: Option<Vec<String>>,
     pub creation_time_ms: i64,
+    /// Whether this filter's destination REFUSED its last delivery
+    /// ([`subscription_delivery::deliver`]). A destination that answered a delivery with a
+    /// failure is not attempted again: the filter delivers nothing more until a
+    /// `PutSubscriptionFilter` re-validates it, which is what makes a destination that comes
+    /// back serve the batches written AFTER that put rather than replaying the ones written
+    /// while it was gone. Never reported: no operation models a filter's delivery health.
+    pub destination_unhealthy: bool,
 }
 
 /// One created log stream and its events.

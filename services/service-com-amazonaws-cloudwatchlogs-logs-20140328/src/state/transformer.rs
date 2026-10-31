@@ -27,11 +27,13 @@
 //!
 //! The processors applied here are the ones whose output is fixed by their own configuration
 //! and the event's content: the configurable parsers that structure a message (`parseJSON`,
-//! `parseKeyValue`, `csv`) and the mutate processors that move, rewrite and retype the
-//! fields a parser produced. The remaining kinds each need a published catalogue that is not
-//! in this model — a grok pattern library for `grok`, the per-source record layout of each
-//! AWS-vended log type for `parseCloudfront` / `parseRoute53` / `parsePostgres` / `parseVPC`
-//! / `parseWAF`, the OCSF event mapping for `parseToOCSF`, and the date-format syntax of
+//! `parseKeyValue`, `csv`), the vended parsers whose log type's record layout is PUBLISHED
+//! (`parseVPC`, which reads the VPC flow log record held in [`super::log_transformer`]), and
+//! the mutate processors that move, rewrite and retype the fields a parser produced. The
+//! remaining kinds each need a published catalogue that is not in this model and is not
+//! written down beside it — a grok pattern library for `grok`, the per-source record layout of
+//! the other AWS-vended log types for `parseCloudfront` / `parseRoute53` / `parsePostgres` /
+//! `parseWAF`, the OCSF event mapping for `parseToOCSF`, and the date-format syntax of
 //! `dateTimeConverter$matchPatterns` — so they leave the event as they found it rather than
 //! inventing fields nothing derived. They are still ACCEPTED by `PutTransformer`, which is
 //! what a client observes of them.
@@ -418,14 +420,15 @@ fn apply(event: &mut Event, processor: &Processor, substitutions: &[Option<::reg
         lower_case_string,
         move_keys,
         // The AWS-vended parsers each read one published record layout — the fields that log
-        // type carries, in order — which this model does not publish either.
+        // type carries, in order. The one this crate holds is the VPC flow log record
+        // ([`super::log_transformer`]); the others' layouts are not written down here.
         parse_cloudfront: _,
         parse_json,
         parse_key_value,
         parse_route53: _,
         parse_to_ocsf: _,
         parse_postgres: _,
-        parse_vpc: _,
+        parse_vpc,
         parse_waf: _,
         rename_keys,
         split_string,
@@ -434,6 +437,17 @@ fn apply(event: &mut Event, processor: &Processor, substitutions: &[Option<::reg
         type_converter,
         upper_case_string,
     } = processor;
+
+    // `parseVPC` converts "Amazon VPC vended logs" into "a JSON format", extracting the
+    // fields of a flow log record. It "always processes the entire log event message", and
+    // "No other value than `@message` is allowed for `source`", so the record it reads is the
+    // ingested message whatever the configuration names; it names no destination either, so
+    // the fields it extracts are placed at the root.
+    if parse_vpc.is_some() {
+        for (name, value) in super::log_transformer::vpc_flow_log_fields(event.message) {
+            event.write(name, value, true);
+        }
+    }
 
     // `parseJSON` "can extract JSON key-value pairs and place them under a destination that
     // you specify"; with no destination "it is placed under the root node", which is the

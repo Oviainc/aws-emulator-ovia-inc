@@ -9,7 +9,10 @@
 //! from it ([`crate::state::metric_filters`]) and the metrics an Embedded Metric Format
 //! message declares ([`crate::state::emf`]), is DELIVERED to the destination of every
 //! subscription filter of its log group whose `filterPattern` matches it
-//! ([`crate::state::subscription_delivery`]), and is evaluated against the Contributor
+//! ([`crate::state::subscription_delivery`]) — matched against, and delivered as, the
+//! TRANSFORMED version of the event ([`crate::state::transformer`]) for a filter that
+//! applies on transformed logs, with what each delivery forwarded or failed published as the
+//! service's own `AWS/Logs` metric data — and is evaluated against the Contributor
 //! Insights rules collecting from the log group
 //! (`service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::insight_rules`).
 //! This is the ONLY file to touch for this operation.
@@ -302,7 +305,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "you can subscribe to a real-time stream of log events ingested through
         // PutLogEvents and have them delivered to a specific destination"
         // (`PutSubscriptionFilter`).
-        crate::state::subscription_delivery::deliver(ctx, &region, deliveries).await;
+        crate::state::subscription_delivery::deliver(&*self.engine, ctx, &region, deliveries)
+            .await;
         Ok(output)
     }
 }

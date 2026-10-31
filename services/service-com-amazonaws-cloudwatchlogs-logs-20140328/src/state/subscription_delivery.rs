@@ -15,7 +15,10 @@
 //! The envelope carries each event's message as the filter is configured to see it: as it
 //! was INGESTED by default, and — for a filter put with `applyOnTransformedLogs` on a log
 //! group that has an active transformer — the version that transformer produced
-//! ([`super::transformer`]). A log group's
+//! ([`super::transformer`]), which is both what the filter's own `filterPattern` is run
+//! against and what the envelope carries, because it is the version the filter was applied
+//! to. The event the group STORED is untouched either way, so `GetLogEvents` reports the
+//! ingested bytes whether the group transforms or not. A log group's
 //! `kmsKeyId` names the key the group's own stored log data is encrypted with
 //! (`AssociateKmsKey`: "Associates the specified KMS key with either one log group in the
 //! account, or with all stored CloudWatch Logs query insights results in the account"); it
@@ -43,8 +46,16 @@
 //!
 //! Delivery is best effort, as it is for the real service: `PutLogEvents` "always
 //! accepted" the batch, and whether a destination took the envelope is not part of its
-//! answer, so a destination that refuses or does not exist is logged and the ingestion
-//! stands.
+//! answer, so a destination that refuses or does not exist leaves the ingestion standing.
+//! What it does answer with is TELEMETRY, the only place a client can observe the outcome of
+//! a delivery it did not make itself: the events a filter forwarded are counted as the
+//! service's own [`FORWARDED_LOG_EVENTS_METRIC`] and a destination that would not take an
+//! envelope as [`DELIVERY_ERRORS_METRIC`], both in [`super::emf::LOGS_NAMESPACE`] under the
+//! dimensions of the filter that owes the delivery ([`DELIVERY_DIMENSIONS`]), published into
+//! the same metric store `ListMetrics` and `GetMetricStatistics` read. A destination that
+//! refused is also marked on the filter, which stops attempting it until the next
+//! `PutSubscriptionFilter` re-validates it — so the events written during an outage stay
+//! readable in the log group and are never re-delivered once the destination returns.
 //!
 //! What one ingestion can cost is bounded by what the batch and the group already bound: a
 //! log group holds at most [`super::MAX_SUBSCRIPTION_FILTERS_PER_GROUP`] filters, so a
@@ -53,8 +64,10 @@
 //! ([`record_sized_chunks`]) — one request therefore makes a bounded number of bounded
 //! calls.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 
+use super::emf::{ExtractedDatapoint, DEFAULT_STORAGE_RESOLUTION, LOGS_NAMESPACE};
 use super::filter_pattern::FilterPattern;
 use super::{ComAmazonawsCloudwatchlogsLogs20140328State, StoredEvent};
 
@@ -92,16 +105,58 @@ const FIREHOSE_DELIVERY_STREAM: (&str, &str) = ("firehose", "deliverystream");
 const LAMBDA_FUNCTION: (&str, &str) = ("lambda", "function");
 const LOGS_DESTINATION: (&str, &str) = ("logs", "destination");
 
+/// The metric CloudWatch Logs publishes, in [`LOGS_NAMESPACE`], for the log events a
+/// subscription filter FORWARDED to its destination: the count of the events the filter's
+/// `filterPattern` selected out of the ingested batch, which is what tells a client its
+/// pattern is selecting what it intended without reading the destination.
+pub const FORWARDED_LOG_EVENTS_METRIC: &str = "ForwardedLogEvents";
+
+/// The metric it publishes, in [`LOGS_NAMESPACE`], for an envelope the filter's destination
+/// would not take: the one signal separating a destination that refused a delivery from a
+/// delivery that was never attempted.
+pub const DELIVERY_ERRORS_METRIC: &str = "DeliveryErrors";
+
+/// The dimension naming the KIND of destination an envelope was delivered to, which both
+/// metrics carry beside the log group ([`super::emf::LOG_GROUP_NAME_DIMENSION`]) and the
+/// filter ([`FILTER_NAME_DIMENSION`]).
+pub const DESTINATION_TYPE_DIMENSION: &str = "DestinationType";
+
+/// The dimension naming the subscription filter that owes the delivery, whose value is that
+/// filter's own `filterName`.
+pub const FILTER_NAME_DIMENSION: &str = "FilterName";
+
+/// The [`DESTINATION_TYPE_DIMENSION`] value of each destination kind, named by the service
+/// that serves the resource the envelope reaches — the three kinds a filter delivers to
+/// directly, a logical destination being resolved to one of them
+/// ([`physical_destination`]).
+const KINESIS_DESTINATION_TYPE: &str = "Kinesis";
+const FIREHOSE_DESTINATION_TYPE: &str = "Firehose";
+const LAMBDA_DESTINATION_TYPE: &str = "Lambda";
+
+/// The unit both delivery metrics' datapoints carry, from the `AWS/Logs` metric table: these
+/// are counts of events and of failures rather than measurements in a unit, so the unit is
+/// the `StandardUnit` value for no unit.
+const DELIVERY_METRIC_UNIT: &str = ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::UNIT_NONE;
+
 /// One envelope a batch of ingested events owes one subscription filter, resolved to the
 /// PHYSICAL destination it is delivered to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delivery {
-    /// The filter that selected the events, for the warning a failed delivery logs.
+    /// The log group the events were ingested into, which is one of the dimensions the
+    /// delivery's telemetry is published under.
+    pub log_group_name: String,
+    /// The filter that selected the events: the dimension naming it, and the warning a
+    /// failed delivery logs.
     pub filter_name: String,
     /// The ARN of the resource the envelope is delivered to: the filter's own
     /// `destinationArn`, or — for a logical destination — the `targetArn` that destination
     /// names.
     pub destination_arn: String,
+    /// The kind of destination that ARN names ([`DESTINATION_TYPE_DIMENSION`]).
+    pub destination_type: String,
+    /// How many ingested events this envelope carries, which is what a delivery that
+    /// succeeds counts as [`FORWARDED_LOG_EVENTS_METRIC`].
+    pub forwarded_log_events: usize,
     /// The key the envelope is placed under where the destination partitions what it is
     /// handed. `PutSubscriptionFilter$distribution`: "By default, log data is grouped by
     /// log stream, but the grouping can be set to random for a more even distribution",
@@ -110,6 +165,41 @@ pub struct Delivery {
     pub partition_key: String,
     /// The gzip-framed envelope.
     pub payload: Vec<u8>,
+}
+
+impl Delivery {
+    /// The dimension set this delivery's telemetry is published under: the log group, the
+    /// kind of destination and the filter's name — and nothing else, because `PolicyLevel`
+    /// is a dimension of an ACCOUNT-level subscription filter and a filter on one log group
+    /// has no policy level.
+    fn dimensions(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                super::emf::LOG_GROUP_NAME_DIMENSION.to_string(),
+                self.log_group_name.clone(),
+            ),
+            (
+                DESTINATION_TYPE_DIMENSION.to_string(),
+                self.destination_type.clone(),
+            ),
+            (FILTER_NAME_DIMENSION.to_string(), self.filter_name.clone()),
+        ])
+    }
+
+    /// One datapoint of `metric` for this delivery, at the instant the delivery was
+    /// attempted: the delivery metrics measure the forwarding, not the log event, so they
+    /// fall in the period the forwarding happened in.
+    fn datapoint(&self, metric: &str, value: f64, at_ms: i64) -> ExtractedDatapoint {
+        ExtractedDatapoint {
+            namespace: LOGS_NAMESPACE.to_string(),
+            metric_name: metric.to_string(),
+            dimensions: self.dimensions(),
+            timestamp_ms: at_ms,
+            value,
+            unit: Some(DELIVERY_METRIC_UNIT.to_string()),
+            storage_resolution: DEFAULT_STORAGE_RESOLUTION,
+        }
+    }
 }
 
 /// A delivered log event's id: 56 decimal digits ([`EVENT_ID_DIGITS`]) over the ingestion
@@ -124,7 +214,7 @@ pub fn event_id(event: &StoredEvent) -> String {
 }
 
 /// The subscription envelope for `events`, as the receiving service reads it.
-pub fn envelope(
+fn envelope(
     owner: &str,
     log_group_name: &str,
     log_stream_name: &str,
@@ -159,12 +249,14 @@ fn gzip(body: &str) -> Vec<u8> {
 }
 
 /// Every envelope the events `PutLogEvents` just stored on `log_stream_name` owe the
-/// subscription filters of `log_group_name`.
+/// subscription filters of `log_group_name`, ingested in `region`.
 ///
 /// Read under the store's own guard, so the filters a batch is fanned out through are the
 /// ones the group held when the batch arrived. A filter whose pattern matches none of the
-/// batch's events owes nothing, and neither does a filter whose destination resolves to
-/// nothing this emulator can deliver to.
+/// batch's events owes nothing; neither does a filter whose destination resolves to nothing
+/// this emulator can deliver to, nor one whose destination refused its last delivery and has
+/// not been re-validated by a `PutSubscriptionFilter` since
+/// ([`SubscriptionFilterRecord::destination_unhealthy`](super::SubscriptionFilterRecord)).
 pub fn deliveries(
     store: &ComAmazonawsCloudwatchlogsLogs20140328State,
     log_group_name: &str,
@@ -186,7 +278,7 @@ pub fn deliveries(
             group
                 .subscription_filters
                 .values()
-                .any(|filter| filter.apply_on_transformed_logs)
+                .any(|filter| filter.apply_on_transformed_logs && !filter.destination_unhealthy)
         })
         .map(|transformer| {
             let pipeline = super::transformer::Pipeline::of(&transformer.processors);
@@ -203,11 +295,16 @@ pub fn deliveries(
         });
     let mut deliveries = Vec::new();
     for filter in group.subscription_filters.values() {
+        if filter.destination_unhealthy {
+            continue;
+        }
         // A stored filter's pattern was parsed when the put configured it, so one that
         // does not parse here selects nothing rather than refusing the ingestion.
         let Ok(pattern) = FilterPattern::parse(&filter.filter_pattern) else {
             continue;
         };
+        // The version of the batch THIS filter sees. Its pattern is run against that version
+        // and the envelope carries it, because they are one reading of the event.
         let offered: &[StoredEvent] = match (filter.apply_on_transformed_logs, &transformed) {
             (true, Some(transformed)) => transformed,
             _ => events,
@@ -220,6 +317,9 @@ pub fn deliveries(
             continue;
         }
         let Some(destination_arn) = physical_destination(store, &filter.destination_arn) else {
+            continue;
+        };
+        let Some(destination_type) = destination_type(&destination_arn) else {
             continue;
         };
         for chunk in record_sized_chunks(&matched) {
@@ -241,8 +341,11 @@ pub fn deliveries(
                     .map_or_else(|| log_stream_name.to_string(), |event| event_id(event))
             };
             deliveries.push(Delivery {
+                log_group_name: log_group_name.to_string(),
                 filter_name: filter.filter_name.clone(),
                 destination_arn: destination_arn.clone(),
+                destination_type: destination_type.to_string(),
+                forwarded_log_events: chunk.len(),
                 partition_key,
                 payload: gzip(&body),
             });
@@ -306,7 +409,23 @@ fn is_deliverable(arn: &str) -> bool {
         })
 }
 
-/// Hand every envelope of `deliveries` to its destination.
+/// The kind of destination an ARN names, as the [`DESTINATION_TYPE_DIMENSION`] of the
+/// delivery's telemetry names it: the service that serves the resource the envelope reaches.
+/// `None` for an ARN of no kind a subscription filter delivers to.
+fn destination_type(arn: &str) -> Option<&'static str> {
+    let vendor = ::service_common::arn::parse(arn)?.vendor.to_string();
+    [
+        (KINESIS_STREAM.0, KINESIS_DESTINATION_TYPE),
+        (FIREHOSE_DELIVERY_STREAM.0, FIREHOSE_DESTINATION_TYPE),
+        (LAMBDA_FUNCTION.0, LAMBDA_DESTINATION_TYPE),
+    ]
+    .into_iter()
+    .find(|(named, _)| *named == vendor)
+    .map(|(_, kind)| kind)
+}
+
+/// Hand every envelope of `deliveries` to its destination, and publish what each delivery
+/// did.
 ///
 /// `fallback_region` is the Region the ingesting request was signed for, used only for a
 /// destination ARN that names no Region of its own.
@@ -315,7 +434,16 @@ fn is_deliverable(arn: &str) -> bool {
 /// clients below is used, and the Region label is held to the grammar a Region is written
 /// in ([`service_common::arn::region_label`]) before it is put in an endpoint, so no value
 /// a request carried can name a host. The transport is the in-process callback either way.
-pub async fn deliver(
+///
+/// The ingestion stands whatever the destinations answer — `PutLogEvents` already answered
+/// the batch — so the outcome is reported as the service's own telemetry instead: the events
+/// an accepted envelope carried count as [`FORWARDED_LOG_EVENTS_METRIC`], an envelope a
+/// destination would not take counts as [`DELIVERY_ERRORS_METRIC`], and the filter whose
+/// destination refused is marked so nothing is attempted against it until the next
+/// `PutSubscriptionFilter`. Both the metric store and the log store are reached with no
+/// guard held across any in-process call.
+pub async fn deliver<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     fallback_region: &str,
     deliveries: Vec<Delivery>,
@@ -323,12 +451,20 @@ pub async fn deliver(
     let fallback_region = ::service_common::arn::region_label(fallback_region)
         .unwrap_or(super::DEFAULT_REGION)
         .to_string();
+    let mut datapoints: Vec<ExtractedDatapoint> = Vec::with_capacity(deliveries.len());
+    let mut refused: Vec<(String, String)> = Vec::new();
     for delivery in deliveries {
         let Some(parsed) = ::service_common::arn::parse(&delivery.destination_arn) else {
             continue;
         };
         let vendor = parsed.vendor.to_string();
+        // The Region the destination is addressed in comes from the destination's own ARN,
+        // which a request carried, so it is held to the grammar a Region is written in before
+        // it reaches an endpoint — the same reading the fallback went through above. A value
+        // that is not a Region label addresses nothing, so the Region the ingesting request
+        // was signed for stands instead.
         let region = ::service_common::arn::region_of(&delivery.destination_arn, &vendor)
+            .and_then(::service_common::arn::region_label)
             .unwrap_or(&fallback_region)
             .to_string();
         let failure = if vendor == KINESIS_STREAM.0 {
@@ -340,16 +476,60 @@ pub async fn deliver(
         } else {
             Some("the destination names no kind a subscription filter delivers to".to_string())
         };
-        if let Some(failure) = failure {
-            // The ingestion stands either way: `PutLogEvents` answered the batch, so a
-            // destination that would not take the envelope is reported here rather than in
-            // that answer.
-            ::tracing::warn!(
-                filter_name = %delivery.filter_name,
-                destination_arn = %delivery.destination_arn,
-                error = %failure,
-                "a subscription filter's destination did not take the delivered log events"
-            );
+        let at_ms = super::now_ms();
+        match failure {
+            None => datapoints.push(delivery.datapoint(
+                FORWARDED_LOG_EVENTS_METRIC,
+                // The datapoint counts the events the filter's pattern selected and this
+                // envelope carried, not the events the batch wrote.
+                delivery.forwarded_log_events as f64,
+                at_ms,
+            )),
+            Some(failure) => {
+                // One envelope the destination would not take is one delivery error. The
+                // destination answering at all is its refusal, so the filter stops
+                // attempting it until a put re-validates it; the events it carried stay in
+                // the log group and are never re-delivered.
+                datapoints.push(delivery.datapoint(DELIVERY_ERRORS_METRIC, 1.0, at_ms));
+                refused.push((
+                    delivery.log_group_name.clone(),
+                    delivery.filter_name.clone(),
+                ));
+                ::tracing::warn!(
+                    filter_name = %delivery.filter_name,
+                    destination_arn = %delivery.destination_arn,
+                    error = %failure,
+                    "a subscription filter's destination did not take the delivered log events"
+                );
+            }
+        }
+    }
+    super::emf::publish(engine, &datapoints);
+    mark_destinations_unhealthy(engine, &refused);
+}
+
+/// Mark each named filter's destination as one that refused its last delivery, so
+/// [`deliveries`] attempts nothing against it until a `PutSubscriptionFilter` re-validates
+/// it. A filter deleted or re-put since the attempt is left alone: the mark belongs to the
+/// delivery that failed, not to whatever the group holds afterwards.
+fn mark_destinations_unhealthy<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    refused: &[(String, String)],
+) {
+    if refused.is_empty() {
+        return;
+    }
+    let Some(state) = super::service_state(engine) else {
+        return;
+    };
+    let mut store = state.lock();
+    for (log_group_name, filter_name) in refused {
+        if let Some(filter) = store
+            .log_groups
+            .get_mut(log_group_name)
+            .and_then(|group| group.subscription_filters.get_mut(filter_name))
+        {
+            filter.destination_unhealthy = true;
         }
     }
 }

@@ -41,15 +41,24 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    shard_id, ACTIVATION_DELAY, SHARD_ITERATOR_TYPE_TRIM_HORIZON,
+    shard_id, ACTIVATION_DELAY, DELETION_DELAY, SHARD_ITERATOR_TYPE_TRIM_HORIZON,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{base_ms, REGION};
 
-/// `X-Amz-Target` prefixes of the two services this suite drives.
+/// `X-Amz-Target` prefixes of the services this suite drives.
 pub(crate) const LOGS_TARGET_PREFIX: &str = "Logs_20140328";
 const KINESIS_TARGET_PREFIX: &str = "Kinesis_20131202";
+/// CloudWatch's prefix and the signing name its credential scope carries (`sigv4Name:
+/// monitoring`), for the suites that read what a delivery published as metric data.
+pub(crate) const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
+pub(crate) const CLOUDWATCH_SIGNING_NAME: &str = "monitoring";
+
+/// The awsJson wire each service speaks: CloudWatch Logs and Kinesis on 1.1, CloudWatch on
+/// 1.0.
+const JSON_1_1: &str = "application/x-amz-json-1.1";
+pub(crate) const JSON_1_0: &str = "application/x-amz-json-1.0";
 
 /// The `messageType` of an envelope that carries ingested log events.
 pub(crate) const DATA_MESSAGE: &str = "DATA_MESSAGE";
@@ -68,10 +77,17 @@ pub(crate) fn past_activation() -> Duration {
     ACTIVATION_DELAY + Duration::from_millis(400)
 }
 
-/// CloudWatch Logs and Kinesis on ONE shared engine, reached over the wire — the same
-/// assembly `core/router` performs, with two services mounted. The in-process callback a
-/// delivery travels over is the router's own, so a record that is not written by the
-/// Kinesis service cannot be read back here.
+/// How long a case waits before treating a deleted Kinesis stream as gone: past the instant
+/// its delete armed the removal for, after which the name is free again.
+pub(crate) fn past_deletion() -> Duration {
+    DELETION_DELAY + Duration::from_millis(400)
+}
+
+/// CloudWatch Logs, Kinesis and CloudWatch on ONE shared engine, reached over the wire —
+/// the same assembly `core/router` performs, with three services mounted. The in-process
+/// callback a delivery travels over is the router's own, so a record that is not written by
+/// the Kinesis service cannot be read back here, and a datapoint that is not published into
+/// CloudWatch's own metric store cannot be read back through CloudWatch.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
@@ -89,7 +105,14 @@ impl Emulator {
             )),
         );
         router.register_service(
-            service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(engine),
+            service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
+        );
+        router.register_service(
+            service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+                engine,
+            ),
         );
         Self { router }
     }
@@ -102,10 +125,24 @@ impl Emulator {
         operation: &str,
         body: &Value,
     ) -> (u16, Value) {
+        self.call_on_wire(service, prefix, JSON_1_1, operation, body)
+            .await
+    }
+
+    /// [`Emulator::call`] on the awsJson wire `content_type` names, for a service that does
+    /// not speak 1.1.
+    pub(crate) async fn call_on_wire(
+        &self,
+        service: &str,
+        prefix: &str,
+        content_type: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
-            .header("content-type", "application/x-amz-json-1.1")
+            .header("content-type", content_type)
             .header("x-amz-target", format!("{prefix}.{operation}"))
             .header(
                 "authorization",
@@ -131,6 +168,25 @@ impl Emulator {
     /// One CloudWatch Logs call that must succeed.
     pub(crate) async fn logs(&self, case: &str, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call("logs", LOGS_TARGET_PREFIX, operation, body).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: {operation} {body} must succeed, got {status} {parsed}"
+        );
+        parsed
+    }
+
+    /// One CloudWatch call that must succeed — CloudWatch speaks awsJson1_0 and signs under
+    /// its own name, which is the only difference from any other call here.
+    pub(crate) async fn cloudwatch(&self, case: &str, operation: &str, body: &Value) -> Value {
+        let (status, parsed) = self
+            .call_on_wire(
+                CLOUDWATCH_SIGNING_NAME,
+                CLOUDWATCH_TARGET_PREFIX,
+                JSON_1_0,
+                operation,
+                body,
+            )
+            .await;
         assert_eq!(
             status, 200,
             "case {case}: {operation} {body} must succeed, got {status} {parsed}"

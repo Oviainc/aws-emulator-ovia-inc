@@ -193,6 +193,8 @@ mod scratch_queries;
 mod state_roundtrip;
 #[path = "all/storage_tier_policy.rs"]
 mod storage_tier_policy;
+#[path = "all/subscription_delivery_telemetry.rs"]
+mod subscription_delivery_telemetry;
 #[path = "all/subscription_destination_plumbing.rs"]
 mod subscription_destination_plumbing;
 #[path = "all/subscription_fan_out.rs"]
@@ -205,6 +207,8 @@ mod subscription_filters;
 mod syslog_configurations;
 #[path = "all/transformed_log_filters.rs"]
 mod transformed_log_filters;
+#[path = "all/transformed_subscription_delivery.rs"]
+mod transformed_subscription_delivery;
 #[path = "all/transformers.rs"]
 mod transformers;
 #[path = "all/validation_message_rendering.rs"]

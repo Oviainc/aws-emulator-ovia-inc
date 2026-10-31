@@ -7,6 +7,9 @@
 //! that destination's access policy — the only thing that authorizes one
 //! ([`crate::state::subscription_destination_refusal`]) — and refused with
 //! `AccessDeniedException` when it grants this caller nothing.
+//! A put also RE-VALIDATES the filter's destination: a filter whose destination refused its
+//! last delivery ([`crate::state::subscription_delivery`]) is attempted again from the next
+//! ingested batch on, with no replay of the batches it missed.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -391,6 +394,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 field_selection_criteria: input.field_selection_criteria,
                 emit_system_fields: input.emit_system_fields,
                 creation_time_ms,
+                // This put IS the destination's re-validation: a filter whose destination
+                // refused a delivery before is attempted again from here on, which is how a
+                // client whose destination came back restores delivery through it.
+                destination_unhealthy: false,
             },
         );
 
