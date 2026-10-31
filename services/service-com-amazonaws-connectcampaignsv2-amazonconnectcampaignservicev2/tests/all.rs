@@ -103,6 +103,8 @@ mod instance_refusal_messages;
 mod integration_config_map_keys;
 #[path = "all/integration_identifier_precedes_lookup.rs"]
 mod integration_identifier_precedes_lookup;
+#[path = "all/integration_mutation_audit.rs"]
+mod integration_mutation_audit;
 #[path = "all/onboarding_job_deletion.rs"]
 mod onboarding_job_deletion;
 #[path = "all/outbound_batch_is_one_rule.rs"]
