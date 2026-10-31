@@ -188,19 +188,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "The specified tag is not valid. Key names cannot be prefixed with aws:."
-        // A system tag is AWS's to set and AWS's to remove.
-        if let Some(key) = input
+        // A key AWS reserves to itself is AWS's to set and AWS's to remove: the
+        // refusal is about who is asking, so it names neither the key nor the
+        // resource, and is worded in the one place this crate words it.
+        if input
             .tag_keys
             .iter()
-            .find(|key| crate::state::is_system_tag_key(key))
+            .any(|key| crate::state::is_system_tag_key(key))
         {
             return Err(UntagResourceErrorModeled::InvalidSystemTagUsageException(
                 InvalidSystemTagUsageException {
-                    message: Some(format!(
-                        "the tag key {key} is not valid: key names cannot be prefixed with {}",
-                        crate::state::SYSTEM_TAG_PREFIX
-                    )),
+                    message: Some(crate::state::SYSTEM_TAG_MUTATION_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -284,9 +282,9 @@ fn repository_name_of(resource_arn: &str) -> Result<&str, UntagResourceError> {
             crate::state::ResourceArnProblem::RepositoryName => {
                 UntagResourceErrorModeled::InvalidRepositoryNameException(
                     InvalidRepositoryNameException {
-                        message: Some(format!(
-                            "the repository name in the resource ARN {resource_arn} is not valid"
-                        )),
+                        // One code, one message: this crate words it in a single
+                        // place, and the ARN the caller sent is not echoed into it.
+                        message: Some(crate::state::INVALID_REPOSITORY_NAME_MESSAGE.to_string()),
                     },
                 )
             }

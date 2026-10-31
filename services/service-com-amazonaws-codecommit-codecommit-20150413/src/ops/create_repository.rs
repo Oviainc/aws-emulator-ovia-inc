@@ -193,29 +193,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // `repositoryName`'s length and pattern are modeled, so the boundary
-        // validator already refused anything outside them. What is left is the
-        // documented rule the model cannot express: "The suffix .git is prohibited."
-        if crate::state::has_prohibited_git_suffix(&input.repository_name) {
+        // validator already refused anything its own pattern engine reads as
+        // outside them. What is left is the rest of the naming rule, which
+        // `crate::state::is_repository_name` decides for every operation that
+        // takes a name: the ASCII character set an ECMA-262 `\w` stands for, and
+        // the documented "The suffix .git is prohibited."
+        if !crate::state::is_repository_name(&input.repository_name) {
             return Err(CreateRepositoryErrorModeled::InvalidRepositoryNameException(
                 InvalidRepositoryNameException {
-                    message: Some(format!(
-                        "the repository name {} is not valid: the suffix .git is prohibited",
-                        input.repository_name
-                    )),
+                    // One code, one message: the sentence group this crate words
+                    // this code with in a single place, which states the naming
+                    // rule in full and carries nothing from the request.
+                    message: Some(crate::state::INVALID_REPOSITORY_NAME_MESSAGE.to_string()),
                 },
             )
             .into());
         }
 
-        // "The specified tag is not valid. Key names cannot be prefixed with aws:."
+        // A key AWS reserves to itself is a well-formed key the CALLER may not
+        // set, so the refusal is the one this crate words once for every
+        // operation carrying a tag key, naming neither the key nor the resource.
         let tags: std::collections::BTreeMap<String, String> =
             input.tags.clone().unwrap_or_default().into_iter().collect();
-        if let Some(key) = tags.keys().find(|key| crate::state::is_system_tag_key(key)) {
+        if tags.keys().any(|key| crate::state::is_system_tag_key(key)) {
             return Err(CreateRepositoryErrorModeled::InvalidSystemTagUsageException(
                 InvalidSystemTagUsageException {
-                    message: Some(format!(
-                        "the tag key {key} is not valid: key names cannot be prefixed with aws:"
-                    )),
+                    message: Some(crate::state::SYSTEM_TAG_MUTATION_MESSAGE.to_string()),
                 },
             )
             .into());

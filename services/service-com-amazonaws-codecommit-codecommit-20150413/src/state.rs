@@ -385,9 +385,10 @@ pub fn is_tag_value(candidate: &str) -> bool {
     (TAG_VALUE_MIN_LENGTH..=TAG_VALUE_MAX_LENGTH).contains(&candidate.chars().count())
 }
 
-/// The tag key prefix AWS reserves for its own system tags. A request that sets
-/// or removes a key carrying it is refused with `InvalidSystemTagUsageException`:
-/// "The specified tag is not valid. Key names cannot be prefixed with aws:."
+/// The tag key prefix AWS reserves for its own system tags. A key carrying it is
+/// legal as a key but RESERVED to the service, so a request from an end-user
+/// caller that would set or remove one is refused with
+/// `InvalidSystemTagUsageException` and [`SYSTEM_TAG_MUTATION_MESSAGE`].
 pub const SYSTEM_TAG_PREFIX: &str = "aws:";
 
 /// Is this a tag key only AWS itself may set, i.e. one carrying
@@ -395,6 +396,20 @@ pub const SYSTEM_TAG_PREFIX: &str = "aws:";
 pub fn is_system_tag_key(key: &str) -> bool {
     key.starts_with(SYSTEM_TAG_PREFIX)
 }
+
+/// `InvalidSystemTagUsageException`'s message: what the service answers a caller
+/// that tries to set or remove a tag whose key is reserved to AWS itself.
+///
+/// The refusal is about WHO is asking rather than about the key's form — a key
+/// carrying [`SYSTEM_TAG_PREFIX`] is a well-formed key, and the caller simply is
+/// not the service — so the sentence states that and names neither the key nor the
+/// resource. It is not the error shape's documented sentence ("The specified tag is
+/// not valid. Key names cannot be prefixed with aws:."), which is prose about the
+/// class for a reader of the API reference. Worded here once for every operation
+/// that can carry a tag key, so none of them can report the same refusal as a
+/// malformed-key complaint or echo the requested key back into it.
+pub const SYSTEM_TAG_MUTATION_MESSAGE: &str =
+    "Caller is an end user and not allowed to mutate system tags";
 
 /// `RepositoryName`'s modelled `length` bounds
 /// (`smithy_query(query="shape",shape="RepositoryName")`).
@@ -420,6 +435,26 @@ pub fn is_repository_name(candidate: &str) -> bool {
         // repository can ever carry is not a valid repository name here either.
         && !has_prohibited_git_suffix(candidate)
 }
+
+/// `InvalidRepositoryNameException`'s message: the sentence group the service
+/// answers that code with, which states the naming rule IN FULL — the characters a
+/// name may combine, the length bounds [`REPOSITORY_NAME_MIN_LENGTH`] and
+/// [`REPOSITORY_NAME_MAX_LENGTH`] that `RepositoryName` publishes, and that names
+/// are case sensitive — and then where the limits are documented. FIXED text
+/// carrying no value from the request.
+///
+/// It is not the error shape's documented sentence ("A specified repository name is
+/// not valid."), which is prose about the class for a reader of the API reference:
+/// the service's own text is the only statement of the allowed character set and
+/// the bounds, so it is what lets a caller correct the name it sent. Worded here
+/// once for the request boundary (`crate::service::refusal_for`, which refuses the
+/// modelled `length` and `pattern`) and for every handler that raises the code for
+/// the part of the rule the model cannot express, so two operations cannot word it
+/// differently.
+pub const INVALID_REPOSITORY_NAME_MESSAGE: &str =
+    "The repository name is not valid. Repository names can be any valid combination of letters, \
+     numbers, periods, underscores, and dashes between 1 and 100 characters in length. Names are \
+     case sensitive. For more information, see Limits in the AWS CodeCommit User Guide.";
 
 /// Why a `resourceArn` cannot address a CodeCommit resource. Each variant is the
 /// modelled error the tagging operations answer for it.
@@ -3523,6 +3558,20 @@ pub fn pull_request_text_cannot_be_changed_message(status: &str) -> String {
 pub const PULL_REQUEST_APPROVAL_OVERRIDE_CANNOT_BE_CHANGED_MESSAGE: &str =
     "This pull request is already merged or closed. You cannot override the approval status of a \
      merged or closed pull request. Modify your request, and then try again.";
+
+/// `SourceAndDestinationAreSameException`'s message: the FIXED sentence pair the
+/// service answers that code with, covering BOTH conditions it is raised for —
+/// the two references naming the same branch, and two differently named branches
+/// whose tips are the same commit — and carrying nothing from the request.
+///
+/// It is not the error shape's documented sentence, which speaks only of the two
+/// branches being the same and so asserts something untrue of a request whose
+/// branches differ in name but not in tip. Worded here once for every operation
+/// that compares a source against a destination.
+pub const SOURCE_AND_DESTINATION_ARE_SAME_MESSAGE: &str =
+    "The source branch name and the destination branch name are either the same, or the tips of \
+     both branches are identical. Make sure that your source branch and destination branch have \
+     unique names and that the tips of the branches are different.";
 
 /// `TipOfSourceReferenceIsDifferentException`'s message: the sentences the model
 /// documents for the shape, echoing nothing from the request. Worded here once

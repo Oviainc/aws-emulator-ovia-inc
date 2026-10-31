@@ -159,6 +159,8 @@ mod pull_request_events;
 mod pull_request_identifier_refusals;
 #[path = "all/pull_request_listing.rs"]
 mod pull_request_listing;
+#[path = "all/pull_request_lookup_precedence.rs"]
+mod pull_request_lookup_precedence;
 #[path = "all/pull_request_override_state_read.rs"]
 mod pull_request_override_state_read;
 #[path = "all/pull_request_status_update.rs"]
@@ -179,6 +181,8 @@ mod repository_description;
 mod repository_encryption_key;
 #[path = "all/repository_lifecycle.rs"]
 mod repository_lifecycle;
+#[path = "all/repository_name_and_system_tag_message_text.rs"]
+mod repository_name_and_system_tag_message_text;
 #[path = "all/repository_rename.rs"]
 mod repository_rename;
 #[path = "all/repository_triggers.rs"]

@@ -183,24 +183,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "The specified tag is not valid. Key names cannot be prefixed with aws:."
-        // Keys are compared in sorted order so the same request always names the
-        // same offending key.
-        let tags: std::collections::BTreeMap<&String, &String> = input.tags.iter().collect();
-        if let Some(key) = tags
+        // A key AWS reserves to itself is a well-formed key the CALLER may not
+        // set: the refusal is about who is asking, so it names neither the key
+        // nor the resource, and is worded in the one place this crate words it.
+        if input
+            .tags
             .keys()
-            .find(|key| crate::state::is_system_tag_key(key))
+            .any(|key| crate::state::is_system_tag_key(key))
         {
             return Err(TagResourceErrorModeled::InvalidSystemTagUsageException(
                 InvalidSystemTagUsageException {
-                    message: Some(format!(
-                        "the tag key {key} is not valid: key names cannot be prefixed with {}",
-                        crate::state::SYSTEM_TAG_PREFIX
-                    )),
+                    message: Some(crate::state::SYSTEM_TAG_MUTATION_MESSAGE.to_string()),
                 },
             )
             .into());
         }
+
+        let tags: std::collections::BTreeMap<&String, &String> = input.tags.iter().collect();
 
         // Every key and value must satisfy `TagKey` / `TagValue`'s modelled
         // length; the boundary validator applies a `length` to the `tags` MEMBER
@@ -296,9 +295,9 @@ fn repository_name_of(resource_arn: &str) -> Result<&str, TagResourceError> {
             crate::state::ResourceArnProblem::RepositoryName => {
                 TagResourceErrorModeled::InvalidRepositoryNameException(
                     InvalidRepositoryNameException {
-                        message: Some(format!(
-                            "the repository name in the resource ARN {resource_arn} is not valid"
-                        )),
+                        // One code, one message: this crate words it in a single
+                        // place, and the ARN the caller sent is not echoed into it.
+                        message: Some(crate::state::INVALID_REPOSITORY_NAME_MESSAGE.to_string()),
                     },
                 )
             }

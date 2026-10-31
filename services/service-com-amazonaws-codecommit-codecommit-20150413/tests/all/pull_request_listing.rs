@@ -462,7 +462,11 @@ async fn a_listing_that_cannot_be_served_is_refused_with_the_modeled_error() {
             case: "a repository name outside the pattern the model publishes",
             body: json!({ "repositoryName": "not a name!" }),
             code: "InvalidRepositoryNameException",
-            message: "A specified repository name is not valid.".to_string(),
+            message: "The repository name is not valid. Repository names can be any valid \
+                      combination of letters, numbers, periods, underscores, and dashes between \
+                      1 and 100 characters in length. Names are case sensitive. For more \
+                      information, see Limits in the AWS CodeCommit User Guide."
+                .to_string(),
         },
         Refusal {
             case: "an author that is no ARN at all",

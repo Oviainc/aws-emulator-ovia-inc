@@ -218,7 +218,19 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ),
         (_, _) if member == "repositoryName" || leaf == "repositoryName" => (
             "InvalidRepositoryNameException",
-            "A specified repository name is not valid.",
+            crate::state::INVALID_REPOSITORY_NAME_MESSAGE,
+        ),
+        // `UpdateRepositoryName` addresses the repository in `oldName` and names
+        // the name it asks for in `newName`; both carry a `RepositoryName`, so
+        // both take the repository-name errors, exactly as the member called
+        // `repositoryName` does.
+        ("oldName" | "newName", _) if missing => (
+            "RepositoryNameRequiredException",
+            crate::state::REPOSITORY_NAME_REQUIRED_MESSAGE,
+        ),
+        ("oldName" | "newName", _) => (
+            "InvalidRepositoryNameException",
+            crate::state::INVALID_REPOSITORY_NAME_MESSAGE,
         ),
         ("repositoryNames", _) if missing => (
             "RepositoryNamesRequiredException",

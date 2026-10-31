@@ -421,7 +421,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreatePullRequestErrorModeled::InvalidRepositoryNameException(
                     InvalidRepositoryNameException {
-                        message: Some("A specified repository name is not valid.".to_string()),
+                        // One code, one message: the sentence group this crate
+                        // words this code with in a single place.
+                        message: Some(crate::state::INVALID_REPOSITORY_NAME_MESSAGE.to_string()),
                     },
                 )
                 .into(),
@@ -496,18 +498,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .clone()
                     .ok_or_else(reference_does_not_exist)?,
             };
-            // "The source branch and destination branch for the pull request are
-            // the same. You must specify different branches for the source and
-            // the destination."
+            // The two sides of the comparison must differ. The refusal is worded
+            // in the one place this crate words this code, covering both the
+            // same-name and the identical-tip condition.
             if source_branch == destination_branch {
                 return Err(
                     CreatePullRequestErrorModeled::SourceAndDestinationAreSameException(
                         SourceAndDestinationAreSameException {
                             message: Some(
-                                "The source branch and destination branch for the pull request are \
-                                 the same. You must specify different branches for the source and \
-                                 destination."
-                                    .to_string(),
+                                crate::state::SOURCE_AND_DESTINATION_ARE_SAME_MESSAGE.to_string(),
                             ),
                         },
                     )

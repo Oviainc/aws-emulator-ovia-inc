@@ -170,15 +170,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // Both names' modelled length and pattern are refused by the boundary
-        // validator before this handler runs. What is left is the documented rule
-        // the model cannot express: "The suffix .git is prohibited."
-        for (member, name) in [("oldName", &input.old_name), ("newName", &input.new_name)] {
-            if crate::state::has_prohibited_git_suffix(name) {
+        // validator before this handler runs. What is left is the rest of the
+        // naming rule, which `crate::state::is_repository_name` decides for every
+        // operation that takes a name: the ASCII character set an ECMA-262 `\w`
+        // stands for, and the documented "The suffix .git is prohibited."
+        for name in [&input.old_name, &input.new_name] {
+            if !crate::state::is_repository_name(name) {
                 return Err(UpdateRepositoryNameErrorModeled::InvalidRepositoryNameException(
                     InvalidRepositoryNameException {
-                        message: Some(format!(
-                            "the {member} {name} is not valid: the suffix .git is prohibited"
-                        )),
+                        // One code, one message: the sentence group this crate
+                        // words this code with in a single place, naming neither
+                        // the member at fault nor the name it carried.
+                        message: Some(crate::state::INVALID_REPOSITORY_NAME_MESSAGE.to_string()),
                     },
                 )
                 .into());

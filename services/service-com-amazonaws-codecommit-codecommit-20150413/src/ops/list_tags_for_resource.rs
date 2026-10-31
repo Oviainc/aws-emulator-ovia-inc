@@ -235,9 +235,9 @@ fn repository_name_of(resource_arn: &str) -> Result<&str, ListTagsForResourceErr
             crate::state::ResourceArnProblem::RepositoryName => {
                 ListTagsForResourceErrorModeled::InvalidRepositoryNameException(
                     InvalidRepositoryNameException {
-                        message: Some(format!(
-                            "the repository name in the resource ARN {resource_arn} is not valid"
-                        )),
+                        // One code, one message: this crate words it in a single
+                        // place, and the ARN the caller sent is not echoed into it.
+                        message: Some(crate::state::INVALID_REPOSITORY_NAME_MESSAGE.to_string()),
                     },
                 )
             }
