@@ -348,7 +348,7 @@ async fn an_id_naming_no_discoverer_is_refused_as_missing() {
             );
             assert_eq!(
                 answer.str_at("Message"),
-                format!("Discoverer with ID {absent} does not exist."),
+                format!("Discoverer {absent} does not exist."),
                 "case {row}: the refusal names the discoverer the request asked for, \
                  got {:?}",
                 answer.body

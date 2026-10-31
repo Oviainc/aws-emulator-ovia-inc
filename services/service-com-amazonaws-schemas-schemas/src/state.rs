@@ -29,13 +29,11 @@ pub struct ComAmazonawsSchemasSchemasState {
     /// Source of resource-policy revision ids, so every revision this process mints
     /// is distinct. See [`ComAmazonawsSchemasSchemasState::mint_policy_revision_id`].
     pub next_policy_revision_seq: u64,
-    /// Discoverers by `DiscovererId`, as `CreateDiscoverer` minted them. A discoverer
-    /// belongs to no registry — it is keyed by the id the service minted for it, which
-    /// is what every other discoverer operation names it by.
+    /// Discoverers by `DiscovererId`, as `CreateDiscoverer` derived it from the source
+    /// they subscribe to ([`discoverer_id_for_source`]). A discoverer belongs to no
+    /// registry — it is keyed by that id, which is what every other discoverer
+    /// operation names it by.
     pub discoverers: BTreeMap<String, Discoverer>,
-    /// Source of the ids `CreateDiscoverer` mints. See
-    /// [`ComAmazonawsSchemasSchemasState::mint_discoverer_id`].
-    pub next_discoverer_seq: u64,
 }
 
 impl ComAmazonawsSchemasSchemasState {
@@ -52,33 +50,6 @@ impl ComAmazonawsSchemasSchemasState {
         self.next_policy_revision_seq = self.next_policy_revision_seq.saturating_add(1);
         let seq = self.next_policy_revision_seq;
         format!("{:08x}-0000-4000-8000-{seq:012x}", seq & 0xffff_ffff)
-    }
-
-    /// Mint the id of a new discoverer.
-    ///
-    /// `DiscovererId` is modelled as a plain `__string` with no pattern, so its form
-    /// is the service's: an OPAQUE, server-minted identifier a caller can only read
-    /// back, rendered here as 32 lower-case hex digits. It is a digest of this store's
-    /// discoverer counter, so no two discoverers of a process ever share one and a
-    /// deleted id is never minted again, and the counter is not readable from the id.
-    pub fn mint_discoverer_id(&mut self) -> String {
-        self.next_discoverer_seq = self.next_discoverer_seq.saturating_add(1);
-        let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(
-            [b"schemas-discoverer".as_slice(), &self.next_discoverer_seq.to_be_bytes()].concat(),
-        );
-        ::hex::encode(&digest[..16])
-    }
-
-    /// The discoverer this store holds for `source_arn`, if it holds one.
-    ///
-    /// A discoverer is the service's subscription to ONE event source, so the source
-    /// ARN identifies it as surely as its minted id does: this is what makes a second
-    /// `CreateDiscoverer` for the same source a conflict rather than a second
-    /// subscription.
-    pub fn discoverer_for_source(&self, source_arn: &str) -> Option<&Discoverer> {
-        self.discoverers
-            .values()
-            .find(|discoverer| discoverer.source_arn == source_arn)
     }
 
     /// The tags this store holds for the resource a `ResourceArn` names, as the
@@ -340,7 +311,6 @@ impl Default for ComAmazonawsSchemasSchemasState {
             next_policy_revision_seq: 0,
             // No discoverer exists until a caller creates one: AWS seeds none.
             discoverers: BTreeMap::new(),
-            next_discoverer_seq: 0,
         }
     }
 }
@@ -427,9 +397,9 @@ impl DiscovererState {
 /// operation reads and writes it.
 #[derive(Debug, Clone)]
 pub struct Discoverer {
-    /// The id the service minted for this discoverer
-    /// ([`ComAmazonawsSchemasSchemasState::mint_discoverer_id`]); the key it is stored
-    /// under and the only name a caller has for it.
+    /// The id the service gave this discoverer, derived from the source it subscribes
+    /// to ([`discoverer_id_for_source`]); the key it is stored under and the name every
+    /// id-addressed discoverer operation reaches it by.
     pub id: String,
     /// `arn:aws:schemas:<region>:<account>:discoverer/<id>`, minted at create time.
     pub arn: String,
@@ -3476,6 +3446,39 @@ pub fn schema_arn(region: &str, registry: &str, schema: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("schema/{registry}/{schema}"))
 }
 
+/// The `DiscovererId` this service gives the discoverer of `source_arn`: the source
+/// ARN's service namespace followed by the resource it names, with every separator
+/// inside the resource rendered as `-`.
+///
+/// A discoverer IS the subscription to ONE event source, so its id is DERIVED from that
+/// source rather than drawn from a counter or a digest: a caller can compute the id of
+/// the discoverer it asked for from the source alone, the id carries which source it
+/// discovers, and re-creating a discoverer for a source gets the same id back whatever
+/// else the store has been asked for in between.
+///
+/// `DiscovererId` is modelled as a plain `__string` with no pattern, so nothing in the
+/// model constrains the rendering; what constrains it is that the id must identify the
+/// source. A value with no ARN fields to read carries no source to derive from — a
+/// create refuses such a `SourceArn` on its form ([`source_arn_not_an_arn`]) before
+/// this is reached — so the fallback is the whole value, rendered the same way, which
+/// keeps the mapping total.
+///
+/// Collapsing the separators is not injective: two sources whose resources differ only
+/// in which separator they use derive the same id. The create resolves that by looking
+/// the derived id up in the store, so the second such source is refused as a resource
+/// that already exists rather than overwriting the first.
+pub fn discoverer_id_for_source(source_arn: &str) -> String {
+    let mut fields = source_arn.splitn(6, ':');
+    // Fields 0..=5 of an ARN are `arn`, the partition, the service, the region, the
+    // account and the resource: the id is built from the service (field 2) and the
+    // resource (field 5), which are what say WHICH source this is.
+    let derived = match (fields.nth(2), fields.nth(2)) {
+        (Some(service), Some(resource)) => format!("{service}:{resource}"),
+        _ => source_arn.to_string(),
+    };
+    derived.replace(['/', ':'], "-")
+}
+
 /// `arn:aws:schemas:<region>:<account>:discoverer/<id>`.
 pub fn discoverer_arn(region: &str, discoverer_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("discoverer/{discoverer_id}"))
@@ -4245,25 +4248,24 @@ pub fn registry_already_exists(registry: &str) -> ConflictException {
 }
 
 /// Message for a discoverer this store does not hold, named by the request's
-/// `DiscovererId`. The sentence is the service's own template for a missing resource —
-/// "«Resource» with «identifier» «value» does not exist.", as [`registry_not_found`]
-/// carries it.
+/// `DiscovererId`.
+///
+/// A discoverer is refused by its id ALONE — the sentence is "Discoverer «id» does not
+/// exist.", not the "«Resource» with «identifier» «value»" template
+/// [`registry_not_found`] and [`schema_not_found`] carry — because the id is the whole
+/// of what a discoverer operation names.
 pub fn discoverer_not_found(discoverer_id: &str) -> NotFoundException {
-    not_found(format!(
-        "Discoverer with ID {discoverer_id} does not exist."
-    ))
+    not_found(format!("Discoverer {discoverer_id} does not exist."))
 }
 
 /// Refuse a `CreateDiscoverer` for a source this store already discovers.
 ///
 /// A discoverer IS the subscription to one event source, so a second one for the same
-/// source is the same resource asked for twice. Built from the request's `SourceArn`,
-/// as the other already-exists sentences are built from the member that identifies the
-/// resource.
-pub fn discoverer_already_exists(source_arn: &str) -> ConflictException {
-    already_exists(format!(
-        "Discoverer for source {source_arn} already exists."
-    ))
+/// source is the same resource asked for twice. Built from the `DiscovererId` of the
+/// discoverer the store already holds, so a caller that parses the sentence gets the
+/// handle it needs to describe or reuse the colliding resource.
+pub fn discoverer_already_exists(discoverer_id: &str) -> ConflictException {
+    already_exists(format!("Discoverer {discoverer_id} already exists."))
 }
 
 /// Refuse a `SourceArn` that is not an ARN.

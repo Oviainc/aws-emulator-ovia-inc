@@ -24,6 +24,7 @@ use service_com_amazonaws_schemas_schemas::state::{
     CODE_MALFORMED_REQUEST, CODE_RESOURCE_ALREADY_EXIST, CODE_RESOURCE_NOT_FOUND,
 };
 
+use crate::discoverer_id_derivation::expected_discoverer_id;
 use crate::registry_schema_lifecycle::{Answer, Emulator, ACCOUNT, REGION};
 
 /// `CreateDiscoverer`'s route (`POST /v1/discoverers -> 201`).
@@ -380,9 +381,9 @@ fn create_cases() -> Vec<CreateCase> {
 }
 
 /// RULE: a create answers from the resource it stored, so every member of the created
-/// discoverer reads back unchanged through `DescribeDiscoverer`; the id and the ARN are
-/// minted by the service (never taken from the request), and a created discoverer is
-/// `STARTED`.
+/// discoverer reads back unchanged through `DescribeDiscoverer`; the id is the one the
+/// source the request named derives, the ARN is this service's own for that id, and a
+/// created discoverer is `STARTED`.
 #[tokio::test]
 async fn a_created_discoverer_reads_back_exactly_as_it_was_stored() {
     let emulator = Emulator::new();
@@ -399,9 +400,11 @@ async fn a_created_discoverer_reads_back_exactly_as_it_was_stored() {
         );
 
         let discoverer_id = created.str_at("DiscovererId");
-        assert!(
-            discoverer_id.len() == 32 && discoverer_id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-            "case {:?}: the service mints an opaque id, got {discoverer_id:?}",
+        assert_eq!(
+            discoverer_id,
+            expected_discoverer_id(&case.source_arn),
+            "case {:?}: the id is derived from the source the request named, got \
+             {discoverer_id:?}",
             case.case
         );
         assert!(

@@ -404,14 +404,18 @@ async fn each_prefix_member_selects_exactly_the_entries_that_start_with_it() {
                 .collect(),
         },
         PrefixCase {
-            case: "half of one id".to_string(),
-            query: format!("discovererIdPrefix={}", &first[..16]),
+            // All but the last character of one derived id: among these three sources
+            // only that one id starts with it, so a shorter-than-whole prefix still
+            // selects exactly one entry.
+            case: "all but the last character of one id".to_string(),
+            query: format!("discovererIdPrefix={}", &first[..first.len() - 1]),
             expected: vec![first.clone()],
         },
         PrefixCase {
-            // A minted id is 32 lower-case hex digits, so no stored id starts with
-            // this: `tests/all/discoverer_state.rs` pins the form.
-            case: "an id prefix no minted id can start with".to_string(),
+            // Every id a source derives begins with that source's service namespace
+            // (`crate::discoverer_id_derivation` pins the derivation), so no stored id
+            // starts with this.
+            case: "an id prefix no stored id can start with".to_string(),
             query: "discovererIdPrefix=zz".to_string(),
             expected: Vec::new(),
         },
@@ -505,17 +509,20 @@ async fn following_next_token_walks_the_listing_exactly_once() {
             );
         }
 
-        // The same invariant over a SELECTED listing: a prefix that keeps a subset.
+        // The same invariant over a SELECTED listing: a prefix of one stored id, which
+        // keeps a subset of the listing (the empty store selects everything it holds,
+        // which is nothing).
+        let prefix = expected.first().cloned().unwrap_or_default();
         let selected: Vec<String> = expected
             .iter()
-            .filter(|id| id.starts_with('a'))
+            .filter(|id| id.starts_with(&prefix))
             .cloned()
             .collect();
         for limit in [None, Some(1), Some(3)] {
-            let case = format!("total={total} limit={limit:?} prefix=a");
+            let case = format!("total={total} limit={limit:?} prefix={prefix:?}");
             let walked = walk(
                 &emulator,
-                &format!("{LIST_URI}?discovererIdPrefix=a"),
+                &format!("{LIST_URI}?discovererIdPrefix={prefix}"),
                 limit,
                 discoverer_ids,
             )

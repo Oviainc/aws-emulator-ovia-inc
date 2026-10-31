@@ -3,7 +3,8 @@
 //! @op CreateDiscoverer
 //!
 //! Mints a discoverer for one event source in this service's store and answers from the
-//! stored value. A discoverer is the service's subscription to ONE source, so a second
+//! stored value. A discoverer is the service's subscription to ONE source, so its id is
+//! derived from that source (`crate::state::discoverer_id_for_source`) and a second
 //! create for a source the store already discovers is a conflict rather than a second
 //! subscription, and a created discoverer is `STARTED`: it discovers from the moment it
 //! exists, until `StopDiscoverer` pauses it.
@@ -172,11 +173,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The id is DERIVED from the source this discoverer subscribes to, so the same
+        // source always names the same discoverer. See
+        // `crate::state::discoverer_id_for_source`.
+        let discoverer_id = crate::state::discoverer_id_for_source(&input.source_arn);
+
         // One discoverer per source: the source identifies the subscription, so asking
-        // for it twice names a resource that already exists.
-        if state.discoverer_for_source(&input.source_arn).is_some() {
+        // for it twice names a resource that already exists — and the refusal names the
+        // id of the discoverer the store already holds for it.
+        if let Some(existing) = state.discoverers.get(&discoverer_id) {
             return Err(CreateDiscovererErrorModeled::ConflictException(
-                crate::state::discoverer_already_exists(&input.source_arn),
+                crate::state::discoverer_already_exists(&existing.id),
             )
             .into());
         }
@@ -191,9 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Minted only once every refusal above has been answered, so a refused request
-        // consumes no id.
-        let discoverer_id = state.mint_discoverer_id();
+        // Stored only once every refusal above has been answered, so a refused request
+        // writes nothing.
         let discoverer = crate::state::Discoverer {
             arn: crate::state::discoverer_arn(&region, &discoverer_id),
             id: discoverer_id.clone(),

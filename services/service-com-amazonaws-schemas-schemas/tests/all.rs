@@ -33,6 +33,8 @@ mod describe_discoverer;
 mod discovered_schema_inference;
 #[path = "all/discoverer_deletion.rs"]
 mod discoverer_deletion;
+#[path = "all/discoverer_id_derivation.rs"]
+mod discoverer_id_derivation;
 #[path = "all/discoverer_state.rs"]
 mod discoverer_state;
 #[path = "all/draft4_openapi_vocabulary.rs"]

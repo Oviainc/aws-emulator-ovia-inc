@@ -260,8 +260,8 @@ async fn a_delete_removes_the_whole_discoverer_and_frees_its_source() {
         }
 
         // The source is undiscovered again, so the very create that was a conflict
-        // while the discoverer existed now succeeds — with a NEW id, never the freed
-        // one.
+        // while the discoverer existed now succeeds — and because the id is derived
+        // from the source, it comes back under the SAME id.
         let again = emulator
             .call("POST", DISCOVERERS_URI, Some(case.body()))
             .await;
@@ -271,14 +271,10 @@ async fn a_delete_removes_the_whole_discoverer_and_frees_its_source() {
             case.case, again.status, again.body
         );
         let new_id = again.str_at("DiscovererId");
-        assert_ne!(
+        assert_eq!(
             new_id, discoverer_id,
-            "case {:?}: a deleted id is never minted again, got {new_id:?}",
-            case.case
-        );
-        assert!(
-            minted.insert(new_id.clone()),
-            "case {:?}: no two discoverers share an id, got {new_id:?}",
+            "case {:?}: the id a source derives does not change across a delete and a \
+             re-create, got {new_id:?}",
             case.case
         );
         assert_eq!(
@@ -387,10 +383,9 @@ async fn an_id_this_store_holds_no_discoverer_for_deletes_nothing() {
     let before = emulator.call("GET", &discoverer_uri(&existing), None).await;
 
     // Rows: ids of every shape a caller can send — a well-formed id nothing minted, a
-    // value that is not of the minted form at all, and the existing id perturbed. The
-    // last row replaces the existing id's first character with a letter OUTSIDE the hex
-    // alphabet the service mints ids from, so it differs from that id whatever digits
-    // the digest produced.
+    // value that is not of the derived form at all, and the existing id perturbed. The
+    // last row replaces the existing id's first character, so it differs from that id
+    // whatever the source derived.
     for absent in [
         "0".repeat(32),
         "ffffffffffffffffffffffffffffffff".to_string(),

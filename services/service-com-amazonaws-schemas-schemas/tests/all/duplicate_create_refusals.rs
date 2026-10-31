@@ -4,8 +4,8 @@
 //!
 //! RULE: a create whose requested resource is already there is refused as a CONFLICT —
 //! this service's conflict shape, HTTP 409 — under the already-exists condition code
-//! and the service's already-exists sentence built from the identifier the request
-//! sent, leaving the stored resource exactly as it was. The class follows the
+//! and the service's already-exists sentence naming the resource that is already there,
+//! leaving the stored resource exactly as it was. The class follows the
 //! CONDITION (the request is well-formed; what stops it is the stored resource), not
 //! which shapes one operation's modelled `errors` list happens to enumerate.
 //!
@@ -20,6 +20,7 @@ use service_com_amazonaws_schemas_schemas::state::{
     CODE_MALFORMED_REQUEST, CODE_RESOURCE_ALREADY_EXIST,
 };
 
+use crate::discoverer_id_derivation::expected_discoverer_id;
 use crate::discoverer_state::{discoverer_uri, source_arn, DISCOVERERS_URI};
 use crate::registry_schema_lifecycle::{registry_uri, schema_uri, Answer, Emulator};
 
@@ -64,9 +65,14 @@ fn rows() -> Vec<Row> {
         },
         Row {
             create: Create::Discoverer,
-            // A discoverer is identified by the source it discovers, so its sentence
-            // names that source rather than a name the caller chose.
-            sentence: |token| format!("Discoverer for source {} already exists.", source_arn(token)),
+            // A discoverer carries no name of the caller's: it is identified by the id
+            // the source it discovers derives, so its sentence names that id.
+            sentence: |token| {
+                format!(
+                    "Discoverer {} already exists.",
+                    expected_discoverer_id(&source_arn(token))
+                )
+            },
         },
     ]
 }
