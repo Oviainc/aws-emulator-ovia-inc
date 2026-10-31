@@ -345,13 +345,23 @@ pub fn encode_cursor(scope: &str, last_key: &str) -> String {
 /// The key a cursor resumes after, when it is one [`encode_cursor`] produced for the
 /// same `scope`. A cursor from another listing (a different account's roles, or another
 /// session's accounts) is refused rather than applied to this one.
+///
+/// Admitted ONLY when the token is byte for byte the one [`encode_cursor`] mints for the
+/// key it carries: the acceptance set is the mint's output set and nothing wider.
+/// `hex::decode` reads spellings `hex::encode` never writes (upper- and mixed-case
+/// digits), and such a spelling is a token no response of this service ever carried, so
+/// re-minting the decoded key and comparing is what holds the two to exact inverses —
+/// whatever the encoding is, and without a second grammar maintained beside it.
 pub fn decode_cursor(scope: &str, token: &str) -> Result<String, InvalidCursor> {
     let bytes = hex::decode(token).map_err(|_| InvalidCursor)?;
     let decoded = String::from_utf8(bytes).map_err(|_| InvalidCursor)?;
-    decoded
+    let last_key = decoded
         .strip_prefix(&format!("{CURSOR_VERSION}:{scope}:"))
-        .map(str::to_string)
-        .ok_or(InvalidCursor)
+        .ok_or(InvalidCursor)?;
+    if encode_cursor(scope, last_key) != token {
+        return Err(InvalidCursor);
+    }
+    Ok(last_key.to_string())
 }
 
 /// Cut `sorted` — a listing of `(sort key, item)` pairs in ascending key order — into
