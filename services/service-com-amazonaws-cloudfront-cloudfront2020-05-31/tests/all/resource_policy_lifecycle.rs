@@ -12,13 +12,14 @@
 //!   refused on its FORM: HTTP 400 `InvalidArgument` with the fixed sentence
 //!   [`MALFORMED_ARN_MESSAGE`], since the value cannot be read as an ARN in the first
 //!   place;
-//! * a `ResourceArn` that IS an ARN but names anything else — an ARN of another service, an
-//!   ARN of another CloudFront resource type, an ARN carrying no resource id — is refused on
-//!   the resource TYPE it names: HTTP 400 `InvalidArgument`, decided before anything is
-//!   written or looked up and whether or not a resource of that type exists. The CONDITION
+//! * a `ResourceArn` that IS an ARN naming a resource this service HOLDS, of a type other
+//!   than the one the surface attaches policies to, is refused on the resource TYPE it
+//!   names: HTTP 400 `InvalidArgument`, decided before anything is written. The CONDITION
 //!   is one for both operations; the SENTENCE is the one each puts on the wire — the write
 //!   names the resource type it wants ([`INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE`]),
 //!   the read demands a usable ARN ([`INVALID_RESOURCE_POLICY_ARN_MESSAGE`]);
+//! * an ARN this service holds no resource for is reported ABSENT instead — HTTP 404
+//!   `EntityNotFound`, which [`crate::resource_policy_absent_resource`] is the table for;
 //! * an ARN the surface does accept round-trips: a read answers with the document the last
 //!   write persisted under that ARN, byte for byte, and with that ARN;
 //! * an accepted ARN carrying no policy is `EntityNotFound` (404) — the EXISTENCE answer,
@@ -43,6 +44,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{call, create_distribution, emulator, Answer, ACCOUNT_ID, API_VERSION};
 use crate::distribution_tenant_lifecycle::escape;
+use crate::function_lifecycle::create_key_value_store;
 
 /// The CloudFront resource types that are NOT the one the resource-policy surface attaches
 /// a policy to, beyond the taggable ones [`TAGGABLE_RESOURCE_TYPES`] already names.
@@ -127,7 +129,10 @@ pub(crate) async fn get_resource_policy(router: &MultiServiceRouter, arn: &str) 
 
 /// A minimal `DistributionConfig`, so one row of the refusal table can name a CloudFront
 /// resource that EXISTS and is of a type the surface does not attach policies to.
-fn distribution_config(reference: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite that needs an existing resource of another type writes it
+/// with this one writer rather than a copy of it.
+pub(crate) fn distribution_config(reference: &str) -> String {
     format!(
         "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <CallerReference>{reference}</CallerReference>\
@@ -154,11 +159,11 @@ pub(crate) fn policy(statement: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn an_arn_naming_no_vpc_origin_is_an_invalid_argument() {
+async fn an_arn_naming_an_existing_resource_of_another_type_is_an_invalid_argument() {
     let router = emulator();
 
-    // The row the rule has to hold for even though the resource EXISTS: a live
-    // distribution, read back through its own ARN.
+    // The row the rule stands on: a live distribution, named by the very ARN its create
+    // minted — a resource that IS there, of a type that takes no resource policy.
     let created = create_distribution(&router, &distribution_config("ref-resource-policy")).await;
     assert_eq!(
         created.status, 201,
@@ -175,52 +180,20 @@ async fn an_arn_naming_no_vpc_origin_is_an_invalid_argument() {
         "expected a distribution ARN to name the existing resource, got {distribution_arn:?}"
     );
 
-    // Every other resource type this service mints an ARN for, each with an ARN of the
-    // same shape as the accepted one — so what refuses each row is the TYPE it names.
-    let mut rows: Vec<(String, String)> = TAGGABLE_RESOURCE_TYPES
-        .iter()
-        .chain(OTHER_RESOURCE_TYPES.iter())
-        .map(|kind| {
-            (
-                format!("an ARN naming a {kind}"),
-                format!("arn:aws:cloudfront::{ACCOUNT_ID}:{kind}/absent-resource"),
-            )
-        })
-        .collect();
-    rows.extend([
+    // Rows differing along the KIND of existing resource the ARN names and how this emulator
+    // holds it: a distribution and a key value store each mint an ARN of their own, and both
+    // are types that take no resource policy.
+    let key_value_store_arn = create_key_value_store(&router, "resource-policy-gate-store").await;
+    let rows = [
         (
             "the ARN of a distribution that exists".to_string(),
             distribution_arn.clone(),
         ),
         (
-            "a bare ARN prefix".to_string(),
-            "arn:".to_string(),
+            "the ARN of a key value store that exists".to_string(),
+            key_value_store_arn,
         ),
-        (
-            "an ARN carrying no resource part".to_string(),
-            format!("arn:aws:cloudfront::{ACCOUNT_ID}:"),
-        ),
-        (
-            "an ARN of another service naming the accepted type".to_string(),
-            format!("arn:aws:ec2:us-east-1:{ACCOUNT_ID}:{RESOURCE_POLICY_RESOURCE_TYPE}/vo-1"),
-        ),
-        (
-            "an ARN with no partition".to_string(),
-            format!("arn::cloudfront::{ACCOUNT_ID}:{RESOURCE_POLICY_RESOURCE_TYPE}/vo-1"),
-        ),
-        (
-            "an ARN whose resource type merely starts with the accepted one".to_string(),
-            format!("arn:aws:cloudfront::{ACCOUNT_ID}:{RESOURCE_POLICY_RESOURCE_TYPE}-group/vo-1"),
-        ),
-        (
-            "an ARN naming the accepted type with no id".to_string(),
-            format!("arn:aws:cloudfront::{ACCOUNT_ID}:{RESOURCE_POLICY_RESOURCE_TYPE}"),
-        ),
-        (
-            "an ARN naming the accepted type with an empty id".to_string(),
-            format!("arn:aws:cloudfront::{ACCOUNT_ID}:{RESOURCE_POLICY_RESOURCE_TYPE}/"),
-        ),
-    ]);
+    ];
 
     for (case, arn) in &rows {
         // The CONDITION is one for both operations; the SENTENCE each answers it with is the
@@ -258,6 +231,26 @@ async fn an_arn_naming_no_vpc_origin_is_an_invalid_argument() {
                 message(&answer)
             );
         }
+    }
+
+    // Every type this service mints an ARN for, naming a resource the store holds NONE of,
+    // is the absent answer rather than this refusal: the two are told apart by the store,
+    // never by the type alone.
+    for kind in TAGGABLE_RESOURCE_TYPES.iter().chain(OTHER_RESOURCE_TYPES.iter()) {
+        let arn = format!("arn:aws:cloudfront::{ACCOUNT_ID}:{kind}/absent-resource");
+        let answer = get_resource_policy(&router, &arn).await;
+        assert_eq!(
+            answer.status, 404,
+            "case an absent {kind}: expected HTTP 404, got {} ({})",
+            answer.status, answer.raw
+        );
+        assert_eq!(
+            answer.error_code(),
+            "EntityNotFound",
+            "case an absent {kind}: expected EntityNotFound, got {:?} ({})",
+            answer.error_code(),
+            answer.raw
+        );
     }
 
     // The refusals wrote nothing: an accepted ARN still carries no policy, so no refused
@@ -589,8 +582,9 @@ async fn a_second_write_supersedes_the_policy_the_resource_carried() {
         );
     }
 
-    // And a refused write leaves the policy the resource already carried untouched: the
-    // parameter gate decides before anything is written.
+    // And a refused write leaves the policy the resource already carried untouched: the ARN
+    // is resolved before anything is written, so a write the surface refuses — here for a
+    // resource this service holds none of — changes nothing.
     let refused = put_resource_policy(
         &router,
         &format!("arn:aws:cloudfront::{ACCOUNT_ID}:distribution/E1REFUSED"),
@@ -598,8 +592,8 @@ async fn a_second_write_supersedes_the_policy_the_resource_carried() {
     )
     .await;
     assert_eq!(
-        refused.status, 400,
-        "case the refused write: expected HTTP 400, got {} ({})",
+        refused.status, 404,
+        "case the refused write: expected HTTP 404, got {} ({})",
         refused.status, refused.raw
     );
     let read = get_resource_policy(&router, &arn).await;

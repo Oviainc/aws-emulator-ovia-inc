@@ -5061,6 +5061,48 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .map(|tenant| &tenant.tags)
     }
 
+    /// Whether this store holds the CloudFront resource `arn` names, whatever its type.
+    ///
+    /// The question an operation that addresses a resource by ARN has to answer before it
+    /// can say anything about that resource — so it is resolved the way every other ARN
+    /// lookup here resolves one, against the STORED record rather than by re-deriving an
+    /// identifier out of the request:
+    ///
+    /// * a kind that mints an ARN of its own is matched on the ARN it carries, the very
+    ///   comparison [`Self::tags_for_resource`] makes, so no two lookups can disagree about
+    ///   which resource an ARN names;
+    /// * a kind that mints none is matched on the id its own routes address it by, read out
+    ///   of the resource part of an ARN of this service ([`cloudfront_arn_resource`]). A
+    ///   policy family also answers for the policies AWS publishes, since an id addresses
+    ///   one policy whichever of the two created it.
+    ///
+    /// `false` is "this emulator holds no such resource", whatever the ARN's type: a type
+    /// this store holds nothing of at all, another service's ARN, and an ARN carrying no
+    /// resource part all answer it.
+    pub fn holds_resource(&self, arn: &str) -> bool {
+        if self.tags_for_resource(arn).is_some() || self.realtime_log_config_by_arn(arn).is_some() {
+            return true;
+        }
+        let Some((kind, id)) = cloudfront_arn_resource(arn) else {
+            return false;
+        };
+        match kind {
+            "cache-policy" => self.readable_cache_policy(id).is_some(),
+            "continuous-deployment-policy" => self.continuous_deployment_policies.contains_key(id),
+            "field-level-encryption-config" => self.field_level_encryption_configs.contains_key(id),
+            "field-level-encryption-profile" => {
+                self.field_level_encryption_profiles.contains_key(id)
+            }
+            "key-group" => self.key_groups.contains_key(id),
+            "origin-access-control" => self.origin_access_controls.contains_key(id),
+            "origin-access-identity" => self.origin_access_identities.contains_key(id),
+            "origin-request-policy" => self.readable_origin_request_policy(id).is_some(),
+            "public-key" => self.public_keys.contains_key(id),
+            "response-headers-policy" => self.readable_response_headers_policy(id).is_some(),
+            _ => false,
+        }
+    }
+
     /// The tag set of the resource `arn` names, MUTABLY, so a tagging call writes the
     /// very set a tag read reports rather than a second copy of it.
     ///
@@ -7016,75 +7058,78 @@ pub fn vpc_origin_arn(id: &str) -> String {
     )
 }
 
-/// The resource a `ResourceArn` names for the resource-policy surface — the id of the VPC
-/// origin it addresses — or `None` where the ARN names no such resource.
+/// The resource an ARN of THIS service names, as the `(type, id)` pair its resource part
+/// spells, or `None` where the value is not an ARN of this service naming a resource.
 ///
-/// `ResourceArn` is modelled as a plain `string` with no pattern, so nothing is refused
-/// before a handler runs and reading the ARN is this check: it is an ARN of this service
-/// (`arn:<partition>:cloudfront:…`) whose resource part names
-/// [`RESOURCE_POLICY_RESOURCE_TYPE`] and carries an id. A string that is no ARN at all, an
-/// ARN of another service and an ARN naming another resource type all answer `None`, which
-/// is the one condition the surface refuses as a bad parameter
-/// ([`invalid_resource_policy_resource_type`]).
-pub fn resource_policy_resource(arn: &str) -> Option<&str> {
-    // The resource TYPE, read through the one helper this crate decomposes an ARN's
-    // resource part with.
-    if arn_resource_type(arn)? != RESOURCE_POLICY_RESOURCE_TYPE {
-        return None;
-    }
-    // `arn:<partition>:cloudfront:` — the prefix, a named partition and this service's own
-    // namespace. The region and account segments that follow are the owner's and narrow
-    // nothing about which resource the ARN names.
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>` and this service's
+/// resources spell their resource part `<type>/<id>` ([`arn_resource_type`]), so what is
+/// read here is `arn:`, a named partition and this service's own namespace — the region and
+/// account segments that follow are the owner's and narrow nothing about WHICH resource the
+/// ARN names — and then that pair. One reading of an ARN for every caller that has to
+/// resolve one against this store, so no two of them can disagree about which resource an
+/// ARN names.
+pub fn cloudfront_arn_resource(arn: &str) -> Option<(&str, &str)> {
     let mut segments = arn.splitn(6, ':');
     if segments.next()? != "arn" || segments.next()?.is_empty() || segments.next()? != "cloudfront"
     {
         return None;
     }
-    // The id the resource part carries after its type, which the check above pinned: what
-    // remains of it is the separator and the id.
-    let id = segments
-        .nth(2)?
-        .strip_prefix(RESOURCE_POLICY_RESOURCE_TYPE)?
-        .strip_prefix('/')?;
-    (!id.is_empty()).then_some(id)
+    let (kind, id) = segments.nth(2)?.split_once('/')?;
+    (!kind.is_empty() && !id.is_empty()).then_some((kind, id))
+}
+
+/// The resource a `ResourceArn` names for the resource-policy surface — the id of the VPC
+/// origin it addresses — or `None` where the ARN names no such resource.
+///
+/// `ResourceArn` is modelled as a plain `string` with no pattern, so nothing is refused
+/// before a handler runs and reading the ARN is this check: it is an ARN of this service
+/// ([`cloudfront_arn_resource`]) whose resource part names [`RESOURCE_POLICY_RESOURCE_TYPE`]
+/// and carries an id. A string that is no ARN at all, an ARN of another service and an ARN
+/// naming another resource type all answer `None` — which is not one refusal but two, told
+/// apart by whether this store holds the resource the ARN names
+/// ([`resource_policy_arn_refusal`]).
+pub fn resource_policy_resource(arn: &str) -> Option<&str> {
+    let (kind, id) = cloudfront_arn_resource(arn)?;
+    (kind == RESOURCE_POLICY_RESOURCE_TYPE).then_some(id)
 }
 
 /// The sentence either resource-policy WRITE — the one that attaches a policy and the one
-/// that removes it — refuses a `ResourceArn` naming anything but a VPC origin with: the
-/// whole text is fixed, so nothing of the request — neither the ARN nor the type it names —
-/// reaches it. Recorded behaviour.
+/// that removes it — refuses a `ResourceArn` naming an existing resource that is not a VPC
+/// origin with: the whole text is fixed, so nothing of the request — neither the ARN nor the
+/// type it names — reaches it. Recorded behaviour.
 pub const INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE: &str =
     "The specified resource type isn't valid. Specify a VPC origin and try again.";
 
-/// The modelled `InvalidArgument` (HTTP 400) a resource-policy WRITE naming a resource the
-/// surface does not attach policies to is refused with — "An argument is invalid."
+/// The modelled `InvalidArgument` (HTTP 400) a resource-policy WRITE naming an existing
+/// resource the surface does not attach policies to is refused with — "An argument is
+/// invalid."
 ///
 /// Both writes of the surface word the condition this way: what a caller has to fix is the
 /// resource type it named, whether it was attaching a policy or removing one.
 ///
-/// Decided BEFORE any policy lookup: a `ResourceArn` the surface cannot attach a policy to
-/// is a parameter the caller has to fix, whether or not a policy or a resource exists,
-/// which is what leaves [`resource_policy_not_found`] for "a resource this surface does
-/// accept, carrying no policy".
+/// Decided AFTER the ARN is resolved against the store: a type refusal states that the
+/// resource the caller named takes no resource policy, which is only true of a resource that
+/// is there, so an ARN this service holds no resource for is the absent-resource answer
+/// ([`resource_policy_resource_absent`]) instead.
 pub fn invalid_resource_policy_resource_type() -> crate::ops::types::InvalidArgument {
     crate::ops::types::InvalidArgument {
         message: Some(INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE.to_string()),
     }
 }
 
-/// The sentence a resource-policy READ refuses a `ResourceArn` naming anything but a VPC
-/// origin with.
+/// The sentence a resource-policy READ refuses a `ResourceArn` naming an existing resource
+/// that is not a VPC origin with.
 ///
-/// The CONDITION the two operations of the surface refuse is one
-/// ([`resource_policy_arn_refusal`]); the sentence each puts on the wire for it is the
+/// The CONDITION the three operations of the surface refuse is one
+/// ([`resource_policy_arn_refusal`]); the sentence each puts on the wire is the
 /// service's own, and the read words it as a demand for a usable ARN rather than naming the
 /// resource type the write asks for. Recorded behaviour; the whole text is fixed, so nothing
 /// of the request reaches it.
 pub const INVALID_RESOURCE_POLICY_ARN_MESSAGE: &str =
     "The ResourceArn parameter is required. Specify a valid ARN and try again.";
 
-/// The modelled `InvalidArgument` (HTTP 400) a resource-policy READ naming a resource the
-/// surface does not attach policies to is refused with.
+/// The modelled `InvalidArgument` (HTTP 400) a resource-policy READ naming an existing
+/// resource the surface does not attach policies to is refused with.
 pub fn invalid_resource_policy_arn() -> crate::ops::types::InvalidArgument {
     crate::ops::types::InvalidArgument {
         message: Some(INVALID_RESOURCE_POLICY_ARN_MESSAGE.to_string()),
@@ -7116,25 +7161,42 @@ pub fn malformed_arn() -> crate::ops::types::InvalidArgument {
 /// Why the resource-policy surface refuses `arn`, or `None` when it names a resource the
 /// surface attaches policies to.
 ///
-/// TWO conditions, in the order the service decides them, and both are about the PARAMETER
-/// rather than about the store:
+/// THREE conditions, in the order the service decides them:
 ///
 /// * [`ResourceArnRefusal::Malformed`] — a value that is no ARN at all cannot be read as
 ///   one, so it is refused on its FORM;
-/// * [`ResourceArnRefusal::WrongType`] — an ARN naming any resource other than
-///   [`RESOURCE_POLICY_RESOURCE_TYPE`] is refused on the resource TYPE it names.
+/// * [`ResourceArnRefusal::AbsentResource`] — an ARN naming no resource this service holds
+///   ([`ComAmazonawsCloudfrontCloudfront20200531State::holds_resource`]) is reported ABSENT:
+///   there is no resource for a policy to be attached to, read from or removed from, which
+///   is a property of the store rather than of the parameter;
+/// * [`ResourceArnRefusal::WrongType`] — an ARN naming a resource this service DOES hold,
+///   of a type other than [`RESOURCE_POLICY_RESOURCE_TYPE`], is refused on the resource TYPE
+///   it names: that resource exists and takes no resource policy.
+///
+/// The accepted type is not resolved against the store: this emulator holds no VPC origins
+/// of its own, so a policy is keyed by the ARN it was attached to and whether that key
+/// carries one is the surface's own existence answer ([`resource_policy_not_found`]).
 ///
 /// ONE rule for every operation of the surface, which all take the one `ResourceArn`, so no
 /// two of them can disagree about which values they accept. The SENTENCE each puts on the
 /// wire is the service's own per operation: see [`malformed_arn`],
-/// [`invalid_resource_policy_resource_type`] and [`invalid_resource_policy_arn`].
-pub fn resource_policy_arn_refusal(arn: &str) -> Option<ResourceArnRefusal> {
+/// [`invalid_resource_policy_resource_type`], [`invalid_resource_policy_arn`] and
+/// [`resource_policy_resource_absent`].
+pub fn resource_policy_arn_refusal(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    arn: &str,
+) -> Option<ResourceArnRefusal> {
     if !arn.starts_with(ARN_PREFIX) {
         return Some(ResourceArnRefusal::Malformed);
     }
-    resource_policy_resource(arn)
-        .is_none()
-        .then_some(ResourceArnRefusal::WrongType)
+    if resource_policy_resource(arn).is_some() {
+        return None;
+    }
+    Some(if store.holds_resource(arn) {
+        ResourceArnRefusal::WrongType
+    } else {
+        ResourceArnRefusal::AbsentResource
+    })
 }
 
 /// Why a `ResourceArn` names no resource the resource-policy surface attaches policies to.
@@ -7142,9 +7204,23 @@ pub fn resource_policy_arn_refusal(arn: &str) -> Option<ResourceArnRefusal> {
 pub enum ResourceArnRefusal {
     /// The value is no ARN at all: it does not open with [`ARN_PREFIX`].
     Malformed,
-    /// The value is an ARN, but it names a resource other than
+    /// The value is an ARN, and this service holds no resource it names.
+    AbsentResource,
+    /// The value is an ARN of a resource this service holds, of a type other than
     /// [`RESOURCE_POLICY_RESOURCE_TYPE`].
     WrongType,
+}
+
+/// The modelled `EntityNotFound` (HTTP 404) a resource-policy call naming a resource this
+/// service holds none of is refused with — "The entity was not found."
+///
+/// The sentence is the one CloudFront answers for the class ([`NO_SUCH_RESOURCE_MESSAGE`]):
+/// it states that the resource asked about is not there and names no part of the request, so
+/// nothing in it is built out of the call.
+pub fn resource_policy_resource_absent() -> EntityNotFound {
+    EntityNotFound {
+        message: Some(NO_SUCH_RESOURCE_MESSAGE.to_string()),
+    }
 }
 
 /// The modelled `InvalidArgument` (HTTP 400) a resource-policy write that would grow the

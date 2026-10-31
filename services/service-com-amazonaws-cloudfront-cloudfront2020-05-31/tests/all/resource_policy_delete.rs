@@ -16,11 +16,12 @@
 //!   [`RESOURCE_POLICY_NOT_FOUND_MESSAGE`] — there is nothing to remove, so a repeated
 //!   delete is refused rather than answered a second success;
 //! * a `ResourceArn` that is no ARN at all is refused on its FORM (400 `InvalidArgument`,
-//!   [`MALFORMED_ARN_MESSAGE`]) and an ARN naming any other resource on the resource TYPE it
-//!   names (400 `InvalidArgument`,
+//!   [`MALFORMED_ARN_MESSAGE`]); an ARN naming a resource this service HOLDS, of another
+//!   type, is refused on the resource TYPE it names (400 `InvalidArgument`,
 //!   [`INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE`] — the sentence the surface's other
-//!   WRITE puts on the wire), decided before anything is removed and whether or not a
-//!   resource of that type exists.
+//!   WRITE puts on the wire); and an ARN this service holds no resource for is reported
+//!   ABSENT (404 `EntityNotFound`, [`NO_SUCH_RESOURCE_MESSAGE`]), each decided before
+//!   anything is removed.
 //!
 //! The rows differ along what the rule generalises over: the resource type the ARN names
 //! (every type this service mints an ARN for, and the forms an ARN can take that name none),
@@ -33,19 +34,23 @@
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     vpc_origin_arn, INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE, MALFORMED_ARN_MESSAGE,
-    RESOURCE_POLICY_NOT_FOUND_MESSAGE, RESOURCE_POLICY_RESOURCE_TYPE, TAGGABLE_RESOURCE_TYPES,
+    NO_SUCH_RESOURCE_MESSAGE, RESOURCE_POLICY_NOT_FOUND_MESSAGE, RESOURCE_POLICY_RESOURCE_TYPE,
+    TAGGABLE_RESOURCE_TYPES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::distribution_lifecycle::{call, emulator, Answer, ACCOUNT_ID, API_VERSION};
+use crate::distribution_lifecycle::{call, create_distribution, emulator, Answer, ACCOUNT_ID, API_VERSION};
 use crate::distribution_tenant_lifecycle::escape;
 use crate::resource_policy_lifecycle::{
-    get_resource_policy, message, policy, put_resource_policy, reported_document,
-    OTHER_RESOURCE_TYPES,
+    distribution_config, get_resource_policy, message, policy, put_resource_policy,
+    reported_document, OTHER_RESOURCE_TYPES,
 };
 
 /// `POST /2020-05-31/delete-resource-policy`, removing the policy attached to `arn`.
-async fn delete_resource_policy(router: &MultiServiceRouter, arn: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite that removes a policy goes over the same wire path rather
+/// than growing a copy of this.
+pub(crate) async fn delete_resource_policy(router: &MultiServiceRouter, arn: &str) -> Answer {
     let body = format!(
         "<DeleteResourcePolicyRequest \
          xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
@@ -303,7 +308,7 @@ async fn deleting_a_policy_an_accepted_arn_does_not_carry_is_entity_not_found() 
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn deleting_under_an_arn_the_surface_does_not_accept_is_an_invalid_argument() {
+async fn deleting_under_an_arn_the_surface_does_not_accept_is_refused() {
     let router = emulator();
 
     // The policy the gate must leave alone: every refusal below is decided before anything
@@ -317,19 +322,38 @@ async fn deleting_under_an_arn_the_surface_does_not_accept_is_an_invalid_argumen
         written.status, written.raw
     );
 
-    // Every other resource type this service mints an ARN for, plus the ARN forms that name
-    // no resource of the accepted type: refused on the TYPE the ARN names.
-    let mut wrong_type: Vec<(String, String)> = TAGGABLE_RESOURCE_TYPES
+    // A resource that EXISTS, of a type the surface attaches no policy to: refused on the
+    // TYPE the ARN names, with the sentence this WRITE words that condition in.
+    let created = create_distribution(&router, &distribution_config("ref-delete-gate")).await;
+    assert_eq!(
+        created.status, 201,
+        "the distribution must be created for its row to be about its TYPE, got {} ({})",
+        created.status, created.raw
+    );
+    let distribution_arn = created
+        .root()
+        .find_text("ARN")
+        .unwrap_or_default()
+        .to_string();
+    let wrong_type = [(
+        "an ARN naming a distribution that exists".to_string(),
+        distribution_arn,
+    )];
+
+    // Every other resource type this service mints an ARN for, naming a resource the store
+    // holds none of, plus the ARN forms that name no resource at all: reported ABSENT, since
+    // there is no resource to remove a policy from.
+    let mut absent: Vec<(String, String)> = TAGGABLE_RESOURCE_TYPES
         .iter()
         .chain(OTHER_RESOURCE_TYPES.iter())
         .map(|kind| {
             (
-                format!("an ARN naming a {kind}"),
+                format!("an ARN naming an absent {kind}"),
                 format!("arn:aws:cloudfront::{ACCOUNT_ID}:{kind}/absent-resource"),
             )
         })
         .collect();
-    wrong_type.extend([
+    absent.extend([
         ("a bare ARN prefix".to_string(), "arn:".to_string()),
         (
             "an ARN carrying no resource part".to_string(),
@@ -388,24 +412,41 @@ async fn deleting_under_an_arn_the_surface_does_not_accept_is_an_invalid_argumen
 
     let cases = wrong_type
         .iter()
-        .map(|(case, value)| (case, value, INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE))
+        .map(|(case, value)| {
+            (
+                case,
+                value,
+                400,
+                "InvalidArgument",
+                INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE,
+            )
+        })
+        .chain(absent.iter().map(|(case, value)| {
+            (
+                case,
+                value,
+                404,
+                "EntityNotFound",
+                NO_SUCH_RESOURCE_MESSAGE,
+            )
+        }))
         .chain(
             malformed
                 .iter()
-                .map(|(case, value)| (case, value, MALFORMED_ARN_MESSAGE)),
+                .map(|(case, value)| (case, value, 400, "InvalidArgument", MALFORMED_ARN_MESSAGE)),
         );
 
-    for (case, value, expected) in cases {
+    for (case, value, status, code, expected) in cases {
         let answer = delete_resource_policy(&router, value).await;
         assert_eq!(
-            answer.status, 400,
-            "case {case}: expected HTTP 400 for {value:?}, got {} ({})",
+            answer.status, status,
+            "case {case}: expected HTTP {status} for {value:?}, got {} ({})",
             answer.status, answer.raw
         );
         assert_eq!(
             answer.error_code(),
-            "InvalidArgument",
-            "case {case}: expected InvalidArgument for {value:?}, got {:?} ({})",
+            code,
+            "case {case}: expected {code} for {value:?}, got {:?} ({})",
             answer.error_code(),
             answer.raw
         );

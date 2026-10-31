@@ -223,6 +223,8 @@ mod realtime_log_config_list;
 mod refusal_contract;
 #[path = "all/request_supplied_order_and_values.rs"]
 mod request_supplied_order_and_values;
+#[path = "all/resource_policy_absent_resource.rs"]
+mod resource_policy_absent_resource;
 #[path = "all/resource_policy_delete.rs"]
 mod resource_policy_delete;
 #[path = "all/resource_policy_lifecycle.rs"]

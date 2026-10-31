@@ -8,12 +8,14 @@
 //! caller sees is exactly what it would have seen had this call never happened.
 //!
 //! The surface attaches policies to ONE resource type
-//! ([`crate::state::RESOURCE_POLICY_RESOURCE_TYPE`]), so a `ResourceArn` naming anything
-//! else is a bad PARAMETER, refused 400 `InvalidArgument` before any policy is looked up
-//! ([`crate::state::resource_policy_arn_refusal`]): a value that is no ARN at all is
-//! refused on its form, and an ARN of another service or of another CloudFront resource
-//! type on the resource type it names — which this READ words as the demand for a usable
-//! ARN that CloudFront answers it with
+//! ([`crate::state::RESOURCE_POLICY_RESOURCE_TYPE`]), and the `ResourceArn` is resolved
+//! against the store before any policy is looked up
+//! ([`crate::state::resource_policy_arn_refusal`]): a value that is no ARN at all is refused
+//! on its form, 400 `InvalidArgument`; an ARN this service holds no resource for is reported
+//! ABSENT, 404 `EntityNotFound` ([`crate::state::resource_policy_resource_absent`]); and an
+//! ARN of a resource this service DOES hold whose type takes no resource policy is a bad
+//! PARAMETER, refused 400 `InvalidArgument` — which this READ words as the demand for a
+//! usable ARN that CloudFront answers it with
 //! ([`crate::state::INVALID_RESOURCE_POLICY_ARN_MESSAGE`]).
 //! An ARN the surface does accept, carrying no policy, is 404 `EntityNotFound`.
 //!
@@ -156,24 +158,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
-        // The PARAMETER gate, decided before any lookup: a value that is no ARN at all is
-        // refused on its form and an ARN naming any other resource on the type it names,
-        // each with the sentence this operation words that condition in, whether or not a
-        // policy is attached to anything.
-        if let Some(refusal) = crate::state::resource_policy_arn_refusal(&input.resource_arn) {
-            return Err(GetResourcePolicyErrorModeled::InvalidArgument(match refusal {
-                crate::state::ResourceArnRefusal::Malformed => crate::state::malformed_arn(),
-                crate::state::ResourceArnRefusal::WrongType => {
-                    crate::state::invalid_resource_policy_arn()
-                }
-            })
-            .into());
-        }
-
+        // The ARN is resolved against the store before any policy lookup: a value that is no
+        // ARN at all is refused on its form, an ARN this service holds no resource for is
+        // reported ABSENT, and an ARN of a resource it does hold that takes no resource
+        // policy is refused on the type it names — each with the sentence this operation
+        // words that condition in, whether or not a policy is attached to anything.
+        //
         // A read: the store is taken SHARED and nothing in it is written. Nothing about a
         // resource policy is owed by the CLOCK either — a policy carries no status and no
         // deadline — so there is nothing to settle before reading one.
         let store = state.lock();
+        if let Some(refusal) =
+            crate::state::resource_policy_arn_refusal(&store, &input.resource_arn)
+        {
+            return Err(match refusal {
+                crate::state::ResourceArnRefusal::Malformed => {
+                    GetResourcePolicyErrorModeled::InvalidArgument(crate::state::malformed_arn())
+                }
+                crate::state::ResourceArnRefusal::WrongType => {
+                    GetResourcePolicyErrorModeled::InvalidArgument(
+                        crate::state::invalid_resource_policy_arn(),
+                    )
+                }
+                crate::state::ResourceArnRefusal::AbsentResource => {
+                    GetResourcePolicyErrorModeled::EntityNotFound(
+                        crate::state::resource_policy_resource_absent(),
+                    )
+                }
+            }
+            .into());
+        }
+
         let Some(document) = store.resource_policy(&input.resource_arn) else {
             return Err(GetResourcePolicyErrorModeled::EntityNotFound(
                 crate::state::resource_policy_not_found(),

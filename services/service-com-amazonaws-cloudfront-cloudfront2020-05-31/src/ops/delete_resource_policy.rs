@@ -8,12 +8,15 @@
 //! `GetResourcePolicy` on that ARN answers not-found until another write attaches one.
 //!
 //! The surface attaches policies to ONE resource type
-//! ([`crate::state::RESOURCE_POLICY_RESOURCE_TYPE`]), so a `ResourceArn` naming anything
-//! else is a bad PARAMETER, refused 400 `InvalidArgument` before anything is removed
-//! ([`crate::state::resource_policy_arn_refusal`]): a value that is no ARN at all is
-//! refused on its form, and an ARN of another service or of another CloudFront resource
-//! type on the resource type it names — which this WRITE words as the resource type it
-//! demands, as the surface's other write does
+//! ([`crate::state::RESOURCE_POLICY_RESOURCE_TYPE`]), and the `ResourceArn` is resolved
+//! against the store before anything is removed
+//! ([`crate::state::resource_policy_arn_refusal`]): a value that is no ARN at all is refused
+//! on its form, 400 `InvalidArgument`; an ARN this service holds no resource for is reported
+//! ABSENT, 404 `EntityNotFound` ([`crate::state::resource_policy_resource_absent`]), since
+//! there is no resource to remove a policy from; and an ARN of a resource this service DOES
+//! hold whose type takes no resource policy is a bad PARAMETER, refused 400 `InvalidArgument`
+//! on the resource type it names — which this WRITE words as the resource type it demands, as
+//! the surface's other write does
 //! ([`crate::state::INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE`]).
 //! An ARN the surface does accept, carrying no policy, is 404 `EntityNotFound`: there is
 //! nothing to remove, so the store is left exactly as it was.
@@ -179,23 +182,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
-        // The PARAMETER gate, decided before anything is removed: a value that is no ARN at
-        // all is refused on its form and an ARN naming any other resource on the type it
-        // names, each with the sentence this operation words that condition in, and the
-        // store is left exactly as it was.
-        if let Some(refusal) = crate::state::resource_policy_arn_refusal(&input.resource_arn) {
-            return Err(DeleteResourcePolicyErrorModeled::InvalidArgument(match refusal {
-                crate::state::ResourceArnRefusal::Malformed => crate::state::malformed_arn(),
-                crate::state::ResourceArnRefusal::WrongType => {
-                    crate::state::invalid_resource_policy_resource_type()
+        // The ARN is resolved against the store before anything is removed: a value that is
+        // no ARN at all is refused on its form, an ARN this service holds no resource for is
+        // reported ABSENT, and an ARN of a resource it does hold that takes no resource
+        // policy is refused on the type it names — each with the sentence this operation
+        // words that condition in, and the store is left exactly as it was.
+        let mut store = state.lock();
+        if let Some(refusal) =
+            crate::state::resource_policy_arn_refusal(&store, &input.resource_arn)
+        {
+            return Err(match refusal {
+                crate::state::ResourceArnRefusal::Malformed => {
+                    DeleteResourcePolicyErrorModeled::InvalidArgument(
+                        crate::state::malformed_arn(),
+                    )
                 }
-            })
+                crate::state::ResourceArnRefusal::WrongType => {
+                    DeleteResourcePolicyErrorModeled::InvalidArgument(
+                        crate::state::invalid_resource_policy_resource_type(),
+                    )
+                }
+                crate::state::ResourceArnRefusal::AbsentResource => {
+                    DeleteResourcePolicyErrorModeled::EntityNotFound(
+                        crate::state::resource_policy_resource_absent(),
+                    )
+                }
+            }
             .into());
         }
 
-        // The EXISTENCE answer, which is what the parameter gate above leaves it for: an ARN
-        // the surface does accept, carrying no policy, has nothing for this call to remove.
-        let mut store = state.lock();
+        // The EXISTENCE answer for a resource the surface does attach policies to, which is
+        // what the gate above leaves it: an ARN the surface accepts, carrying no policy, has
+        // nothing for this call to remove.
         if !store.delete_resource_policy(&input.resource_arn) {
             return Err(DeleteResourcePolicyErrorModeled::EntityNotFound(
                 crate::state::resource_policy_not_found(),

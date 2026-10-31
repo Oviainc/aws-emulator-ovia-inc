@@ -8,11 +8,14 @@
 //! the first rather than adding a second policy beside it.
 //!
 //! The surface attaches policies to ONE resource type
-//! ([`crate::state::RESOURCE_POLICY_RESOURCE_TYPE`]), so a `ResourceArn` naming anything
-//! else is a bad PARAMETER, refused 400 `InvalidArgument` before anything is written
-//! ([`crate::state::resource_policy_arn_refusal`]): a value that is no ARN at all is
-//! refused on its form, and an ARN of another service or of another CloudFront resource
-//! type on the resource type it names.
+//! ([`crate::state::RESOURCE_POLICY_RESOURCE_TYPE`]), and the `ResourceArn` is resolved
+//! against the store before anything is written
+//! ([`crate::state::resource_policy_arn_refusal`]): a value that is no ARN at all is refused
+//! on its form, 400 `InvalidArgument`; an ARN this service holds no resource for is reported
+//! ABSENT, 404 `EntityNotFound` ([`crate::state::resource_policy_resource_absent`]), since
+//! there is no resource to attach a policy to; and an ARN of a resource this service DOES
+//! hold whose type takes no resource policy is a bad PARAMETER, refused 400 `InvalidArgument`
+//! on the resource type it names.
 //!
 //! ## Shape of an operation
 //!
@@ -157,21 +160,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
-        // The PARAMETER gate, decided before anything is written: a value that is no ARN
-        // at all is refused on its form and an ARN naming any other resource on the type it
-        // names, each with the sentence this operation words that condition in, and the
-        // store is left exactly as it was.
-        if let Some(refusal) = crate::state::resource_policy_arn_refusal(&input.resource_arn) {
-            return Err(PutResourcePolicyErrorModeled::InvalidArgument(match refusal {
-                crate::state::ResourceArnRefusal::Malformed => crate::state::malformed_arn(),
-                crate::state::ResourceArnRefusal::WrongType => {
-                    crate::state::invalid_resource_policy_resource_type()
+        // The ARN is resolved against the store before anything is written: a value that is
+        // no ARN at all is refused on its form, an ARN this service holds no resource for is
+        // reported ABSENT, and an ARN of a resource it does hold that takes no resource
+        // policy is refused on the type it names — each with the sentence this operation
+        // words that condition in, and the store is left exactly as it was.
+        let mut store = state.lock();
+        if let Some(refusal) =
+            crate::state::resource_policy_arn_refusal(&store, &input.resource_arn)
+        {
+            return Err(match refusal {
+                crate::state::ResourceArnRefusal::Malformed => {
+                    PutResourcePolicyErrorModeled::InvalidArgument(crate::state::malformed_arn())
                 }
-            })
+                crate::state::ResourceArnRefusal::WrongType => {
+                    PutResourcePolicyErrorModeled::InvalidArgument(
+                        crate::state::invalid_resource_policy_resource_type(),
+                    )
+                }
+                crate::state::ResourceArnRefusal::AbsentResource => {
+                    PutResourcePolicyErrorModeled::EntityNotFound(
+                        crate::state::resource_policy_resource_absent(),
+                    )
+                }
+            }
             .into());
         }
 
-        let mut store = state.lock();
         // The store grows only here and a policy cannot be evicted (a later read has to
         // answer with what this write persisted), so the bound is an entry count refused
         // before the insert. A write that replaces the policy of a resource the store
