@@ -311,12 +311,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+        // A pool holds at most Amazon Cognito's per-pool quota of custom
+        // attributes, so a `Schema` that asks for more is refused before
+        // anything is built or stored — the same quota `AddCustomAttributes`
+        // enforces for a schema that grows after the pool exists.
+        if input.schema.as_deref().is_some_and(|schema| {
+            crate::state::requested_custom_attribute_count(schema)
+                > crate::state::MAX_CUSTOM_ATTRIBUTES_PER_POOL
+        }) {
+            return Err(invalid_parameter(
+                crate::state::custom_attribute_quota_message(),
+            ));
+        }
         let mut pool = crate::state::new_user_pool(input.pool_name.clone(), &region, now);
         pool.policies = crate::state::effective_policies(input.policies);
         pool.schema = crate::state::effective_schema(input.schema);
         pool.admin_create_user_config =
             crate::state::effective_admin_create_user_config(input.admin_create_user_config);
-        pool.user_pool_tier = crate::state::effective_user_pool_tier(input.user_pool_tier);
+        pool.user_pool_add_ons = input.user_pool_add_ons;
+        // The plan this pool is created on. A request that names one configures
+        // it, and a request that names none is created on the cheapest plan that
+        // includes every feature its configuration asks for.
+        pool.user_pool_tier = crate::state::effective_user_pool_tier_for_configuration(
+            input.user_pool_tier,
+            Some(&pool.policies),
+            pool.user_pool_add_ons.as_ref(),
+        );
         if let Some(mfa_configuration) = input.mfa_configuration {
             pool.mfa_configuration = mfa_configuration;
         }
@@ -336,7 +356,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.account_recovery_setting,
         ));
         pool.user_attribute_update_settings = input.user_attribute_update_settings;
-        pool.user_pool_add_ons = input.user_pool_add_ons;
         pool.key_configuration = input.key_configuration;
         pool.issuer_configuration = input.issuer_configuration;
         pool.acr_configuration = input.acr_configuration;
@@ -345,8 +364,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A pool configuration member whose feature plan the pool is not on is
         // refused before the pool exists, so nothing is stored: the plan judged
-        // is the EFFECTIVE one this create asks for, and the rule is the one
-        // `UpdateUserPool` applies to the same members.
+        // is the one this create CONFIGURES, and the rule is the one
+        // `UpdateUserPool` applies to the same members. A request that names no
+        // plan configures none, and the plan above answers for every feature it
+        // asks for, so only a plan the request itself asked for can refuse it.
         if let Some(message) = crate::state::pool_feature_plan_refusal(
             &pool.user_pool_tier,
             Some(&pool.policies),
@@ -390,6 +411,17 @@ fn feature_unavailable_in_tier(message: String) -> CreateUserPoolError {
             message: Some(message),
         },
     )
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a pool configuration the
+/// service cannot hold, such as a `Schema` asking for more custom attributes
+/// than a user pool's quota.
+fn invalid_parameter(message: String) -> CreateUserPoolError {
+    CreateUserPoolErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
+    })
     .into()
 }
 

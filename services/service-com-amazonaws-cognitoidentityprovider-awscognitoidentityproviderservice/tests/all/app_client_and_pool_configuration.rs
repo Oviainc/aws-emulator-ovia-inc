@@ -15,8 +15,9 @@
 //!   only scopes the pool has a definition of (`ScopeDoesNotExistException`),
 //!   and a `RegionName` names an AWS Region (`InvalidParameterException`);
 //! * a member whose documentation names a feature plan is refused on a pool
-//!   whose plan is below it (`FeatureUnavailableInTierException`), and served on
-//!   every plan from that floor upwards;
+//!   whose CONFIGURED plan is below it (`FeatureUnavailableInTierException`),
+//!   and served on every plan from that floor upwards — and a create that
+//!   configures no plan at all is served on the cheapest plan that includes it;
 //! * a refusal persists NOTHING: the resource it was about reads back exactly as
 //!   it was;
 //! * a user import job starts only once the CSV file has been uploaded to the
@@ -700,6 +701,18 @@ fn plan_includes(tier: &str, floor: &str) -> bool {
     rank(tier) >= rank(floor)
 }
 
+/// The plan a `CreateUserPool` that names none is created on when it configures
+/// a feature whose floor is `floor`: the cheapest plan that includes that
+/// feature, which is the documented default when the default already includes
+/// it.
+fn plan_a_create_without_a_plan_lands_on(floor: &'static str) -> &'static str {
+    if plan_includes("ESSENTIALS", floor) {
+        "ESSENTIALS"
+    } else {
+        floor
+    }
+}
+
 /// What a refusal says about a pool configuration whose plan excludes a feature:
 /// the request sets the plan and the feature together, so the features that have
 /// to be off for that plan are what it names.
@@ -778,6 +791,24 @@ async fn a_pool_configuration_its_plan_excludes_is_refused_at_create_and_update(
             let pools_before = ok(&router, "ListUserPools", &json!({ "MaxResults": 60 })).await;
             let (status, payload) =
                 call(&router, "CreateUserPool", &Value::Object(body.clone())).await;
+
+            // A create that names NO plan configures none, so it is served
+            // whatever feature it asks for and the pool is created on the
+            // cheapest plan that includes that feature.
+            if requested.is_none() {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: a create that names no plan is served, got {status} with \
+                     {payload}"
+                );
+                let expected = plan_a_create_without_a_plan_lands_on(row.floor);
+                assert_eq!(
+                    payload["UserPool"]["UserPoolTier"],
+                    json!(expected),
+                    "case {case:?}: the pool must be created on {expected:?}, got {payload}"
+                );
+                continue;
+            }
 
             if plan_includes(effective, row.floor) {
                 assert_eq!(

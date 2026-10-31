@@ -785,31 +785,82 @@ pub const CLIENT_SECRET_REQUIRED_FOR_CONTEXT_DATA_MESSAGE: &str =
 /// action") nor a `SignInPolicy` naming only [`PASSWORD_AUTH_FACTOR`], which
 /// configures no further factor.
 ///
-/// The pool's EFFECTIVE plan is what decides, so a create is judged against the
-/// plan it asks for and an update against the plan it leaves the pool on; both
-/// paths ask this one function, so neither can gate a feature the other serves.
+/// The plan the pool is CONFIGURED on is what decides: an update is judged
+/// against the plan it leaves the pool on, and a create against the plan its own
+/// request names — a create that names none configures no plan and is put on one
+/// that includes its features instead
+/// ([`effective_user_pool_tier_for_configuration`]). Both paths ask this one
+/// function, so neither can gate a feature the other serves.
 #[must_use]
 pub fn pool_feature_plan_refusal(
     tier: &str,
     policies: Option<&UserPoolPolicyType>,
     add_ons: Option<&UserPoolAddOnsType>,
 ) -> Option<String> {
-    let refusal = |minimum: &str, feature: &str| {
-        (!user_pool_tier_includes(tier, minimum)).then(|| features_need_disabling_message(tier, feature))
-    };
+    pool_configuration_feature_floors(policies, add_ons)
+        .into_iter()
+        .find(|(floor, _)| !user_pool_tier_includes(tier, floor))
+        .map(|(_, feature)| features_need_disabling_message(tier, feature))
+}
+
+/// Every plan-gated feature a pool configuration ASKS FOR, each with the plan
+/// floor its own documentation names and the name a refusal reports it under.
+///
+/// The two gated members of a pool's configuration are `SignInPolicyType` ("the
+/// Essentials tier or higher") and `UserPoolAddOnsType` ("the Plus tier") (this
+/// service's model), and what each asks FOR is what counts — not whether the
+/// member is present. Both the gate ([`pool_feature_plan_refusal`]) and the plan
+/// a create that names none is put on
+/// ([`effective_user_pool_tier_for_configuration`]) read this one table, so the
+/// plan a pool is given can never exclude a feature the same configuration is
+/// refused for.
+#[must_use]
+fn pool_configuration_feature_floors(
+    policies: Option<&UserPoolPolicyType>,
+    add_ons: Option<&UserPoolAddOnsType>,
+) -> Vec<(&'static str, &'static str)> {
+    let mut floors = Vec::new();
     if configures_choice_based_sign_in(policies) {
-        if let Some(message) = refusal(ESSENTIALS_USER_POOL_TIER, CHOICE_BASED_SIGN_IN_FEATURE) {
-            return Some(message);
-        }
+        floors.push((ESSENTIALS_USER_POOL_TIER, CHOICE_BASED_SIGN_IN_FEATURE));
     }
-    if add_ons.is_some_and(|add_ons| {
-        add_ons.advanced_security_mode == ADVANCED_SECURITY_MODE_ENFORCED
-    }) {
-        if let Some(message) = refusal(PLUS_USER_POOL_TIER, THREAT_PROTECTION_FEATURE) {
-            return Some(message);
-        }
+    if add_ons.is_some_and(|add_ons| add_ons.advanced_security_mode == ADVANCED_SECURITY_MODE_ENFORCED)
+    {
+        floors.push((PLUS_USER_POOL_TIER, THREAT_PROTECTION_FEATURE));
     }
-    None
+    floors
+}
+
+/// The feature plan a pool whose configuration is `policies` and `add_ons` is
+/// created on when the request names `requested`.
+///
+/// A request that names a plan CONFIGURES it, so that plan is the pool's and
+/// [`pool_feature_plan_refusal`] judges the configuration against it. A request
+/// that names none configures no plan: "`UserPoolTier` ... determines the
+/// eligibility of the user pool for features like managed login, access-token
+/// customization, and threat protection" (`CreateUserPool.UserPoolTier` in this
+/// service's model), so the pool is created on the cheapest plan that includes
+/// every feature its configuration asks for — the documented
+/// [`DEFAULT_USER_POOL_TIER`] when it asks for none, and the highest floor among
+/// the features it does ask for otherwise.
+#[must_use]
+pub fn effective_user_pool_tier_for_configuration(
+    requested: Option<String>,
+    policies: Option<&UserPoolPolicyType>,
+    add_ons: Option<&UserPoolAddOnsType>,
+) -> String {
+    if let Some(requested) = requested {
+        return requested;
+    }
+    pool_configuration_feature_floors(policies, add_ons)
+        .into_iter()
+        .fold(DEFAULT_USER_POOL_TIER, |plan, (floor, _)| {
+            if user_pool_tier_includes(plan, floor) {
+                plan
+            } else {
+                floor
+            }
+        })
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -3041,11 +3092,15 @@ impl UserPool {
     /// for the CSV file that determines the users in a user import job"
     /// (`GetCSVHeader`), as the list of column names it is modelled as.
     ///
-    /// COMPUTED from the stored schema, so a pool whose schema carries a custom
-    /// attribute reports a column for it: every attribute a user import can
-    /// carry, then the two columns Amazon Cognito's import format adds
+    /// COMPUTED from the stored schema IN ITS STORED ORDER, so a pool whose
+    /// schema carries a custom attribute reports a column for it where the
+    /// schema holds it: one column per attribute of this pool a user import can
+    /// carry, then the columns the import format adds
     /// ([`CSV_HEADER_TRAILING_COLUMNS`]). [`SUB_ATTRIBUTE`] is not among them —
-    /// the pool mints it for every user and no import supplies it.
+    /// the pool mints it for every user and no import supplies it. The stored
+    /// order is the pool's own, as created ([`effective_schema`]), so the header
+    /// a client builds its CSV from and the schema `DescribeUserPool` reports
+    /// list the pool's attributes in ONE order.
     pub fn csv_header(&self) -> Vec<String> {
         self.schema
             .iter()
@@ -6246,10 +6301,18 @@ pub fn is_standard_attribute(name: &str) -> bool {
 
 /// The columns Amazon Cognito's user-import CSV carries BEYOND the pool's own
 /// attributes, in the order the import format puts them: the MFA state of the
-/// imported user and the username to create them under (Amazon Cognito
-/// Developer Guide, "Importing users from a CSV file"). They are not attributes
-/// of the pool's schema, so they are not reported by any other read of it.
-const CSV_HEADER_TRAILING_COLUMNS: [&str; 2] = ["cognito:mfa_enabled", "cognito:username"];
+/// imported user, the username to create them under (Amazon Cognito Developer
+/// Guide, "Importing users from a CSV file") and that user's password as a hash
+/// — "the password hashing algorithm used to generate the hashes in the CSV file
+/// for this import job" (`CreateUserImportJob.PasswordHashingAlgorithm` in this
+/// service's model) is what an import job reads that last column with. They are
+/// not attributes of the pool's schema, so they are not reported by any other
+/// read of it.
+const CSV_HEADER_TRAILING_COLUMNS: [&str; 3] = [
+    "cognito:mfa_enabled",
+    "cognito:username",
+    "password_hash",
+];
 
 /// How many digits a minted verification code carries: Amazon Cognito's
 /// verification messages carry a six-digit code.
@@ -7180,6 +7243,25 @@ pub fn code_delivery_details(attribute: &str, value: &str) -> Option<CodeDeliver
 /// requested attribute of the same name overriding its properties, and every
 /// other requested attribute added under the `custom:` prefix Amazon Cognito
 /// gives custom attributes.
+///
+/// The stored ORDER is the pool's own, as created: "an array of attributes for
+/// the new user pool. You can add custom attributes and modify the properties of
+/// default attributes" (`CreateUserPool.Schema` in this service's model), so the
+/// attributes the request names are stored in the order IT names them — a custom
+/// one among the standard ones where the request put it — followed by the
+/// standard attributes it does not name, in Amazon Cognito's standard claim
+/// order. [`SUB_ATTRIBUTE`] leads the schema whatever the request says: the pool
+/// mints it for every user rather than taking it from a caller. Every read of
+/// the schema — `DescribeUserPool`, `GetCSVHeader` — reports that one order, and
+/// a later `AddCustomAttributes` appends behind it.
+///
+/// The work is bounded and linear in the request: each requested attribute is
+/// resolved through a name-keyed index rather than by scanning what the schema
+/// already holds, the ordering reads each attribute's rank out of a map, and no
+/// more attributes are taken than a pool may hold
+/// ([`MAX_CUSTOM_ATTRIBUTES_PER_POOL`] beside the standard ones) — a bound
+/// `CreateUserPool` refuses past before it calls this, so nothing a request can
+/// reach is dropped here.
 pub fn effective_schema(requested: Option<Vec<SchemaAttributeType>>) -> Vec<SchemaAttributeType> {
     let requested = requested.unwrap_or_default();
     let mut schema: Vec<SchemaAttributeType> = STANDARD_SCHEMA
@@ -7205,29 +7287,85 @@ pub fn effective_schema(requested: Option<Vec<SchemaAttributeType>>) -> Vec<Sche
         })
         .collect();
 
-    for attribute in requested {
+    // Where each stored attribute sits, so a requested one is resolved by name
+    // instead of by scanning the schema.
+    let mut position: BTreeMap<String, usize> = schema
+        .iter()
+        .enumerate()
+        .filter_map(|(at, entry)| entry.name.clone().map(|name| (name, at)))
+        .collect();
+    // The rank of each attribute the request names, in the order it names them.
+    let mut requested_rank: BTreeMap<String, usize> = BTreeMap::new();
+
+    let bound = STANDARD_SCHEMA.len().saturating_add(MAX_CUSTOM_ATTRIBUTES_PER_POOL);
+    for attribute in requested.iter().take(bound) {
         let Some(name) = attribute.name.clone() else {
             continue;
         };
-        if let Some(standard) = schema
-            .iter_mut()
-            .find(|entry| entry.name.as_deref() == Some(name.as_str()))
-        {
+        if let Some(standard) = position.get(&name).and_then(|at| schema.get_mut(*at)) {
             standard.required = attribute.required.or(standard.required);
             standard.mutable = attribute.mutable.or(standard.mutable);
             if attribute.string_attribute_constraints.is_some() {
-                standard.string_attribute_constraints = attribute.string_attribute_constraints;
+                standard.string_attribute_constraints =
+                    attribute.string_attribute_constraints.clone();
             }
             if attribute.number_attribute_constraints.is_some() {
-                standard.number_attribute_constraints = attribute.number_attribute_constraints;
+                standard.number_attribute_constraints =
+                    attribute.number_attribute_constraints.clone();
             }
+            let next = requested_rank.len();
+            requested_rank.entry(name).or_insert(next);
             continue;
         }
-        if let Some((_, entry)) = custom_schema_attribute(&attribute) {
+        if let Some((stored_name, entry)) = custom_schema_attribute(attribute) {
+            if position.contains_key(&stored_name) {
+                continue;
+            }
+            position.insert(stored_name.clone(), schema.len());
             schema.push(entry);
+            let next = requested_rank.len();
+            requested_rank.insert(stored_name, next);
         }
     }
+
+    // One attribute is stored under exactly one name, so ranking each entry and
+    // sorting by that rank keeps the minted attribute first, then the requested
+    // order, then the standard order a stable sort leaves the rest in.
+    schema.sort_by_key(|entry| {
+        let name = entry.name.as_deref().unwrap_or_default();
+        if name == SUB_ATTRIBUTE {
+            return (0, 0);
+        }
+        match requested_rank.get(name) {
+            Some(rank) => (1, *rank),
+            None => (2, 0),
+        }
+    });
     schema
+}
+
+/// The message a `CreateUserPool` whose `Schema` asks for more custom
+/// attributes than a pool may hold is refused with: the per-pool quota is
+/// [`MAX_CUSTOM_ATTRIBUTES_PER_POOL`], the same one `AddCustomAttributes`
+/// enforces for a schema that grows after the pool exists, and the request
+/// names no pool yet.
+pub fn custom_attribute_quota_message() -> String {
+    format!("A user pool holds at most {MAX_CUSTOM_ATTRIBUTES_PER_POOL} custom attributes.")
+}
+
+/// How many of `requested`'s attributes a pool would hold as CUSTOM ones: every
+/// requested attribute that is not one of the standard attributes a pool already
+/// carries, which are not counted against the quota.
+pub fn requested_custom_attribute_count(requested: &[SchemaAttributeType]) -> usize {
+    requested
+        .iter()
+        .filter(|attribute| {
+            attribute
+                .name
+                .as_deref()
+                .is_some_and(|name| !is_standard_attribute(name))
+        })
+        .count()
 }
 
 /// The `AttributeDataType` a requested custom attribute that names none is

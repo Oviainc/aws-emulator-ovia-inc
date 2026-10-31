@@ -143,6 +143,8 @@ mod log_delivery_configuration;
 mod message_delivery_and_live_codes;
 #[path = "all/pool_configuration_refusal_wire.rs"]
 mod pool_configuration_refusal_wire;
+#[path = "all/pool_plan_and_csv_header.rs"]
+mod pool_plan_and_csv_header;
 #[path = "all/post_confirmation_trigger.rs"]
 mod post_confirmation_trigger;
 #[path = "all/provisioned_limits.rs"]
