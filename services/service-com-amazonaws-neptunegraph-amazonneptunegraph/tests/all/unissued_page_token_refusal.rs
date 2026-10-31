@@ -109,21 +109,25 @@ fn error_code(body: &Value) -> String {
 }
 
 /// One paginated listing: the operation, where it is served, the member carrying its
-/// entries, the id space its tokens name a position in, and a value carrying that
-/// space's prefix while falling outside its pattern.
+/// entries, the id space its tokens name a position in, the scope its tokens belong to,
+/// and a value carrying that space's prefix while falling outside its pattern.
 struct Listing {
     operation: &'static str,
     path: String,
     entries_member: &'static str,
     space: &'static str,
+    /// What a token of this listing carries ahead of the position: the operation's own
+    /// name, and — for the listing whose entries are ordered inside one graph's own
+    /// collection — that graph too.
+    token_scope: String,
     prefixed_but_invalid: &'static str,
 }
 
-/// The token this service issues for `position` in the listing `operation` pages: the
-/// listing that minted it and the position it reached, hex-encoded, which is what binds
-/// a token to one listing's order.
-fn issued_token(operation: &str, position: &str) -> String {
-    hex::encode(format!("{operation}:{position}"))
+/// The token this service issues for `position` in the listing `scope` names: the scope
+/// the token belongs to and the position it reached, hex-encoded, which is what binds a
+/// token to one order.
+fn issued_token(scope: &str, position: &str) -> String {
+    hex::encode(format!("{scope}{position}"))
 }
 
 /// Create one graph and return its id, so the endpoint listing has a graph to be a
@@ -153,6 +157,7 @@ async fn every_listing_refuses_an_unissued_token_with_the_modelled_validation_ex
             path: "/graphs".to_string(),
             entries_member: "graphs",
             space: "graph",
+            token_scope: "ListGraphs:".to_string(),
             prefixed_but_invalid: "g-short",
         },
         Listing {
@@ -160,6 +165,7 @@ async fn every_listing_refuses_an_unissued_token_with_the_modelled_validation_ex
             path: "/snapshots".to_string(),
             entries_member: "graphSnapshots",
             space: "snapshot",
+            token_scope: "ListGraphSnapshots:".to_string(),
             prefixed_but_invalid: "gs-short",
         },
         Listing {
@@ -167,6 +173,7 @@ async fn every_listing_refuses_an_unissued_token_with_the_modelled_validation_ex
             path: "/importtasks".to_string(),
             entries_member: "tasks",
             space: "task",
+            token_scope: "ListImportTasks:".to_string(),
             prefixed_but_invalid: "t-short",
         },
         Listing {
@@ -174,6 +181,7 @@ async fn every_listing_refuses_an_unissued_token_with_the_modelled_validation_ex
             path: "/exporttasks".to_string(),
             entries_member: "tasks",
             space: "task",
+            token_scope: "ListExportTasks:".to_string(),
             prefixed_but_invalid: "t-short",
         },
         Listing {
@@ -181,6 +189,9 @@ async fn every_listing_refuses_an_unissued_token_with_the_modelled_validation_ex
             path: format!("/graphs/{graph}/endpoints/"),
             entries_member: "privateGraphEndpoints",
             space: "vpc",
+            // This listing pages the endpoints held under ONE graph, so the graph is
+            // part of what its tokens carry.
+            token_scope: format!("ListPrivateGraphEndpoints:{graph}:"),
             // `VpcId`'s pattern requires at least one character after the prefix.
             prefixed_but_invalid: "vpc-",
         },
@@ -261,7 +272,7 @@ async fn every_listing_refuses_an_unissued_token_with_the_modelled_validation_ex
             .find(|(space, _)| *space == listing.space)
             .map(|(_, position)| *position)
             .unwrap_or_else(|| panic!("case {operation}: no id space named {}", listing.space));
-        let token = issued_token(operation, own);
+        let token = issued_token(&listing.token_scope, own);
         let case = format!("{operation} with issued token {token:?}");
         let path = format!("{}?nextToken={token}", listing.path);
         let (status, answer) = call(&router, "GET", &path, None).await;

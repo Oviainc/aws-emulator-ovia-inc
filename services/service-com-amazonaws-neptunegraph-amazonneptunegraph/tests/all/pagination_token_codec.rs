@@ -202,6 +202,10 @@ struct Listing {
     path: String,
     entries_member: &'static str,
     key_member: &'static str,
+    /// What a token of this listing carries ahead of the position: the operation's own
+    /// name, and — for the listing whose entries are ordered inside one graph's own
+    /// collection — that graph too.
+    token_scope: String,
     /// A position in THIS listing's id space to resume from, chosen to sort at or
     /// before every stored entry. Whether an entry occupies it is not assumed: the
     /// assertion is that the page reports exactly the entries sorting after it.
@@ -211,10 +215,10 @@ struct Listing {
     foreign_tokens: Vec<String>,
 }
 
-/// The token this service issues for `position` in the listing `operation` pages: the
-/// listing that minted it and the position it reached, hex-encoded.
-fn issued_token(operation: &str, position: &str) -> String {
-    hex::encode(format!("{operation}:{position}"))
+/// The token this service issues for `position` in the listing `scope` names: the scope
+/// the token belongs to and the position it reached, hex-encoded.
+fn issued_token(scope: &str, position: &str) -> String {
+    hex::encode(format!("{scope}{position}"))
 }
 
 /// `GET` the listing with the query string `query` (already encoded, without the `?`).
@@ -280,6 +284,7 @@ async fn every_listing_issues_and_accepts_the_one_pagination_token_format() {
             path: "/graphs".to_string(),
             entries_member: "graphs",
             key_member: "id",
+            token_scope: "ListGraphs:".to_string(),
             // The least value of the modelled `GraphId` pattern `^g-[a-z0-9]{10}$`.
             probe_position: "g-0000000000",
             foreign_tokens: vec![
@@ -294,6 +299,7 @@ async fn every_listing_issues_and_accepts_the_one_pagination_token_format() {
             path: "/snapshots".to_string(),
             entries_member: "graphSnapshots",
             key_member: "id",
+            token_scope: "ListGraphSnapshots:".to_string(),
             // The least value of the modelled `SnapshotId` pattern `^gs-[a-z0-9]{10}$`.
             probe_position: "gs-0000000000",
             foreign_tokens: vec![
@@ -308,6 +314,9 @@ async fn every_listing_issues_and_accepts_the_one_pagination_token_format() {
             path: format!("/graphs/{graph_id}/endpoints/"),
             entries_member: "privateGraphEndpoints",
             key_member: "vpcId",
+            // This listing pages the endpoints held under ONE graph, so the graph is
+            // part of what its tokens carry.
+            token_scope: format!("ListPrivateGraphEndpoints:{graph_id}:"),
             // A position in the modelled `VpcId` pattern `^vpc-[a-z0-9]+$` that sorts
             // before every VPC id these endpoints were created in.
             probe_position: "vpc-0",
@@ -323,6 +332,7 @@ async fn every_listing_issues_and_accepts_the_one_pagination_token_format() {
             path: "/exporttasks".to_string(),
             entries_member: "tasks",
             key_member: "taskId",
+            token_scope: "ListExportTasks:".to_string(),
             // The least value of the modelled `ExportTaskId` pattern `^t-[a-z0-9]{10}$`.
             probe_position: "t-0000000000",
             foreign_tokens: vec![
@@ -377,9 +387,9 @@ async fn every_listing_issues_and_accepts_the_one_pagination_token_format() {
                     .unwrap_or_else(|| panic!("case {case}: a token was issued for an empty page"));
                 assert_eq!(
                     issued,
-                    issued_token(operation, last),
-                    "case {case}: expected the token to be the hex encoding of this listing and \
-                     {last:?}, got {issued:?}"
+                    issued_token(&listing.token_scope, last),
+                    "case {case}: expected the token to be the hex encoding of this listing's \
+                     scope and {last:?}, got {issued:?}"
                 );
             }
             assert!(
@@ -412,7 +422,7 @@ async fn every_listing_issues_and_accepts_the_one_pagination_token_format() {
         // entry occupies that position, which is what keeps an entry deleted between
         // two pages from hiding the entries that follow it.
         let position = listing.probe_position;
-        let token = issued_token(operation, position);
+        let token = issued_token(&listing.token_scope, position);
         let (status, body) = list(&router, listing, &format!("nextToken={token}")).await;
         let case = format!("{operation}, position {position:?}");
         let resumed = keys(&case, listing, status, &body);

@@ -106,19 +106,24 @@ async fn graph_id(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 /// One paginated listing: the operation, where it is served, the member carrying its
-/// entries, and two positions in the id space its tokens name a position in.
+/// entries, the scope its tokens belong to, and two positions in the id space its tokens
+/// name a position in.
 struct Listing {
     operation: &'static str,
     path: String,
     entries_member: &'static str,
+    /// What a token of this listing carries ahead of the position: the operation's own
+    /// name, and — for the listing whose entries are ordered inside one graph's own
+    /// collection — that graph too.
+    token_scope: String,
     positions: [&'static str; 2],
 }
 
-/// The token this service issues for `position` in the listing `operation` pages: the
-/// listing that minted it and the position it reached, hex-encoded. The spelling of
-/// that hex is what this suite varies.
-fn issued_token(operation: &str, position: &str) -> String {
-    hex::encode(format!("{operation}:{position}"))
+/// The token this service issues for `position` in the listing `scope` names: the scope
+/// the token belongs to and the position it reached, hex-encoded. The spelling of that
+/// hex is what this suite varies.
+fn issued_token(scope: &str, position: &str) -> String {
+    hex::encode(format!("{scope}{position}"))
 }
 
 /// The byte offsets of the letters of `token` — the only digits of the hex grammar that
@@ -211,30 +216,37 @@ fn listings(graph: &str) -> Vec<Listing> {
             operation: "ListGraphs",
             path: "/graphs".to_string(),
             entries_member: "graphs",
+            token_scope: "ListGraphs:".to_string(),
             positions: ["g-0000000000", "g-abcdefghij"],
         },
         Listing {
             operation: "ListGraphSnapshots",
             path: "/snapshots".to_string(),
             entries_member: "graphSnapshots",
+            token_scope: "ListGraphSnapshots:".to_string(),
             positions: ["gs-0000000000", "gs-abcdefghij"],
         },
         Listing {
             operation: "ListImportTasks",
             path: "/importtasks".to_string(),
             entries_member: "tasks",
+            token_scope: "ListImportTasks:".to_string(),
             positions: ["t-0000000000", "t-abcdefghij"],
         },
         Listing {
             operation: "ListExportTasks",
             path: "/exporttasks".to_string(),
             entries_member: "tasks",
+            token_scope: "ListExportTasks:".to_string(),
             positions: ["t-0000000000", "t-abcdefghij"],
         },
         Listing {
             operation: "ListPrivateGraphEndpoints",
             path: format!("/graphs/{graph}/endpoints/"),
             entries_member: "privateGraphEndpoints",
+            // This listing pages the endpoints held under ONE graph, so the graph is
+            // part of what its tokens carry.
+            token_scope: format!("ListPrivateGraphEndpoints:{graph}:"),
             positions: ["vpc-0a1b2c3d4e5f00000", "vpc-abcdef"],
         },
     ]
@@ -249,7 +261,7 @@ async fn every_listing_accepts_only_the_token_spelling_it_mints() {
         let operation = listing.operation;
         for position in listing.positions {
             // The one spelling the service mints for this position resumes the listing.
-            let issued = issued_token(operation, position);
+            let issued = issued_token(&listing.token_scope, position);
             let case = format!("{operation} with the issued token {issued:?}");
             let path = format!("{}?nextToken={issued}", listing.path);
             let (status, answer) = call(&router, "GET", &path, None).await;
@@ -304,6 +316,7 @@ async fn a_token_a_listing_issued_is_the_only_spelling_it_takes_back() {
         operation: "ListGraphs",
         path: "/graphs".to_string(),
         entries_member: "graphs",
+        token_scope: "ListGraphs:".to_string(),
         positions: ["g-0000000000", "g-abcdefghij"],
     };
 

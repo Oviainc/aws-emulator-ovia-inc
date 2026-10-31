@@ -77,6 +77,8 @@ mod listing_paging_rule;
 mod minted_snapshot_name_rule;
 #[path = "all/page_token_listing_scope.rs"]
 mod page_token_listing_scope;
+#[path = "all/page_token_parent_scope.rs"]
+mod page_token_parent_scope;
 #[path = "all/page_token_spelling.rs"]
 mod page_token_spelling;
 #[path = "all/pagination_token_codec.rs"]

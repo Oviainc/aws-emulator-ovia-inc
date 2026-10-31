@@ -2630,7 +2630,8 @@ pub const TAG_KEY_PATTERN: &str = "^[a-zA-Z+-=._:/]+$";
 /// From the modelled `TagValue`: `@length(0..256)`.
 pub const MAX_TAG_VALUE_CHARS: usize = 256;
 
-/// One paginated listing of this service, as the scope a pagination token belongs to.
+/// One paginated listing of this service, the listing half of the scope a pagination
+/// token belongs to ([`PageScope`]).
 ///
 /// A token names a position in ONE listing's order — the order of the listing that
 /// handed it out — so the listing is part of what a token carries and is checked when
@@ -2650,7 +2651,9 @@ pub enum PagedListing {
     ImportTasks,
     /// `ListExportTasks`, ordered by export-task id.
     ExportTasks,
-    /// `ListPrivateGraphEndpoints`, ordered by VPC id.
+    /// `ListPrivateGraphEndpoints`, ordered by VPC id inside the collection held under
+    /// one graph, so a token of it is scoped to that graph as well
+    /// ([`PageScope::listing_in`]).
     PrivateGraphEndpoints,
 }
 
@@ -2681,61 +2684,114 @@ impl PagedListing {
     }
 }
 
-/// What separates the minting listing from the position inside a token's decoded
-/// payload.
+/// What separates the minting listing — and, where it has one, the parent its entries
+/// are ordered inside — from the position inside a token's decoded payload.
 ///
 /// Neither a listing's name nor any key this service orders a listing by carries this
-/// character, so a payload splits back into exactly the two parts it was built from.
+/// character, so a payload splits back into exactly the parts it was built from.
 const PAGE_TOKEN_SEPARATOR: char = ':';
 
-/// The pagination token `listing` resumes after `last_returned_key` — the id, or other
+/// The scope one pagination token belongs to: the listing that minted it, and — when
+/// that listing pages a collection held per parent resource — the parent whose order
+/// the position lies in.
+///
+/// A position names a cut point in ONE order. Four listings of this service range over a
+/// single collection and apply their `graphIdentifier` restriction as a filter after the
+/// range, so one total order underlies every page of them and the listing alone scopes
+/// their tokens. `ListPrivateGraphEndpoints` instead pages the endpoints held under one
+/// graph ([`ComAmazonawsNeptunegraphAmazonneptunegraphState::private_endpoints`]), a
+/// separate order per graph, so the
+/// parent is part of the scope: the same VPC id is a legal key under every graph and
+/// names a different cut point in each of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageScope<'parent> {
+    /// Which listing minted — and will take back — the token.
+    listing: PagedListing,
+    /// The parent resource whose own collection the position lies in, for a listing
+    /// that keeps one order per parent, and `None` for a listing with a single order.
+    parent: Option<&'parent str>,
+}
+
+impl<'parent> PageScope<'parent> {
+    /// The scope of a listing that pages ONE order: a token of it names a position in
+    /// that order wherever the listing is asked from.
+    pub const fn whole_listing(listing: PagedListing) -> Self {
+        Self {
+            listing,
+            parent: None,
+        }
+    }
+
+    /// The scope of a listing that pages the collection held under `parent`: a token of
+    /// it names a position in THAT parent's order and in no other's.
+    pub const fn listing_in(listing: PagedListing, parent: &'parent str) -> Self {
+        Self {
+            listing,
+            parent: Some(parent),
+        }
+    }
+
+    /// How a token spells the scope it belongs to: the listing's own name, followed by
+    /// the parent whose order the position lies in when the listing keeps one order per
+    /// parent.
+    fn label(self) -> String {
+        match self.parent {
+            Some(parent) => format!("{}{PAGE_TOKEN_SEPARATOR}{parent}", self.listing.label()),
+            None => self.listing.label().to_string(),
+        }
+    }
+}
+
+/// The pagination token `scope` resumes after `last_returned_key` — the id, or other
 /// stable key, of the last entry the page just returned.
 ///
 /// ONE token format for every listing of this service, so a client that pages one
-/// listing and then another sees one token grammar: the listing and the position it
-/// reached, hex-encoded, which keeps the token opaque to a client and within
-/// `PaginationToken`'s 1..8192 length.
-pub fn encode_page_token(listing: PagedListing, last_returned_key: &str) -> String {
+/// listing and then another sees one token grammar: the scope the token belongs to and
+/// the position it reached, hex-encoded, which keeps the token opaque to a client and
+/// within `PaginationToken`'s 1..8192 length.
+pub fn encode_page_token(scope: PageScope<'_>, last_returned_key: &str) -> String {
     hex::encode(format!(
         "{}{PAGE_TOKEN_SEPARATOR}{last_returned_key}",
-        listing.label()
+        scope.label()
     ))
 }
 
-/// The position a token resumes `listing` after, or `None` when it is not a token
-/// [`encode_page_token`] minted for that listing.
+/// The position a token resumes `scope` after, or `None` when it is not a token
+/// [`encode_page_token`] minted for that scope.
 ///
-/// A token is a token OF ONE LISTING: it is accepted only when it names `listing`
-/// itself and a position in the id space `listing` orders its entries by. A token
-/// another listing minted — even one whose position lies in the same modelled id space,
-/// as an import-task token's does for the export-task listing — names no position in
-/// this listing's order, so it is refused rather than used as a cut point in a
-/// collection it was never taken from.
+/// A token is a token OF ONE SCOPE: it is accepted only when it names `scope` itself —
+/// the listing, and the parent that listing was paging when the token was handed out —
+/// and a position in the id space that listing orders its entries by. A token minted
+/// under any other scope, even one whose position lies in the same modelled id space (an
+/// import-task token sent to the export-task listing, or one graph's endpoint token sent
+/// to another graph's endpoints), names no position in the order being paged, so it is
+/// refused rather than used as a cut point in a collection it was never taken from.
 ///
 /// Membership in the store is deliberately NOT required: a resource deleted between two
 /// pages must still leave its successors reachable, which is what resuming from a
 /// position — rather than from a row — gives.
 ///
-/// The accepted set is exactly the MINTED set: a value is a token of this listing only
+/// The accepted set is exactly the MINTED set: a value is a token of this scope only
 /// when it is, byte for byte, the token [`encode_page_token`] produces for the position
 /// it decodes to. Decoding alone is weaker than that — several spellings of the token
 /// grammar can carry the same bytes, and only one of them is ever handed out — so the
 /// token is compared against its own canonical minting before the id space is consulted.
-pub fn decode_page_token(token: &str, listing: PagedListing) -> Option<String> {
+pub fn decode_page_token(token: &str, scope: PageScope<'_>) -> Option<String> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
     let position = decoded
-        .strip_prefix(listing.label())?
+        .strip_prefix(&scope.label())?
         .strip_prefix(PAGE_TOKEN_SEPARATOR)?;
-    if encode_page_token(listing, position) != token {
+    if encode_page_token(scope, position) != token {
         return None;
     }
-    listing
+    scope
+        .listing
         .holds_position(position)
         .then(|| position.to_string())
 }
 
 /// The modelled `ValidationException` for a `nextToken` [`decode_page_token`] refuses:
-/// a value this service never issued for the listing it was sent to.
+/// a value this service never issued for the page it was sent to.
 ///
 /// The service models its own `ValidationException`, which carries a `reason` beside
 /// `message` (`smithy_query(query="shape",shape="ValidationException")`), so every
@@ -2791,13 +2847,13 @@ pub fn resolve_page_size(max_results: Option<i32>) -> usize {
 pub fn take_page<T, I: Iterator<Item = T>>(
     entries: &mut I,
     page_size: usize,
-    listing: PagedListing,
+    scope: PageScope<'_>,
     key_of: impl Fn(&T) -> &str,
 ) -> (Vec<T>, Option<String>) {
     let page: Vec<T> = entries.by_ref().take(page_size).collect();
     let next_token = if entries.next().is_some() {
         page.last()
-            .map(|entry| encode_page_token(listing, key_of(entry)))
+            .map(|entry| encode_page_token(scope, key_of(entry)))
     } else {
         None
     };

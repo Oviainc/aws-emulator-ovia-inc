@@ -77,14 +77,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 // The page-size resolution and the page-plus-token decision every listing of this
-// service shares, hosted once in `crate::state` beside the token codec and the id-space
-// predicates its decode half takes. Only the id space and the key an entry is ordered
-// by are this listing's own.
-// The page-size resolution and the page-plus-token decision every listing of this
-// service shares, hosted once in `crate::state` beside the token codec and the listing
-// scopes its two halves take. Only which listing this is, and the key an entry is
-// ordered by, are this file's own.
-use crate::state::{resolve_page_size, take_page, unissued_page_token, PagedListing};
+// service shares, hosted once in `crate::state` beside the token codec and the page
+// scopes its two halves take. Only which scope this listing's tokens belong to, and the
+// key an entry is ordered by, are this file's own.
+use crate::state::{resolve_page_size, take_page, unissued_page_token, PageScope, PagedListing};
 // The token format itself is reached through `take_page`, so only this file's own
 // round-trip test names it.
 #[cfg(test)]
@@ -175,15 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // A token this service did not issue names no page, so it is refused rather
-        // than treated as the start of the listing. The refusal is the service's own
-        // modelled 400, worded and classified once in `crate::state`.
+        // A token this service did not issue for THIS page names no position in it, so
+        // it is refused rather than treated as the start of the listing: this listing
+        // pages the endpoints held under one graph, so its tokens belong to the graph
+        // they were minted while paging and to no other. The refusal is the service's
+        // own modelled 400, worded and classified once in `crate::state`.
+        let scope = page_scope(&input.graph_identifier);
         let start_after = match input.next_token.as_deref() {
-            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
-                ListPrivateGraphEndpointsErrorModeled::ValidationException(unissued_page_token(
-                    token,
-                ))
-            })?),
+            Some(token) => Some(
+                decode_page_token(token, &input.graph_identifier).ok_or_else(|| {
+                    ListPrivateGraphEndpointsErrorModeled::ValidationException(
+                        unissued_page_token(token),
+                    )
+                })?,
+            ),
             None => None,
         };
         let page_size = resolve_page_size(input.max_results);
@@ -217,9 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .private_endpoints_of(&graph_id, start_after.as_deref())
             .map(PrivateGraphEndpointSummary::from);
         let (private_graph_endpoints, next_token) =
-            take_page(&mut remaining, page_size, LISTING, |endpoint| {
-                &endpoint.vpc_id
-            });
+            take_page(&mut remaining, page_size, scope, |endpoint| &endpoint.vpc_id);
 
         Ok(Self::Output {
             private_graph_endpoints,
@@ -232,33 +231,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// token is accepted only by the listing that handed it out.
 const LISTING: PagedListing = PagedListing::PrivateGraphEndpoints;
 
-/// The VPC id a token resumes after, or `None` when the token is not one
-/// [`crate::state::encode_page_token`] produced for THIS listing.
+/// The scope a token of this listing belongs to: the listing, AND the graph whose
+/// endpoints were being paged when the token was minted.
 ///
-/// Only the listing is this file's own: the wire format, and the decision to refuse a
-/// value that names no position in that listing's order rather than treat it as the
-/// start of the list, are [`crate::state::decode_page_token`]'s.
-fn decode_page_token(token: &str) -> Option<String> {
-    crate::state::decode_page_token(token, LISTING)
+/// Unlike every other listing of this service, this one's entries are ordered INSIDE one
+/// graph's own collection, so a position names a cut point in that graph's order alone;
+/// the same VPC id is a legal key under every graph. The graph is therefore part of what
+/// the token carries and is checked when it comes back, which is what keeps a token
+/// minted on one graph from cutting another graph's page short. `graphIdentifier` is the
+/// graph id itself (modelled `^g-[a-z0-9]{10}$`), which is the key the endpoints of a
+/// graph are held under, so the scope is the identifier the request named.
+fn page_scope(graph_identifier: &str) -> PageScope<'_> {
+    PageScope::listing_in(LISTING, graph_identifier)
+}
+
+/// The VPC id a token resumes `graph_identifier`'s endpoints after, or `None` when the
+/// token is not one [`crate::state::encode_page_token`] produced for THIS listing of
+/// THAT graph.
+///
+/// Only the scope is this file's own: the wire format, and the decision to refuse a
+/// value that names no position in that scope's order rather than treat it as the start
+/// of the list, are [`crate::state::decode_page_token`]'s.
+fn decode_page_token(token: &str, graph_identifier: &str) -> Option<String> {
+    crate::state::decode_page_token(token, page_scope(graph_identifier))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_page_token, encode_page_token, PagedListing, LISTING};
+    use super::{decode_page_token, encode_page_token, page_scope, PageScope, PagedListing};
 
-    /// A token round-trips to the VPC id it was minted from, and a token this listing
-    /// never issued is rejected rather than silently treated as the first page.
+    /// Two graphs, each holding its own order of endpoints: the ids are written to the
+    /// modelled `GraphIdentifier` pattern `^g-[a-z0-9]{10}$`
+    /// (`smithy_query(query="shape",shape="GraphIdentifier")`).
+    const GRAPHS: [&str; 2] = ["g-0123456789", "g-abcdefghij"];
+
+    /// A token round-trips to the VPC id it was minted from, in the graph it was minted
+    /// for, and a token this listing of that graph never issued is rejected rather than
+    /// silently treated as the first page.
     #[test]
     fn page_tokens_round_trip_and_reject_foreign_tokens() {
-        for vpc_id in ["vpc-0", "vpc-abc", "vpc-0a1b2c3d4e5f67890"] {
-            let token = encode_page_token(LISTING, vpc_id);
-            let decoded = decode_page_token(&token);
-            assert_eq!(
-                decoded.as_deref(),
-                Some(vpc_id),
-                "case {vpc_id:?}: token {token:?} did not round-trip, got {decoded:?}"
-            );
+        for graph in GRAPHS {
+            for vpc_id in ["vpc-0", "vpc-abc", "vpc-0a1b2c3d4e5f67890"] {
+                let token = encode_page_token(page_scope(graph), vpc_id);
+                let decoded = decode_page_token(&token, graph);
+                assert_eq!(
+                    decoded.as_deref(),
+                    Some(vpc_id),
+                    "case {graph} {vpc_id:?}: token {token:?} did not round-trip, got {decoded:?}"
+                );
+            }
         }
+        let [graph, other_graph] = GRAPHS;
         for foreign in [
             "not-a-token",
             "zz",
@@ -269,16 +292,37 @@ mod tests {
             &hex::encode("VPC-ABC"),
             // A graph id is a position in another id space.
             &hex::encode("g-0123456789"),
-            // A bare position, in this listing's own id space, carrying no listing: not
+            // A bare position, in this listing's own id space, carrying no scope: not
             // a value this listing ever handed out.
             &hex::encode("vpc-0a1b2c3d"),
+            // This listing's name and a position, without the graph the order belongs
+            // to: no page of a per-graph listing is named by that.
+            &encode_page_token(
+                PageScope::whole_listing(PagedListing::PrivateGraphEndpoints),
+                "vpc-0a1b2c3d",
+            ),
+            // The same position in ANOTHER graph's order: a legal key under every
+            // graph, and a different cut point in each.
+            &encode_page_token(page_scope(other_graph), "vpc-0a1b2c3d"),
             // Every OTHER listing's token for a position in its own id space.
-            &encode_page_token(PagedListing::Graphs, "g-0123456789"),
-            &encode_page_token(PagedListing::GraphSnapshots, "gs-0123456789"),
-            &encode_page_token(PagedListing::ImportTasks, "t-0123456789"),
-            &encode_page_token(PagedListing::ExportTasks, "t-0123456789"),
+            &encode_page_token(
+                PageScope::whole_listing(PagedListing::Graphs),
+                "g-0123456789",
+            ),
+            &encode_page_token(
+                PageScope::whole_listing(PagedListing::GraphSnapshots),
+                "gs-0123456789",
+            ),
+            &encode_page_token(
+                PageScope::whole_listing(PagedListing::ImportTasks),
+                "t-0123456789",
+            ),
+            &encode_page_token(
+                PageScope::whole_listing(PagedListing::ExportTasks),
+                "t-0123456789",
+            ),
         ] {
-            let decoded = decode_page_token(foreign);
+            let decoded = decode_page_token(foreign, graph);
             assert!(
                 decoded.is_none(),
                 "case {foreign:?}: expected rejection, got {decoded:?}"

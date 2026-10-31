@@ -80,7 +80,7 @@ use super::types::*;
 // service shares, hosted once in `crate::state` beside the token codec and the listing
 // scopes its two halves take. Only which listing this is, and the key an entry is
 // ordered by, are this file's own.
-use crate::state::{resolve_page_size, take_page, unissued_page_token, PagedListing};
+use crate::state::{resolve_page_size, take_page, unissued_page_token, PageScope, PagedListing};
 // The token format itself is reached through `take_page`, so only this file's own
 // round-trip test names it.
 #[cfg(test)]
@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut remaining = store
             .import_tasks_in(&region, of_graph.as_deref(), start_after.as_deref())
             .map(ImportTaskSummary::from);
-        let (tasks, next_token) = take_page(&mut remaining, page_size, LISTING, |summary| {
+        let (tasks, next_token) = take_page(&mut remaining, page_size, SCOPE, |summary| {
             &summary.task_id
         });
 
@@ -227,26 +227,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// token to the order it names a position in.
 const LISTING: PagedListing = PagedListing::ImportTasks;
 
+/// The scope a token of this listing belongs to: the listing alone, because it pages ONE
+/// order — `import_tasks` keyed by task id, with any `graphIdentifier` restriction
+/// applied as a filter after the range — so a position names the same cut point in it
+/// whichever graph the listing was restricted to.
+const SCOPE: PageScope<'static> = PageScope::whole_listing(LISTING);
+
 /// The import-task id a token resumes after, or `None` when the token is not one
 /// [`crate::state::encode_page_token`] produced for THIS listing.
 ///
-/// Only the listing is this file's own: the wire format, and the decision to refuse a
-/// value that names no position in that listing's order rather than treat it as the
+/// Only the scope is this file's own: the wire format, and the decision to refuse a
+/// value that names no position in that scope's order rather than treat it as the
 /// start of the list, are [`crate::state::decode_page_token`]'s.
 fn decode_page_token(token: &str) -> Option<String> {
-    crate::state::decode_page_token(token, LISTING)
+    crate::state::decode_page_token(token, SCOPE)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_page_token, encode_page_token, PagedListing, LISTING};
+    use super::{decode_page_token, encode_page_token, PageScope, PagedListing, SCOPE};
 
     /// A token round-trips to the id it was minted from, and a token this listing never
     /// issued is rejected rather than silently treated as the first page.
     #[test]
     fn page_tokens_round_trip_and_reject_foreign_tokens() {
         for id in ["t-0000000000", "t-abcdefghij", "t-zz99zz99zz"] {
-            let token = encode_page_token(LISTING, id);
+            let token = encode_page_token(SCOPE, id);
             let decoded = decode_page_token(&token);
             assert_eq!(
                 decoded.as_deref(),
@@ -269,11 +275,25 @@ mod tests {
             &hex::encode("gs-0123456789"),
             // The token the SIBLING task listing mints for a position in the one task-id
             // space both are keyed by: a cut point in the other collection's order.
-            &encode_page_token(PagedListing::ExportTasks, "t-0123456789"),
+            &encode_page_token(
+                PageScope::whole_listing(PagedListing::ExportTasks),
+                "t-0123456789",
+            ),
             // And every other listing's token for a position in its own id space.
-            &encode_page_token(PagedListing::Graphs, "g-0123456789"),
-            &encode_page_token(PagedListing::GraphSnapshots, "gs-0123456789"),
-            &encode_page_token(PagedListing::PrivateGraphEndpoints, "vpc-0a1b2c3d"),
+            &encode_page_token(
+                PageScope::whole_listing(PagedListing::Graphs),
+                "g-0123456789",
+            ),
+            &encode_page_token(
+                PageScope::whole_listing(PagedListing::GraphSnapshots),
+                "gs-0123456789",
+            ),
+            // The endpoint listing's token for a position in its own id space, under the
+            // graph whose endpoints it pages.
+            &encode_page_token(
+                PageScope::listing_in(PagedListing::PrivateGraphEndpoints, "g-0123456789"),
+                "vpc-0a1b2c3d",
+            ),
         ] {
             let decoded = decode_page_token(foreign);
             assert!(
