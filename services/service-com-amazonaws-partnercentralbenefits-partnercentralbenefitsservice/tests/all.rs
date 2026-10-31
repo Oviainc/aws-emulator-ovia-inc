@@ -59,6 +59,8 @@ mod file_name_length_bound;
 mod get_benefit;
 #[path = "all/get_benefit_allocation.rs"]
 mod get_benefit_allocation;
+#[path = "all/handler_enforced_length_wording.rs"]
+mod handler_enforced_length_wording;
 #[path = "all/idempotent_parameter_mismatch.rs"]
 mod idempotent_parameter_mismatch;
 #[path = "all/list_applications_filter_members.rs"]

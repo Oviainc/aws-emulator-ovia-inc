@@ -345,6 +345,14 @@ pub const ALLOCATION_TERM_MILLIS: i64 = 365 * MILLIS_PER_DAY;
 /// one correction touches, while keeping one request's work and footprint finite.
 pub const MAX_AMENDMENTS_PER_REQUEST: usize = 20;
 
+/// The fewest amendments one `AmendBenefitApplication` request may carry.
+///
+/// The model marks `Amendments` `@required` but gives `AmendmentList` no `@length`, so an
+/// empty list satisfies the centralized walk and this is the other end of the bound the
+/// handler enforces for itself: a request that names nothing to amend amends nothing, and
+/// is refused rather than answered with a write that did not happen.
+pub const MIN_AMENDMENTS_PER_REQUEST: usize = 1;
+
 /// The longest `Amendment$FieldPath` this service reads.
 ///
 /// The member is an unconstrained `String`, so this is what keeps a path (and the record
@@ -3315,10 +3323,24 @@ pub fn validation_field(
 ///
 /// `None` when the value satisfies the bound.
 pub fn length_clause(value: &str, min: usize, max: usize) -> Option<String> {
-    let length = value.chars().count();
-    let kind = if length < min {
+    count_length_clause(value.chars().count(), min, max)
+}
+
+/// Whether a COUNT satisfies the `@length(min: min, max: max)` of the collection it is the
+/// length of — the elements of a list, the entries of a map.
+///
+/// The same wording [`length_clause`] gives a string's length, for the same reason: a
+/// length bound a handler enforces for itself (one the model leaves off the collection, so
+/// both of its ends live in the handler) states the requirement
+/// [`crate::service::constraint_requirement`] words for that violation class, at BOTH ends,
+/// rather than a sentence of its own that can drift from the one the centralized walk
+/// states for the other end of the same member.
+///
+/// `None` when the count satisfies the bound.
+pub fn count_length_clause(count: usize, min: usize, max: usize) -> Option<String> {
+    let kind = if count < min {
         ::smithy_server_runtime::ViolationKind::MinLength(min as i64)
-    } else if length > max {
+    } else if count > max {
         ::smithy_server_runtime::ViolationKind::MaxLength(max as i64)
     } else {
         return None;

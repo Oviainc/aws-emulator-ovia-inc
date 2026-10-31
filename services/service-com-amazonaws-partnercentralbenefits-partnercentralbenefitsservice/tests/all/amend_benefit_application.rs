@@ -18,7 +18,7 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
     not_found_message, APPLICATION_KIND, MAX_AMENDMENTS_PER_REQUEST, MAX_AMENDMENT_REASON_LEN,
     MAX_CLIENT_TOKEN_LEN, MAX_DETAILS_BYTES, MAX_DETAILS_MEMBERS, MAX_DETAILS_VALUE_LEN,
-    MAX_FIELD_PATH_LEN,
+    MAX_FIELD_PATH_LEN, MIN_AMENDMENTS_PER_REQUEST,
 };
 
 use crate::benefit_application_lifecycle::{error_code, Harness};
@@ -544,9 +544,14 @@ async fn amend_refuses_an_unamendable_path_or_a_value_past_a_bound() {
         (
             "no amendment at all",
             json!([]),
+            // The list's own bound, worded the way this service words EVERY length —
+            // the same vocabulary the max bound below this table states.
             Some(clause(
                 "amendments",
-                "Member must name at least one field to amend",
+                &format!(
+                    "Member must have length greater than or equal to \
+                     {MIN_AMENDMENTS_PER_REQUEST}"
+                ),
             )),
         ),
         ("a service-owned field", json!([amendment("Status", "APPROVED")]), None),

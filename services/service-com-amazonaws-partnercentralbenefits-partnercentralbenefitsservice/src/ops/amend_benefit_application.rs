@@ -47,7 +47,8 @@
 //! validation runs.
 //!
 //! The members the model leaves unconstrained carry this service's own bounds, so no
-//! request and no sequence of requests can grow one record without limit: at most
+//! request and no sequence of requests can grow one record without limit: at least
+//! [`crate::state::MIN_AMENDMENTS_PER_REQUEST`] and at most
 //! [`crate::state::MAX_AMENDMENTS_PER_REQUEST`] amendments per request, a `FieldPath` of
 //! at most [`crate::state::MAX_FIELD_PATH_LEN`] bytes and
 //! [`crate::state::MAX_DETAILS_DEPTH`] segments, a details value — and a value written to
@@ -148,7 +149,6 @@ use super::types::*;
 use std::collections::HashMap;
 
 use ::aws_smithy_types::Document;
-use smithy_server_runtime::ViolationKind;
 
 /// The benefit-application member `Name` amends, as the model spells it on the wire.
 const FIELD_NAME: &str = "Name";
@@ -442,13 +442,17 @@ fn refused(member: &str, clause: &str) -> AmendBenefitApplicationError {
 
 /// The number of amendments one request may carry, as the clause states it — a length
 /// bound on the list, worded like any other.
+///
+/// BOTH of its ends go through the one length wording of this crate
+/// ([`crate::state::count_length_clause`], which words a length with
+/// [`crate::service::constraint_requirement`]), so the two bounds of this one member are
+/// stated in one vocabulary and a caller parses them the same way.
 fn amendments_length_clause(count: usize) -> Option<String> {
-    (count > crate::state::MAX_AMENDMENTS_PER_REQUEST).then(|| {
-        crate::service::constraint_requirement(&ViolationKind::MaxLength(
-            crate::state::MAX_AMENDMENTS_PER_REQUEST as i64,
-        ))
-        .unwrap_or_default()
-    })
+    crate::state::count_length_clause(
+        count,
+        crate::state::MIN_AMENDMENTS_PER_REQUEST,
+        crate::state::MAX_AMENDMENTS_PER_REQUEST,
+    )
 }
 
 /// Apply one amendment to `application`, or report why it cannot be applied.
@@ -709,12 +713,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service applies in one request: the model requires the list but constrains no
         // length, so both bounds live here — ahead of the store lock, so the loop that
         // applies them runs under the lock with a cited bound.
-        if input.amendments.is_empty() {
-            return Err(refused(
-                AMENDMENTS_MEMBER,
-                "Member must name at least one field to amend",
-            ));
-        }
         if let Some(clause) = amendments_length_clause(input.amendments.len()) {
             return Err(refused(AMENDMENTS_MEMBER, &clause));
         }
