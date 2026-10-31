@@ -211,6 +211,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Domain` (`UserPoolId` is **required** here), and the pair is
         // resolved as a unit: a pool that is not stored holds no domain,
         // exactly as a stored pool holds none under a name it never took.
+        // A domain name is unique across pools, so the `Domain` half resolving
+        // to a domain of another pool is a pool that is not configured with it
+        // rather than a pair that names nothing.
+        if guard.domain_of_other_pool(&input.user_pool_id, &input.domain) {
+            return Err(domain_of_other_pool());
+        }
+
         let Some(pool) = guard.pool(&input.user_pool_id) else {
             return Err(user_pool_domain_not_found());
         };
@@ -358,6 +365,22 @@ const USER_POOL_DOMAIN_NOT_FOUND_MESSAGE: &str = "User pool domain was not found
 fn user_pool_domain_not_found() -> UpdateUserPoolDomainError {
     UpdateUserPoolDomainErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(USER_POOL_DOMAIN_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's refusal of a request whose `Domain` is a stored domain of a
+/// DIFFERENT pool, worded as [`crate::state::DOMAIN_OF_OTHER_POOL_MESSAGE`].
+///
+/// The name resolves, so nothing is missing: the pool the request named is not
+/// the one configured with it, so this is a bad pairing of the two parameters —
+/// `InvalidParameterException` is "thrown when the Amazon Cognito service
+/// encounters an invalid parameter" (this service's model) and the model gives
+/// it HTTP 400, unlike the 404 a pair that resolves nothing answers.
+fn domain_of_other_pool() -> UpdateUserPoolDomainError {
+    UpdateUserPoolDomainErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(crate::state::DOMAIN_OF_OTHER_POOL_MESSAGE.to_string()),
+        reason_code: None,
     })
     .into()
 }

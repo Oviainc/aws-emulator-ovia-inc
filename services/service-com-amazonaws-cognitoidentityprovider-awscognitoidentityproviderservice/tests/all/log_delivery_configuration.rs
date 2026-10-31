@@ -529,7 +529,15 @@ async fn a_pool_that_does_not_exist_is_a_400_on_both_operations() {
                  with {payload}"
             );
             let message = error_message(&payload);
-            let expected = format!("User pool {absent} does not exist.");
+            // Each operation words its own pool lookup: the setter answers
+            // Amazon Cognito's sentence for it, which joins `UserPool with ID: `
+            // to `does not exist.` with no separator, and the reader answers its
+            // own.
+            let expected = if operation == "SetLogDeliveryConfiguration" {
+                format!("UserPool with ID: {absent}does not exist.")
+            } else {
+                format!("User pool {absent} does not exist.")
+            };
             assert_eq!(
                 message, expected,
                 "case {case:?}: expected {expected:?}, got {message:?}"

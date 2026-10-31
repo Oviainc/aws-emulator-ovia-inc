@@ -260,12 +260,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A domain string resolves to one pool (`DescribeUserPoolDomain` takes
         // `Domain` alone), so a name any pool already holds is not free. This
         // spans the whole store, so it is checked before the pool this create
-        // writes to is borrowed mutably. The refusal reports only that the
-        // domain is taken: it names neither the domain nor the pool holding it,
-        // so it discloses nothing about a pool the caller may not own.
+        // writes to is borrowed mutably. The refusal is
+        // [`crate::state::DOMAIN_EXISTS_MESSAGE`]: it reports only that the name
+        // is taken, so it discloses nothing about a pool the caller may not own.
         if guard.domain(&input.domain).is_some() {
             return Err(invalid_parameter(
-                "Domain already associated with another user pool.".to_string(),
+                crate::state::DOMAIN_EXISTS_MESSAGE.to_string(),
             ));
         }
 

@@ -176,7 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`DescribeTermsByClient`), so an app client the named pool does not hold
         // has no documents to describe.
         if !pool.clients.contains_key(&input.client_id) {
-            return Err(client_not_found(&input.client_id, &input.user_pool_id));
+            return Err(client_not_found(guard.app_client_lookup_refusal(
+                &input.user_pool_id,
+                &input.client_id,
+                &crate::state::app_client_not_found_message(&input.client_id),
+            )));
         }
 
         // A terms document's name is unique to its app client, so the app
@@ -205,23 +209,18 @@ fn user_pool_not_found(user_pool_id: &str) -> DescribeTermsByClientError {
 /// This operation's `ResourceNotFoundException` for an app client the named pool
 /// does not hold.
 ///
-/// Amazon Cognito's observed refusal for THIS operation's app-client lookup
-/// names both halves of what failed to resolve — the app client asked for and
-/// the pool it was looked for in — in the sentence
-/// `User pool client <ClientId> does not exist in user pool <UserPoolId>.`, with
-/// both variable parts taken from the request. Operations that resolve an app
-/// client with no pool to resolve it in report the shorter sentence (the
-/// `resend_confirmation_code` handler beside this one), which is why that wording is left
-/// where it is rather than reused here.
-///
-/// An app client of another pool is this same refusal: it is not an app client
-/// OF THIS pool, so this pool has no documents of it to describe and none of
-/// this pool's documents may be answered for it.
-fn client_not_found(client_id: &str, user_pool_id: &str) -> DescribeTermsByClientError {
+/// The sentence is the one
+/// [`crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::app_client_lookup_refusal`]
+/// words for this lookup, because the lookup fails in two different ways: a
+/// `ClientId` that names an app client of ANOTHER pool is reported with both
+/// halves of what was asked for — it is not an app client OF THIS pool, so this
+/// pool has no documents of it to describe — while a `ClientId` that names no
+/// app client at all carries this operation's own
+/// [`crate::state::app_client_not_found_message`], which quotes the id the
+/// request asked for.
+fn client_not_found(message: String) -> DescribeTermsByClientError {
     DescribeTermsByClientErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!(
-            "User pool client {client_id} does not exist in user pool {user_pool_id}."
-        )),
+        message: Some(message),
     })
     .into()
 }

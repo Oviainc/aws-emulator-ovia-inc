@@ -225,8 +225,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut guard = state.lock();
+        // Every refusal is decided on a SHARED borrow of the store, because the
+        // wording of an unresolved app-client lookup depends on whether the
+        // `ClientId` names an app client of ANOTHER pool — a question about the
+        // whole store, which cannot be asked while this pool is borrowed
+        // mutably. The mutable borrow is taken once nothing can refuse.
         let pool = guard
-            .pool_mut(&input.user_pool_id)
+            .pool(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
 
         // The add-on precondition is scoped to the setting it governs, not to the
@@ -239,18 +244,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(add_ons_not_enabled());
         }
 
+        // "When you include both ClientId and UserPoolId, Amazon Cognito maps
+        // the configuration to the app client only", so a `ClientId` the named
+        // pool does not hold names no level to configure.
+        if let Some(client_id) = client_id.as_deref() {
+            if !pool.clients.contains_key(client_id) {
+                return Err(client_not_found(guard.app_client_lookup_refusal(
+                    &input.user_pool_id,
+                    client_id,
+                    &crate::state::app_client_not_found_message(client_id),
+                )));
+            }
+        }
+
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(internal_error)?;
+
         // The settings are stored at the level the request names: the app client
-        // when it carries a `ClientId`, since "when you include both ClientId and
-        // UserPoolId, Amazon Cognito maps the configuration to the app client
-        // only", and the pool itself when it carries none. Each response is
-        // rendered from the STORED configuration, which is what a later
-        // `DescribeRiskConfiguration` of that level reads back.
+        // when it carries a `ClientId`, and the pool itself when it carries
+        // none. Each response is rendered from the STORED configuration, which
+        // is what a later `DescribeRiskConfiguration` of that level reads back.
         let stored = match client_id.as_deref() {
             Some(client_id) => {
                 let client = pool
                     .clients
                     .get_mut(client_id)
-                    .ok_or_else(|| client_not_found(client_id))?;
+                    .ok_or_else(internal_error)?;
                 client.risk_configuration = Some(configuration);
                 client
                     .risk_configuration
@@ -282,10 +302,14 @@ fn user_pool_not_found(user_pool_id: &str) -> SetRiskConfigurationError {
 }
 
 /// This operation's `ResourceNotFoundException` for an app client the named pool
-/// does not hold.
-fn client_not_found(client_id: &str) -> SetRiskConfigurationError {
+/// does not hold, carrying the sentence the store's shared app-client lookup
+/// refusal words for it: [`crate::state::app_client_not_found_message`] for a
+/// `ClientId` that names no app client at all, and
+/// [`crate::state::app_client_not_found_in_pool_message`] for one that names an
+/// app client of another pool.
+fn client_not_found(message: String) -> SetRiskConfigurationError {
     SetRiskConfigurationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool client {client_id} does not exist.")),
+        message: Some(message),
     })
     .into()
 }

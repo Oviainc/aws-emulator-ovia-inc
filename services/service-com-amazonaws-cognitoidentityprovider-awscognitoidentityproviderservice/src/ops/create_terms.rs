@@ -211,15 +211,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
+        // Every refusal is decided on a SHARED borrow of the store, because the
+        // wording of an unresolved app-client lookup depends on whether the
+        // `ClientId` names an app client of ANOTHER pool — a question about the
+        // whole store, which cannot be asked while this pool is borrowed
+        // mutably. The mutable borrow is taken once nothing can refuse.
         let pool = guard
-            .pool_mut(&input.user_pool_id)
+            .pool(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
 
         // "The ID of the app client where you want to create terms documents.
         // Must be an app client in the requested user pool."
         // (`CreateTerms.ClientId`).
         if !pool.clients.contains_key(&input.client_id) {
-            return Err(client_not_found(&input.client_id));
+            return Err(client_not_found(guard.app_client_lookup_refusal(
+                &input.user_pool_id,
+                &input.client_id,
+                &crate::state::app_client_not_found_message(&input.client_id),
+            )));
         }
 
         // "Terms document names must be unique to the app client."
@@ -231,6 +240,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(terms_exists(&input.terms_name, &input.client_id));
         }
+
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(internal_error)?;
 
         let terms_id = crate::state::new_uuid();
         let terms = crate::state::Terms {
@@ -266,10 +279,14 @@ fn user_pool_not_found(user_pool_id: &str) -> CreateTermsError {
 }
 
 /// This operation's `ResourceNotFoundException` for an app client the named pool
-/// does not hold.
-fn client_not_found(client_id: &str) -> CreateTermsError {
+/// does not hold, carrying the sentence
+/// [`crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::app_client_lookup_refusal`]
+/// words for that lookup: [`crate::state::app_client_not_found_message`] for an
+/// id that names no app client at all, and the sentence naming the id and the
+/// pool for one that names an app client of another pool.
+fn client_not_found(message: String) -> CreateTermsError {
     CreateTermsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool client {client_id} does not exist.")),
+        message: Some(message),
     })
     .into()
 }

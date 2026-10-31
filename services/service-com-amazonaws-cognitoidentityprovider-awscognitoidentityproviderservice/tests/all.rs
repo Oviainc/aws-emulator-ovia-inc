@@ -143,6 +143,8 @@ mod managed_login_branding_updates;
 mod log_delivery_configuration;
 #[path = "all/message_delivery_and_live_codes.rs"]
 mod message_delivery_and_live_codes;
+#[path = "all/per_operation_refusal_wording.rs"]
+mod per_operation_refusal_wording;
 #[path = "all/pool_configuration_refusal_wire.rs"]
 mod pool_configuration_refusal_wire;
 #[path = "all/pool_plan_and_csv_header.rs"]

@@ -444,19 +444,22 @@ async fn a_delete_that_names_no_stored_domain_is_refused() {
     )
     .await;
 
-    // (case, the request that must be refused)
-    for (label, body) in [
+    // (case, the request that must be refused, the sentence it owes)
+    for (label, body, expected) in [
         (
             "a domain on a user pool that does not exist",
             json!({ "UserPoolId": "us-east-1_absent", "Domain": "held-domain" }),
+            "No such domain or user pool exists.",
         ),
         (
             "a name the named pool does not hold",
             json!({ "UserPoolId": user_pool_id, "Domain": "never-created" }),
+            "No such domain or user pool exists.",
         ),
         (
             "a name another pool holds",
             json!({ "UserPoolId": other_pool_id, "Domain": "held-domain" }),
+            "The domain is not configured for this user pool.",
         ),
     ] {
         let (status, payload) = call(&router, "DeleteUserPoolDomain", &body).await;
@@ -467,8 +470,8 @@ async fn a_delete_that_names_no_stored_domain_is_refused() {
         );
         assert_eq!(
             payload["message"],
-            json!("No such domain or user pool exists."),
-            "case {label:?}: the refusal reports the pair and names neither half, got {payload}"
+            json!(expected),
+            "case {label:?}: expected {expected:?}, got {payload}"
         );
     }
 

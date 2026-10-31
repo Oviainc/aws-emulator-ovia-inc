@@ -618,7 +618,10 @@ async fn an_add_for_a_resource_no_pool_holds_is_refused() {
             Absent::AppClientOfAnotherPool => (
                 named.user_pool_id.clone(),
                 elsewhere.client_id.clone(),
-                format!("User pool client {} does not exist.", elsewhere.client_id),
+                format!(
+                    "User pool client {} does not exist in user pool {}.",
+                    elsewhere.client_id, named.user_pool_id
+                ),
             ),
         };
         let body = json!({ "UserPoolId": user_pool_id, "ClientId": client_id });

@@ -190,14 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
         let pool_id = pool.id.clone();
 
-        // This emulator holds a pool's import jobs in memory, so the store is
-        // bounded.
+        // "The limit for user pool import jobs is: 1000." — the quota Amazon
+        // Cognito refuses a further job with, stated by the refusal itself.
         if pool.user_import_jobs.len() >= crate::state::MAX_USER_IMPORT_JOBS_PER_POOL {
-            return Err(limit_exceeded(format!(
-                "User pool {} holds at most {} user import jobs.",
-                input.user_pool_id,
-                crate::state::MAX_USER_IMPORT_JOBS_PER_POOL
-            )));
+            return Err(limit_exceeded(crate::state::user_import_job_limit_message()));
         }
 
         // A `JobId` is minted per job, so each create answers a job of its own

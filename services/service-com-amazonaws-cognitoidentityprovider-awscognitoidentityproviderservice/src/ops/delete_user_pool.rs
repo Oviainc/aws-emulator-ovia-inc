@@ -185,12 +185,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
         // "When you try to delete a protected user pool in a DeleteUserPool API
         // request, Amazon Cognito returns an InvalidParameterException error."
-        // (`UserPoolType.DeletionProtection` in this service's model).
+        // (`UserPoolType.DeletionProtection` in this service's model). The
+        // refusal reports the protection that has to be deactivated and names no
+        // pool: it is fixed text in full.
         if pool.deletion_protection == "ACTIVE" {
-            return Err(invalid_parameter(format!(
-                "User pool {} cannot be deleted while deletion protection is active.",
-                input.user_pool_id
-            )));
+            return Err(invalid_parameter(DELETION_PROTECTION_MESSAGE.to_string()));
         }
         guard.user_pools.remove(&input.user_pool_id);
         // The pool's sessions and tokens go with the pool they belong to.
@@ -198,6 +197,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DeleteUserPoolOutput)
     }
 }
+
+/// The message this operation's `InvalidParameterException` carries when the
+/// pool it was asked to delete has deletion protection switched on.
+///
+/// Fixed text in full, with no variable part: it reports the protection that
+/// blocks the delete and what has to happen before a delete can succeed, and
+/// names no pool.
+const DELETION_PROTECTION_MESSAGE: &str = "The user pool cannot be deleted because deletion protection is activated. Deletion protection must be inactivated first.";
 
 /// This operation's `ResourceNotFoundException` for an absent user pool.
 fn user_pool_not_found(user_pool_id: &str) -> DeleteUserPoolError {

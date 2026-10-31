@@ -346,10 +346,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let pool = guard
                 .pool(&input.user_pool_id)
                 .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-            let client = pool
-                .clients
-                .get(&input.client_id)
-                .ok_or_else(|| client_not_found(&input.client_id))?;
+            // How an unresolved app-client lookup is worded depends on whether
+            // the `ClientId` names an app client of ANOTHER pool, a question
+            // about the whole store, asked only where the lookup has failed.
+            let client = pool.clients.get(&input.client_id).ok_or_else(|| {
+                client_not_found(guard.app_client_lookup_refusal(
+                    &input.user_pool_id,
+                    &input.client_id,
+                    &crate::state::app_client_not_found_message(&input.client_id),
+                ))
+            })?;
             if !client.allows_admin_password_auth() {
                 return Err(invalid_parameter(
                     crate::state::ADMIN_AUTH_FLOW_NOT_ENABLED_MESSAGE.to_string(),
@@ -544,10 +550,15 @@ fn user_pool_not_found(user_pool_id: &str) -> AdminInitiateAuthError {
     .into()
 }
 
-/// This operation's `ResourceNotFoundException` for an absent app client.
-fn client_not_found(client_id: &str) -> AdminInitiateAuthError {
+/// This operation's `ResourceNotFoundException` for an app client the named pool
+/// does not hold, carrying the sentence the store's shared app-client lookup
+/// refusal words for it: [`crate::state::app_client_not_found_message`] for a
+/// `ClientId` that names no app client at all, and
+/// [`crate::state::app_client_not_found_in_pool_message`] for one that names an
+/// app client of another pool.
+fn client_not_found(message: String) -> AdminInitiateAuthError {
     AdminInitiateAuthErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool client {client_id} does not exist.")),
+        message: Some(message),
     })
     .into()
 }

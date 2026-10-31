@@ -161,15 +161,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
 
         // The request names both the pool and the app client of it the secret is
-        // created for, so a `ClientId` that names a client of ANOTHER pool is as
-        // absent as one no create minted.
+        // created for, so a `ClientId` that names a client of ANOTHER pool names
+        // no app client to create a secret for. How that lookup is worded
+        // depends on the whole store, which cannot be read while this pool is
+        // borrowed mutably, so the lookup is decided on a SHARED borrow and the
+        // mutable one taken after it.
         let pool = guard
-            .pool_mut(&input.user_pool_id)
+            .pool(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-        let client = pool
-            .clients
-            .get_mut(&input.client_id)
-            .ok_or_else(|| client_not_found(&input.client_id))?;
+        if !pool.clients.contains_key(&input.client_id) {
+            return Err(client_not_found(guard.app_client_lookup_refusal(
+                &input.user_pool_id,
+                &input.client_id,
+                &crate::state::app_client_not_found_message(&input.client_id),
+            )));
+        }
+        let client = guard
+            .pool_mut(&input.user_pool_id)
+            .and_then(|pool| pool.clients.get_mut(&input.client_id))
+            .ok_or_else(internal_error)?;
 
         // "Supports up to 2 active secrets per app client for zero-downtime
         // credential rotation workflows" (this operation's own doc), so an app
@@ -222,10 +232,14 @@ fn user_pool_not_found(user_pool_id: &str) -> AddUserPoolClientSecretError {
 }
 
 /// This operation's `ResourceNotFoundException` for a `ClientId` the named pool
-/// holds no app client for.
-fn client_not_found(client_id: &str) -> AddUserPoolClientSecretError {
+/// holds no app client for, carrying the sentence the store's shared app-client
+/// lookup refusal words for it: [`crate::state::app_client_not_found_message`]
+/// for a `ClientId` that names no app client at all, and
+/// [`crate::state::app_client_not_found_in_pool_message`] for one that names an
+/// app client of another pool.
+fn client_not_found(message: String) -> AddUserPoolClientSecretError {
     AddUserPoolClientSecretErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool client {client_id} does not exist.")),
+        message: Some(message),
     })
     .into()
 }

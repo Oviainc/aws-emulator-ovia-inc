@@ -15,6 +15,12 @@
 //! else the request carries. The sentence it carries is fixed text in full: the
 //! pair is resolved as a unit, so the refusal names neither half.
 //!
+//! A domain name is unique across pools, so ONE pairing resolves after all: a
+//! stored pool paired with a domain name ANOTHER stored pool holds. Nothing is
+//! missing there — the pool named is simply not the one configured with that
+//! domain — so both pair-addressed operations answer
+//! `InvalidParameterException` with the sentence for that mismatch.
+//!
 //! The control that the two pair-addressed operations are NOT one refusal:
 //! `DeleteUserPoolDomain`, asked to remove the very same unresolvable pair,
 //! keeps answering `400 InvalidParameterException` with its own sentence.
@@ -49,6 +55,11 @@ const DOMAIN_NOT_FOUND: &str = "User pool domain was not found.";
 /// The sentence `DeleteUserPoolDomain` answers for the same unresolvable pair,
 /// which is deliberately a different refusal.
 const NO_SUCH_DOMAIN: &str = "No such domain or user pool exists.";
+
+/// The sentence both pair-addressed operations answer when the pair resolves — a
+/// stored pool and a domain name another stored pool holds — but names a pool
+/// that is not the one configured with that domain.
+const DOMAIN_OF_OTHER_POOL: &str = "The domain is not configured for this user pool.";
 
 /// A well-formed `UserPoolId` (pattern `^[\w-]+_[0-9a-zA-Z]+$`) that no
 /// `CreateUserPool` call minted.
@@ -155,6 +166,10 @@ struct PairCase {
     /// so the refusal is measured against an empty request, a request asking for
     /// a legal change, and a request whose other members are themselves illegal.
     members: Value,
+    /// Whether the pair RESOLVES to a stored pool and a domain name another
+    /// stored pool holds, which is the mismatch both operations refuse as a bad
+    /// parameter rather than an absent resource.
+    of_other_pool: bool,
 }
 
 #[tokio::test]
@@ -199,54 +214,63 @@ async fn an_unresolvable_pool_and_domain_pair_is_the_resource_the_service_cannot
             user_pool_id: holder.clone(),
             domain: "deleted-prefix".to_string(),
             members: json!({ "ManagedLoginVersion": 1 }),
+            of_other_pool: false,
         },
         PairCase {
             case: "a custom domain a delete took away",
             user_pool_id: holder.clone(),
             domain: "deleted-custom".to_string(),
             members: json!({ "CustomDomainConfig": { "CertificateArn": CERTIFICATE } }),
+            of_other_pool: false,
         },
         PairCase {
             case: "a name nothing ever created, with no updatable member",
             user_pool_id: holder.clone(),
             domain: "never-created".to_string(),
             members: json!({}),
+            of_other_pool: false,
         },
         PairCase {
             case: "a name nothing ever created, asking for managed login",
             user_pool_id: holder.clone(),
             domain: "never-created".to_string(),
             members: json!({ "ManagedLoginVersion": 2 }),
+            of_other_pool: false,
         },
         PairCase {
             case: "a name ANOTHER pool holds",
             user_pool_id: other.clone(),
             domain: "held-prefix".to_string(),
             members: json!({ "ManagedLoginVersion": 2 }),
+            of_other_pool: true,
         },
         PairCase {
             case: "a pool nothing ever minted, naming a domain a pool does hold",
             user_pool_id: ABSENT_POOL.to_string(),
             domain: "held-prefix".to_string(),
             members: json!({ "ManagedLoginVersion": 1 }),
+            of_other_pool: false,
         },
         PairCase {
             case: "a pool nothing ever minted, naming a name nothing created",
             user_pool_id: ABSENT_POOL.to_string(),
             domain: "never-created".to_string(),
             members: json!({}),
+            of_other_pool: false,
         },
         PairCase {
             case: "a pool a delete took away, naming the domain it used to hold",
             user_pool_id: dropped.clone(),
             domain: "dropped-prefix".to_string(),
             members: json!({ "ManagedLoginVersion": 2 }),
+            of_other_pool: false,
         },
         PairCase {
             case: "an unresolvable pair whose branding version is illegal too",
             user_pool_id: holder.clone(),
             domain: "never-created".to_string(),
             members: json!({ "ManagedLoginVersion": 3 }),
+            of_other_pool: false,
         },
         PairCase {
             case: "an unresolvable pair carrying routing, which a prefix domain forbids",
@@ -260,6 +284,7 @@ async fn an_unresolvable_pool_and_domain_pair_is_the_resource_the_service_cannot
                     },
                 },
             }),
+            of_other_pool: false,
         },
     ];
 
@@ -274,17 +299,24 @@ async fn an_unresolvable_pool_and_domain_pair_is_the_resource_the_service_cannot
         body.insert("Domain".to_string(), json!(case.domain));
         let body = Value::Object(body);
 
+        // What this pairing owes: the mismatch refusal when it resolves to a
+        // stored pool and another stored pool's domain, and the not-found
+        // refusal when it resolves nothing.
+        let (expected_code, expected_message) = if case.of_other_pool {
+            ("InvalidParameterException", DOMAIN_OF_OTHER_POOL)
+        } else {
+            ("ResourceNotFoundException", DOMAIN_NOT_FOUND)
+        };
         let (status, payload) = call(&router, "UpdateUserPoolDomain", &body).await;
         assert_eq!(
             (status, error_code(&payload)),
-            (400, "ResourceNotFoundException"),
-            "case {label:?}: expected a 400 ResourceNotFoundException, got {status} with {payload}"
+            (400, expected_code),
+            "case {label:?}: expected a 400 {expected_code}, got {status} with {payload}"
         );
         assert_eq!(
             error_message(&payload),
-            DOMAIN_NOT_FOUND,
-            "case {label:?}: expected the fixed sentence for a domain the service cannot \
-             find, got {payload}"
+            expected_message,
+            "case {label:?}: expected {expected_message:?}, got {payload}"
         );
         // Fixed text in full: the sentence reports the pair and echoes neither
         // half of it, so no row's own values can appear in it.
@@ -294,8 +326,8 @@ async fn an_unresolvable_pool_and_domain_pair_is_the_resource_the_service_cannot
             "case {label:?}: the sentence names neither half of the pair, got {message:?}"
         );
 
-        // The control: removing the very same pair is a different refusal, so the
-        // two operations do not share one.
+        // The control: removing the very same pair is a different refusal when
+        // the pair resolves nothing, so the two operations do not share one.
         let removal = json!({ "UserPoolId": case.user_pool_id, "Domain": case.domain });
         let (status, payload) = call(&router, "DeleteUserPoolDomain", &removal).await;
         assert_eq!(
@@ -304,10 +336,15 @@ async fn an_unresolvable_pool_and_domain_pair_is_the_resource_the_service_cannot
             "case {label:?}: removing the same pair keeps its own refusal, got {status} \
              with {payload}"
         );
+        let expected_removal = if case.of_other_pool {
+            DOMAIN_OF_OTHER_POOL
+        } else {
+            NO_SUCH_DOMAIN
+        };
         assert_eq!(
             error_message(&payload),
-            NO_SUCH_DOMAIN,
-            "case {label:?}: removing the same pair keeps its own sentence, got {payload}"
+            expected_removal,
+            "case {label:?}: removing the same pair owes {expected_removal:?}, got {payload}"
         );
 
         // A refused update creates nothing: the name is still one the reader

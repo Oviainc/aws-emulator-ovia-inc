@@ -217,8 +217,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
+        // Every refusal is decided on a SHARED borrow of the store, because the
+        // wording of an unresolved app-client lookup depends on whether the
+        // `ClientId` names an app client of ANOTHER pool — a question about the
+        // whole store, which cannot be asked while this pool is borrowed
+        // mutably. The mutable borrow is taken once nothing can refuse.
         let pool = guard
-            .pool_mut(&input.user_pool_id)
+            .pool(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
 
         // "The app client that you want to create the branding style for"
@@ -226,7 +231,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // app client of the NAMED pool, so an id that pool does not hold names
         // nothing to assign it to.
         if !pool.clients.contains_key(&input.client_id) {
-            return Err(client_not_found(&input.client_id));
+            return Err(client_not_found(guard.app_client_lookup_refusal(
+                &input.user_pool_id,
+                &input.client_id,
+                &crate::state::app_client_not_found_message(&input.client_id),
+            )));
         }
 
         // "This exception is thrown when you attempt to apply a managed login
@@ -236,6 +245,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if pool.branding_for_client(&input.client_id).is_some() {
             return Err(branding_exists(&input.client_id));
         }
+
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(internal_error)?;
 
         let branding_id = crate::state::new_uuid();
         let branding = crate::state::ManagedLoginBranding {
@@ -271,10 +284,14 @@ fn user_pool_not_found(user_pool_id: &str) -> CreateManagedLoginBrandingError {
 }
 
 /// This operation's `ResourceNotFoundException` for an app client the named pool
-/// does not hold.
-fn client_not_found(client_id: &str) -> CreateManagedLoginBrandingError {
+/// does not hold, carrying the sentence the store's shared app-client lookup
+/// refusal words for it: [`crate::state::app_client_not_found_message`] for a
+/// `ClientId` that names no app client at all, and
+/// [`crate::state::app_client_not_found_in_pool_message`] for one that names an
+/// app client of another pool.
+fn client_not_found(message: String) -> CreateManagedLoginBrandingError {
     CreateManagedLoginBrandingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool client {client_id} does not exist.")),
+        message: Some(message),
     })
     .into()
 }

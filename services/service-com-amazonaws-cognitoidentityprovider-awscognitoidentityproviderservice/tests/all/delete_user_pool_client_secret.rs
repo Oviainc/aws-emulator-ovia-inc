@@ -771,7 +771,10 @@ async fn a_delete_for_a_resource_no_app_client_holds_is_refused() {
                 named.user_pool_id.clone(),
                 elsewhere.client_id.clone(),
                 elsewhere_ids[0].clone(),
-                format!("User pool client {} does not exist.", elsewhere.client_id),
+                format!(
+                    "User pool client {} does not exist in user pool {}.",
+                    elsewhere.client_id, named.user_pool_id
+                ),
             ),
             Absent::ClientSecret => (
                 named.user_pool_id.clone(),

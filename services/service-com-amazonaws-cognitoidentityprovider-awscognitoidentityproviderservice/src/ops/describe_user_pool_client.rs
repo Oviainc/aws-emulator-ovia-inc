@@ -166,10 +166,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pool = guard
             .pool(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-        let client = pool
-            .clients
-            .get(&input.client_id)
-            .ok_or_else(client_not_found)?;
+        let client = pool.clients.get(&input.client_id).ok_or_else(|| {
+            client_not_found(guard.app_client_lookup_refusal(
+                &input.user_pool_id,
+                &input.client_id,
+                crate::state::APP_CLIENT_NOT_FOUND_MESSAGE,
+            ))
+        })?;
         Ok(DescribeUserPoolClientOutput {
             user_pool_client: Some(client.to_user_pool_client_type()),
         })
@@ -185,12 +188,15 @@ fn user_pool_not_found(user_pool_id: &str) -> DescribeUserPoolClientError {
 }
 
 /// This operation's `ResourceNotFoundException` for a `ClientId` the named pool
-/// holds no app client for, worded as
-/// [`crate::state::APP_CLIENT_NOT_FOUND_MESSAGE`] — the one sentence the
-/// app-client lookup answers whatever id was asked for, quoting none of it.
-fn client_not_found() -> DescribeUserPoolClientError {
+/// holds no app client for, carrying the sentence
+/// [`crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::app_client_lookup_refusal`]
+/// words for that lookup: this operation's fixed
+/// [`crate::state::APP_CLIENT_NOT_FOUND_MESSAGE`] for an id that names no app
+/// client at all, and the sentence naming the id and the pool for one that names
+/// an app client of another pool.
+fn client_not_found(message: String) -> DescribeUserPoolClientError {
     DescribeUserPoolClientErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::APP_CLIENT_NOT_FOUND_MESSAGE.to_string()),
+        message: Some(message),
     })
     .into()
 }

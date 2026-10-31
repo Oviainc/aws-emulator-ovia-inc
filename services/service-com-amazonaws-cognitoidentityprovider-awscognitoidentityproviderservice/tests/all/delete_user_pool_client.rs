@@ -505,7 +505,7 @@ async fn a_delete_that_names_no_stored_app_client_is_refused() {
         (
             "a client id another pool holds",
             json!({ "UserPoolId": other_pool_id, "ClientId": client_id }),
-            format!("User pool client {client_id} does not exist."),
+            format!("User pool client {client_id} does not exist in user pool {other_pool_id}."),
         ),
     ] {
         let (status, payload) = call(&router, "DeleteUserPoolClient", &body).await;

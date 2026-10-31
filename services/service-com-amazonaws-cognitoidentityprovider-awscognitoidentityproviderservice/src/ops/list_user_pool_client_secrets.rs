@@ -166,15 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let guard = state.lock();
 
         // The request names both the pool and the app client of it whose secrets are
-        // listed, so a `ClientId` that names a client of ANOTHER pool is as absent as
-        // one no create minted.
+        // listed, so a `ClientId` that names a client of ANOTHER pool names no app
+        // client of this pool to list secrets of.
         let pool = guard
             .pool(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-        let client = pool
-            .clients
-            .get(&input.client_id)
-            .ok_or_else(|| client_not_found(&input.client_id))?;
+        let client = pool.clients.get(&input.client_id).ok_or_else(|| {
+            client_not_found(guard.app_client_lookup_refusal(
+                &input.user_pool_id,
+                &input.client_id,
+                &crate::state::app_client_not_found_message(&input.client_id),
+            ))
+        })?;
 
         // Rendered from the STORED secrets, in the order the app client holds them
         // (oldest first): this read changes nothing. No descriptor carries a value —
@@ -208,10 +211,14 @@ fn user_pool_not_found(user_pool_id: &str) -> ListUserPoolClientSecretsError {
 }
 
 /// This operation's `ResourceNotFoundException` for a `ClientId` the named pool
-/// holds no app client for.
-fn client_not_found(client_id: &str) -> ListUserPoolClientSecretsError {
+/// holds no app client for, carrying the sentence the store's shared app-client
+/// lookup refusal words for it: [`crate::state::app_client_not_found_message`]
+/// for a `ClientId` that names no app client at all, and
+/// [`crate::state::app_client_not_found_in_pool_message`] for one that names an
+/// app client of another pool.
+fn client_not_found(message: String) -> ListUserPoolClientSecretsError {
     ListUserPoolClientSecretsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool client {client_id} does not exist.")),
+        message: Some(message),
     })
     .into()
 }

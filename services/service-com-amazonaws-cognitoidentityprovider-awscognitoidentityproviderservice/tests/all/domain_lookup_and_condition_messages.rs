@@ -59,6 +59,11 @@ const NO_SUCH_DOMAIN: &str = "No such domain or user pool exists.";
 /// RECONFIGURATION of an existing domain is addressed by holds no stored domain.
 const DOMAIN_NOT_FOUND: &str = "User pool domain was not found.";
 
+/// The sentence AWS answers when the pair names a stored pool and a domain name
+/// ANOTHER stored pool holds, so the two parameters are mismatched rather than
+/// unresolvable.
+const DOMAIN_OF_OTHER_POOL: &str = "The domain is not configured for this user pool.";
+
 /// The sentence AWS answers on the device surface of a pool that activated no
 /// device remembering.
 const DEVICE_TRACKING_OFF: &str = "Device tracking not currently enabled for this pool.";
@@ -314,12 +319,15 @@ async fn a_read_of_a_domain_no_pool_holds_reports_an_empty_description() {
 }
 
 /// RULE: an operation addressed by the `UserPoolId` + `Domain` pair resolves
-/// that pair as a unit, so every way the pair can fail to resolve is refused
+/// that pair as a unit, so every way the pair can fail to RESOLVE is refused
 /// identically for that operation, with one sentence that names neither half:
 /// the operation that reconfigures an existing domain answers the resource it
 /// cannot find (400), and the one that removes a domain answers its bad-parameter
-/// refusal (400). Over a table spanning both operations and every way the pair
-/// can fail to resolve.
+/// refusal (400). The one pairing that does resolve without naming this pool's
+/// domain — a stored pool and a name ANOTHER stored pool holds — is a mismatch of
+/// the two parameters, which both operations refuse as a bad parameter with the
+/// sentence for it. Over a table spanning both operations and every way the pair
+/// can fail.
 #[tokio::test]
 async fn an_unresolved_pool_and_domain_pair_is_refused_the_same_way_however_it_fails() {
     let router = router();
@@ -347,27 +355,33 @@ async fn an_unresolved_pool_and_domain_pair_is_refused_the_same_way_however_it_f
     )
     .await;
 
-    // (case, the pair the request carries)
+    // (case, the pair the request carries, whether the pair resolves to a stored
+    // pool and a domain ANOTHER stored pool holds)
     let pairs = [
         (
             "a pool that does not exist, holding a name another pool does",
             json!({ "UserPoolId": "us-east-1_absent", "Domain": "pair-held" }),
+            false,
         ),
         (
             "a pool that does not exist, holding a name nothing created",
             json!({ "UserPoolId": "us-east-1_absent", "Domain": "pair-never" }),
+            false,
         ),
         (
             "a stored pool and a name nothing created",
             json!({ "UserPoolId": user_pool_id, "Domain": "pair-never" }),
+            false,
         ),
         (
             "a stored pool and a name a delete took away",
             json!({ "UserPoolId": user_pool_id, "Domain": "pair-deleted" }),
+            false,
         ),
         (
             "a stored pool and a name ANOTHER pool holds",
             json!({ "UserPoolId": other_pool_id, "Domain": "pair-held" }),
+            true,
         ),
     ];
 
@@ -388,8 +402,16 @@ async fn an_unresolved_pool_and_domain_pair_is_refused_the_same_way_however_it_f
         ),
     ];
 
-    for (label, pair) in &pairs {
+    for (label, pair, of_other_pool) in &pairs {
         for (operation, expected_status, expected_code, expected_message) in &refusals {
+            // A pair naming a stored pool and another pool's domain resolves, so
+            // both operations refuse it as the parameter mismatch it is rather
+            // than with their own not-found sentence.
+            let (expected_status, expected_code, expected_message) = if *of_other_pool {
+                (&400, &"InvalidParameterException", &DOMAIN_OF_OTHER_POOL)
+            } else {
+                (expected_status, expected_code, expected_message)
+            };
             // The update carries a member to change, so the row measures the
             // pair and not an empty request.
             let mut body = pair.as_object().expect("the pair is an object").clone();

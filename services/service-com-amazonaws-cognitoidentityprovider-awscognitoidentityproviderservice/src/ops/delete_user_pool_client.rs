@@ -171,16 +171,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut guard = state.lock();
-        let pool = guard
-            .pool_mut(&input.user_pool_id)
-            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-
+        // The lookup is decided on a SHARED borrow of the store, because the
+        // wording of an unresolved app-client lookup depends on whether the
+        // `ClientId` names an app client of ANOTHER pool — a question about the
+        // whole store, which cannot be asked while this pool is borrowed
+        // mutably.
+        //
         // "Deletes a user pool app client" (this operation's documentation): the
         // client has to be one the NAMED pool holds. A client id is minted per app
         // client and lives in exactly one pool, so an id another pool holds names
-        // nothing here and is refused like one that was never created.
+        // nothing here — reported as the client that pool is not configured with.
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        if !pool.clients.contains_key(&input.client_id) {
+            return Err(client_not_found(guard.app_client_lookup_refusal(
+                &input.user_pool_id,
+                &input.client_id,
+                &crate::state::app_client_not_found_message(&input.client_id),
+            )));
+        }
+
+        // Nothing can refuse from here on, so the pool is borrowed mutably and
+        // the stored client removed.
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(internal_error)?;
         if pool.clients.remove(&input.client_id).is_none() {
-            return Err(client_not_found(&input.client_id));
+            return Err(internal_error());
         }
 
         // A terms document belongs to ONE app client of the pool — `CreateTerms`
@@ -216,10 +234,14 @@ fn user_pool_not_found(user_pool_id: &str) -> DeleteUserPoolClientError {
 }
 
 /// This operation's `ResourceNotFoundException` for an app client the named pool
-/// does not hold.
-fn client_not_found(client_id: &str) -> DeleteUserPoolClientError {
+/// does not hold, carrying the sentence the store's shared app-client lookup
+/// refusal words for it: [`crate::state::app_client_not_found_message`] for a
+/// `ClientId` that names no app client at all, and
+/// [`crate::state::app_client_not_found_in_pool_message`] for one that names an
+/// app client of another pool.
+fn client_not_found(message: String) -> DeleteUserPoolClientError {
     DeleteUserPoolClientErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool client {client_id} does not exist.")),
+        message: Some(message),
     })
     .into()
 }

@@ -623,8 +623,10 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
         ),
         // The pair `UserPoolId` + `Domain` addresses an EXISTING domain record,
         // so a pair that holds no stored domain — whichever half of it is wrong
-        // — names a resource the service cannot find, not a bad parameter. The
-        // whole class is covered by `update_user_pool_domain_not_found.rs`.
+        // — names a resource the service cannot find, not a bad parameter. A
+        // stored pool paired with a domain ANOTHER pool holds is the one case
+        // that resolves: the parameters are mismatched rather than unresolvable.
+        // The whole class is covered by `update_user_pool_domain_not_found.rs`.
         (
             "a domain the named pool does not hold",
             json!({ "UserPoolId": user_pool_id, "Domain": "never-created", "ManagedLoginVersion": 2 }),
@@ -633,7 +635,7 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
         (
             "a domain another pool holds",
             json!({ "UserPoolId": other_pool, "Domain": "refusal-prefix", "ManagedLoginVersion": 2 }),
-            (400, "ResourceNotFoundException"),
+            (400, "InvalidParameterException"),
         ),
         (
             "a user pool that does not exist",

@@ -299,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
 fn client_not_found(client_id: &str) -> ResendConfirmationCodeError {
     ResendConfirmationCodeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool client {client_id} does not exist.")),
+        message: Some(crate::state::app_client_not_found_message(client_id)),
     })
     .into()
 }

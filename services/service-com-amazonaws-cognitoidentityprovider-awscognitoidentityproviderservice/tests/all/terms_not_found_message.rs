@@ -370,16 +370,18 @@ async fn an_unresolved_app_client_keeps_its_own_wording() {
     let other_pool = pool(&router, "terms-not-found-client-other-pool").await;
     let client_id = client(&router, &user_pool_id, "this-pools-client").await;
 
-    for (case, pool_id, asked_client) in [
+    for (case, pool_id, asked_client, expected) in [
         (
             "an app client id no pool ever minted",
             user_pool_id.clone(),
             "neverminted1234".to_string(),
+            "User pool client neverminted1234 does not exist.".to_string(),
         ),
         (
             "this pool's own app client, asked against another pool",
             other_pool.clone(),
             client_id.clone(),
+            format!("User pool client {client_id} does not exist in user pool {other_pool}."),
         ),
     ] {
         let (status, payload) = call(
@@ -399,8 +401,7 @@ async fn an_unresolved_app_client_keeps_its_own_wording() {
         );
         let message = error_message(&payload);
         assert_eq!(
-            message,
-            format!("User pool client {asked_client} does not exist in user pool {pool_id}."),
+            message, expected,
             "case {case:?}: an unresolved app client keeps its own wording, got {message:?}"
         );
     }

@@ -713,8 +713,8 @@ async fn a_schema_attribute_name_already_declared_is_refused_with_the_structured
 // A domain another pool already holds
 // ---------------------------------------------------------------------------
 
-/// The one sentence the refusal of an already-associated domain carries.
-const DOMAIN_ALREADY_ASSOCIATED: &str = "Domain already associated with another user pool.";
+/// The one sentence the refusal of an already-taken domain carries.
+const DOMAIN_ALREADY_ASSOCIATED: &str = "Domain already exists.";
 
 #[tokio::test]
 async fn a_domain_another_pool_holds_is_refused_without_naming_that_pool() {

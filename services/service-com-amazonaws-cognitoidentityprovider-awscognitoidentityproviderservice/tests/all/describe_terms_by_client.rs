@@ -472,10 +472,11 @@ async fn an_absent_pool_client_or_name_is_a_400() {
     .await;
 
     // Each row carries the message its refusal class is worded with: an
-    // unresolvable pool names the pool and an app client that is not one of the
-    // named pool's names both the client and the pool it was looked for in,
-    // while a lookup that resolves no terms documents answers the one fixed
-    // sentence for that class, naming nothing the request asked for.
+    // unresolvable pool names the pool, an app client of ANOTHER pool names both
+    // the client and the pool it was looked for in, an id that names no app
+    // client at all names just the id, while a lookup that resolves no terms
+    // documents answers the one fixed sentence for that class, naming nothing
+    // the request asked for.
     let other_pool_client = client(&router, &other_pool, "other-pool-client").await;
     for (label, body, expected_message) in [
         (
@@ -488,13 +489,13 @@ async fn an_absent_pool_client_or_name_is_a_400() {
             "User pool us-east-1_absent does not exist.".to_string(),
         ),
         (
-            "an app client the pool does not hold",
+            "an app client id no pool holds",
             json!({
                 "UserPoolId": user_pool_id,
                 "ClientId": "absentclientid",
                 "TermsName": TERMS_NAMES[0],
             }),
-            format!("User pool client absentclientid does not exist in user pool {user_pool_id}."),
+            "User pool client absentclientid does not exist.".to_string(),
         ),
         (
             "an app client of ANOTHER pool, asked against the pool that stores the documents",
@@ -643,8 +644,11 @@ async fn a_client_of_another_pool_is_refused_and_leaves_every_pool_listing_untou
     }
 
     // A ClientId that is a real app client of ANOTHER pool, and one no pool ever
-    // minted, are the same refusal: neither is an app client of the pool named
-    // by the request, so that pool has no documents of it to describe.
+    // minted, are both refused: neither is an app client of the pool named by
+    // the request, so that pool has no documents of it to describe. The two are
+    // worded differently — the id that resolves to another pool's client is
+    // reported with the pool it is not in, the one that resolves to nothing by
+    // its id alone.
     let never_minted = "0000000000notanappclient".to_string();
     for (label, user_pool_id, client_id, terms_name) in [
         (
@@ -693,10 +697,15 @@ async fn a_client_of_another_pool_is_refused_and_leaves_every_pool_listing_untou
             (400, "ResourceNotFoundException"),
             "case {label:?}: a client that is not an app client of the named pool is a 400 ResourceNotFoundException, got {payload}"
         );
+        let expected = if client_id == &never_minted {
+            format!("User pool client {client_id} does not exist.")
+        } else {
+            format!("User pool client {client_id} does not exist in user pool {user_pool_id}.")
+        };
         assert_eq!(
             error_message(&payload),
-            format!("User pool client {client_id} does not exist in user pool {user_pool_id}."),
-            "case {label:?}: the refusal must name the client and the pool from the request, got {payload}"
+            expected,
+            "case {label:?}: the refusal must carry {expected:?}, got {payload}"
         );
         assert!(
             payload.get("Terms").is_none(),

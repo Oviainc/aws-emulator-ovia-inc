@@ -387,7 +387,7 @@ fn code_rejected(rejection: crate::state::CodeRejection) -> ConfirmForgotPasswor
 /// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
 fn client_not_found(client_id: &str) -> ConfirmForgotPasswordError {
     ConfirmForgotPasswordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool client {client_id} does not exist.")),
+        message: Some(crate::state::app_client_not_found_message(client_id)),
     })
     .into()
 }

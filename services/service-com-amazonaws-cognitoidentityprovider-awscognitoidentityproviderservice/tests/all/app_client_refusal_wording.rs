@@ -5,10 +5,12 @@
 //! The rules under test, each one sentence of fixed text:
 //!
 //! * An operation on the app-client resource itself — `DescribeUserPoolClient` reading it,
-//!   `UpdateUserPoolClient` writing it — refuses a `ClientId` the named pool holds no app
-//!   client for with `ResourceNotFoundException` and ONE sentence that quotes neither the
-//!   id asked for nor the pool, so every unresolved app client is reported identically:
-//!   one no create minted, one a delete took away, and one another pool holds.
+//!   `UpdateUserPoolClient` writing it — refuses a `ClientId` that names NO app client at
+//!   all with `ResourceNotFoundException` and ONE sentence that quotes neither the id
+//!   asked for nor the pool, so an id no create minted, one a delete took away and one
+//!   that is a near miss of a live id are all reported identically. A `ClientId` that
+//!   does name an app client, of ANOTHER pool, is the other way that lookup fails and is
+//!   reported with both halves of what was asked for: the id and the pool it is not in.
 //! * `DeleteUserPoolClientSecret` refuses to take an app client's ONLY secret away
 //!   ("you cannot delete the last remaining secret for an app client", that operation in
 //!   the service model) with `InvalidParameterException` and one sentence that quotes
@@ -46,7 +48,7 @@ const ENDPOINT_HOST: &str = "cognito-idp.us-east-1.amazonaws.com";
 /// The region the suite's calls are signed for.
 const DEFAULT_REGION: &str = "us-east-1";
 
-/// The one sentence an app-client lookup that resolves nothing answers: fixed text,
+/// The one sentence an app-client lookup that resolves NO app client answers: fixed text,
 /// quoting neither the `ClientId` asked for nor the pool it was looked for in.
 const APP_CLIENT_NOT_FOUND_MESSAGE: &str = "User pool client does not exist.";
 
@@ -229,7 +231,7 @@ enum Absent {
 }
 
 #[tokio::test]
-async fn an_unresolved_app_client_is_refused_with_one_fixed_sentence() {
+async fn an_unresolved_app_client_is_refused_by_the_way_the_lookup_failed() {
     // The rows differ along the form and length of the `ClientId` asked for, and along
     // how it came to be absent. The three NeverMinted forms span the pattern
     // `^[\w+]+$` and the published length bounds 1 and 128.
@@ -289,6 +291,16 @@ async fn an_unresolved_app_client_is_refused_with_one_fixed_sentence() {
             Absent::NearMiss => format!("{live_id}+"),
         };
 
+        // Which sentence the lookup owes: an id that names an app client of ANOTHER pool
+        // is reported with the id and the pool it is not in, while an id that names no
+        // app client at all carries this operation's fixed sentence.
+        let cross_pool = *absent == Absent::OfAnotherPool;
+        let expected = if cross_pool {
+            format!("User pool client {asked} does not exist in user pool {user_pool_id}.")
+        } else {
+            APP_CLIENT_NOT_FOUND_MESSAGE.to_string()
+        };
+
         // The same unresolved lookup, reached by the read and by the write: one answer.
         for (operation, request) in [
             (
@@ -314,24 +326,27 @@ async fn an_unresolved_app_client_is_refused_with_one_fixed_sentence() {
             );
             let message = error_message(&payload);
             assert_eq!(
-                message, APP_CLIENT_NOT_FOUND_MESSAGE,
-                "case {case:?}: {operation} must answer {APP_CLIENT_NOT_FOUND_MESSAGE:?}, \
-                 got {message:?}"
+                message, expected,
+                "case {case:?}: {operation} must answer {expected:?}, got {message:?}"
             );
-            // Nothing of the request is in the sentence, so no two callers in this
-            // condition can be told apart by its text — and the `@sensitive` ClientId
-            // never reaches it. A one-character id is a substring of ordinary prose, so
-            // the quoting assertion is made on the ids long enough to mean something.
-            if asked.len() >= 4 {
+            // Nothing of the request is in the sentence for an id that names no app
+            // client, so no two callers in that condition can be told apart by its text
+            // — and the `@sensitive` ClientId never reaches it. A one-character id is a
+            // substring of ordinary prose, so the quoting assertion is made on the ids
+            // long enough to mean something.
+            if !cross_pool {
+                if asked.len() >= 4 {
+                    assert!(
+                        !message.contains(asked.as_str()),
+                        "case {case:?}: {operation} must not quote the id asked for, \
+                         got {message:?}"
+                    );
+                }
                 assert!(
-                    !message.contains(asked.as_str()),
-                    "case {case:?}: {operation} must not quote the id asked for, got {message:?}"
+                    !message.contains(user_pool_id.as_str()),
+                    "case {case:?}: {operation} must not quote the pool, got {message:?}"
                 );
             }
-            assert!(
-                !message.contains(user_pool_id.as_str()),
-                "case {case:?}: {operation} must not quote the pool, got {message:?}"
-            );
         }
 
         // The refusals changed nothing: the pool still holds exactly the app client that

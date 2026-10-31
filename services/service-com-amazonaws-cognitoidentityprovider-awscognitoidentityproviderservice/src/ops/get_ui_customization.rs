@@ -178,7 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|id| *id != crate::state::UI_CUSTOMIZATION_ALL_CLIENTS)
         {
             if !pool.clients.contains_key(client_id) {
-                return Err(client_not_found(client_id));
+                return Err(client_not_found(guard.app_client_lookup_refusal(
+                    &input.user_pool_id,
+                    client_id,
+                    &crate::state::app_client_not_found_message(client_id),
+                )));
             }
         }
 
@@ -203,10 +207,14 @@ fn user_pool_not_found(user_pool_id: &str) -> GetUICustomizationError {
 }
 
 /// This operation's `ResourceNotFoundException` for an app client the named pool
-/// does not hold.
-fn client_not_found(client_id: &str) -> GetUICustomizationError {
+/// does not hold, carrying the sentence the store's shared app-client lookup
+/// refusal words for it: [`crate::state::app_client_not_found_message`] for a
+/// `ClientId` that names no app client at all, and
+/// [`crate::state::app_client_not_found_in_pool_message`] for one that names an
+/// app client of another pool.
+fn client_not_found(message: String) -> GetUICustomizationError {
     GetUICustomizationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool client {client_id} does not exist.")),
+        message: Some(message),
     })
     .into()
 }

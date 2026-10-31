@@ -356,8 +356,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
+        // Every refusal is decided on a SHARED borrow of the store, because the
+        // wording of an unresolved app-client lookup depends on whether the
+        // `ClientId` names an app client of ANOTHER pool — a question about the
+        // whole store, which cannot be asked while this pool is borrowed
+        // mutably. The mutable borrow is taken once nothing can refuse.
         let pool = guard
-            .pool_mut(&input.user_pool_id)
+            .pool(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
         // An app-client configuration member whose feature plan the POOL is not
         // on is refused with the same rule the create path applies, asked on the
@@ -385,10 +390,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let client = pool
-            .clients
-            .get_mut(&input.client_id)
-            .ok_or_else(client_not_found)?;
+        if !pool.clients.contains_key(&input.client_id) {
+            return Err(client_not_found(guard.app_client_lookup_refusal(
+                &input.user_pool_id,
+                &input.client_id,
+                crate::state::APP_CLIENT_NOT_FOUND_MESSAGE,
+            )));
+        }
+
+        let client = guard
+            .pool_mut(&input.user_pool_id)
+            .and_then(|pool| pool.clients.get_mut(&input.client_id))
+            .ok_or_else(internal_error)?;
 
         // "You can only activate `EnablePropagateAdditionalUserContextData` in
         // an app client that has a client secret"
@@ -525,12 +538,15 @@ fn feature_unavailable_in_tier(message: String) -> UpdateUserPoolClientError {
 }
 
 /// This operation's `ResourceNotFoundException` for a `ClientId` the named pool
-/// holds no app client for, worded as
-/// [`crate::state::APP_CLIENT_NOT_FOUND_MESSAGE`] — the one sentence the
-/// app-client lookup answers whatever id was asked for, quoting none of it.
-fn client_not_found() -> UpdateUserPoolClientError {
+/// holds no app client for, carrying the sentence
+/// [`crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::app_client_lookup_refusal`]
+/// words for that lookup: this operation's fixed
+/// [`crate::state::APP_CLIENT_NOT_FOUND_MESSAGE`] for an id that names no app
+/// client at all, and the sentence naming the id and the pool for one that names
+/// an app client of another pool.
+fn client_not_found(message: String) -> UpdateUserPoolClientError {
     UpdateUserPoolClientErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::APP_CLIENT_NOT_FOUND_MESSAGE.to_string()),
+        message: Some(message),
     })
     .into()
 }

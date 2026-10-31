@@ -159,6 +159,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DescribeUserPoolDomain`), and the pair is resolved as a unit: a pool
         // that is not stored holds no domain, exactly as a stored pool holds
         // none under a name it never took, so both are the same refusal.
+        // A domain name is unique across pools, so the `Domain` half resolving
+        // to a domain of another pool is a pool that is not configured with it
+        // rather than a pair that names nothing. Read before this pool is
+        // borrowed mutably, since it spans the whole store.
+        if guard.domain_of_other_pool(&input.user_pool_id, &input.domain) {
+            return Err(domain_of_other_pool());
+        }
+
         let Some(pool) = guard.pool_mut(&input.user_pool_id) else {
             return Err(no_such_domain());
         };
@@ -196,6 +204,19 @@ fn no_such_domain() -> DeleteUserPoolDomainError {
         message: Some(crate::state::NO_SUCH_DOMAIN_MESSAGE.to_string()),
         // `ReasonCode` is an optional machine code AWS fills in for a few
         // specific refusals only, so none is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's refusal of a request whose `Domain` is a stored domain of a
+/// DIFFERENT pool, worded as [`crate::state::DOMAIN_OF_OTHER_POOL_MESSAGE`].
+///
+/// The name resolves, so nothing is missing: the pool the request named is not
+/// the one configured with it, which is a bad pairing of the two parameters.
+fn domain_of_other_pool() -> DeleteUserPoolDomainError {
+    DeleteUserPoolDomainErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(crate::state::DOMAIN_OF_OTHER_POOL_MESSAGE.to_string()),
         reason_code: None,
     })
     .into()

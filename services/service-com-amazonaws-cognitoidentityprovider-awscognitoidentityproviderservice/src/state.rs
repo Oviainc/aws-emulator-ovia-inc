@@ -970,6 +970,23 @@ pub const DOMAIN_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
 /// name, whichever of the two the caller got wrong.
 pub const NO_SUCH_DOMAIN_MESSAGE: &str = "No such domain or user pool exists.";
 
+/// The message an operation that resolves a domain by the PAIR `UserPoolId` +
+/// `Domain` carries when the `Domain` half resolves to a domain of ANOTHER pool.
+///
+/// A domain name is unique across pools, so this pair does not name a resource
+/// that is missing: it names one the pool it was asked for is not configured
+/// with. The sentence is fixed text in full and names neither half of the pair,
+/// so it discloses nothing about the pool that does hold the domain.
+pub const DOMAIN_OF_OTHER_POOL_MESSAGE: &str = "The domain is not configured for this user pool.";
+
+/// The message `CreateUserPoolDomain` carries when the `Domain` the request asks
+/// for is one some pool already holds.
+///
+/// Fixed text in full, with no variable part: the refusal reports that the name
+/// is taken and names neither the domain nor the pool holding it, so it
+/// discloses nothing about a pool the caller may not own.
+pub const DOMAIN_EXISTS_MESSAGE: &str = "Domain already exists.";
+
 // ---------------------------------------------------------------------------
 // User pool replicas
 //
@@ -1235,11 +1252,21 @@ pub const MAX_IDENTITY_PROVIDERS_PER_POOL: usize = 1_000;
 /// The most secondary replicas one user pool holds.
 pub const MAX_REPLICAS_PER_POOL: usize = 100;
 
-/// The most user import jobs one user pool holds: `UserImportJobsListType`, the
-/// list `ListUserImportJobs` answers a pool's jobs in, is modelled with a
-/// maximum length of 50, so a pool holds no more jobs than one listing can
-/// report.
-pub const MAX_USER_IMPORT_JOBS_PER_POOL: usize = 50;
+/// The most user import jobs one user pool holds: Amazon Cognito's quota for
+/// user import jobs per user pool, which its refusal states in full
+/// ([`USER_IMPORT_JOB_LIMIT_MESSAGE`]). `ListUserImportJobs` reports them a page
+/// at a time, so the store is not bounded by what one listing can carry.
+pub const MAX_USER_IMPORT_JOBS_PER_POOL: usize = 1_000;
+
+/// The message `CreateUserImportJob`'s `LimitExceededException` carries once the
+/// pool holds [`MAX_USER_IMPORT_JOBS_PER_POOL`] jobs.
+///
+/// The fixed text is `The limit for user pool import jobs is: ` and the trailing
+/// `.`; the one variable part is the limit itself, so the sentence and the
+/// ceiling the handler enforces can never drift apart.
+pub fn user_import_job_limit_message() -> String {
+    format!("The limit for user pool import jobs is: {MAX_USER_IMPORT_JOBS_PER_POOL}.")
+}
 
 /// The most custom (and developer-only) attributes one user pool's schema
 /// holds: Amazon Cognito's quota for custom attributes per user pool is 50 and
@@ -1379,6 +1406,52 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         self.user_pools
             .values()
             .find(|pool| pool.clients.contains_key(client_id))
+    }
+
+    /// How an operation reports an app-client lookup it made inside the pool
+    /// `user_pool_id` that resolved nothing.
+    ///
+    /// A `ClientId` is minted per app client and lives in exactly one pool
+    /// ([`Self::pool_of_client`]), so such a lookup fails in two different ways
+    /// and Amazon Cognito words them differently: an id that names an app client
+    /// of ANOTHER pool is reported with both halves of what was asked for
+    /// ([`app_client_not_found_in_pool_message`]), while an id that names no app
+    /// client at all carries `unresolved` — the sentence the ASKING operation
+    /// answers for that case, which is
+    /// [`APP_CLIENT_NOT_FOUND_MESSAGE`] for the operations that address the app
+    /// client itself and [`app_client_not_found_message`] for the ones that
+    /// quote the id.
+    ///
+    /// Call it only where the lookup in `user_pool_id` has already failed.
+    pub fn app_client_lookup_refusal(
+        &self,
+        user_pool_id: &str,
+        client_id: &str,
+        unresolved: &str,
+    ) -> String {
+        if self
+            .pool_of_client(client_id)
+            .is_some_and(|pool| pool.id != user_pool_id)
+        {
+            return app_client_not_found_in_pool_message(client_id, user_pool_id);
+        }
+        unresolved.to_string()
+    }
+
+    /// Whether the pool `user_pool_id` is stored and the domain `domain` is a
+    /// stored domain of a DIFFERENT pool.
+    ///
+    /// A domain string names at most one pool ([`Self::domain`]), so an
+    /// operation addressed by the PAIR `UserPoolId` + `Domain` can tell a pair
+    /// that resolves nothing from a stored pool that is simply not the one
+    /// configured with a domain some other pool holds, and the two are refused
+    /// differently. A `UserPoolId` nothing answers to is the first case,
+    /// whichever domain it is paired with.
+    pub fn domain_of_other_pool(&self, user_pool_id: &str, domain: &str) -> bool {
+        self.pool(user_pool_id).is_some()
+            && self
+                .domain(domain)
+                .is_some_and(|stored| stored.user_pool_id != user_pool_id)
     }
 
     /// The stored user pool domain `domain` names, prefix or custom, or `None`
@@ -3823,24 +3896,44 @@ impl ClientSecret {
     }
 }
 
-/// The message a `ResourceNotFoundException` carries when the app client
-/// `DescribeUserPoolClient` reads or `UpdateUserPoolClient` writes is not one
-/// the named pool holds — a `ClientId` no create minted, one an earlier
-/// `DeleteUserPoolClient` took away, or one that belongs to another pool.
+/// The message a `ResourceNotFoundException` carries when the `ClientId`
+/// `DescribeUserPoolClient` reads or `UpdateUserPoolClient` writes names no app
+/// client of this emulator at all — an id no create minted, or one an earlier
+/// `DeleteUserPoolClient` took away.
 ///
-/// Amazon Cognito answers the same sentence for every `ClientId`: the lookup
-/// reports that it resolved no app client and quotes neither the id nor the
-/// pool, exactly as [`USER_NOT_FOUND_MESSAGE`] and [`GROUP_NOT_FOUND_MESSAGE`]
-/// report their own unresolved lookups. A message built from the request would
-/// word the refusal differently per app client, so nothing could group these
-/// refusals into one not-found class by text — and it would put a `@sensitive`
-/// `ClientId` (`ClientIdType` in this service's model) into an error string.
+/// These two operations report that lookup without quoting the id: the sentence
+/// is fixed text in full, exactly as [`USER_NOT_FOUND_MESSAGE`] and
+/// [`GROUP_NOT_FOUND_MESSAGE`] report their own unresolved lookups, so a
+/// `@sensitive` `ClientId` (`ClientIdType` in this service's model) reaches no
+/// error string.
 ///
-/// Every other operation words its own app-client lookup: the ones that resolve
-/// a client on the way to ANOTHER resource — its terms documents, its branding,
-/// its UI customization, its secrets — and `DeleteUserPoolClient`, which still
-/// names the `ClientId` it was asked to remove.
+/// An id that DOES name an app client, of another pool, is a different failure
+/// and carries a different sentence — see
+/// [`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::app_client_lookup_refusal`].
 pub const APP_CLIENT_NOT_FOUND_MESSAGE: &str = "User pool client does not exist.";
+
+/// The sentence the operations that report an unresolved app-client lookup BY
+/// ITS `ClientId` carry — the ones that resolve a client on the way to another
+/// resource (its terms documents, its branding, its UI customization, its
+/// secrets), the authentication operations that take a `UserPoolId` beside the
+/// `ClientId`, and `DeleteUserPoolClient`, which names the id it was asked to
+/// remove.
+///
+/// The fixed text is `User pool client ` and ` does not exist.`; the one
+/// variable part is the `ClientId` the REQUEST carried.
+pub fn app_client_not_found_message(client_id: &str) -> String {
+    format!("User pool client {client_id} does not exist.")
+}
+
+/// The sentence every operation carries when the `ClientId` it was given names
+/// an app client that exists but is NOT in the pool the request named.
+///
+/// The fixed text is `User pool client `, ` does not exist in user pool ` and
+/// the trailing `.`; the two variable parts are the `ClientId` and the
+/// `UserPoolId` the REQUEST carried, never a value read out of the store.
+pub fn app_client_not_found_in_pool_message(client_id: &str, user_pool_id: &str) -> String {
+    format!("User pool client {client_id} does not exist in user pool {user_pool_id}.")
+}
 
 /// One stored app client of a user pool.
 #[derive(Debug, Clone)]

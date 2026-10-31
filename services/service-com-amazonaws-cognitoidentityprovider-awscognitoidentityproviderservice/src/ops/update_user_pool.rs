@@ -321,7 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         let pool = guard
             .pool_mut(&input.user_pool_id)
-            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+            .ok_or_else(user_pool_not_found)?;
 
         // A pool configuration member whose feature plan the pool is not on is
         // refused with the same rule the create path applies, judged on the plan
@@ -394,9 +394,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// This operation's `ResourceNotFoundException` for an absent user pool.
-fn user_pool_not_found(user_pool_id: &str) -> UpdateUserPoolError {
+///
+/// Its message is EMPTY: this operation reports the unresolved pool by the error
+/// class and status alone, so the `UserPoolId` the request carried is not echoed
+/// back in prose. Each operation words its own pool lookup, so nothing is shared
+/// with the operations that do carry a sentence.
+fn user_pool_not_found() -> UpdateUserPoolError {
     UpdateUserPoolErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool {user_pool_id} does not exist.")),
+        message: Some(String::new()),
     })
     .into()
 }

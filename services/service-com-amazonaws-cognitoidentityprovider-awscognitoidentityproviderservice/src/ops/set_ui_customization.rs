@@ -185,8 +185,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let host = crate::state::request_host(ctx);
 
         let mut guard = state.lock();
+        // Every refusal is decided on a SHARED borrow of the store, because the
+        // wording of an unresolved app-client lookup depends on whether the
+        // `ClientId` names an app client of ANOTHER pool — a question about the
+        // whole store, which cannot be asked while this pool is borrowed
+        // mutably. The mutable borrow is taken once nothing can refuse.
         let pool = guard
-            .pool_mut(&input.user_pool_id)
+            .pool(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
 
         // "The ID of the app client that you want to customize" (this
@@ -197,8 +202,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if client_id != crate::state::UI_CUSTOMIZATION_ALL_CLIENTS
             && !pool.clients.contains_key(&client_id)
         {
-            return Err(client_not_found(&client_id));
+            return Err(client_not_found(guard.app_client_lookup_refusal(
+                &input.user_pool_id,
+                &client_id,
+                &crate::state::app_client_not_found_message(&client_id),
+            )));
         }
+
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(internal_error)?;
 
         // Stored first, then rendered from the STORED record, so the response
         // is exactly what a later `GetUICustomization` of this level reads back.
@@ -222,10 +235,14 @@ fn user_pool_not_found(user_pool_id: &str) -> SetUICustomizationError {
 }
 
 /// This operation's `ResourceNotFoundException` for an app client the named pool
-/// does not hold.
-fn client_not_found(client_id: &str) -> SetUICustomizationError {
+/// does not hold, carrying the sentence the store's shared app-client lookup
+/// refusal words for it: [`crate::state::app_client_not_found_message`] for a
+/// `ClientId` that names no app client at all, and
+/// [`crate::state::app_client_not_found_in_pool_message`] for one that names an
+/// app client of another pool.
+fn client_not_found(message: String) -> SetUICustomizationError {
     SetUICustomizationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool client {client_id} does not exist.")),
+        message: Some(message),
     })
     .into()
 }
