@@ -151,6 +151,13 @@ pub struct ScalingActivityRecord {
     pub description: String,
     /// "A simple description of what caused the scaling activity to happen."
     pub cause: String,
+    /// The capacity this movement SET on the target — the value after the target's registered
+    /// window was enforced, which is the capacity the resource is driven to.
+    ///
+    /// It is what both messages the activity reports name: while the change is on its way to
+    /// the owning service ([`awaiting_fulfilment_status_message`]) and once it has taken
+    /// effect ([`fulfilled_status_message`]).
+    pub capacity: i32,
     pub start_time: SystemTime,
     /// When the activity reaches [`ScalingActivityRecord::terminal_status_code`], or
     /// `None` for one that was already terminal when it was recorded (an activity that
@@ -264,6 +271,7 @@ impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
             target: target.clone(),
             description: movement_description(target, capacity),
             cause: cause.into(),
+            capacity,
             start_time: at,
             fulfilled_at: Some(at + ACTIVITY_FULFILMENT),
             terminal_status_code: ACTIVITY_SUCCESSFUL.to_string(),
@@ -852,12 +860,35 @@ pub fn fulfilled_status_message(target: &TargetKey, capacity: i32) -> String {
     )
 }
 
+/// The `StatusMessage` of a capacity movement this service has PERFORMED whose change the
+/// service owning the scaled resource has not confirmed yet: the capacity the movement set,
+/// and the service the change is still waiting on, in the wording a recorded in-flight
+/// activity of this service carries ("Successfully set desired count to 6. Waiting for change
+/// to be fulfilled by ecs.").
+///
+/// The same two variables as [`fulfilled_status_message`], which is what the same activity
+/// reports from its fulfilment instant on: a reader of either learns the capacity the
+/// activity settled on and how far the fulfilment got.
+pub fn awaiting_fulfilment_status_message(target: &TargetKey, capacity: i32) -> String {
+    format!(
+        "Successfully set {} to {capacity}. Waiting for change to be fulfilled by {}.",
+        capacity_noun(&target.scalable_dimension),
+        target.service_namespace
+    )
+}
+
 /// The `ScalingActivity` a `Describe` returns for a stored record, as of `now`.
 ///
 /// An activity whose fulfilment instant has not arrived yet is reported in its
 /// non-terminal status with no `EndTime`; from that instant on it reports the terminal
 /// status it was recorded with, and the `EndTime` is that instant — so the same record
 /// answers the same thing to every reader at the same clock reading.
+///
+/// Either way it carries a `StatusMessage` ("a simple message about the current status of the
+/// scaling activity") naming the capacity the movement set: an activity that has started is
+/// past the statuses that report no progress at all, so what it reports is how far the
+/// fulfilment of that capacity got — awaited while the change is on its way
+/// ([`awaiting_fulfilment_status_message`]), settled once it is terminal.
 pub fn scaling_activity_of(record: &ScalingActivityRecord, now: SystemTime) -> ScalingActivity {
     let pending = record.fulfilled_at.filter(|due| *due > now);
     ScalingActivity {
@@ -877,7 +908,10 @@ pub fn scaling_activity_of(record: &ScalingActivityRecord, now: SystemTime) -> S
             None => record.terminal_status_code.clone(),
         },
         status_message: match pending {
-            Some(_) => None,
+            Some(_) => Some(awaiting_fulfilment_status_message(
+                &record.target,
+                record.capacity,
+            )),
             None => record.terminal_status_message.clone(),
         },
         details: record.details.clone(),

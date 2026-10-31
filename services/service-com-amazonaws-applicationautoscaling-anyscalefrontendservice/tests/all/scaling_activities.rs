@@ -288,10 +288,16 @@ async fn a_capacity_movement_is_reported_as_one_activity_that_reaches_its_termin
                     Value::Null,
                     "case {case:?}: expected no EndTime before fulfilment, got {started:?}"
                 );
+                // A movement that has started reports how far its fulfilment got, naming the
+                // capacity it set; the fulfilment itself is what it is still waiting on.
+                let awaited = format!(
+                    "Successfully set {} to {}. Waiting for change to be fulfilled by {}.",
+                    row.noun, row.capacity, row.namespace
+                );
                 assert_eq!(
                     started["StatusMessage"],
-                    Value::Null,
-                    "case {case:?}: expected no StatusMessage before fulfilment, \
+                    json!(awaited),
+                    "case {case:?}: expected StatusMessage {awaited:?} before fulfilment, \
                      got {started:?}"
                 );
             }

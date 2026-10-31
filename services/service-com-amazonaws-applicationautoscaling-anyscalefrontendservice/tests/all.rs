@@ -35,6 +35,8 @@ mod scalable_target_lifecycle;
 mod scalable_target_resolution;
 #[path = "all/scaling_activities.rs"]
 mod scaling_activities;
+#[path = "all/scaling_activity_status_message.rs"]
+mod scaling_activity_status_message;
 #[path = "all/scaling_policy_preconditions.rs"]
 mod scaling_policy_preconditions;
 #[path = "all/scheduled_action_deletion.rs"]
