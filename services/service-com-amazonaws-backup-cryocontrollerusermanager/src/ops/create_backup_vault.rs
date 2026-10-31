@@ -277,6 +277,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             settles_at: None,
             tags,
             lock: None,
+            // An ordinary vault gives access to its own recovery points, so it
+            // names no source vault and asks for no approval, and multi-party
+            // approval is not a facility of its type.
+            source_backup_vault_arn: None,
+            approval_date: None,
+            mpa_approval_team_arn: None,
         };
         let output = CreateBackupVaultOutput {
             backup_vault_name: Some(vault.name.clone()),

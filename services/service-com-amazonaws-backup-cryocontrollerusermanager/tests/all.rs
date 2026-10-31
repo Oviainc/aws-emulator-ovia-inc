@@ -31,6 +31,8 @@ mod logically_air_gapped_vault;
 mod recovery_point_deletion;
 #[path = "all/recovery_point_read.rs"]
 mod recovery_point_read;
+#[path = "all/restore_access_vault.rs"]
+mod restore_access_vault;
 #[path = "all/scheduled_runs_preview.rs"]
 mod scheduled_runs_preview;
 #[path = "all/state_roundtrip.rs"]

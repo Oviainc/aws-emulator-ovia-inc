@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeRestoreAccessBackupVault
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeRestoreAccessBackupVault`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeRestoreAccessBackupVault::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one restore access backup vault from [`crate::state`] — the SAME
+//! store `CreateRestoreAccessBackupVault` inserted it into and
+//! `ListRestoreAccessBackupVaults` pages — so the access it gave is gone and
+//! the vault itself with it: this operation "revokes access to a restore access
+//! backup vault, removing the ability to restore from its recovery points and
+//! permanently deleting the vault" (model doc).
+//!
+//! A `RestoreAccessBackupVaultArn` that names none of the named source vault's
+//! restore access vaults is refused as a parameter VALUE rather than as an
+//! absent resource — see [`crate::state::rejected_restore_access_vault_arn`].
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +176,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeRestoreAccessBackupVault` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeRestoreAccessBackupVaultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeRestoreAccessBackupVault"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RevokeRestoreAccessBackupVaultErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        // `RestoreAccessBackupVaultArn` names a BACKUP VAULT by ARN, and the
+        // model types it as `ARN` with no pattern, so the framework cannot
+        // refuse a value that is not one; AWS does, rather than looking for a
+        // vault no ARN this service mints could name. It is the same refusal
+        // the resolution below answers, because it is the same condition: the
+        // member does not name a vault whose access can be revoked.
+        if crate::state::backup_vault_arn_parts(&input.restore_access_backup_vault_arn).is_none() {
+            return Err(
+                RevokeRestoreAccessBackupVaultErrorModeled::InvalidParameterValueException(
+                    crate::state::rejected_restore_access_vault_arn(),
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // `BackupVaultName` names the SOURCE vault (model doc: "the name of the
+        // source backup vault associated with the restore access backup vault
+        // to be revoked"), and a vault-scoped call decides access before
+        // existence: a source vault outside the caller's visibility is refused
+        // with 403 `AccessDeniedException` rather than reported as missing. The
+        // decision lives in `state::visible_vault`, shared with every other
+        // vault-scoped call; this input models no `BackupVaultAccountId`, so
+        // the vault is resolved in the caller's own account.
+        let source_arn = store
+            .visible_vault(&input.backup_vault_name, None)?
+            .arn
+            .clone();
+        // The target must be one of the restore access vaults created against
+        // that source vault — resolved through the one source link the list
+        // pages, so an ARN this call accepts is one the list reports. An ARN no
+        // stored vault answers to, one belonging to another source vault and
+        // one already revoked are ONE condition as far as this call is
+        // concerned: the ARN names no restore access vault of the named source.
+        let target = store
+            .restore_access_vaults_of(&source_arn)
+            .into_iter()
+            .find(|vault| vault.arn == input.restore_access_backup_vault_arn)
+            .map(|vault| vault.name.clone());
+        let Some(name) = target else {
+            return Err(
+                RevokeRestoreAccessBackupVaultErrorModeled::InvalidParameterValueException(
+                    crate::state::rejected_restore_access_vault_arn(),
+                )
+                .into(),
+            );
+        };
+        // "Permanently deleting the vault": the record goes, and its per-vault
+        // recovery-point index with it, so nothing is left for a later read to
+        // resolve the name through. The SOURCE vault and its recovery points
+        // are untouched — only the access to them is withdrawn.
+        store.vaults.remove(&name);
+        store.recovery_points_by_vault.remove(&name);
+        Ok(RevokeRestoreAccessBackupVaultOutput)
     }
 }

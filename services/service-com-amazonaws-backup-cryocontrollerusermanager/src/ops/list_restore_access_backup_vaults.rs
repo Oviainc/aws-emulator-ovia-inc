@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRestoreAccessBackupVaults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRestoreAccessBackupVaults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRestoreAccessBackupVaults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the restore access backup vaults stored against the named source
+//! vault, read out of the SAME [`crate::state`] vault store
+//! `CreateRestoreAccessBackupVault` inserts them into and
+//! `RevokeRestoreAccessBackupVault` removes them from, so a vault this page
+//! reports is exactly one those two agree exists.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +149,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRestoreAccessBackupVaults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRestoreAccessBackupVaultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRestoreAccessBackupVaults"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        // A page size outside the model's `@range` is this service's own
+        // `InvalidParameterValueException`, answered before anything is read so
+        // the body is the modelled shape carrying `Code` and `Message`.
+        if let Some(refusal) = crate::state::rejected_max_results(input.max_results) {
+            return Err(
+                ListRestoreAccessBackupVaultsErrorModeled::InvalidParameterValueException(refusal)
+                    .into(),
+            );
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRestoreAccessBackupVaultsErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        // The ONE write this reporting operation performs: every `CREATING` ->
+        // `AVAILABLE` transition the clock has already made due was owed at
+        // that instant whether or not anybody listed, so a listed vault and a
+        // described one never disagree about its state.
+        store.settle_vaults(now);
+        // A vault-scoped read decides access before existence: a source vault
+        // outside the caller's visibility is refused with 403
+        // `AccessDeniedException` rather than reported as missing, so the
+        // answer discloses nothing about whether it exists. The decision lives
+        // in `state::visible_vault`, shared with every other vault-scoped
+        // read; this input models no `BackupVaultAccountId`, so the vault is
+        // resolved in the caller's own account.
+        let source_arn = store
+            .visible_vault(&input.backup_vault_name, None)?
+            .arn
+            .clone();
+        // The ONE place the source link is resolved, shared with the revoke, so
+        // a vault this page reports is exactly one the revoke can find.
+        let matching = store.restore_access_vaults_of(&source_arn);
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let key = crate::state::decode_page_token(token);
+                let position =
+                    key.and_then(|key| matching.iter().position(|vault| vault.name == key));
+                let Some(position) = position else {
+                    return Err(
+                        ListRestoreAccessBackupVaultsErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(
+                                    "NextToken does not name a page of this result set".to_string(),
+                                ),
+                                ..Default::default()
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                position
+            }
+        };
+        // No `MaxResults` means one page: the model's own maximum. A page size
+        // the model's `@range(1..1000)` refuses was answered above, so the
+        // clamp here only applies the default.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+        let end = start.saturating_add(page_size).min(matching.len());
+        let next_token = matching
+            .get(end)
+            .map(|vault| crate::state::encode_page_token(&vault.name));
+
+        let restore_access_backup_vaults: Vec<RestoreAccessBackupVaultListMember> = matching
+            [start..end]
+            .iter()
+            .map(|vault| RestoreAccessBackupVaultListMember {
+                restore_access_backup_vault_arn: Some(vault.arn.clone()),
+                creation_date: Some(::aws_smithy_types::DateTime::from(vault.creation_date)),
+                // Set once the access this vault asked for was approved, which
+                // is the instant its creation settled.
+                approval_date: vault.approval_date.map(::aws_smithy_types::DateTime::from),
+                vault_state: vault.vault_state.clone(),
+                // A revoke of a restore access vault this emulator holds takes
+                // effect at once, so no revoke request is ever left
+                // outstanding for a listed vault to report.
+                latest_revoke_request: None,
+            })
+            .collect();
+
+        Ok(ListRestoreAccessBackupVaultsOutput {
+            restore_access_backup_vaults: Some(restore_access_backup_vaults),
+            next_token,
+        })
     }
 }

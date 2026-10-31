@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRestoreAccessBackupVault
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRestoreAccessBackupVault`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRestoreAccessBackupVault::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a vault record into [`crate::state`] — the SAME store
+//! `DescribeBackupVault`, `ListBackupVaults` and `ListRestoreAccessBackupVaults`
+//! read — with `VaultType` `RESTORE_ACCESS_BACKUP_VAULT`, the ARN of the source
+//! vault whose recovery points it gives temporary access to, and the
+//! non-terminal `VaultState` `CREATING` this operation's output models, which
+//! the clock settles to `AVAILABLE`.
+//!
+//! The source vault has to be a logically air-gapped one that is itself
+//! `AVAILABLE` and has an MPA approval team associated: a type that holds no
+//! air-gapped recovery points cannot grant access to any, a vault still being
+//! created cannot serve the ones it will hold, and access is granted "subject
+//! to MPA approval" (model doc), which no vault without an approval team can
+//! obtain — so each is refused with the modelled error for its class.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +174,222 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRestoreAccessBackupVault` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRestoreAccessBackupVaultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRestoreAccessBackupVault"))
+        // `BackupVaultName`'s `@pattern` is refused by the framework BEFORE
+        // this handler runs, so a name reaching here is one the model admits.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateRestoreAccessBackupVaultErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // `SourceBackupVaultArn` names a BACKUP VAULT by ARN, and the model
+        // types it as `ARN` with no pattern, so the framework cannot refuse a
+        // value that is not one; AWS does, rather than looking for a vault no
+        // ARN this service mints could name. The check and its sentence are
+        // `crate::state`'s, shared with every other member this service types
+        // as a vault ARN, and it hands back the fields the ARN names.
+        let source = crate::state::resolved_backup_vault_arn(
+            "SourceBackupVaultArn",
+            &input.source_backup_vault_arn,
+        )
+        .map_err(CreateRestoreAccessBackupVaultErrorModeled::InvalidParameterValueException)?;
+        let tags: ::std::collections::BTreeMap<String, String> = input
+            .backup_vault_tags
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        let mut store = state.lock();
+        // A source vault whose creation the clock has already settled can grant
+        // restore access, so the transition owed at its `settles_at` is
+        // materialised before the state guard below reads the state.
+        store.settle_vault(&source.name, now);
+        // The source vault is resolved by the WHOLE ARN: one whose account or
+        // region is not the stored vault's names another account's or another
+        // region's vault, which this emulator holds either way no more than a
+        // vault that was never created.
+        let source_vault = store
+            .vaults
+            .get(&source.name)
+            .filter(|vault| vault.arn == input.source_backup_vault_arn);
+        let Some(source_vault) = source_vault else {
+            return Err(
+                CreateRestoreAccessBackupVaultErrorModeled::ResourceNotFoundException(
+                    crate::state::backup_vault_not_found(&source.name),
+                )
+                .into(),
+            );
+        };
+        // Restore access is a facility of a LOGICALLY AIR-GAPPED vault — this
+        // operation "provides temporary access to recovery points in a
+        // logically air-gapped backup vault" (model doc) — so a source vault of
+        // any other type cannot grant it.
+        if source_vault.vault_type != crate::state::VAULT_TYPE_LOGICALLY_AIR_GAPPED_BACKUP_VAULT {
+            return Err(
+                CreateRestoreAccessBackupVaultErrorModeled::InvalidParameterValueException(
+                    crate::state::unsupported_vault_type(),
+                )
+                .into(),
+            );
+        }
+        // A vault grants access to its recovery points only once it is itself
+        // ready to serve them: a source vault still in a non-terminal state is
+        // refused for its STATE — the modelled `InvalidRequestException`, as
+        // `StartBackupJob` refuses a backup into such a vault and
+        // `DeleteBackupVault` a delete of one — rather than reported as absent,
+        // which is what tells a client to retry once creation finishes.
+        let pending_state = source_vault
+            .vault_state
+            .clone()
+            .filter(|state| state != crate::state::VAULT_STATE_AVAILABLE);
+        if let Some(pending_state) = pending_state {
+            return Err(
+                CreateRestoreAccessBackupVaultErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "Backup vault {} is in {pending_state} state and cannot grant \
+                             restore access",
+                            source.name
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+        // A restore access vault exposes the SOURCE vault's recovery points,
+        // which are encrypted with the source vault's key, so that key is the
+        // one it reports.
+        let encryption_key_arn = source_vault.encryption_key_arn.clone();
+        let customer_managed_key = source_vault.customer_managed_key;
+        let encryption_key_type = source_vault.encryption_key_type.clone();
+        let approval_team = source_vault.mpa_approval_team_arn.is_some();
+        // Access to an air-gapped vault's recovery points is granted "subject
+        // to MPA approval" (model doc), and the team that approves it is the
+        // one `AssociateBackupVaultMpaApprovalTeam` associates with the source
+        // vault: a source vault with no team can obtain no approval, so there
+        // is no access for it to grant. That is a refusal the stored vault's
+        // configuration makes, so it is the modelled
+        // `InvalidRequestException`.
+        if !approval_team {
+            return Err(
+                CreateRestoreAccessBackupVaultErrorModeled::InvalidRequestException(
+                    crate::state::no_mpa_approval_team(),
+                )
+                .into(),
+            );
+        }
+
+        // "A unique string that identifies the request and allows failed
+        // requests to be retried without the risk of executing the operation
+        // twice" (model doc for `CreatorRequestId`): a repeat create carrying a
+        // token one of this source vault's restore access vaults already
+        // records is answered from that stored vault rather than making a
+        // second one. The token is matched before the name because the create's
+        // `BackupVaultName` is optional, so a retry of a request that named
+        // none carries no name to match on.
+        let replayed = input.creator_request_id.as_deref().and_then(|token| {
+            store
+                .restore_access_vaults_of(&input.source_backup_vault_arn)
+                .into_iter()
+                .find(|vault| vault.creator_request_id.as_deref() == Some(token))
+                .map(|vault| vault.name.clone())
+        });
+        if let Some(name) = replayed {
+            // The stored vault as it stands NOW, including the state the clock
+            // has since made due.
+            store.settle_vault(&name, now);
+            let existing = store.vaults.get(&name).expect("the vault resolved above");
+            return Ok(CreateRestoreAccessBackupVaultOutput {
+                restore_access_backup_vault_arn: Some(existing.arn.clone()),
+                restore_access_backup_vault_name: Some(existing.name.clone()),
+                vault_state: existing.vault_state.clone(),
+                creation_date: Some(::aws_smithy_types::DateTime::from(existing.creation_date)),
+            });
+        }
+
+        // A vault is ADDRESSED by name, so a create that named none is given a
+        // name this service mints.
+        let name = match input.backup_vault_name.clone() {
+            Some(name) => name,
+            None => store.minted_restore_access_vault_name(now),
+        };
+        // A vault name is unique across vault types, so a name this account
+        // already holds collides — the same answer `CreateBackupVault` gives,
+        // because it is the same condition, and it discloses nothing about the
+        // vault that is already there.
+        if store.vaults.contains_key(&name) {
+            return Err(
+                CreateRestoreAccessBackupVaultErrorModeled::AlreadyExistsException(
+                    crate::state::vault_already_exists(),
+                )
+                .into(),
+            );
+        }
+        // The store is in memory and every request can add to it, so the number
+        // of vaults it keeps is bounded. AWS answers the same modelled error
+        // once an account reaches its own vault quota.
+        if store.vaults.len() >= crate::state::MAX_VAULTS {
+            return Err(
+                CreateRestoreAccessBackupVaultErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "this emulator keeps at most {} backup vaults",
+                            crate::state::MAX_VAULTS
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let vault = crate::state::BackupVault {
+            name: name.clone(),
+            // The vault belongs to the region of the vault it gives access to,
+            // which the source ARN names.
+            arn: crate::state::backup_vault_arn(&source.region, &name),
+            encryption_key_arn,
+            customer_managed_key,
+            encryption_key_type,
+            creator_request_id: input.creator_request_id,
+            creation_date: now,
+            vault_type: crate::state::VAULT_TYPE_RESTORE_ACCESS_BACKUP_VAULT.to_string(),
+            // This operation's output models `VaultState`, so the vault is
+            // reported in the non-terminal state first and the clock owes it
+            // the move to `AVAILABLE` — which is also when the access it asks
+            // for is approved.
+            vault_state: Some(crate::state::VAULT_STATE_CREATING.to_string()),
+            settles_at: now.checked_add(crate::state::VAULT_SETTLE_AFTER),
+            tags,
+            // Retention stays the SOURCE vault's affair: a restore access
+            // vault holds no recovery points of its own, so it carries no
+            // vault-lock configuration.
+            lock: None,
+            source_backup_vault_arn: Some(input.source_backup_vault_arn.clone()),
+            approval_date: None,
+            // The team that approves access to the recovery points stays on
+            // the SOURCE vault: the restore access vault associates none of
+            // its own.
+            mpa_approval_team_arn: None,
+        };
+        let output = CreateRestoreAccessBackupVaultOutput {
+            restore_access_backup_vault_arn: Some(vault.arn.clone()),
+            restore_access_backup_vault_name: Some(vault.name.clone()),
+            vault_state: vault.vault_state.clone(),
+            creation_date: Some(::aws_smithy_types::DateTime::from(vault.creation_date)),
+        };
+        store
+            .recovery_points_by_vault
+            .entry(vault.name.clone())
+            .or_default();
+        store.vaults.insert(vault.name.clone(), vault);
+        Ok(output)
     }
 }

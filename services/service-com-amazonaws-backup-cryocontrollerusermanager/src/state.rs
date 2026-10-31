@@ -30,6 +30,14 @@
 //! ONLY recovery-point read projection: `DescribeRecoveryPoint` and
 //! `ListRecoveryPointsByBackupVault` both answer from it.
 //!
+//! A restore access backup vault is one of those [`BackupVault`] records too,
+//! of vault type `RESTORE_ACCESS_BACKUP_VAULT`, and
+//! [`BackupVault::source_backup_vault_arn`] is the ONLY link it keeps to the
+//! vault it gives access to: `ListRestoreAccessBackupVaults`' page,
+//! `RevokeRestoreAccessBackupVault`'s target and `DescribeBackupVault`'s
+//! `SourceBackupVaultArn` are all derived from it, so none of the three can
+//! disagree with the others.
+//!
 //! [`ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault`] (and its
 //! `_mut` twin, for a call that writes the vault it resolves) is the resolution
 //! step every vault-scoped call AWS Backup authorizes against the named vault
@@ -60,6 +68,10 @@ pub const VAULT_TYPE_BACKUP_VAULT: &str = "BACKUP_VAULT";
 /// `VaultType` for a logically air-gapped backup vault (model enum `VaultType`).
 pub const VAULT_TYPE_LOGICALLY_AIR_GAPPED_BACKUP_VAULT: &str =
     "LOGICALLY_AIR_GAPPED_BACKUP_VAULT";
+/// `VaultType` for a restore access backup vault — the vault
+/// `CreateRestoreAccessBackupVault` makes to give temporary access to the
+/// recovery points of a logically air-gapped one (model enum `VaultType`).
+pub const VAULT_TYPE_RESTORE_ACCESS_BACKUP_VAULT: &str = "RESTORE_ACCESS_BACKUP_VAULT";
 /// `VaultState` of a vault that is ready to receive backups (model enum `VaultState`).
 pub const VAULT_STATE_AVAILABLE: &str = "AVAILABLE";
 /// `VaultState` of a vault whose creation has not settled yet (model enum
@@ -551,6 +563,28 @@ pub fn backup_vault_arn_parts(value: &str) -> Option<BackupVaultArnParts> {
 // condition rather than for the request — it names no part of the request, so
 // it is a constant here and not a format string.
 
+/// The sentence AWS states for "this vault's TYPE does not support the
+/// operation that was called on it" — fixed, since it names no part of the
+/// request. Restore access is a facility of a logically air-gapped vault, so a
+/// source vault of any other type cannot grant it.
+pub const MESSAGE_UNSUPPORTED_VAULT_TYPE: &str =
+    "Operation not supported for the provided vault type";
+
+/// The sentence AWS states for "the `RestoreAccessBackupVaultArn` the request
+/// carries does not name a restore access backup vault of the named source
+/// vault" — fixed: it names no part of the request, so the ARN asked about does
+/// not appear in it. No `Code`: this condition has no observed token.
+pub const MESSAGE_RESTORE_ACCESS_VAULT_ARN_INVALID: &str =
+    "The provided restore access backup vault ARN is not valid.";
+
+/// The sentence AWS states for "a restore access backup vault was asked for
+/// against a source vault that has no MPA approval team to approve it" — fixed:
+/// it names no part of the request, so the vault asked about does not appear in
+/// it. No `Code`: this condition has no observed token.
+pub const MESSAGE_NO_MPA_APPROVAL_TEAM: &str = "Cannot create restore access backup vault. \
+                                               No MPA approval team associated with the backup \
+                                               vault.";
+
 /// `Code` for "the backup job asked about is not one this account holds".
 pub const ERROR_CODE_BACKUP_JOB_NOT_FOUND: &str = "ERROR_2403";
 /// The sentence AWS states for that condition. A FIXED string: it names no part
@@ -661,6 +695,42 @@ pub fn vault_already_exists() -> AlreadyExistsException {
     AlreadyExistsException {
         code: Some(ERROR_CODE_VAULT_ALREADY_EXISTS.to_string()),
         message: Some(MESSAGE_VAULT_ALREADY_EXISTS.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a call whose named vault is of a type that does not
+/// support it — see [`MESSAGE_UNSUPPORTED_VAULT_TYPE`].
+pub fn unsupported_vault_type() -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        message: Some(MESSAGE_UNSUPPORTED_VAULT_TYPE.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a `RestoreAccessBackupVaultArn` this service cannot
+/// accept — see [`MESSAGE_RESTORE_ACCESS_VAULT_ARN_INVALID`].
+///
+/// A value that is not a backup vault's ARN at all and one that resolves to no
+/// restore access vault of the named source vault are ONE condition: the member
+/// does not name a vault whose access can be revoked. Both are answered with
+/// this one sentence, so the refusal discloses nothing about which vaults exist.
+///
+/// The PARAMETER-value class, not the not-found one: the ARN is a member of the
+/// request, and AWS Backup reports a resource ARN that resolves to nothing as a
+/// value it cannot accept.
+pub fn rejected_restore_access_vault_arn() -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        message: Some(MESSAGE_RESTORE_ACCESS_VAULT_ARN_INVALID.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a restore access create whose source vault has no
+/// MPA approval team — see [`MESSAGE_NO_MPA_APPROVAL_TEAM`].
+pub fn no_mpa_approval_team() -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(MESSAGE_NO_MPA_APPROVAL_TEAM.to_string()),
         ..Default::default()
     }
 }
@@ -896,10 +966,21 @@ pub fn rejected_backup_vault_arn(
     member: &str,
     value: &str,
 ) -> Option<InvalidParameterValueException> {
-    if backup_vault_arn_parts(value).is_some() {
-        return None;
-    }
-    Some(InvalidParameterValueException {
+    resolved_backup_vault_arn(member, value).err()
+}
+
+/// The fields a backup-vault ARN names, or the modelled refusal for a value
+/// that is not one.
+///
+/// The same check and the same sentence as [`rejected_backup_vault_arn`] — that
+/// one is this one's refusal half — for a caller that goes on to USE the parsed
+/// fields, so the parse and the refusal cannot drift apart and neither needs a
+/// second parse that could fail.
+pub fn resolved_backup_vault_arn(
+    member: &str,
+    value: &str,
+) -> Result<BackupVaultArnParts, InvalidParameterValueException> {
+    backup_vault_arn_parts(value).ok_or_else(|| InvalidParameterValueException {
         message: Some(format!(
             "{member} must be the ARN of a backup vault, of the form \
              arn:<partition>:backup:<region>:<account>:backup-vault:<name>"
@@ -1150,15 +1231,15 @@ pub struct BackupVault {
     pub encryption_key_type: Option<String>,
     pub creator_request_id: Option<String>,
     pub creation_date: SystemTime,
-    /// [`VAULT_TYPE_BACKUP_VAULT`] for a vault made by `CreateBackupVault` and
+    /// [`VAULT_TYPE_BACKUP_VAULT`] for a vault made by `CreateBackupVault`,
     /// [`VAULT_TYPE_LOGICALLY_AIR_GAPPED_BACKUP_VAULT`] for one made by
-    /// `CreateLogicallyAirGappedBackupVault`; `RESTORE_ACCESS_BACKUP_VAULT`
-    /// belongs to an operation still at 501.
+    /// `CreateLogicallyAirGappedBackupVault` and
+    /// [`VAULT_TYPE_RESTORE_ACCESS_BACKUP_VAULT`] for one made by
+    /// `CreateRestoreAccessBackupVault`.
     pub vault_type: String,
     /// `VaultState`, as this vault's type reports it. `None` for a standard
     /// `BACKUP_VAULT`, for the reason given on [`Self::encryption_key_type`];
-    /// the vault types that do carry a state are created by operations still at
-    /// 501.
+    /// the vault types whose create models the member do carry one.
     pub vault_state: Option<String>,
     /// When the clock owes this vault its `CREATING` -> `AVAILABLE`
     /// transition, for a vault whose create reports a non-terminal state. See
@@ -1167,6 +1248,24 @@ pub struct BackupVault {
     pub tags: BTreeMap<String, String>,
     /// The vault-lock configuration, once one has been applied.
     pub lock: Option<VaultLock>,
+    /// The ARN of the vault a [`VAULT_TYPE_RESTORE_ACCESS_BACKUP_VAULT`] vault
+    /// was created against: the source vault whose recovery points it gives
+    /// temporary access to. `None` for every other vault type, which has no
+    /// source vault, and the link `ListRestoreAccessBackupVaults` pages over.
+    pub source_backup_vault_arn: Option<String>,
+    /// The ARN of the MPA approval team `AssociateBackupVaultMpaApprovalTeam`
+    /// associated with this vault, once one has been. Multi-party approval is a
+    /// facility of a logically air-gapped vault, and the team it names is what
+    /// approves access to the recovery points that vault holds, so a source
+    /// vault with none can grant no restore access at all.
+    pub mpa_approval_team_arn: Option<String>,
+    /// When the access a restore access vault asks for was approved, which is
+    /// the instant its creation settled: such a vault is created "subject to
+    /// MPA approval" (model doc for `CreateRestoreAccessBackupVault`), so it is
+    /// usable exactly once that approval is in. `None` while one is still
+    /// [`VAULT_STATE_CREATING`], and for every vault type that asks for no
+    /// approval at all.
+    pub approval_date: Option<SystemTime>,
 }
 
 impl BackupVault {
@@ -1198,6 +1297,9 @@ pub struct VaultView {
     pub min_retention_days: Option<i64>,
     pub max_retention_days: Option<i64>,
     pub lock_date: Option<SystemTime>,
+    pub source_backup_vault_arn: Option<String>,
+    pub approval_date: Option<SystemTime>,
+    pub mpa_approval_team_arn: Option<String>,
 }
 
 /// A recovery point stored inside a vault by `StartBackupJob`.
@@ -1851,6 +1953,13 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
                 && vault.settles_at.is_some_and(|due| now >= due)
             {
                 vault.vault_state = Some(VAULT_STATE_AVAILABLE.to_string());
+                // A restore access vault becomes available exactly when the
+                // access it asked for is approved, so the instant that
+                // transition CAME DUE — not the instant somebody looked — is
+                // the approval date it reports from then on.
+                if vault.vault_type == VAULT_TYPE_RESTORE_ACCESS_BACKUP_VAULT {
+                    vault.approval_date = vault.settles_at;
+                }
             }
         }
     }
@@ -1919,7 +2028,45 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
             min_retention_days: vault.lock.as_ref().and_then(|lock| lock.min_retention_days),
             max_retention_days: vault.lock.as_ref().and_then(|lock| lock.max_retention_days),
             lock_date: vault.lock.as_ref().and_then(|lock| lock.lock_date),
+            source_backup_vault_arn: vault.source_backup_vault_arn.clone(),
+            approval_date: vault.approval_date,
+            mpa_approval_team_arn: vault.mpa_approval_team_arn.clone(),
         }
+    }
+
+    /// Every restore access backup vault created against the vault whose ARN is
+    /// `source_backup_vault_arn`, in `BackupVaultName` order.
+    ///
+    /// The ONE place that link is resolved, so `ListRestoreAccessBackupVaults`'
+    /// page and `RevokeRestoreAccessBackupVault`'s target are read out of the
+    /// same set: a vault the list reports is exactly one the revoke can find.
+    /// The source is matched by ARN rather than by name because the ARN is what
+    /// the create was given, and it names the account and region as well as the
+    /// name. `vaults` is a `BTreeMap` keyed by name, so this walk is already in
+    /// name order \u2014 which is what makes a name-valued page cursor resolve to
+    /// the same position on every request.
+    pub fn restore_access_vaults_of(&self, source_backup_vault_arn: &str) -> Vec<&BackupVault> {
+        self.vaults
+            .values()
+            .filter(|vault| vault.vault_type == VAULT_TYPE_RESTORE_ACCESS_BACKUP_VAULT)
+            .filter(|vault| {
+                vault.source_backup_vault_arn.as_deref() == Some(source_backup_vault_arn)
+            })
+            .collect()
+    }
+
+    /// The name this service gives a restore access backup vault whose create
+    /// request named none: `CreateRestoreAccessBackupVault`'s `BackupVaultName`
+    /// is optional, while a vault is ADDRESSED by name, so one is minted.
+    ///
+    /// The minted name has to satisfy the model's `BackupVaultName` pattern
+    /// (`^[a-zA-Z0-9\-\_]{2,50}$`) or the vault could not be named by a later
+    /// request, which rules out carrying a whole [`Self::next_id`]; the last
+    /// group of one is the per-engine counter, so it is unique on its own.
+    pub fn minted_restore_access_vault_name(&mut self, now: SystemTime) -> String {
+        let id = self.next_id(now);
+        let suffix = id.split('-').next_back().unwrap_or(id.as_str());
+        format!("restore-access-{suffix}")
     }
 
     /// Project one stored recovery point for a read. The ONE place a recovery

@@ -269,11 +269,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             max_retention_days: view.max_retention_days,
             encryption_key_type: view.encryption_key_type,
             lock_date: view.lock_date.map(::aws_smithy_types::DateTime::from),
-            // The MPA approval team and restore-access vaults are reached only
-            // by operations still at 501, so nothing stored can populate these
-            // yet.
-            source_backup_vault_arn: None,
-            mpa_approval_team_arn: None,
+            // The vault a RESTORE_ACCESS_BACKUP_VAULT gives access to, as
+            // `CreateRestoreAccessBackupVault` stored it; absent for every
+            // vault type that names no source vault.
+            source_backup_vault_arn: view.source_backup_vault_arn,
+            // The MPA approval team `AssociateBackupVaultMpaApprovalTeam`
+            // recorded on this vault, if any. The MPA SESSION members belong to
+            // the approval sessions an operation still at 501 runs, so nothing
+            // stored can populate them yet.
+            mpa_approval_team_arn: view.mpa_approval_team_arn,
             mpa_session_arn: None,
             latest_mpa_approval_team_update: None,
         })

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateBackupVaultMpaApprovalTeam
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateBackupVaultMpaApprovalTeam`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateBackupVaultMpaApprovalTeam::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the MPA approval team on the named vault in [`crate::state`] — the
+//! SAME stored vault `DescribeBackupVault` reports it from and
+//! `CreateRestoreAccessBackupVault` requires one of, since the team is what
+//! approves access to the recovery points an air-gapped vault holds.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +168,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateBackupVaultMpaApprovalTeam` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateBackupVaultMpaApprovalTeamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateBackupVaultMpaApprovalTeam"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateBackupVaultMpaApprovalTeamErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        // The model types `MpaApprovalTeamArn` as `ARN` with no pattern, so the
+        // framework cannot refuse a value that is not one; AWS does, rather
+        // than recording a team reference that names nothing. The check and its
+        // sentence are `crate::state`'s, shared with every other member this
+        // service types as an ARN.
+        if let Some(refusal) =
+            crate::state::rejected_arn("MpaApprovalTeamArn", &input.mpa_approval_team_arn)
+        {
+            return Err(
+                AssociateBackupVaultMpaApprovalTeamErrorModeled::InvalidParameterValueException(
+                    refusal,
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // The write this operation performs is the association, so the
+        // transition the clock owes the vault is materialised first: the vault
+        // it resolves is the vault as it stands now.
+        store.settle_vault(&input.backup_vault_name, now);
+        // A vault-scoped call decides access before existence: a vault outside
+        // the caller's visibility is refused with 403 `AccessDeniedException`
+        // rather than reported as missing, so the answer discloses nothing
+        // about whether it exists. The decision lives in
+        // `state::visible_vault_mut`, shared with every other vault-scoped
+        // write; this input models no `BackupVaultAccountId`, so the vault is
+        // resolved in the caller's own account.
+        let vault = store.visible_vault_mut(&input.backup_vault_name, None)?;
+        // Multi-party approval is a facility of a LOGICALLY AIR-GAPPED vault:
+        // it governs access to the recovery points such a vault holds, so a
+        // vault of any other type supports no team at all.
+        if vault.vault_type != crate::state::VAULT_TYPE_LOGICALLY_AIR_GAPPED_BACKUP_VAULT {
+            return Err(
+                AssociateBackupVaultMpaApprovalTeamErrorModeled::InvalidParameterValueException(
+                    crate::state::unsupported_vault_type(),
+                )
+                .into(),
+            );
+        }
+        // A vault has one approval team, so associating a team replaces the
+        // one recorded before it.
+        vault.mpa_approval_team_arn = Some(input.mpa_approval_team_arn);
+        Ok(AssociateBackupVaultMpaApprovalTeamOutput)
     }
 }

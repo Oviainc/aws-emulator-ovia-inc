@@ -84,7 +84,13 @@ impl Case {
     }
 }
 
-async fn create_air_gapped(router: &MultiServiceRouter, name: &str, body: &str) -> (u16, Value) {
+/// Shared with the sibling suites in this test binary, so the air-gapped
+/// create has ONE spelling here rather than one per file.
+pub(crate) async fn create_air_gapped(
+    router: &MultiServiceRouter,
+    name: &str,
+    body: &str,
+) -> (u16, Value) {
     call(
         router,
         "PUT",

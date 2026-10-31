@@ -353,6 +353,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 max_retention_days: Some(input.max_retention_days),
                 lock_date: Some(now),
             }),
+            // An air-gapped vault holds its own recovery points: it is the
+            // SOURCE a restore access vault is created against, never one
+            // itself, so it names no source vault and asks for no approval.
+            source_backup_vault_arn: None,
+            approval_date: None,
+            // An MPA approval team is associated by its own operation, never
+            // at creation: this create models no team.
+            mpa_approval_team_arn: None,
         };
         let output = CreateLogicallyAirGappedBackupVaultOutput {
             backup_vault_name: Some(vault.name.clone()),
