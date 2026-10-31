@@ -931,6 +931,20 @@
 //! modelled `InstanceMetadataDefaultsResponse`, so `ModifyInstanceMetadataDefaults` and
 //! `GetInstanceMetadataDefaults` cannot disagree about what the account's defaults are.
 //!
+//! The MANAGED RESOURCE VISIBILITY default is a single-word setting of the same kind as the
+//! snapshot one, and account-wide for the same reason this store is: "visibility settings
+//! are account-wide and affect all IAM principals uniformly"
+//! (`ModifyManagedResourceVisibility`), with no Region in its documentation. So
+//! [`ComAmazonawsEc2Amazonec2State::managed_resource_default_visibility`] is one
+//! `&'static str` holding a member of the modelled `ManagedResourceDefaultVisibility`
+//! catalog ([`managed_resource_default_visibility_word`] is what turns a request's word into
+//! one), [`MANAGED_RESOURCE_VISIBILITY_VISIBLE`] for an account that has never modified it.
+//! [`ComAmazonawsEc2Amazonec2State::managed_resource_visibility`] is the one projection into
+//! the modelled [`ManagedResourceVisibilitySettings`] shape both operations answer with, so
+//! `ModifyManagedResourceVisibility` and `GetManagedResourceVisibility` cannot report one
+//! account's setting two ways. Like the snapshot setting it has no clock-owed move: the word
+//! a modify asks for is the word the next read reports.
+//!
 //! ## The Spot Instance data feed
 //!
 //! [`ComAmazonawsEc2Amazonec2State::spot_datafeed_subscription`] is a single
@@ -4060,6 +4074,17 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::set_snapshot_block_public_access_state`], so the operations that report and
     /// the operations that change it cannot disagree.
     snapshot_block_public_access: &'static str,
+    /// The account's MANAGED RESOURCE VISIBILITY default — see the module docs.
+    ///
+    /// A `&'static str` so only a member of the modelled `ManagedResourceDefaultVisibility`
+    /// catalog can ever be stored here: the word comes from that generated catalog
+    /// ([`managed_resource_default_visibility_word`]), never from a request. ONE field rather than
+    /// a map keyed by Region because the setting is account-wide (see the module docs). Read
+    /// it through [`Self::managed_resource_visibility`] and write it through
+    /// [`Self::set_managed_resource_default_visibility`], so the operation that reports the
+    /// setting and the one that changes it cannot disagree. PRIVATE, like the single-word
+    /// setting above, so those accessors are the only way in.
+    managed_resource_default_visibility: &'static str,
     /// The Regions this account has *block public access for AMIs* turned ON in, each under
     /// the mode the enable put it in — see the module docs.
     ///
@@ -4418,6 +4443,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
             snapshot_block_public_access: SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
+            // An account that has never called `ModifyManagedResourceVisibility` has its
+            // managed resources `visible`: a Describe reports one until the account asks for
+            // managed resources to be hidden.
+            managed_resource_default_visibility: MANAGED_RESOURCE_VISIBILITY_VISIBLE,
             // No Region has block public access for AMIs turned on until an enable reaches
             // it there, so a fresh account holds the empty map.
             image_block_public_access: BTreeMap::new(),
@@ -34671,6 +34700,72 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn set_snapshot_block_public_access_state(&mut self, state: &'static str) -> &'static str {
         self.snapshot_block_public_access = state;
         self.snapshot_block_public_access
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Managed resource visibility (the account-wide setting)
+// ---------------------------------------------------------------------------
+
+use crate::ops::types::{
+    MANAGED_RESOURCE_DEFAULT_VISIBILITY_VALUES, ManagedResourceVisibilitySettings,
+};
+
+/// `visible` — "a value of `visible` indicates that managed resources are included [in
+/// Describe operation responses] by default"
+/// (`ManagedResourceVisibilitySettings$DefaultVisibility`): the
+/// `ManagedResourceDefaultVisibility` enum's `visible` member.
+///
+/// It is also where an account that has never called `ModifyManagedResourceVisibility` sits:
+/// a Describe reports a managed resource unless the request asks to "include resources that
+/// are managed by Amazon Web Services services, EVEN IF managed resource visibility is set
+/// to hidden" (`DescribeNetworkInterfacesRequest$IncludeManagedResources`), so hiding them is
+/// a setting the account has to put in effect rather than the state it starts in.
+pub const MANAGED_RESOURCE_VISIBILITY_VISIBLE: &str = "visible";
+
+/// `hidden` — "a value of `hidden` indicates that managed resources are not included in
+/// Describe operation responses by default"
+/// (`ManagedResourceVisibilitySettings$DefaultVisibility`): the
+/// `ManagedResourceDefaultVisibility` enum's other member, which only
+/// `ModifyManagedResourceVisibility` can put the account into.
+pub const MANAGED_RESOURCE_VISIBILITY_HIDDEN: &str = "hidden";
+
+/// The [`MANAGED_RESOURCE_DEFAULT_VISIBILITY_VALUES`] member `requested` names, or `None`
+/// when it names none.
+///
+/// Answering a `&'static str` out of the GENERATED catalog is what keeps request text out of
+/// the store, exactly as [`snapshot_block_public_access_mode`] does for its own setting; the
+/// catalog here is the whole modelled enum, because `ModifyManagedResourceVisibility`
+/// documents both of its members as valid values.
+pub fn managed_resource_default_visibility_word(requested: &str) -> Option<&'static str> {
+    catalog_member(MANAGED_RESOURCE_DEFAULT_VISIBILITY_VALUES, requested)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The account's managed resource visibility settings right now, as the modelled shape
+    /// both operations report them with.
+    ///
+    /// A pure read: the setting has no clock-owed move — the word a modify asks for is the
+    /// word a read made in the same instant reports — so nothing about it changes with time.
+    pub fn managed_resource_visibility(&self) -> ManagedResourceVisibilitySettings {
+        ManagedResourceVisibilitySettings {
+            default_visibility: Some(self.managed_resource_default_visibility.to_string()),
+        }
+    }
+
+    /// Put the account's default visibility to `visibility` and answer the settings now in
+    /// effect — "the UPDATED managed resource visibility settings for the account"
+    /// (`ModifyManagedResourceVisibilityResult$Visibility`).
+    ///
+    /// `visibility` is a `&'static str` so only a member of the catalog above can be stored;
+    /// the answer is read back off the field through [`Self::managed_resource_visibility`]
+    /// rather than echoed, so the writer reports exactly what a later read will.
+    pub fn set_managed_resource_default_visibility(
+        &mut self,
+        visibility: &'static str,
+    ) -> ManagedResourceVisibilitySettings {
+        self.managed_resource_default_visibility = visibility;
+        self.managed_resource_visibility()
     }
 }
 

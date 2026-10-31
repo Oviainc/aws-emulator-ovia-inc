@@ -1063,3 +1063,8 @@ mod modify_verified_access_instance;
 // one refusal for every shape of request, in any Region, with nothing stored.
 #[path = "all/trunk_interface_associations.rs"]
 mod trunk_interface_associations;
+// Appended at the END of this file, for the reason the header gives. The account's *managed
+// resource visibility* setting: the word `ModifyManagedResourceVisibility` puts in effect and
+// the word `GetManagedResourceVisibility` reports out of the account's own setting.
+#[path = "all/managed_resource_visibility.rs"]
+mod managed_resource_visibility;

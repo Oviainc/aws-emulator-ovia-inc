@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyManagedResourceVisibility
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyManagedResourceVisibility`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyManagedResourceVisibility::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Puts the account's managed resource visibility default into the word the request names
+//! and answers the settings now in effect, read back off the store. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +134,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyManagedResourceVisibility` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyManagedResourceVisibilityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyManagedResourceVisibility"))
+        use crate::state;
+
+        // "Visibility settings are ACCOUNT-WIDE and affect all IAM principals uniformly":
+        // the setting is one account-wide fact, and this store is per account
+        // (`crate::state`'s module docs), so nothing of the request beyond
+        // `DefaultVisibility` and `DryRun` is read and `ctx` carries nothing this operation
+        // needs.
+        let _ = ctx;
+
+        // "The default visibility setting for managed resources. Valid values: hidden |
+        // visible" (`ModifyManagedResourceVisibilityRequest$DefaultVisibility`). Resolving
+        // the word against the modelled catalog is what keeps request text out of the store:
+        // what is stored is the catalog member, never the string the request carried. The
+        // modelled enum constraint already refuses a word outside that catalog before this
+        // handler runs, so the refusal below is reached only if that boundary ever stops
+        // covering a member; it is an `InvalidParameterValue`, EC2's refusal for a member's
+        // value, never a 501.
+        let requested = input.default_visibility.as_str();
+        let Some(visibility) = state::managed_resource_default_visibility_word(requested) else {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({requested}) for parameter defaultVisibility is invalid. Valid \
+                 values are {}",
+                MANAGED_RESOURCE_DEFAULT_VISIBILITY_VALUES.join(", ")
+            )));
+        };
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+
+        // DryRun sits AFTER `DefaultVisibility` has been resolved and BEFORE the write: the
+        // flag asks whether the request WOULD have succeeded, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves the setting where it was.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "Use this operation to control whether managed resources are hidden or visible by
+        // default": the word the request names replaces whatever word the setting held,
+        // including the same one again. The response is read back off the store, so it
+        // reports exactly what a `GetManagedResourceVisibility` made in the same instant
+        // would — "the UPDATED managed resource visibility settings for the account"
+        // (`ModifyManagedResourceVisibilityResult$Visibility`).
+        let in_effect = store.set_managed_resource_default_visibility(visibility);
+        Ok(ModifyManagedResourceVisibilityOutput {
+            visibility: Some(in_effect),
+        })
     }
 }

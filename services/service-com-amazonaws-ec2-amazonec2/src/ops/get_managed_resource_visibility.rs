@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetManagedResourceVisibility
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetManagedResourceVisibility`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetManagedResourceVisibility::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's managed resource visibility settings out of the store, and writes
+//! nothing: the setting has no clock-owed move, so two reads with no modify between them
+//! answer the same word. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +129,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetManagedResourceVisibility` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetManagedResourceVisibilityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetManagedResourceVisibility"))
+        use crate::state;
+
+        // "Retrieves the managed resource visibility configuration for the ACCOUNT": the
+        // setting is one account-wide fact, and this store is per account (`crate::state`'s
+        // module docs), so nothing of the request beyond `DryRun` is read and `ctx` carries
+        // nothing this operation needs.
+        let _ = ctx;
+
+        // A `DryRun` request that would have succeeded stops before the read: "If you have
+        // the required permissions, the error response is DryRunOperation"
+        // (`GetManagedResourceVisibilityRequest$DryRun`).
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "The response indicates whether managed resources are hidden or visible by
+        // default": the settings are read off the store, so this answers exactly what the
+        // last `ModifyManagedResourceVisibility` left — or, for an account that has never
+        // made one, the default the store starts in. A REPORT: nothing is written, so a read
+        // cannot change what a later caller sees.
+        let store = state::require_service_state(&*self.engine)?;
+        let store = store.lock();
+        Ok(GetManagedResourceVisibilityOutput {
+            visibility: Some(store.managed_resource_visibility()),
+        })
     }
 }
