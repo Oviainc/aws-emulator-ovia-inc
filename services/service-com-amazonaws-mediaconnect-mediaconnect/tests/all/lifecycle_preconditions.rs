@@ -105,7 +105,7 @@ async fn created_gateway_arn(emulator: &Emulator, name: &str) -> String {
 
 /// Create one flow over the wire and answer its ARN. `extra` adds members to the request,
 /// so a row can vary what the flow HOLDS while the rule under test is about its status.
-async fn created_flow_arn(emulator: &Emulator, name: &str, extra: Value) -> String {
+pub(crate) async fn created_flow_arn(emulator: &Emulator, name: &str, extra: Value) -> String {
     let mut body = json!({
         "name": name,
         "source": { "name": "src", "protocol": "rtp", "whitelistCidr": "10.0.0.0/16" }
@@ -134,7 +134,7 @@ async fn created_flow_arn(emulator: &Emulator, name: &str, extra: Value) -> Stri
 /// `ERROR`) are still values of the modelled `Status` enum a stored flow can carry, so the
 /// refusal table covers them from the store rather than leaving a third of the enum
 /// unasserted.
-fn seed_flow(emulator: &Emulator, name: &str, status: &str) -> String {
+pub(crate) fn seed_flow(emulator: &Emulator, name: &str, status: &str) -> String {
     let state = emulator
         .engine
         .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();

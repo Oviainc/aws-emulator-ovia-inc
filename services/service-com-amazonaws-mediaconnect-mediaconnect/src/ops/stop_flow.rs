@@ -169,12 +169,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Stopping a flow is not instantaneous: it reports `STOPPING` and the clock owes
-        // `STANDBY` one transition span later. A flow that is already stopped, or already
-        // on its way there, keeps the status it has.
-        if flow.status != crate::state::STATUS_STANDBY
-            && flow.status != crate::state::STATUS_STOPPING
-        {
+        // A flow that is already stopped, or already on its way there, keeps the status it
+        // has: a repeat of the stop answers the same thing rather than restarting the
+        // transition the first one began, so the instant the clock owes `STANDBY` at does
+        // not move.
+        let already_stopped = flow.status == crate::state::STATUS_STANDBY
+            || flow.status == crate::state::STATUS_STOPPING;
+
+        if !already_stopped {
+            // A stop moves the flow out of the running status, so that status is where it
+            // begins: `ACTIVE` is the status of a running flow, and it is the only one a stop
+            // that is not already a repeat can be accepted from. A flow in any other status
+            // is either between two statuses — the clock owes it a DIFFERENT one, which is
+            // what a start accepted a moment ago leaves behind — or not in a status a stop
+            // applies to at all, and accepting the call there would discard the change the
+            // service already told a caller it had accepted. That is a semantic error, which
+            // is what `BadRequestException` is "thrown if the request contains", worded
+            // through the one place this crate states a flow status precondition; the flow,
+            // and the transition the clock owes it, are left exactly as they were.
+            if flow.status != crate::state::STATUS_ACTIVE {
+                return Err(StopFlowErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: crate::state::state_precondition_message(
+                            "Flow",
+                            crate::state::STATUS_ACTIVE,
+                            "STOP",
+                        ),
+                    },
+                )
+                .into());
+            }
+
+            // Stopping a flow is not instantaneous: it reports `STOPPING` and the clock owes
+            // `STANDBY` one transition span later, so a caller that reads the flow straight
+            // afterwards still sees the stop in flight.
             flow.begin_transition(
                 crate::state::STATUS_STOPPING,
                 crate::state::STATUS_STANDBY,

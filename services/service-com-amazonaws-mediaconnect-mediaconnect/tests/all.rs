@@ -233,3 +233,5 @@ mod bridge_source_flow_outputs;
 mod flow_name_addressed_sub_resource_tags;
 #[path = "all/flow_delete_and_bridge_source_writes_agree.rs"]
 mod flow_delete_and_bridge_source_writes_agree;
+#[path = "all/flow_start_stop_preconditions.rs"]
+mod flow_start_stop_preconditions;
