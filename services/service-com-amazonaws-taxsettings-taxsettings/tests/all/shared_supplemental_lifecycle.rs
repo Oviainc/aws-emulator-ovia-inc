@@ -59,7 +59,7 @@ use crate::tax_registration_lifecycle::{call, emulator_with_engine, field_list, 
 /// jurisdiction rule is keyed on (`crate::state::SUPPLEMENTAL_TRN_COUNTRIES`) so
 /// this suite asserts nothing about which jurisdictions those are. Which one a
 /// record is held in is not a dimension of the write decision.
-fn supported_country() -> &'static str {
+pub(crate) fn supported_country() -> &'static str {
     SUPPLEMENTAL_TRN_COUNTRIES
         .first()
         .expect("the supported set names at least one jurisdiction")
@@ -225,7 +225,7 @@ async fn reported(router: &MultiServiceRouter) -> Vec<(String, String, String)> 
 }
 
 /// The `authorityId` a write reported, empty when it reported none.
-fn reported_authority(answer: &Answer) -> String {
+pub(crate) fn reported_authority(answer: &Answer) -> String {
     answer
         .get("authorityId")
         .as_str()

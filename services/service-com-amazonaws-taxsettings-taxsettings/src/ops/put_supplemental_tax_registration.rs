@@ -10,7 +10,11 @@
 //! itself — its `registrationType` and `registrationId` — is the identity a
 //! write addresses: writing the same TRN again UPDATES that record under the
 //! `authorityId` it already has, and a TRN the account does not hold yet gets a
-//! freshly minted one.
+//! freshly minted one. The same TRN means the same NUMBER, not the same
+//! spelling of it: the separators its authority prints it with and the padding
+//! the member's non-blank pattern admits are no part of the number, so a write
+//! that re-spells one the account holds still addresses that one record
+//! ([`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::find_supplemental_authority`]).
 //!
 //! WHICH JURISDICTIONS may hold a supplemental TRN is a rule of its own, and it
 //! is applied here: supplemental registration is supported in a bounded set of

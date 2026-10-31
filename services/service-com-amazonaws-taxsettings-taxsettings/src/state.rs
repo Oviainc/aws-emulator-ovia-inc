@@ -966,16 +966,33 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     /// itself — its type and its registration id — is the identity a write
     /// addresses: that is what makes `PutSupplementalTaxRegistration` "adding or
     /// updating" one registration rather than appending a record per call.
+    ///
+    /// Which means the number is compared as the NUMBER it is, not as the string
+    /// one submission spelled it with: a registration number is one number
+    /// however its holder punctuates and pads it, so the separators the
+    /// authorities print it with and the surrounding whitespace the member's
+    /// non-blank pattern admits are removed and its letters folded before the
+    /// comparison — the form [`registration_number::normalised`] states, which is
+    /// already the form every judgement this service makes about a submitted
+    /// number is made in. Case and padding in the registration TYPE make no
+    /// second TRN either, exactly as they make no second exemption
+    /// ([`is_same_exemption`]), so what this store treats as one number of one
+    /// type it treats as one record.
     pub fn find_supplemental_authority(
         &self,
         registration_type: &str,
         registration_id: &str,
     ) -> Option<String> {
+        let submitted_number = registration_number::normalised(registration_id);
         self.supplemental_registrations
             .iter()
             .find(|(_, stored)| {
-                stored.registration_type == registration_type
-                    && stored.registration_id == registration_id
+                stored
+                    .registration_type
+                    .trim()
+                    .eq_ignore_ascii_case(registration_type.trim())
+                    && registration_number::normalised(&stored.registration_id)
+                        == submitted_number
             })
             .map(|(authority_id, _)| authority_id.clone())
     }
@@ -1006,9 +1023,12 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     /// The entry carries no `authorityId`, so the TRN itself — its
     /// `registrationType` and `registrationId` — is the identity the write
     /// addresses ([`Self::find_supplemental_authority`]): writing a TRN the store
-    /// already holds REPLACES that record under the id it was first stored with,
-    /// and a TRN the store does not hold yet gets a freshly minted one
-    /// ([`Self::mint_supplemental_authority_id`]).
+    /// already holds REPLACES that record under the id it was first stored with —
+    /// held means the same number, whichever of its separator and padding forms
+    /// the write spells it in — and a TRN the store does not hold yet gets a
+    /// freshly minted one ([`Self::mint_supplemental_authority_id`]). The record
+    /// then carries the members the LAST write submitted, that number included,
+    /// as submitted.
     ///
     /// One refusal, the modelled `ConflictException`: `registrationId` is
     /// caller-supplied, so a write that would ADD a record is refused once the

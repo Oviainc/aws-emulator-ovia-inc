@@ -132,13 +132,21 @@ pub fn satisfies_published_structure(
 }
 
 /// The submitted number with the separators a holder writes it with removed and
-/// its letters upper-cased, which is the form every published structure below is
-/// stated in: the authorities print the same number with and without spaces,
-/// dots, slashes and hyphens (`12.345.678/0001-95`, `CHE-123.456.789`).
-fn normalised(registration_id: &str) -> String {
+/// its letters upper-cased, which is the form every published structure above is
+/// stated in: the authorities print the same number with and without whitespace,
+/// dots, slashes and hyphens (`12.345.678/0001-95`, `CHE-123.456.789`), and the
+/// padding a submission carries around it is no part of the number either.
+///
+/// This is therefore what one number IS, separators and padding aside, so it is
+/// also the form a stored number is compared in wherever the number itself is an
+/// identity rather than merely a value — see
+/// [`super::ComAmazonawsTaxsettingsTaxsettingsState::find_supplemental_authority`].
+pub fn normalised(registration_id: &str) -> String {
     registration_id
         .chars()
-        .filter(|character| !matches!(character, ' ' | '.' | '-' | '/' | '_'))
+        .filter(|character| {
+            !character.is_whitespace() && !matches!(character, '.' | '-' | '/' | '_')
+        })
         .flat_map(char::to_uppercase)
         .collect()
 }
