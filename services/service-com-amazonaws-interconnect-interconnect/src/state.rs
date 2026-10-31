@@ -1283,18 +1283,19 @@ fn tag_length_violation(tags: &std::collections::HashMap<String, String>) -> Opt
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// How many tags a resource currently holding `existing` would hold once `incoming`
-/// is merged into it: a key already present takes the new value instead of adding an
-/// entry, so only the keys that are new count towards the growth.
+/// is merged into it.
+///
+/// Counted off the set the ONE merge every tag writer here applies ([`merge_tags`])
+/// would leave, so the bound is judged against exactly what would be stored: a key
+/// already present takes the new value instead of adding an entry, and a request
+/// carrying no tag leaves the count where it was.
 fn merged_tag_count(
     existing: Option<&std::collections::HashMap<String, String>>,
     incoming: &std::collections::HashMap<String, String>,
 ) -> usize {
-    let held = existing.map(|tags| tags.len()).unwrap_or(0);
-    let added = incoming
-        .keys()
-        .filter(|key| existing.is_none_or(|tags| !tags.contains_key(*key)))
-        .count();
-    held + added
+    let mut merged = existing.cloned();
+    merge_tags(&mut merged, Some(incoming));
+    merged.map(|tags| tags.len()).unwrap_or(0)
 }
 
 /// Why writing `incoming` onto a resource that currently holds `existing` is not a
