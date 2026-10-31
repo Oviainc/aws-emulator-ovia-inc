@@ -311,11 +311,12 @@ pub struct ComAmazonawsKmsTrentserviceState {
     /// Every persisted grant, keyed by its grant id. A grant id is minted from the
     /// OS CSPRNG ([`mint_grant_id`]) and so identifies one grant across every key
     /// and Region.
-    pub grants: HashMap<String, Grant>,
-    /// The grant ids in creation order. A grant reader pages over this, so a page
-    /// boundary is stable across calls and a new grant never reshuffles earlier
-    /// pages.
-    pub grant_order: Vec<String>,
+    ///
+    /// The map is ORDERED by that key, because grant id ascending is the order a
+    /// grant reader reports grants in ([`Self::grants_in`]), so the order the store
+    /// holds them in is the order they are served in and a page boundary is stable
+    /// across calls.
+    pub grants: BTreeMap<String, Grant>,
     /// Every persisted custom key store, keyed by its minted key store id. A custom
     /// key store is a regional resource, so each record carries the Region whose
     /// endpoint created it and a reader serves only its own
@@ -421,12 +422,11 @@ impl ComAmazonawsKmsTrentserviceState {
             .count()
     }
 
-    /// Persist a freshly created grant, remembering its place in creation order.
+    /// Persist a freshly created grant.
     ///
     /// The caller refuses the request past [`MAX_GRANTS_PER_KEY`] BEFORE minting it,
     /// so this never grows the store without a bound.
     pub fn insert_grant(&mut self, grant: Grant) {
-        self.grant_order.push(grant.grant_id.clone());
         self.grants.insert(grant.grant_id.clone(), grant);
     }
 
@@ -440,8 +440,8 @@ impl ComAmazonawsKmsTrentserviceState {
             .filter(|grant| grant.region == region)
     }
 
-    /// The grants `region`'s endpoint holds for the key `key_id`, in creation order
-    /// — what a grant reader pages over, so a page boundary is stable across calls.
+    /// The grants `region`'s endpoint holds for the key `key_id`, in the order a
+    /// grant reader reports them — see [`Self::grants_in`].
     pub fn grants_for_key(&self, region: &str, key_id: &str) -> Vec<&Grant> {
         self.grants_in(region)
             .into_iter()
@@ -449,12 +449,17 @@ impl ComAmazonawsKmsTrentserviceState {
             .collect()
     }
 
-    /// Every grant `region`'s endpoint holds, in creation order. A grant reader that
-    /// is not scoped to one key pages over this.
+    /// Every grant `region`'s endpoint holds, ordered by GRANT ID ascending — the
+    /// order a grant reader reports grants in, whichever selection it reports, so
+    /// two readers of the same grants agree and a page boundary is stable across
+    /// calls. A grant reader that is not scoped to one key pages over this.
+    ///
+    /// The order is a property of the grants themselves rather than of when each was
+    /// written, so a steady-state grant set reads the same however it was built, and
+    /// filtering it keeps the order.
     pub fn grants_in(&self, region: &str) -> Vec<&Grant> {
-        self.grant_order
-            .iter()
-            .filter_map(|grant_id| self.grants.get(grant_id))
+        self.grants
+            .values()
             .filter(|grant| grant.region == region)
             .collect()
     }
@@ -500,13 +505,11 @@ impl ComAmazonawsKmsTrentserviceState {
     /// when `region`'s endpoint holds no such grant).
     ///
     /// Removal is from the grant store ITSELF, so the permissions the grant carried
-    /// are gone from the next request on, and the creation order is kept in step so a
-    /// later reader cannot page over a grant the store no longer holds.
+    /// are gone from the next request on, and a later reader cannot page over a grant
+    /// the store no longer holds.
     pub fn remove_grant(&mut self, region: &str, grant_id: &str) -> Option<Grant> {
         self.grant(region, grant_id)?;
-        let removed = self.grants.remove(grant_id)?;
-        self.grant_order.retain(|held| held != grant_id);
-        Some(removed)
+        self.grants.remove(grant_id)
     }
 
     /// Whether the store can hold another custom key store, across every Region,
@@ -5187,6 +5190,45 @@ fn mac_key(key: &Cmk, mac_algorithm: &str) -> Option<::aws_lc_rs::hmac::Key> {
 /// constraint or quota was exceeded" — and persists nothing.
 pub const MAX_GRANTS_PER_KEY: usize = 500;
 
+/// The order a grant's permitted operations are reported in: the order the model
+/// DECLARES the `GrantOperation` enum's values in
+/// (`smithy_query(query="shape",shape="GrantOperation")`, whose `values` are listed in
+/// declaration order).
+///
+/// `GrantOperationList` is a plain list of that enum, so the model fixes no order for
+/// it, and the recorded AWS wire reports a grant's operations in this one whatever
+/// order the creating request listed them in. Projecting through it is what makes two
+/// readings of one grant, and two grants permitting the same set, render identically.
+pub const GRANT_OPERATION_ORDER: &[&str] = &[
+    "Decrypt",
+    "Encrypt",
+    "GenerateDataKey",
+    "GenerateDataKeyWithoutPlaintext",
+    "ReEncryptFrom",
+    "ReEncryptTo",
+    "Sign",
+    "Verify",
+    "GetPublicKey",
+    "CreateGrant",
+    "RetireGrant",
+    "DescribeKey",
+    "GenerateDataKeyPair",
+    "GenerateDataKeyPairWithoutPlaintext",
+    "GenerateMac",
+    "VerifyMac",
+    "DeriveSharedSecret",
+];
+
+/// Where `operation` comes in [`GRANT_OPERATION_ORDER`] — past the end for a value the
+/// enum does not declare, which the modelled enum constraint refuses before a handler
+/// runs, so such a value keeps the place the request gave it rather than being dropped.
+pub fn grant_operation_rank(operation: &str) -> usize {
+    GRANT_OPERATION_ORDER
+        .iter()
+        .position(|declared| *declared == operation)
+        .unwrap_or(GRANT_OPERATION_ORDER.len())
+}
+
 /// One grant on a KMS key: "a policy instrument that allows Amazon Web Services
 /// principals to use KMS keys in cryptographic operations"
 /// (`smithy_query(query="doc",shape="CreateGrant")`).
@@ -5225,16 +5267,33 @@ pub struct Grant {
 impl Grant {
     /// This grant's `GrantListEntry`, computed from the record — the one place a
     /// grant is projected onto the wire, so two readers cannot disagree.
+    ///
+    /// `Name` is ALWAYS reported: the name the grant was created with, or the empty
+    /// string for a grant created without one, so a client reading it never has to
+    /// tell a missing member from a grant that has no name. The member's own
+    /// documentation says the value "is null" for a grant created without a name
+    /// (`smithy_query(query="doc",shape="GrantListEntry",member="Name")`), but the
+    /// recorded AWS wire (`simparity-wire-aws-v1`, the `kms-grant-*` fixtures)
+    /// reports the empty string, so that is what a reader answers.
+    ///
+    /// The permitted operations are reported in the order the `GrantOperation` enum
+    /// declares its values ([`GRANT_OPERATION_ORDER`]) rather than in the order the
+    /// creating request listed them: they are a SET of permissions (which is also how
+    /// a retry of `CreateGrant` compares them, [`Self::fingerprint`]), so the
+    /// projection puts them in one canonical order and a client comparing two readings
+    /// of the same grant sees no difference.
     pub fn list_entry(&self) -> GrantListEntry {
+        let mut operations = self.operations.clone();
+        operations.sort_by_key(|operation| grant_operation_rank(operation));
         GrantListEntry {
             key_id: Some(self.key_arn.clone()),
             grant_id: Some(self.grant_id.clone()),
-            name: self.name.clone(),
+            name: Some(self.name.clone().unwrap_or_default()),
             creation_date: Some(date_time(self.creation_date)),
             grantee_principal: self.grantee_principal.clone(),
             retiring_principal: self.retiring_principal.clone(),
             issuing_account: Some(self.issuing_account.clone()),
-            operations: Some(self.operations.clone()),
+            operations: Some(operations),
             constraints: self.constraints.clone(),
             grantee_service_principal: self.grantee_service_principal.clone(),
             retiring_service_principal: self.retiring_service_principal.clone(),

@@ -8,24 +8,34 @@ cargo build -p service-com-amazonaws-kms-trentservice
 cargo test  -p service-com-amazonaws-kms-trentservice
 ```
 
-## A response member the model snapshot does not declare
+## Response members the model snapshot does not declare
 
 `smithy-model/com-amazonaws-kms-trentservice.json` is a snapshot of the published
 model and is kept EXACTLY as shipped — nothing in this crate edits it.
 
-One member AWS answers with is therefore not in it: `Decrypt` reports `KeyOrigin`
-(the origin of the key that opened the ciphertext, recorded in the
-`simparity-wire-aws-v1` fixture `kms-symmetric-encrypt-decrypt` as
-`KeyOrigin: AWS_KMS`), while the snapshot declares that member only on
-`DeriveSharedSecretResponse`. `src/ops/decrypt.rs` declares the member schema itself,
-beside its response type, and writes it after the generated shape's modelled members;
-the value comes from the same stored field `KeyMetadata.Origin` projects, so `Decrypt`
-and `DescribeKey` always agree.
+Some members AWS answers with are therefore not in it:
 
-`tests/all/decrypt_key_origin.rs` pins both halves — the member on the wire, and the
-snapshot still not declaring it. If the snapshot is ever refreshed with a
-`DecryptResponse$KeyOrigin` member, that test fails and the local declaration should
-give way to the modelled one.
+- `Decrypt` reports `KeyOrigin` (the origin of the key that opened the ciphertext,
+  recorded in the `simparity-wire-aws-v1` fixture `kms-symmetric-encrypt-decrypt` as
+  `KeyOrigin: AWS_KMS`), while the snapshot declares that member only on
+  `DeriveSharedSecretResponse`.
+- `CreateGrant` reports `KeyOrigin` for the key the grant was created on, while the
+  snapshot declares `CreateGrantResponse` with `GrantId` and `GrantToken` only.
+- `ListGrants` and `ListRetirableGrants` report `GrantCount`, how many grants the
+  answered `Grants` list holds, while the snapshot declares `ListGrantsResponse` with
+  `Grants`, `NextMarker` and `Truncated` only.
+
+Each member is declared in this crate rather than in the snapshot: an origin beside
+its operation's response type (`src/ops/decrypt.rs`, `src/ops/create_grant.rs`), and
+`GrantCount` once beside the one response shape both grant readers answer
+(`src/ops/types/shared_types.rs`). Every one is written after the generated shape's
+modelled members, and an origin comes from the same stored field
+`KeyMetadata.Origin` projects, so a key's origin is the same wherever it is read.
+
+`tests/all/decrypt_key_origin.rs` and `tests/all/grant_read_projection.rs` pin both
+halves — the members on the wire, and the snapshot still not declaring them. If the
+snapshot is ever refreshed with one of them, those tests fail and the local
+declaration should give way to the modelled one.
 
 ## Layout
 

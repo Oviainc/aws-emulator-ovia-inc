@@ -55,6 +55,8 @@ mod get_key_policy_reads;
 mod get_key_rotation_status_reads;
 #[path = "all/grant_authorization.rs"]
 mod grant_authorization;
+#[path = "all/grant_read_projection.rs"]
+mod grant_read_projection;
 #[path = "all/grants.rs"]
 mod grants;
 #[path = "all/harness.rs"]

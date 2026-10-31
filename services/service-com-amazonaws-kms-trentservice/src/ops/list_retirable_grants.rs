@@ -2,8 +2,8 @@
 
 //! @op ListRetirableGrants
 //! IMPLEMENTED: reports the grants the store holds whose retiring principal is the one
-//! the request names, across every key in this account and Region, paged as asked. This
-//! is the ONLY file to touch for this operation.
+//! the request names, across every key in this account and Region, in grant id order,
+//! paged as asked. This is the ONLY file to touch for this operation.
 //!
 //! A reporting operation: it reads the grant store and writes nothing, so what one
 //! caller lists is what the next one lists.
@@ -106,6 +106,10 @@
 //!   truncated. To get more items, pass the value of the NextMarker element in this response
 //!   to the Marker parameter in a subsequent request.
 //!
+//! Beside those, the response carries `GrantCount`, which this model snapshot does not
+//! declare on `ListGrantsResponse` while AWS answers both grant listings with it — see
+//! [`GrantListing`], where the member both readers add is declared.
+//!
 //! ## Errors
 //!
 //! * `DependencyTimeoutException` (HTTP 503) — The system timed out while trying to fulfill
@@ -181,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for ListRetirableGrants<Eng>
 {
     type Input = ListRetirableGrantsInput;
-    type Output = ListRetirableGrantsOutput;
+    type Output = GrantListing<ListRetirableGrantsOutput>;
     type Error = ListRetirableGrantsError;
 
     const NAME: &'static str = "ListRetirableGrants";
@@ -264,8 +268,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "This operation returns a list of grants where the retiring principal
         // specified in the request is the same retiring principal on the grant", over
-        // every key rather than one — in creation order, so a page boundary is stable
-        // across calls.
+        // every key rather than one — in the grant order every grant reader serves, so
+        // a page boundary is stable across calls.
         let listed: Vec<&crate::state::Grant> = state
             .grants_in(&region)
             .into_iter()
@@ -332,10 +336,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .flatten();
 
-        Ok(ListRetirableGrantsOutput {
-            grants: Some(page),
-            next_marker,
-            truncated,
+        // `GrantCount` reports how many grants THIS response carries, so it is counted
+        // from the page that is being answered — including the empty one a principal
+        // with nothing to retire gets, where a client has no list to count for itself.
+        let grant_count = i32::try_from(page.len()).unwrap_or(i32::MAX);
+
+        Ok(GrantListing {
+            modelled: ListRetirableGrantsOutput {
+                grants: Some(page),
+                next_marker,
+                truncated,
+            },
+            grant_count,
         })
     }
 }

@@ -2,7 +2,7 @@
 
 //! @op ListGrants
 //! IMPLEMENTED: reports the grants the store holds for the KMS key `KeyId` names, in
-//! creation order, filtered and paged as the request asks. This is the ONLY file to
+//! grant id order, filtered and paged as the request asks. This is the ONLY file to
 //! touch for this operation.
 //!
 //! A reporting operation: it reads the grant store and writes nothing, so what one
@@ -104,6 +104,10 @@
 //!   truncated. To get more items, pass the value of the NextMarker element in this response
 //!   to the Marker parameter in a subsequent request.
 //!
+//! Beside those, the response carries `GrantCount`, which this model snapshot does not
+//! declare on `ListGrantsResponse` while AWS answers both grant listings with it — see
+//! [`GrantListing`], where the member both readers add is declared.
+//!
 //! ## Errors
 //!
 //! * `DependencyTimeoutException` (HTTP 503) — The system timed out while trying to fulfill
@@ -191,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for ListGrants<Eng>
 {
     type Input = ListGrantsInput;
-    type Output = ListGrantsOutput;
+    type Output = GrantListing<ListGrantsOutput>;
     type Error = ListGrantsError;
 
     const NAME: &'static str = "ListGrants";
@@ -353,10 +357,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .flatten();
 
-        Ok(ListGrantsOutput {
-            grants: Some(page),
-            next_marker,
-            truncated,
+        // `GrantCount` reports how many grants THIS response carries, so it is counted
+        // from the page that is being answered — including the empty one, where a
+        // client has no list to count for itself.
+        let grant_count = i32::try_from(page.len()).unwrap_or(i32::MAX);
+
+        Ok(GrantListing {
+            modelled: ListGrantsOutput {
+                grants: Some(page),
+                next_marker,
+                truncated,
+            },
+            grant_count,
         })
     }
 }

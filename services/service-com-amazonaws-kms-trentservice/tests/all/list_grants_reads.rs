@@ -19,6 +19,9 @@
 //! whether they select, in which key the grants were created on, and — for the refusals
 //! — in why the identifier resolves to no key of this account and Region, and in why a
 //! filter member cannot select at all.
+//!
+//! A reader answers its grants ordered by grant id, which is [`super::grant_read_projection`]'s
+//! rule; every expectation here is therefore the selected grants in that order.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -51,8 +54,16 @@ struct Seeded {
     /// key's grants left the key itself untouched.
     metadata: Value,
     /// The grant ids in creation order: two for [`READER_ROLE`], one for
-    /// [`OTHER_ROLE`], and one for [`GRANTEE_SERVICE`].
+    /// [`OTHER_ROLE`], and one for [`GRANTEE_SERVICE`]. A read answers them in grant
+    /// id order, so an expectation is built with [`ascending`].
     grants: Vec<String>,
+}
+
+/// `grants` in the order a reader answers them: by grant id ascending.
+fn ascending(grants: &[String]) -> Vec<String> {
+    let mut ordered = grants.to_vec();
+    ordered.sort();
+    ordered
 }
 
 /// Create a symmetric encryption key and four grants on it that differ in grantee, in
@@ -108,7 +119,8 @@ async fn seed(router: &MultiServiceRouter, case: &str) -> Seeded {
     }
 }
 
-/// The grant ids one `ListGrants` answer reports, in the order reported.
+/// The grant ids one `ListGrants` answer reports, in the order reported — which is by
+/// grant id ascending.
 ///
 /// Every entry is checked to name, by its key ARN, the key the request resolved to —
 /// the listing is of that key's grants, however the request named it — and the page is
@@ -164,10 +176,11 @@ async fn the_reader_reports_a_key_s_grants_for_every_identifier_form() {
     ] {
         let reported = listed(&router, form, &seeded.key_arn, &json!({"KeyId": identifier})).await;
         assert_eq!(
-            reported, seeded.grants,
-            "case read by {form}: expected every grant of the key in creation order {:?}, \
+            reported,
+            ascending(&seeded.grants),
+            "case read by {form}: expected every grant of the key by ascending grant id {:?}, \
              got {reported:?}",
-            seeded.grants
+            ascending(&seeded.grants)
         );
     }
 
@@ -181,7 +194,8 @@ async fn the_reader_reports_a_key_s_grants_for_every_identifier_form() {
     )
     .await;
     assert_eq!(
-        again, seeded.grants,
+        again,
+        ascending(&seeded.grants),
         "case repeated read: listing a key's grants must not change them, got {again:?}"
     );
     let described = describe(&router, &seeded.key_id).await;
@@ -227,7 +241,8 @@ async fn the_reader_reports_grants_in_every_key_state() {
         )
         .await;
         assert_eq!(
-            reported, seeded.grants,
+            reported,
+            ascending(&seeded.grants),
             "case {case}: every key state must report the key's grants, got {reported:?}"
         );
     }
@@ -271,11 +286,11 @@ async fn every_filter_the_request_carries_narrows_the_listing() {
     // Rows: the case, the members the request carries beside `KeyId`, and the grant ids
     // expected in the order expected.
     let rows: Vec<(&str, Value, Vec<String>)> = vec![
-        ("no filter at all", json!({}), grants.clone()),
+        ("no filter at all", json!({}), ascending(&grants)),
         (
             "the grantee of two grants",
             json!({"GranteePrincipal": principal(READER_ROLE)}),
-            vec![grants[0].clone(), grants[1].clone()],
+            ascending(&[grants[0].clone(), grants[1].clone()]),
         ),
         (
             "the grantee of one grant",
@@ -407,7 +422,8 @@ async fn a_filter_that_cannot_select_is_refused() {
     )
     .await;
     assert_eq!(
-        reported, seeded.grants,
+        reported,
+        ascending(&seeded.grants),
         "case after the refusals: a refused filter must leave the key's grants as they \
          were, got {reported:?}"
     );
@@ -430,13 +446,13 @@ async fn the_listing_holds_only_the_grants_of_the_key_it_names() {
             "the first key",
             &first.key_id,
             &first.key_arn,
-            first.grants.clone(),
+            ascending(&first.grants),
         ),
         (
             "the second key",
             &second.key_id,
             &second.key_arn,
-            second.grants.clone(),
+            ascending(&second.grants),
         ),
         ("a key with no grants", &bare_id, &bare_arn, Vec::new()),
     ];

@@ -21,11 +21,16 @@
 //! 6. A grant principal must be given as an ARN, and the grantee/retiring members must
 //!    hold together.
 //! 7. A grant token the service never minted is not valid.
-//! 8. `ListGrants` pages over a key's grants in creation order, filtered as asked.
+//! 8. `ListGrants` pages over a key's grants in grant id order, filtered as asked.
 //! 9. `RevokeGrant` and `RetireGrant` delete the grant the request identifies, so its
 //!    permissions — and the grant tokens that named it — are gone afterwards.
 //! 10. `ListRetirableGrants` selects, across every key, the grants whose retiring
 //!     principal the request names.
+//!
+//! How a grant is PROJECTED onto the wire — the count a listing carries, the empty
+//! string a nameless grant's `Name` takes, the ascending order of `Operations` and of
+//! the listing itself — is [`super::grant_read_projection`]'s rule; it is what the
+//! expectations below are built with.
 
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -95,6 +100,24 @@ async fn grant_entry(
         "case {case}: expected exactly the grant {grant_id} on {key_id}, got {listed:?}"
     );
     listed[0].clone()
+}
+
+/// `grants` in the order a reader answers them: by grant id ascending.
+fn ascending(grants: &[String]) -> Vec<String> {
+    let mut ordered = grants.to_vec();
+    ordered.sort();
+    ordered
+}
+
+/// `operations` in the order a grant entry reports them: the order the
+/// `GrantOperation` enum declares its values in
+/// (`state::GRANT_OPERATION_ORDER`).
+fn ascending_operations(operations: &[&str]) -> Vec<String> {
+    let mut ordered: Vec<String> = operations.iter().map(|op| (*op).to_string()).collect();
+    ordered.sort_by_key(|operation| {
+        service_com_amazonaws_kms_trentservice::state::grant_operation_rank(operation)
+    });
+    ordered
 }
 
 /// One row of the round-trip table: the grant to create, described member by member.
@@ -260,9 +283,9 @@ async fn a_created_grant_round_trips_through_list_grants() {
         );
         assert_eq!(
             entry["Operations"],
-            json!(row.operations),
+            json!(ascending_operations(row.operations)),
             "case {case}: expected Operations {:?}, got {entry}",
-            row.operations
+            ascending_operations(row.operations)
         );
         assert_eq!(
             entry["GranteePrincipal"],
@@ -272,9 +295,9 @@ async fn a_created_grant_round_trips_through_list_grants() {
         );
         assert_eq!(
             entry["Name"],
-            row.name.map_or(Value::Null, |name| json!(name)),
+            json!(row.name.unwrap_or_default()),
             "case {case}: expected Name {:?}, got {entry}",
-            row.name
+            row.name.unwrap_or_default()
         );
         assert_eq!(
             entry["RetiringPrincipal"],
@@ -323,16 +346,15 @@ async fn a_created_grant_round_trips_through_list_grants() {
         created.push(grant_id);
     }
 
-    // Every grant is still there, in the order it was created: a later create never
-    // reshuffles or drops an earlier grant.
+    // Every grant is still there, in the order a reader answers them: a later create
+    // never reshuffles or drops an earlier grant.
     let listed = list_grants(&router, "all grants", &json!({"KeyId": key_id})).await;
-    let listed_ids: Vec<String> = listed
-        .iter()
-        .map(|entry| text("all grants", entry, "GrantId"))
-        .collect();
+    let listed_ids = listed_ids("all grants", &listed);
     assert_eq!(
-        listed_ids, created,
-        "case all grants: expected the grants in creation order {created:?}, got {listed_ids:?}"
+        listed_ids,
+        ascending(&created),
+        "case all grants: expected the grants by ascending grant id {:?}, got {listed_ids:?}",
+        ascending(&created)
     );
 }
 
@@ -731,9 +753,9 @@ async fn the_granted_operations_must_be_supported_by_the_key() {
             let entry = grant_entry(&router, case, &key_id, &grant_id).await;
             assert_eq!(
                 entry["Operations"],
-                json!(row.operations),
+                json!(ascending_operations(row.operations)),
                 "case {case}: expected Operations {:?}, got {entry}",
-                row.operations
+                ascending_operations(row.operations)
             );
         } else {
             let (status, actual) = failure(&router, "CreateGrant", &request).await;
@@ -989,7 +1011,7 @@ async fn a_grant_token_the_service_never_minted_is_refused() {
     );
 }
 
-/// Rule 8: `ListGrants` pages over a key's grants in creation order, and filters.
+/// Rule 8: `ListGrants` pages over a key's grants in grant id order, and filters.
 #[tokio::test]
 async fn list_grants_pages_and_filters() {
     let router = router();
@@ -997,8 +1019,8 @@ async fn list_grants_pages_and_filters() {
     let grantee = principal("role/Paged");
     let other = principal("role/Unpaged");
 
-    // Seven grants in creation order, the last two for another grantee so the filter
-    // has something to narrow.
+    // Seven grants, the last two for another grantee so the filter has something to
+    // narrow.
     let mut created = Vec::new();
     for index in 0..7u32 {
         let principal = if index < 5 { &grantee } else { &other };
@@ -1059,8 +1081,10 @@ async fn list_grants_pages_and_filters() {
             marker = Some(text(&case, &answer, "NextMarker"));
         }
         assert_eq!(
-            collected, created,
-            "case {case}: expected every grant in creation order {created:?}, got {collected:?}"
+            collected,
+            ascending(&created),
+            "case {case}: expected every grant by ascending grant id {:?}, got {collected:?}",
+            ascending(&created)
         );
     }
 
@@ -1077,7 +1101,7 @@ async fn list_grants_pages_and_filters() {
         .collect();
     assert_eq!(
         filtered_ids,
-        created[5..].to_vec(),
+        ascending(&created[5..]),
         "case grantee filter: expected the two grants of {other}, got {filtered_ids:?}"
     );
 
@@ -1408,7 +1432,7 @@ async fn retire_grant_deletes_the_grant_it_identifies() {
 }
 
 /// Rule 10: `ListRetirableGrants` selects the grants a principal may retire, across
-/// every key, and pages over them in creation order.
+/// every key, and pages over them in grant id order.
 #[tokio::test]
 async fn list_retirable_grants_selects_by_retiring_principal() {
     let router = router();
@@ -1446,9 +1470,17 @@ async fn list_retirable_grants_selects_by_retiring_principal() {
     }
 
     // (case, the retiring principal asked about, the grants expected).
-    let selections: Vec<(&str, &String, &Vec<String>)> = vec![
-        ("the retiring principal of four grants", &retirer, &retirable),
-        ("the retiring principal of two grants", &other, &unrelated),
+    let selections: Vec<(&str, &String, Vec<String>)> = vec![
+        (
+            "the retiring principal of four grants",
+            &retirer,
+            ascending(&retirable),
+        ),
+        (
+            "the retiring principal of two grants",
+            &other,
+            ascending(&unrelated),
+        ),
     ];
     for (case, principal, expected) in selections {
         let listed = list_retirable(
@@ -1458,7 +1490,7 @@ async fn list_retirable_grants_selects_by_retiring_principal() {
         )
         .await;
         assert_eq!(
-            &listed_ids(case, &listed),
+            listed_ids(case, &listed),
             expected,
             "case {case}: expected {expected:?}, got {listed:?}"
         );
@@ -1520,9 +1552,11 @@ async fn list_retirable_grants_selects_by_retiring_principal() {
             marker = Some(text(&case, &answer, "NextMarker"));
         }
         assert_eq!(
-            collected, retirable,
-            "case {case}: expected every retirable grant in creation order {retirable:?}, got \
-             {collected:?}"
+            collected,
+            ascending(&retirable),
+            "case {case}: expected every retirable grant by ascending grant id {:?}, got \
+             {collected:?}",
+            ascending(&retirable)
         );
     }
 
@@ -1581,9 +1615,13 @@ async fn list_retirable_grants_selects_by_retiring_principal() {
         &json!({"RetiringPrincipal": retirer}),
     )
     .await;
+    let remaining: Vec<String> = ascending(&retirable)
+        .into_iter()
+        .filter(|grant_id| grant_id != &retirable[0])
+        .collect();
     assert_eq!(
         listed_ids("after retiring one", &after),
-        retirable[1..].to_vec(),
+        remaining,
         "case after retiring one: expected the retired grant to be gone, got {after:?}"
     );
 }

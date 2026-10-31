@@ -298,6 +298,58 @@ pub struct ListGrantsOutput {
     pub truncated: bool,
 }
 
+/// The `GrantCount` response member both grant listings carry: how many grants the
+/// `Grants` list of THIS response holds.
+///
+/// It is declared here, beside the modelled `ListGrantsResponse` members, because
+/// this model snapshot does not declare it while AWS answers both `ListGrants` and
+/// `ListRetirableGrants` with it — including as `0` beside an empty list, which is
+/// the case a client cannot recover from the list alone. The member schema carries
+/// the wire name, which is what the JSON codec emits the key from; the index follows
+/// the three modelled members of `ListGrantsResponse`.
+static GRANT_COUNT_MEMBER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.kms#ListGrantsResponse$GrantCount",
+        "com.amazonaws.kms",
+        "GrantCount",
+    ),
+    ::aws_smithy_schema::ShapeType::Integer,
+    "GrantCount",
+    3,
+);
+
+/// What a grant listing answers: every modelled member of `ListGrantsResponse`, plus
+/// `GrantCount`.
+///
+/// Both grant readers answer the same shape, so the member the snapshot lacks is
+/// added ONCE here and each reader wraps its own generated output type in it. The
+/// modelled half IS that generated shape, serialized by its own generated
+/// implementation against the generated schema, so no modelled member is
+/// re-described here.
+#[derive(Debug, Clone)]
+pub struct GrantListing<Modelled> {
+    /// The modelled response, holding `Grants`, `NextMarker` and `Truncated`.
+    pub modelled: Modelled,
+    /// How many grants `Grants` carries — counted from the list that is being
+    /// answered, so the two can never disagree.
+    pub grant_count: i32,
+}
+
+impl<Modelled: ::aws_smithy_schema::serde::SerializableStruct>
+    ::aws_smithy_schema::serde::SerializableStruct for GrantListing<Modelled>
+{
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        ::aws_smithy_schema::serde::SerializableStruct::serialize_members(
+            &self.modelled,
+            serializer,
+        )?;
+        serializer.write_integer(&GRANT_COUNT_MEMBER, self.grant_count)
+    }
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.kms#GrantListEntry")]
 #[derive(Debug, Clone, Default)]
 pub struct GrantListEntry {

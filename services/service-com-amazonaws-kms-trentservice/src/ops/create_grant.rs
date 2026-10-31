@@ -25,6 +25,21 @@
 //! encryption-context constraints (which apply to cryptographic operations) do not narrow
 //! it, and a token naming a grant on another key is accepted.
 //!
+//! ## `KeyOrigin`
+//!
+//! The response reports the ORIGIN of the key the grant was created on, beside the grant
+//! id and the grant token: AWS answers `CreateGrant` with that member, while THIS model
+//! snapshot declares `CreateGrantResponse` with `GrantId` and `GrantToken` only
+//! (`smithy_query(query="shape",shape="CreateGrantResponse")`) and declares the member
+//! itself on `DeriveSharedSecretResponse`
+//! (`smithy_query(query="doc",shape="DeriveSharedSecretResponse",member="KeyOrigin")`,
+//! whose wording it reuses). So the member is declared HERE, beside
+//! [`CreateGrantResponse`], rather than by editing the vendored snapshot: the generated
+//! shape writes every modelled member and this one is written after it. The value is read
+//! from the key record that backs `KeyMetadata.Origin`, so `CreateGrant` and `DescribeKey`
+//! report one origin for one key — the same projection `Decrypt` already makes
+//! (`src/ops/decrypt.rs`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -170,6 +185,9 @@
 //!   eventual consistency. For more information, see Grant token and Using a grant token in
 //!   the Key Management Service Developer Guide.
 //!
+//! Beside those, the response carries `KeyOrigin` (OriginType), which this model snapshot
+//! does not declare for `CreateGrant` — see "## `KeyOrigin`" above.
+//!
 //! ## Errors
 //!
 //! * `DependencyTimeoutException` (HTTP 503) — The system timed out while trying to fulfill
@@ -206,6 +224,54 @@ use super::types::*;
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
 // `CreateGrantError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-kms-trentservice.json");
+
+/// The `KeyOrigin` response member: "The source of the key material for the specified
+/// KMS key. When this value is `AWS_KMS`, KMS created the key material. When this
+/// value is `EXTERNAL`, the key material was imported or the KMS key doesn't have any
+/// key material."
+/// (`smithy_query(query="doc",shape="DeriveSharedSecretResponse",member="KeyOrigin")` —
+/// the one shape this snapshot declares the member on).
+///
+/// It is declared here because the snapshot does not declare it on
+/// `CreateGrantResponse` while AWS answers `CreateGrant` with it. The member schema
+/// carries the wire name, which is what the JSON codec emits the key from; the index
+/// follows the two modelled members of `CreateGrantResponse`.
+static KEY_ORIGIN_MEMBER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.kms#CreateGrantResponse$KeyOrigin",
+        "com.amazonaws.kms",
+        "KeyOrigin",
+    ),
+    ::aws_smithy_schema::ShapeType::String,
+    "KeyOrigin",
+    2,
+);
+
+/// What `CreateGrant` answers: every modelled member of `CreateGrantResponse`, plus
+/// `KeyOrigin`.
+///
+/// The modelled half IS the generated shape, serialized by its own generated
+/// implementation against the generated schema, so no modelled member is re-described
+/// here; this type only adds the one member the snapshot lacks.
+pub struct CreateGrantResponse {
+    modelled: CreateGrantOutput,
+    /// The `OriginType` of the key the grant was created on — the same value
+    /// `DescribeKey` reports as `KeyMetadata.Origin`.
+    key_origin: String,
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for CreateGrantResponse {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        ::aws_smithy_schema::serde::SerializableStruct::serialize_members(
+            &self.modelled,
+            serializer,
+        )?;
+        serializer.write_string(&KEY_ORIGIN_MEMBER, &self.key_origin)
+    }
+}
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
@@ -264,7 +330,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for CreateGrant<Eng>
 {
     type Input = CreateGrantInput;
-    type Output = CreateGrantOutput;
+    type Output = CreateGrantResponse;
     type Error = CreateGrantError;
 
     const NAME: &'static str = "CreateGrant";
@@ -364,7 +430,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`smithy_query(query="doc",shape="CreateGrantRequest",member="KeyId")`). The
         // grant records the key the identifier RESOLVED to, so an alias that is later
         // repointed does not move the grant.
-        let (key_id, key_arn) = match state.resolve(&region, &input.key_id) {
+        let (key_id, key_arn, key_origin) = match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(key) => {
                 // "The KMS key that you use for this operation must be in a compatible
                 // key state" (`smithy_query(query="doc",shape="CreateGrant")`). A
@@ -399,7 +465,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
 
-                (key.key_id.clone(), key.arn.clone())
+                (key.key_id.clone(), key.arn.clone(), key.origin.clone())
             }
             crate::state::KeyRef::UnauthorizedAccount => {
                 return Err(crate::state::unauthorized_account(Self::NAME));
@@ -586,9 +652,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.insert_grant(grant);
         }
 
-        Ok(CreateGrantOutput {
-            grant_id: Some(grant_id),
-            grant_token: Some(grant_token),
+        Ok(CreateGrantResponse {
+            modelled: CreateGrantOutput {
+                grant_id: Some(grant_id),
+                grant_token: Some(grant_token),
+            },
+            key_origin,
         })
     }
 }
