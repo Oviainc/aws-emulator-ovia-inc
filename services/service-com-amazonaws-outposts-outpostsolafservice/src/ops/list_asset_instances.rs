@@ -195,16 +195,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The resume point the caller's token names, by the rule
         // `crate::state::page_boundary` states for every paged answer of this service:
         // a token it did not issue for THIS list is a bad request, not an empty page.
-        let after = crate::state::page_boundary(
-            crate::state::ASSET_INSTANCE_PAGE,
-            Self::NAME,
-            input.next_token.as_deref(),
-        )
-        .map_err(|report| {
-            ListAssetInstancesErrorModeled::ValidationException(ValidationException {
-                message: Some(report),
-            })
-        })?;
+        // The list is cut from ONE Outpost, so the stamp it names is the kind together
+        // with that Outpost (`crate::state::nested_page_kind`) and a token minted
+        // while paging another Outpost's instances is refused here.
+        let stamp =
+            crate::state::nested_page_kind(crate::state::ASSET_INSTANCE_PAGE, &[&outpost_id]);
+        let after = crate::state::page_boundary(&stamp, Self::NAME, input.next_token.as_deref())
+            .map_err(|report| {
+                ListAssetInstancesErrorModeled::ValidationException(ValidationException {
+                    message: Some(report),
+                })
+            })?;
         let size = crate::state::page_size(input.max_results);
 
         // A read, so the guard is taken immutably: which instances are running on the
@@ -218,12 +219,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // running on it. The refusal is the identifier echo of the value AS SUPPLIED —
         // not of the bare id an ARN resolved to.
         let record = store.outpost(&region, &outpost_id).ok_or_else(not_found)?;
-        // The boundary this list pages on is an instance's POSITION in the Outpost's
-        // recorded order: an instance carries no creation sequence of its own, and that
-        // order is the one stable order the whole list is reported in — the same rule
-        // `ListAssets` pages an Outpost's assets by.
+        // The boundary this list pages on is an instance's place in the Outpost's own
+        // recorded order: an instance is launched through Amazon EC2 and no call in
+        // this API adds one to that order, removes one from it or reorders it, so the
+        // n-th instance recorded on an Outpost stays that one instance and a boundary
+        // naming it names an instance rather than wherever a page happened to stop.
         let (asset_instances, next_token) = crate::state::page(
-            crate::state::ASSET_INSTANCE_PAGE,
+            &stamp,
             record
                 .instances
                 .iter()

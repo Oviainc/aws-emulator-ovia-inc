@@ -309,6 +309,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // not by the call that creates the Outpost, so a just-created
                 // Outpost carries no asset and `ListAssets` reports none for it.
                 assets: Vec::new(),
+                // The install that places this Outpost's hardware is what takes the
+                // creation sequences its units are identified by out of the store's
+                // creation order, so there is none to record for hardware nothing has
+                // installed yet.
+                asset_sequence_base: 0,
                 // An instance is launched through Amazon EC2 against the Outpost,
                 // not by this call, so a just-created Outpost runs none and
                 // `ListBlockingInstancesForCapacityTask` reports none for it.

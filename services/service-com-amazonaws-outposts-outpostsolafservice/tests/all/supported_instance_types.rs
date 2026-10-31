@@ -47,6 +47,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_outposts_outpostsolafservice::ops::types::{
     AssetInfo, ComputeAttributes,
 };
+use service_com_amazonaws_outposts_outpostsolafservice::state::{
+    nested_page_kind, SUPPORTED_INSTANCE_TYPE_PAGE,
+};
 
 use crate::site_and_outpost_lifecycle::{
     query_value, refusal, segment, text, Outposts, Refusal, ABSENT_OUTPOST_ID, OUTPOST_ARN_PREFIX,
@@ -576,14 +579,19 @@ async fn paging_covers_every_supported_instance_type_exactly_once() {
     // A boundary past the end of the catalog is an empty last page, not a refusal.
     // The boundary a token names is a position in the published catalog, so the
     // past-the-end boundary is past the whole catalog rather than past this narrowed
-    // report.
+    // report; the report is this Outpost's own, so the stamp the token carries names
+    // the Outpost as well as the kind of report (`state::nested_page_kind`).
     let catalog_entries = catalog(&outposts).await.len();
     let past_the_end = supported(
         &outposts,
         &outpost_id,
         &format!(
             "?NextToken={}",
-            query_value(&format!("{}##supportedInstanceTypes", catalog_entries + 1))
+            query_value(&format!(
+                "{}##{}",
+                catalog_entries + 1,
+                nested_page_kind(SUPPORTED_INSTANCE_TYPE_PAGE, &[&outpost_id])
+            ))
         ),
     )
     .await;

@@ -198,16 +198,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The resume point the caller's token names, by the rule
         // `crate::state::page_boundary` states for every paged answer of this service:
         // a token it did not issue for THIS report is a bad request, not an empty page.
-        let after = crate::state::page_boundary(
+        // The report is cut from ONE Outpost's configuration, so the stamp it names is
+        // the kind together with that Outpost (`crate::state::nested_page_kind`) and a
+        // token minted while paging another Outpost's report is refused here.
+        let stamp = crate::state::nested_page_kind(
             crate::state::CONFIGURED_INSTANCE_TYPE_PAGE,
-            Self::NAME,
-            input.next_token.as_deref(),
-        )
-        .map_err(|report| {
-            GetOutpostInstanceTypesErrorModeled::ValidationException(ValidationException {
-                message: Some(report),
-            })
-        })?;
+            &[&outpost_id],
+        );
+        let after = crate::state::page_boundary(&stamp, Self::NAME, input.next_token.as_deref())
+            .map_err(|report| {
+                GetOutpostInstanceTypesErrorModeled::ValidationException(ValidationException {
+                    message: Some(report),
+                })
+            })?;
         let size = crate::state::page_size(input.max_results);
 
         let mut store = state.lock();
@@ -225,12 +228,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .outpost(&region, &outpost_id)
             .map(|record| record.outpost.clone())
             .ok_or_else(not_found)?;
-        // The boundary a page of this report stops at is an entry's POSITION in the
-        // configuration's own stable order: a configured instance type carries no
-        // creation sequence of its own, and that order is the one the whole report is
-        // reported in.
+        // The boundary a page of this report stops at is a place in the report's own
+        // derivation order: a reported entry is an instance TYPE the configuration
+        // standing on this Outpost's hardware names rather than a record this store
+        // created, so there is no creation sequence of an entry to name, and that
+        // derivation fixes the order the whole report is answered in
+        // (`crate::state::CONFIGURED_INSTANCE_TYPE_PAGE`).
         let (instance_types, next_token) = crate::state::page(
-            crate::state::CONFIGURED_INSTANCE_TYPE_PAGE,
+            &stamp,
             store
                 .configured_instance_types(&region, &outpost_id)
                 .into_iter()

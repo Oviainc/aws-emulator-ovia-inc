@@ -230,16 +230,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The resume point the caller's token names, by the rule
         // `crate::state::page_boundary` states for every paged answer of this service:
         // a token it did not issue for THIS report is a bad request, not an empty page.
-        let after = crate::state::page_boundary(
+        // The report is the catalog narrowed to what ONE Outpost's hardware supports,
+        // so the stamp it names is the kind together with that Outpost
+        // (`crate::state::nested_page_kind`) and a token minted while paging another
+        // Outpost's report is refused here.
+        let stamp = crate::state::nested_page_kind(
             crate::state::SUPPORTED_INSTANCE_TYPE_PAGE,
-            Self::NAME,
-            input.next_token.as_deref(),
-        )
-        .map_err(|report| {
-            GetOutpostSupportedInstanceTypesErrorModeled::ValidationException(ValidationException {
-                message: Some(report),
-            })
-        })?;
+            &[&outpost_id],
+        );
+        let after = crate::state::page_boundary(&stamp, Self::NAME, input.next_token.as_deref())
+            .map_err(|report| {
+                GetOutpostSupportedInstanceTypesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(report),
+                    },
+                )
+            })?;
         let size = crate::state::page_size(input.max_results);
 
         // What an Outpost's hardware can support is a fact about that hardware, but
@@ -310,7 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // position in the catalog's stable order, which is the order the whole report
         // is reported in.
         let (instance_types, next_token) = crate::state::page(
-            crate::state::SUPPORTED_INSTANCE_TYPE_PAGE,
+            &stamp,
             store
                 .orderable_instance_types
                 .iter()

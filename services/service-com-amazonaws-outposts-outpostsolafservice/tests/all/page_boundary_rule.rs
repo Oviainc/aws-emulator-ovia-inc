@@ -12,6 +12,10 @@
 //!   reports; and one this service never issued for that list is refused as a bad
 //!   request (400 `ValidationException`) whose report names the operation it was asked
 //!   of, never honoured as a boundary and never served as a silently truncated page.
+//!   An answer NESTED under a parent resource is that parent's own list, so the stamp
+//!   its tokens carry names the parents the route binds as well as the kind of list
+//!   (`state::nested_page_kind`) — which parent's list a token belongs to is stated
+//!   over a set of parents in [`crate::nested_page_tokens`].
 //!
 //! The rows span EVERY paged answer this service serves — the twelve that each used to
 //! carry the rule themselves — and, per answer, the token forms the rule distinguishes:
@@ -25,8 +29,8 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
-    encode_page_token, page_boundary, ASSET_INSTANCE_PAGE, ASSET_PAGE, BLOCKING_INSTANCE_PAGE,
-    CAPACITY_TASK_PAGE, CATALOG_ITEM_PAGE, CONFIGURED_INSTANCE_TYPE_PAGE,
+    encode_page_token, nested_page_kind, page_boundary, ASSET_INSTANCE_PAGE, ASSET_PAGE,
+    BLOCKING_INSTANCE_PAGE, CAPACITY_TASK_PAGE, CATALOG_ITEM_PAGE, CONFIGURED_INSTANCE_TYPE_PAGE,
     ORDERABLE_INSTANCE_TYPE_PAGE, ORDER_PAGE, OUTPOST_PAGE, QUOTE_PAGE, SITE_PAGE,
     SUPPORTED_INSTANCE_TYPE_PAGE,
 };
@@ -142,11 +146,13 @@ fn the_shared_resume_rule_reads_every_token_form() {
 }
 
 /// One paged answer over the wire: the operation its refusal has to name, the route it
-/// is asked on (every `@httpLabel` already bound), and the stamp its own tokens carry.
+/// is asked on (every `@httpLabel` already bound), and the stamp its own tokens carry —
+/// for an answer nested under a parent resource, the kind together with the parents the
+/// route names ([`nested_page_kind`]).
 struct Paged {
     operation: &'static str,
     path: String,
-    stamp: &'static str,
+    stamp: String,
 }
 
 /// Every paged answer this service serves, with the resources the Outpost-scoped ones
@@ -164,8 +170,8 @@ async fn every_route(outposts: &Outposts) -> Vec<Paged> {
     );
     let outpost = segment(&outpost_id);
     let task = segment(&task_id);
-    let route = |operation: &'static str, path: String| {
-        let stamp = EVERY_PAGED_ANSWER
+    let route = |operation: &'static str, path: String, parents: &[&str]| {
+        let kind = EVERY_PAGED_ANSWER
             .iter()
             .find(|(_, named)| *named == operation)
             .unwrap_or_else(|| panic!("{operation} is a paged answer of this service"))
@@ -173,34 +179,46 @@ async fn every_route(outposts: &Outposts) -> Vec<Paged> {
         Paged {
             operation,
             path,
-            stamp,
+            stamp: nested_page_kind(kind, parents),
         }
     };
 
     vec![
-        route("ListSites", "/sites".to_string()),
-        route("ListOutposts", "/outposts".to_string()),
-        route("ListQuotes", "/quotes".to_string()),
-        route("ListOrders", "/list-orders".to_string()),
-        route("ListCatalogItems", "/catalog/items".to_string()),
-        route("ListCapacityTasks", "/capacity/tasks".to_string()),
-        route("ListOrderableInstanceTypes", "/instanceTypes".to_string()),
-        route("ListAssets", format!("/outposts/{outpost}/assets")),
+        route("ListSites", "/sites".to_string(), &[]),
+        route("ListOutposts", "/outposts".to_string(), &[]),
+        route("ListQuotes", "/quotes".to_string(), &[]),
+        route("ListOrders", "/list-orders".to_string(), &[]),
+        route("ListCatalogItems", "/catalog/items".to_string(), &[]),
+        route("ListCapacityTasks", "/capacity/tasks".to_string(), &[]),
+        route(
+            "ListOrderableInstanceTypes",
+            "/instanceTypes".to_string(),
+            &[],
+        ),
+        route(
+            "ListAssets",
+            format!("/outposts/{outpost}/assets"),
+            &[&outpost_id],
+        ),
         route(
             "ListAssetInstances",
             format!("/outposts/{outpost}/assetInstances"),
+            &[&outpost_id],
         ),
         route(
             "GetOutpostInstanceTypes",
             format!("/outposts/{outpost}/instanceTypes"),
+            &[&outpost_id],
         ),
         route(
             "GetOutpostSupportedInstanceTypes",
             format!("/outposts/{outpost}/supportedInstanceTypes"),
+            &[&outpost_id],
         ),
         route(
             "ListBlockingInstancesForCapacityTask",
             format!("/outposts/{outpost}/capacity/{task}/blockingInstances"),
+            &[&outpost_id, &task_id],
         ),
     ]
 }
@@ -230,7 +248,7 @@ async fn every_paged_answer_takes_its_resume_point_from_the_shared_rule() {
         let past = format!(
             "{}?NextToken={}",
             answer.path,
-            query_value(&encode_page_token(answer.stamp, PAST_THE_END))
+            query_value(&encode_page_token(&answer.stamp, PAST_THE_END))
         );
         let reply = outposts.call("GET", &past, None).await;
         assert_eq!(
@@ -247,7 +265,7 @@ async fn every_paged_answer_takes_its_resume_point_from_the_shared_rule() {
         // another paged answer, one whose digits no `u64` holds — are the same 400,
         // reported by this operation's name.
         let expected = expected_report(answer.operation);
-        let foreign = answers[(index + 1) % answers.len()].stamp;
+        let foreign = &answers[(index + 1) % answers.len()].stamp;
         let unusable = [
             encode_page_token(foreign, 1),
             format!("{PAST_U64}##{}", answer.stamp),

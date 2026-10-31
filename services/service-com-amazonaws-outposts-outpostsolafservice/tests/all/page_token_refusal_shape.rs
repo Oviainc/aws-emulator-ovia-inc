@@ -29,7 +29,7 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
-    ASSET_INSTANCE_PAGE, ASSET_PAGE, BLOCKING_INSTANCE_PAGE, CAPACITY_TASK_PAGE,
+    nested_page_kind, ASSET_INSTANCE_PAGE, ASSET_PAGE, BLOCKING_INSTANCE_PAGE, CAPACITY_TASK_PAGE,
     CATALOG_ITEM_PAGE, CONFIGURED_INSTANCE_TYPE_PAGE, ORDERABLE_INSTANCE_TYPE_PAGE, ORDER_PAGE,
     OUTPOST_PAGE, QUOTE_PAGE, SITE_PAGE, SUPPORTED_INSTANCE_TYPE_PAGE,
 };
@@ -72,11 +72,13 @@ const EVERY_PAGE_STAMP: &[&str] = &[
 const SEQUENCES: &[&str] = &["0", "1", "7", "18446744073709551615"];
 
 /// One paged answer: the operation its refusal has to name, the route it is asked on
-/// (every `@httpLabel` already bound), and the page stamp its OWN tokens carry.
+/// (every `@httpLabel` already bound), and the page stamp its OWN tokens carry — for an
+/// answer nested under a parent resource, the kind together with the parents the route
+/// binds ([`nested_page_kind`]).
 struct Paged {
     operation: &'static str,
     path: String,
-    stamp: &'static str,
+    stamp: String,
 }
 
 /// The report this service states for a `NextToken` it did not issue for `operation`.
@@ -111,62 +113,62 @@ async fn every_paged_answer(outposts: &Outposts) -> Vec<Paged> {
         Paged {
             operation: "ListSites",
             path: "/sites".to_string(),
-            stamp: SITE_PAGE,
+            stamp: nested_page_kind(SITE_PAGE, &[]),
         },
         Paged {
             operation: "ListOutposts",
             path: "/outposts".to_string(),
-            stamp: OUTPOST_PAGE,
+            stamp: nested_page_kind(OUTPOST_PAGE, &[]),
         },
         Paged {
             operation: "ListQuotes",
             path: "/quotes".to_string(),
-            stamp: QUOTE_PAGE,
+            stamp: nested_page_kind(QUOTE_PAGE, &[]),
         },
         Paged {
             operation: "ListOrders",
             path: "/list-orders".to_string(),
-            stamp: ORDER_PAGE,
+            stamp: nested_page_kind(ORDER_PAGE, &[]),
         },
         Paged {
             operation: "ListCatalogItems",
             path: "/catalog/items".to_string(),
-            stamp: CATALOG_ITEM_PAGE,
+            stamp: nested_page_kind(CATALOG_ITEM_PAGE, &[]),
         },
         Paged {
             operation: "ListCapacityTasks",
             path: "/capacity/tasks".to_string(),
-            stamp: CAPACITY_TASK_PAGE,
+            stamp: nested_page_kind(CAPACITY_TASK_PAGE, &[]),
         },
         Paged {
             operation: "ListOrderableInstanceTypes",
             path: "/instanceTypes".to_string(),
-            stamp: ORDERABLE_INSTANCE_TYPE_PAGE,
+            stamp: nested_page_kind(ORDERABLE_INSTANCE_TYPE_PAGE, &[]),
         },
         Paged {
             operation: "ListAssets",
             path: format!("/outposts/{outpost}/assets"),
-            stamp: ASSET_PAGE,
+            stamp: nested_page_kind(ASSET_PAGE, &[&outpost_id]),
         },
         Paged {
             operation: "ListAssetInstances",
             path: format!("/outposts/{outpost}/assetInstances"),
-            stamp: ASSET_INSTANCE_PAGE,
+            stamp: nested_page_kind(ASSET_INSTANCE_PAGE, &[&outpost_id]),
         },
         Paged {
             operation: "GetOutpostInstanceTypes",
             path: format!("/outposts/{outpost}/instanceTypes"),
-            stamp: CONFIGURED_INSTANCE_TYPE_PAGE,
+            stamp: nested_page_kind(CONFIGURED_INSTANCE_TYPE_PAGE, &[&outpost_id]),
         },
         Paged {
             operation: "GetOutpostSupportedInstanceTypes",
             path: format!("/outposts/{outpost}/supportedInstanceTypes"),
-            stamp: SUPPORTED_INSTANCE_TYPE_PAGE,
+            stamp: nested_page_kind(SUPPORTED_INSTANCE_TYPE_PAGE, &[&outpost_id]),
         },
         Paged {
             operation: "ListBlockingInstancesForCapacityTask",
             path: format!("/outposts/{outpost}/capacity/{task}/blockingInstances"),
-            stamp: BLOCKING_INSTANCE_PAGE,
+            stamp: nested_page_kind(BLOCKING_INSTANCE_PAGE, &[&outpost_id, &task_id]),
         },
     ]
 }

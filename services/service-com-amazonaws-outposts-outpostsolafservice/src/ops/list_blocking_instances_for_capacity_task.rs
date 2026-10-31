@@ -197,18 +197,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The resume point the caller's token names, by the rule
         // `crate::state::page_boundary` states for every paged answer of this service:
         // a token it did not issue for THIS list is a bad request, not an empty page.
-        let after = crate::state::page_boundary(
+        // This list is cut from ONE capacity task of ONE Outpost — which instances it
+        // reports is what that task would need stopped — so the stamp it names is the
+        // kind together with both (`crate::state::nested_page_kind`), and a token
+        // minted under another Outpost or another task is refused here.
+        let stamp = crate::state::nested_page_kind(
             crate::state::BLOCKING_INSTANCE_PAGE,
-            Self::NAME,
-            input.next_token.as_deref(),
-        )
-        .map_err(|report| {
-            ListBlockingInstancesForCapacityTaskErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(report),
-                },
-            )
-        })?;
+            &[&outpost_id, &input.capacity_task_id],
+        );
+        let after = crate::state::page_boundary(&stamp, Self::NAME, input.next_token.as_deref())
+            .map_err(|report| {
+                ListBlockingInstancesForCapacityTaskErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(report),
+                    },
+                )
+            })?;
         let size = crate::state::page_size(input.max_results);
 
         // A read, so the guard is taken immutably: which instances are running on the
@@ -244,12 +248,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the task excludes, read once rather than per instance (see
         // `crate::state::ExcludedInstances`).
         let exclude = crate::state::ExcludedInstances::of(task.instances_to_exclude.as_ref());
-        // The boundary this list pages on is an instance's POSITION in the Outpost's
-        // recorded order: an instance carries no creation sequence of its own, and that
-        // order is the one stable order the whole list is reported in — the same rule
-        // `ListAssets` pages an Outpost's assets by.
+        // The boundary this list pages on is an instance's place in the Outpost's own
+        // recorded order — the one `ListAssetInstances` pages that order by: no call in
+        // this API adds an instance to it, removes one from it or reorders it, so the
+        // n-th instance recorded on an Outpost stays that one instance. It is the place
+        // in the WHOLE recorded order, not in what this task's own selection leaves, so
+        // the boundary names the same instance whatever a page was narrowed to.
         let (blocking_instances, next_token) = crate::state::page(
-            crate::state::BLOCKING_INSTANCE_PAGE,
+            &stamp,
             record
                 .instances
                 .iter()

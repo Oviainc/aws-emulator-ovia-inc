@@ -46,6 +46,9 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::ops::types::{AssetInfo, ComputeAttributes};
+use service_com_amazonaws_outposts_outpostsolafservice::state::{
+    nested_page_kind, CONFIGURED_INSTANCE_TYPE_PAGE,
+};
 
 use crate::capacity_task_lifecycle::{an_order, pool, settle_capacity_task, start_ok, HOST_VCPUS};
 use crate::outpost_assets::record;
@@ -724,13 +727,19 @@ async fn the_report_pages_and_refuses_a_token_it_did_not_issue() {
         );
     }
 
-    // A boundary past the end of the report is an empty last page, not a refusal.
+    // A boundary past the end of the report is an empty last page, not a refusal. The
+    // report is this Outpost's own, so the stamp its tokens carry names the Outpost as
+    // well as the kind of report (`state::nested_page_kind`).
     let past_the_end = configured(
         &outposts,
         &outpost_id,
         &format!(
             "?NextToken={}",
-            query_value(&format!("{}##outpostInstanceTypes", whole.len() + 1))
+            query_value(&format!(
+                "{}##{}",
+                whole.len() + 1,
+                nested_page_kind(CONFIGURED_INSTANCE_TYPE_PAGE, &[&outpost_id])
+            ))
         ),
     )
     .await;

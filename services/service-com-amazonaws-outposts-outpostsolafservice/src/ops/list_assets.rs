@@ -196,18 +196,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .to_string();
         // The resume point the caller's token names. A token this service did not
         // issue for THIS list is a bad request, not an empty page —
-        // `crate::state::page_boundary` is where that rule is stated, so this handler
-        // only names its own list and wraps the report in the error it models.
-        let after = crate::state::page_boundary(
-            crate::state::ASSET_PAGE,
-            Self::NAME,
-            input.next_token.as_deref(),
-        )
-        .map_err(|report| {
-            ListAssetsErrorModeled::ValidationException(ValidationException {
-                message: Some(report),
-            })
-        })?;
+        // `crate::state::page_boundary` is where that rule is stated. The list is cut
+        // from ONE Outpost, so what this handler names is not the kind of list alone
+        // but the kind together with that Outpost
+        // (`crate::state::nested_page_kind`): a token minted while paging another
+        // Outpost's assets is no boundary of this one's, and is refused here rather
+        // than read as a boundary of it.
+        let stamp = crate::state::nested_page_kind(crate::state::ASSET_PAGE, &[&outpost_id]);
+        let after = crate::state::page_boundary(&stamp, Self::NAME, input.next_token.as_deref())
+            .map_err(|report| {
+                ListAssetsErrorModeled::ValidationException(ValidationException {
+                    message: Some(report),
+                })
+            })?;
         let size = crate::state::page_size(input.max_results);
 
         // An Outpost's hardware is installed when an order placed on it has delivered
@@ -229,17 +230,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // hold is the not-found error this operation models, worded as the identifier
         // echo of the value AS SUPPLIED — not of the bare id an ARN resolved to.
         let record = store.outpost(&region, &outpost_id).ok_or_else(not_found)?;
-        // The boundary this list pages on is an asset's POSITION in the Outpost's
-        // installation order: an asset carries no creation sequence of its own, and
-        // that order is the one stable order the whole list is reported in.
+        // The boundary this list pages on is the creation sequence of an installed
+        // UNIT (`crate::state::OutpostRecord::sequenced_assets`), reported in the
+        // Outpost's own installation order: hardware installed later was created
+        // later, so a page resumes after the unit it stopped at and never at a
+        // position an install that replaced this Outpost's hardware has since filled
+        // with another unit.
         let (assets, next_token) = crate::state::page(
-            crate::state::ASSET_PAGE,
+            &stamp,
             record
-                .assets
-                .iter()
-                .enumerate()
+                .sequenced_assets()
                 .filter(|(_, asset)| matches_filters(asset, &input))
-                .map(|(position, asset)| (position as u64, asset.clone())),
+                .map(|(sequence, asset)| (sequence, asset.clone())),
             after,
             size,
         );

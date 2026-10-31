@@ -492,6 +492,22 @@ pub struct OutpostRecord {
     /// factor recorded on it later names different hardware, which is installed in its
     /// turn ([`OutpostRecord::set_supported_hardware_type`]).
     pub assets: Vec<AssetInfo>,
+    /// The creation sequence of the FIRST unit of the installation this Outpost holds,
+    /// so the unit at position `n` of [`Self::assets`] was created
+    /// `asset_sequence_base + n`th in this store ([`Self::sequenced_assets`]).
+    ///
+    /// An install takes a block of consecutive sequences out of the store's own
+    /// creation order
+    /// ([`ComAmazonawsOutpostsOutpostsolafserviceState::reserve_sequences`]) the
+    /// moment it places the hardware, exactly as a created resource takes one, so no
+    /// two units this store ever installs — on this Outpost or on any other — carry
+    /// one sequence. That is what lets a page of [`ASSET_PAGE`] stop AT A UNIT rather
+    /// than at a position: the hardware a replacement install places
+    /// ([`Self::set_supported_hardware_type`]) is created after every sequence the
+    /// store had handed out before it, so a boundary cut from the hardware that came
+    /// out names no unit of what went in and the page that resumes from it drops
+    /// nothing.
+    pub asset_sequence_base: u64,
     /// The Amazon EC2 instances RUNNING on this Outpost — what
     /// `ListBlockingInstancesForCapacityTask` weighs a capacity task against, and what
     /// `ListAssetInstances` reports
@@ -528,6 +544,23 @@ pub struct OutpostRecord {
 }
 
 impl OutpostRecord {
+    /// Every hardware asset installed on this Outpost, in installation order, each
+    /// with the creation sequence that identifies the UNIT.
+    ///
+    /// What a page of this Outpost's assets stops at, so the number travels with the
+    /// unit and not with the place the unit sits in: see
+    /// [`Self::asset_sequence_base`] for why that is what a boundary of such a list
+    /// has to be.
+    pub fn sequenced_assets(&self) -> impl Iterator<Item = (u64, &AssetInfo)> {
+        let base = self.asset_sequence_base;
+        self.assets.iter().enumerate().map(move |(position, asset)| {
+            (
+                base.saturating_add(u64::try_from(position).unwrap_or_default()),
+                asset,
+            )
+        })
+    }
+
     /// Record `form_factor` as this Outpost's hardware type, and with it the install
     /// of the hardware that form factor names.
     ///
@@ -4322,12 +4355,20 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             })
             .collect();
         for (outpost_id, hardware) in settled {
+            // The install places hardware, so each unit it places takes its own
+            // creation sequence out of the store's creation order the moment it is
+            // placed (see [`OutpostRecord::asset_sequence_base`]).
+            let installed = match hardware.is_empty() {
+                true => None,
+                false => Some(self.reserve_sequences(hardware.len())),
+            };
             let Some(record) = self.outposts.get_mut(&outpost_id) else {
                 continue;
             };
             record.outpost.life_cycle_status = Some(LIFE_CYCLE_STATUS_ACTIVE.to_string());
             record.active_at = None;
-            if !hardware.is_empty() {
+            if let Some(base) = installed {
+                record.asset_sequence_base = base;
                 record.assets = hardware;
             }
         }
@@ -5086,6 +5127,22 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&digest);
         (bytes, self.created)
+    }
+
+    /// Take the next `count` creation sequences of this store, answering the FIRST of
+    /// them.
+    ///
+    /// [`Self::created`] is this store's one creation order, so the hardware this
+    /// service installs takes its sequences from it exactly as a created resource
+    /// does ([`Self::mint_digest`]): a block of `count` consecutive sequences this
+    /// store has never handed out and will never hand out again. That is what makes a
+    /// unit's sequence identify that unit — see
+    /// [`OutpostRecord::asset_sequence_base`].
+    fn reserve_sequences(&mut self, count: usize) -> u64 {
+        let count = u64::try_from(count).unwrap_or_default();
+        let first = self.created.wrapping_add(1);
+        self.created = self.created.wrapping_add(count);
+        first
     }
 }
 
@@ -6673,22 +6730,26 @@ pub const CATALOG_ITEM_PAGE: &str = "catalogItems";
 /// [`OUTPOST_PAGE`].
 pub const CAPACITY_TASK_PAGE: &str = "capacityTasks";
 
-/// The stamp a `ListAssets` page token carries.
+/// The KIND a `ListAssets` page token is stamped with.
 ///
-/// An asset is not a top-level resource with a creation sequence of its own: it is
-/// a unit of hardware installed on ONE Outpost, held in that Outpost's own
-/// installation order ([`OutpostRecord::assets`]), so the boundary such a token
-/// names is a position in THAT list and the route the token is replayed on names
-/// the Outpost it belongs to. See [`OUTPOST_PAGE`].
+/// What it pages through is the hardware installed on ONE Outpost
+/// ([`OutpostRecord::assets`]), so the list has no existence apart from that
+/// Outpost: the stamp such a token carries is this kind together with the Outpost
+/// the list was cut from ([`nested_page_kind`]), and the boundary it names is the
+/// creation sequence of one installed unit ([`OutpostRecord::sequenced_assets`]).
+/// See [`OUTPOST_PAGE`].
 pub const ASSET_PAGE: &str = "assets";
 
-/// The stamp a `ListBlockingInstancesForCapacityTask` page token carries.
+/// The KIND a `ListBlockingInstancesForCapacityTask` page token is stamped with.
 ///
-/// An instance is not a top-level resource with a creation sequence of its own
-/// either: it runs on ONE Outpost, held in that Outpost's own recorded order
-/// ([`OutpostRecord::instances`]), so the boundary such a token names is a position
-/// in THAT list and the route it is replayed on names the Outpost (and the capacity
-/// task) it belongs to. See [`ASSET_PAGE`].
+/// What it pages through is what ONE capacity task of ONE Outpost would need
+/// stopped, cut out of that Outpost's own recorded order
+/// ([`OutpostRecord::instances`]) — so the stamp carries this kind together with
+/// both resources the list is cut from ([`nested_page_kind`]). An instance is
+/// launched through Amazon EC2 and no call in this API adds one to that order,
+/// removes one from it or reorders it, so the n-th instance recorded on an Outpost
+/// stays the n-th for as long as the Outpost holds it and the boundary such a token
+/// carries names that one instance. See [`ASSET_PAGE`].
 pub const BLOCKING_INSTANCE_PAGE: &str = "blockingInstances";
 
 /// The stamp a `ListAssetInstances` page token carries.
@@ -6698,7 +6759,8 @@ pub const BLOCKING_INSTANCE_PAGE: &str = "blockingInstances";
 /// list from the one `ListBlockingInstancesForCapacityTask` cuts out of the same
 /// recorded order ([`BLOCKING_INSTANCE_PAGE`]), which reports only one account's
 /// and drops what a capacity task excludes — so a token issued for one of them is
-/// not a boundary of the other. See [`ASSET_PAGE`].
+/// not a boundary of the other, and the stamp carries this kind together with the
+/// Outpost the list was cut from ([`nested_page_kind`]). See [`ASSET_PAGE`].
 pub const ASSET_INSTANCE_PAGE: &str = "assetInstances";
 
 /// The stamp a `GetOutpostSupportedInstanceTypes` page token carries.
@@ -6707,17 +6769,28 @@ pub const ASSET_INSTANCE_PAGE: &str = "assetInstances";
 /// Outpost's hardware can support, so it is a different list from the whole catalog
 /// `ListOrderableInstanceTypes` pages ([`ORDERABLE_INSTANCE_TYPE_PAGE`]) even though
 /// both name a boundary in the same catalog order — and a token issued for one of
-/// them is therefore not a boundary of the other. See [`OUTPOST_PAGE`].
+/// them is therefore not a boundary of the other. The report is narrowed per
+/// Outpost, so the stamp carries this kind together with the Outpost it was cut from
+/// ([`nested_page_kind`]), while the boundary stays the catalog entry's own
+/// published sequence. See [`OUTPOST_PAGE`].
 pub const SUPPORTED_INSTANCE_TYPE_PAGE: &str = "supportedInstanceTypes";
 
-/// The stamp a `GetOutpostInstanceTypes` page token carries.
+/// The KIND a `GetOutpostInstanceTypes` page token is stamped with.
 ///
 /// What that report pages through is the instance types one Outpost's capacity is
 /// CONFIGURED with
 /// ([`ComAmazonawsOutpostsOutpostsolafserviceState::configured_instance_types`]) — a
 /// different list from the capability report [`SUPPORTED_INSTANCE_TYPE_PAGE`] stamps
 /// and from the published catalog [`ORDERABLE_INSTANCE_TYPE_PAGE`] stamps — so a
-/// token issued for one of them is not a boundary of another. See [`OUTPOST_PAGE`].
+/// token issued for one of them is not a boundary of another, and the stamp carries
+/// this kind together with the Outpost the report was cut from
+/// ([`nested_page_kind`]).
+///
+/// What a boundary of this one names is a place in the report's own derivation order:
+/// a reported entry is an instance TYPE the configuration standing on the Outpost's
+/// hardware names, not a record this store created, so there is no creation sequence
+/// of an entry to name — the order itself is what the derivation fixes, the same on
+/// every read of one store. See [`OUTPOST_PAGE`].
 pub const CONFIGURED_INSTANCE_TYPE_PAGE: &str = "outpostInstanceTypes";
 
 /// The page size a list uses when the caller named no `MaxResults`, which is also
@@ -6769,9 +6842,11 @@ pub fn store_full(resource: &str) -> String {
 /// The token carries the creation sequence of the LAST item the page returned, so
 /// the next page is everything created strictly after it — a resume point that
 /// stays correct when items are added or removed between pages, which a positional
-/// offset would not. It is STAMPED with the list it belongs to, so a token replayed
-/// against another list is refused rather than honoured as that list's boundary.
-/// The rendering is exactly the modelled `Token` pattern `^(\d+)##(\S+)$`.
+/// offset would not. It is STAMPED with the list it belongs to — for a list nested
+/// under a parent resource, with that parent as well ([`nested_page_kind`]) — so a
+/// token replayed against another list is refused rather than honoured as that
+/// list's boundary. The rendering is exactly the modelled `Token` pattern
+/// `^(\d+)##(\S+)$`.
 pub fn encode_page_token(kind: &str, last_sequence: u64) -> String {
     format!("{last_sequence}##{kind}")
 }
@@ -6785,6 +6860,30 @@ pub fn decode_page_token(kind: &str, token: &str) -> Option<u64> {
         return None;
     }
     sequence.parse().ok()
+}
+
+/// The stamp the page tokens of a list NESTED under one or more parent resources
+/// carry: the kind of list, and every resource that list was cut from.
+///
+/// A nested list has no existence apart from its parents — the modelled route binds
+/// them as labels, and the items are held on the parent's own record — so two parents
+/// of one store serve two DIFFERENT lists of the same kind, and a boundary of one is
+/// no boundary of the other. Binding the parents into the stamp is what has
+/// [`decode_page_token`] refuse such a token instead of reading its number as this
+/// list's boundary and serving a page with everything up to that number silently
+/// dropped. What narrows a list WITHIN one parent — a filter, a scope the caller
+/// asked for — is no part of it: the parents are the resources the list belongs to.
+///
+/// The identifiers are joined by a character none of this service's own identifier
+/// forms holds, and carry no whitespace, so the token stays exactly the modelled
+/// `Token` pattern ([`encode_page_token`]).
+pub fn nested_page_kind(kind: &str, parents: &[&str]) -> String {
+    let mut stamp = String::from(kind);
+    for parent in parents {
+        stamp.push('.');
+        stamp.push_str(parent);
+    }
+    stamp
 }
 
 /// The page boundary the caller's `NextToken` names, or the report a token this
