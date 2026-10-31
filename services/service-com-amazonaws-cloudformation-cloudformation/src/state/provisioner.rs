@@ -3925,7 +3925,7 @@ const NO_SUCH_BUCKET: &str = "NoSuchBucket";
 
 /// Create the bucket an `AWS::S3::Bucket` declares, and apply the
 /// `VersioningConfiguration`, the `NotificationConfiguration`, the
-/// `AnalyticsConfigurations` and the tags it carries.
+/// `AnalyticsConfigurations`, the `InventoryConfigurations` and the tags it carries.
 ///
 /// "Ref returns the bucket name" for this type, so the physical resource id the stack
 /// reports IS the bucket a client addresses, and it is the bucket created here.
@@ -3941,7 +3941,8 @@ const NO_SUCH_BUCKET: &str = "NoSuchBucket";
 /// ([`declared_notification_configuration`]), and each entry of `AnalyticsConfigurations` is
 /// one `PutBucketAnalyticsConfiguration` ([`declared_analytics_configurations`]) — the call
 /// Amazon S3 publishes for ONE analytics configuration, since the property is a list keyed
-/// by `Id` and the API takes one id per call.
+/// by `Id` and the API takes one id per call. `InventoryConfigurations` is the same story
+/// with `PutBucketInventoryConfiguration` ([`declared_inventory_configurations`]).
 ///
 /// `CreateBucket` takes no tag set at all, so the bucket's tags are a `PutBucketTagging` of
 /// its own — "sets the tags for a bucket", the one call S3 publishes for them — carrying
@@ -4030,8 +4031,24 @@ async fn create_bucket(
             .await
             .map_err(|error| refusal_of(&error))?;
     }
+    // "InventoryConfigurations — specifies the inventory configuration for an Amazon S3
+    // bucket" (this type's own property): the property is a LIST keyed by `Id` and
+    // `PutBucketInventoryConfiguration` "adds an S3 Inventory configuration (identified by
+    // the inventory ID) to the bucket", so each declared entry is installed by its own call
+    // under the id it names.
+    for (id, configuration) in declared_inventory_configurations(resource)? {
+        client
+            .put_bucket_inventory_configuration()
+            .bucket(bucket)
+            .id(id)
+            .inventory_configuration(configuration)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
     // The bucket's whole tag set, in the one call Amazon S3 takes it through.
-    let tags = tags_of(&resource.properties, propagated);    if !tags.is_empty() {
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
         let mut tag_set = Vec::with_capacity(tags.len());
         for (key, value) in &tags {
             tag_set.push(
@@ -4498,6 +4515,181 @@ fn declared_storage_class_analysis(
         .build())
 }
 
+/// The property an `AWS::S3::Bucket` declares its S3 Inventory reports under.
+const INVENTORY_CONFIGURATIONS: &str = "InventoryConfigurations";
+
+/// Every inventory configuration a bucket's declaration states, each paired with the `Id`
+/// that identifies it — the `(Id, InventoryConfiguration)` pair one
+/// `PutBucketInventoryConfiguration` takes. A declaration stating none yields none, which is
+/// the state a bucket is created in.
+///
+/// The template's spelling is FLAT where the API nests, and this is the one place the two are
+/// reconciled. An entry states the object scope as a single `Prefix` where the API takes the
+/// `Filter` whose one REQUIRED member is that prefix, and the schedule as a single
+/// `ScheduleFrequency` where the API takes the `Schedule` whose one REQUIRED member is that
+/// frequency; `Enabled` is the API's `IsEnabled`, read as a BOOLEAN in either spelling a
+/// template gives one ([`declared_flag`]); and the destination travels one level deeper
+/// through [`declared_inventory_destination`]. `IncludedObjectVersions` and `OptionalFields`
+/// are spelled the same on both sides and pass through — the values are the template's,
+/// since Amazon S3's own deserializer is what judges them against their enums.
+///
+/// An entry missing a member the API REQUIRES — the `Id` it is addressable by, the enabled
+/// flag, the schedule or the object versions — is refused rather than installed under a value
+/// of this module's invention: the stack must not complete with an inventory report a client
+/// cannot address or one the service never agreed to.
+fn declared_inventory_configurations(
+    resource: &StoredResource,
+) -> Result<Vec<(String, ::aws_sdk_s3::types::InventoryConfiguration)>, Refusal> {
+    use ::aws_sdk_s3::types::{
+        InventoryConfiguration, InventoryFilter, InventoryFrequency,
+        InventoryIncludedObjectVersions, InventoryOptionalField, InventorySchedule,
+    };
+
+    let listed = resource
+        .properties
+        .get(INVENTORY_CONFIGURATIONS)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut configurations = Vec::with_capacity(listed.len());
+    for declared in listed {
+        let id = declared
+            .get("Id")
+            .and_then(scalar_text)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| Refusal {
+                code: MISSING_PROPERTY_CODE.to_string(),
+                message: format!(
+                    "an {INVENTORY_CONFIGURATIONS} entry of {S3_BUCKET} declares no Id"
+                ),
+            })?;
+        let missing = |member: &str| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "the {INVENTORY_CONFIGURATIONS} entry {id} of {S3_BUCKET} declares no {member}"
+            ),
+        };
+        let enabled = declared
+            .as_object()
+            .and_then(|entry| declared_flag(entry, "Enabled"))
+            .ok_or_else(|| missing("Enabled"))?;
+        let frequency = declared_text(declared, "ScheduleFrequency")
+            .ok_or_else(|| missing("ScheduleFrequency"))?;
+        let versions = declared_text(declared, "IncludedObjectVersions")
+            .ok_or_else(|| missing("IncludedObjectVersions"))?;
+        // The entry's own `Prefix` is the object scope's, and `InventoryFilter`'s one member
+        // is REQUIRED, so an entry stating no prefix carries no filter at all — which is the
+        // report that covers every object in the bucket.
+        let filter = match declared_text(declared, "Prefix") {
+            Some(prefix) => Some(
+                InventoryFilter::builder()
+                    .prefix(prefix)
+                    .build()
+                    .map_err(|error| inventory_not_sendable(&id, &error))?,
+            ),
+            None => None,
+        };
+        let optional_fields: Option<Vec<InventoryOptionalField>> = declared
+            .get("OptionalFields")
+            .and_then(Value::as_array)
+            // An EMPTY list asks for no optional field, which is what a declaration stating
+            // none asks for: both send the member not at all, rather than an empty element.
+            .filter(|fields| !fields.is_empty())
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(scalar_text)
+                    .map(|field| InventoryOptionalField::from(field.as_str()))
+                    .collect()
+            });
+        let schedule = InventorySchedule::builder()
+            .frequency(InventoryFrequency::from(frequency.as_str()))
+            .build()
+            .map_err(|error| inventory_not_sendable(&id, &error))?;
+        let configuration = InventoryConfiguration::builder()
+            .id(&id)
+            .is_enabled(enabled)
+            .destination(declared_inventory_destination(declared, &id)?)
+            .schedule(schedule)
+            .included_object_versions(InventoryIncludedObjectVersions::from(versions.as_str()))
+            .set_filter(filter)
+            .set_optional_fields(optional_fields)
+            .build()
+            .map_err(|error| inventory_not_sendable(&id, &error))?;
+        configurations.push((id, configuration));
+    }
+    Ok(configurations)
+}
+
+/// The refusal for a declared inventory configuration the SDK will not build into the request
+/// shape: the entry is named, so the failing declaration can be found.
+fn inventory_not_sendable(id: &str, error: &dyn ::std::fmt::Display) -> Refusal {
+    Refusal {
+        code: UNIDENTIFIED_FAILURE.to_string(),
+        message: format!(
+            "the {INVENTORY_CONFIGURATIONS} entry {id} of {S3_BUCKET} cannot be sent to Amazon \
+             S3: {error}"
+        ),
+    }
+}
+
+/// The `InventoryDestination` one declared entry states, as Amazon S3 takes it.
+///
+/// The API nests the destination one level deeper than the template: `S3BucketDestination`
+/// carries "the Amazon Resource Name (ARN) of the bucket where inventory results will be
+/// published" (`InventoryS3BucketDestination$Bucket`) and the `Format` the report is written
+/// in, both REQUIRED, beside the optional `AccountId` — "the account ID that owns the
+/// destination S3 bucket" — and `Prefix`, which is "prepended to all inventory results".
+///
+/// The destination is the ONE nested object an entry states, and the entry's own `Prefix` is
+/// the object scope's filter rather than this one's — so a destination prefix is declared
+/// exactly where `Destination.Prefix` is, and one that is not declared is left OUT of the
+/// request rather than sent as an empty one.
+///
+/// A declaration missing the destination, or either member it REQUIRES, is refused rather
+/// than sent incomplete: the stack must not complete with an inventory report that is
+/// published nowhere.
+fn declared_inventory_destination(
+    declared: &Value,
+    id: &str,
+) -> Result<::aws_sdk_s3::types::InventoryDestination, Refusal> {
+    use ::aws_sdk_s3::types::{InventoryDestination, InventoryFormat, InventoryS3BucketDestination};
+
+    let missing = |member: &str| Refusal {
+        code: MISSING_PROPERTY_CODE.to_string(),
+        message: format!(
+            "the {INVENTORY_CONFIGURATIONS} entry {id} of {S3_BUCKET} declares no {member}"
+        ),
+    };
+    let destination = declared
+        .get("Destination")
+        .ok_or_else(|| missing("Destination"))?;
+    // The values are the template's: Amazon S3's own deserializer is what judges the format
+    // against `InventoryFormat`.
+    let required_text = |member: &str| {
+        declared_text(destination, member).ok_or_else(|| missing(&format!("Destination.{member}")))
+    };
+    let s3_bucket_destination = InventoryS3BucketDestination::builder()
+        .bucket(required_text("BucketArn")?)
+        .format(InventoryFormat::from(required_text("Format")?.as_str()))
+        .set_account_id(declared_text(destination, "BucketAccountId"))
+        .set_prefix(declared_text(destination, "Prefix"))
+        .build()
+        .map_err(|error| inventory_not_sendable(id, &error))?;
+    Ok(InventoryDestination::builder()
+        .s3_bucket_destination(s3_bucket_destination)
+        .build())
+}
+
+/// One property of a declaration as the text an API member takes, or `None` where the
+/// declaration states it as nothing, as the empty string or as a composite.
+fn declared_text(declared: &Value, property: &str) -> Option<String> {
+    declared
+        .get(property)
+        .and_then(scalar_text)
+        .filter(|text| !text.is_empty())
+}
+
 /// Delete the bucket a stack created. A bucket S3 no longer has is already in the state
 /// the delete asks for; one that still holds objects is NOT deleted, and that refusal is
 /// what the stack reports.
@@ -4536,9 +4728,9 @@ const BUCKET_NOT_FOUND: &str = "NotFound";
 /// existing with no comparable property rather than failing the whole detection. A declared
 /// property this read does not report is not compared at all ("only resource properties
 /// explicitly defined in the stack template are checked for drift", against what the owning
-/// service reports), so the bucket's notification and analytics configurations — which the
-/// create installs but this read does not fetch — are outside this detection rather than
-/// reported as changed.
+/// service reports), so the bucket's notification, analytics and inventory configurations —
+/// which the create installs but this read does not fetch — are outside this detection rather
+/// than reported as changed.
 async fn describe_bucket(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
