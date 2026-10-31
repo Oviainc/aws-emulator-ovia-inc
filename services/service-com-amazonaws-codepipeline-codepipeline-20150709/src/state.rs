@@ -308,8 +308,9 @@ pub const TRIGGER_TYPE_PUT_ACTION_REVISION: &str = "PutActionRevision";
 pub enum ExecutionAdmission {
     /// The execution runs from the moment it is recorded.
     Started,
-    /// The execution WAITS for the one already running, as `QUEUED` and `SUPERSEDED`
-    /// hold one execution at a time; the driver admits it when that one finishes.
+    /// The execution WAITS for the stage it would enter first, which another execution
+    /// still holds, as `QUEUED` and `SUPERSEDED` admit one execution per stage; the
+    /// driver admits it as soon as that stage's turn is free.
     Queued,
     /// The pipeline already carries every execution it may, so the call that asked is
     /// refused with `ConcurrentPipelineExecutionsLimitExceededException`
@@ -974,9 +975,12 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     /// * `PipelineDeclaration$executionMode` documents `PARALLEL` as the mode in which
     ///   every execution runs on its own, while `QUEUED` and `SUPERSEDED` "handle
     ///   multiple executions" one at a time — so in those two an execution admitted
-    ///   while another is RUNNING waits ([`ExecutionAdmission::Queued`]);
+    ///   while another is RUNNING waits ([`ExecutionAdmission::Queued`]) for the stage it
+    ///   would enter, which the driver admits it to as soon as that stage's turn is free;
     /// * in `SUPERSEDED` mode — the default — the execution that is waiting is
-    ///   superseded by this one, which is what that mode means.
+    ///   superseded by this one, which is what that mode means. The driver applies the
+    ///   same rule at every stage boundary further in, where a later execution catches up
+    ///   with one waiting to enter a stage.
     ///
     /// Only the second and third rule write, and they write only to the executions the
     /// mode supersedes: a call answered `AtLimit` changes nothing, so the caller may
@@ -3214,8 +3218,10 @@ pub struct PipelineExecutionRecord {
     pub artifact_bucket: String,
     /// The customer managed key the artifact store declares, when it declares one.
     pub artifact_encryption_key: Option<String>,
-    /// True while the execution has not been admitted to run — the state a start takes
-    /// in `QUEUED` and `SUPERSEDED` mode while another execution of the pipeline runs.
+    /// True while the execution has not entered the pipeline at all — the state a start
+    /// takes in `QUEUED` and `SUPERSEDED` mode while another execution holds the stage it
+    /// would enter first. The driver admits it as soon as that stage's turn is free; it
+    /// never waits for the whole pipeline to empty.
     pub queued: bool,
     /// The `StopPipelineExecution` request recorded against this execution, if any.
     pub stop: Option<StopRequest>,

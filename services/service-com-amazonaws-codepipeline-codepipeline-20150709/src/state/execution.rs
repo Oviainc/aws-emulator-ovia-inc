@@ -16,6 +16,15 @@
 //! reporting operations report. So the execution's progress is a function of the stored
 //! declaration and the CLOCK, not of what anybody asked for.
 //!
+//! A pipeline runs one execution PER STAGE, not one execution at a time: an execution is
+//! never held out of the pipeline because another is in flight — it runs every stage whose
+//! turn is free and waits at the boundary of the stage another execution holds, however
+//! long that one stays there (waiting for an approval, for a job worker, or for a disabled
+//! transition to be enabled). `PipelineDeclaration$executionMode` decides what happens to
+//! the one that is waiting: in `SUPERSEDED` — the default — a later execution that reaches
+//! the same boundary supersedes it, `QUEUED` lets them in in the order they arrived, and
+//! `PARALLEL` executions wait for no other one at all. [`super::driver`] applies it.
+//!
 //! # Where the work happens, and why a read may perform it
 //!
 //! Nothing here sleeps and nothing runs in the background: every step carries the
@@ -334,6 +343,16 @@ pub struct StageRun {
     pub declaration_index: usize,
     /// A `StageExecutionStatus` value, or `None` while the stage has not been entered.
     pub status: Option<String>,
+    /// When this execution's ENTRY into the stage becomes due, once something held it at
+    /// that boundary.
+    ///
+    /// An execution that WAITED at a boundary — for the turn of a stage another execution
+    /// holds, or for a disabled transition to be enabled — does not enter the stage at the
+    /// instant it is let in: being let in is itself a clock-owed transition, a span long
+    /// like every other step ([`ACTION_STEP`]), so the stage keeps reporting the run that
+    /// just left it until the next execution really enters. `None` for an execution
+    /// nothing held, which enters as soon as its turn comes.
+    pub entry_due: Option<SystemTime>,
     /// This stage's actions, in declaration order.
     pub actions: Vec<ActionRun>,
 }
@@ -424,6 +443,7 @@ fn plan_stage_at(
         name: stage.name.clone(),
         declaration_index: index,
         status: None,
+        entry_due: None,
         actions: stage
             .actions
             .iter()

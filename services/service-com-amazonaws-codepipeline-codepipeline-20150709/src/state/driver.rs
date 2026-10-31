@@ -21,8 +21,8 @@ use super::execution::{
     ACTION_STEP, CLAIM_TIMEOUT, FAILURE_CONFIGURATION_ERROR, FAILURE_JOB_FAILED,
     MAX_ADVANCE_STEPS, MAX_ARCHIVE_ENTRIES, MAX_EXTRACTED_BYTES, MAX_EXTRACTED_ENTRY_BYTES,
     MAX_SOURCE_BYTES, MAX_SOURCE_FILES,
-    STATUS_FAILED, STATUS_STOPPED, STATUS_STOPPING, STATUS_SUCCEEDED, TRANSITION_INBOUND,
-    TRANSITION_OUTBOUND,
+    STATUS_FAILED, STATUS_STOPPED, STATUS_STOPPING, STATUS_SUCCEEDED, STATUS_SUPERSEDED,
+    TRANSITION_INBOUND, TRANSITION_OUTBOUND,
 };
 use super::rules::{
     ConditionOutcome, CONDITION_TYPE_BEFORE_ENTRY, CONDITION_TYPE_ON_SUCCESS, RESULT_FAIL,
@@ -113,7 +113,14 @@ pub fn plan(
     pipeline_name: &str,
     now: SystemTime,
 ) -> Option<Job> {
-    admit_queued(store, pipeline_name);
+    // An execution a later one has caught up with is superseded before anything moves,
+    // so the stage ahead of them takes the newest one.
+    supersede_waiting(store, pipeline_name, now);
+    // Which execution holds each stage of the pipeline, before anything moves: one stage
+    // runs ONE execution at a time, so this is what decides which execution may enter a
+    // stage next and which of the executions waiting to start may enter the pipeline.
+    let mut claims = stage_claims(store, pipeline_name);
+    admit_queued(store, pipeline_name, &mut claims);
     // The pipelines and the executions are DISJOINT fields of the store, so the
     // declaration an execution runs is borrowed for reading while that execution's
     // record is written — no clone of the declaration is made per step.
@@ -148,6 +155,7 @@ pub fn plan(
             jobs: &mut *jobs,
             rules: &mut *rule_executions,
             disabled: &disabled,
+            claims: &mut claims,
         };
         if let Some(job) = step_execution(record, &mut context, now) {
             return Some(job);
@@ -174,27 +182,136 @@ struct StepContext<'a> {
     rules: &'a mut super::RuleExecutionLog,
     /// The `(stage, StageTransitionType)` pairs a caller has disabled.
     disabled: &'a ::std::collections::BTreeSet<(String, String)>,
+    /// Which execution holds each stage of the pipeline: a stage runs one execution at a
+    /// time, so an execution may enter a stage only where this names it or nobody.
+    claims: &'a mut BTreeMap<String, String>,
 }
 
-/// Let queued executions start, as the pipeline's `executionMode` allows.
+/// Supersede the executions a later one has caught up with.
 ///
-/// `PipelineDeclaration$executionMode` documents the three modes: in `PARALLEL` every
-/// execution runs on its own, while `QUEUED` and `SUPERSEDED` run one execution at a
-/// time and hold the rest.
-fn admit_queued(
+/// `PipelineDeclaration$executionMode` documents `SUPERSEDED` — the default — as the mode
+/// in which a more recent execution supersedes one that has not entered the stage yet. So
+/// at most one execution waits at a stage boundary: the newest that reached it, with the
+/// ones it caught up with moved to the terminal `Superseded` status, whether they were
+/// waiting at the pipeline's first stage or at a boundary further in (behind a disabled
+/// transition, or behind the execution that holds the stage). `QUEUED` keeps every waiting
+/// execution — they enter in the order they arrived — and a `PARALLEL` execution waits for
+/// no other one at all, so neither mode supersedes anything here.
+///
+/// An execution that is RUNNING a stage is not waiting for anything and is never
+/// superseded, and neither is a rollback, which re-runs one stage of an execution that
+/// already ran rather than taking the pipeline's next turn.
+fn supersede_waiting(
     store: &mut ComAmazonawsCodepipelineCodepipeline20150709State,
     pipeline_name: &str,
+    now: SystemTime,
 ) {
     let ids = store
         .executions_by_pipeline
         .get(pipeline_name)
         .cloned()
         .unwrap_or_default();
-    let mut running = ids
-        .iter()
-        .filter_map(|id| store.executions.get(id))
-        .filter(|record| !record.queued && !is_terminal_status(&record.status))
-        .count();
+    // Where each execution is waiting, oldest first.
+    let mut waiting: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for id in &ids {
+        let Some(record) = store.executions.get(id) else {
+            continue;
+        };
+        if record.execution_mode != super::DEFAULT_EXECUTION_MODE
+            || record.execution_type != super::EXECUTION_TYPE_STANDARD
+            || record.status != super::STATUS_IN_PROGRESS
+            || record.stages.iter().any(|run| run.is_in_progress())
+        {
+            continue;
+        }
+        if let Some(run) = record.stages.iter().find(|run| run.status.is_none()) {
+            waiting.entry(run.name.clone()).or_default().push(id.clone());
+        }
+    }
+    for at_boundary in waiting.into_values() {
+        // The newest execution at the boundary is the one that enters the stage.
+        let superseded = at_boundary.len().saturating_sub(1);
+        for id in at_boundary.iter().take(superseded) {
+            if let Some(record) = store.executions.get_mut(id) {
+                record.status = STATUS_SUPERSEDED.to_string();
+                record.status_summary =
+                    Some("superseded by a later execution of the pipeline".to_string());
+                record.last_update_time = now;
+            }
+        }
+    }
+}
+
+/// Which execution of `pipeline_name` holds each of its stages.
+///
+/// CodePipeline runs ONE execution per stage: the execution that entered a stage holds it
+/// until its run of that stage finishes, and the next execution to reach that boundary
+/// waits there — it is held OUT of that one stage, not out of the pipeline, so every
+/// earlier stage of it still runs. An execution occupying no stage holds the boundary it
+/// is waiting at, so the executions enter a stage in the order they reached it; an
+/// execution that has not entered the pipeline at all holds nothing yet, which is what
+/// lets [`admit_queued`] decide whether it may.
+///
+/// `PARALLEL` executions are independent of one another
+/// (`PipelineDeclaration$executionMode`), so one neither holds a stage against another
+/// execution nor waits for one.
+fn stage_claims(
+    store: &ComAmazonawsCodepipelineCodepipeline20150709State,
+    pipeline_name: &str,
+) -> BTreeMap<String, String> {
+    let mut claims: BTreeMap<String, String> = BTreeMap::new();
+    for id in store
+        .executions_by_pipeline
+        .get(pipeline_name)
+        .into_iter()
+        .flatten()
+    {
+        let Some(record) = store.executions.get(id) else {
+            continue;
+        };
+        if record.execution_mode == super::EXECUTION_MODE_PARALLEL
+            || is_terminal_status(&record.status)
+        {
+            continue;
+        }
+        let held = record
+            .stages
+            .iter()
+            .find(|run| run.is_in_progress())
+            .or_else(|| {
+                (!record.queued)
+                    .then(|| record.stages.iter().find(|run| run.status.is_none()))
+                    .flatten()
+            });
+        if let Some(run) = held {
+            // The executions are listed oldest first, so the one that reached the stage
+            // first is the one that holds it.
+            claims.entry(run.name.clone()).or_insert_with(|| id.clone());
+        }
+    }
+    claims
+}
+
+/// Let the executions waiting to enter the pipeline start, as the stage they would enter
+/// allows.
+///
+/// An execution waits only for the STAGE it would enter, never for the whole pipeline to
+/// empty: the stage it starts in takes one execution at a time ([`stage_claims`]), so an
+/// execution waits exactly while another one holds that boundary — whatever is happening
+/// in the stages beyond it, and however long an execution parked there (at a manual
+/// approval, at a custom action's job, at a disabled transition) stays. In `PARALLEL` mode
+/// every execution runs on its own (`PipelineDeclaration$executionMode`), so it waits for
+/// nothing.
+fn admit_queued(
+    store: &mut ComAmazonawsCodepipelineCodepipeline20150709State,
+    pipeline_name: &str,
+    claims: &mut BTreeMap<String, String>,
+) {
+    let ids = store
+        .executions_by_pipeline
+        .get(pipeline_name)
+        .cloned()
+        .unwrap_or_default();
     for id in ids {
         let Some(record) = store.executions.get_mut(&id) else {
             continue;
@@ -202,10 +319,28 @@ fn admit_queued(
         if !record.queued || is_terminal_status(&record.status) {
             continue;
         }
-        let parallel = record.execution_mode == "PARALLEL";
-        if parallel || running == 0 {
+        let parallel = record.execution_mode == super::EXECUTION_MODE_PARALLEL;
+        // The stage this execution would enter first. Its own plan says which that is: a
+        // rollback's plan holds one stage, not the pipeline's first.
+        let entering = record
+            .stages
+            .iter()
+            .find(|run| run.status.is_none())
+            .map(|run| run.name.clone());
+        let Some(entering) = entering else {
+            // A plan with no stage left to enter waits for nothing.
             record.queued = false;
-            running += 1;
+            continue;
+        };
+        if parallel {
+            record.queued = false;
+            continue;
+        }
+        if let std::collections::btree_map::Entry::Vacant(free) = claims.entry(entering) {
+            record.queued = false;
+            // It is now the execution waiting at that boundary, so the next one in the
+            // queue waits behind it rather than beside it.
+            free.insert(id.clone());
         }
     }
 }
@@ -259,13 +394,29 @@ fn step_execution(
             Some(_) if record.stages[index].is_terminal() => return None,
             Some(_) => {}
             None => {
-                // "Disabling the inbound transition" holds an execution OUT of the
-                // stage, so the execution stays InProgress and the stage is not entered.
-                if transition_held(
-                    disabled,
-                    &record.stages[index].name,
-                    TRANSITION_INBOUND,
-                ) {
+                // One stage runs ONE execution at a time: an execution that reaches a
+                // stage another execution is still in waits at that boundary — and
+                // "disabling the inbound transition" holds an execution OUT of the stage
+                // the same way, so the execution stays InProgress and the stage is not
+                // entered.
+                let held = context
+                    .claims
+                    .get(&record.stages[index].name)
+                    .is_some_and(|holder| *holder != record.pipeline_execution_id)
+                    || transition_held(disabled, &record.stages[index].name, TRANSITION_INBOUND);
+                if held {
+                    // Being let in later is a step of its own, so the boundary records
+                    // when the execution may enter once it is released.
+                    record.stages[index].entry_due = Some(now + ACTION_STEP);
+                    return None;
+                }
+                // The release of a boundary that DID hold this execution is that
+                // clock-owed step: until it falls due the stage still reports the run
+                // that left it.
+                if record.stages[index]
+                    .entry_due
+                    .is_some_and(|due| due > now)
+                {
                     return None;
                 }
                 // A stage's ENTRY conditions are evaluated at the instant the
@@ -291,6 +442,10 @@ fn step_execution(
                 }
                 record.stages[index].status = Some(STAGE_IN_PROGRESS.to_string());
                 record.last_update_time = now;
+                context.claims.insert(
+                    record.stages[index].name.clone(),
+                    record.pipeline_execution_id.clone(),
+                );
             }
         }
         return step_stage(record, context, index, now);

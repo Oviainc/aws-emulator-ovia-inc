@@ -43,6 +43,8 @@ mod delete_custom_action_type;
 mod error_message_rules;
 #[path = "all/execution_engine.rs"]
 mod execution_engine;
+#[path = "all/execution_stage_locking.rs"]
+mod execution_stage_locking;
 #[path = "all/pipeline_lifecycle.rs"]
 mod pipeline_lifecycle;
 #[path = "all/pipeline_state.rs"]

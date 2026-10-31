@@ -25,6 +25,11 @@ mod cloudformation_refuses_s3vectors_vector_buckets;
 #[path = "all/ses_raw_send_under_a_shared_domain_identity.rs"]
 mod ses_raw_send_under_a_shared_domain_identity;
 // Declared here, at the head, for the reason the entries below record: the appended tail
+// and the sorted `c…` span (where every codepipeline and cloudformation suite would land)
+// are both regions concurrently landing suites add their line to.
+#[path = "all/codepipeline_execution_controls.rs"]
+mod codepipeline_execution_controls;
+// Declared here, at the head, for the reason the entries below record: the appended tail
 // and the sorted `i…` span are both regions concurrently landing suites add their line to.
 #[path = "all/iam_management_events.rs"]
 mod iam_management_events;
