@@ -33,6 +33,9 @@ pub struct ComAmazonawsLocationLocationserviceState {
     /// Tracker resources by `TrackerName`. A `BTreeMap` so list operations have a
     /// stable, total order to paginate over with a key-based cursor.
     pub trackers: BTreeMap<String, Tracker>,
+    /// Route calculator resources by `CalculatorName`, ordered for the same reason
+    /// as [`Self::trackers`].
+    pub route_calculators: BTreeMap<String, RouteCalculator>,
 }
 
 /// One tracker resource and everything stored under it.
@@ -55,6 +58,22 @@ pub struct Tracker {
     /// Position history per `DeviceId`, kept sorted ascending by `sample_time`, so
     /// the latest position is the last element.
     pub devices: BTreeMap<String, Vec<StoredPosition>>,
+}
+
+/// One route calculator resource.
+#[derive(Debug, Clone)]
+pub struct RouteCalculator {
+    pub name: String,
+    pub arn: String,
+    /// `DescribeRouteCalculator` models `Description` as required, and the member
+    /// is `len 0..1000`, so an unset description is the empty string.
+    pub description: String,
+    /// The data provider the calculator sources traffic and road network data from,
+    /// as the create request spelled it.
+    pub data_source: String,
+    pub tags: BTreeMap<String, String>,
+    pub create_time: EpochMillis,
+    pub update_time: EpochMillis,
 }
 
 /// One stored device position sample.
@@ -104,6 +123,11 @@ pub const MAX_DEVICES_PER_TRACKER: usize = 1_000;
 /// `CreateTracker` refuses past it with the modelled `ServiceQuotaExceededException`
 /// rather than growing the store without limit.
 pub const MAX_TRACKERS: usize = 1_000;
+
+/// Emulator memory bound, NOT an AWS quota: route calculator resources held at
+/// once. `CreateRouteCalculator` refuses past it with the modelled
+/// `ServiceQuotaExceededException` rather than growing the store without limit.
+pub const MAX_ROUTE_CALCULATORS: usize = 1_000;
 
 impl Tracker {
     /// Record `sample` in its device's history, keeping the history sorted ascending
@@ -228,6 +252,56 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// `CreateTrackerResponse$TrackerArn` documents.
 pub fn tracker_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("geo", region, &format!("tracker/{name}"))
+}
+
+/// `arn:aws:geo:<region>:<account>:route-calculator/<name>` — the format
+/// `CreateRouteCalculatorResponse$CalculatorArn` documents.
+pub fn route_calculator_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn("geo", region, &format!("route-calculator/{name}"))
+}
+
+/// The data providers a route calculator can source traffic and road network data
+/// from, spelled exactly as a request must spell them.
+///
+/// Source: the `CreateRouteCalculatorRequest$DataSource` member doc, which lists
+/// `Esri`, `Grab` and `Here` as the valid values and notes that the field is
+/// case-sensitive.
+pub const ROUTE_CALCULATOR_DATA_SOURCES: [&str; 3] = ["Esri", "Grab", "Here"];
+
+/// `Ok` when `data_source` names one of [`ROUTE_CALCULATOR_DATA_SOURCES`], matched
+/// case-sensitively as the member documents, otherwise the sentence the refusal
+/// states.
+///
+/// The sentence follows the form this service states a member requirement in —
+/// the member name as the model spells it, quoted, then what the member has to
+/// satisfy — which is also the form its `fieldList` entry repeats.
+///
+/// The member is a plain `String` in the model rather than an enum, so the request
+/// boundary accepts any text and the provider set is the service's own check.
+pub fn validate_route_calculator_data_source(data_source: &str) -> Result<(), String> {
+    if ROUTE_CALCULATOR_DATA_SOURCES.contains(&data_source) {
+        return Ok(());
+    }
+    Err(format!(
+        "'DataSource' must be one of [{}]",
+        ROUTE_CALCULATOR_DATA_SOURCES.join(", ")
+    ))
+}
+
+/// `Ok` when a request's deprecated `PricingPlan` carries the one value it still
+/// admits, otherwise the sentence the refusal states.
+///
+/// The member doc on every operation that still accepts it: "No longer used. If
+/// included, the only allowed value is `RequestBasedUsage`." The member IS a
+/// modelled enum, so the request boundary already refuses a value outside the
+/// enum; what it cannot refuse is one of the enum's two retired values, which is
+/// this check.
+pub fn validate_deprecated_pricing_plan(pricing_plan: Option<&str>) -> Result<(), String> {
+    match pricing_plan {
+        None => Ok(()),
+        Some(plan) if plan == ALWAYS_PRICING_PLAN => Ok(()),
+        Some(_) => Err(format!("'PricingPlan' must be {ALWAYS_PRICING_PLAN}")),
+    }
 }
 
 /// An opaque pagination cursor: the INCLUSIVE start key of the next page (the key

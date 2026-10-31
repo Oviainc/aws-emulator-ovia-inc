@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRouteCalculator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRouteCalculator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRouteCalculator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the route calculator resource stored under
+//! `CalculatorName` in
+//! [`crate::state::ComAmazonawsLocationLocationserviceState::route_calculators`],
+//! or `ResourceNotFoundException` when the account holds no such resource. This is
+//! the only file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +173,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRouteCalculator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRouteCalculatorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRouteCalculator"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeRouteCalculatorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Amazon Location state store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        let store = state.lock();
+        let calculator = store
+            .route_calculators
+            .get(&input.calculator_name)
+            .ok_or_else(|| {
+                DescribeRouteCalculatorErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Route calculator not found: {}.",
+                            input.calculator_name
+                        ),
+                    },
+                )
+            })?;
+
+        Ok(DescribeRouteCalculatorOutput {
+            calculator_name: calculator.name.clone(),
+            calculator_arn: calculator.arn.clone(),
+            description: calculator.description.clone(),
+            data_source: calculator.data_source.clone(),
+            // `PricingPlan` is documented as fixed: "Always returns
+            // RequestBasedUsage".
+            pricing_plan: Some(crate::state::ALWAYS_PRICING_PLAN.to_string()),
+            tags: if calculator.tags.is_empty() {
+                // An empty tag set is reported as an absent member, not as an
+                // empty map.
+                None
+            } else {
+                Some(
+                    calculator
+                        .tags
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                )
+            },
+            create_time: crate::state::to_date_time(calculator.create_time),
+            update_time: crate::state::to_date_time(calculator.update_time),
+        })
     }
 }
