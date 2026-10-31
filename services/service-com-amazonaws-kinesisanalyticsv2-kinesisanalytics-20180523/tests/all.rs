@@ -25,3 +25,5 @@ mod ops_name_bindings;
 mod sql_input_and_configuration_defaults;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/studio_notebook_catalog.rs"]
+mod studio_notebook_catalog;

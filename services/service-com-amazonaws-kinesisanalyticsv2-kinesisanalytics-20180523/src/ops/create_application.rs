@@ -234,6 +234,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_timestamp();
         let region = crate::state::region_from_headers(&ctx.parts().headers);
 
+        // A Studio notebook's `CatalogConfiguration` names "the configuration parameters
+        // for the default Amazon Glue database" the notebook reads its tables through
+        // (`GlueDataCatalogConfiguration`), so the create RESOLVES that database in the
+        // Glue Data Catalog and is refused when the catalog holds none under the name the
+        // `DatabaseARN` points at. Resolved BEFORE the store's guard is taken, so nothing
+        // is written for a notebook whose catalog does not exist and this handler never
+        // holds two services' store locks at once.
+        if let Some(database_arn) = input
+            .application_configuration
+            .as_ref()
+            .and_then(crate::state::configured_catalog_database_arn)
+        {
+            if let Some(message) =
+                crate::state::catalog_database_refusal(&*self.engine, database_arn)
+            {
+                return Err(CreateApplicationErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
         let mut store = state.lock();
         store.settle_named(&name);
 

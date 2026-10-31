@@ -10,6 +10,12 @@ build = "build.rs"
 engine = { workspace = true }
 # The shared request-claim rule for one endpoint serving several API versions.
 service-common = { path = "../common" }
+# The Glue service, for ONE read: the Data Catalog database a Studio notebook's
+# `GlueDataCatalogConfiguration$DatabaseARN` names, which a create or an update of that
+# notebook has to resolve before it persists anything. The database lives in Glue's own
+# store in the shared engine, so this is a cross-service READ of it rather than a copy of
+# the value the request carried. No cycle: that crate does not depend on this one.
+service-com-amazonaws-glue-awsglue = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

@@ -4,14 +4,17 @@
 //!
 //! The store is the single source of truth for every response this service computes:
 //! `CreateApplication` writes an [`Application`] here, and `DescribeApplication`,
-//! `ListApplications`, `StartApplication`, `StopApplication` and `DeleteApplication`
-//! all read or mutate THIS struct — nothing is echoed from a request or canned.
-//! `CreateApplicationSnapshot` writes a [`Snapshot`] onto the application it names and
-//! `DescribeApplicationSnapshot` reads it back from there.
+//! `ListApplications`, `StartApplication`, `StopApplication`, `UpdateApplication` and
+//! `DeleteApplication` all read or mutate THIS struct — nothing is echoed from a request
+//! or canned. `CreateApplicationSnapshot` writes a [`Snapshot`] onto the application it
+//! names and `DescribeApplicationSnapshot` reads it back from there.
 //!
 //! Beside the records themselves this module owns the two projections every reader
-//! needs ([`Application::detail`], [`Application::summary`]) and the clock-owed status
-//! settlement ([`ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State::settle`]),
+//! needs ([`Application::detail`], [`Application::summary`]), the merge an update applies
+//! to a stored configuration ([`Application::apply_configuration_update`]), the
+//! resolution of a Studio notebook's catalog against the Glue Data Catalog
+//! ([`catalog_database_refusal`]) and the clock-owed status settlement
+//! ([`ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State::settle`]),
 //! so an operation handler never re-derives them.
 
 use std::collections::BTreeMap;
@@ -21,23 +24,26 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     ApplicationCodeConfigurationDescription, ApplicationConfiguration,
-    ApplicationConfigurationDescription, ApplicationDetail,
+    ApplicationConfigurationDescription, ApplicationConfigurationUpdate, ApplicationDetail,
     ApplicationEncryptionConfigurationDescription, ApplicationSnapshotConfigurationDescription,
     ApplicationSummary, ApplicationSystemRollbackConfigurationDescription,
     CatalogConfigurationDescription, CheckpointConfigurationDescription, CodeContentDescription,
     CustomArtifactConfigurationDescription, DeployAsApplicationConfigurationDescription,
     EnvironmentPropertyDescriptions, FlinkApplicationConfigurationDescription,
-    GlueDataCatalogConfigurationDescription, Input, InputDescription,
+    GlueDataCatalogConfigurationDescription, Input, InputDescription, InputParallelism,
     InputProcessingConfigurationDescription, InputLambdaProcessorDescription,
     KinesisFirehoseInputDescription, KinesisFirehoseOutputDescription,
     KinesisStreamsInputDescription, KinesisStreamsOutputDescription, LambdaOutputDescription,
     MonitoringConfigurationDescription, OutputDescription, ParallelismConfigurationDescription,
-    ReferenceDataSourceDescription, S3ApplicationCodeLocationDescription,
-    S3ContentBaseLocationDescription, S3ReferenceDataSourceDescription, SnapshotDetails,
-    SqlApplicationConfigurationDescription, VpcConfigurationDescription,
-    ZeppelinApplicationConfigurationDescription, ZeppelinMonitoringConfigurationDescription,
+    ReferenceDataSourceDescription, RunConfigurationDescription, RunConfigurationUpdate,
+    S3ApplicationCodeLocationDescription, S3ContentBaseLocationDescription,
+    S3ReferenceDataSourceDescription, SnapshotDetails, SqlApplicationConfigurationDescription,
+    VpcConfigurationDescription, ZeppelinApplicationConfigurationDescription,
+    ZeppelinMonitoringConfigurationDescription,
 };
-use crate::ops::types::{CloudWatchLoggingOption, CloudWatchLoggingOptionDescription};
+use crate::ops::types::{
+    CloudWatchLoggingOption, CloudWatchLoggingOptionDescription, CloudWatchLoggingOptionUpdate,
+};
 
 /// `ApplicationStatus` values this slice drives, spelled exactly as the model's
 /// `ApplicationStatus` enum does (`smithy_query(query="shape",shape="ApplicationStatus")`).
@@ -45,6 +51,7 @@ pub const STATUS_READY: &str = "READY";
 pub const STATUS_STARTING: &str = "STARTING";
 pub const STATUS_RUNNING: &str = "RUNNING";
 pub const STATUS_STOPPING: &str = "STOPPING";
+pub const STATUS_UPDATING: &str = "UPDATING";
 
 /// `OperationStatus` values, from the model's `OperationStatus` enum.
 pub const OPERATION_IN_PROGRESS: &str = "IN_PROGRESS";
@@ -158,7 +165,8 @@ pub struct Application {
     pub pending: Option<PendingTransition>,
     pub version_id: i64,
     /// The version this application was on before the latest configuration update, while
-    /// one has landed: `ApplicationVersionUpdatedFrom`.
+    /// one has landed: `ApplicationVersionUpdatedFrom`. `None` for an application still on
+    /// the version its create wrote.
     pub version_updated_from: Option<i64>,
     pub create_timestamp: DateTime,
     /// When the current application version was created; equal to `create_timestamp`
@@ -271,6 +279,448 @@ impl Application {
             application_mode: self.application_mode.clone(),
         }
     }
+
+    /// The `DatabaseARN` of the Glue Data Catalog database this application's stored
+    /// Studio-notebook configuration points at, or `None` for one configured with no
+    /// catalog at all.
+    ///
+    /// Read off the STORED description, so what a later call resolves is the catalog the
+    /// create or the last accepted update persisted rather than a value a request carried.
+    pub fn catalog_database_arn(&self) -> Option<&str> {
+        self.configuration
+            .as_ref()
+            .and_then(|cfg| cfg.zeppelin_application_configuration_description.as_ref())
+            .and_then(|zeppelin| zeppelin.catalog_configuration_description.as_ref())
+            .map(|catalog| {
+                catalog
+                    .glue_data_catalog_configuration_description
+                    .database_arn
+                    .as_str()
+            })
+    }
+
+    /// Apply an `ApplicationConfigurationUpdate` to this application's stored
+    /// configuration description.
+    ///
+    /// Every `…Update` member REPLACES the one value it names and leaves the rest of the
+    /// stored description as it stands, which is what makes a configuration-only update
+    /// of one member (a log level, say) not a reset of the others. An update that names
+    /// an element by id — an input, an output, a reference data source, a VPC
+    /// configuration — the application holds no such element under is refused instead of
+    /// silently doing nothing: `Err` carries that refusal's sentence.
+    ///
+    /// The merged description is then completed the same way a create's is
+    /// ([`complete_with_service_defaults`]), so one rule decides what an application RUNS
+    /// under however its configuration was written: a sub-configuration left or put back
+    /// at `DEFAULT` reports the service's values, and only a `CUSTOM` one reports the
+    /// caller's.
+    pub fn apply_configuration_update(
+        &mut self,
+        update: &ApplicationConfigurationUpdate,
+    ) -> Result<(), String> {
+        let name = self.name.clone();
+        let runtime_environment = self.runtime_environment.clone();
+        let cfg = self.configuration.get_or_insert_with(Default::default);
+
+        if let Some(code) = update.application_code_configuration_update.as_ref() {
+            let stored = cfg
+                .application_code_configuration_description
+                .get_or_insert_with(Default::default);
+            if let Some(content_type) = code.code_content_type_update.clone() {
+                stored.code_content_type = content_type;
+            }
+            if let Some(content) = code.code_content_update.as_ref() {
+                let described = stored
+                    .code_content_description
+                    .get_or_insert_with(Default::default);
+                if let Some(text) = content.text_content_update.clone() {
+                    described.code_size = Some(text.len() as i64);
+                    described.text_content = Some(text);
+                }
+                if let Some(zip) = content.zip_file_content_update.as_ref() {
+                    // AWS does not echo uploaded bytes back, so a zip is described by
+                    // its size, exactly as a create describes one.
+                    described.code_size = Some(zip.len() as i64);
+                    described.text_content = None;
+                }
+                if let Some(s3) = content.s3_content_location_update.as_ref() {
+                    let location = described
+                        .s3_application_code_location_description
+                        .get_or_insert_with(Default::default);
+                    if let Some(bucket) = s3.bucket_arn_update.clone() {
+                        location.bucket_arn = bucket;
+                    }
+                    if let Some(key) = s3.file_key_update.clone() {
+                        location.file_key = key;
+                    }
+                    if let Some(version) = s3.object_version_update.clone() {
+                        location.object_version = Some(version);
+                    }
+                }
+            }
+        }
+
+        if let Some(flink) = update.flink_application_configuration_update.as_ref() {
+            let stored = cfg
+                .flink_application_configuration_description
+                .get_or_insert_with(Default::default);
+            if let Some(checkpoint) = flink.checkpoint_configuration_update.as_ref() {
+                let described = stored
+                    .checkpoint_configuration_description
+                    .get_or_insert_with(Default::default);
+                if let Some(kind) = checkpoint.configuration_type_update.clone() {
+                    described.configuration_type = Some(kind);
+                }
+                if let Some(enabled) = checkpoint.checkpointing_enabled_update {
+                    described.checkpointing_enabled = Some(enabled);
+                }
+                if let Some(interval) = checkpoint.checkpoint_interval_update {
+                    described.checkpoint_interval = Some(interval);
+                }
+                if let Some(pause) = checkpoint.min_pause_between_checkpoints_update {
+                    described.min_pause_between_checkpoints = Some(pause);
+                }
+            }
+            if let Some(monitoring) = flink.monitoring_configuration_update.as_ref() {
+                let described = stored
+                    .monitoring_configuration_description
+                    .get_or_insert_with(Default::default);
+                if let Some(kind) = monitoring.configuration_type_update.clone() {
+                    described.configuration_type = Some(kind);
+                }
+                if let Some(level) = monitoring.metrics_level_update.clone() {
+                    described.metrics_level = Some(level);
+                }
+                if let Some(level) = monitoring.log_level_update.clone() {
+                    described.log_level = Some(level);
+                }
+            }
+            if let Some(parallelism) = flink.parallelism_configuration_update.as_ref() {
+                let described = stored
+                    .parallelism_configuration_description
+                    .get_or_insert_with(Default::default);
+                if let Some(kind) = parallelism.configuration_type_update.clone() {
+                    described.configuration_type = Some(kind);
+                }
+                if let Some(count) = parallelism.parallelism_update {
+                    described.parallelism = Some(count);
+                    // The parallelism in force right now follows the configured one:
+                    // autoscaling, which is what else would move it, is not modelled.
+                    described.current_parallelism = Some(count);
+                }
+                if let Some(per_kpu) = parallelism.parallelism_per_kpu_update {
+                    described.parallelism_per_kpu = Some(per_kpu);
+                }
+                if let Some(enabled) = parallelism.auto_scaling_enabled_update {
+                    described.auto_scaling_enabled = Some(enabled);
+                }
+            }
+        }
+
+        if let Some(environment) = update.environment_property_updates.as_ref() {
+            cfg.environment_property_descriptions = Some(EnvironmentPropertyDescriptions {
+                property_group_descriptions: Some(environment.property_groups.clone()),
+            });
+        }
+
+        if let Some(snapshots) = update.application_snapshot_configuration_update.as_ref() {
+            cfg.application_snapshot_configuration_description =
+                Some(ApplicationSnapshotConfigurationDescription {
+                    snapshots_enabled: snapshots.snapshots_enabled_update,
+                });
+        }
+
+        if let Some(rollback) = update
+            .application_system_rollback_configuration_update
+            .as_ref()
+        {
+            cfg.application_system_rollback_configuration_description =
+                Some(ApplicationSystemRollbackConfigurationDescription {
+                    rollback_enabled: rollback.rollback_enabled_update,
+                });
+        }
+
+        for vpc in update.vpc_configuration_updates.iter().flatten() {
+            let described = cfg
+                .vpc_configuration_descriptions
+                .iter_mut()
+                .flatten()
+                .find(|described| described.vpc_configuration_id == vpc.vpc_configuration_id)
+                .ok_or_else(|| {
+                    missing_update_target_message(
+                        "VPC configuration",
+                        &vpc.vpc_configuration_id,
+                        &name,
+                    )
+                })?;
+            if let Some(subnets) = vpc.subnet_id_updates.clone() {
+                // The VPC a set of subnets belongs to is derived from the subnets, so it
+                // follows them when they change.
+                described.vpc_id = vpc_id_for(&subnets);
+                described.subnet_ids = subnets;
+            }
+            if let Some(groups) = vpc.security_group_id_updates.clone() {
+                described.security_group_ids = groups;
+            }
+        }
+
+        if let Some(zeppelin) = update.zeppelin_application_configuration_update.as_ref() {
+            let stored = cfg
+                .zeppelin_application_configuration_description
+                .get_or_insert_with(|| ZeppelinApplicationConfigurationDescription {
+                    // A description this update brings into existence still reports the
+                    // verbosity in force, which for a notebook that has configured no
+                    // monitoring is the service default.
+                    monitoring_configuration_description:
+                        ZeppelinMonitoringConfigurationDescription {
+                            log_level: Some(DEFAULT_LOG_LEVEL.to_string()),
+                        },
+                    ..Default::default()
+                });
+            if let Some(monitoring) = zeppelin.monitoring_configuration_update.as_ref() {
+                stored.monitoring_configuration_description.log_level =
+                    Some(monitoring.log_level_update.clone());
+            }
+            if let Some(catalog) = zeppelin.catalog_configuration_update.as_ref() {
+                stored.catalog_configuration_description = Some(CatalogConfigurationDescription {
+                    glue_data_catalog_configuration_description:
+                        GlueDataCatalogConfigurationDescription {
+                            database_arn: catalog
+                                .glue_data_catalog_configuration_update
+                                .database_arn_update
+                                .clone(),
+                        },
+                });
+            }
+            if let Some(deploy) = zeppelin.deploy_as_application_configuration_update.as_ref() {
+                let described = stored
+                    .deploy_as_application_configuration_description
+                    .get_or_insert_with(Default::default);
+                if let Some(s3) = deploy.s3_content_location_update.as_ref() {
+                    if let Some(bucket) = s3.bucket_arn_update.clone() {
+                        described.s3_content_location_description.bucket_arn = bucket;
+                    }
+                    if let Some(path) = s3.base_path_update.clone() {
+                        described.s3_content_location_description.base_path = Some(path);
+                    }
+                }
+            }
+            if let Some(artifacts) = zeppelin.custom_artifacts_configuration_update.as_ref() {
+                stored.custom_artifacts_configuration_description = Some(
+                    artifacts
+                        .iter()
+                        .map(|artifact| CustomArtifactConfigurationDescription {
+                            artifact_type: Some(artifact.artifact_type.clone()),
+                            s3_content_location_description: artifact.s3_content_location.clone(),
+                            maven_reference_description: artifact.maven_reference.clone(),
+                        })
+                        .collect(),
+                );
+            }
+        }
+
+        if let Some(encryption) = update.application_encryption_configuration_update.as_ref() {
+            let described = cfg
+                .application_encryption_configuration_description
+                .get_or_insert_with(Default::default);
+            if let Some(key) = encryption.key_id_update.clone() {
+                described.key_id = Some(key);
+            }
+            described.key_type = encryption.key_type_update.clone();
+        }
+
+        if let Some(sql) = update.sql_application_configuration_update.as_ref() {
+            let stored = cfg
+                .sql_application_configuration_description
+                .get_or_insert_with(Default::default);
+            for input in sql.input_updates.iter().flatten() {
+                let described = stored
+                    .input_descriptions
+                    .iter_mut()
+                    .flatten()
+                    .find(|described| described.input_id.as_deref() == Some(&input.input_id))
+                    .ok_or_else(|| {
+                        missing_update_target_message("Input", &input.input_id, &name)
+                    })?;
+                if let Some(prefix) = input.name_prefix_update.clone() {
+                    described.name_prefix = Some(prefix);
+                }
+                if let Some(parallelism) = input.input_parallelism_update.as_ref() {
+                    described.input_parallelism = Some(InputParallelism {
+                        count: Some(parallelism.count_update),
+                    });
+                }
+                // The in-app stream names are one per unit of input parallelism, named
+                // after the prefix, so they follow both wherever either moves.
+                described.in_app_stream_names = described.name_prefix.as_deref().and_then(|prefix| {
+                    in_app_stream_names(
+                        prefix,
+                        described
+                            .input_parallelism
+                            .as_ref()
+                            .and_then(|parallelism| parallelism.count)
+                            .unwrap_or(1),
+                    )
+                });
+                if let Some(processing) = input.input_processing_configuration_update.as_ref() {
+                    described.input_processing_configuration_description =
+                        Some(InputProcessingConfigurationDescription {
+                            input_lambda_processor_description: Some(
+                                InputLambdaProcessorDescription {
+                                    resource_arn: processing
+                                        .input_lambda_processor_update
+                                        .resource_arn_update
+                                        .clone(),
+                                    role_arn: None,
+                                },
+                            ),
+                        });
+                }
+                if let Some(kinesis) = input.kinesis_streams_input_update.as_ref() {
+                    described.kinesis_streams_input_description =
+                        Some(KinesisStreamsInputDescription {
+                            resource_arn: kinesis.resource_arn_update.clone(),
+                            role_arn: None,
+                        });
+                }
+                if let Some(firehose) = input.kinesis_firehose_input_update.as_ref() {
+                    described.kinesis_firehose_input_description =
+                        Some(KinesisFirehoseInputDescription {
+                            resource_arn: firehose.resource_arn_update.clone(),
+                            role_arn: None,
+                        });
+                }
+                if let Some(schema) = input.input_schema_update.as_ref() {
+                    let described = described.input_schema.get_or_insert_with(Default::default);
+                    if let Some(format) = schema.record_format_update.clone() {
+                        described.record_format = format;
+                    }
+                    if let Some(encoding) = schema.record_encoding_update.clone() {
+                        described.record_encoding = Some(encoding);
+                    }
+                    if let Some(columns) = schema.record_column_updates.clone() {
+                        described.record_columns = columns;
+                    }
+                }
+            }
+            for output in sql.output_updates.iter().flatten() {
+                let described = stored
+                    .output_descriptions
+                    .iter_mut()
+                    .flatten()
+                    .find(|described| described.output_id.as_deref() == Some(&output.output_id))
+                    .ok_or_else(|| {
+                        missing_update_target_message("Output", &output.output_id, &name)
+                    })?;
+                if let Some(stream) = output.name_update.clone() {
+                    described.name = Some(stream);
+                }
+                if let Some(kinesis) = output.kinesis_streams_output_update.as_ref() {
+                    described.kinesis_streams_output_description =
+                        Some(KinesisStreamsOutputDescription {
+                            resource_arn: kinesis.resource_arn_update.clone(),
+                            role_arn: None,
+                        });
+                }
+                if let Some(firehose) = output.kinesis_firehose_output_update.as_ref() {
+                    described.kinesis_firehose_output_description =
+                        Some(KinesisFirehoseOutputDescription {
+                            resource_arn: firehose.resource_arn_update.clone(),
+                            role_arn: None,
+                        });
+                }
+                if let Some(lambda) = output.lambda_output_update.as_ref() {
+                    described.lambda_output_description = Some(LambdaOutputDescription {
+                        resource_arn: lambda.resource_arn_update.clone(),
+                        role_arn: None,
+                    });
+                }
+                if let Some(schema) = output.destination_schema_update.clone() {
+                    described.destination_schema = Some(schema);
+                }
+            }
+            for reference in sql.reference_data_source_updates.iter().flatten() {
+                let described = stored
+                    .reference_data_source_descriptions
+                    .iter_mut()
+                    .flatten()
+                    .find(|described| described.reference_id == reference.reference_id)
+                    .ok_or_else(|| {
+                        missing_update_target_message(
+                            "Reference data source",
+                            &reference.reference_id,
+                            &name,
+                        )
+                    })?;
+                if let Some(table) = reference.table_name_update.clone() {
+                    described.table_name = table;
+                }
+                if let Some(s3) = reference.s3_reference_data_source_update.as_ref() {
+                    if let Some(bucket) = s3.bucket_arn_update.clone() {
+                        described.s3_reference_data_source_description.bucket_arn = bucket;
+                    }
+                    if let Some(key) = s3.file_key_update.clone() {
+                        described.s3_reference_data_source_description.file_key = key;
+                    }
+                }
+                if let Some(schema) = reference.reference_schema_update.clone() {
+                    described.reference_schema = Some(schema);
+                }
+            }
+        }
+
+        complete_with_service_defaults(cfg, &runtime_environment);
+        Ok(())
+    }
+
+    /// Apply the `CloudWatchLoggingOptionUpdates` of one update request.
+    ///
+    /// "You can only update existing CloudWatch logging options with this action" — the
+    /// `UpdateApplication$CloudWatchLoggingOptionUpdates` doc — so an update naming an
+    /// id this application holds no logging option under is refused, with the sentence
+    /// `Err` carries.
+    pub fn apply_logging_option_updates(
+        &mut self,
+        updates: &[CloudWatchLoggingOptionUpdate],
+    ) -> Result<(), String> {
+        let name = self.name.clone();
+        for update in updates {
+            let described = self
+                .cloud_watch_logging_options
+                .iter_mut()
+                .find(|described| {
+                    described.cloud_watch_logging_option_id.as_deref()
+                        == Some(&update.cloud_watch_logging_option_id)
+                })
+                .ok_or_else(|| {
+                    missing_update_target_message(
+                        "CloudWatch logging option",
+                        &update.cloud_watch_logging_option_id,
+                        &name,
+                    )
+                })?;
+            if let Some(arn) = update.log_stream_arn_update.clone() {
+                described.log_stream_arn = arn;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a `RunConfigurationUpdate`: the parameters the application's next run
+    /// starts with, which `DescribeApplication` reports back as its
+    /// `RunConfigurationDescription`.
+    pub fn apply_run_configuration_update(&mut self, update: &RunConfigurationUpdate) {
+        let cfg = self.configuration.get_or_insert_with(Default::default);
+        let described = cfg
+            .run_configuration_description
+            .get_or_insert_with(RunConfigurationDescription::default);
+        if let Some(flink) = update.flink_run_configuration.clone() {
+            described.flink_run_configuration_description = Some(flink);
+        }
+        if let Some(restore) = update.application_restore_configuration.clone() {
+            described.application_restore_configuration_description = Some(restore);
+        }
+    }
 }
 
 /// The ceiling on how many applications this store holds, and on how many operation
@@ -356,14 +806,38 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
     /// log is capped at [`MAX_OPERATIONS_PER_APPLICATION`] and trimmed oldest-first, so
     /// repeated Start/Stop calls cannot grow one application's record without limit.
     pub fn record_operation(&mut self, name: &str, operation: &str, now: DateTime) -> String {
+        self.push_operation(name, operation, OPERATION_IN_PROGRESS, now, None)
+    }
+
+    /// Record an operation on `name` that is ALREADY complete: one whose whole effect
+    /// landed inside the call that made it, so the clock owes it nothing and a reader must
+    /// never see it outstanding.
+    pub fn record_completed_operation(
+        &mut self,
+        name: &str,
+        operation: &str,
+        now: DateTime,
+    ) -> String {
+        self.push_operation(name, operation, OPERATION_SUCCESSFUL, now, Some(now))
+    }
+
+    /// Append one operation record to `name`'s log and answer its `OperationId`.
+    fn push_operation(
+        &mut self,
+        name: &str,
+        operation: &str,
+        status: &str,
+        start_time: DateTime,
+        end_time: Option<DateTime>,
+    ) -> String {
         let operation_id = self.mint_id(operation);
         if let Some(app) = self.applications.get_mut(name) {
             app.operations.push(AppOperation {
                 operation_id: operation_id.clone(),
                 operation: operation.to_string(),
-                status: OPERATION_IN_PROGRESS.to_string(),
-                start_time: now,
-                end_time: None,
+                status: status.to_string(),
+                start_time,
+                end_time,
             });
             if app.operations.len() > MAX_OPERATIONS_PER_APPLICATION {
                 let excess = app.operations.len() - MAX_OPERATIONS_PER_APPLICATION;
@@ -722,7 +1196,16 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
                 .as_ref()
                 .map(|z| ZeppelinApplicationConfigurationDescription {
                     monitoring_configuration_description: ZeppelinMonitoringConfigurationDescription {
-                        log_level: z.monitoring_configuration.as_ref().map(|m| m.log_level.clone()),
+                        // The verbosity the notebook's CloudWatch Logs are written at.
+                        // `ZeppelinApplicationConfigurationDescription` declares this
+                        // description REQUIRED, so it reports the level in force — the
+                        // one the create configured, else the service default — rather
+                        // than nothing at all for a notebook that configured no
+                        // monitoring.
+                        log_level: Some(z.monitoring_configuration.as_ref().map_or_else(
+                            || DEFAULT_LOG_LEVEL.to_string(),
+                            |m| m.log_level.clone(),
+                        )),
                     },
                     catalog_configuration_description: z.catalog_configuration.as_ref().map(|c| {
                         CatalogConfigurationDescription {
@@ -1059,6 +1542,99 @@ pub fn missing_snapshot_message(snapshot: &str, application: &str) -> String {
 /// create one.
 pub fn existing_snapshot_message(snapshot: &str, application: &str) -> String {
     snapshot_message(snapshot, "already exists", application)
+}
+
+/// How this service words an update that names an element of an application's
+/// configuration — an input, an output, a reference data source, a VPC configuration, a
+/// CloudWatch logging option — by an id the application holds no such element under.
+///
+/// `kind` names the element as the API spells it, so every update that resolves one by id
+/// reports a miss the same way.
+pub fn missing_update_target_message(kind: &str, id: &str, application: &str) -> String {
+    format!("{kind} '{id}' does not exist for application {application}.")
+}
+
+/// How the service words a Studio notebook's catalog reference that the Glue Data Catalog
+/// holds no database for: the database the request's `DatabaseARN` names, quoted, and the
+/// catalog it was looked for in.
+pub fn missing_catalog_database_message(database: &str) -> String {
+    format!("Cannot find database with name '{database}' in Glue Data Catalog")
+}
+
+/// How the service words a `DatabaseARN` that is not the ARN of a Glue Data Catalog
+/// database at all — a value that names no database for the notebook to read, as opposed
+/// to one naming a database the catalog does not hold
+/// ([`missing_catalog_database_message`]). The value the request carried is the sentence's
+/// only variable part.
+pub fn invalid_catalog_database_arn_message(database_arn: &str) -> String {
+    format!("The DatabaseARN '{database_arn}' is not the ARN of a Glue Data Catalog database")
+}
+
+/// The `arnNamespace` of the service whose resource a `DatabaseARN` names, and the type of
+/// resource it has to name: a Glue database, written
+/// `arn:aws:glue:<region>:<account>:database/<name>`.
+const GLUE_ARN_NAMESPACE: &str = "glue";
+const GLUE_DATABASE_RESOURCE_TYPE: &str = "database";
+
+/// The Data Catalog and the database name a `GlueDataCatalogConfiguration$DatabaseARN`
+/// points at, or `None` when the value is not the ARN of a Glue database.
+///
+/// A Glue database ARN carries the catalog it lives in as its ACCOUNT field (Glue keys a
+/// Data Catalog by the account id, which is what its own operations default `CatalogId`
+/// to) and the database as the ID of a `database` resource. Read through the shared ARN
+/// parse, so this service reads a caller-supplied ARN exactly as every other one does
+/// rather than splitting the value again.
+fn glue_database_reference(database_arn: &str) -> Option<(String, String)> {
+    let arn = ::service_common::arn::parse(database_arn)?;
+    if arn.vendor != GLUE_ARN_NAMESPACE {
+        return None;
+    }
+    let database =
+        ::service_common::arn::resource_id_of_type(database_arn, GLUE_DATABASE_RESOURCE_TYPE)?;
+    if database.is_empty() {
+        return None;
+    }
+    let catalog_id = if arn.account.is_empty() {
+        ::engine::emulator_account_id()
+    } else {
+        arn.account
+    };
+    Some((catalog_id.to_string(), database.to_string()))
+}
+
+/// The refusal a Studio notebook's catalog configuration earns when the `DatabaseARN` it
+/// names is not a Glue database ARN, or the Glue Data Catalog holds no database under the
+/// name it points at — `None` when that database resolves.
+///
+/// Read from the Glue service's OWN store through the one shared engine, so the answer is
+/// LIVE: the same ARN resolves once `CreateDatabase` has written the database and stops
+/// resolving once `DeleteDatabase` has dropped it, and the name is folded exactly as
+/// Glue's own `GetDatabase` folds it (the catalog keys a database by its folded name).
+/// It takes the Glue store's lock and holds no other while it does, so it is called with
+/// NO guard of this service's store held.
+///
+/// `None` when that store is unreachable (the engine is not the shared in-memory one): an
+/// emulator with no Glue to ask shows nothing about the database, and refusing on that
+/// would refuse every notebook. A value that is no database ARN needs nothing asked.
+pub fn catalog_database_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    database_arn: &str,
+) -> Option<String> {
+    let Some((catalog_id, database)) = glue_database_reference(database_arn) else {
+        return Some(invalid_catalog_database_arn_message(database_arn));
+    };
+    let state = ::service_com_amazonaws_glue_awsglue::state::service_state(engine)?;
+    let held = state.lock().database(&catalog_id, &database).is_some();
+    (!held).then(|| missing_catalog_database_message(&database))
+}
+
+/// The `DatabaseARN` a configuration supplied to a create points its Studio notebook at,
+/// or `None` when it configures no catalog.
+pub fn configured_catalog_database_arn(cfg: &ApplicationConfiguration) -> Option<&str> {
+    cfg.zeppelin_application_configuration
+        .as_ref()
+        .and_then(|zeppelin| zeppelin.catalog_configuration.as_ref())
+        .map(|catalog| catalog.glue_data_catalog_configuration.database_arn.as_str())
 }
 
 /// The region every ARN this service mints carries: the one the caller signed for.

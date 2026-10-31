@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: applies the updates a request carries to the stored application, mints the
+//! next `ApplicationVersionId` and answers with the stored `ApplicationDetail`. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +181,258 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApplication"))
+        // Every modelled constraint on the input — `ApplicationName`'s length and
+        // pattern, `CurrentApplicationVersionId`'s 1..999999999 range,
+        // `ConditionalToken`'s pattern, the enum value sets of every `…Update` member —
+        // is refused at the boundary with HTTP 400 before this handler runs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateApplicationErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "this service is not mounted on a stateful engine, so no \
+                         application can be updated"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.application_name.clone();
+        let now = crate::state::now_timestamp();
+
+        // What this update has to decide against, read under the store's guard and the
+        // guard RELEASED before the Glue Data Catalog is asked anything: no two services'
+        // store locks are ever held at once.
+        let (status, version_id, stored_token, stored_catalog_arn) = {
+            let mut store = state.lock();
+            store.settle_named(&name);
+            let Some(application) = store.applications.get(&name) else {
+                return Err(UpdateApplicationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_application_message(&name)),
+                    },
+                )
+                .into());
+            };
+            (
+                application.status.clone(),
+                application.version_id,
+                application.conditional_token.clone(),
+                application.catalog_database_arn().map(str::to_string),
+            )
+        };
+
+        // "You must provide the CurrentApplicationVersionId or the ConditionalToken"
+        // (both members' docs): the update is made against a NAMED version of the
+        // application, and whichever of the two the caller names has to be the version in
+        // force — otherwise something else has modified the application since the caller
+        // read it, which is what the modelled `ConcurrentModificationException` (HTTP 409)
+        // reports.
+        match (
+            input.current_application_version_id,
+            input.conditional_token.as_deref(),
+        ) {
+            (None, None) => {
+                return Err(UpdateApplicationErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(VERSION_OR_TOKEN_REQUIRED.to_string()),
+                    },
+                )
+                .into())
+            }
+            (Some(supplied), _) if supplied != version_id => {
+                return Err(
+                    UpdateApplicationErrorModeled::ConcurrentModificationException(
+                        ConcurrentModificationException {
+                            message: Some(stale_version_message(VERSION_ID_MEMBER)),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            (_, Some(token)) if Some(token) != stored_token.as_deref() => {
+                return Err(
+                    UpdateApplicationErrorModeled::ConcurrentModificationException(
+                        ConcurrentModificationException {
+                            message: Some(stale_version_message(CONDITIONAL_TOKEN_MEMBER)),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            _ => {}
+        }
+
+        // An application in the middle of another lifecycle action is not available for
+        // this one: the settled statuses this service drives an application through are
+        // READY and RUNNING, and a transient one (STARTING, STOPPING, an update still
+        // settling) means a change is already outstanding. Worded as this crate already
+        // words the same refusal for the same class (`crate::ops::start_application`:
+        // "Application {name} cannot be started while it is in the {status} state"), so
+        // two operations refusing an application in use do not report it differently.
+        if status != crate::state::STATUS_READY && status != crate::state::STATUS_RUNNING {
+            return Err(UpdateApplicationErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "Application {name} cannot be updated while it is in the \
+                         {status} state"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The Glue Data Catalog database the notebook will read its tables through once
+        // this update lands: the one the update asks for, else the one already stored. It
+        // is RESOLVED the same way a create resolves it, so an update of a notebook whose
+        // database has since been dropped is refused — and refused before anything is
+        // written, so the version, the configuration and the log level all stay as they
+        // were until the database exists again.
+        let catalog_database_arn = input
+            .application_configuration_update
+            .as_ref()
+            .and_then(|update| update.zeppelin_application_configuration_update.as_ref())
+            .and_then(|zeppelin| zeppelin.catalog_configuration_update.as_ref())
+            .map(|catalog| {
+                catalog
+                    .glue_data_catalog_configuration_update
+                    .database_arn_update
+                    .clone()
+            })
+            .or(stored_catalog_arn);
+        if let Some(database_arn) = catalog_database_arn.as_deref() {
+            if let Some(message) =
+                crate::state::catalog_database_refusal(&*self.engine, database_arn)
+            {
+                return Err(UpdateApplicationErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        // The preconditions are re-checked under THIS guard, the one the write happens
+        // under: the catalog resolution above released the first one, so between them
+        // another update could have landed — and two updates naming the same version must
+        // not both be accepted.
+        let Some(application) = store.applications.get(&name) else {
+            return Err(UpdateApplicationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::missing_application_message(&name)),
+                },
+            )
+            .into());
+        };
+        if application.version_id != version_id || application.conditional_token != stored_token {
+            return Err(
+                UpdateApplicationErrorModeled::ConcurrentModificationException(
+                    ConcurrentModificationException {
+                        message: Some(stale_version_message(VERSION_ID_MEMBER)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every update is applied to a COPY of the stored application and the copy stored
+        // only once all of them have landed, so an update that names an element the
+        // application does not hold leaves the stored record exactly as it was rather
+        // than half-updated.
+        let mut updated = application.clone();
+        if let Some(role) = input.service_execution_role_update.clone() {
+            updated.service_execution_role = role;
+        }
+        // Applied before the configuration update, because which configuration the
+        // application runs under depends on the runtime it runs on.
+        if let Some(runtime) = input.runtime_environment_update.clone() {
+            updated.runtime_environment = runtime;
+        }
+        if let Some(update) = input.application_configuration_update.as_ref() {
+            updated
+                .apply_configuration_update(update)
+                .map_err(invalid_argument)?;
+        }
+        if let Some(updates) = input.cloud_watch_logging_option_updates.as_deref() {
+            updated
+                .apply_logging_option_updates(updates)
+                .map_err(invalid_argument)?;
+        }
+        if let Some(update) = input.run_configuration_update.as_ref() {
+            updated.apply_run_configuration_update(update);
+        }
+        store.applications.insert(name.clone(), updated);
+        // "Managed Service for Apache Flink updates the ApplicationVersionId each time you
+        // update your application": the version advance, the version's create timestamp
+        // and the fresh `ConditionalToken` are the one the whole crate shares.
+        store.advance_version(&name, now);
+
+        // A RUNNING application has to restart its job under the new configuration before
+        // the update is in force, so it reports `UPDATING` until the clock makes that due
+        // and the operation record stays outstanding until then. An application that is
+        // not running has no job to restart: its update is complete when this call
+        // answers, so its status does not move and its operation record is stored
+        // complete. Either way the `OperationId` the answer carries is the id of a record
+        // held in this store, which `DescribeApplicationOperation` reports on.
+        let operation_id = if status == crate::state::STATUS_RUNNING {
+            let operation_id = store.record_operation(&name, Self::NAME, now);
+            store.begin_transition(
+                &name,
+                crate::state::STATUS_UPDATING,
+                &status,
+                operation_id.clone(),
+                now,
+            );
+            operation_id
+        } else {
+            store.record_completed_operation(&name, Self::NAME, now)
+        };
+
+        // Read the answer back out of the store, so what the caller receives is exactly
+        // what a later DescribeApplication will report.
+        let application_detail = store
+            .applications
+            .get(&name)
+            .expect("the application was just stored under this name")
+            .detail();
+        Ok(UpdateApplicationOutput {
+            application_detail,
+            operation_id: Some(operation_id),
+        })
     }
+}
+
+/// What AWS answers a caller that names neither of the two members an update is made
+/// against, as both members' docs state the requirement ("You must provide the
+/// CurrentApplicationVersionId or the ConditionalToken").
+const VERSION_OR_TOKEN_REQUIRED: &str =
+    "You must provide the CurrentApplicationVersionId or the ConditionalToken.";
+
+/// The whole sentence an update that addresses a version other than the one in force is
+/// refused with.
+///
+/// The corpus records it for an update that named a consumed `CurrentApplicationVersionId`
+/// — "The provided application version ID does not match the most recent version for the
+/// application." — and the MEMBER the request addressed the version by is its only
+/// variable part, so an update that addressed it by `ConditionalToken` is refused in the
+/// same words about that member.
+fn stale_version_message(member: &str) -> String {
+    format!("The provided {member} does not match the most recent version for the application.")
+}
+
+/// The two members an update can address a version by, as that sentence names them.
+const VERSION_ID_MEMBER: &str = "application version ID";
+const CONDITIONAL_TOKEN_MEMBER: &str = "ConditionalToken";
+
+/// Lift a refusal sentence about an element of the configuration an update names into
+/// this operation's modelled `InvalidArgumentException` (HTTP 400).
+fn invalid_argument(message: String) -> UpdateApplicationError {
+    UpdateApplicationErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
 }
