@@ -37,6 +37,8 @@ mod not_found_error_code;
 mod put_deployment_parameter_target;
 #[path = "all/put_deployment_parameter_unseeded.rs"]
 mod put_deployment_parameter_unseeded;
+#[path = "all/put_reports_the_stored_tag_set.rs"]
+mod put_reports_the_stored_tag_set;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_arn_classification.rs"]

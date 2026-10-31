@@ -18,6 +18,24 @@
 //! ignored if the resource already exists" — and the response's `tags` is the
 //! resource's stored tag map, which `TagResource` and `UntagResource` also write.
 //!
+//! That response member is the model's CONSTRAINED copy of the tag map, while the
+//! same stored set is also reported through the copy the model leaves
+//! unconstrained (`ListTagsForResourceResponse$tags` targets `Tags`:
+//! `smithy_query(query="shape",shape="Tags,TagsMap")`), so the two members the
+//! model gives one resource's tags state different things about what a tag may
+//! hold. What they agree on is WHOSE tags they report, and that is what is
+//! reported here: the set the record holds at the instant the call is served,
+//! entry for entry, the same set `ListTagsForResource` answers with. A key or
+//! value AWS's documented tag character set admits but the constrained copy does
+//! not — one carrying a space, one of letters outside ASCII, an empty value —
+//! reaches the record through `TagResource`, whose member targets the
+//! unconstrained map, and is reported here unchanged: the constrained copy's
+//! `@pattern` and `@length` bind the tag set a REQUEST may carry through a member
+//! that targets it, which is why this operation refuses such a set on the way IN,
+//! and dropping those entries from the response would report a tag set the
+//! resource does not have and make the two reporting members disagree about one
+//! record.
+//!
 //! `expirationDate` is the parameter's DEADLINE: it is "the date when deployment
 //! parameters expire and are scheduled for deletion", so once it passes the
 //! parameter is gone ([`crate::state::ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::purge_expired`],
@@ -439,7 +457,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The response for `record`, read entirely out of the stored record.
+/// The response for `record`, read entirely out of the stored record — its tag
+/// map included, reported as stored for the reason the module header gives.
 fn output_of(record: &crate::state::DeploymentParameterRecord) -> PutDeploymentParameterOutput {
     PutDeploymentParameterOutput {
         resource_arn: record.resource_arn.clone(),

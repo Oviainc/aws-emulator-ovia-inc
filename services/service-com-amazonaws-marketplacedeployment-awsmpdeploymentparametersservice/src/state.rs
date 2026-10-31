@@ -132,11 +132,22 @@ pub const RESOURCE_ARN_CHARACTER_CLASS: &str = "[a-zA-Z0-9:*/-]+";
 
 /// The number of tags one deployment parameter holds.
 ///
-/// AWS's per-resource tag limit, which the model restates for its constrained copy
-/// of the tag map: `PutDeploymentParameterRequest$tags` and
-/// `PutDeploymentParameterResponse$tags` are a `TagsMap` with `length max 50`
-/// (`smithy_query(query="shape",shape="TagsMap")`), so a stored set larger than
-/// this could not be reported back through the response at all.
+/// AWS's per-resource tag limit: a taggable resource carries at most this many
+/// tags, whichever member a tag arrives through — so, exactly like the key and
+/// value length bounds below, it holds for a member targeting the map the model
+/// leaves unconstrained too. The model restates it for its constrained copy of the
+/// tag map (`PutDeploymentParameterRequest$tags` and
+/// `PutDeploymentParameterResponse$tags` are a `TagsMap` with `length max 50`,
+/// `smithy_query(query="shape",shape="TagsMap")`).
+///
+/// It is NOT inferred from what that response member can serialize, and no limit
+/// on what this service STORES is: the same stored tag set is also reported through
+/// the map the model leaves unconstrained (`ListTagsForResourceResponse$tags`
+/// targets `Tags`, `smithy_query(query="shape",shape="Tags,TagsMap")`), so the two
+/// members the model gives one resource's tags state different things about what a
+/// tag may hold. What a member's own target map constrains is the tag set a REQUEST
+/// may carry through that member ([`TagConstraints`]); a reported set is the set
+/// the record holds.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// Longest tag key this service stores, in CHARACTERS.
