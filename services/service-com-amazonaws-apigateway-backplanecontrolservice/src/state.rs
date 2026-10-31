@@ -2197,6 +2197,23 @@ impl TaggedResource {
 /// The region and account fields are not matched further: this emulator serves one
 /// account, and nothing it stores is keyed by partition or region, so what selects a
 /// record is the resource portion.
+/// The AWS ACCOUNT the ARN `resource_arn` names as the owner of the resource it addresses
+/// — an ARN's fifth field — or `None` when the value is not an ARN of this service at all.
+///
+/// Read through [`::service_common::arn::parse_of`], the same single parse
+/// [`parse_tagged_resource`] reads the resource portion with, so the owner an ARN names and
+/// the record it selects are read off one grammar.
+///
+/// The field is EMPTY on every ARN this service MINTS ([`service_arn`]), because API
+/// Gateway's own ARNs carry no account — so two ARNs this emulator handed out name the same
+/// (single) account, and only an ARN whose account field a caller filled in differently
+/// names another one. That is what lets an operation defined on a CROSS-ACCOUNT
+/// relationship (`RejectDomainNameAccessAssociation`) tell the two cases apart: nothing
+/// else in a request says whose a resource is.
+pub fn arn_account(resource_arn: &str) -> Option<&str> {
+    ::service_common::arn::parse_of(resource_arn, ARN_SERVICE).map(|arn| arn.account)
+}
+
 pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
     let arn = ::service_common::arn::parse_of(resource_arn, ARN_SERVICE)?;
     let path: Vec<&str> = arn.resource.strip_prefix('/')?.split('/').collect();
@@ -4008,11 +4025,16 @@ pub const NO_SUCH_BASE_PATH_MAPPING: &str = "Invalid base path mapping identifie
 pub const BASE_PATH_MAPPING_ALREADY_EXISTS: &str = "Base path already exists for this domain name";
 
 /// The `NotFoundException` message for a domain name access association ARN that names no
-/// stored association, in the shape of the sibling identifier messages above. Shared by
-/// every operation that resolves one, so all of them say the same thing about the same
-/// failure.
+/// stored association.
+///
+/// API Gateway words this condition as a SENTENCE OF ITS OWN rather than as an identifier
+/// refusal like the siblings above, because an access association is only ever reached
+/// through the private custom domain name it is for: an ARN that answers to no stored
+/// record is a domain name that has no such association. Shared by every operation that
+/// resolves one — the delete, the rejection and the tag operations — so all of them say the
+/// same thing about the same failure.
 pub const NO_SUCH_ACCESS_ASSOCIATION: &str =
-    "Invalid domain name access association identifier specified";
+    "This private custom domain name doesn't have any domain name access associations.";
 
 /// The `ConflictException` message for a custom domain name a stored
 /// `DomainNameAccessAssociation` still depends on, which is what `DeleteDomainName`

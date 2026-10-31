@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RejectDomainNameAccessAssociation
-//! PARTLY IMPLEMENTED — REFUSALS ONLY: both ARNs are read and resolved against stored
-//! state, so a malformed pair answers the modelled `BadRequestException` (400) and a
-//! well-formed pair naming records this emulator does not hold answers the modelled
-//! `NotFoundException` (404). The SUCCESS path is still the scaffold's 501: a rejection
-//! removes an access association REQUESTED BY ANOTHER ACCOUNT ("To remove a domain name
-//! access association with an access association source in your own account, use the
-//! DeleteDomainNameAccessAssociation operation"), which is this operation's own question
-//! and its own issue — not something the create that stores an association answers.
+//! IMPLEMENTED: both ARNs are read and resolved against stored state, so a malformed pair
+//! answers the modelled `BadRequestException` (400) and a well-formed pair naming records
+//! this emulator does not hold answers the modelled `NotFoundException` (404) — the domain
+//! name first, then an access association ARN that names none of the ones that domain name
+//! has ([`crate::state::NO_SUCH_ACCESS_ASSOCIATION`]). A resolved
+//! pair is then decided by WHOSE the two resources are, because that is the whole
+//! distinction this operation is defined on: "To reject a domain name access association
+//! with an access association source in ANOTHER AWS account, use this operation. To remove
+//! a domain name access association with an access association source in YOUR OWN account,
+//! use the DeleteDomainNameAccessAssociation operation." A pair naming one account is
+//! therefore the modelled `BadRequestException` carrying AWS's fixed sentence for that
+//! class ([`SAME_ACCOUNT_REFUSAL`]), and a pair naming two is the rejection itself: the
+//! association is removed from the account's records and the modelled 202 with an empty
+//! body is answered.
 //!
 //! ## Shape of an operation
 //!
@@ -89,20 +95,39 @@ const ACCESS_ASSOCIATION_KIND: &str = "domainnameaccessassociations";
 /// operation="GetDomainName")`: `/domainnames/{domainName}`).
 const DOMAIN_NAME_KIND: &str = "domainnames";
 
-/// Read one of this operation's two ARNs as the resource of `kind` it must name.
+/// What AWS refuses a SAME-ACCOUNT rejection with, verbatim.
+///
+/// The sentence is wholly FIXED text for this error class — no name, identifier or value of
+/// the request or of the store appears in it — so it is one constant rather than a format.
+/// It is the answer for the case this operation is NOT defined on: an access association
+/// whose source is in the same account as the private custom domain name is removed with
+/// `DeleteDomainNameAccessAssociation`.
+const SAME_ACCOUNT_REFUSAL: &str = "Cannot reject the domain name access association when \
+                                    the private custom domain and domain name access \
+                                    association are in the same account.";
+
+/// Read one of this operation's two ARNs as the resource of `kind` it must name, with the
+/// ACCOUNT that ARN names as the owner of that resource.
 ///
 /// Both members are ARNs of resources of THIS service, so they are read through
 /// [`crate::state::parse_tagged_resource`] — the one place this service reads a
 /// caller-supplied ARN — and then held to the kind the member names. A value that is not
 /// an ARN at all, an ARN of another vendor, or an ARN naming another kind of resource is
 /// a malformed request rather than a missing one.
-fn arn_of_kind(
-    value: &str,
+///
+/// The owner comes from [`crate::state::arn_account`], the same parse's fifth field: this
+/// operation is defined on whether the two resources are in ONE account or in two, and an
+/// ARN's account field is what a request says that with.
+fn arn_of_kind<'a>(
+    value: &'a str,
     kind: &str,
-) -> Result<TaggedResource, RejectDomainNameAccessAssociationError> {
-    crate::state::parse_tagged_resource(value)
+) -> Result<(TaggedResource, &'a str), RejectDomainNameAccessAssociationError> {
+    let resource = crate::state::parse_tagged_resource(value)
         .filter(|resource| resource.kind() == kind)
-        .ok_or_else(|| bad_request(crate::state::INVALID_ARN.to_string()))
+        .ok_or_else(|| bad_request(crate::state::INVALID_ARN.to_string()))?;
+    let account = crate::state::arn_account(value)
+        .ok_or_else(|| bad_request(crate::state::INVALID_ARN.to_string()))?;
+    Ok((resource, account))
 }
 
 /// A request this service cannot read: the bad request it is.
@@ -217,7 +242,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
 
@@ -225,29 +249,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot read resolves nothing: a malformed pair is a client error (400), which
         // is a different answer from a well-formed pair naming records that do not exist
         // (404). Each member is held to the kind of resource it names, so the ARN of some
-        // other API Gateway resource is refused the way a non-ARN is.
-        let association = arn_of_kind(
+        // other API Gateway resource is refused the way a non-ARN is. The ACCOUNT each ARN
+        // names comes off the same read, because that is what this operation decides on.
+        let (association, association_account) = arn_of_kind(
             &input.domain_name_access_association_arn,
             ACCESS_ASSOCIATION_KIND,
         )?;
-        let domain_name = arn_of_kind(&input.domain_name_arn, DOMAIN_NAME_KIND)?;
+        let (domain_name, domain_name_account) =
+            arn_of_kind(&input.domain_name_arn, DOMAIN_NAME_KIND)?;
+        let TaggedResource::DomainNameAccessAssociation {
+            access_association_id,
+        } = &association
+        else {
+            // Unreachable: `arn_of_kind` held the member to this kind above, which is the
+            // only variant whose `kind()` answers it.
+            return Err(bad_request(crate::state::INVALID_ARN.to_string()));
+        };
 
-        let store = state.lock();
-        // "Rejects a domain name access association with a private custom domain name":
-        // the call resolves the domain name the association was requested on and the
-        // association itself, and both must name records this emulator holds. The lookup
-        // is the SAME one the tag operations resolve an ARN with, so what this operation
-        // says a pair names is what every other reader of those ARNs says.
+        let mut store = state.lock();
+        // "Rejects a domain name access association with a private custom domain name": the
+        // DOMAIN NAME is resolved first, because the association the pair names is looked
+        // for among the ones that domain name has. The lookup is the SAME one the tag
+        // operations resolve an ARN with, so what this operation says an ARN names is what
+        // every other reader of it says.
         store.holds(&domain_name).map_err(not_found)?;
-        store.holds(&association).map_err(not_found)?;
-        // Reached only by a pair that names records this emulator holds. It is the
-        // scaffold's 501 rather than a success because a REJECTION is not a deletion: it
-        // answers another account's association request, which this operation's own issue
-        // settles. Every request a caller can make against records it does not hold is
-        // answered above, by this operation's own modelled errors.
+        // Which of this domain name's associations the pair names. The comparison is on the
+        // RESOURCE each ARN addresses rather than on the ARN text, because the account field
+        // is exactly what may legitimately differ between the spelling a record stores and
+        // the one a request carries.
+        //
+        // An ARN that answers to none of them names no association to reject — which is one
+        // condition, whether the domain name has no associations at all (what the sibling
+        // delete leaves behind) or has some and this is not one of them.
+        let names_one_of_them = store
+            .domain_name_access_associations
+            .values()
+            .filter(|entry| {
+                crate::state::parse_tagged_resource(&entry.domain_name_arn).as_ref()
+                    == Some(&domain_name)
+            })
+            .any(|entry| entry.id == *access_association_id);
+        if !names_one_of_them {
+            return Err(not_found(
+                crate::state::NO_SUCH_ACCESS_ASSOCIATION.to_string(),
+            ));
+        }
+
+        // The whole distinction this operation is defined on: "To reject a domain name
+        // access association with an access association source in ANOTHER AWS account, use
+        // this operation. To remove a domain name access association with an access
+        // association source in YOUR OWN account, use the
+        // DeleteDomainNameAccessAssociation operation." The access association is held by
+        // the account its source is in, and the private custom domain name by its own
+        // owner, so the two ARNs' account fields are what say whether this is one account
+        // or two ([`crate::state::arn_account`]). One account is the wrong operation for
+        // the ask — a permanent, caller-side refusal naming what to use instead — and not a
+        // missing record or a server fault.
+        if association_account == domain_name_account {
+            return Err(bad_request(SAME_ACCOUNT_REFUSAL.to_string()));
+        }
+
+        // Two accounts: the rejection itself. Rejecting the other account's request is what
+        // takes the association out of this account's records, so nothing lists it, reads
+        // its tags or resolves its ARN afterwards — the same removal the sibling delete
+        // performs for an association of this account's own. The lookup above and this
+        // removal share ONE hold of the store lock, so two concurrent rejections of one
+        // record cannot both remove it.
+        let removed = store
+            .domain_name_access_associations
+            .remove(access_association_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_ACCESS_ASSOCIATION.to_string()))?;
+        // The store lock is released before the outcome is recorded: the critical section
+        // covers the state change only.
         drop(store);
-        Err(crate::scaffolded::Scaffolded::not_implemented(
-            "RejectDomainNameAccessAssociation",
-        ))
+        // The access record for a state-changing operation: who, what, and the outcome —
+        // metadata only, as the sibling delete emits it; the association's tags and its
+        // source identifier are the caller's data and are never fields.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            domain_name_access_association = ?removed.id,
+            outcome = "rejected",
+            "domain name access association rejected",
+        );
+        Ok(RejectDomainNameAccessAssociationOutput)
     }
 }

@@ -326,6 +326,10 @@ mod stage_export_content_types;
 // template are RENDERED against, and which of them this emulator does not render.
 #[path = "all/stage_mapping_templates.rs"]
 mod stage_mapping_templates;
+// Appended for the reason the note above gives: WHOSE the two resources are is what
+// decides `RejectDomainNameAccessAssociation` once both of its ARNs resolve.
+#[path = "all/domain_name_access_association_reject_accounts.rs"]
+mod domain_name_access_association_reject_accounts;
 // Appended for the reason the note above gives: the ACCOUNT-level CloudWatch Logs role a
 // stage configuration that turns execution logging on is refused without.
 #[path = "all/stage_execution_logging_account_role.rs"]
