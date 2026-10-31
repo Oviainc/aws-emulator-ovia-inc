@@ -170,3 +170,47 @@ pub fn not_found_by_id(name: &str) -> String {
 pub fn not_found_by_name(name: &str) -> String {
     format!("WorkloadIdentity with name {name} not found.")
 }
+
+/// Assert `status`/`body` is the modelled 404 `ResourceNotFoundException` carrying
+/// `message` — the one place the suites agree what a miss looks like on the wire.
+pub fn assert_not_found(case: &str, status: u16, body: &Value, message: &str) {
+    assert_eq!(
+        (status, error_code(body), text(body, "message")),
+        (
+            404,
+            "ResourceNotFoundException".to_string(),
+            message.to_string()
+        ),
+        "case {case:?}: expected HTTP 404 ResourceNotFoundException {message:?}, got {status} {} \
+         ({body})",
+        error_code(body)
+    );
+}
+
+/// Whether an answer carries no member at all: `DeleteWorkloadIdentity`'s output is an
+/// empty structure, so a success holds nothing whichever envelope it renders in (no body,
+/// or an empty object).
+pub fn carries_no_member(body: &Value) -> bool {
+    match body {
+        Value::Null => true,
+        Value::Object(members) => members.is_empty(),
+        _ => false,
+    }
+}
+
+/// An epoch-seconds instant off a response member. The prelude `Timestamp` carries no
+/// `@timestampFormat`, so on this service's restJson1 wire each instant is a NUMBER.
+pub fn instant(case: &str, body: &Value, member: &str) -> f64 {
+    body[member].as_f64().unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: expected {member} as epoch-seconds, got {}",
+            body[member]
+        )
+    })
+}
+
+/// How a stored `allowedResourceOauth2ReturnUrls` reads back on the wire: the list the
+/// caller supplied, in that order, or no member at all when the identity carries none.
+pub fn expected_url_list(urls: Option<&Vec<&str>>) -> Value {
+    urls.map_or(Value::Null, |urls| json!(urls))
+}

@@ -26,9 +26,10 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    create_identity, delete_identity, error_code, expected_arn, get_identity, list_identities,
-    listed_names, not_found_by_id, not_found_by_name, router, text, update_identity,
-    MAX_RESULTS_MAX, NAME_MAX_LENGTH, NAME_MIN_LENGTH,
+    assert_not_found, carries_no_member, create_identity, delete_identity, expected_arn,
+    expected_url_list, get_identity, instant, list_identities, listed_names, not_found_by_id,
+    not_found_by_name, router, text, update_identity, MAX_RESULTS_MAX, NAME_MAX_LENGTH,
+    NAME_MIN_LENGTH,
 };
 
 /// The modelled success statuses: `UpdateWorkloadIdentity` answers 200, and
@@ -55,43 +56,6 @@ struct DeleteCase {
     case: &'static str,
     name: String,
     urls: Option<Vec<&'static str>>,
-}
-
-/// Whether an answer carries no member at all: `DeleteWorkloadIdentity`'s output is an
-/// empty structure, so a success holds nothing whichever envelope it renders in (no body,
-/// or an empty object).
-fn carries_no_member(body: &Value) -> bool {
-    match body {
-        Value::Null => true,
-        Value::Object(members) => members.is_empty(),
-        _ => false,
-    }
-}
-
-/// Assert `answer` is the modelled 404 `ResourceNotFoundException` carrying `message`.
-fn assert_not_found(case: &str, status: u16, body: &Value, message: &str) {
-    assert_eq!(
-        (status, error_code(body), text(body, "message")),
-        (
-            404,
-            "ResourceNotFoundException".to_string(),
-            message.to_string()
-        ),
-        "case {case:?}: expected HTTP 404 ResourceNotFoundException {message:?}, got {status} {} \
-         ({body})",
-        error_code(body)
-    );
-}
-
-/// An epoch-seconds instant off a response member. The prelude `Timestamp` carries no
-/// `@timestampFormat`, so on this service's restJson1 wire each instant is a NUMBER.
-fn instant(case: &str, body: &Value, member: &str) -> f64 {
-    body[member].as_f64().unwrap_or_else(|| {
-        panic!(
-            "case {case:?}: expected {member} as epoch-seconds, got {}",
-            body[member]
-        )
-    })
 }
 
 /// The names the listing reports, at a page size above every count these tests store.
@@ -190,9 +154,7 @@ async fn an_update_replaces_the_stored_return_url_list_and_the_read_reports_it()
             "case {case:?}: expected HTTP {UPDATE_STATUS} from UpdateWorkloadIdentity, got \
              {status} ({updated})"
         );
-        let expected_list = updated_urls
-            .as_ref()
-            .map_or(Value::Null, |urls| json!(urls));
+        let expected_list = expected_url_list(updated_urls.as_ref());
         assert_eq!(
             updated["allowedResourceOauth2ReturnUrls"], expected_list,
             "case {case:?}: the update must report exactly the list it was given, got {}",

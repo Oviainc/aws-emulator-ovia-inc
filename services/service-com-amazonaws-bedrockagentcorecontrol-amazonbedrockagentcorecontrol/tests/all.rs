@@ -67,3 +67,5 @@ mod validation_message_rendering;
 mod workload_identity_lifecycle;
 #[path = "all/workload_identity_mutation.rs"]
 mod workload_identity_mutation;
+#[path = "all/workload_identity_read_back.rs"]
+mod workload_identity_read_back;
