@@ -34,7 +34,10 @@ use serde_json::{json, Value};
 use crate::slack_channel_configurations::{role_arn, Emulator};
 
 /// The three notification flags, in the order this API's prose lists them.
-const FLAG_MEMBERS: [&str; 3] = [
+///
+/// `pub(crate)` so a sibling suite spells the wire member names from here rather than
+/// keeping a second copy of the list.
+pub(crate) const FLAG_MEMBERS: [&str; 3] = [
     "notifyOnCreateOrReopenCase",
     "notifyOnAddCorrespondenceToCase",
     "notifyOnResolveCase",
@@ -159,7 +162,10 @@ fn update_body(severity: Option<&str>, requested: [Option<bool>; 3]) -> Value {
 }
 
 /// Assert `reported` carries `severity` and `flags`.
-fn assert_configuration(case: &str, reported: &Value, severity: &str, flags: [bool; 3]) {
+///
+/// `pub(crate)` so a sibling suite checks a stored configuration the same way instead
+/// of spelling the three member names again.
+pub(crate) fn assert_configuration(case: &str, reported: &Value, severity: &str, flags: [bool; 3]) {
     assert_eq!(
         reported.get("notifyOnCaseSeverity").and_then(Value::as_str),
         Some(severity),

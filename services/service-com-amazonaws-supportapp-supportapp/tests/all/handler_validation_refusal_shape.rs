@@ -17,13 +17,16 @@
 //! grew; and once over the wire through the production router, which pins the status, the
 //! code and the wording a client observes.
 //!
-//! The rows span the operations and the handler-enforced rules this service has, taking
-//! in both of the ways the crate used to raise this refusal: the `nextToken` rule of
-//! EACH listing, and the documented `notifyOnCaseSeverity` / notification-flag rule of
-//! `CreateSlackChannelConfiguration`. Within each, the rows differ along what that rule
-//! generalises over — the form and length of a token no listing ever minted, and the
-//! severity level together with which flags the request carries. The boundary of each
-//! rule is a row too: the request each operation SERVES is not refused.
+//! The rows span EVERY operation of this service whose handler raises such a refusal,
+//! and the rule each of them enforces: the `nextToken` rule of each listing, the
+//! documented `notifyOnCaseSeverity` / notification-flag rule of
+//! `CreateSlackChannelConfiguration` and of `UpdateSlackChannelConfiguration`, and the
+//! documented workspace quota of `RegisterSlackWorkspaceForOrganization`. Within each,
+//! the rows differ along what that rule generalises over — the form and length of a
+//! token no listing ever minted, the severity level together with which flags the
+//! request carries (and, on an update, whether it carries them at all), and the form and
+//! length of the `teamId` a registration past the quota names. The boundary of each rule
+//! is a row too: the request each operation SERVES is not refused.
 
 use std::sync::Arc;
 
@@ -45,17 +48,29 @@ use supportapp::ops::list_slack_workspace_configurations::{
     ListSlackWorkspaceConfigurations, ListSlackWorkspaceConfigurationsError,
     ListSlackWorkspaceConfigurationsErrorModeled,
 };
+use supportapp::ops::register_slack_workspace_for_organization::{
+    RegisterSlackWorkspaceForOrganization, RegisterSlackWorkspaceForOrganizationError,
+    RegisterSlackWorkspaceForOrganizationErrorModeled,
+};
 use supportapp::ops::types::{
     CreateSlackChannelConfigurationInput, CreateSlackChannelConfigurationOutput,
     ListSlackChannelConfigurationsInput, ListSlackChannelConfigurationsOutput,
     ListSlackWorkspaceConfigurationsInput, ListSlackWorkspaceConfigurationsOutput,
+    RegisterSlackWorkspaceForOrganizationInput, RegisterSlackWorkspaceForOrganizationOutput,
+    UpdateSlackChannelConfigurationInput, UpdateSlackChannelConfigurationOutput,
     ValidationException,
 };
+use supportapp::ops::update_slack_channel_configuration::{
+    UpdateSlackChannelConfiguration, UpdateSlackChannelConfigurationError,
+    UpdateSlackChannelConfigurationErrorModeled,
+};
 use supportapp::scaffolded::Scaffolded;
+use supportapp::state::MAX_SLACK_WORKSPACE_CONFIGURATIONS;
 
 use crate::error_message_templates::refusal;
 use crate::slack_channel_configurations::{role_arn, Emulator, Reply};
-use crate::slack_workspace_configurations::list_workspaces;
+use crate::slack_workspace_configurations::{list_workspaces, reported, team_ids};
+use crate::update_severity_rule_scope::{assert_configuration, FLAG_MEMBERS};
 
 /// The Region every request below is signed for; this API's resources are not regional.
 const REGION: &str = "us-east-1";
@@ -74,10 +89,25 @@ const VALIDATION_CODE: &str = "ValidationException";
 /// validator's.
 const NEXT_TOKEN_MAX_LEN: usize = 256;
 
-/// The Slack ids the create rows configure. The channel configuration is never stored —
-/// every create row below is refused before the store is reached.
+/// The Slack ids the create and update rows name. No create row stores anything — each
+/// is refused before the store is reached — so the configuration the update rows are
+/// applied to is the one the create BOUNDARY row below stores.
 const TEAM_ID: &str = "T012ABCDEFG";
 const CHANNEL_ID: &str = "C01234A5BCD";
+
+/// The configuration that boundary create leaves stored, which the update rows are then
+/// worded over: severity `high`, notifying on create-or-reopen only — the two flags it
+/// does not carry are created `false`, as `notifyOnCaseSeverity` documents ("If you
+/// don't specify these parameters in your request, they default to false").
+const STORED_SEVERITY: &str = "high";
+const STORED_FLAGS: [bool; 3] = [true, false, false];
+
+/// `teamId` is `len 1..256, pattern ^\S+$`
+/// (`smithy_query(query="operation",operation="RegisterSlackWorkspaceForOrganization")`),
+/// so a registration past the quota is tried on both published length bounds as well as
+/// on a conventional Slack id.
+const TEAM_ID_MIN_LEN: usize = 1;
+const TEAM_ID_MAX_LEN: usize = 256;
 
 /// The handler leg: this service on its own engine, plus the request metadata and the
 /// in-process callback a handler is given, so an operation can be called with a typed
@@ -90,8 +120,10 @@ struct Handlers {
 }
 
 impl Handlers {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    /// The handler leg over `engine`, the store the wire leg of the same row answers
+    /// from: a refusal that depends on what is stored — an update of a configuration, a
+    /// registration past the account's quota — is then the same refusal on both legs.
+    fn sharing(engine: Arc<engine::InMemoryEngine>) -> Self {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(supportapp::EmulatedService::new(Arc::clone(&engine)));
@@ -145,6 +177,32 @@ impl Handlers {
     ) -> Result<CreateSlackChannelConfigurationOutput, CreateSlackChannelConfigurationError> {
         CreateSlackChannelConfiguration::new(Arc::clone(&self.engine))
             .handle(input, &self.ctx())
+            .await
+    }
+
+    async fn update(
+        &self,
+        input: UpdateSlackChannelConfigurationInput,
+    ) -> Result<UpdateSlackChannelConfigurationOutput, UpdateSlackChannelConfigurationError> {
+        UpdateSlackChannelConfiguration::new(Arc::clone(&self.engine))
+            .handle(input, &self.ctx())
+            .await
+    }
+
+    async fn register(
+        &self,
+        team_id: &str,
+    ) -> Result<
+        RegisterSlackWorkspaceForOrganizationOutput,
+        RegisterSlackWorkspaceForOrganizationError,
+    > {
+        RegisterSlackWorkspaceForOrganization::new(Arc::clone(&self.engine))
+            .handle(
+                RegisterSlackWorkspaceForOrganizationInput {
+                    team_id: team_id.to_string(),
+                },
+                &self.ctx(),
+            )
             .await
     }
 }
@@ -319,11 +377,7 @@ fn create_body(severity: &str, flags: Flags) -> Value {
         "notifyOnCaseSeverity": severity,
         "channelRoleArn": role_arn("SupportAppRole"),
     });
-    for (member, value) in [
-        ("notifyOnCreateOrReopenCase", flags[0]),
-        ("notifyOnAddCorrespondenceToCase", flags[1]),
-        ("notifyOnResolveCase", flags[2]),
-    ] {
+    for (member, value) in FLAG_MEMBERS.into_iter().zip(flags) {
         if let Some(value) = value {
             body[member] = json!(value);
         }
@@ -331,10 +385,114 @@ fn create_body(severity: &str, flags: Flags) -> Value {
     body
 }
 
+/// Severity/flag combinations an UPDATE of the stored configuration is refused for, as
+/// `(case, the severity the request carries, flags)` — `None` is a member the request
+/// leaves out.
+///
+/// The documented rule's two clauses have different scopes on an update
+/// (`smithy_query(query="doc",shape="UpdateSlackChannelConfigurationRequest",member="notifyOnCaseSeverity")`):
+/// `all`/`high` is worded over the record the update leaves behind, where a member the
+/// request omits keeps its stored value, and `none` over only the flags the request
+/// itself specifies. So the rows differ along both scopes — which severity the request
+/// carries, including carrying none at all, and which flags it turns off or on.
+fn update_violations() -> Vec<(&'static str, Option<&'static str>, Flags)> {
+    vec![
+        // The `all`/`high` clause, over the record the update would leave behind: every
+        // flag it would hold is false.
+        (
+            "all with every flag turned off",
+            Some("all"),
+            [Some(false), Some(false), Some(false)],
+        ),
+        (
+            "high with every flag turned off",
+            Some("high"),
+            [Some(false), Some(false), Some(false)],
+        ),
+        (
+            "the severity the request omits, with the one stored true flag turned off",
+            None,
+            [Some(false), None, None],
+        ),
+        // The `none` clause, over the flags the request specifies.
+        (
+            "none with the resolve flag specified true",
+            Some("none"),
+            [None, None, Some(true)],
+        ),
+        (
+            "none with the create-or-reopen flag specified true",
+            Some("none"),
+            [Some(true), None, None],
+        ),
+        (
+            "none with every flag specified true",
+            Some("none"),
+            [Some(true), Some(true), Some(true)],
+        ),
+    ]
+}
+
+/// The update request a row sends, as a typed input.
+fn update_input(severity: Option<&str>, flags: Flags) -> UpdateSlackChannelConfigurationInput {
+    UpdateSlackChannelConfigurationInput {
+        team_id: TEAM_ID.to_string(),
+        channel_id: CHANNEL_ID.to_string(),
+        channel_name: None,
+        notify_on_create_or_reopen_case: flags[0],
+        notify_on_add_correspondence_to_case: flags[1],
+        notify_on_resolve_case: flags[2],
+        notify_on_case_severity: severity.map(str::to_string),
+        channel_role_arn: None,
+    }
+}
+
+/// The same update request as the JSON body a client sends, so the handler leg and the
+/// wire leg of a row are the same request.
+fn update_body(severity: Option<&str>, flags: Flags) -> Value {
+    let mut body = json!({
+        "teamId": TEAM_ID,
+        "channelId": CHANNEL_ID,
+    });
+    if let Some(severity) = severity {
+        body["notifyOnCaseSeverity"] = json!(severity);
+    }
+    for (member, value) in FLAG_MEMBERS.into_iter().zip(flags) {
+        if let Some(value) = value {
+            body[member] = json!(value);
+        }
+    }
+    body
+}
+
+/// Team ids a registration is refused for once the account's registry is full, as
+/// `(case, teamId)`.
+///
+/// The quota is documented on `CreateSlackChannelConfiguration` ("You can add up to 5
+/// Slack workspaces for your account") and bounds the registry, so what the rows differ
+/// along is the `teamId` the over-quota registration names: a conventional Slack id and
+/// each published `teamId` length bound. None of them is a workspace the registry
+/// already holds, which is what makes each a registration the quota refuses.
+fn over_quota_team_ids() -> Vec<(&'static str, String)> {
+    vec![
+        ("a conventional Slack team id", "T0ABCDEFGHI".to_string()),
+        (
+            "a team id at the published minimum length",
+            "Z".repeat(TEAM_ID_MIN_LEN),
+        ),
+        (
+            "a team id at the published maximum length",
+            "Z".repeat(TEAM_ID_MAX_LEN),
+        ),
+    ]
+}
+
 #[tokio::test]
 async fn every_handler_refusal_carries_the_validation_exception_this_service_models() {
-    let handlers = Handlers::new();
     let emulator = Emulator::new();
+    // Both legs of a row answer from ONE store, so a refusal that depends on what is
+    // stored is the same refusal whichever leg raises it.
+    let handlers = Handlers::sharing(emulator.engine());
 
     for (form, token) in forged_tokens() {
         // The channel listing's `nextToken` rule.
@@ -436,5 +594,128 @@ async fn every_handler_refusal_carries_the_validation_exception_this_service_mod
         created.status, 200,
         "case \"high with one flag true\": expected HTTP 200, got {} / {}",
         created.status, created.body
+    );
+
+    // The record that create left stored, read back through the listing: the record the
+    // update rows below are worded over, checked rather than assumed.
+    let stored = emulator
+        .listed(TEAM_ID, CHANNEL_ID)
+        .await
+        .unwrap_or_else(|| panic!("the created configuration must be reported by the listing"));
+    assert_configuration(
+        "the record the update rows are applied to",
+        &stored,
+        STORED_SEVERITY,
+        STORED_FLAGS,
+    );
+
+    for (combination, severity, flags) in update_violations() {
+        let case = format!("UpdateSlackChannelConfiguration / {combination}");
+        let refused = handlers
+            .update(update_input(severity, flags))
+            .await
+            .expect_err(&format!(
+                "case {case:?}: a request against the documented severity rule must be refused"
+            ));
+        assert_modelled_shape(&case, &refused);
+        let message = match refused {
+            Scaffolded::Modeled(
+                UpdateSlackChannelConfigurationErrorModeled::ValidationException(exception),
+            ) => assert_envelope(&case, "UpdateSlackChannelConfiguration", &exception),
+            other => panic!(
+                "case {case:?}: expected the modelled ValidationException, got {other:?}"
+            ),
+        };
+        let reply = emulator.update(update_body(severity, flags)).await;
+        let wire = refusal(&case, &reply, 400, VALIDATION_CODE);
+        assert_eq!(
+            wire, message,
+            "case {case:?}: expected the wire message to be the handler's, got {wire:?}"
+        );
+        assert_only_message(&case, &reply);
+    }
+
+    // The boundary of the update's rule: every refusal above wrote nothing, and an
+    // update the rule holds together with is served.
+    let stored = emulator
+        .listed(TEAM_ID, CHANNEL_ID)
+        .await
+        .unwrap_or_else(|| panic!("the configuration must survive a refused update"));
+    assert_configuration(
+        "the record every refused update left alone",
+        &stored,
+        STORED_SEVERITY,
+        STORED_FLAGS,
+    );
+    let served = emulator.update(update_body(Some("none"), [None, None, None])).await;
+    assert_eq!(
+        served.status, 200,
+        "case \"none with no flag in the request\": expected HTTP 200, got {} / {}",
+        served.status, served.body
+    );
+
+    // `RegisterSlackWorkspaceForOrganization`'s documented workspace quota. The account
+    // already holds the workspace the create above registered, so this table takes the
+    // registry to exactly the quota.
+    for team_id in team_ids() {
+        let registered = emulator.register_workspace(&team_id).await;
+        assert_eq!(
+            registered.status,
+            200,
+            "case {:?}: the row's workspace must be registered, got {} / {}",
+            &team_id[..team_id.len().min(16)],
+            registered.status,
+            registered.body
+        );
+    }
+    let registry = list_workspaces(&emulator, None).await;
+    assert_eq!(
+        reported(&registry).len(),
+        MAX_SLACK_WORKSPACE_CONFIGURATIONS,
+        "the registry must stand at the documented quota before the rows below, got {}",
+        registry.body
+    );
+
+    for (form, team_id) in over_quota_team_ids() {
+        let case = format!("RegisterSlackWorkspaceForOrganization / {form}");
+        // The workspace is authorized in the console first, so each row is refused for
+        // the quota rather than for a workspace this API never saw authorized.
+        emulator.authorize_workspace_in_console(&team_id);
+        let refused = handlers.register(&team_id).await.expect_err(&format!(
+            "case {case:?}: a registration past the documented quota must be refused"
+        ));
+        assert_modelled_shape(&case, &refused);
+        let message = match refused {
+            Scaffolded::Modeled(
+                RegisterSlackWorkspaceForOrganizationErrorModeled::ValidationException(exception),
+            ) => assert_envelope(&case, "RegisterSlackWorkspaceForOrganization", &exception),
+            other => panic!(
+                "case {case:?}: expected the modelled ValidationException, got {other:?}"
+            ),
+        };
+        let reply = emulator.register_workspace(&team_id).await;
+        let wire = refusal(&case, &reply, 400, VALIDATION_CODE);
+        assert_eq!(
+            wire, message,
+            "case {case:?}: expected the wire message to be the handler's, got {wire:?}"
+        );
+        assert_only_message(&case, &reply);
+    }
+
+    // The boundary of the quota rule: registering a workspace the account already holds
+    // adds nothing to the registry, so it is served even at the quota — and every
+    // refusal above registered nothing.
+    let served = emulator.register_workspace(TEAM_ID).await;
+    assert_eq!(
+        served.status, 200,
+        "case \"a workspace the account already holds\": expected HTTP 200, got {} / {}",
+        served.status, served.body
+    );
+    let registry = list_workspaces(&emulator, None).await;
+    assert_eq!(
+        reported(&registry).len(),
+        MAX_SLACK_WORKSPACE_CONFIGURATIONS,
+        "a refused registration must register nothing, got {}",
+        registry.body
     );
 }

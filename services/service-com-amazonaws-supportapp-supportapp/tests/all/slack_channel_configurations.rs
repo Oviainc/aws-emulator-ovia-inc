@@ -114,6 +114,16 @@ impl Emulator {
         Self { router, engine }
     }
 
+    /// The engine the mounted services share.
+    ///
+    /// `pub(crate)` so a sibling suite can call an operation of this service DIRECTLY,
+    /// with a typed input, against the very store this harness's wire calls arranged —
+    /// which is how [`crate::handler_validation_refusal_shape`] reads the error VALUE a
+    /// handler returns for a request the wire can only show the status and body of.
+    pub(crate) fn engine(&self) -> Arc<engine::InMemoryEngine> {
+        Arc::clone(&self.engine)
+    }
+
     /// Hand the organization this account is in over to ANOTHER management account, so
     /// this account is a MEMBER of its organization rather than the account that manages
     /// it — the other role an Organizations-scoped call can read for the caller.
