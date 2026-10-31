@@ -139,7 +139,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // modelled catalog this service has recorded wording for is EC2's
             // `InvalidParameterValue` with the sentence EC2 words for that parameter TYPE,
             // and a page size below the smallest its `@range` publishes is EC2's
-            // `InvalidMaxResults` ([`ec2_value_refusal`]).
+            // `InvalidMaxResults`, and a page size that is no page size at all — zero or
+            // negative — is EC2's `InvalidParameter` ([`ec2_value_refusal`]).
             //
             // Every other framework refusal answers `None`, which keeps the framework's own
             // code and its request-built clause in AWS's validation envelope
@@ -610,11 +611,13 @@ impl ErasedOperation for FinishedEnvelope {
 /// the framework's own clause.
 ///
 /// A `MaxResults` below the smallest page the operation publishes is the other refusal this
-/// service states: EC2 answers its own `InvalidMaxResults` for it, naming the value and the
-/// bound ([`crate::state::max_results_below_minimum_message`]). It is keyed on the member
-/// the constraint walk reports and on the bound it failed, so every paged operation of this
-/// service answers one code for a page size under its own published minimum — the minimum
-/// comes from the violation, never from a number written here.
+/// service states: EC2 answers its own code and sentence for it, naming the value and the
+/// bound ([`crate::state::max_results_refusal`]). It is keyed on the member the constraint
+/// walk reports, on the bound it failed and on the value it carried — a positive page size
+/// the operation will not page with is `InvalidMaxResults`, a value that is no page size at
+/// all is `InvalidParameter` — so every paged operation of this service answers one code and
+/// one wording for each of the two, the minimum coming from the violation rather than from a
+/// number written here.
 fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<Refused> {
     use aws_smithy_schema_server::ViolationKind;
 
@@ -632,12 +635,16 @@ fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<
         ViolationKind::MinValue(minimum)
             if violation.path == crate::state::MAX_RESULTS_MEMBER_PATH =>
         {
+            let value = violation.value.as_deref().unwrap_or_default();
+            // Which code and which sentence depend on what the value IS — a page size the
+            // operation will not page with, or no page size at all — never on the operation
+            // that carries it ([`crate::state::max_results_refusal`], which answers both so
+            // they cannot disagree).
+            let (code, message) =
+                crate::state::max_results_refusal(&violation.path, value, minimum);
             Some(Refused {
-                code: crate::state::INVALID_MAX_RESULTS.to_string(),
-                message: crate::state::max_results_below_minimum_message(
-                    violation.value.as_deref().unwrap_or_default(),
-                    minimum,
-                ),
+                code: code.to_string(),
+                message,
             })
         }
         _ => None,

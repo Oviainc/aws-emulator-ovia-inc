@@ -1103,12 +1103,14 @@ async fn max_results_is_accepted_at_its_bounds_and_refused_past_them() {
              body {body}"
         );
         if expected_status == 400 {
-            // Which code the BOUNDARY answers is one rule for the whole service: a page
-            // size below the smallest the operation serves carries EC2's own
-            // `InvalidMaxResults`, one above the largest the boundary validator's generic
-            // code.
+            // Which code the BOUNDARY answers is one rule for the whole service, keyed on
+            // what the value is: a POSITIVE page size below the smallest the operation
+            // serves carries EC2's own `InvalidMaxResults`, a value that is no page size at
+            // all — this operation's `@range` starting at 1, that is what a page size below
+            // it is — carries EC2's `InvalidParameter`, and one above the largest keeps the
+            // boundary validator's generic code.
             let expected_code = if max_results < 1 {
-                "InvalidMaxResults"
+                "InvalidParameter"
             } else {
                 "ValidationError"
             };

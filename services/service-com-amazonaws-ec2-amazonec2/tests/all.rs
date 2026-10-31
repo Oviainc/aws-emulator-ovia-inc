@@ -657,6 +657,8 @@ mod local_gateway_route_tables;
 mod local_gateway_virtual_interface_groups;
 #[path = "all/mac_dedicated_hosts.rs"]
 mod mac_dedicated_hosts;
+#[path = "all/mac_modification_tasks.rs"]
+mod mac_modification_tasks;
 #[path = "all/modify_route_server.rs"]
 mod modify_route_server;
 #[path = "all/modify_subnet_attribute.rs"]

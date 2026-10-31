@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDelegateMacVolumeOwnershipTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDelegateMacVolumeOwnershipTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDelegateMacVolumeOwnershipTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts a `volume-ownership-delegation` task on an Apple silicon Mac
+//! instance of the account and stores it in [`crate::state`], where
+//! `DescribeMacModificationTasks` reports it. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDelegateMacVolumeOwnershipTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDelegateMacVolumeOwnershipTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDelegateMacVolumeOwnershipTask"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            architecture_for, require_mac_instance, require_service_state,
+            tags_from_specifications, MacModificationTaskSpec, ARCHITECTURE_ARM64_MAC,
+            MAC_MODIFICATION_TASK_TAGGABLE_RESOURCE,
+            MAC_MODIFICATION_TASK_TYPE_VOLUME_OWNERSHIP_DELEGATION, MAX_CLIENT_TOKEN_CHARS,
+        };
+
+        // `ctx` carries request metadata only, and nothing a Mac modification task holds
+        // names a Region: the modelled `MacModificationTask` carries no ARN and no zone.
+        let _ = ctx;
+
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // "The tags to assign to the volume ownership delegation task"
+        // (`TagSpecifications`): the task is the only resource this call creates, so the
+        // crate's ONE reader of a create's tag specifications is what reads them — a
+        // specification naming another resource type or none at all is refused, a duplicate
+        // or reserved key is refused, and the per-resource tag count and each key and value
+        // length are bounded there rather than a second way here.
+        let tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            MAC_MODIFICATION_TASK_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // This call writes, so the moves the clock already owed the instances are applied
+        // before their states are read: the refusal below is about the state the instance is
+        // in NOW, not the one it was left in by an earlier call.
+        store.materialize_due_transitions();
+
+        // "The ID of the Amazon EC2 Mac instance" (`InstanceId`), resolved through the one
+        // reader both Mac task creates share, so neither accepts an instance the other
+        // refuses.
+        let instance = require_mac_instance(&store, &input.instance_id)?;
+        // "Delegates ownership of the Amazon EBS root volume for an Apple silicon Mac
+        // instance" (`CreateDelegateMacVolumeOwnershipTask`): the delegation is a fact of
+        // Apple silicon hardware, so an Intel Mac instance — the one Mac family whose
+        // architecture is not `arm64_mac` ([`architecture_for`]) — has no volume ownership to
+        // delegate.
+        let architecture = architecture_for(&instance.instance_type);
+        if architecture != ARCHITECTURE_ARM64_MAC {
+            let instance_type = instance.instance_type.clone();
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{instance_id}' for instanceId. The instance is a \
+                 '{instance_type}' instance, which is not an Apple silicon Mac instance",
+                instance_id = input.instance_id,
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and the instance resolved,
+        // and BEFORE the first write: the flag asks whether the request WOULD have worked,
+        // so one that would have been refused is refused with that reason instead, and one
+        // that would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The task is read back OUT of the store by the writer, so the caller sees what a
+        // later `DescribeMacModificationTasks` will see rather than the request object. The
+        // request's `MacCredentials` is `@sensitive` and the task carries no member for it,
+        // so it is not stored.
+        let task = store.start_mac_modification_task(MacModificationTaskSpec {
+            instance_id: input.instance_id.clone(),
+            task_type: MAC_MODIFICATION_TASK_TYPE_VOLUME_OWNERSHIP_DELEGATION,
+            // "[SIP modification tasks only] Information about the SIP configuration"
+            // (`MacModificationTask$MacSystemIntegrityProtectionConfig`), and this is not
+            // one.
+            sip_configuration: None,
+            tags,
+            client_token: input.client_token.clone(),
+        })?;
+
+        Ok(CreateDelegateMacVolumeOwnershipTaskOutput {
+            mac_modification_task: Some(task),
+        })
     }
 }

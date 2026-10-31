@@ -1485,6 +1485,23 @@
 //! other stores are kept in, so a pagination token can name the id the next page starts
 //! at.
 //!
+//! ## Mac modification tasks
+//!
+//! [`ComAmazonawsEc2Amazonec2State::mac_modification_tasks`] holds the tasks
+//! `CreateMacSystemIntegrityProtectionModificationTask` and
+//! `CreateDelegateMacVolumeOwnershipTask` start as [`MacModificationTaskRecord`]s: the
+//! modelled [`MacModificationTask`] `DescribeMacModificationTasks` reports, plus the two
+//! moves the clock owes it. One store for both task types, because both operations create
+//! the same resource and the describe reports it without being told which started it; the
+//! task's `TaskType` is what tells them apart. A task AWS hands back is `pending` and walks
+//! `pending` -> `in-progress` -> `successful` on its own
+//! (`smithy_query(query="shape",shape="MacModificationTaskState")`), so each move falls due
+//! one [`TRANSITION_DELAY`] after the one before it on the same monotonic clock as an
+//! instance's [`PendingTransition`], and [`MacModificationTaskRecord::view_at`] derives the
+//! state a reader sees from it rather than writing on a read. Keyed by
+//! `MacModificationTaskId` in a [`BTreeMap`], the same stable order the other stores are
+//! kept in, so a pagination token can name the id the next page starts at.
+//!
 //! ## Spot Instance requests
 //!
 //! [`ComAmazonawsEc2Amazonec2State::spot_instance_requests`] holds the Spot Instance
@@ -1584,7 +1601,8 @@ use crate::ops::types::{
     MemoryInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo, VCpuInfo,
     InstanceState, InstanceTypeOffering, InterruptionInfo, IpPermission, IpRange, Ipv6Range,
     LOCATION_TYPE_VALUES,
-    LaunchTemplate, MacHost, Monitoring, NatGateway, NetworkInsightsAccessScope,
+    LaunchTemplate, MacHost, MacModificationTask, MacSystemIntegrityProtectionConfiguration,
+    Monitoring, NatGateway, NetworkInsightsAccessScope,
     NetworkInsightsAccessScopeAnalysis, NetworkInsightsAnalysis, NetworkInsightsPath,
     NetworkInterface, NetworkInterfacePermission,
     NetworkInterfacePermissionState, NetworkInterfacePrivateIpAddress,
@@ -2264,6 +2282,67 @@ pub const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 /// Answered through [`override_refusal`](crate::service) for the modelled `@range` the
 /// boundary walk reports, and through [`max_results_below_minimum_message`] for its wording.
 pub const INVALID_MAX_RESULTS: &str = "InvalidMaxResults";
+
+/// The code and the sentence EC2 refuses a `MaxResults` below its published minimum with.
+///
+/// The two refusals differ by what the value IS, not by which operation carries it:
+///
+/// * a POSITIVE page size smaller than the smallest page the operation serves is a page
+///   size the operation will not page with, which EC2 answers [`INVALID_MAX_RESULTS`] for,
+///   in the sentence [`max_results_below_minimum_message`] words — `maxResults=4` against a
+///   published minimum of 5;
+/// * a value that is no page size at all — zero or negative, so it asks for a page of none —
+///   is a parameter the service cannot use, which EC2 answers [`INVALID_PARAMETER`] for, in
+///   the sentence [`value_below_required_minimum_message`] words.
+///
+/// One function for both, so the code and the wording of a refusal cannot disagree. `path`
+/// is the member the constraint walk reports and `value` the value the caller sent.
+/// Anything that is not an integer at all never reaches here: the walk refuses it before it
+/// has a bound to compare against.
+pub fn max_results_refusal(path: &str, value: &str, minimum: &str) -> (&'static str, String) {
+    match value.trim().parse::<i64>() {
+        Ok(page_size) if page_size > 0 => (
+            INVALID_MAX_RESULTS,
+            max_results_below_minimum_message(value, minimum),
+        ),
+        _ => (
+            INVALID_PARAMETER,
+            value_below_required_minimum_message(&declared_member_name(path), value, minimum),
+        ),
+    }
+}
+
+/// The member name as the MODEL declares it, from the lowerCamel path the constraint walk
+/// reports: `maxResults` -> `MaxResults`.
+///
+/// The walk spells a member in lowerCamel (`aws_smithy_schema_server::constraints::path`)
+/// while EC2's members are declared in PascalCase and AWS's own sentences name them that
+/// way, so the first character of each dotted segment is upper-cased and nothing else is
+/// touched.
+pub fn declared_member_name(path: &str) -> String {
+    path.split('.')
+        .map(|segment| {
+            let mut characters = segment.chars();
+            match characters.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().chain(characters).collect::<String>(),
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(".")
+}
+
+/// How EC2 states a value below the minimum a member's `@range` declares: "value `<value>`
+/// for `<member>` is less than required minimum `<minimum>`".
+///
+/// Every variable part comes from the request and the model — the member as the model
+/// declares it ([`declared_member_name`]), the value as the caller sent it (already elided
+/// by the constraint walk, so echoing it cannot amplify a request into an arbitrarily long
+/// response) and the minimum off the member's own `@range` — so nothing of one run's request
+/// is written into the template.
+pub fn value_below_required_minimum_message(member: &str, value: &str, minimum: &str) -> String {
+    format!("value {value} for {member} is less than required minimum {minimum}")
+}
 
 /// The path the boundary's constraint walk reports a `MaxResults` violation under: the
 /// member's own name in lowerCamel, which is how
@@ -4062,6 +4141,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// "Unique, case-sensitive identifier you provide to ensure the idempotency of the
     /// request" (`CreateReplaceRootVolumeTaskRequest$ClientToken`).
     pub replace_root_volume_task_client_tokens: HashMap<String, String>,
+    /// Every Mac modification task the account has started, by `MacModificationTaskId` — see
+    /// [`MacModificationTaskRecord`] and the module docs.
+    /// `CreateMacSystemIntegrityProtectionModificationTask` and
+    /// `CreateDelegateMacVolumeOwnershipTask` are the operations that start one and
+    /// `DescribeMacModificationTasks` the one that reports it. Ordered by id, which is the
+    /// order that describe reports and pages over.
+    pub mac_modification_tasks: BTreeMap<String, MacModificationTaskRecord>,
+    /// A Mac modification task `ClientToken` and the task id it minted, so a repeat of the
+    /// same request answers with that task instead of starting a second one. One map for
+    /// both creates, because one token names one task of this account whichever operation
+    /// started it.
+    pub mac_modification_task_client_tokens: HashMap<String, String>,
     /// Every Infrastructure Performance metric subscription the account has enabled, as the
     /// modelled [`Subscription`] shape itself, keyed by [`subscription_key`] — the four
     /// members that are a subscription's identity.
@@ -4468,6 +4559,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             placement_groups: BTreeMap::new(),
             replace_root_volume_tasks: BTreeMap::new(),
             replace_root_volume_task_client_tokens: HashMap::new(),
+            // A fresh account has started no Mac modification task, and no token names one.
+            mac_modification_tasks: BTreeMap::new(),
+            mac_modification_task_client_tokens: HashMap::new(),
             // A fresh account has enabled no Infrastructure Performance metric
             // subscription.
             network_performance_subscriptions: BTreeMap::new(),
@@ -9653,6 +9747,7 @@ impl ComAmazonawsEc2Amazonec2State {
             local_gateway_route_table_virtual_interface_group_associations => view,
             local_gateway_route_table_vpc_associations => view,
             local_gateway_route_tables => view,
+            mac_modification_tasks => view,
             managed_prefix_lists => view,
             nat_gateways,
             network_insights_access_scope_analyses => view,
@@ -9889,6 +9984,12 @@ pub fn private_dns_name(private_ip: &str, region: &str) -> String {
     format!("ip-{host}.{domain}", domain = private_dns_domain(region))
 }
 
+/// The `ArchitectureValues` member every Apple silicon Mac instance type reports: the
+/// catalog's `arm64_mac` (the generated catalog is
+/// `crate::ops::types::ARCHITECTURE_VALUES_VALUES`), which [`architecture_for`] answers for
+/// every `mac` family but the Intel `mac1`.
+pub const ARCHITECTURE_ARM64_MAC: &str = "arm64_mac";
+
 /// The public DNS domain of a Region: the suffix of every Amazon-provided PUBLIC hostname
 /// in it, the public counterpart of [`private_dns_domain`].
 ///
@@ -9925,7 +10026,7 @@ pub fn architecture_for(instance_type: &str) -> String {
         return if family == "mac1" {
             "x86_64_mac".to_string()
         } else {
-            "arm64_mac".to_string()
+            ARCHITECTURE_ARM64_MAC.to_string()
         };
     }
     if family == "a1" {
@@ -43525,6 +43626,368 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         self.replace_root_volume_tasks.insert(task_id.clone(), record);
         task_id
+    }
+}
+
+// =============================================================================
+// EC2 Mac modification tasks: the SIP modification and the volume ownership
+// delegation task an EC2 Mac instance can be given
+// =============================================================================
+
+/// The id prefix this service mints a Mac modification task id with.
+///
+/// CHOSEN: `MacModificationTaskId` is a bare string in the model
+/// (`smithy_query(query="shape",shape="MacModificationTaskId")` publishes no `@pattern`),
+/// so there is no prefix to read off it; this one is spelled for the Mac modification task
+/// it names, in the style of the other task prefixes this store mints. Every id comes from
+/// [`ComAmazonawsEc2Amazonec2State::next_id`], which appends the seventeen lowercase
+/// hexadecimal digits every long EC2 resource id carries, so each one is an id
+/// [`prefixed_id_is_well_formed`] accepts.
+pub const MAC_MODIFICATION_TASK_ID_PREFIX: &str = "macmdf";
+
+/// The `ResourceType` a Mac modification task is tagged as: the `mac-modification-task`
+/// member of the modelled `ResourceType` catalog (the generated catalog is
+/// `crate::ops::types::RESOURCE_TYPE_VALUES`), which is the one resource type a create's
+/// `TagSpecifications` may name.
+pub const MAC_MODIFICATION_TASK_TAGGABLE_RESOURCE: &str = "mac-modification-task";
+
+/// `MacModificationTaskState`'s `pending` member — the state a task is created in, before
+/// the service has begun carrying it out. The generated catalog is
+/// `crate::ops::types::MAC_MODIFICATION_TASK_STATE_VALUES`.
+pub const MAC_MODIFICATION_TASK_STATE_PENDING: &str = "pending";
+
+/// `MacModificationTaskState`'s `in-progress` member — the task is being carried out on the
+/// instance.
+pub const MAC_MODIFICATION_TASK_STATE_IN_PROGRESS: &str = "in-progress";
+
+/// `MacModificationTaskState`'s `successful` member — the terminal state a task that runs
+/// to completion reaches.
+pub const MAC_MODIFICATION_TASK_STATE_SUCCESSFUL: &str = "successful";
+
+/// `MacModificationTaskType`'s `sip-modification` member, the type of the task
+/// `CreateMacSystemIntegrityProtectionModificationTask` starts. The generated catalog is
+/// `crate::ops::types::MAC_MODIFICATION_TASK_TYPE_VALUES`.
+pub const MAC_MODIFICATION_TASK_TYPE_SIP_MODIFICATION: &str = "sip-modification";
+
+/// `MacModificationTaskType`'s `volume-ownership-delegation` member, the type of the task
+/// `CreateDelegateMacVolumeOwnershipTask` starts.
+pub const MAC_MODIFICATION_TASK_TYPE_VOLUME_OWNERSHIP_DELEGATION: &str =
+    "volume-ownership-delegation";
+
+/// The largest page `DescribeMacModificationTasks` serves, and the page it serves when the
+/// request names no size: the top of the modelled `MaxResults` range, `range 1..500`
+/// (`smithy_query(query="operation",operation="DescribeMacModificationTasks")`), so a
+/// request that names no page size is answered with the largest page the operation can be
+/// asked for and the `NextToken` path behaves the same either way.
+pub const MAX_MAC_MODIFICATION_TASKS_PAGE_SIZE: usize = 500;
+
+/// EC2's code for something that is not a Mac modification task id at all, named the way
+/// [`INVALID_REPLACE_ROOT_VOLUME_TASK_ID_MALFORMED`] is: EC2 answers
+/// `Invalid<Resource>Id.Malformed` BEFORE it looks an id up.
+pub const INVALID_MAC_MODIFICATION_TASK_ID_MALFORMED: &str = "InvalidMacModificationTaskId.Malformed";
+
+/// EC2's code for a Mac modification task id that names no task of the account.
+pub const INVALID_MAC_MODIFICATION_TASK_ID_NOT_FOUND: &str = "InvalidMacModificationTaskId.NotFound";
+
+/// One stored Mac modification task: the modelled [`MacModificationTask`] every operation
+/// that reports one answers with, plus the two moves the clock owes it.
+///
+/// A create answers a task in the non-terminal `pending` state, and the task walks
+/// `pending` -> `in-progress` -> `successful` on its own whether or not anybody calls again
+/// (`smithy_query(query="shape",shape="MacModificationTaskState")`), so each move's due
+/// instant is recorded here on the monotonic clock and [`Self::view_at`] derives the state
+/// from it. `TaskState` is therefore NOT stored on the view: a reader that observed one
+/// state could otherwise disagree with the clock.
+#[derive(Debug, Clone)]
+pub struct MacModificationTaskRecord {
+    /// The task as the model shapes it, with `TaskState` left for [`Self::view_at`] to fill.
+    pub view: MacModificationTask,
+    /// The instant from which this task's `pending` -> `in-progress` move is due.
+    /// Monotonic ([`Instant`]), because it is only ever compared against the clock and never
+    /// reported, so a wall-clock adjustment cannot move a task backwards.
+    pub in_progress_at: Instant,
+    /// The instant from which this task's `in-progress` -> `successful` move is due.
+    pub successful_at: Instant,
+}
+
+impl MacModificationTaskRecord {
+    /// A task starting now: `pending`, with its `in-progress` move due one
+    /// [`TRANSITION_DELAY`] from now and its `successful` move one delay after that.
+    pub fn starting_now(view: MacModificationTask) -> Self {
+        let now = Instant::now();
+        Self {
+            view,
+            in_progress_at: now + TRANSITION_DELAY,
+            successful_at: now + TRANSITION_DELAY * 2,
+        }
+    }
+
+    /// The task's `MacModificationTaskState` at `now`.
+    pub fn state_at(&self, now: Instant) -> &'static str {
+        if now < self.in_progress_at {
+            MAC_MODIFICATION_TASK_STATE_PENDING
+        } else if now < self.successful_at {
+            MAC_MODIFICATION_TASK_STATE_IN_PROGRESS
+        } else {
+            MAC_MODIFICATION_TASK_STATE_SUCCESSFUL
+        }
+    }
+
+    /// This task as of `now`: the stored view with the state the clock has reached. A read
+    /// observes the moves the clock already owed without writing anything.
+    pub fn view_at(&self, now: Instant) -> MacModificationTask {
+        MacModificationTask {
+            task_state: Some(self.state_at(now).to_string()),
+            ..self.view.clone()
+        }
+    }
+}
+
+/// The bytes one stored Mac modification task holds for the process's lifetime: the tags the
+/// request chose, the `ClientToken` the token map keeps for it, and the fixed overhead of the
+/// record itself ([`STORED_RECORD_OVERHEAD_BYTES`]).
+///
+/// Everything else on the record — the task's own id, the instance it names, the SIP
+/// configuration (eight members of a two-value catalog), the start time and the state — is
+/// this module's own or bounded by the forms the model publishes, so it is fixed-size. The
+/// ONE definition of that charge, so a writer cannot store bytes the store's budget never
+/// saw.
+pub fn mac_modification_task_payload_bytes(
+    view: &MacModificationTask,
+    client_token: Option<&str>,
+) -> usize {
+    tag_list_bytes(view.tags.as_deref().unwrap_or_default())
+        .saturating_add(client_token.map_or(0, str::len))
+        .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
+}
+
+/// Refuse a request that named a Mac modification task id this service cannot resolve: a
+/// malformed one before an unknown one, the order EC2 asks the two questions in — the
+/// contract [`require_known_replace_root_volume_task`] keeps for root volume replacement
+/// tasks.
+pub fn require_known_mac_modification_task<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    task_id: &str,
+) -> Result<(), Scaffolded<E>> {
+    require_well_formed_id(
+        MAC_MODIFICATION_TASK_ID_PREFIX,
+        task_id,
+        INVALID_MAC_MODIFICATION_TASK_ID_MALFORMED,
+    )?;
+    if !store.mac_modification_tasks.contains_key(task_id) {
+        return Err(id_not_found(
+            INVALID_MAC_MODIFICATION_TASK_ID_NOT_FOUND,
+            "mac modification task id",
+            task_id,
+        ));
+    }
+    Ok(())
+}
+
+/// The stored instance a Mac modification task may be given to, or the refusal the request
+/// gets instead.
+///
+/// Both tasks act on "an Amazon EC2 Mac instance" (`MacModificationTask$InstanceId`), so an
+/// instance of a family that does not run macOS ([`is_mac_instance_family`]) is no instance
+/// either task can be created for, and an instance on its way to `terminated` has no macOS
+/// left to configure. The ONE reading of those three refusals, so the two creates cannot
+/// disagree about which instance a task may name, and the resolved record is handed back so
+/// a handler reads the instance once.
+pub fn require_mac_instance<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+) -> Result<&'store InstanceRecord, Scaffolded<E>> {
+    let instance = require_instance_record(store, instance_id)?;
+    let instance_family = instance_family_of(&instance.instance_type);
+    if !is_mac_instance_family(instance_family) {
+        return Err(invalid_parameter_value(format!(
+            "Invalid value '{instance_id}' for instanceId. The instance is a \
+             '{instance_type}' instance, which is not an Amazon EC2 Mac instance",
+            instance_type = instance.instance_type,
+        )));
+    }
+    if instance.state.is_terminating() {
+        return Err(Scaffolded::incorrect_instance_state(
+            instance_id,
+            instance.state.as_str(),
+            "given a Mac modification task",
+        ));
+    }
+    Ok(instance)
+}
+
+/// What one Mac modification task is created from: the facts its writer resolved, which
+/// [`ComAmazonawsEc2Amazonec2State::start_mac_modification_task`] turns into the stored
+/// record.
+///
+/// The caller's `MacCredentials` is NOT among them: the member is `@sensitive`
+/// (`smithy_query(query="shape",shape="SensitiveMacCredentials")`), the modelled
+/// `MacModificationTask` carries no member for it, and nothing a reader is shown is derived
+/// from it — so it is never stored.
+#[derive(Debug, Clone)]
+pub struct MacModificationTaskSpec {
+    /// "The ID of the Amazon EC2 Mac instance" (`MacModificationTask$InstanceId`), already
+    /// resolved by [`require_mac_instance`].
+    pub instance_id: String,
+    /// "The type of task" (`MacModificationTask$TaskType`): one of
+    /// [`MAC_MODIFICATION_TASK_TYPE_SIP_MODIFICATION`] and
+    /// [`MAC_MODIFICATION_TASK_TYPE_VOLUME_OWNERSHIP_DELEGATION`].
+    pub task_type: &'static str,
+    /// "[SIP modification tasks only] Information about the SIP configuration"
+    /// (`MacModificationTask$MacSystemIntegrityProtectionConfig`) — `None` for a task of any
+    /// other type, which is what "SIP modification tasks only" means.
+    pub sip_configuration: Option<MacSystemIntegrityProtectionConfiguration>,
+    /// "The tags assigned to the task" (`MacModificationTask$Tags`), as the request's
+    /// `TagSpecifications` named them.
+    pub tags: Vec<Tag>,
+    /// The request's idempotency token, if it carried one.
+    pub client_token: Option<String>,
+}
+
+/// Does the stored task `view` report exactly the request `spec` describes?
+///
+/// Everything the modelled `MacModificationTask` carries OF THE REQUEST is compared — the
+/// instance, the task type, the SIP configuration and the tags — so a `ClientToken` reuse
+/// counts as a replay only when the request really is the one the token already named; the
+/// members the SERVICE owns (the id, the start time and the state) are its own and are not
+/// part of a request's identity. The modelled shapes derive no `PartialEq`, so the
+/// comparison is written out member by member here, in the one place that needs it.
+fn mac_modification_task_reports(
+    view: &MacModificationTask,
+    spec: &MacModificationTaskSpec,
+) -> bool {
+    let settings = |configuration: Option<&MacSystemIntegrityProtectionConfiguration>| {
+        configuration.map(|configuration| {
+            [
+                configuration.apple_internal.clone(),
+                configuration.base_system.clone(),
+                configuration.debugging_restrictions.clone(),
+                configuration.d_trace_restrictions.clone(),
+                configuration.filesystem_protections.clone(),
+                configuration.kext_signing.clone(),
+                configuration.nvram_protections.clone(),
+                configuration.status.clone(),
+            ]
+        })
+    };
+    let pairs = |tags: &[Tag]| -> Vec<(Option<String>, Option<String>)> {
+        tags.iter()
+            .map(|tag| (tag.key.clone(), tag.value.clone()))
+            .collect()
+    };
+    view.instance_id.as_deref() == Some(spec.instance_id.as_str())
+        && view.task_type.as_deref() == Some(spec.task_type)
+        && settings(view.mac_system_integrity_protection_config.as_ref())
+            == settings(spec.sip_configuration.as_ref())
+        && pairs(view.tags.as_deref().unwrap_or_default()) == pairs(&spec.tags)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another Mac modification task fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_replace_root_volume_task_capacity`].
+    pub fn has_mac_modification_task_capacity(&self) -> bool {
+        self.mac_modification_tasks.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Start the Mac modification task `spec` describes and answer it as a reader will see
+    /// it, or refuse the request because this emulator cannot hold another task.
+    ///
+    /// The ONE way a Mac modification task is stored, so the two creates cannot write one
+    /// resource two ways: the id is minted here, the start time is this service's own
+    /// reading of the clock, and the state is left to the clock
+    /// ([`MacModificationTaskRecord`]). A `ClientToken` already in the store names the task
+    /// it started — "unique, case-sensitive identifier you provide to ensure the idempotency
+    /// of the request" (`CreateMacSystemIntegrityProtectionModificationTaskRequest$ClientToken`)
+    /// — so a replay reports that task and starts nothing, while a token reused by a
+    /// different request is refused ([`idempotent_parameter_mismatch`]). Both are answered
+    /// before the ceilings a fresh create has to clear, because neither stores anything.
+    pub fn start_mac_modification_task<E>(
+        &mut self,
+        spec: MacModificationTaskSpec,
+    ) -> Result<MacModificationTask, Scaffolded<E>> {
+        if let Some(task_id) = spec
+            .client_token
+            .as_deref()
+            .and_then(|token| self.mac_modification_task_client_tokens.get(token))
+            .cloned()
+        {
+            // The token names the task it started, so a REPLAY reports that task. A
+            // DIFFERENT request under the same token is not a replay — "the request uses the
+            // same client token as a previous, but non-identical request" — so it is told so
+            // rather than served, and the identity compared is EVERYTHING the stored task
+            // reports of the request it was created from ([`mac_modification_task_reports`]).
+            let started = self
+                .mac_modification_tasks
+                .get(&task_id)
+                .map(|record| &record.view);
+            let names_the_same_request =
+                started.is_some_and(|view| mac_modification_task_reports(view, &spec));
+            if !names_the_same_request {
+                return Err(idempotent_parameter_mismatch());
+            }
+            return self.mac_modification_task_view(&task_id);
+        }
+
+        let view = MacModificationTask {
+            // Minted at the insert below, so an id is never chosen twice.
+            mac_modification_task_id: None,
+            instance_id: Some(spec.instance_id),
+            mac_system_integrity_protection_config: spec.sip_configuration,
+            // "The date and time the task was created"
+            // (`MacModificationTask$StartTime`): this service's own reading of the wall
+            // clock, never a value a request carried.
+            start_time: Some(system_time_to_date_time(SystemTime::now())),
+            tags: Some(spec.tags),
+            // Derived by the record from the clock, not stored on the view.
+            task_state: None,
+            task_type: Some(spec.task_type.to_string()),
+        };
+        let payload_bytes =
+            mac_modification_task_payload_bytes(&view, spec.client_token.as_deref());
+        if !self.has_mac_modification_task_capacity() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {MAX_STORED_RECORDS_PER_STORE} Mac modification tasks, \
+                 which is as many as it stores"
+            )));
+        }
+        if self.would_exceed_stored_bytes(payload_bytes) {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                self.stored_bytes()
+            )));
+        }
+
+        let task_id = self.next_id(MAC_MODIFICATION_TASK_ID_PREFIX);
+        let mut record = MacModificationTaskRecord::starting_now(view);
+        record.view.mac_modification_task_id = Some(task_id.clone());
+        self.add_stored_bytes(payload_bytes);
+        if let Some(token) = spec.client_token {
+            self.mac_modification_task_client_tokens
+                .insert(token, task_id.clone());
+        }
+        self.mac_modification_tasks.insert(task_id.clone(), record);
+        self.mac_modification_task_view(&task_id)
+    }
+
+    /// The stored Mac modification task `task_id` names, as of now.
+    ///
+    /// A create answers the task by reading it back OUT of the store through here, so the
+    /// caller sees what a later `DescribeMacModificationTasks` will see rather than the
+    /// request object.
+    fn mac_modification_task_view<E>(
+        &self,
+        task_id: &str,
+    ) -> Result<MacModificationTask, Scaffolded<E>> {
+        self.mac_modification_tasks
+            .get(task_id)
+            .map(|record| record.view_at(Instant::now()))
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the Mac modification task '{task_id}' could not be read back"
+                ))
+            })
     }
 }
 

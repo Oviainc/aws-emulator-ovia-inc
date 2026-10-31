@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMacSystemIntegrityProtectionModificationTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMacSystemIntegrityProtectionModificationTask`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: starts a `sip-modification` task on an EC2 Mac instance of the account and
+//! stores it in [`crate::state`], where `DescribeMacModificationTasks` reports it. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMacSystemIntegrityProtectionModificationTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +170,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMacSystemIntegrityProtectionModificationTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMacSystemIntegrityProtectionModificationTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMacSystemIntegrityProtectionModificationTask"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            require_mac_instance, require_service_state, tags_from_specifications,
+            MacModificationTaskSpec, MAC_MODIFICATION_TASK_TAGGABLE_RESOURCE,
+            MAC_MODIFICATION_TASK_TYPE_SIP_MODIFICATION, MAX_CLIENT_TOKEN_CHARS,
+        };
+
+        // `ctx` carries request metadata only, and nothing a Mac modification task holds
+        // names a Region: the modelled `MacModificationTask` carries no ARN and no zone.
+        let _ = ctx;
+
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // "Specifies tags to apply to the SIP modification task" (`TagSpecifications`): the
+        // task is the only resource this call creates, so the crate's ONE reader of a
+        // create's tag specifications is what reads them — a specification naming another
+        // resource type or none at all is refused, a duplicate or reserved key is refused,
+        // and the per-resource tag count and each key and value length are bounded there
+        // rather than a second way here.
+        let tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            MAC_MODIFICATION_TASK_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+
+        // The configuration the task will report, derived from the request before the store
+        // is touched: the modelled enum members have already been refused if they were not
+        // `enabled` or `disabled`, so this cannot fail.
+        let sip_configuration = requested_sip_configuration(
+            &input.mac_system_integrity_protection_status,
+            input.mac_system_integrity_protection_configuration.as_ref(),
+        );
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // This call writes, so the moves the clock already owed the instances are applied
+        // before their states are read: the refusal below is about the state the instance is
+        // in NOW, not the one it was left in by an earlier call.
+        store.materialize_due_transitions();
+
+        // "The ID of the Amazon EC2 Mac instance" (`InstanceId`), resolved through the one
+        // reader both Mac task creates share, so neither accepts an instance the other
+        // refuses.
+        require_mac_instance(&store, &input.instance_id)?;
+
+        // DryRun sits AFTER every parameter has been validated and the instance resolved,
+        // and BEFORE the first write: the flag asks whether the request WOULD have worked,
+        // so one that would have been refused is refused with that reason instead, and one
+        // that would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The task is read back OUT of the store by the writer, so the caller sees what a
+        // later `DescribeMacModificationTasks` will see rather than the request object.
+        let task = store.start_mac_modification_task(MacModificationTaskSpec {
+            instance_id: input.instance_id.clone(),
+            task_type: MAC_MODIFICATION_TASK_TYPE_SIP_MODIFICATION,
+            sip_configuration: Some(sip_configuration),
+            tags,
+            client_token: input.client_token.clone(),
+        })?;
+
+        Ok(CreateMacSystemIntegrityProtectionModificationTaskOutput {
+            mac_modification_task: Some(task),
+        })
+    }
+}
+
+/// The SIP configuration a task reports for a request that asked for the overall `status`
+/// with `overrides`.
+///
+/// "To enable or disable all SIP settings, use the MacSystemIntegrityProtectionStatus
+/// parameter only", and "to specify a custom configuration that selectively enables or
+/// disables specific SIP settings, use the MacSystemIntegrityProtectionStatus parameter to
+/// enable or disable all SIP settings, and then use the
+/// MacSystemIntegrityProtectionConfiguration parameter to specify exceptions. In this case,
+/// the exceptions you specify for MacSystemIntegrityProtectionConfiguration override the
+/// value you specify for MacSystemIntegrityProtectionStatus"
+/// (`CreateMacSystemIntegrityProtectionModificationTask`). So every individual setting the
+/// task reports is the exception the request named for it, else the overall status, and
+/// `Status` — "indicates SIP was enabled or disabled by the task"
+/// (`MacSystemIntegrityProtectionConfiguration$Status`) — is the overall status itself.
+///
+/// The reported configuration has one member per setting of
+/// `MacSystemIntegrityProtectionConfigurationRequest`, so a setting cannot be dropped as
+/// the catalog grows: the shapes are paired member by member here.
+fn requested_sip_configuration(
+    status: &str,
+    overrides: Option<&MacSystemIntegrityProtectionConfigurationRequest>,
+) -> MacSystemIntegrityProtectionConfiguration {
+    let setting = |exception: Option<&String>| {
+        Some(
+            exception
+                .map(String::as_str)
+                .unwrap_or(status)
+                .to_string(),
+        )
+    };
+    MacSystemIntegrityProtectionConfiguration {
+        apple_internal: setting(overrides.and_then(|request| request.apple_internal.as_ref())),
+        base_system: setting(overrides.and_then(|request| request.base_system.as_ref())),
+        debugging_restrictions: setting(
+            overrides.and_then(|request| request.debugging_restrictions.as_ref()),
+        ),
+        d_trace_restrictions: setting(
+            overrides.and_then(|request| request.d_trace_restrictions.as_ref()),
+        ),
+        filesystem_protections: setting(
+            overrides.and_then(|request| request.filesystem_protections.as_ref()),
+        ),
+        kext_signing: setting(overrides.and_then(|request| request.kext_signing.as_ref())),
+        nvram_protections: setting(overrides.and_then(|request| request.nvram_protections.as_ref())),
+        status: Some(status.to_string()),
     }
 }
