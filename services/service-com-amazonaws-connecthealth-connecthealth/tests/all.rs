@@ -19,6 +19,8 @@ mod caller_sized_refusal_bound;
 mod client_refusal_is_modelled;
 #[path = "all/create_domain_idempotent_repeat.rs"]
 mod create_domain_idempotent_repeat;
+#[path = "all/deleted_domain_stops_contained_transitions.rs"]
+mod deleted_domain_stops_contained_transitions;
 #[path = "all/domain_account_cap_and_lookup_semantics.rs"]
 mod domain_account_cap_and_lookup_semantics;
 #[path = "all/domain_liveness_agreement.rs"]

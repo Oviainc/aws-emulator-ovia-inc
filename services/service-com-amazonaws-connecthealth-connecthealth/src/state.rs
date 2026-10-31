@@ -1025,8 +1025,8 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     ///
     /// Stated once HERE rather than per handler, so no handler can materialise one class
     /// of owed work and leave another standing: a `Domain` whose `DELETING` span has
-    /// elapsed is purged (`purge_due_deletions`), and a patient insights job whose next
-    /// status transition has fallen due is moved on
+    /// elapsed is purged (`purge_due_deletions`), and a patient insights job of a LIVE
+    /// domain whose next status transition has fallen due is moved on
     /// (`advance_due_patient_insights_jobs`). The purge runs first, so no transition is
     /// applied to a record this same instant already owed the removal of.
     ///
@@ -1065,14 +1065,22 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     }
 
     /// Materialise every patient-insights-job status transition the CLOCK has already
-    /// made due, in every domain.
+    /// made due, in every LIVE domain.
     ///
     /// The other half of [`Self::materialise_due`], which is the only caller: it writes
     /// only what was owed at this instant whether or not anybody called, so a job
     /// observed late reads exactly as it would have at the moment its transition fell
     /// due.
+    ///
+    /// Liveness is the scope because of the rule [`Domain::is_live`] states: from the
+    /// instant a delete is recorded against a domain, the records it CONTAINS are gone
+    /// for every transition on them, so a job held under a domain whose deletion is
+    /// already recorded owes nothing further — the same treatment `DeleteDomain` gives
+    /// the other contained record kind, whose lifecycle it ends in the deleting call.
+    /// Owed work on such a record is the purge, which the half that runs first
+    /// (`purge_due_deletions`) applies.
     fn advance_due_patient_insights_jobs(&mut self, now: SystemTime) {
-        for domain in self.domains.values_mut() {
+        for domain in self.domains.values_mut().filter(|domain| domain.is_live()) {
             for job in domain.patient_insights_jobs.values_mut() {
                 job.apply_due_transitions(now);
             }
