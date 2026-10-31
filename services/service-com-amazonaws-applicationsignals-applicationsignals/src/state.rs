@@ -11,7 +11,7 @@
 //! the server-derived members of a stored record — two copies of that logic would let a
 //! Get disagree with the Create that wrote the record.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::time::Duration;
 
@@ -3145,14 +3145,69 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         })
     }
 
+    /// The ONE identity this emulator reports the entity `key_attributes` names by over the
+    /// window, or `None` when no stored SLO monitors it — so nothing was discovered for that
+    /// identity.
+    ///
+    /// An entity is identified by as few as one of its up to four `Attributes` entries
+    /// ([`attributes_contain`]), so the same entity can be named by a subset of the
+    /// attributes one of its SLOs records and by a fuller set another records. It is still
+    /// ONE entity, which the real service holds one identity for, so a read reports it by the
+    /// FULLEST identity this store holds for it — the caller's own set when the matching SLOs
+    /// hold none fuller, since the attributes ARE the identity and the caller named it.
+    ///
+    /// Single-homed so every projection of one entity — its own summary, its operations and
+    /// the edges it is an end of — reports and dimensions it the same way, and two reads
+    /// over one window cannot disagree about an entity's identity or about the dimensions of
+    /// the metrics collected for it. It is the same resolution
+    /// [`Self::observed_services`] applies from the other side, where a strict-subset identity
+    /// is folded into the fuller one rather than reported as a second service.
+    ///
+    /// A map that names NO attribute identifies no entity — every stored record matches it —
+    /// so there is no entity to resolve an identity for.
+    ///
+    /// The map handed in is the identity the entity is NAMED by: the request's own where the
+    /// caller named the entity the read is about — which already carries the minimum identity
+    /// the member documents for its `Type` ([`entity_identity_refusal`]), so it pins the
+    /// entity down and the whole answer is about that one entity — or a stored record's own
+    /// where the entity is one this store named rather than the caller
+    /// ([`Self::observed_dependents`], whose near end is a dependent the caller did not name).
+    fn observed_identity(
+        &self,
+        key_attributes: &HashMap<String, String>,
+        window_start: &DateTime,
+        window_end: &DateTime,
+        now: &DateTime,
+    ) -> Option<HashMap<String, String>> {
+        if key_attributes.is_empty() {
+            return None;
+        }
+        let mut reported: Option<HashMap<String, String>> = None;
+        for slo in self.monitoring(key_attributes, window_start, window_end, now) {
+            // Every record this walk admits holds every entry the caller named
+            // ([`attributes_contain`]), so a matched identity is a SUPERSET of the named one
+            // and the longest of them is the fullest this store holds for the entity.
+            let Some(observed) = entity_of(slo).key_attributes else {
+                continue;
+            };
+            let fuller = reported
+                .as_ref()
+                .is_none_or(|current| observed.len() > current.len());
+            if fuller {
+                reported = Some(observed);
+            }
+        }
+        reported
+    }
+
     /// The entity `key_attributes` identifies, as `GetService` reports it over the window.
     ///
-    /// The reported key attributes are the fullest set this emulator holds for the entity —
-    /// the request's own when it holds none, since the attributes ARE the entity's identity
-    /// and the caller named it. So an entity no stored SLO monitors is reported by its
-    /// identity alone rather than refused: Application Signals identifies an entity by its
-    /// key attributes rather than by a stored resource id, and this read reports what it
-    /// observed for that identity.
+    /// The reported key attributes are the identity this emulator holds for the entity
+    /// ([`Self::observed_identity`]) — the request's own when no stored SLO holds a fuller
+    /// one, since the attributes ARE the entity's identity and the caller named it. So an
+    /// entity no stored SLO monitors is reported by its identity alone rather than refused:
+    /// Application Signals identifies an entity by its key attributes rather than by a
+    /// stored resource id, and this read reports what it observed for that identity.
     ///
     /// `MetricReferences` reports the standard metrics Application Signals collects for the
     /// entity ([`standard_metric_references`]), dimensioned by the identity this read
@@ -3175,24 +3230,15 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         window_end: &DateTime,
         now: &DateTime,
     ) -> Service {
-        let mut reported = key_attributes.clone();
-        let mut discovered = false;
-        for slo in self.monitoring(key_attributes, window_start, window_end, now) {
-            discovered = true;
-            if let Some(observed) = entity_of(slo).key_attributes {
-                if observed.len() > reported.len() {
-                    reported = observed;
-                }
-            }
-        }
-        let (metric_references, service_groups) = if discovered {
-            (
-                standard_metric_references(metric_dimensions(&reported, None, None)),
-                self.service_groups(&reported),
-            )
-        } else {
-            (Vec::new(), None)
-        };
+        let (reported, metric_references, service_groups) =
+            match self.observed_identity(key_attributes, window_start, window_end, now) {
+                Some(reported) => (
+                    reported.clone(),
+                    standard_metric_references(metric_dimensions(&reported, None, None)),
+                    self.service_groups(&reported),
+                ),
+                None => (key_attributes.clone(), Vec::new(), None),
+            };
         Service {
             key_attributes: reported,
             attribute_maps: None,
@@ -3284,9 +3330,11 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// Each entry's `MetricReferences` reports the standard metrics collected for THAT
     /// operation ([`standard_metric_references`]): the dimensions are the entity's identity
     /// plus the operation, so two operations of one service carry different references. The
-    /// identity used is the fullest one the stored SLOs hold for the entity, as
-    /// [`Self::observed_service`] reports it, so the dimensions cannot disagree with the
-    /// `GetService` answer for the same entity.
+    /// identity is the ONE this emulator holds for the entity ([`Self::observed_identity`]),
+    /// resolved once for the whole answer rather than per operation, so the entries cannot
+    /// disagree with each other or with the `GetService` answer for the same entity over the
+    /// same window — a `ServiceOperation` carries no identity of its own for a caller to tell
+    /// two dimension sets apart by.
     pub fn observed_operations(
         &self,
         key_attributes: &HashMap<String, String>,
@@ -3294,23 +3342,19 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         window_end: &DateTime,
         now: &DateTime,
     ) -> Vec<ServiceOperation> {
-        let mut by_name: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
+        let Some(identity) = self.observed_identity(key_attributes, window_start, window_end, now)
+        else {
+            return Vec::new();
+        };
+        let mut names: BTreeSet<String> = BTreeSet::new();
         for slo in self.monitoring(key_attributes, window_start, window_end, now) {
-            let entity = entity_of(slo);
-            let Some(name) = entity.operation_name else {
-                continue;
-            };
-            let observed = entity
-                .key_attributes
-                .unwrap_or_else(|| key_attributes.clone());
-            let identity = by_name.entry(name).or_default();
-            if observed.len() > identity.len() {
-                *identity = observed;
+            if let Some(name) = entity_of(slo).operation_name {
+                names.insert(name);
             }
         }
-        by_name
+        names
             .into_iter()
-            .map(|(name, identity)| ServiceOperation {
+            .map(|name| ServiceOperation {
                 metric_references: standard_metric_references(metric_dimensions(
                     &identity,
                     Some(&name),
@@ -3333,7 +3377,13 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// Each edge's `MetricReferences` reports the standard metrics collected for THAT call
     /// ([`standard_metric_references`]): the dimensions are the calling entity's identity
     /// and operation plus the far end's identity and operation, so two edges out of one
-    /// service carry different references.
+    /// service carry different references. The near end's identity is the ONE this emulator
+    /// holds for the entity ([`Self::observed_identity`]), resolved once for the whole
+    /// answer rather than per edge, so no two edges out of one entity — and no other read of
+    /// it over the same window — disagree about the entity's own dimensions. The far end's
+    /// is the one the edge RECORDS, which this entry also reports under its `@required`
+    /// `DependencyKeyAttributes`, so an entry's dimensions state the same far end its
+    /// members do.
     pub fn observed_dependencies(
         &self,
         key_attributes: &HashMap<String, String>,
@@ -3341,6 +3391,10 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         window_end: &DateTime,
         now: &DateTime,
     ) -> Vec<ServiceDependency> {
+        let Some(identity) = self.observed_identity(key_attributes, window_start, window_end, now)
+        else {
+            return Vec::new();
+        };
         let mut by_edge: BTreeMap<String, ServiceDependency> = BTreeMap::new();
         for slo in self.monitoring(key_attributes, window_start, window_end, now) {
             let entity = entity_of(slo);
@@ -3349,9 +3403,6 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             else {
                 continue;
             };
-            let identity = entity
-                .key_attributes
-                .unwrap_or_else(|| key_attributes.clone());
             let edge = format!(
                 "{operation_name}\u{1d}{}\u{1d}{}",
                 attribute_key(&dependency.dependency_key_attributes),
@@ -3389,7 +3440,12 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// the dimensions are the dependent's identity and operation on the near end and the
     /// invoked entity and operation on the far end — the same dimension set
     /// [`Self::observed_dependencies`] reports for the same edge seen from the caller, which
-    /// is what keeps the two directions from disagreeing about one edge.
+    /// is what keeps the two directions from disagreeing about one edge. The dependent is an
+    /// entity of its own, so the identity reported and dimensioned for it is the ONE this
+    /// emulator holds for it ([`Self::observed_identity`]) rather than whichever subset of it
+    /// the record this edge was read off happens to name — the identity a `GetService` on the
+    /// dependent echoes back, and the identity the dependency view of this edge dimensions
+    /// its near end by.
     pub fn observed_dependents(
         &self,
         key_attributes: &HashMap<String, String>,
@@ -3404,6 +3460,11 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             return Vec::new();
         }
         let mut by_edge: BTreeMap<String, ServiceDependent> = BTreeMap::new();
+        // The identity resolved for each dependent, by the record's own identity: several
+        // edges can come out of one dependent, and resolving its identity walks the store, so
+        // the answer is resolved once per distinct recorded identity rather than once per
+        // edge.
+        let mut identities: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
         for slo in self
             .slos
             .values()
@@ -3416,9 +3477,16 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             if !attributes_contain(Some(&dependency.dependency_key_attributes), key_attributes) {
                 continue;
             }
-            let Some(dependent_key_attributes) = entity.key_attributes else {
+            let Some(recorded) = entity.key_attributes else {
                 continue;
             };
+            let dependent_key_attributes = identities
+                .entry(attribute_key(&recorded))
+                .or_insert_with(|| {
+                    self.observed_identity(&recorded, window_start, window_end, now)
+                        .unwrap_or(recorded)
+                })
+                .clone();
             let edge = format!(
                 "{}\u{1d}{}\u{1d}{}",
                 attribute_key(&dependent_key_attributes),
