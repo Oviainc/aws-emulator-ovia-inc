@@ -241,11 +241,16 @@ fn resolve(
     // `UnsupportedOperationException` is "thrown when you attempt to perform an
     // operation that isn't enabled for the user pool client" (this service's model),
     // and token revocation is the one feature of an app client this operation needs:
-    // a client whose `EnableTokenRevocation` is off serves it for no token at all.
+    // a client whose `EnableTokenRevocation` is off serves it for no token at all. The
+    // refusal carries the one fixed sentence this service answers for a feature its app
+    // client does not have ([`crate::state::CLIENT_FEATURE_NOT_ENABLED_MESSAGE`]), and
+    // the gate is asked before the submitted `Token` is resolved at all, so the refusal
+    // is the same whatever that value names and nothing is revoked by a request it
+    // refuses.
     if !client.enable_token_revocation {
         return Err(RevokeTokenErrorModeled::UnsupportedOperationException(
             UnsupportedOperationException {
-                message: Some("Token revocation is not enabled for this app client.".to_string()),
+                message: Some(crate::state::CLIENT_FEATURE_NOT_ENABLED_MESSAGE.to_string()),
             },
         )
         .into());

@@ -22,7 +22,8 @@
 //!   client has a secret" (this operation's own doc), and
 //!   `UnsupportedOperationException` is "thrown when you attempt to perform an operation
 //!   that isn't enabled for the user pool client" (this service's model), which for this
-//!   operation is an app client whose `EnableTokenRevocation` is off.
+//!   operation is an app client whose stored `EnableTokenRevocation` is off — refused
+//!   before the submitted `Token` is looked at, with one fixed sentence.
 //!
 //! Each table row names the case it asserts.
 
@@ -55,6 +56,14 @@ const REVOKE: &str = "RevokeToken";
 
 /// The operation that exchanges a refresh token for fresh tokens.
 const REFRESH: &str = "GetTokensFromRefreshToken";
+
+/// The wire error code of the refusal an app client answers with when the feature the
+/// operation needs is switched off in its stored configuration.
+const FEATURE_DISABLED_CODE: &str = "UnsupportedOperationException";
+
+/// The fixed sentence that refusal carries: no part of it is taken from the request or
+/// from stored state, so it reads the same for every app client and every token.
+const FEATURE_DISABLED_MESSAGE: &str = "This feature is not enabled for this client";
 
 /// A `ClientIdType`-shaped id (pattern `^[\w+]+$`, length 1..128) no create minted.
 const UNKNOWN_CLIENT_ID: &str = "nosuchappclient0000";
@@ -830,9 +839,250 @@ async fn the_app_client_must_authenticate_and_serve_revocation() {
         REVOKE,
         &revoke_body(&no_revocation, &live_refresh),
         400,
-        "UnsupportedOperationException",
-        "Token revocation is not enabled for this app client.",
+        FEATURE_DISABLED_CODE,
+        FEATURE_DISABLED_MESSAGE,
     )
     .await;
     access_token_identifies(&router, case, &token(case, &signed_in, "AccessToken"), "alice").await;
+}
+
+/// Which value a row of the feature-gate table submits as `Token`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GatedToken {
+    /// The sign-in's own refresh token, the one value this operation revokes.
+    Refresh,
+    /// The access token minted beside it, a token of this app client that is not a
+    /// refresh token.
+    Access,
+    /// The id token minted beside it.
+    Id,
+    /// A well-formed value this emulator issued to nobody.
+    Unissued,
+    /// A refresh token ANOTHER app client of the same pool issued.
+    OtherClientRefresh,
+}
+
+/// One row of the feature-gate table: how the app client's stored
+/// `EnableTokenRevocation` came to hold the value it holds, whether the app client
+/// authenticates with a secret, and which value the revocation names.
+struct FeatureGateRow {
+    case: &'static str,
+    /// `EnableTokenRevocation` at create time; `None` leaves the member unset, which
+    /// activates token revocation.
+    created_with: Option<bool>,
+    /// The `EnableTokenRevocation` an `UpdateUserPoolClient` then writes, when the row
+    /// makes one: `Some(None)` is an update that omits the member.
+    updated_to: Option<Option<bool>>,
+    /// Whether the app client holds a secret, which the revocation then presents.
+    generate_secret: bool,
+    token: GatedToken,
+}
+
+/// Whether the app client the row configures ends up with token revocation activated.
+///
+/// "If you don't include this parameter, token revocation is automatically activated"
+/// (`EnableTokenRevocation` in this service's model), on the create path and on the
+/// update path alike, and an update REPLACES the member, so the last write wins.
+fn revocation_activated(row: &FeatureGateRow) -> bool {
+    match row.updated_to {
+        Some(updated) => updated.unwrap_or(true),
+        None => row.created_with.unwrap_or(true),
+    }
+}
+
+/// An app client whose stored configuration does not activate the feature this
+/// operation needs refuses it with `UnsupportedOperationException` and ONE fixed
+/// sentence, before the submitted `Token` is resolved at all — so the refusal is the
+/// same whatever that value names, and nothing is revoked. Activate the feature again
+/// and the same request is decided by the value instead.
+#[tokio::test]
+async fn an_app_client_without_the_feature_refuses_with_the_fixed_sentence() {
+    let rows = [
+        FeatureGateRow {
+            case: "revocation off at create, the sign-in's own refresh token",
+            created_with: Some(false),
+            updated_to: None,
+            generate_secret: false,
+            token: GatedToken::Refresh,
+        },
+        FeatureGateRow {
+            case: "revocation off at create, the access token minted beside it",
+            created_with: Some(false),
+            updated_to: None,
+            generate_secret: false,
+            token: GatedToken::Access,
+        },
+        FeatureGateRow {
+            case: "revocation off at create, the id token minted beside it",
+            created_with: Some(false),
+            updated_to: None,
+            generate_secret: false,
+            token: GatedToken::Id,
+        },
+        FeatureGateRow {
+            case: "revocation off at create, a value this emulator issued no token for",
+            created_with: Some(false),
+            updated_to: None,
+            generate_secret: false,
+            token: GatedToken::Unissued,
+        },
+        FeatureGateRow {
+            case: "revocation off at create, another app client's refresh token",
+            created_with: Some(false),
+            updated_to: None,
+            generate_secret: false,
+            token: GatedToken::OtherClientRefresh,
+        },
+        FeatureGateRow {
+            case: "revocation off at create, on an app client that holds a secret",
+            created_with: Some(false),
+            updated_to: None,
+            generate_secret: true,
+            token: GatedToken::Refresh,
+        },
+        FeatureGateRow {
+            case: "revocation switched off by an update",
+            created_with: None,
+            updated_to: Some(Some(false)),
+            generate_secret: false,
+            token: GatedToken::Refresh,
+        },
+        FeatureGateRow {
+            case: "revocation off at create and switched back on by an update",
+            created_with: Some(false),
+            updated_to: Some(Some(true)),
+            generate_secret: false,
+            token: GatedToken::Refresh,
+        },
+        FeatureGateRow {
+            case: "revocation off at create, then an update that names no \
+                   EnableTokenRevocation",
+            created_with: Some(false),
+            updated_to: Some(None),
+            generate_secret: false,
+            token: GatedToken::Refresh,
+        },
+        FeatureGateRow {
+            case: "the member left unset at create, the sign-in's own refresh token",
+            created_with: None,
+            updated_to: None,
+            generate_secret: false,
+            token: GatedToken::Refresh,
+        },
+        FeatureGateRow {
+            case: "revocation on explicitly, the access token minted beside it",
+            created_with: Some(true),
+            updated_to: None,
+            generate_secret: false,
+            token: GatedToken::Access,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let router = router();
+        let fixture = pool_with_client(
+            &router,
+            "feature-gate-pool",
+            &ClientSetup {
+                rotation: None,
+                generate_secret: row.generate_secret,
+                enable_token_revocation: row.created_with,
+            },
+        )
+        .await;
+        create_confirmed_user(&router, &fixture.user_pool_id, "alice").await;
+        let signed_in = sign_in(
+            &router,
+            &fixture.client_id,
+            fixture.client_secret.as_deref(),
+            "alice",
+        )
+        .await;
+        let access_token = token(case, &signed_in, "AccessToken");
+
+        // The value the revocation will name. The sign-ins happen while the app client
+        // still configures the auth flows it was created with, before any update.
+        let (presented, other_access_token) = match row.token {
+            GatedToken::Refresh => (token(case, &signed_in, "RefreshToken"), None),
+            GatedToken::Access => (access_token.clone(), None),
+            GatedToken::Id => (token(case, &signed_in, "IdToken"), None),
+            GatedToken::Unissued => (UNISSUED_TOKEN.to_string(), None),
+            GatedToken::OtherClientRefresh => {
+                let (other_client_id, _) =
+                    add_client(&router, &fixture.user_pool_id, &ClientSetup::default()).await;
+                let other_sign_in = sign_in(&router, &other_client_id, None, "alice").await;
+                (
+                    token(case, &other_sign_in, "RefreshToken"),
+                    Some(token(case, &other_sign_in, "AccessToken")),
+                )
+            }
+        };
+
+        // The gate reads the configuration the app client holds NOW, so a row that
+        // updates it rewrites the member (and names the flows again, which an update
+        // replaces like every other member).
+        if let Some(enable_token_revocation) = row.updated_to {
+            let mut body = Map::new();
+            body.insert("UserPoolId".to_string(), json!(fixture.user_pool_id));
+            body.insert("ClientId".to_string(), json!(fixture.client_id));
+            body.insert(
+                "ExplicitAuthFlows".to_string(),
+                json!(["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]),
+            );
+            if let Some(enabled) = enable_token_revocation {
+                body.insert("EnableTokenRevocation".to_string(), json!(enabled));
+            }
+            ok(&router, "UpdateUserPoolClient", &Value::Object(body)).await;
+        }
+
+        let body = revoke_body(&fixture, &presented);
+        if revocation_activated(&row) {
+            // With the feature activated the submitted value decides: a refresh token of
+            // this app client is revoked, a token of another type is the unsupported type
+            // it is, and a value this app client issued no token for is served as a
+            // no-op.
+            match row.token {
+                GatedToken::Access | GatedToken::Id => {
+                    refused(
+                        &router,
+                        case,
+                        REVOKE,
+                        &body,
+                        400,
+                        "UnsupportedTokenTypeException",
+                        "Unsupported token type",
+                    )
+                    .await;
+                    access_token_identifies(&router, case, &access_token, "alice").await;
+                }
+                GatedToken::Refresh => {
+                    ok(&router, REVOKE, &body).await;
+                    access_token_revoked(&router, case, &access_token).await;
+                }
+                GatedToken::Unissued | GatedToken::OtherClientRefresh => {
+                    ok(&router, REVOKE, &body).await;
+                    access_token_identifies(&router, case, &access_token, "alice").await;
+                }
+            }
+        } else {
+            refused(
+                &router,
+                case,
+                REVOKE,
+                &body,
+                400,
+                FEATURE_DISABLED_CODE,
+                FEATURE_DISABLED_MESSAGE,
+            )
+            .await;
+            // A refused request revoked nothing: the sign-in's tokens stay in force.
+            access_token_identifies(&router, case, &access_token, "alice").await;
+        }
+
+        // The other app client one row names is untouched either way.
+        if let Some(other_access_token) = other_access_token {
+            access_token_identifies(&router, case, &other_access_token, "alice").await;
+        }
+    }
 }

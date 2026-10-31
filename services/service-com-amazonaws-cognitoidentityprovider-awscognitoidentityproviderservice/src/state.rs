@@ -196,6 +196,19 @@ pub fn auth_flow_not_enabled_message(auth_flow: &str) -> String {
     format!("{auth_flow} flow not enabled for this client")
 }
 
+/// The message an operation refuses with when the app client the request names
+/// does not have the FEATURE that operation needs switched on in its stored
+/// configuration.
+///
+/// `UnsupportedOperationException` is "thrown when you attempt to perform an
+/// operation that isn't enabled for the user pool client" (this service's model),
+/// and Amazon Cognito reports it in ONE fixed sentence with no variable part at
+/// all: it interpolates neither the feature asked for, nor the app client, nor the
+/// pool, so the refusal reads the same for every client id and tells a caller
+/// nothing about the client it addressed. A request such a gate refuses changes
+/// nothing, so the sentence is also the whole of what the caller learns.
+pub const CLIENT_FEATURE_NOT_ENABLED_MESSAGE: &str = "This feature is not enabled for this client";
+
 /// The `ChallengeParameters` of a successful authentication response that leaves
 /// NO challenge outstanding: the empty map.
 ///
