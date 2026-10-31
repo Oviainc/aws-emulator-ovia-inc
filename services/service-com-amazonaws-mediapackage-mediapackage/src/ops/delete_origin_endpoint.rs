@@ -147,12 +147,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+        // The clock, not this call, carries a harvest out and moves its status:
+        // materialise first what it has already made due, so a job that finished its
+        // harvest on its own is left in the status the clock gave it rather than counted
+        // among the jobs this delete cuts short. It is done BEFORE this service's guard is
+        // taken, because carrying a harvest out writes to another service's store through
+        // its own front door.
+        crate::state::harvest_export::settle_due_harvests(&state, ctx, std::time::SystemTime::now())
+            .await;
         let mut state = state.lock();
-        // The clock, not this call, moves a harvest job's status: materialise first what it
-        // has already made due, so a job that finished its harvest on its own is left in
-        // the status the clock gave it rather than counted among the jobs this delete cuts
-        // short.
-        state.settle_harvest_jobs(std::time::SystemTime::now());
 
         if state.remove_origin_endpoint(&region, &input.id).is_none() {
             return Err(crate::state::origin_endpoint_not_found(&input.id).into());

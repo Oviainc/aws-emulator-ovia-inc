@@ -7,9 +7,10 @@
 //! filters BEFORE paging, so a page is `MaxResults` MATCHING jobs and the `NextToken`
 //! points at the next matching one.
 //!
-//! Reporting only: the one write it makes is through `settle_harvest_jobs`, which
-//! materialises the status transitions the clock had already made due — which is what
-//! makes an `IncludeStatus` filter reflect the status the clock left each job in.
+//! Reporting only: the one write it makes is through
+//! [`crate::state::harvest_export::settle_due_harvests`], which materialises the harvests
+//! the clock had already made due — which is what makes an `IncludeStatus` filter reflect
+//! the status the clock left each job in.
 //!
 //! ## Shape of an operation
 //!
@@ -173,11 +174,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // MediaPackage is regional: a listing reports only the harvest jobs of the Region
         // its own request is served in.
         let region = crate::state::request_region(ctx.parts());
-        let mut state = state.lock();
-        // Reporting only: this materialises the status transitions the clock had already
-        // made due, so the status each entry reports — and the `IncludeStatus` filter
-        // applied to it — is the one the clock decided, not one this call moved.
-        state.settle_harvest_jobs(std::time::SystemTime::now());
+        // Reporting only: this materialises the harvests the clock had already made due —
+        // each one's output and the terminal status it decides — so the status each entry
+        // reports, and the `IncludeStatus` filter applied to it, is the one the clock
+        // decided and not one this call moved. It is done BEFORE this service's guard is
+        // taken, because carrying a harvest out writes to another service's store through
+        // its own front door.
+        crate::state::harvest_export::settle_due_harvests(&state, ctx, std::time::SystemTime::now())
+            .await;
+        let state = state.lock();
 
         // A `nextToken` is resolved against the enumeration that would have minted it —
         // this operation, in this Region, narrowed by the filters this request carries —

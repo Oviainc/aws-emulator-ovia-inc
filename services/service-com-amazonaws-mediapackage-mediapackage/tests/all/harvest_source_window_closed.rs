@@ -176,9 +176,9 @@ async fn an_update_that_closes_the_window_fails_the_harvests_still_running_again
             );
             assert_eq!(
                 status_of(&body),
-                Some(state::HARVEST_OUTCOME),
+                Some(state::HARVEST_FAILED),
                 "case {case:?}: job {id:?} must have settled on its own to {}, got {body:?}",
-                state::HARVEST_OUTCOME
+                state::HARVEST_FAILED
             );
             finished.push((*id, body));
         }
@@ -339,9 +339,10 @@ async fn an_update_that_closes_the_window_fails_the_harvests_still_running_again
             );
         }
 
-        // Only the clock finishes a job the update left harvesting: with its owed
-        // transition brought forward, every job of the endpoint reports the terminal status
-        // this emulator's harvests reach.
+        // Only the clock finishes a job the update left harvesting: with its owed harvest
+        // brought forward, every job of the endpoint reports the terminal status that
+        // harvest earned — these submissions name a bucket no object store holds, so
+        // nothing could be written and each one failed.
         make_transitions_due(&engine);
         for (id, _) in &unfinished {
             let (status, described) =
@@ -352,10 +353,10 @@ async fn an_update_that_closes_the_window_fails_the_harvests_still_running_again
             );
             assert_eq!(
                 status_of(&described),
-                Some(state::HARVEST_OUTCOME),
+                Some(state::HARVEST_FAILED),
                 "case {case:?}: job {id:?} must have reached {} once the clock made its \
-                 transition due, got {described:?}",
-                state::HARVEST_OUTCOME
+                 harvest due, got {described:?}",
+                state::HARVEST_FAILED
             );
         }
     }

@@ -16,6 +16,8 @@
 //! into parallel structs, so a stored packaging configuration is byte-for-byte what a
 //! later read renders.
 
+pub mod harvest_export;
+
 use crate::ops::types::{
     Authorization, Channel, CmafPackage, CmafPackageCreateOrUpdateParameters, DashPackage,
     EgressAccessLogs, HarvestJob, HlsIngest, HlsManifest, HlsPackage, IngestEndpoint,
@@ -116,6 +118,16 @@ pub const MAX_ORIGIN_ENDPOINTS: usize = 20_000;
 /// the only thing that adds one and `DescribeHarvestJob` must still answer what it
 /// created, so the bound is an entry count, refused past with `TooManyRequestsException`.
 pub const MAX_HARVEST_JOBS: usize = 20_000;
+
+/// The most harvests ONE call materialises ([`ComAmazonawsMediapackageMediapackageState::take_due_harvests`]).
+///
+/// Carrying a harvest out writes an object to the destination, so how many a single
+/// request would do that for is the number of jobs a caller has submitted — up to
+/// [`MAX_HARVEST_JOBS`] of them, every one due at the same instant. This caps the work one
+/// request pays for. Nothing is lost: a harvest this call does not take keeps the due
+/// instant it was owed at, so the next call materialises it, and each is still carried out
+/// exactly once.
+pub const MAX_HARVESTS_PER_CALL: usize = 64;
 
 /// AWS's tagging limit of 50 tags per resource.
 pub const MAX_TAGS: usize = 50;
@@ -2396,10 +2408,15 @@ impl OriginEndpointRecord {
 // `CreateHarvestJob` submits a job that exports a window of an origin endpoint's
 // packaged content to an S3 bucket. The submitted job is `IN_PROGRESS` — a NON-TERMINAL
 // status — so the service owes it a later status without anybody calling again. That
-// owed transition is stored as a DUE INSTANT on the record and materialised by
-// [`ComAmazonawsMediapackageMediapackageState::settle_harvest_jobs`], which every
-// harvest-job handler calls first: a read reports what the clock has already made due
-// and never advances a job because it was polled.
+// owed work is stored as a DUE INSTANT on the record and materialised by
+// [`harvest_export::settle_due_harvests`], which every harvest-job handler calls first: a
+// read reports what the clock has already made due and never advances a job because it
+// was polled.
+//
+// What that materialisation DOES is the harvest: the job's top-level manifest is written
+// to the destination the submission named, and the terminal status is whichever of
+// `SUCCEEDED` / `FAILED` that write's outcome decides (see [`harvest_export`]). Nothing
+// here fixes the outcome in advance.
 // ---------------------------------------------------------------------------
 
 /// The `Status` values the model declares for a HarvestJob, so no handler spells one as a
@@ -2415,27 +2432,16 @@ pub const HARVEST_FAILED: &str = "FAILED";
 /// The statuses a harvest job never leaves: the harvest finished, or it failed.
 pub const HARVEST_TERMINAL_STATUSES: &[&str] = &[HARVEST_SUCCEEDED, HARVEST_FAILED];
 
-/// How long after `CreateHarvestJob` the clock owes the submitted job its terminal
-/// status.
+/// How long after `CreateHarvestJob` the clock owes the submitted job its harvest, and
+/// so its terminal status.
 ///
 /// AWS documents no duration — how long a harvest takes depends on the window harvested
 /// — so this span is CHOSEN, not modelled: 500 ms, inside the project's 250-750 ms band
 /// for a transition the clock owes. It is deliberately non-zero, so a caller reading
-/// straight after the create still observes the submitted job `IN_PROGRESS`. Nothing
-/// sleeps for it: the due instant is stored and compared against the clock.
+/// straight after the create still observes the submitted job `IN_PROGRESS` and the
+/// destination still empty. Nothing sleeps for it: the due instant is stored and compared
+/// against the clock.
 pub const HARVEST_SETTLE_AFTER: Duration = Duration::from_millis(500);
-
-/// The terminal status a harvest job submitted to THIS emulator reaches.
-///
-/// A harvest exports the packaged content of an origin endpoint to the caller's S3
-/// bucket. This emulator serves no MediaPackage data plane — a channel ingests nothing
-/// and an endpoint's playback URL answers no segments — and it writes nothing to the
-/// caller's bucket, so no harvest runs and `SUCCEEDED` would claim content that is not
-/// there. The job therefore ends in the service's own modelled failure status, which is
-/// what the API has to say about a harvest that produced nothing (the explanation AWS
-/// publishes for a failure travels as a CloudWatch event, not as a member of this
-/// service's `HarvestJob` shape, so there is no field to carry a reason).
-pub const HARVEST_OUTCOME: &str = HARVEST_FAILED;
 
 /// A HarvestJob, exactly as `CreateHarvestJob` stored it.
 #[derive(Debug, Clone, Default)]
@@ -2456,9 +2462,10 @@ pub struct HarvestJobRecord {
     pub created_at: String,
     /// One of [`HARVEST_IN_PROGRESS`] or [`HARVEST_TERMINAL_STATUSES`].
     pub status: String,
-    /// The status the clock owes this job, and the instant it falls due. `None` for a job
-    /// that has reached a terminal status, which owes nothing.
-    pub next_status_due: Option<(SystemTime, &'static str)>,
+    /// The instant the clock makes this job's harvest due. `None` for a job whose harvest
+    /// has been carried out — which is every job in a terminal status — so nothing is owed
+    /// twice.
+    pub next_status_due: Option<SystemTime>,
 }
 
 impl HarvestJobRecord {
@@ -2482,20 +2489,19 @@ impl HarvestJobRecord {
             status: Some(self.status.clone()),
         }
     }
+}
 
-    /// Apply the owed status transition when the clock has already made it due, and
-    /// nothing else: the job moves at the instant it was owed whether or not anybody
-    /// called.
-    fn settle(&mut self, now: SystemTime) {
-        let Some((due, next)) = self.next_status_due else {
-            return;
-        };
-        if now < due {
-            return;
-        }
-        self.status = next.to_string();
-        self.next_status_due = None;
-    }
+/// The window a stored job harvests, as `(the instant it starts, its length)` in
+/// NANOSECONDS — the unit [`parse_instant`] reads a bound to, because a bound may carry a
+/// fractional second.
+///
+/// `None` when the bounds do not name an interval of media. `CreateHarvestJob` refuses
+/// such a submission, so a STORED job's bounds always do; a job that somehow carries
+/// others names no window to export, which is a harvest that produces nothing.
+pub fn harvest_window(job: &HarvestJobRecord) -> Option<(i128, i128)> {
+    let start = parse_instant(&job.start_time)?;
+    let end = parse_instant(&job.end_time)?;
+    (end > start).then_some((start, end - start))
 }
 
 /// Per-service state for com-amazonaws-mediapackage-mediapackage. A handler reaches it through [`service_state`].
@@ -2734,16 +2740,98 @@ impl ComAmazonawsMediapackageMediapackageState {
             .count()
     }
 
-    /// Materialise every harvest-job status transition the clock has already made due,
-    /// and nothing else.
+    /// Every harvest the clock has already made due, as the export each one owes.
     ///
-    /// Called FIRST by every harvest-job handler, a read included: it applies only a
-    /// change that was owed at `now` whether or not anybody called, so what a reader sees
-    /// is decided by the clock and never by the read itself.
-    pub fn settle_harvest_jobs(&mut self, now: SystemTime) {
-        for job in self.harvest_jobs.values_mut() {
-            job.settle(now);
+    /// Called under this store's guard by [`harvest_export::settle_due_harvests`], which
+    /// then carries each export out with NO guard held. Only a harvest that was already due
+    /// at `now` is reported — the work was owed at that instant whether or not anybody
+    /// called.
+    ///
+    /// A reported harvest KEEPS the instant it was owed at until its outcome is recorded
+    /// ([`Self::record_harvest_outcome`], which is what clears it), so an export whose call
+    /// never finished — the request serving it was cancelled — is still owed and is carried
+    /// out by the next call, rather than leaving the job reporting work in progress that
+    /// nothing will ever finish. The cost of that choice is that two calls racing the same
+    /// due harvest may both carry it out: both write the same manifest to the same key, so
+    /// the destination holds what it would have held either way.
+    ///
+    /// A due job with nothing to export produces no output at all, so it reaches the
+    /// modelled failure status here rather than being reported: the endpoint it harvests
+    /// stores no packaging configuration, or its window names no interval of media (see
+    /// [`harvest_export::harvested_manifest`]). Every job reported is still
+    /// [`HARVEST_IN_PROGRESS`] until its outcome is recorded.
+    ///
+    /// At most [`MAX_HARVESTS_PER_CALL`] are reported, which is what bounds the work one
+    /// request pays for; the rest keep the instant they were owed at and are taken by the
+    /// next call.
+    pub fn take_due_harvests(&mut self, now: SystemTime) -> Vec<harvest_export::DueHarvest> {
+        let due: Vec<ResourceKey> = self
+            .harvest_jobs
+            .iter()
+            .filter(|(_, job)| job.next_status_due.is_some_and(|instant| now >= instant))
+            .map(|(key, _)| key.clone())
+            .take(MAX_HARVESTS_PER_CALL)
+            .collect();
+        let mut owed = Vec::new();
+        for key in due {
+            // The export is worked out while only this store is read; the record is then
+            // taken mutably to settle a job with nothing to export, so no two borrows of it
+            // overlap.
+            let export = {
+                let Some(job) = self.harvest_jobs.get(&key) else {
+                    continue;
+                };
+                self.origin_endpoint(&job.region, &job.origin_endpoint_id)
+                    .and_then(|endpoint| harvest_export::harvested_manifest(endpoint, job))
+                    .map(|(manifest, media_type)| harvest_export::DueHarvest {
+                        job: key.clone(),
+                        region: job.region.clone(),
+                        bucket: job.s3_destination.bucket_name.clone(),
+                        manifest_key: job.s3_destination.manifest_key.clone(),
+                        manifest,
+                        media_type,
+                    })
+            };
+            match export {
+                // Still owed until its outcome is recorded, so it is not lost if the call
+                // carrying it out never finishes.
+                Some(export) => owed.push(export),
+                None => {
+                    if let Some(job) = self.harvest_jobs.get_mut(&key) {
+                        job.status = HARVEST_FAILED.to_string();
+                        job.next_status_due = None;
+                    }
+                }
+            }
         }
+        owed
+    }
+
+    /// Record what a harvest this service carried out did: the modelled terminal status
+    /// the outcome of its export decides, and nothing further owed — this is what clears
+    /// the due instant the harvest kept while it ran.
+    ///
+    /// `exported` is whether the object store took the job's top-level manifest, which is
+    /// the one thing the status reports (see [`harvest_export`]).
+    ///
+    /// A job the clock moved on while its export ran — its source endpoint was removed or
+    /// stopped retaining content, so [`Self::fail_harvests_of_origin_endpoint`] already
+    /// failed it — keeps the status that gave it: a job never leaves a terminal status, and
+    /// that path already cleared what it owed.
+    pub fn record_harvest_outcome(&mut self, job: &ResourceKey, exported: bool) {
+        let Some(record) = self.harvest_jobs.get_mut(job) else {
+            return;
+        };
+        if record.is_terminal() {
+            return;
+        }
+        record.status = if exported {
+            HARVEST_SUCCEEDED
+        } else {
+            HARVEST_FAILED
+        }
+        .to_string();
+        record.next_status_due = None;
     }
 
     /// Fail every harvest job OF `region` that has not finished harvesting the origin
@@ -2970,7 +3058,15 @@ pub fn now_iso8601() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
-    ::aws_smithy_types::DateTime::from_secs(i64::try_from(secs).unwrap_or(0))
+    iso8601_of_secs(i64::try_from(secs).unwrap_or(0))
+}
+
+/// `secs` since the epoch, as the ISO-8601 instant this service writes an instant as.
+///
+/// The one rendering, so an instant a response reports ([`now_iso8601`]) and one a
+/// harvested manifest states are written the same way.
+pub fn iso8601_of_secs(secs: i64) -> String {
+    ::aws_smithy_types::DateTime::from_secs(secs)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_default()
 }

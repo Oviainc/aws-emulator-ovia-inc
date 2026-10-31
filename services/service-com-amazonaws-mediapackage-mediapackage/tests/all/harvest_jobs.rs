@@ -13,8 +13,12 @@
 //!    read of it — `DescribeHarvestJob`, each `ListHarvestJobs` entry — renders that same
 //!    record.
 //! 2. A submitted job is `IN_PROGRESS` and reaches its terminal status only when the
-//!    CLOCK makes that transition due, at a stored instant 250-750 ms after the submit; a
-//!    read reports what the clock made due and never advances a job itself.
+//!    CLOCK makes its harvest due, at a stored instant 250-750 ms after the submit; a
+//!    read reports what the clock made due and never advances a job itself. WHICH
+//!    terminal status it reaches is decided by whether the harvest's output reached its
+//!    destination, which `tests/all/harvest_export.rs` is the suite for — the submits
+//!    here name buckets no object store holds, so their harvests produce nothing and the
+//!    jobs fail.
 //! 3. `ListHarvestJobs` filters by `IncludeChannelId` or by `IncludeStatus` — never by
 //!    both, which it refuses (`tests/all/mutually_exclusive_list_filters.rs`) — BEFORE
 //!    paging, so the filtered pages carry exactly the matching jobs, in id order, with a
@@ -211,7 +215,7 @@ fn pending_span(engine: &engine::InMemoryEngine, id: &str, from: SystemTime) -> 
     store
         .harvest_job(REGION, id)?
         .next_status_due
-        .and_then(|(due, _)| due.duration_since(from).ok())
+        .and_then(|due| due.duration_since(from).ok())
 }
 
 /// Push every outstanding harvest-job transition an hour out, so the transient status
@@ -237,7 +241,7 @@ fn set_due(engine: &engine::InMemoryEngine, due: SystemTime) {
     let mut store = store.lock();
     for job in store.harvest_jobs.values_mut() {
         if let Some(pending) = job.next_status_due.as_mut() {
-            pending.0 = due;
+            *pending = due;
         }
     }
 }
@@ -435,7 +439,6 @@ fn the_statuses_this_service_reports_are_the_modelled_ones() {
         state::HARVEST_IN_PROGRESS,
         state::HARVEST_SUCCEEDED,
         state::HARVEST_FAILED,
-        state::HARVEST_OUTCOME,
     ] {
         assert!(
             types::STATUS_VALUES.contains(&status),
@@ -444,11 +447,13 @@ fn the_statuses_this_service_reports_are_the_modelled_ones() {
             types::STATUS_VALUES
         );
     }
-    assert!(
-        state::HARVEST_TERMINAL_STATUSES.contains(&state::HARVEST_OUTCOME),
-        "the status a harvest job settles into must be terminal, got {:?}",
-        state::HARVEST_OUTCOME
-    );
+    for status in [state::HARVEST_SUCCEEDED, state::HARVEST_FAILED] {
+        assert!(
+            state::HARVEST_TERMINAL_STATUSES.contains(&status),
+            "case {status:?}: a status a harvest job settles into must be terminal, got {:?}",
+            state::HARVEST_TERMINAL_STATUSES
+        );
+    }
     assert!(
         !state::HARVEST_TERMINAL_STATUSES.contains(&state::HARVEST_IN_PROGRESS),
         "a submitted job's status must be the non-terminal one, got {:?}",
@@ -480,8 +485,9 @@ async fn a_harvest_job_leaves_in_progress_only_when_the_clock_makes_the_transiti
         }
     }
 
-    // Once the clock has made it due, the job carries the terminal status — and nothing
-    // else about the record moved.
+    // Once the clock has made it due, the job carries the terminal status its harvest
+    // earned — these destinations are buckets no object store holds, so nothing could be
+    // written and the jobs failed — and nothing else about the record moved.
     make_transitions_due(&engine);
     for (id, body) in &created {
         let (status, described) = call(&router, "GET", &format!("/harvest_jobs/{id}"), None).await;
@@ -491,9 +497,10 @@ async fn a_harvest_job_leaves_in_progress_only_when_the_clock_makes_the_transiti
         );
         assert_eq!(
             described.get("status").and_then(Value::as_str),
-            Some(state::HARVEST_OUTCOME),
-            "case {id:?}: once the transition is due the job must be {}, got {described:?}",
-            state::HARVEST_OUTCOME
+            Some(state::HARVEST_FAILED),
+            "case {id:?}: once the harvest is due and its output could not be written the \
+             job must be {}, got {described:?}",
+            state::HARVEST_FAILED
         );
         for member in [
             "arn",
@@ -546,9 +553,9 @@ async fn the_owed_transition_settles_on_its_own_wall_clock() {
     );
     assert_eq!(
         described.get("status").and_then(Value::as_str),
-        Some(state::HARVEST_OUTCOME),
+        Some(state::HARVEST_FAILED),
         "case \"read after the span elapsed\": expected {}, got {described:?}",
-        state::HARVEST_OUTCOME
+        state::HARVEST_FAILED
     );
 }
 
@@ -642,8 +649,9 @@ async fn list_filters_select_by_channel_and_by_the_status_the_clock_left() {
         );
     }
 
-    // Once the clock has made the transitions due the SAME filters follow the new status:
-    // the transient one now selects nothing and the terminal one selects everything.
+    // Once the clock has made the harvests due the SAME filters follow the new status:
+    // the transient one now selects nothing and the terminal one these harvests earned
+    // selects everything.
     make_transitions_due(&engine);
     for (filter, expected) in [
         (
@@ -651,7 +659,7 @@ async fn list_filters_select_by_channel_and_by_the_status_the_clock_left() {
             Vec::new(),
         ),
         (
-            format!("?includeStatus={}", state::HARVEST_OUTCOME),
+            format!("?includeStatus={}", state::HARVEST_FAILED),
             ids_for_channel(None),
         ),
         (

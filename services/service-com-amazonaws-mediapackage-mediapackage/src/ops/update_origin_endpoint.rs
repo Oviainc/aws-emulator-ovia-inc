@@ -239,6 +239,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         };
 
+        // The clock, not this call, carries a harvest out and moves its status:
+        // materialise first what it has already made due, so a job the clock had already
+        // finished keeps the status the clock gave it and only the unfinished jobs move
+        // below. It is done BEFORE this service's guard is taken, because carrying a
+        // harvest out writes to another service's store through its own front door.
+        crate::state::harvest_export::settle_due_harvests(&state, ctx, std::time::SystemTime::now())
+            .await;
+
         let mut state = state.lock();
 
         // An update changes an endpoint this Region holds; there is nothing to update
@@ -416,10 +424,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Those jobs are settled by the same helper `DeleteOriginEndpoint` settles them
         // with, rather than left reporting work in progress against a source that holds
         // nothing while a submission naming the very same endpoint is refused. The clock's
-        // own owed transitions are materialised first, so a job the clock had already
-        // finished keeps the status the clock gave it and only the unfinished jobs move.
+        // own owed harvests were materialised before this write, so a job the clock had
+        // already finished keeps the status the clock gave it and only the unfinished jobs
+        // move.
         if !retains_startover_content {
-            state.settle_harvest_jobs(std::time::SystemTime::now());
             state.fail_harvests_of_origin_endpoint(&region, &id);
         }
         Ok(UpdateOriginEndpointOutput {

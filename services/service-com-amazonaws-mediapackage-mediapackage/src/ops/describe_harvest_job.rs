@@ -4,9 +4,10 @@
 //! Reports the stored HarvestJob the request's `Id` names, rendered from that one record;
 //! an id this service holds no job for is `NotFoundException` (404).
 //!
-//! Reporting only: the one write it makes is through `settle_harvest_jobs`, which
-//! materialises the status transition the clock had already made due — owed at the same
-//! instant whether or not anybody read the job.
+//! Reporting only: the one write it makes is through
+//! [`crate::state::harvest_export::settle_due_harvests`], which materialises the harvest
+//! the clock had already made due — its output and the terminal status that decides, owed
+//! at the same instant whether or not anybody read the job.
 //!
 //! ## Shape of an operation
 //!
@@ -168,10 +169,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let mut state = state.lock();
-        // Reporting only: this materialises the status transitions the clock had already
-        // made due, so a read reports what the clock decided and advances nothing itself.
-        state.settle_harvest_jobs(std::time::SystemTime::now());
+        // Reporting only: this materialises the harvests the clock had already made due —
+        // each one's output and the terminal status it decides — so a read reports what the
+        // clock decided and advances nothing itself. It is done BEFORE this service's guard
+        // is taken, because carrying a harvest out writes to another service's store
+        // through its own front door.
+        crate::state::harvest_export::settle_due_harvests(&state, ctx, std::time::SystemTime::now())
+            .await;
+        let state = state.lock();
 
         // An id this Region holds no job under — including one only another Region holds
         // — is the addressed resource missing: 404.

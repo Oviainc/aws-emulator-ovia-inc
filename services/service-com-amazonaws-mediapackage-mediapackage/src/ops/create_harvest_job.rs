@@ -6,10 +6,11 @@
 //! `ListHarvestJobs` then report. The job's `ChannelId` is read off the STORED endpoint
 //! (the request carries none), so it is computed from state rather than echoed.
 //!
-//! The submitted job starts `IN_PROGRESS` and leaves it only when the clock makes that
-//! transition due — see [`crate::state::HARVEST_SETTLE_AFTER`] and
-//! [`crate::state::HARVEST_OUTCOME`] for the span and the terminal status, and
-//! `settle_harvest_jobs` on the state struct for where it is materialised.
+//! The submitted job starts `IN_PROGRESS` and leaves it only when the clock makes its
+//! harvest due — see [`crate::state::HARVEST_SETTLE_AFTER`] for the span, and
+//! [`crate::state::harvest_export`] for what the harvest then WRITES (the top-level
+//! manifest, into the destination bucket) and which modelled terminal status the outcome
+//! of that write decides.
 //!
 //! ## What this handler decides about the harvest window, the endpoint and the destination role
 //!
@@ -274,15 +275,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let role_refusal =
             crate::state::harvest_role_refusal(&input.s3_destination.role_arn, &iam.lock());
 
+        let now = std::time::SystemTime::now();
+        // The clock, not this call, carries a submitted job's harvest out and moves its
+        // status: materialise first what was already due, so the duplicate-id rule below
+        // and the response are decided against the jobs as the clock has left them. It is
+        // done BEFORE this service's guard is taken, because carrying a harvest out writes
+        // to another service's store through its own front door.
+        crate::state::harvest_export::settle_due_harvests(&state, ctx, now).await;
+
         let mut state = state.lock();
         // MediaPackage is regional: this job belongs to the Region this request is served
         // in, and the endpoint it names resolves only among that Region's records.
         let region = crate::state::request_region(ctx.parts());
-        // The clock, not this call, moves a submitted job's status: materialise first
-        // what was already due, so the duplicate-id rule below and the response are
-        // decided against the jobs as the clock has left them.
-        let now = std::time::SystemTime::now();
-        state.settle_harvest_jobs(now);
 
         // A HarvestJob harvests ONE origin endpoint: an `OriginEndpointId` naming no
         // stored endpoint OF THIS REGION has nothing to harvest, so the job is not
@@ -345,12 +349,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             end_time: input.end_time.clone(),
             created_at: crate::state::now_iso8601(),
             status: crate::state::HARVEST_IN_PROGRESS.to_string(),
-            // The transition the clock owes the submitted job, stored as the instant it
-            // falls due; nothing sleeps for it and no read brings it forward.
-            next_status_due: Some((
-                now + crate::state::HARVEST_SETTLE_AFTER,
-                crate::state::HARVEST_OUTCOME,
-            )),
+            // The harvest the clock owes this job, stored as the instant it falls due;
+            // nothing sleeps for it and no read brings it forward. Which terminal status
+            // it reaches is decided when it runs, by whether its output was written —
+            // nothing here fixes the outcome in advance.
+            next_status_due: Some(now + crate::state::HARVEST_SETTLE_AFTER),
         };
         // `insert` + the read back below: the record returned is always the STORED one,
         // and the id is free (refused as a duplicate above), so nothing is replaced.

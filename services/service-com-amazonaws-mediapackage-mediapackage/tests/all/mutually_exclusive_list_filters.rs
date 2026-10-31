@@ -174,10 +174,10 @@ fn both_filters() -> Vec<Both> {
             ),
         },
         Both {
-            case: "a channel holding jobs and the terminal status",
+            case: "a channel holding jobs and the terminal status a failed harvest reaches",
             query: format!(
                 "?includeChannelId={channel}&includeStatus={}",
-                state::HARVEST_OUTCOME
+                state::HARVEST_FAILED
             ),
         },
         Both {
@@ -361,11 +361,13 @@ async fn either_filter_alone_is_still_served() {
 
     // A status filter alone: every entry carries the status asked for, and the transient
     // and terminal statuses between them account for every stored job, whichever side of
-    // the transition the clock has taken each one past.
+    // the transition the clock has taken each one past. These jobs name a bucket no object
+    // store holds, so the harvest of each one writes nothing and the terminal status it
+    // reaches is the failure one.
     let mut from_status: Vec<String> = Vec::new();
     for status_filter in [
         state::HARVEST_IN_PROGRESS,
-        state::HARVEST_OUTCOME,
+        state::HARVEST_FAILED,
         "NOT_A_STATUS",
         "",
     ] {
@@ -382,7 +384,7 @@ async fn either_filter_alone_is_still_served() {
                 "case {query:?}: every entry must carry the status asked for, got {job:?}"
             );
         }
-        if status_filter == state::HARVEST_IN_PROGRESS || status_filter == state::HARVEST_OUTCOME {
+        if status_filter == state::HARVEST_IN_PROGRESS || status_filter == state::HARVEST_FAILED {
             from_status.extend(listed_ids(&body));
         } else {
             assert!(

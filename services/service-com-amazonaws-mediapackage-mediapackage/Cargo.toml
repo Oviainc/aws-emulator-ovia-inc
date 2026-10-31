@@ -32,9 +32,18 @@ service-common = { path = "../common" }
 # The IAM store CreateHarvestJob resolves an S3Destination's `roleArn` against, to check
 # the role's trust policy grants mediapackage.amazonaws.com before a job is submitted.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# Amazon S3 client a harvest job writes its top-level manifest with: the destination is
+# reached over the in-process callback into this same emulator (no network client feature
+# is enabled: the transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The harvest-output suite mounts the S3 service beside MediaPackage on one engine,
+# because a harvest writes its manifest into that service's buckets.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

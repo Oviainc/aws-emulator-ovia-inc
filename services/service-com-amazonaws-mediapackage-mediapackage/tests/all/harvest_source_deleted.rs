@@ -212,9 +212,9 @@ async fn removing_an_endpoint_fails_the_harvests_still_running_against_it() {
             );
             assert_eq!(
                 status_of(&body),
-                Some(state::HARVEST_OUTCOME),
+                Some(state::HARVEST_FAILED),
                 "case {case:?}: job {id:?} must have settled on its own to {}, got {body:?}",
-                state::HARVEST_OUTCOME
+                state::HARVEST_FAILED
             );
             finished.push((*id, body));
         }
