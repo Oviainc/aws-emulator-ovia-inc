@@ -91,6 +91,8 @@ mod seq_token_pagination;
 mod session_arn_nondisclosure;
 #[path = "all/session_cancellation.rs"]
 mod session_cancellation;
+#[path = "all/session_execution_status.rs"]
+mod session_execution_status;
 #[path = "all/session_filter_value_bound.rs"]
 mod session_filter_value_bound;
 #[path = "all/session_listing.rs"]

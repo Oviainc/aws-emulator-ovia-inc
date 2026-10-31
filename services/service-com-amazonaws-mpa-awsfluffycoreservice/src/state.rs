@@ -60,7 +60,9 @@
 //! * The approval of a change an active team was asked for ([`UPDATE_APPROVAL_DELAY`])
 //!   and, after it, that change's activation ([`UPDATE_ACTIVATION_DELAY`]): the team
 //!   reports `UPDATE_PENDING_APPROVAL`, then `UPDATE_PENDING_ACTIVATION`, and the
-//!   requested configuration becomes the live one when the activation comes due.
+//!   requested configuration becomes the live one when the activation comes due — which
+//!   is the action that change's session approved being carried out, so from there the
+//!   session reports its execution as `EXECUTED` ([`Session::record_execution`]).
 //!
 //! # Sessions
 //!
@@ -78,6 +80,11 @@
 //! outstanding baseline session is also what `GetApprovalTeam` reports for each approver
 //! ([`ComAmazonawsMpaAwsfluffycoreserviceState::pending_baseline_session_arn`]), so the
 //! two reads cannot disagree.
+//!
+//! Beside its `Status`, a session reports the ACTION it approves
+//! ([`SessionKind::action_name`]) and how far that action has got: `PENDING` while it is
+//! still waiting to run and `EXECUTED` once this store has carried it out
+//! ([`Session::record_execution`]).
 //!
 //! # An update an active team has to approve
 //!
@@ -1852,10 +1859,14 @@ impl SessionStatusCode {
 /// Status of the protected operation a session guards, in the tokens
 /// `SessionExecutionStatus` declares (`PENDING | EXECUTED | FAILED`).
 ///
-/// `PENDING` is the only one this emulator records: it RUNS no protected operation, so
-/// nothing is ever executed and no execution ever fails. `EXECUTED` and `FAILED` are
-/// carried as the model's token catalog; reporting either for work nothing performed
-/// would be a status for a run that never happened.
+/// `PENDING` is what a session reports for as long as the action it approves has not been
+/// carried out, and `EXECUTED` what it reports once it has been
+/// ([`Session::record_execution`]): every session this service records carries
+/// `AUTO_COMPLETION_UPON_APPROVAL`, under which an approved action is executed on the
+/// approval, so a session whose action the clock has carried out is a session whose
+/// execution is done. `FAILED` stands for an execution that was attempted and did not
+/// complete, which nothing here produces: an action this service never carried out is one
+/// that is still waiting, not one that ran and failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionExecutionStatus {
     Pending,
@@ -2069,9 +2080,9 @@ impl Session {
             status: SessionStatus::Creating,
             status_code: None,
             status_message: None,
-            // This emulator executes no protected operation, so nothing has run and
-            // nothing has failed: the execution is `PENDING` for as long as the session
-            // exists.
+            // Nothing has been carried out when a session is started: the action it
+            // approves is waiting on the approvers, so its execution is `PENDING` until
+            // that action is carried out ([`Session::record_execution`]).
             execution_status: SessionExecutionStatus::Pending,
             // The only strategy `ActionCompletionStrategy` declares.
             action_completion_strategy: ActionCompletionStrategy::AutoCompletionUponApproval,
@@ -2161,6 +2172,21 @@ impl Session {
             .filter(|approver| approver.response == SessionResponse::Approved)
             .map(|approver| approver.approver_id.clone())
             .collect()
+    }
+
+    /// Record that the action this session approves HAS BEEN CARRIED OUT, which is what
+    /// `ExecutionStatus` reports: `EXECUTED` from here, where it was `PENDING` while the
+    /// action was still waiting to run.
+    ///
+    /// Every session this service records carries
+    /// [`ActionCompletionStrategy::AutoCompletionUponApproval`], under which the approved
+    /// action is executed on the approval, so this is recorded at the instant the action
+    /// the session names really took effect on this store — never on the approval alone,
+    /// which is the session's `Status`, and never because the session was read.
+    ///
+    /// IDEMPOTENT: an action is carried out once, so a repeat call reports the same thing.
+    pub fn record_execution(&mut self) {
+        self.execution_status = SessionExecutionStatus::Executed;
     }
 }
 
@@ -2762,6 +2788,10 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// deletion it was asked for, and the removal an APPROVED deletion owes once its
     /// pending window has run out. Nothing a caller has to ask for.
     ///
+    /// Carrying out one of those actions is also what records its session's execution
+    /// ([`Session::record_execution`]), so a session reports the action it approves as
+    /// `EXECUTED` from the instant this store really applied it.
+    ///
     /// What is owed is applied in the order the CLOCK made it due, not in the order this
     /// function walks the store, so the outcome depends on `now` alone and not on when the
     /// request that materialises it happens to arrive: where two changes bear on the same
@@ -2966,6 +2996,11 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
             }
 
             // The approved configuration becomes the live one once its activation is due.
+            // That activation IS the action the session approved being carried out — the
+            // requested description, strategy and approvers take effect and the requested
+            // version becomes the team's live one — so the session it was approved in
+            // records its execution at the same instant, and reports it as `EXECUTED`
+            // rather than as still waiting to run.
             let activation_due = self
                 .approval_teams
                 .get(&team_arn)
@@ -2974,6 +3009,9 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
             if let Some(due) = activation_due.filter(|due| *due <= now) {
                 if let Some(team) = self.approval_teams.get_mut(&team_arn) {
                     team.activate_pending_update(due);
+                }
+                if let Some(session) = self.sessions.get_mut(&session_arn) {
+                    session.record_execution();
                 }
             }
         }
@@ -3048,6 +3086,13 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         // A team whose APPROVED deletion's pending window has elapsed is gone. The window
         // runs from the approval ([`PendingTeamDeletion::removal_due`]), so a team that
         // was asked to be deleted and never approved it is never removed here.
+        //
+        // This removal is the action the team's deletion session approved being carried
+        // out, and it takes that session with it: a session asks ONE team's approvers and
+        // cannot outlive that team
+        // ([`ComAmazonawsMpaAwsfluffycoreserviceState::remove_team`]), so there is no
+        // record left to report the execution on — the session's own answer from here is
+        // the one a session of a team this store no longer holds earns.
         let elapsed: Vec<String> = self
             .approval_teams
             .values()

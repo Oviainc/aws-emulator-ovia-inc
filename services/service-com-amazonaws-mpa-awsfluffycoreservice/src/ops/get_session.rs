@@ -10,13 +10,17 @@
 //!
 //! Every member is read off the stored [`crate::state::Session`] that
 //! `StartApprovalTeamBaseline` recorded — the one place a session of this service comes
-//! into being — so nothing in the answer is this handler's own.
+//! into being — so nothing in the answer is this handler's own. `ExecutionStatus` is the
+//! session's own record of how far the action it approves has got
+//! ([`crate::state::Session::record_execution`]): `PENDING` while that action is still
+//! waiting to run, `EXECUTED` once the store has carried it out.
 //!
 //! `@readonly`: this handler writes nothing of its own. It calls
 //! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] first,
 //! which applies only what the CLOCK already owed at this instant (a session whose
-//! activation has come due, a session whose expiration has passed) — changes a caller who
-//! never polled would have seen anyway.
+//! activation has come due, a session whose expiration has passed, the action an approved
+//! session's activation carried out) — changes a caller who never polled would have seen
+//! anyway.
 //!
 //! ## Shape of an operation
 //!

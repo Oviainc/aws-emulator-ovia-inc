@@ -14,7 +14,10 @@
 //! ([`crate::state::UPDATE_APPROVAL_DELAY`]), after which the team reports
 //! `UPDATE_PENDING_ACTIVATION`, and the activation of the approved configuration
 //! ([`crate::state::UPDATE_ACTIVATION_DELAY`]), at which point the requested version
-//! becomes the team's live one and the team is `ACTIVE` again with nothing pending.
+//! becomes the team's live one and the team is `ACTIVE` again with nothing pending — and
+//! the update session reports the action it approved as `EXECUTED`
+//! ([`crate::state::Session::record_execution`]), because that activation is the change
+//! being carried out.
 //!
 //! A team whose configuration has never been activated (a team still waiting on its
 //! approvers' invitations), and one that is no longer active, has no approved

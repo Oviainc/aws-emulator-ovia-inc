@@ -45,7 +45,7 @@ fn approver(n: usize) -> (String, String) {
     )
 }
 
-fn approver_member(n: usize) -> Value {
+pub(crate) fn approver_member(n: usize) -> Value {
     let (id, source) = approver(n);
     json!({ "PrimaryIdentityId": id, "PrimaryIdentitySourceArn": source })
 }
@@ -80,7 +80,7 @@ async fn delete_version(harness: &Harness, team_arn: &str, version_id: &str) -> 
 /// It is moved to NOW rather than further back, because the activation the approval owes
 /// is measured from the instant the approval was due: a due instant long past would make
 /// the activation due in the same breath, and this table reads the state in between.
-fn make_approval_due(harness: &Harness, team_arn: &str) {
+pub(crate) fn make_approval_due(harness: &Harness, team_arn: &str) {
     with_pending_update(harness, team_arn, |update| {
         update.approval_due = Some(SystemTime::now());
     });
@@ -95,7 +95,7 @@ pub(crate) fn postpone_approval(harness: &Harness, team_arn: &str) {
 }
 
 /// Pull the instant an approved change's activation comes due into the past.
-fn make_activation_due(harness: &Harness, team_arn: &str) {
+pub(crate) fn make_activation_due(harness: &Harness, team_arn: &str) {
     with_pending_update(harness, team_arn, |update| {
         update.activation_due = Some(SystemTime::now() - Duration::from_secs(1));
     });
