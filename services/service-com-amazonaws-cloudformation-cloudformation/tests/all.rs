@@ -173,6 +173,8 @@ mod publisher_eligibility;
 mod publisher_reads;
 #[path = "all/publisher_registration.rs"]
 mod publisher_registration;
+#[path = "all/rds_generated_resource_names.rs"]
+mod rds_generated_resource_names;
 #[path = "all/rds_stack_resources.rs"]
 mod rds_stack_resources;
 #[path = "all/refusals_name_their_modelled_taxonomy.rs"]

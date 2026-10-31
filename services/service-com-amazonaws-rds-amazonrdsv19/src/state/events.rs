@@ -135,14 +135,18 @@ pub const DB_INSTANCE_STOPPED: LifecycleEvent = LifecycleEvent {
 /// A manual DB snapshot is being taken: `CreateDBSnapshot`, and the final snapshot a
 /// delete or a stop takes of its instance. The event is recorded when the snapshot starts,
 /// which is the status the snapshot itself reports.
-///
-/// The published table's deletion row has no counterpart here yet because
-/// `DeleteDBSnapshot` is still a scaffold in this crate: a row is recorded only by the
-/// handler that performs its change.
 pub const DB_SNAPSHOT_CREATING: LifecycleEvent = LifecycleEvent {
     source_type: "db-snapshot",
     category: "creation",
     message: "Creating manual snapshot",
+};
+
+/// A manual DB snapshot was deleted (`DeleteDBSnapshot`), which is the published table's
+/// deletion row for this source type.
+pub const DB_SNAPSHOT_DELETED: LifecycleEvent = LifecycleEvent {
+    source_type: "db-snapshot",
+    category: "deletion",
+    message: "Manual snapshot deleted",
 };
 
 /// A DB cluster was created (`CreateDBCluster`).
@@ -274,6 +278,7 @@ mod tests {
             DB_INSTANCE_STARTED,
             DB_INSTANCE_STOPPED,
             DB_SNAPSHOT_CREATING,
+            DB_SNAPSHOT_DELETED,
             DB_CLUSTER_CREATED,
             DB_CLUSTER_DELETED,
         ];

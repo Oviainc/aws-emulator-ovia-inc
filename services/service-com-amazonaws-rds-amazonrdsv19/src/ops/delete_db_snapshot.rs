@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDBSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation deletes the DB snapshot the request names from the region it
+//! was signed for and answers with the record it removed, recording the region's deletion
+//! event for it. An identifier that names no stored snapshot is the modelled
+//! `DBSnapshotNotFoundFault` (404), and a snapshot that is not yet `available` is the
+//! modelled `InvalidDBSnapshotStateFault` (400) — "The DB snapshot must be in the available
+//! state to be deleted."
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDBSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +104,18 @@ impl From<DeleteDBSnapshotErrorModeled> for DeleteDBSnapshotError {
     }
 }
 
+/// The modelled `DBSnapshotNotFoundFault` for a snapshot this store does not hold.
+///
+/// The message is built from the request: it names the snapshot that was looked for, in the
+/// phrasing this service answers for that fault — the same wording its sibling reads
+/// answer, so a caller sees one spelling of "no such snapshot".
+fn not_found(requested: &str) -> DeleteDBSnapshotError {
+    DeleteDBSnapshotErrorModeled::DBSnapshotNotFoundFault(DBSnapshotNotFoundFault {
+        message: Some(format!("DBSnapshot not found: {requested}")),
+    })
+    .into()
+}
+
 /// The `DeleteDBSnapshot` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -141,18 +152,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDBSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDBSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDBSnapshot"))
+        let region =
+            crate::state::request_region(ctx).map_err(DeleteDBSnapshotError::validation)?;
+        let requested = input.db_snapshot_identifier;
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional, and a DB snapshot's identifier is stored as the caller spelled
+        // it (`DBSnapshotIdentifier` states no case folding, unlike the instance and group
+        // names), so the snapshot is looked up under exactly the name it was taken as —
+        // the same key `DescribeDBSnapshots` reads. A name this region holds no snapshot
+        // under is the modelled 404, so a caller deleting a snapshot twice is told the
+        // second call found nothing rather than answered as though it had deleted it again.
+        let key = (region.clone(), requested.clone());
+        let Some(record) = store.db_snapshots.get(&key) else {
+            return Err(not_found(&requested));
+        };
+        // "The DB snapshot must be in the available state to be deleted": one still being
+        // taken is the modelled state fault, which is what a caller that deletes straight
+        // after asking for the snapshot sees.
+        if record.status != crate::state::SNAPSHOT_STATUS_AVAILABLE {
+            return Err(DeleteDBSnapshotErrorModeled::InvalidDBSnapshotStateFault(
+                InvalidDBSnapshotStateFault {
+                    message: Some(format!(
+                        "DB snapshot {requested} is in {} state but must be {} to be deleted",
+                        record.status,
+                        crate::state::SNAPSHOT_STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+        // A key this store resolved and a removal under it can only disagree if the record
+        // is not where the lookup said it was, which answers the same modelled 404 as a
+        // snapshot that was never there: a disagreement is a "not found", never a panic.
+        let Some(removed) = store.db_snapshots.remove(&key) else {
+            return Err(not_found(&requested));
+        };
+        // The region's event log carries the deletion of a manual snapshot, as it carries
+        // the taking of one.
+        store.record_event(
+            &region,
+            crate::state::events::DB_SNAPSHOT_DELETED,
+            &removed.snapshot_identifier,
+            removed.arn(),
+        );
+
+        // The deleted snapshot is reported as it stood, which is what RDS answers: the
+        // record is already gone from the store, so a following describe cannot find it.
+        Ok(DeleteDBSnapshotOutput {
+            db_snapshot: Some(removed.to_wire()),
+        })
     }
 }

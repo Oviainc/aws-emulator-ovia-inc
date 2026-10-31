@@ -2560,6 +2560,21 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         "AWS::RDS::DBInstance" | "AWS::RDS::DBCluster" => {
             rules(63, Characters::LowercaseAlphanumeric)
         }
+        // The Amazon RDS GROUP names, each created under a member whose own doc says "This
+        // value is stored as a lowercase string" — so a name carrying upper case names a
+        // group that service does not hold:
+        // `CreateDBParameterGroup.DBParameterGroupName` ("Must be 1 to 255 letters,
+        // numbers, or hyphens", "First character must be a letter", "Can't end with a
+        // hyphen or contain two consecutive hyphens"),
+        // `CreateDBClusterParameterGroup.DBClusterParameterGroupName` (whose name a modify
+        // answers with, `DBClusterParameterGroupNameMessage$DBClusterParameterGroupName`,
+        // states "from 1 to 255 letters or numbers") and
+        // `CreateDBSubnetGroup.DBSubnetGroupName` ("Must contain no more than 255 letters,
+        // numbers, periods, underscores, spaces, or hyphens", "First character must be a
+        // letter") — RDS's model carries no `@length` for any of the three.
+        "AWS::RDS::DBParameterGroup"
+        | "AWS::RDS::DBClusterParameterGroup"
+        | "AWS::RDS::DBSubnetGroup" => rules(255, Characters::LowercaseAlphanumeric),
         // Amazon Redshift `CreateCluster.ClusterIdentifier`: "Must contain from 1 to 63
         // alphanumeric characters or hyphens", "Alphabetic characters must be lowercase",
         // "Cannot end with a hyphen or contain two consecutive hyphens" (that member's own

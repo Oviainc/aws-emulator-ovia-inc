@@ -71,6 +71,8 @@ mod db_security_groups;
 mod db_shard_group_primary_cluster;
 #[path = "all/db_shard_groups.rs"]
 mod db_shard_groups;
+#[path = "all/db_snapshot_deletion.rs"]
+mod db_snapshot_deletion;
 #[path = "all/db_subnet_group_deletion.rs"]
 mod db_subnet_group_deletion;
 #[path = "all/db_subnet_group_in_use_wording.rs"]
