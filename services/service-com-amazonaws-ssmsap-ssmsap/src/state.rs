@@ -3922,6 +3922,40 @@ pub fn credentials_with(
     credentials
 }
 
+/// How an operation record names the credentials a call carried: the SAP HANA database
+/// each one reaches and its `CredentialType`, in the order the call named them.
+///
+/// `ApplicationCredential$SecretId` is `@sensitive`, so the secret a credential names is
+/// never written into a record a later `GetOperation` reads back; what identifies a
+/// credential of an application is the database and the type anyway ([`same_credential`]).
+/// Every call that carries credentials names them this one way, whichever member carried
+/// them (`RegisterApplication$Credentials`,
+/// `UpdateApplicationSettings$CredentialsToAddOrUpdate` and `$CredentialsToRemove`).
+pub fn named_credentials(credentials: &[ApplicationCredential]) -> String {
+    credentials
+        .iter()
+        .map(|credential| format!("{} ({})", credential.database_name, credential.credential_type))
+        .collect::<Vec<String>>()
+        .join(", ")
+}
+
+/// How an operation record names the components a call declared: each one's
+/// [`component_id`] — the identity this service resolves a component by — and the Amazon
+/// EC2 instance the declaration put it on, in the order the call named them.
+pub fn named_components(components_info: &[ComponentInfo]) -> String {
+    components_info
+        .iter()
+        .map(|component| {
+            format!(
+                "{} ({})",
+                component_id(&component.sid, &component.component_type),
+                component.ec2_instance_id
+            )
+        })
+        .collect::<Vec<String>>()
+        .join(", ")
+}
+
 /// The name the SAP HANA database ARN `database_arn` names its database by: the last
 /// non-empty segment of the ARN, the `:`- and `/`-separated part that carries the name
 /// of the resource an ARN names (a database ARN minted by [`database_arn`] ends with the

@@ -265,6 +265,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let arn = crate::state::application_arn(&region, &input.application_id);
 
+        // The operation's `Properties` are the parameters of the call that filed it, so a
+        // client reading the record back learns how the registration was asked for: every
+        // member the request carried beyond the `ApplicationId` the record already reports
+        // as `ResourceId`/`ResourceArn`. Computed here, while the request is still whole,
+        // because what the registration stores is moved out of it below. A credential's
+        // `SecretId` is `@sensitive`, so what the record names of a credential is the SAP
+        // HANA database it reaches and its type, never the secret
+        // (`crate::state::named_credentials`), and a declared component is named by the
+        // identity this service resolves a component by and the Amazon EC2 instance it was
+        // declared on (`crate::state::named_components`). A list the call carried empty
+        // asked for nothing, so it names no property, exactly as an omitted member does.
+        // `Tags` are no parameter of the work: they are attached to the resource and read
+        // back by ARN through this service's tagging APIs, the way the `ApplicationId` is
+        // read back as the record's `ResourceId`.
+        let mut properties = ::std::collections::HashMap::new();
+        properties.insert(
+            "ApplicationType".to_string(),
+            input.application_type.clone(),
+        );
+        properties.insert("Instances".to_string(), input.instances.join(", "));
+        if let Some(sid) = input.sid.as_ref() {
+            properties.insert("Sid".to_string(), sid.clone());
+        }
+        if let Some(instance_number) = input.sap_instance_number.as_ref() {
+            properties.insert("SapInstanceNumber".to_string(), instance_number.clone());
+        }
+        let declared_credentials = input.credentials.as_deref().unwrap_or_default();
+        if !declared_credentials.is_empty() {
+            properties.insert(
+                "Credentials".to_string(),
+                crate::state::named_credentials(declared_credentials),
+            );
+        }
+        if let Some(database_arn) = input.database_arn.as_ref() {
+            properties.insert("DatabaseArn".to_string(), database_arn.clone());
+        }
+        let declared_components = input.components_info.as_deref().unwrap_or_default();
+        if !declared_components.is_empty() {
+            properties.insert(
+                "ComponentsInfo".to_string(),
+                crate::state::named_components(declared_components),
+            );
+        }
+
         // The emulator discovers nothing on the registered instances, so the only
         // components an application has are the ones the registration described: one per
         // `ComponentsInfo` entry, plus the SAP HANA component of the SAP system its `Sid`
@@ -364,9 +408,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let operation_id = region_state.record_operation(
             crate::state::OPERATION_TYPE_REGISTER_APPLICATION,
             &application,
-            // This call carries no parameters beyond the resource it names, which the
-            // record already reports as `ResourceId`/`ResourceArn`.
-            ::std::collections::HashMap::new(),
+            properties,
             now,
         );
         // Projected through the partition, because what an `Application` reports about

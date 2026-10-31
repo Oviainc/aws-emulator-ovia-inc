@@ -259,18 +259,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The operation's `Properties` are the parameters of the call that filed it, so
         // a client reading the record back learns what the update asked for. A
         // credential's `SecretId` is `@sensitive`, so what the record names of a
-        // credential is the SAP HANA database it reaches and its type, never the secret.
+        // credential is the SAP HANA database it reaches and its type, never the secret
+        // (`crate::state::named_credentials`).
         let mut properties = ::std::collections::HashMap::new();
         if !credentials_to_add_or_update.is_empty() {
             properties.insert(
                 "CredentialsToAddOrUpdate".to_string(),
-                named_credentials(credentials_to_add_or_update),
+                crate::state::named_credentials(credentials_to_add_or_update),
             );
         }
         if !credentials_to_remove.is_empty() {
             properties.insert(
                 "CredentialsToRemove".to_string(),
-                named_credentials(credentials_to_remove),
+                crate::state::named_credentials(credentials_to_remove),
             );
         }
         if let Some(backint) = input.backint.as_ref() {
@@ -325,19 +326,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation_ids: Some(::std::vec![operation_id]),
         })
     }
-}
-
-/// How an operation record names the credentials a call carried: the SAP HANA database
-/// each one reaches and its `CredentialType`, in the order the call named them.
-///
-/// `ApplicationCredential$SecretId` is `@sensitive`, so the secret a credential names is
-/// never written into a record a later `GetOperation` reads back; what identifies a
-/// credential of an application is the database and the type anyway
-/// (`crate::state::same_credential`).
-fn named_credentials(credentials: &[ApplicationCredential]) -> String {
-    credentials
-        .iter()
-        .map(|credential| format!("{} ({})", credential.database_name, credential.credential_type))
-        .collect::<Vec<String>>()
-        .join(", ")
 }
