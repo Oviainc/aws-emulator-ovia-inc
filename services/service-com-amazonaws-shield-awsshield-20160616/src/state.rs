@@ -122,6 +122,11 @@ pub const MAX_PROTECTION_GROUPS: i64 = 1000;
 /// [`MAX_PROTECTIONS_PER_ACCOUNT`].
 pub const MAX_ARBITRARY_PATTERN_MEMBERS: i64 = 100;
 
+/// The most Amazon S3 log buckets the Shield Response Team may be authorized to read
+/// for one account, which is the modelled length bound of `LogBucketList` (0..10) —
+/// the list `DescribeDRTAccess` answers with.
+pub const MAX_DRT_LOG_BUCKETS: usize = 10;
+
 /// The page size a listing uses when the caller names no `MaxResults` — the model's own
 /// wording on `ListProtectionsRequest$MaxResults`,
 /// `ListProtectionGroupsRequest$MaxResults` and
@@ -474,6 +479,10 @@ pub struct ComAmazonawsShieldAwsshield20160616State {
     /// The role the Shield Response Team is authorized through (`AssociateDRTRole`):
     /// `None` while the account has authorized none.
     pub drt_role_arn: Option<String>,
+    /// The Amazon S3 log buckets the Shield Response Team may read, in the order the
+    /// account authorized them (`AssociateDRTLogBucket`, withdrawn again by
+    /// `DisassociateDRTLogBucket`): empty while the account has authorized none.
+    pub drt_log_buckets: Vec<String>,
     /// The creation order counter behind [`ProtectionEntry::sequence`] and
     /// [`ProtectionGroupEntry::sequence`].
     next_sequence: u64,
