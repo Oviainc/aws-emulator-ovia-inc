@@ -20,8 +20,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     ArtifactConfigOutput, BrowserConfig, Canary, CanaryCodeOutput, CanaryDryRunConfigOutput,
     CanaryRun, CanaryRunConfigOutput, CanaryRunStatus, CanaryRunTimeline, CanaryScheduleOutput,
-    CanaryStatus, CanaryTimeline, Dependency, DryRunConfigOutput, Group, RetryConfigOutput,
-    RuntimeVersion, S3EncryptionConfig, VpcConfigOutput,
+    CanaryStatus, CanaryTimeline, Dependency, DryRunConfigOutput, Group, GroupSummary,
+    RetryConfigOutput, RuntimeVersion, S3EncryptionConfig, VpcConfigOutput,
 };
 
 /// Mint a fresh identifier for a canary or a canary run.
@@ -770,6 +770,19 @@ impl StoredGroup {
             last_modified_time: Some(self.last_modified.into()),
         }
     }
+
+    /// Project this record onto the modelled `GroupSummary` shape — the group's identity
+    /// without its tags or timestamps, which is every member `GroupSummary` declares
+    /// (`smithy_query(query="shape",shape="GroupSummary")`). The ONLY way a handler
+    /// produces a `GroupSummary`, so the summary a listing reports and the `Group` a
+    /// reader reports cannot disagree about the same record.
+    pub fn to_group_summary(&self) -> GroupSummary {
+        GroupSummary {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            arn: Some(self.arn()),
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-synthetics-synthetics. A handler reaches it through [`service_state`].
@@ -836,12 +849,23 @@ impl ComAmazonawsSyntheticsSyntheticsState {
         self.canaries.values().find(|canary| canary.arn() == arn)
     }
 
-    /// How many groups the canary at `resource_arn` is currently a member of.
-    pub fn membership_count(&self, resource_arn: &str) -> usize {
+    /// The groups the canary at `resource_arn` is currently a member of, in group-name
+    /// order — [`Self::groups`] is ordered, so this has a total, stable order and a
+    /// tokenised page boundary over it means the same thing on the next call.
+    ///
+    /// Membership is stored on the group side ([`StoredGroup::resources`]), so this is the
+    /// one place the relation is read the other way round, which is what
+    /// `ListAssociatedGroups` reports and what [`Self::membership_count`] counts.
+    pub fn groups_of_resource(&self, resource_arn: &str) -> Vec<&StoredGroup> {
         self.groups
             .values()
             .filter(|group| group.resources.contains(resource_arn))
-            .count()
+            .collect()
+    }
+
+    /// How many groups the canary at `resource_arn` is currently a member of.
+    pub fn membership_count(&self, resource_arn: &str) -> usize {
+        self.groups_of_resource(resource_arn).len()
     }
 
     /// Drop `resource_arn` from every group that holds it, because the resource itself is

@@ -43,13 +43,13 @@ use crate::canary_lifecycle::{create_body, Answer, Synthetics};
 use crate::group_lifecycle::group_not_found_message as recorded_group_not_found;
 
 /// The fixed sentence a canary lookup that misses answers with.
-const CANARY_NOT_FOUND: &str = "Canary not found.";
+pub(crate) const CANARY_NOT_FOUND: &str = "Canary not found.";
 
 /// "Each group can contain as many as 10 canaries." — `CreateGroup`'s documentation.
-const MAX_CANARIES_PER_GROUP: usize = 10;
+pub(crate) const MAX_CANARIES_PER_GROUP: usize = 10;
 
 /// "Any single canary can be a member of up to 10 groups." — same source.
-const MAX_GROUPS_PER_CANARY: usize = 10;
+pub(crate) const MAX_GROUPS_PER_CANARY: usize = 10;
 
 /// Comfortably longer than the provisioning span the emulator owes a freshly created
 /// canary, so a canary created at the start of a step is out of `CREATING` — and therefore
@@ -60,14 +60,14 @@ const PAST_PROVISIONING: Duration = Duration::from_millis(900);
 /// (`^arn:(aws[a-zA-Z-]*)?:synthetics:…:\d{12}:canary:[0-9a-z_\-]{1,255}$`) rather than
 /// read back from a response: the `Canary` shape carries no ARN member, so the ARN a
 /// caller passes to `AssociateResource` is one it composes itself.
-fn canary_arn(region: &str, name: &str) -> String {
+pub(crate) fn canary_arn(region: &str, name: &str) -> String {
     format!(
         "arn:aws:synthetics:{region}:{}:canary:{name}",
         engine::EMULATOR_ACCOUNT_ID
     )
 }
 
-async fn create_group(aws: &Synthetics, body: Value) -> Answer {
+pub(crate) async fn create_group(aws: &Synthetics, body: Value) -> Answer {
     aws.call("POST", "/group", Some(body)).await
 }
 
@@ -75,7 +75,7 @@ async fn get_group(aws: &Synthetics, identifier: &str) -> Answer {
     aws.call("GET", &format!("/group/{identifier}"), None).await
 }
 
-async fn associate(aws: &Synthetics, identifier: &str, resource_arn: &str) -> Answer {
+pub(crate) async fn associate(aws: &Synthetics, identifier: &str, resource_arn: &str) -> Answer {
     aws.call(
         "PATCH",
         &format!("/group/{identifier}/associate"),
@@ -84,7 +84,7 @@ async fn associate(aws: &Synthetics, identifier: &str, resource_arn: &str) -> An
     .await
 }
 
-async fn list_resources(aws: &Synthetics, identifier: &str, body: Value) -> Answer {
+pub(crate) async fn list_resources(aws: &Synthetics, identifier: &str, body: Value) -> Answer {
     aws.call(
         "POST",
         &format!("/group/{identifier}/resources"),
@@ -94,7 +94,7 @@ async fn list_resources(aws: &Synthetics, identifier: &str, body: Value) -> Answ
 }
 
 /// Assert a 200 and hand the answer back.
-fn ok(case: &str, answer: Answer) -> Answer {
+pub(crate) fn ok(case: &str, answer: Answer) -> Answer {
     assert_eq!(
         answer.status, 200,
         "case {case}: expected 200, got {} ({:?})",
@@ -105,7 +105,7 @@ fn ok(case: &str, answer: Answer) -> Answer {
 
 /// Assert the modelled error envelope — status and `x-amzn-errortype` — and return the
 /// `Message`, which is `None` when the body carries none.
-fn error_of(case: &str, answer: &Answer, status: u16, code: &str) -> Option<String> {
+pub(crate) fn error_of(case: &str, answer: &Answer, status: u16, code: &str) -> Option<String> {
     assert_eq!(
         answer.status, status,
         "case {case}: expected {status}, got {} ({:?})",
@@ -122,7 +122,7 @@ fn error_of(case: &str, answer: &Answer, status: u16, code: &str) -> Option<Stri
 }
 
 /// The `Resources` member of a `ListGroupResources` answer.
-fn resources_of(case: &str, answer: &Answer) -> Vec<String> {
+pub(crate) fn resources_of(case: &str, answer: &Answer) -> Vec<String> {
     answer
         .at("Resources")
         .as_array()
@@ -143,7 +143,7 @@ fn resources_of(case: &str, answer: &Answer) -> Vec<String> {
 }
 
 /// Create `name` as a canary in `aws`' Region and answer its ARN.
-async fn canary(aws: &Synthetics, region: &str, name: &str) -> String {
+pub(crate) async fn canary(aws: &Synthetics, region: &str, name: &str) -> String {
     ok(
         &format!("create-canary/{name}"),
         aws.create(create_body(name)).await,
