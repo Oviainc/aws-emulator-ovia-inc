@@ -12,6 +12,12 @@
 //! timestamp, and every continuation token come from [`crate::state`], which the
 //! producer path writes through
 //! [`ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::put_fragment`](crate::state::ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::put_fragment).
+//! The stream a request addresses is the Kinesis Video Streams control plane's
+//! resource, resolved in its registry through
+//! [`ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::resolve_stream`](crate::state::ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::resolve_stream),
+//! so a stream `CreateStream` made is readable here — with an empty payload until a
+//! producer writes to it — and `ResourceNotFoundException` is only ever for an
+//! identifier that registry does not hold.
 //!
 //! Where this emulator stops short of the real service, it stops honestly: a real
 //! `GetMedia` holds the connection open and keeps streaming new fragments, while this
@@ -432,19 +438,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Resolve the stream, the cursor the selector names, and how much of the
         // stream this session carries.
-        let (stream_name, stream_id, content_type, newest_server_millis, start, chunks, bytes) = {
-            let stream = match (name, arn) {
-                (Some(name), _) => store.stream_by_name(name),
-                (None, Some(arn)) => store.stream_by_arn(arn),
-                (None, None) => None,
-            }
-            .ok_or_else(|| {
-                resource_not_found(format!(
-                    "No such stream: {}.",
-                    name.or(arn).unwrap_or_default()
-                ))
-            })?;
-            let fragments = &stream.fragments;
+        let (
+            stream_name,
+            stream_arn,
+            stream_id,
+            content_type,
+            newest_server_millis,
+            start,
+            chunks,
+            bytes,
+        ) = {
+            // The stream is the Kinesis Video Streams control plane's resource, so it
+            // is resolved in that registry in the shared engine; this store holds only
+            // the media produced to it, which is empty for a stream just created.
+            let stream = store
+                .resolve_stream(&*self.engine, name, arn)
+                .ok_or_else(|| {
+                    resource_not_found(format!(
+                        "No such stream: {}.",
+                        name.or(arn).unwrap_or_default()
+                    ))
+                })?;
+            let fragments = stream.fragments;
             let start = match selector_type {
                 // "EARLIEST - Start with earliest available chunk on the stream."
                 "EARLIEST" => 0,
@@ -495,12 +510,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // stream) names no chunk.
                 "CONTINUATION_TOKEN" => {
                     let token = selector.continuation_token.as_deref().unwrap_or_default();
-                    let resumed = store.continuation(token, &stream.name).ok_or_else(|| {
-                        invalid_argument(format!(
-                            "Continuation token {token} does not resolve to a position on stream {}.",
-                            stream.name
-                        ))
-                    })?;
+                    let resumed = store
+                        .continuation(token, &stream.arn, fragments.len())
+                        .ok_or_else(|| {
+                            invalid_argument(format!(
+                                "Continuation token {token} does not resolve to a position on stream {}.",
+                                stream.name
+                            ))
+                        })?;
                     resumed.next_fragment_index
                 }
                 // Every modelled selector type is handled above, and an unmodelled one
@@ -535,6 +552,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default();
             (
                 stream.name.clone(),
+                stream.arn.clone(),
                 stream.id,
                 stream.content_type.clone(),
                 newest_server_millis,
@@ -548,19 +566,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the chunk that carries it — which is what makes two sequential calls
         // neither repeat nor skip a fragment.
         let tokens: Vec<String> = (0..chunks)
-            .map(|offset| store.record_continuation(&stream_name, stream_id, start + offset + 1))
+            .map(|offset| store.record_continuation(&stream_arn, stream_id, start + offset + 1))
             .collect();
 
         // The payload: each stored chunk verbatim, followed by its own `Tags` element.
         // The media bytes are copied once, straight out of the store. The slice is
         // taken through `get`, so the cursor can only ever bound the run the block
-        // above measured under this same lock.
+        // above measured under this same lock — and a registered stream with no log
+        // here carries no chunk at all, which is the empty payload.
         let mut payload =
             Vec::with_capacity(bytes.saturating_add(chunks.saturating_mul(TAGS_ELEMENT_BUDGET)));
         let emitted = store
             .streams
-            .get(&stream_name)
-            .and_then(|stream| stream.fragments.get(start..start.saturating_add(chunks)));
+            .get(&stream_arn)
+            .map_or(&[][..], |stream| stream.fragments.as_slice())
+            .get(start..start.saturating_add(chunks));
         debug_assert!(
             emitted.is_some(),
             "the stream and its cursor were resolved from this same locked store"
@@ -585,6 +605,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         tracing::debug!(
             operation = Self::NAME,
             stream = %stream_name,
+            // The ARN the control-plane registry holds for this stream: the one identity
+            // both planes address it by, whichever identifier the request carried.
+            stream_arn = %stream_arn,
             start_selector_type = selector_type,
             cursor = start,
             chunks,

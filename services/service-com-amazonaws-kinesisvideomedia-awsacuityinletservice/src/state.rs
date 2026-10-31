@@ -8,14 +8,27 @@
 //! `GetMedia` response hands back so the next call resumes exactly where the last one
 //! stopped.
 //!
-//! The producer side of the same data (`PutMedia`) belongs to the sibling
-//! `kinesisvideo` service, whose handlers are all still scaffolded, so today the only
-//! writer of this log is [`ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::put_fragment`]
-//! — the one entry point a producer path (or a test seeding a stream) calls. `GetMedia`
-//! itself never appends a fragment and never creates a stream.
+//! The STREAM itself is not this service's resource: a Kinesis video stream is created
+//! by the Kinesis Video Streams control plane (`CreateStream`), reported by it
+//! (`DescribeStream`) and removed by it (`DeleteStream`), and a data plane reached
+//! through `GetDataEndpoint` reads THAT stream. So a request's `StreamName` /
+//! `StreamARN` is resolved in that service's registry in the shared engine
+//! ([`ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::resolve_stream`]), whose
+//! record decides the stream's identity — which is what makes a just-created stream
+//! readable here (with an empty payload until something is produced to it), a removed
+//! one a missing resource, and a stream created again under a removed one's name a
+//! stream with no media of its own.
+//!
+//! The producer side of the media itself (`PutMedia`) is not modelled by any crate in
+//! this emulator yet, so today the only writer of this log is
+//! [`ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::put_fragment`] — the one
+//! entry point a producer path (or a test seeding a stream) calls. `GetMedia` itself
+//! never appends a fragment and never creates a stream.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
+
+use ::service_com_amazonaws_kinesisvideo_kinesisvideo_20170930::state as control_plane;
 
 /// The content type a Kinesis video stream reports when nothing else is known about
 /// its media: Kinesis Video Streams stores producer fragments as Matroska, and
@@ -41,10 +54,12 @@ pub struct Fragment {
 /// A stream's persisted media log.
 #[derive(Debug, Clone)]
 pub struct MediaStream {
-    /// The stream name a request may name directly.
-    pub name: String,
-    /// The stream ARN that resolves to this same stream.
+    /// The `StreamARN` of the stream whose media this is, and the key the log is held
+    /// under: the identity the control plane minted for THIS incarnation of the stream.
     pub arn: String,
+    /// The `StreamName` that stream is registered under. Carried for attribution only;
+    /// a request is resolved through the registry, never through this field.
+    pub name: String,
     /// The content type `GetMedia` reports for this stream's media.
     pub content_type: String,
     /// Every fragment ever written, oldest first. `GetMedia` emits a contiguous run of
@@ -62,9 +77,9 @@ pub struct MediaStream {
 /// the first fragment the next call must emit.
 #[derive(Debug, Clone)]
 pub struct Continuation {
-    /// The stream the token was minted for. A token presented against another stream
-    /// does not resolve.
-    pub stream_name: String,
+    /// The `StreamARN` of the stream the token was minted for. A token presented
+    /// against another stream does not resolve.
+    pub stream_arn: String,
     /// Index into [`MediaStream::fragments`] of the first fragment still to deliver.
     pub next_fragment_index: usize,
 }
@@ -72,87 +87,70 @@ pub struct Continuation {
 /// Per-service state for com-amazonaws-kinesisvideomedia-awsacuityinletservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
-    /// Streams by name.
+    /// Per-stream fragment logs, keyed by the `StreamARN` the control plane minted for
+    /// the stream. NOT a stream registry: an entry here is the media this service holds
+    /// for a stream, and a stream with no entry is one nothing has been produced to —
+    /// not a stream that does not exist.
+    ///
+    /// Keyed by the ARN rather than by the `StreamName`, because a name is reusable
+    /// while the ARN carries the stream's creation instant: a stream deleted and
+    /// created again under one name is a different stream, and must not inherit the
+    /// previous incarnation's media or its cursors.
     pub streams: HashMap<String, MediaStream>,
-    /// Stream ARN -> stream name, so either identifier a request may carry resolves to
-    /// the same stream.
-    pub arn_index: HashMap<String, String>,
     /// Continuation token -> cursor, so a token this service minted is resolved from
     /// persisted state rather than parsed back out of the token text.
     pub continuations: HashMap<String, Continuation>,
-    /// The id the next stream created here gets.
+    /// The last log id handed out; `0` means none has been, so an id is always at least
+    /// `1` and never collides with the "no log yet" id a log-less stream reports.
     next_stream_id: u64,
 }
 
 impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
-    /// The stream called `stream_name`, created empty (with its ARN registered) when
-    /// this is the first time it is named.
+    /// The media log of the registered stream `stream_arn` identifies, created empty
+    /// when this is the first time it is named.
     ///
-    /// A stream exists before any fragment is written to it — that is what makes an
-    /// empty stream a `GetMedia` with an empty payload rather than a 404. `created_at`
-    /// is used only on creation, and `region` only to build the ARN there, but both
-    /// identifiers are checked on every call so a name or region the model cannot
-    /// express never reaches the log.
-    ///
-    /// `None` when `stream_name` is not a name the service accepts (see
-    /// [`is_valid_stream_name`]) or `region` is not a region an ARN can carry (see
-    /// [`is_valid_region`]): a producer naming a stream the model cannot express is
-    /// refused, so no stream here can carry an ARN the modelled `ResourceARN` pattern
-    /// would reject.
-    pub fn ensure_stream(
-        &mut self,
-        stream_name: &str,
-        region: &str,
-        created_at: SystemTime,
-    ) -> Option<&mut MediaStream> {
-        if !is_valid_stream_name(stream_name) || !is_valid_region(region) {
-            return None;
+    /// Private: a log is not a stream. A stream EXISTS because the control plane
+    /// registered it, so nothing outside this store creates a log — the one writer is
+    /// [`put_fragment`](Self::put_fragment), which resolves the registered stream
+    /// first.
+    fn log_mut(&mut self, stream_arn: &str, stream_name: &str) -> &mut MediaStream {
+        // Ids are handed out from 1, so the `0` a stream with no log reports can never
+        // be a live log's id, and two streams never share a continuation-token prefix.
+        let fresh_id = self.next_stream_id.saturating_add(1);
+        if !self.streams.contains_key(stream_arn) {
+            self.next_stream_id = fresh_id;
         }
-        if !self.streams.contains_key(stream_name) {
-            let id = self.next_stream_id;
-            self.next_stream_id += 1;
-            // The modelled `ResourceARN` is
-            // `^arn:aws:kinesisvideo:[a-z0-9-]+:[0-9]+:[a-z]+/[a-zA-Z0-9_.-]+/[0-9]+$`:
-            // the trailing segment is the stream's creation time, which is what makes
-            // two streams that reuse one name distinguishable.
-            let created_millis = epoch_millis(created_at).max(0);
-            let arn = ::engine::emulator_arn(
-                "kinesisvideo",
-                region,
-                &format!("stream/{stream_name}/{created_millis}"),
-            );
-            self.arn_index.insert(arn.clone(), stream_name.to_string());
-            self.streams.insert(
-                stream_name.to_string(),
-                MediaStream {
-                    name: stream_name.to_string(),
-                    arn,
-                    content_type: DEFAULT_CONTENT_TYPE.to_string(),
-                    fragments: Vec::new(),
-                    next_fragment_number: 1,
-                    id,
-                },
-            );
-        }
-        self.streams.get_mut(stream_name)
+        self.streams
+            .entry(stream_arn.to_string())
+            .or_insert_with(|| MediaStream {
+                arn: stream_arn.to_string(),
+                name: stream_name.to_string(),
+                content_type: DEFAULT_CONTENT_TYPE.to_string(),
+                fragments: Vec::new(),
+                next_fragment_number: 1,
+                id: fresh_id,
+            })
     }
 
-    /// Append `chunk` to `stream_name`, creating the stream on first write, and answer
-    /// the fragment number it was stored under.
+    /// Append `chunk` to the media log of the stream `stream_name`/`stream_arn` names,
+    /// and answer the fragment number it was stored under.
     ///
-    /// This is the producer-side entry point: the writer of the fragment log. `region`
-    /// is the caller's signing region, used only when the stream is created, because
-    /// the stream ARN carries it. `None` when the stream name is one the service does
-    /// not accept (see [`ensure_stream`](Self::ensure_stream)).
-    pub fn put_fragment(
+    /// This is the producer-side entry point: the writer of the fragment log. The
+    /// stream it addresses is resolved in the control-plane registry exactly as a read
+    /// resolves it, so media is only ever written to a stream that EXISTS, under the
+    /// identity that stream is registered with. `None` when the registry holds no such
+    /// stream — the producer side of `ResourceNotFoundException`.
+    pub fn put_fragment<Eng: Send + Sync + 'static>(
         &mut self,
-        stream_name: &str,
-        region: &str,
+        engine: &Eng,
+        stream_name: Option<&str>,
+        stream_arn: Option<&str>,
         chunk: Vec<u8>,
         producer_timestamp: SystemTime,
         server_timestamp: SystemTime,
     ) -> Option<String> {
-        let stream = self.ensure_stream(stream_name, region, server_timestamp)?;
+        let (name, arn) = registered_stream(engine, stream_name, stream_arn)?;
+        let stream = self.log_mut(&arn, &name);
         let fragment_number = stream.next_fragment_number.to_string();
         stream.next_fragment_number += 1;
         stream.fragments.push(Fragment {
@@ -164,20 +162,52 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
         Some(fragment_number)
     }
 
-    /// The stream a request named by `StreamName`, or `None` when there is no such
-    /// stream — which `GetMedia` answers as `ResourceNotFoundException`.
-    pub fn stream_by_name(&self, name: &str) -> Option<&MediaStream> {
-        self.streams.get(name)
+    /// The media log held for the stream `arn` identifies, or `None` when nothing has
+    /// been produced to that stream.
+    pub fn log_by_arn(&self, arn: &str) -> Option<&MediaStream> {
+        self.streams.get(arn)
     }
 
-    /// The stream a request named by `StreamARN`. The ARN index is what makes the two
-    /// identifiers resolve to one stream.
-    pub fn stream_by_arn(&self, arn: &str) -> Option<&MediaStream> {
-        self.streams.get(self.arn_index.get(arn)?)
+    /// The one stream a `GetMedia` request addresses.
+    ///
+    /// A stream EXISTS because the Kinesis Video Streams control plane created it, so
+    /// the identifier is resolved in that service's registry in the shared engine, and
+    /// its record is what the stream's name and ARN are read from — so both planes
+    /// answer to the one identity, a stream created a moment ago is readable here, and
+    /// a stream the control plane no longer holds is not. The FRAGMENTS are this
+    /// service's own log for that stream, empty for a registered stream nothing has
+    /// been produced to, and that emptiness is what an empty payload is computed from.
+    ///
+    /// `None` when the registry holds no stream for this identifier — the one condition
+    /// `ResourceNotFoundException` documents ("The stream with the given name does not
+    /// exist").
+    ///
+    /// The control-plane store is locked while this service's own store is already
+    /// locked (the caller holds that guard); the control plane never reads this
+    /// service's state, so there is no cycle between the two.
+    pub fn resolve_stream<Eng: Send + Sync + 'static>(
+        &self,
+        engine: &Eng,
+        stream_name: Option<&str>,
+        stream_arn: Option<&str>,
+    ) -> Option<ResolvedStream<'_>> {
+        let (name, arn) = registered_stream(engine, stream_name, stream_arn)?;
+        let log = self.streams.get(&arn);
+        Some(ResolvedStream {
+            name,
+            arn,
+            content_type: log.map_or_else(
+                || DEFAULT_CONTENT_TYPE.to_string(),
+                |held| held.content_type.clone(),
+            ),
+            id: log.map_or(0, |held| held.id),
+            fragments: log.map_or(&[][..], |held| held.fragments.as_slice()),
+        })
     }
 
-    /// The token that resumes `stream_name` at `next_fragment_index`, recording the
-    /// cursor so the next request resolves it from state.
+    /// The token that resumes the stream `stream_arn` identifies at
+    /// `next_fragment_index`, recording the cursor so the next request resolves it from
+    /// state.
     ///
     /// Derived from the cursor (and the stream's own [`MediaStream::id`], which the
     /// caller has because it resolved the stream) rather than drawn at random, so
@@ -186,19 +216,19 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
     /// (`^[a-zA-Z0-9_\.\-]+$`, 1..128).
     pub fn record_continuation(
         &mut self,
-        stream_name: &str,
+        stream_arn: &str,
         stream_id: u64,
         next_fragment_index: usize,
     ) -> String {
         // A cursor past the end of the log names no chunk, so never record one: the
         // caller resolved `next_fragment_index` against this same store, and the clamp
         // keeps a future caller from minting a token that resumes nowhere. A stream
-        // this store does not hold cannot be clamped against, and a cursor recorded
+        // this store holds no log for cannot be clamped against, and a cursor recorded
         // for one is caught instead when the token is resolved (see
         // [`continuation`](Self::continuation)).
         let next_fragment_index = self
             .streams
-            .get(stream_name)
+            .get(stream_arn)
             .map_or(next_fragment_index, |stream| {
                 next_fragment_index.min(stream.fragments.len())
             });
@@ -206,49 +236,84 @@ impl ComAmazonawsKinesisvideomediaAwsacuityinletserviceState {
         self.continuations
             .entry(token.clone())
             .or_insert_with(|| Continuation {
-                stream_name: stream_name.to_string(),
+                stream_arn: stream_arn.to_string(),
                 next_fragment_index,
             });
         token
     }
 
-    /// The cursor a previously minted token resumes at ON `stream_name`.
+    /// The cursor a previously minted token resumes at ON the stream `stream_arn`
+    /// identifies, whose log holds `fragment_count` fragments.
     ///
     /// `None` when the token was never minted here, was minted for another stream, or
     /// names a position outside that stream's log: a cursor is an index into one
     /// stream's fragment log, so both bindings are enforced here rather than left to
     /// each caller. A cursor exactly at the end of the log is live — it is where the
     /// next fragment will land, so it resumes with an empty payload.
-    pub fn continuation(&self, token: &str, stream_name: &str) -> Option<&Continuation> {
+    pub fn continuation(
+        &self,
+        token: &str,
+        stream_arn: &str,
+        fragment_count: usize,
+    ) -> Option<&Continuation> {
         let continuation = self.continuations.get(token)?;
-        if continuation.stream_name != stream_name {
+        if continuation.stream_arn != stream_arn {
             return None;
         }
-        self.streams
-            .get(stream_name)
-            .is_some_and(|stream| continuation.next_fragment_index <= stream.fragments.len())
-            .then_some(continuation)
+        (continuation.next_fragment_index <= fragment_count).then_some(continuation)
     }
 }
 
-/// Whether `name` is a stream name this service accepts: the modelled `StreamName`
-/// (len 1..256, `^[a-zA-Z0-9_.-]+$`). The same charset is what keeps the stream ARN
-/// built from it inside the modelled `ResourceARN` pattern.
-pub fn is_valid_stream_name(name: &str) -> bool {
-    (1..=256).contains(&name.len())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+/// The one stream a `GetMedia` request addresses: its IDENTITY as the Kinesis Video
+/// Streams control plane holds it, with the fragments this service owns for it.
+///
+/// Read through
+/// [`ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::resolve_stream`] on every
+/// call, so a stream the control plane created or removed since the last read is
+/// observed by the next one rather than by a copy taken earlier.
+#[derive(Debug)]
+pub struct ResolvedStream<'a> {
+    /// The stream's `StreamName`.
+    pub name: String,
+    /// The stream's `StreamARN`, which is also the key its media log is held under.
+    pub arn: String,
+    /// The content type `GetMedia` reports for this stream's media.
+    pub content_type: String,
+    /// The short, stable id this stream's continuation tokens are built from; `0` for a
+    /// stream with no log yet, which carries no fragment and so mints no token (a live
+    /// log's id is always at least `1`).
+    pub id: u64,
+    /// This stream's fragment log, oldest first; empty for a registered stream nothing
+    /// has been produced to.
+    pub fragments: &'a [Fragment],
 }
 
-/// Whether `region` is one a stream ARN can carry: the region segment of the modelled
-/// `ResourceARN` pattern (`[a-z0-9-]+`). A signing region outside it would produce an
-/// ARN the model rejects, so a stream is not created for it.
-pub fn is_valid_region(region: &str) -> bool {
-    !region.is_empty()
-        && region
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+/// The `StreamName` and `StreamARN` the Kinesis Video Streams control plane registry
+/// holds for this identifier pair, or `None` when it holds no such stream.
+///
+/// The registry is that service's state in the SHARED engine, so a stream a client
+/// created through `CreateStream` is the very record read here — no copy of it is kept
+/// on this side.
+///
+/// The registry's clock is settled first, so a stream whose removal the control plane
+/// already owed (`DeleteStream` fixes that instant) is gone here too: that removal was
+/// due at the same instant whether or not anybody called, so it changes nothing a later
+/// caller would not have seen anyway.
+///
+/// The record's `Status` is not read: a stream is resolved whatever status the control
+/// plane holds it in, so whether a read of a stream that is still creating (or already
+/// marked for deletion) should be refused belongs with the stream-state work on the
+/// control plane, not here.
+fn registered_stream<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    stream_name: Option<&str>,
+    stream_arn: Option<&str>,
+) -> Option<(String, String)> {
+    let registry = control_plane::service_state(engine)?;
+    let mut registry = registry.lock();
+    registry.settle_clock();
+    let stream = registry.resolve(stream_name, stream_arn).ok()?;
+    Some((stream.stream_name.clone(), stream.stream_arn.clone()))
 }
 
 /// `t` as milliseconds since the Unix epoch (negative before it), the unit Kinesis

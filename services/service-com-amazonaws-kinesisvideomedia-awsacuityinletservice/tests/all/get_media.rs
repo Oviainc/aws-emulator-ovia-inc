@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
+use service_com_amazonaws_kinesisvideo_kinesisvideo_20170930 as control_plane;
 use service_com_amazonaws_kinesisvideomedia_awsacuityinletservice::ops::get_media::{
     ID_SIMPLE_TAG, ID_TAG, ID_TAGS, ID_TAG_NAME, ID_TAG_STRING,
 };
@@ -35,7 +36,9 @@ use smithy_server_runtime::MultiServiceRouter;
 /// Read the first EBML element in `bytes`: its id, its body, and how many bytes the
 /// whole element occupied. `None` when `bytes` does not start with a well-formed,
 /// fully present element.
-fn read_ebml_element(bytes: &[u8]) -> Option<(&[u8], &[u8], usize)> {
+///
+/// `pub(crate)` so the sibling suites of this test target read one payload one way.
+pub(crate) fn read_ebml_element(bytes: &[u8]) -> Option<(&[u8], &[u8], usize)> {
     let id_first = *bytes.first()?;
     if id_first == 0 {
         return None;
@@ -67,7 +70,7 @@ fn read_ebml_element(bytes: &[u8]) -> Option<(&[u8], &[u8], usize)> {
 /// The `TagName`/`TagString` pairs of the `Tags` element at the start of `bytes`, in
 /// the order they were written. Empty when `bytes` does not start with a `Tags`
 /// element.
-fn read_kvs_tags(bytes: &[u8]) -> Vec<(String, String)> {
+pub(crate) fn read_kvs_tags(bytes: &[u8]) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let Some((id, tags_body, _)) = read_ebml_element(bytes) else {
         return pairs;
@@ -144,47 +147,76 @@ fn as_epoch_seconds(millis: u64) -> serde_json::Value {
     serde_json::json!(millis as f64 / 1000.0)
 }
 
-/// A router carrying only this service, over the shared engine the seeding helper
-/// wrote to — the same single engine the production router hands every operation.
+/// A router carrying this service AND the Kinesis Video Streams control plane, over
+/// the shared engine the seeding helper writes to — the same single engine the
+/// production router hands every operation. The control plane is what CREATES a
+/// stream, so mounting it is what makes a stream readable here; the two services share
+/// the signing name `kinesisvideo` and are told apart by their first URI path segment.
 fn router(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
+    router.register_service(control_plane::EmulatedService::new(Arc::clone(engine)));
     router.register_service(EmulatedService::new(Arc::clone(engine)));
     router
 }
 
-/// Seed `stream_name` with one fragment per entry of `chunks`, through the producer
-/// entry point on this service's state, and answer the stream's ARN.
-fn seed(engine: &Arc<engine::InMemoryEngine>, stream_name: &str, chunks: &[&[u8]]) -> String {
+/// Create `stream_name` through the control plane and answer the `StreamARN` it minted
+/// — the one stream identity both planes address the stream by.
+async fn create_stream(router: &MultiServiceRouter, stream_name: &str) -> String {
+    let response = post(
+        router,
+        "/createStream",
+        &serde_json::json!({ "StreamName": stream_name }),
+    )
+    .await;
+    assert_eq!(
+        status_of(&response),
+        200,
+        "case \"create {stream_name}\": expected 200, got {} ({})",
+        status_of(&response),
+        error_code(&response)
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(response.body()).unwrap_or(serde_json::Value::Null);
+    body.get("StreamARN")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("case \"create {stream_name}\": no StreamARN in {body:?}"))
+        .to_string()
+}
+
+/// Create `stream_name` through the control plane, then seed one fragment per entry of
+/// `chunks` into this service's log for it through the producer entry point, and answer
+/// the stream's ARN.
+async fn seed(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    stream_name: &str,
+    chunks: &[&[u8]],
+) -> String {
+    let arn = create_stream(router, stream_name).await;
     let state = engine.state::<ComAmazonawsKinesisvideomediaAwsacuityinletserviceState>();
     let mut store = state.lock();
-    store
-        .ensure_stream(stream_name, REGION, at(BASE_MILLIS))
-        .expect("the seeded stream name is one the service accepts");
     for (index, chunk) in chunks.iter().enumerate() {
         store
             .put_fragment(
-                stream_name,
-                REGION,
+                &**engine,
+                Some(stream_name),
+                None,
                 chunk.to_vec(),
                 at(producer_millis(index)),
                 at(server_millis(index)),
             )
-            .expect("the seeded stream name is one the service accepts");
+            .expect("the created stream accepts produced media");
     }
-    store
-        .streams
-        .get(stream_name)
-        .map(|stream| stream.arn.clone())
-        .unwrap_or_default()
+    arn
 }
 
-/// A signed-looking `POST /getMedia`. The credential scope's service field is the
-/// routing key the router selects this service with; no authenticator is registered,
-/// so the signature itself is not checked.
-fn get_media_request(body: &serde_json::Value) -> http::Request<Bytes> {
+/// A signed-looking `POST <path>`. The credential scope's service field is the routing
+/// key the router selects a service with; no authenticator is registered, so the
+/// signature itself is not checked.
+fn signed_request(path: &str, body: &serde_json::Value) -> http::Request<Bytes> {
     http::Request::builder()
         .method("POST")
-        .uri("/getMedia")
+        .uri(path)
         .header(
             "authorization",
             format!(
@@ -199,11 +231,19 @@ fn get_media_request(body: &serde_json::Value) -> http::Request<Bytes> {
         .expect("a valid request")
 }
 
+async fn post(
+    router: &MultiServiceRouter,
+    path: &str,
+    body: &serde_json::Value,
+) -> http::Response<Bytes> {
+    router.dispatch(signed_request(path, body)).await
+}
+
 async fn get_media(
     router: &MultiServiceRouter,
     body: &serde_json::Value,
 ) -> http::Response<Bytes> {
-    router.dispatch(get_media_request(body)).await
+    post(router, "/getMedia", body).await
 }
 
 /// A `GetMedia` body naming a stream by name, with the given selector.
@@ -214,13 +254,13 @@ fn by_name(stream_name: &str, selector: serde_json::Value) -> serde_json::Value 
 /// The decoded form of one emitted chunk: the media bytes and its `AWS_KINESISVIDEO_*`
 /// tags.
 #[derive(Debug)]
-struct EmittedChunk {
-    media: Vec<u8>,
-    tags: Vec<(String, String)>,
+pub(crate) struct EmittedChunk {
+    pub(crate) media: Vec<u8>,
+    pub(crate) tags: Vec<(String, String)>,
 }
 
 impl EmittedChunk {
-    fn tag(&self, name: &str) -> String {
+    pub(crate) fn tag(&self, name: &str) -> String {
         self.tags
             .iter()
             .find(|(tag, _)| tag == name)
@@ -232,7 +272,11 @@ impl EmittedChunk {
 /// Split a payload into its chunks, given the media bytes each emitted fragment was
 /// seeded with: every chunk is its stored bytes followed by exactly one `Tags`
 /// element, and the payload ends with the last one.
-fn split_payload(case: &str, payload: &[u8], expected_media: &[&[u8]]) -> Vec<EmittedChunk> {
+pub(crate) fn split_payload(
+    case: &str,
+    payload: &[u8],
+    expected_media: &[&[u8]],
+) -> Vec<EmittedChunk> {
     let mut chunks = Vec::new();
     let mut offset = 0usize;
     for media in expected_media {
@@ -299,8 +343,8 @@ fn error_code(response: &http::Response<Bytes>) -> String {
 #[tokio::test]
 async fn earliest_returns_every_persisted_chunk_with_its_metadata() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    seed(&engine, "my-stream", CHUNKS);
     let router = router(&engine);
+    seed(&router, &engine, "my-stream", CHUNKS).await;
 
     let response = get_media(
         &router,
@@ -378,8 +422,8 @@ async fn earliest_returns_every_persisted_chunk_with_its_metadata() {
 #[tokio::test]
 async fn every_start_selector_resolves_to_its_documented_position() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let arn = seed(&engine, "my-stream", CHUNKS);
     let router = router(&engine);
+    let arn = seed(&router, &engine, "my-stream", CHUNKS).await;
 
     // `StartSelectorType`'s own documentation is the source of each row: NOW is "the
     // latest chunk", EARLIEST "the earliest available chunk", FRAGMENT_NUMBER "the
@@ -527,8 +571,8 @@ async fn every_start_selector_resolves_to_its_documented_position() {
 #[tokio::test]
 async fn a_continuation_token_resumes_exactly_after_its_own_chunk() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    seed(&engine, "my-stream", CHUNKS);
     let router = router(&engine);
+    seed(&router, &engine, "my-stream", CHUNKS).await;
 
     let first = get_media(
         &router,
@@ -577,13 +621,14 @@ async fn a_continuation_token_resumes_exactly_after_its_own_chunk() {
         state
             .lock()
             .put_fragment(
-                "my-stream",
-                REGION,
+                &*engine,
+                Some("my-stream"),
+                None,
                 fresh_chunk.to_vec(),
                 at(producer_millis(CHUNKS.len())),
                 at(server_millis(CHUNKS.len())),
             )
-            .expect("the seeded stream name is one the service accepts");
+            .expect("the created stream accepts produced media");
     }
     let last_token = tokens.last().expect("EARLIEST delivered chunks").clone();
     let response = get_media(
@@ -621,16 +666,10 @@ async fn a_continuation_token_resumes_exactly_after_its_own_chunk() {
 #[tokio::test]
 async fn a_stream_with_nothing_left_to_send_answers_an_empty_payload() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    seed(&engine, "my-stream", CHUNKS);
-    {
-        // A stream that exists but was never written to.
-        let state = engine.state::<ComAmazonawsKinesisvideomediaAwsacuityinletserviceState>();
-        state
-            .lock()
-            .ensure_stream("silent-stream", REGION, at(BASE_MILLIS))
-            .expect("the seeded stream name is one the service accepts");
-    }
     let router = router(&engine);
+    seed(&router, &engine, "my-stream", CHUNKS).await;
+    // A stream the control plane created that was never produced to.
+    create_stream(&router, "silent-stream").await;
 
     let rows: Vec<(&str, &str, serde_json::Value)> = vec![
         (
@@ -682,9 +721,9 @@ async fn a_stream_with_nothing_left_to_send_answers_an_empty_payload() {
 #[tokio::test]
 async fn malformed_requests_are_refused_with_the_modelled_errors() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let arn = seed(&engine, "my-stream", CHUNKS);
-    seed(&engine, "other-stream", &[b"other-chunk"]);
     let router = router(&engine);
+    let arn = seed(&router, &engine, "my-stream", CHUNKS).await;
+    seed(&router, &engine, "other-stream", &[b"other-chunk"]).await;
 
     // A token minted for another stream, to prove a cursor is stream-scoped.
     let other = get_media(
@@ -863,8 +902,8 @@ async fn malformed_requests_are_refused_with_the_modelled_errors() {
 #[tokio::test]
 async fn reading_a_stream_twice_answers_the_same_bytes() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    seed(&engine, "my-stream", CHUNKS);
     let router = router(&engine);
+    let arn = seed(&router, &engine, "my-stream", CHUNKS).await;
 
     let body = by_name("my-stream", serde_json::json!({"StartSelectorType": "EARLIEST"}));
     let first = get_media(&router, &body).await;
@@ -878,9 +917,8 @@ async fn reading_a_stream_twice_answers_the_same_bytes() {
     let state = engine.state::<ComAmazonawsKinesisvideomediaAwsacuityinletserviceState>();
     let store = state.lock();
     let stream = store
-        .streams
-        .get("my-stream")
-        .expect("the seeded stream is still there");
+        .log_by_arn(&arn)
+        .expect("the seeded stream's media log is still there");
     assert_eq!(
         stream.fragments.len(),
         CHUNKS.len(),
@@ -923,35 +961,48 @@ async fn the_chunk_framing_round_trips_at_every_size_boundary() {
     }
 }
 
-/// The producer entry point accepts exactly the stream names the model's `StreamName`
-/// allows (len 1..256, `^[a-zA-Z0-9_.-]+$`) and only a region the modelled
-/// `ResourceARN` can carry (`[a-z0-9-]+`), so no stream can carry an ARN the model
-/// would reject. Rows walk the charset and both length bounds, plus one past each.
+/// The producer entry point writes media only to a stream the Kinesis Video Streams
+/// control plane HOLDS, under the name that stream is registered with — producing media
+/// never brings a stream into existence here. Rows differ along the identifier form and
+/// along whether the registry holds the stream it names.
 #[tokio::test]
-async fn only_modelled_stream_names_and_regions_are_accepted_by_the_producer_path() {
+async fn media_is_only_written_to_a_stream_the_control_plane_holds() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = router(&engine);
+    let arn = create_stream(&router, "registered-stream").await;
+    // Shaped exactly like the minted ARN, for a stream the registry never held.
+    let unknown_arn = arn.replace("registered-stream", "absent-stream");
     let state = engine.state::<ComAmazonawsKinesisvideomediaAwsacuityinletserviceState>();
 
-    let longest = "a".repeat(256);
-    let too_long = "a".repeat(257);
-    let rows: Vec<(&str, bool)> = vec![
-        ("a", true),
-        ("my-stream", true),
-        ("Stream_1.name-2", true),
-        (longest.as_str(), true),
-        ("", false),
-        (too_long.as_str(), false),
-        ("has/slash", false),
-        ("has space", false),
-        ("has:colon", false),
-        ("hås-unicode", false),
+    // (case, StreamName, StreamARN, whether the write is accepted)
+    let rows: Vec<(&str, Option<&str>, Option<&str>, bool)> = vec![
+        (
+            "a registered stream by name",
+            Some("registered-stream"),
+            None,
+            true,
+        ),
+        (
+            "the same stream by the ARN the control plane minted",
+            None,
+            Some(arn.as_str()),
+            true,
+        ),
+        ("a stream nothing created", Some("absent-stream"), None, false),
+        (
+            "an ARN the registry does not hold",
+            None,
+            Some(unknown_arn.as_str()),
+            false,
+        ),
+        ("neither identifier", None, None, false),
     ];
 
-    for (name, accepted) in rows {
-        let case = format!("stream name of {} byte(s)", name.len());
+    for (case, stream_name, stream_arn, accepted) in rows {
         let written = state.lock().put_fragment(
-            name,
-            REGION,
+            &*engine,
+            stream_name,
+            stream_arn,
             b"chunk".to_vec(),
             at(BASE_MILLIS),
             at(BASE_MILLIS),
@@ -959,54 +1010,41 @@ async fn only_modelled_stream_names_and_regions_are_accepted_by_the_producer_pat
         assert_eq!(
             written.is_some(),
             accepted,
-            "case {case:?}: name {name:?} should be {}, got {written:?}",
+            "case {case:?}: the write should be {}, got {written:?}",
             if accepted { "accepted" } else { "refused" }
         );
-        let stored = state.lock().stream_by_name(name).map(|stream| stream.arn.clone());
-        assert_eq!(
-            stored.is_some(),
-            accepted,
-            "case {case:?}: name {name:?} left the wrong state behind, got {stored:?}"
-        );
-        if let Some(arn) = stored {
-            assert!(
-                arn.starts_with("arn:aws:kinesisvideo:")
-                    && arn.contains(&format!(":stream/{name}/")),
-                "case {case:?}: expected a stream ARN naming {name:?}, got {arn:?}"
-            );
-        }
     }
 
-    // The region segment of the modelled `ResourceARN` is `[a-z0-9-]+`, so a signing
-    // region outside it creates no stream rather than an ARN AWS would never mint.
-    let regions: Vec<(&str, bool)> = vec![
-        ("us-east-1", true),
-        ("ap-southeast-4", true),
-        ("", false),
-        ("US-EAST-1", false),
-        ("us_east_1", false),
-        ("us/east/1", false),
-    ];
-    for (region, accepted) in regions {
-        let case = format!("region {region:?}");
-        let stream = format!("stream-for-{}", region.len());
-        let created = state
-            .lock()
-            .ensure_stream(&stream, region, at(BASE_MILLIS))
-            .map(|stream| stream.arn.clone());
-        assert_eq!(
-            created.is_some(),
-            accepted,
-            "case {case:?}: should be {}, got {created:?}",
-            if accepted { "accepted" } else { "refused" }
-        );
-        if let Some(arn) = created {
-            assert!(
-                arn.contains(&format!(":{region}:")),
-                "case {case:?}: expected the region in the ARN, got {arn:?}"
-            );
-        }
-    }
+    // Both accepted writes landed in the ONE log of the registered stream, in write
+    // order: the two identifier forms name one stream, so neither minted a second log.
+    let numbers: Vec<String> = state
+        .lock()
+        .log_by_arn(&arn)
+        .map(|log| {
+            log.fragments
+                .iter()
+                .map(|fragment| fragment.fragment_number.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        numbers,
+        vec!["1".to_string(), "2".to_string()],
+        "case \"one log per stream\": expected the two accepted writes in order, \
+         got {numbers:?}"
+    );
+    let logs: Vec<String> = {
+        let store = state.lock();
+        let mut keys: Vec<String> = store.streams.keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        logs,
+        vec![arn.clone()],
+        "case \"a refused write leaves no log\": expected only the registered stream's \
+         log (keyed by its ARN), got {logs:?}"
+    );
 }
 
 /// One session carries a bounded amount of media and then stops, with the last chunk's
@@ -1020,8 +1058,8 @@ async fn a_session_is_bounded_and_resumes_where_it_stopped() {
     let chunks: Vec<&[u8]> = vec![&big, &big, &big];
 
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    seed(&engine, "big-stream", &chunks);
     let router = router(&engine);
+    seed(&router, &engine, "big-stream", &chunks).await;
 
     let first = get_media(
         &router,

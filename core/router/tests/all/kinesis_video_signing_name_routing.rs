@@ -281,10 +281,11 @@ async fn every_kinesis_video_route_is_claimed_by_exactly_one_of_the_five_service
             Expect::Answer(404, Some("ResourceNotFoundException")),
         ),
         (
-            // The same route for the stream the control plane just created. What is
-            // asserted is the selection only: the data plane's fragment log is written by
-            // its own producer entry point, so what it answers for a control-plane stream
-            // is that separate store question's to settle, not this routing rule's.
+            // The same route for the stream the control plane just created. One Kinesis
+            // video stream is ONE resource, so the data plane reads the stream
+            // `CreateStream` made: a 200 (an empty payload, since nothing was produced
+            // to it) can only come from the Media data plane, which is the only one of
+            // the five that binds `/getMedia`.
             "media GetMedia by name",
             Call::post(
                 "/getMedia",
@@ -292,7 +293,7 @@ async fn every_kinesis_video_route_is_claimed_by_exactly_one_of_the_five_service
                     r#"{{"StreamName":"{STREAM_NAME}","StartSelector":{{"StartSelectorType":"EARLIEST"}}}}"#
                 ),
             ),
-            Expect::ExactlyOneClaimant,
+            Expect::Answer(200, None),
         ),
         (
             "media GetMedia by ARN",
@@ -302,7 +303,7 @@ async fn every_kinesis_video_route_is_claimed_by_exactly_one_of_the_five_service
                     r#"{{"StreamARN":"{stream_arn}","StartSelector":{{"StartSelectorType":"NOW"}}}}"#
                 ),
             ),
-            Expect::ExactlyOneClaimant,
+            Expect::Answer(200, None),
         ),
         (
             "media GetMedia with a trailing path segment",
