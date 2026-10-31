@@ -23,6 +23,9 @@ mod component_lifecycle;
 #[path = "all/component_refusals.rs"]
 mod component_refusals;
 
+#[path = "all/component_reserved_property_name.rs"]
+mod component_reserved_property_name;
+
 #[path = "all/component_wire_fidelity.rs"]
 mod component_wire_fidelity;
 

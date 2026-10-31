@@ -42,7 +42,7 @@
 //! resolves a `resourceArn` to that record, and [`resource_tags`] /
 //! [`with_resource_tags_mut`] are the one read and the one write over it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -146,7 +146,10 @@ pub const THEME_QUOTA: usize = 1_000;
 ///
 /// `Component$properties`, `$overrides`, `$bindingProperties` and
 /// `$collectionProperties` each document "You can't specify `tags` as a valid
-/// property" for that map, so a request naming it is refused rather than stored.
+/// property" for that map, and so do the maps the payload nests:
+/// `ComponentChild$properties` (at every depth of `children`) and
+/// `ComponentVariant$variantValues` / `$overrides`. A request naming the key in
+/// any of them is refused rather than stored.
 pub const RESERVED_PROPERTY_NAME: &str = "tags";
 
 /// The `CodegenJobStatus` values the model declares, so no handler spells one as
@@ -1115,12 +1118,67 @@ fn os_seed() -> u64 {
 /// True when a component property map carries the reserved
 /// [`RESERVED_PROPERTY_NAME`] key.
 ///
-/// Only the four maps the model documents the rule for are checked by the
-/// handlers; `ComponentVariant$overrides` and `ComponentChild$properties` carry
-/// no such statement, so a key named `tags` there is stored as given rather than
-/// refused on a rule the model does not make.
+/// The rule is about the KEY, so this is generic over the map's value type: the
+/// four maps a component itself carries, the one on each `ComponentChild` and the
+/// two on each `ComponentVariant` are all tested through this one predicate.
 pub fn carries_reserved_name<V>(map: &HashMap<String, V>) -> bool {
     map.contains_key(RESERVED_PROPERTY_NAME)
+}
+
+/// The path of the map nearest the top of a `children` tree that carries the
+/// reserved key — siblings in request order — relative to the payload holding
+/// that list, or `None` when no map in the tree carries it.
+///
+/// `ComponentChild$properties` documents the same rule the component's own maps
+/// do, and a child carries its own `children`, so the rule is tested at every
+/// depth of the tree. The reported path is the one the request spells, so a
+/// refusal names the map the caller wrote rather than the member containing it.
+///
+/// The tree is walked level by level through an explicit queue rather than by
+/// recursion: its depth is whatever the request nested, so no payload can drive
+/// this walk into the call stack.
+pub fn reserved_name_in_children(children: &[ComponentChild]) -> Option<String> {
+    let mut pending: VecDeque<(String, &[ComponentChild])> = VecDeque::new();
+    pending.push_back((String::new(), children));
+    while let Some((prefix, level)) = pending.pop_front() {
+        for (index, child) in level.iter().enumerate() {
+            let path = format!("{prefix}children[{index}]");
+            if carries_reserved_name(&child.properties) {
+                return Some(format!("{path}.properties"));
+            }
+            if let Some(nested) = child.children.as_deref() {
+                pending.push_back((format!("{path}."), nested));
+            }
+        }
+    }
+    None
+}
+
+/// The path of the first map under a `variants` list that carries the reserved
+/// key, in request order, relative to the payload holding that list, or `None`
+/// when none does.
+///
+/// `ComponentVariant$variantValues` and `ComponentVariant$overrides` document the
+/// same rule, so a variant naming the key is refused exactly as a component's own
+/// maps are.
+pub fn reserved_name_in_variants(variants: &[ComponentVariant]) -> Option<String> {
+    variants.iter().enumerate().find_map(|(index, variant)| {
+        [
+            (
+                "variantValues",
+                variant
+                    .variant_values
+                    .as_ref()
+                    .is_some_and(carries_reserved_name),
+            ),
+            (
+                "overrides",
+                variant.overrides.as_ref().is_some_and(carries_reserved_name),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(member, carries)| carries.then(|| format!("variants[{index}].{member}")))
+    })
 }
 
 /// The `nextToken` a page of `key`'s entities that ends before `cursor`

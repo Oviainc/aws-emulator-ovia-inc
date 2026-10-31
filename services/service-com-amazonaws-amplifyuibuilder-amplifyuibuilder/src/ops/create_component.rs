@@ -159,42 +159,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let data = input.component_to_create;
 
-        // `Component$properties`, `$overrides`, `$bindingProperties` and
-        // `$collectionProperties` each document "You can't specify `tags` as a
-        // valid property" for that map — a rule the model itself cannot express —
-        // so a request naming it is refused rather than stored.
-        for (member, carries) in [
-            (
-                "properties",
-                crate::state::carries_reserved_name(&data.properties),
+        // Every map the model documents "You can't specify `tags` as a valid
+        // property" for — a rule the model itself cannot express — is checked,
+        // wherever the payload carries it: the component's own `properties`,
+        // `overrides`, `bindingProperties` and `collectionProperties`, the
+        // `properties` of each `ComponentChild` at every depth of `children`, and
+        // the `variantValues` and `overrides` of each `ComponentVariant`. A
+        // request naming the key in any of them is refused rather than stored,
+        // and the refusal names the map the caller wrote.
+        let reserved = [
+            crate::state::carries_reserved_name(&data.properties)
+                .then(|| "properties".to_string()),
+            crate::state::carries_reserved_name(&data.overrides).then(|| "overrides".to_string()),
+            crate::state::carries_reserved_name(&data.binding_properties)
+                .then(|| "bindingProperties".to_string()),
+            data.collection_properties
+                .as_ref()
+                .is_some_and(crate::state::carries_reserved_name)
+                .then(|| "collectionProperties".to_string()),
+            crate::state::reserved_name_in_children(
+                data.children.as_deref().unwrap_or_default(),
             ),
-            (
-                "overrides",
-                crate::state::carries_reserved_name(&data.overrides),
-            ),
-            (
-                "bindingProperties",
-                crate::state::carries_reserved_name(&data.binding_properties),
-            ),
-            (
-                "collectionProperties",
-                data.collection_properties
-                    .as_ref()
-                    .is_some_and(crate::state::carries_reserved_name),
-            ),
-        ] {
-            if carries {
-                return Err(CreateComponentErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(format!(
-                            "componentToCreate.{member} cannot carry the reserved property \
-                             name {:?}",
-                            crate::state::RESERVED_PROPERTY_NAME
-                        )),
-                    },
-                )
-                .into());
-            }
+            crate::state::reserved_name_in_variants(&data.variants),
+        ]
+        .into_iter()
+        .flatten()
+        .next();
+        if let Some(member) = reserved {
+            return Err(CreateComponentErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "componentToCreate.{member} cannot carry the reserved property name {:?}",
+                        crate::state::RESERVED_PROPERTY_NAME
+                    )),
+                },
+            )
+            .into());
         }
 
         let now = ::std::time::SystemTime::now();
