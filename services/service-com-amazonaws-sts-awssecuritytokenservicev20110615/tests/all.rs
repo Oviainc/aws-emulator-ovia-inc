@@ -38,6 +38,9 @@ mod refusal_message_bytes;
 #[path = "all/request_admission.rs"]
 mod request_admission;
 
+#[path = "all/session_audit_records.rs"]
+mod session_audit_records;
+
 #[path = "all/session_policy_limits.rs"]
 mod session_policy_limits;
 

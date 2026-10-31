@@ -2088,7 +2088,8 @@ fn policy_parse_message(document: &str, parse: &serde_json::Error) -> String {
 /// live sessions, or if the store minted a credential without the secrets the kind it
 /// is asked for always carries — the caller refuses the request rather than answering
 /// with a credential that is missing half of itself.
-pub fn mint_session(
+pub fn mint_session<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     store: &CredentialStore,
     state: &mut StsState,
     now: SystemTime,
@@ -2135,10 +2136,143 @@ pub fn mint_session(
         let _ = store.delete(&session.access_key_id);
         return Err(full);
     }
+    // The account's audit view of the session, so a call made with this credential is
+    // recorded as the session that made it (see [`remember_audited_session`]). Written
+    // once, here, because this is the one path every session of this emulator is minted
+    // through.
+    remember_audited_session(engine, &session, now);
     Ok(MintedSession {
         credentials,
         session,
     })
+}
+
+/// The account's SESSION directory in the shared engine: the audit view of the sessions
+/// this emulator minted, keyed by the access key id each was minted under.
+///
+/// A SHARED type ([`::service_common::management_events::SessionAuditDirectory`]) and not a
+/// field of this service's own store, because the service that MINTS a session is not the
+/// service that SERVES the calls made with it: a record of such a call names the session,
+/// and the recording service cannot read this service's state. The sessions themselves stay
+/// here — [`StsState::sessions`] is what resolves an identity — so the directory carries
+/// only what a record names.
+pub fn session_audit_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::management_events::SessionAuditDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::management_events::SessionAuditDirectory,
+            >,
+        )
+}
+
+/// Remember `session` in the account's session directory, so every service that records a
+/// call made with its credential can name the session it was made by.
+///
+/// Best-effort, as every other audit write in this tree: an engine carrying no directory (a
+/// unit test over a bare engine) still mints the session, because failing a caller because
+/// the audit view is unreachable would be a worse answer than serving it unrecorded.
+pub fn remember_audited_session<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    session: &Session,
+    now: SystemTime,
+) {
+    let Some(directory) = session_audit_directory(engine) else {
+        return;
+    };
+    directory
+        .lock()
+        .remember(session.access_key_id.clone(), audited_session(session), now);
+}
+
+/// Forget a session the account's session directory holds — for a mint this service gave
+/// up again, so the directory never names a credential no caller was handed.
+pub fn forget_audited_session<Eng: Send + Sync + 'static>(engine: &Eng, access_key_id: &str) {
+    if let Some(directory) = session_audit_directory(engine) {
+        directory.lock().forget(access_key_id);
+    }
+}
+
+/// The audit view of one session: who a call made with its credential speaks for, which
+/// entity ISSUED the session, and the source identity the session carries.
+///
+/// Every value is the session's own — nothing is read off a request — so the record of a
+/// call made with the credential names the same session this service resolves an identity
+/// from.
+pub fn audited_session(session: &Session) -> ::service_common::management_events::RecordedSession {
+    use ::service_common::management_events::{
+        RecordedSession, RecordedSessionIssuer, PRINCIPAL_TYPE_ASSUMED_ROLE,
+        PRINCIPAL_TYPE_FEDERATED_USER, PRINCIPAL_TYPE_IAM_USER, SESSION_ISSUER_TYPE_ROLE,
+    };
+
+    // Which `userIdentity.type` a call made with the credential carries follows from the
+    // KIND of session: a role session is an assumed role, a federation token speaks for a
+    // federated user, and a session token speaks for the IAM user that asked for it.
+    let principal_type = match session.kind {
+        SessionKind::AssumedRole => PRINCIPAL_TYPE_ASSUMED_ROLE,
+        SessionKind::FederationToken => PRINCIPAL_TYPE_FEDERATED_USER,
+        SessionKind::SessionToken => PRINCIPAL_TYPE_IAM_USER,
+    };
+    // The issuer is the entity the session was minted OF, as CloudTrail's `sessionIssuer`
+    // reports "how the credentials were obtained":
+    //
+    // * a role session is minted of its ROLE, named by the ARN this service stored when the
+    //   role was assumed, with the role id IAM issued for it; and
+    // * a session token is minted of the IAM USER that asked for it — which is the identity
+    //   the session itself speaks for ("the credentials have the same permissions as the IAM
+    //   user", `GetSessionToken`), so the session's own identity IS its issuer.
+    //
+    // A FEDERATION token is the one kind with neither: it speaks for the federated user the
+    // request named, while its issuer is the IAM user that called for it — a principal this
+    // registry's record of the session does not hold ([`Session`] carries the identity the
+    // credential speaks for), so the record names no issuer rather than one derived from
+    // the federated user it is not.
+    let issuer = match (session.role_arn.as_deref(), session.kind) {
+        (Some(role_arn), _) => Some(RecordedSessionIssuer {
+            principal_type: SESSION_ISSUER_TYPE_ROLE.to_string(),
+            // `AssumedRoleId` is `<RoleId>:<RoleSessionName>`, so the role's own id is the
+            // segment before the colon — the id IAM issued for that role.
+            principal_id: session
+                .identity
+                .user_id
+                .split_once(':')
+                .map_or_else(|| session.identity.user_id.clone(), |(id, _)| id.to_string()),
+            arn: role_arn.to_string(),
+            account_id: session.identity.account.clone(),
+            user_name: entity_name_of(role_arn).to_string(),
+        }),
+        (None, SessionKind::SessionToken) => Some(RecordedSessionIssuer {
+            principal_type: PRINCIPAL_TYPE_IAM_USER.to_string(),
+            principal_id: session.identity.user_id.clone(),
+            arn: session.identity.arn.clone(),
+            account_id: session.identity.account.clone(),
+            user_name: entity_name_of(&session.identity.arn).to_string(),
+        }),
+        (None, _) => None,
+    };
+    RecordedSession {
+        principal_type: principal_type.to_string(),
+        principal_id: session.identity.user_id.clone(),
+        arn: session.identity.arn.clone(),
+        account_id: session.identity.account.clone(),
+        // The name the session speaks under, which CloudTrail reports as an event's
+        // `Username`: the last segment of the session's own ARN — the role session name of a
+        // role session, the federated user's name, the IAM user's name.
+        user_name: Some(entity_name_of(&session.identity.arn).to_string()),
+        issuer,
+        source_identity: session.source_identity.clone(),
+        created_at: session.created_at,
+        expires_at: session.expires_at,
+    }
+}
+
+/// The friendly name an ARN names its entity by: the last `/`-separated segment
+/// (`arn:aws:iam::<account>:role/path/demo` -> `demo`), which is the whole resource for an
+/// ARN that carries no path at all.
+fn entity_name_of(arn: &str) -> &str {
+    arn.rsplit('/').next().unwrap_or(arn)
 }
 
 /// Honour a request's `MinimumSessionTokenSize`, or say why it cannot be.
@@ -2149,7 +2283,8 @@ pub fn mint_session(
 /// invalidating it, so a request asking for a token larger than the store mints is
 /// refused — with the session it already minted dropped again — rather than answered
 /// with a token smaller than it asked for.
-pub fn honour_minimum_token_size(
+pub fn honour_minimum_token_size<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     state: &mut StsState,
     store: &CredentialStore,
     minted: &MintedSession,
@@ -2161,6 +2296,9 @@ pub fn honour_minimum_token_size(
         return Ok(());
     }
     state.discard(&minted.credentials.access_key_id, store);
+    // The session was given up, so the account's audit view gives it up too: no caller was
+    // handed this credential, so no record may name it.
+    forget_audited_session(engine, &minted.credentials.access_key_id);
     Err(format!(
         "MinimumSessionTokenSize {minimum} is larger than the {size}-byte session token this \
          emulator mints, and a minted session token cannot be padded (the limit is \

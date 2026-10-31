@@ -13,7 +13,9 @@
 //!
 //! * its `eventSource` ([`EVENT_SOURCE`]);
 //! * the Region and the account the call was served for;
-//! * the members whose values its records LEAVE OUT ([`OMITTED_MEMBERS`]); and
+//! * the members whose values its records LEAVE OUT ([`OMITTED_MEMBERS`]);
+//! * the SESSION a call made with temporary credentials was made BY, read off the
+//!   account's session directory (see [`SecurityTokenAudit::recorded_session`]); and
 //! * which operations REPORT state and which CHANGE it — the one fact a record cannot read
 //!   off a request, so it is stated per operation in [`audited_table`].
 //!
@@ -28,7 +30,7 @@
 use std::sync::Arc;
 
 use service_common::audited_operation::{AuditedService, AuditedTable, CallKind};
-use service_common::management_events::{ManagementEventLog, ServedApiCall};
+use service_common::management_events::{ManagementEventLog, RecordedSession, ServedApiCall};
 use smithy_server_runtime::{OperationContext, OperationRoutingTable, PreDispatchProtocol};
 
 /// The `eventSource` every record of this service carries: this service's endpoint prefix
@@ -71,7 +73,8 @@ pub const OMITTED_MEMBERS: &[&str] = &[
 /// What this service contributes to the record of each call it serves.
 ///
 /// Holds the shared engine — the record goes into the log that engine carries, the one
-/// CloudTrail reads — so it is generic over the engine type exactly as the service is.
+/// CloudTrail reads, and the sessions it names come from the directory in that same engine
+/// — so it is generic over the engine type exactly as the service is.
 pub struct SecurityTokenAudit<Eng> {
     engine: Arc<Eng>,
 }
@@ -104,6 +107,14 @@ impl<Eng: Send + Sync + 'static> AuditedService for SecurityTokenAudit<Eng> {
             ::std::time::SystemTime::now(),
             answered_as.to_string(),
         );
+    }
+
+    fn recorded_session(&self, access_key_id: &str) -> Option<RecordedSession> {
+        // A call to THIS service can be made with a session this service minted — a chained
+        // assume, or a `GetCallerIdentity` under a role session — so its record names that
+        // session exactly as another service's record of a session call does.
+        crate::state::session_audit_directory(&*self.engine)
+            .and_then(|directory| directory.lock().session(access_key_id).cloned())
     }
 
     fn event_source(&self) -> &'static str {

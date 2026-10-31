@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use service_common::audited_operation::{AuditedService, AuditedTable, CallKind};
 use service_common::management_events::{
-    recorded_member_name, AuditedResource, ManagementEventLog, ServedApiCall,
+    recorded_member_name, AuditedResource, ManagementEventLog, RecordedSession, ServedApiCall,
 };
 use smithy_server_runtime::{OperationContext, OperationRoutingTable, PreDispatchProtocol};
 
@@ -81,6 +81,12 @@ impl<Eng: Send + Sync + 'static> AuditedService for CloudTrailAudit<Eng> {
             ::std::time::SystemTime::now(),
             answered_as.to_string(),
         );
+    }
+
+    fn recorded_session(&self, access_key_id: &str) -> Option<RecordedSession> {
+        // The account's own session directory, so a call made with a role session is
+        // recorded as that session: the shared store the minting service wrote it to.
+        crate::state::recorded_session(&*self.engine, Some(access_key_id))
     }
 
     fn event_source(&self) -> &'static str {

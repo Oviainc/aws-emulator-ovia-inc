@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use service_common::audited_operation::{AuditedService, AuditedTable, CallKind};
-use service_common::management_events::{ManagementEventLog, ServedApiCall};
+use service_common::management_events::{ManagementEventLog, RecordedSession, ServedApiCall};
 use smithy_server_runtime::{OperationContext, OperationRoutingTable, PreDispatchProtocol};
 
 /// The `eventSource` every record of this service carries.
@@ -91,6 +91,13 @@ impl<Eng: Send + Sync + 'static> AuditedService for LoadBalancingAudit<Eng> {
             ::std::time::SystemTime::now(),
             answered_as.to_string(),
         );
+    }
+
+    fn recorded_session(&self, access_key_id: &str) -> Option<RecordedSession> {
+        // The account's own session directory, so a call made with a role session is
+        // recorded as that session: the shared store the minting service wrote it to.
+        crate::state::session_audit_directory(&*self.engine)
+            .and_then(|directory| directory.lock().session(access_key_id).cloned())
     }
 
     fn event_source(&self) -> &'static str {

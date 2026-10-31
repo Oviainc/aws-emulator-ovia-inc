@@ -732,6 +732,8 @@ mod sesv2_sns_event_destination_topic_policy;
 mod shared_signing_name_routing;
 #[path = "all/ssm_contacts_replication_set.rs"]
 mod ssm_contacts_replication_set;
+#[path = "all/sts_source_identity_is_audited.rs"]
+mod sts_source_identity_is_audited;
 #[path = "all/sts_web_identity_federation.rs"]
 mod sts_web_identity_federation;
 #[path = "all/transcribe_signing_name_routing.rs"]

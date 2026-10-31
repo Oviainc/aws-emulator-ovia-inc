@@ -2813,6 +2813,7 @@ pub fn mint_vended_role_session<Eng: Send + Sync + 'static>(
     };
     let mut registry = registry.lock();
     let minted = sts::mint_session(
+        engine,
         store,
         &mut registry,
         now,
@@ -2834,12 +2835,17 @@ pub fn mint_vended_role_session<Eng: Send + Sync + 'static>(
 
 /// Forget a session this service vended, in both stores that hold it: the credential store
 /// (so a request still presenting it no longer verifies) and the STS session registry (so
-/// it names no identity either).
+/// it names no identity either), and in the account's session directory (so no record of a
+/// later call names a credential nobody holds).
 pub fn discard_vended_role_session<Eng: Send + Sync + 'static>(
     engine: &Eng,
     store: &CredentialStore,
     access_key_id: &str,
 ) {
+    ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::forget_audited_session(
+        engine,
+        access_key_id,
+    );
     match sts_state(engine) {
         Some(registry) => registry.lock().discard(access_key_id, store),
         None => {
@@ -2922,6 +2928,10 @@ pub fn record_vended_assume<Eng: Send + Sync + 'static>(
             // Amazon Cognito Identity issued, and `userIdentity.identityProvider` is the
             // external provider's principal name.
             identity_provider: Some(COGNITO_IDENTITY_PRINCIPAL.to_string()),
+            // The assume itself is made ON BEHALF of a federated user, not BY a session:
+            // the session it mints is what LATER calls carry, and each of those records
+            // names it through the account's session directory.
+            session: None,
             account_id: ::engine::emulator_account_id().to_string(),
             user_agent: ::service_common::management_events::recorded_user_agent(parts),
             resources: vec![::service_common::management_events::AuditedResource::new(
@@ -3082,6 +3092,7 @@ pub fn record_served_call<Eng: Send + Sync + 'static, T, E>(
     let (error_code, error_message) =
         ::service_common::management_events::recorded_failure(outcome);
     let caller = ::service_common::management_events::recorded_caller(parts);
+    let session = recorded_session(engine, caller.access_key_id.as_deref());
     log.lock().record(
         ::service_common::management_events::ServedApiCall {
             event_name: call.operation.to_string(),
@@ -3089,16 +3100,26 @@ pub fn record_served_call<Eng: Send + Sync + 'static, T, E>(
             aws_region: call.region.to_string(),
             read_only: call.read_only,
             access_key_id: caller.access_key_id,
-            user_name: caller.user_name,
-            principal_type: caller.principal_type.to_string(),
-            // The unique id of the IAM entity a credential speaks for is IAM's to mint,
-            // and this service resolves none, so the record leaves it out rather than
-            // naming a principal nothing resolves.
-            principal_id: None,
+            user_name: session
+                .as_ref()
+                .map_or(caller.user_name, |session| session.user_name.clone()),
+            principal_type: session.as_ref().map_or_else(
+                || caller.principal_type.to_string(),
+                |session| session.principal_type.clone(),
+            ),
+            // The unique id of the IAM entity a LONG-TERM credential speaks for is IAM's
+            // to mint, and this service resolves none, so such a record leaves it out
+            // rather than naming a principal nothing resolves. A session's own principal
+            // id is the session's, and the directory holds it.
+            principal_id: session.as_ref().map(|session| session.principal_id.clone()),
             // Every operation of this service is called either with an AWS credential or
             // with none at all, so no caller of one is a federated user an external
             // provider authenticated.
             identity_provider: None,
+            // The session the call was made BY, when it was made with one — the shared
+            // directory the minting service wrote it to, so a call this service serves
+            // under a role session is recorded as that session.
+            session: session.clone(),
             account_id: ::engine::emulator_account_id().to_string(),
             user_agent: ::service_common::management_events::recorded_user_agent(parts),
             resources: call
@@ -3239,6 +3260,37 @@ pub fn management_event_log<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<::service_common::management_events::ManagementEventLog>)
+}
+
+/// The account's SESSION directory in that same shared engine: the sessions STS minted,
+/// each keyed by the access key id it was minted under.
+///
+/// A SHARED type, for the same reason as the log above: the service that MINTS a session
+/// and the services that record the calls made WITH it are not the same service.
+pub fn session_audit_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::management_events::SessionAuditDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::management_events::SessionAuditDirectory,
+            >,
+        )
+}
+
+/// The session the credential a request was signed with belongs to, for a request signed
+/// with one: what the record of that call carries as its `userIdentity.sessionContext`.
+///
+/// `None` for a long-term credential, for an unsigned request — every vend leg is one —
+/// and for an engine that carries no directory.
+pub fn recorded_session<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    access_key_id: Option<&str>,
+) -> Option<::service_common::management_events::RecordedSession> {
+    let access_key_id = access_key_id?;
+    session_audit_directory(engine)
+        .and_then(|directory| directory.lock().session(access_key_id).cloned())
 }
 
 /// The registry of web identity tokens THIS emulator issued, in the same shared engine:

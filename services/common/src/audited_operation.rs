@@ -24,6 +24,10 @@
 //! * `errorCode` / `errorMessage` come from the error channel the caller was answered
 //!   through ([`crate::management_events::recorded_failure`]), so a failed call records
 //!   the fault SHAPE's name;
+//! * `userIdentity` is the credential the request was signed with, and — for a call made
+//!   with a session the account's session directory holds — the session's own principal,
+//!   the role that issued it and the source identity it carries
+//!   ([`AuditedService::recorded_session`]);
 //! * `requestID` is the id the CALLER was answered under
 //!   ([`crate::query_error_envelope::named_request`]), so a client holding a response can
 //!   find the record of that very call rather than guessing which of two records of one
@@ -65,7 +69,7 @@ use smithy_server_runtime::{
 };
 
 use crate::management_events::{
-    recorded_failure, recorded_shape, ServedApiCall, WithheldFromRecord,
+    recorded_failure, recorded_shape, RecordedSession, ServedApiCall, WithheldFromRecord,
 };
 use crate::query_error_envelope::named_request;
 
@@ -181,6 +185,21 @@ pub trait AuditedService: Send + Sync + 'static {
     /// that literal and never stored.
     fn sensitive_members(&self) -> &'static [&'static str];
 
+    /// The SESSION the credential a call was signed with belongs to, read off the
+    /// account's shared session directory
+    /// ([`crate::management_events::SessionAuditDirectory`]) — which is what makes a call
+    /// made with temporary credentials recorded as the session it was made by, with the
+    /// role that issued the session and the source identity the session carries.
+    ///
+    /// The default is `None`: the directory is a store in the shared engine, and a service
+    /// reaches engine state through its own accessor, so a service that records calls
+    /// answers this with that accessor (and one whose engine carries no directory records
+    /// no session context, exactly as it records nothing when the log is unreachable).
+    fn recorded_session(&self, access_key_id: &str) -> Option<RecordedSession> {
+        let _ = access_key_id;
+        None
+    }
+
     /// The members this service's records leave OUT entirely: no key for them at all,
     /// rather than a key carrying the redaction literal.
     ///
@@ -292,20 +311,34 @@ impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
         };
         let (error_code, error_message) = recorded_failure(outcome);
         let caller = crate::management_events::recorded_caller(ctx.parts());
+        // The session the credential belongs to, when the call was made with one: a session
+        // knows its own principal type, id and name, so those come from it rather than from
+        // the access-key prefix the request carried.
+        let session = caller
+            .access_key_id
+            .as_deref()
+            .and_then(|access_key_id| self.service.recorded_session(access_key_id));
         Some(ServedApiCall {
             event_name: O::NAME.to_string(),
             event_source: self.service.event_source().to_string(),
             read_only: self.kind.read_only(),
             access_key_id: caller.access_key_id,
-            user_name: caller.user_name,
-            principal_type: caller.principal_type.to_string(),
-            // The unique id of the IAM entity a credential speaks for is IAM's to mint,
-            // and a serving service resolves none, so the record leaves it out rather
-            // than naming a principal nothing resolves.
-            principal_id: None,
+            user_name: session
+                .as_ref()
+                .map_or(caller.user_name, |session| session.user_name.clone()),
+            principal_type: session.as_ref().map_or_else(
+                || caller.principal_type.to_string(),
+                |session| session.principal_type.clone(),
+            ),
+            // The unique id of the IAM entity a LONG-TERM credential speaks for is IAM's to
+            // mint, and a serving service resolves none, so such a record leaves it out
+            // rather than naming a principal nothing resolves. A session's own principal id
+            // is the session's, and the directory holds it.
+            principal_id: session.as_ref().map(|session| session.principal_id.clone()),
             // A call signed with an AWS credential was authenticated by this account, not
             // by an external provider.
             identity_provider: None,
+            session,
             account_id: self.service.account_id(),
             user_agent: crate::management_events::recorded_user_agent(ctx.parts()),
             resources: self.service.resources(O::NAME, request_parameters, &region),

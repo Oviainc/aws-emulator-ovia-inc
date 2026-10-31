@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use service_common::audited_operation::{AuditedService, AuditedTable, CallKind};
-use service_common::management_events::{ManagementEventLog, ServedApiCall};
+use service_common::management_events::{ManagementEventLog, RecordedSession, ServedApiCall};
 use smithy_server_runtime::{OperationContext, OperationRoutingTable, PreDispatchProtocol};
 
 /// This service's model-derived half, routing through the AUDITED operations — the shared
@@ -124,6 +124,13 @@ impl<Eng: Send + Sync + 'static> AuditedService for IamAudit<Eng> {
         );
     }
 
+    fn recorded_session(&self, access_key_id: &str) -> Option<RecordedSession> {
+        // The account's own session directory, so a call made with a role session is
+        // recorded as that session: the shared store the minting service wrote it to.
+        session_audit_directory(&*self.engine)
+            .and_then(|directory| directory.lock().session(access_key_id).cloned())
+    }
+
     fn event_source(&self) -> &'static str {
         EVENT_SOURCE
     }
@@ -167,6 +174,24 @@ pub fn management_event_log<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ManagementEventLog>)
+}
+
+/// The account's SESSION directory in that same shared engine: the sessions STS minted,
+/// each keyed by the access key id it was minted under, which is what lets a record of a
+/// call made with one name the session it was made by.
+///
+/// A SHARED type, for the same reason as the log above: the service that MINTS a session
+/// and the services that record the calls made WITH it are not the same service.
+pub fn session_audit_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::management_events::SessionAuditDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::management_events::SessionAuditDirectory,
+            >,
+        )
 }
 
 /// The envelope a pre-dispatch failure of one of this service's operations renders in:

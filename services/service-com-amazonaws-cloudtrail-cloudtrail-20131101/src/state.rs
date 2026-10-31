@@ -49,7 +49,9 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::time::{Duration, SystemTime};
 
-use service_common::management_events::ManagementEventLog;
+use service_common::management_events::{
+    ManagementEventLog, RecordedSession, SessionAuditDirectory,
+};
 
 use crate::ops::types::{
     AdvancedEventSelector, AggregationConfiguration, ContextKeySelector, EventDataStore,
@@ -3743,6 +3745,35 @@ pub fn management_event_log<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ManagementEventLog>)
+}
+
+/// The account's SESSION directory in that same shared engine: the sessions STS minted,
+/// each keyed by the access key id it was minted under, which is what lets a record of a
+/// call made with one name the session it was made by.
+///
+/// A SHARED type, for the same reason as the log above: the service that MINTS a session
+/// and the services that record the calls made WITH it are not the same service.
+pub fn session_audit_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<SessionAuditDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<SessionAuditDirectory>)
+}
+
+/// The session the credential a request was signed with belongs to, for a request signed
+/// with one: what the record of this call carries as its `userIdentity.sessionContext`.
+///
+/// `None` for a long-term credential, for an unsigned request, and for an engine that
+/// carries no directory — each of which is a call made by no session, which is what leaves
+/// the block out of the record.
+pub fn recorded_session<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    access_key_id: Option<&str>,
+) -> Option<RecordedSession> {
+    let access_key_id = access_key_id?;
+    session_audit_directory(engine)
+        .and_then(|directory| directory.lock().session(access_key_id).cloned())
 }
 
 /// This service's `eventSource` on an audit record: CloudTrail's endpoint prefix

@@ -4904,6 +4904,24 @@ pub fn management_event_log<Eng: Send + Sync + 'static>(
         )
 }
 
+/// The account's SESSION directory in that same shared engine: the sessions STS minted,
+/// each keyed by the access key id it was minted under, which is what lets a record of a
+/// call made with one name the session it was made by.
+///
+/// A SHARED type, for the same reason as the log above: the service that MINTS a session
+/// and the services that record the calls made WITH it are not the same service.
+pub fn session_audit_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::management_events::SessionAuditDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::management_events::SessionAuditDirectory,
+            >,
+        )
+}
+
 /// The region this request was signed for: every ARN and endpoint host this service
 /// mints is scoped to it, and it is half of every stored record's key.
 ///

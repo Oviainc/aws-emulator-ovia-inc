@@ -223,6 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to what is left of the token's validity, and the record is left in place:
         // nothing in the model says one exchange consumes the token.
         let minted = crate::state::mint_session(
+            &*self.engine,
             store,
             &mut registry,
             now,

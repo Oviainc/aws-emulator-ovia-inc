@@ -373,6 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .duration_seconds
             .unwrap_or(VENDED_SESSION_DEFAULT_DURATION_SECONDS);
         let minted = crate::state::mint_session(
+            &*self.engine,
             store,
             &mut registry,
             now,
@@ -390,6 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(why) => return Err(crate::scaffolded::Scaffolded::validation(why.message())),
         };
         if let Err(why) = crate::state::honour_minimum_token_size(
+            &*self.engine,
             &mut registry,
             store,
             &minted,

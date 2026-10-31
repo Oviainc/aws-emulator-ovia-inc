@@ -29,7 +29,7 @@
 //! the clock has already made due), never on a read: a lookup must not change what a
 //! later lookup sees.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How long a recorded event stays retrievable.
@@ -71,9 +71,17 @@ pub const PRINCIPAL_TYPE_IAM_USER: &str = "IAMUser";
 /// role.
 pub const PRINCIPAL_TYPE_ASSUMED_ROLE: &str = "AssumedRole";
 
+/// `userIdentity.type` for a call signed with the temporary credentials of a federated
+/// user — the session `GetFederationToken` mints.
+pub const PRINCIPAL_TYPE_FEDERATED_USER: &str = "FederatedUser";
+
 /// `userIdentity.type` for a call that carried no credential this emulator can read an
 /// identity from.
 pub const PRINCIPAL_TYPE_UNKNOWN: &str = "Unknown";
+
+/// `sessionContext.sessionIssuer.type` for a session an IAM ROLE issued, which is what an
+/// assumed-role session's issuer is.
+pub const SESSION_ISSUER_TYPE_ROLE: &str = "Role";
 
 /// The IAM user name a long-term access key speaks for in this emulator.
 ///
@@ -731,6 +739,149 @@ impl AuditedResource {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The session a temporary credential belongs to
+// ---------------------------------------------------------------------------
+
+/// Who ISSUED the session a temporary credential belongs to, as a record names it in
+/// `userIdentity.sessionContext.sessionIssuer` — "the role that was assumed", which is the
+/// resource an action taken through a shared role is attributed to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedSessionIssuer {
+    /// `sessionIssuer.type`: [`SESSION_ISSUER_TYPE_ROLE`] for an assumed role.
+    pub principal_type: String,
+    /// The unique id of the issuing entity — the role id for an assumed role.
+    pub principal_id: String,
+    /// The ARN of the issuing entity: the ROLE's own ARN, never the session's.
+    pub arn: String,
+    /// The account that holds it.
+    pub account_id: String,
+    /// Its friendly name — the role name for an assumed role.
+    pub user_name: String,
+}
+
+/// What a record names about the SESSION a call's temporary credential belongs to.
+///
+/// A session is minted by one service (STS, or a service that assumes a role on a
+/// caller's behalf) and the calls made WITH it are served by every other, so these facts
+/// live in the shared [`SessionAuditDirectory`] rather than in the minting service's own
+/// state: the service that records a call is the one that needs them, and it cannot read
+/// another service's store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedSession {
+    /// `userIdentity.type` of a call made with the session: one of the `PRINCIPAL_TYPE_*`
+    /// constants.
+    pub principal_type: String,
+    /// `userIdentity.principalId` — `<RoleId>:<RoleSessionName>` for an assumed role.
+    pub principal_id: String,
+    /// `userIdentity.arn`: the session's own ARN (`…:assumed-role/<role>/<session>`).
+    pub arn: String,
+    /// The account the session belongs to.
+    pub account_id: String,
+    /// The friendly name the session speaks under, which CloudTrail reports as an event's
+    /// `Username`: the role session name for an assumed role.
+    pub user_name: Option<String>,
+    /// The role or user that issued the session, when the emulator holds one.
+    pub issuer: Option<RecordedSessionIssuer>,
+    /// The source identity the session carries, when it carries one — "the source identity
+    /// value persists across chained role sessions", so a chained session carries the value
+    /// its caller carried. `None` for a session assumed without one, which is what leaves
+    /// `sessionContext.sourceIdentity` out of the record altogether.
+    pub source_identity: Option<String>,
+    /// When the session was minted, as `sessionContext.attributes.creationDate`.
+    pub created_at: SystemTime,
+    /// When the credential stops being valid — the instant past which no call can be made
+    /// with it, which is what bounds this directory (see
+    /// [`SessionAuditDirectory::remember`]).
+    pub expires_at: SystemTime,
+}
+
+/// How many sessions the directory holds at once.
+///
+/// An EMULATOR ceiling, not an AWS quota: minting a session is a request-driven insert, so
+/// the directory needs a declared cap. The session whose credential expires SOONEST gives
+/// way first, so the sessions still able to make a call are the ones that survive.
+pub const MAX_AUDITED_SESSIONS: usize = 8_192;
+
+/// The account's directory of live sessions, keyed by the access key id each was minted
+/// under: what a recorder needs to name the session a call was made with.
+///
+/// Held once in the shared engine, like the log itself — written by the service that MINTS
+/// a session and read by every service that records a call — so the two cannot hold two
+/// different accounts of one session.
+///
+/// A record keeps its OWN copy of these facts at the instant it is written, so forgetting
+/// a session here never changes what an already-recorded event reports.
+#[derive(Debug, Default)]
+pub struct SessionAuditDirectory {
+    /// Every remembered session, keyed by its access key id. At most
+    /// [`MAX_AUDITED_SESSIONS`] entries.
+    sessions: HashMap<String, RecordedSession>,
+}
+
+impl SessionAuditDirectory {
+    /// Remember the session minted under `access_key_id`.
+    ///
+    /// Prunes first: a session whose credential the clock has already expired can make no
+    /// further call, so its entry is dropped — owed at this instant whether or not anybody
+    /// minted anything — and at [`MAX_AUDITED_SESSIONS`] the entry expiring soonest gives
+    /// way, so no path can push the directory past the cap.
+    pub fn remember(
+        &mut self,
+        access_key_id: impl Into<String>,
+        session: RecordedSession,
+        now: SystemTime,
+    ) {
+        self.prune(now);
+        self.sessions.insert(access_key_id.into(), session);
+    }
+
+    /// The session an access key id names, or `None` for a credential this directory holds
+    /// no session for (a long-term key, or a session minted before it was remembered).
+    pub fn session(&self, access_key_id: &str) -> Option<&RecordedSession> {
+        self.sessions.get(access_key_id)
+    }
+
+    /// Forget the session minted under `access_key_id` — for a mint the minting service
+    /// gave up again, so the directory never names a credential that was never handed out.
+    pub fn forget(&mut self, access_key_id: &str) {
+        self.sessions.remove(access_key_id);
+    }
+
+    /// How many sessions the directory holds.
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Whether the directory holds no session at all.
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    /// Drop what the clock has already made unusable, then make room under the cap.
+    ///
+    /// Called BEFORE an entry is added, which is why the count test is `>=`: it leaves room
+    /// for the entry about to be inserted.
+    fn prune(&mut self, now: SystemTime) {
+        self.sessions.retain(|_, session| now < session.expires_at);
+        while self.sessions.len() >= MAX_AUDITED_SESSIONS {
+            let soonest = self
+                .sessions
+                .iter()
+                .min_by(|(one_key, one), (other_key, other)| {
+                    (one.expires_at, one_key.as_str()).cmp(&(other.expires_at, other_key.as_str()))
+                })
+                .map(|(key, _)| key.clone());
+            match soonest {
+                Some(key) => {
+                    self.sessions.remove(&key);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
 /// What the service that SERVED a call knows about it — everything in a record except
 /// the identifiers and the instant the log itself stamps.
 #[derive(Debug, Clone)]
@@ -764,6 +915,13 @@ pub struct ServedApiCall {
     /// ("the principal name of the external identity provider"). `None` for a caller this
     /// account authenticated itself, which is every call signed with an AWS credential.
     pub identity_provider: Option<String>,
+    /// The SESSION the call's temporary credential belongs to, for a call made with one:
+    /// what the record carries as `userIdentity.sessionContext` (and as the session's own
+    /// `userIdentity.arn`). `None` for a call made with a long-term credential or with none
+    /// at all, which is what leaves the whole block out of the record — the twin of a
+    /// session that carries no source identity, whose record carries the block without a
+    /// `sourceIdentity`.
+    pub session: Option<RecordedSession>,
     /// The account the call was served for.
     pub account_id: String,
     /// The request's `User-Agent`, when it sent one.
@@ -863,7 +1021,19 @@ impl ManagementEvent {
                 serde_json::Value::String(access_key_id.clone()),
             );
         }
-        if let Some(user_name) = &call.user_name {
+        // The friendly name of the identity that made the call. CloudTrail reports
+        // `userIdentity.userName` for an identity that HAS a name of its own — an IAM user,
+        // including one calling with its own session-token credentials, and a user an
+        // external provider authenticated — and reports none for the two principal types
+        // whose name belongs to another entity: an assumed role, whose role name is in
+        // `sessionContext.sessionIssuer.userName`, and a federated user, named by its own
+        // ARN. The name still names the EVENT whatever the type (CloudTrail's
+        // `Event$Username`, which a lookup filters on), which is what `user_name` carries.
+        let named_by_another_entity = matches!(
+            call.principal_type.as_str(),
+            PRINCIPAL_TYPE_ASSUMED_ROLE | PRINCIPAL_TYPE_FEDERATED_USER
+        );
+        if let (Some(user_name), false) = (&call.user_name, named_by_another_entity) {
             identity.insert(
                 "userName".to_string(),
                 serde_json::Value::String(user_name.clone()),
@@ -874,6 +1044,40 @@ impl ManagementEvent {
                 "identityProvider".to_string(),
                 serde_json::Value::String(identity_provider.clone()),
             );
+        }
+        if let Some(session) = &call.session {
+            // The session's own ARN, and the block CloudTrail reports a temporary
+            // credential's session in: the entity that issued it, when the emulator holds
+            // one, and the source identity it carries, which is absent for a session
+            // assumed without one.
+            identity.insert(
+                "arn".to_string(),
+                serde_json::Value::String(session.arn.clone()),
+            );
+            let mut context = serde_json::Map::new();
+            if let Some(issuer) = &session.issuer {
+                context.insert(
+                    "sessionIssuer".to_string(),
+                    serde_json::json!({
+                        "type": issuer.principal_type,
+                        "principalId": issuer.principal_id,
+                        "arn": issuer.arn,
+                        "accountId": issuer.account_id,
+                        "userName": issuer.user_name,
+                    }),
+                );
+            }
+            context.insert(
+                "attributes".to_string(),
+                serde_json::json!({"creationDate": iso8601(session.created_at)}),
+            );
+            if let Some(source_identity) = &session.source_identity {
+                context.insert(
+                    "sourceIdentity".to_string(),
+                    serde_json::Value::String(source_identity.clone()),
+                );
+            }
+            identity.insert("sessionContext".to_string(), context.into());
         }
 
         let mut event = serde_json::Map::new();
@@ -1106,6 +1310,7 @@ mod tests {
             principal_type: PRINCIPAL_TYPE_IAM_USER.to_string(),
             principal_id: None,
             identity_provider: None,
+            session: None,
             account_id: "000000000000".to_string(),
             user_agent: None,
             resources: vec![AuditedResource::new("AWS::CloudTrail::Trail", "demo")],
@@ -1245,6 +1450,134 @@ mod tests {
             json.pointer("/userIdentity/userName"),
             Some(&serde_json::json!("emulator")),
             "case userIdentity: expected the caller's user name, got {json}"
+        );
+    }
+
+    /// One remembered session, lasting `lasts` from `at` and carrying `source_identity`.
+    fn session(source_identity: Option<&str>, at: SystemTime, lasts: Duration) -> RecordedSession {
+        RecordedSession {
+            principal_type: PRINCIPAL_TYPE_ASSUMED_ROLE.to_string(),
+            principal_id: "AROAEXAMPLEROLEID001:analyst".to_string(),
+            arn: "arn:aws:sts::000000000000:assumed-role/shared/analyst".to_string(),
+            account_id: "000000000000".to_string(),
+            user_name: Some("analyst".to_string()),
+            issuer: Some(RecordedSessionIssuer {
+                principal_type: SESSION_ISSUER_TYPE_ROLE.to_string(),
+                principal_id: "AROAEXAMPLEROLEID001".to_string(),
+                arn: "arn:aws:iam::000000000000:role/shared".to_string(),
+                account_id: "000000000000".to_string(),
+                user_name: "shared".to_string(),
+            }),
+            source_identity: source_identity.map(ToString::to_string),
+            created_at: at,
+            expires_at: at + lasts,
+        }
+    }
+
+    /// A call made with a session credential is recorded with the session's own ARN and
+    /// the `sessionContext` block — the issuer that minted it, and the source identity
+    /// only when the session carries one.
+    #[test]
+    fn a_session_call_records_its_session_context() {
+        let now = SystemTime::now();
+        // The rows differ along the one fact the record is read for: whether the session
+        // carries a source identity.
+        for (case, source_identity) in [
+            ("a session with a source identity", Some("alice@example.com")),
+            ("a session without one", None),
+        ] {
+            let mut log = ManagementEventLog::default();
+            let mut served = call("DescribeTrails");
+            served.session = Some(session(source_identity, now, Duration::from_secs(3600)));
+            // What a recorder fills for a session call: the identity is the SESSION's, so
+            // the type and the name are its own.
+            served.principal_type = PRINCIPAL_TYPE_ASSUMED_ROLE.to_string();
+            served.user_name = Some("analyst".to_string());
+            log.record(served, now);
+            let json = log
+                .iter()
+                .next()
+                .expect("the recorded event")
+                .to_cloudtrail_event_json();
+            assert_eq!(
+                json.pointer("/userIdentity/arn"),
+                Some(&serde_json::json!(
+                    "arn:aws:sts::000000000000:assumed-role/shared/analyst"
+                )),
+                "case {case:?}: expected the session's own ARN, got {json}"
+            );
+            assert_eq!(
+                json.pointer("/userIdentity/sessionContext/sessionIssuer/arn"),
+                Some(&serde_json::json!("arn:aws:iam::000000000000:role/shared")),
+                "case {case:?}: expected the issuing role's ARN, got {json}"
+            );
+            assert_eq!(
+                json.pointer("/userIdentity/sessionContext/sourceIdentity"),
+                source_identity.map(|value| serde_json::json!(value)).as_ref(),
+                "case {case:?}: expected sourceIdentity {source_identity:?}, got {json}"
+            );
+            assert_eq!(
+                json.pointer("/userIdentity/userName"),
+                None,
+                "case {case:?}: an assumed role's identity carries no userName — the name \
+                 behind it is the issuer's, got {json}"
+            );
+        }
+    }
+
+    /// The directory answers the session a credential names, forgets a session whose
+    /// credential the clock has expired, and holds no more than its cap.
+    #[test]
+    fn the_session_directory_is_bounded_by_the_clock_and_by_its_cap() {
+        let now = SystemTime::now();
+        let mut directory = SessionAuditDirectory::default();
+        directory.remember(
+            "ASIALIVE",
+            session(Some("alice@example.com"), now, Duration::from_secs(3600)),
+            now,
+        );
+        // Minted an hour ago for an hour, so `now` owes its removal.
+        directory.remember(
+            "ASIAEXPIRED",
+            session(None, now - Duration::from_secs(3600), Duration::from_secs(1)),
+            now,
+        );
+        assert_eq!(
+            directory
+                .session("ASIALIVE")
+                .and_then(|held| held.source_identity.clone()),
+            Some("alice@example.com".to_string()),
+            "case a live session: expected its source identity, got {directory:?}"
+        );
+        // The next write is what materialises the expiry the clock already made due.
+        directory.remember(
+            "ASIAOTHER",
+            session(None, now, Duration::from_secs(3600)),
+            now,
+        );
+        assert_eq!(
+            directory.session("ASIAEXPIRED"),
+            None,
+            "case an expired session: expected it dropped, got {directory:?}"
+        );
+        directory.forget("ASIAOTHER");
+        assert_eq!(
+            directory.session("ASIAOTHER"),
+            None,
+            "case a forgotten session: expected it dropped, got {directory:?}"
+        );
+
+        for index in 0..MAX_AUDITED_SESSIONS + 16 {
+            directory.remember(
+                format!("ASIAFILLER{index}"),
+                session(None, now, Duration::from_secs(3600 + index as u64)),
+                now,
+            );
+        }
+        assert!(
+            directory.len() <= MAX_AUDITED_SESSIONS,
+            "case past the cap: expected at most {MAX_AUDITED_SESSIONS} sessions, got {}",
+            directory.len()
         );
     }
 

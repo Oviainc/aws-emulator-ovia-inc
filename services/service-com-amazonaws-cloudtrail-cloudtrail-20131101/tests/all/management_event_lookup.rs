@@ -137,6 +137,10 @@ fn served(event_name: &str, region: &str) -> ServedApiCall {
         principal_type: PRINCIPAL_TYPE_IAM_USER.to_string(),
         principal_id: None,
         identity_provider: None,
+        // A long-term credential belongs to no session, which is what leaves the
+        // `sessionContext` block out of the record; a session call's own record is pinned
+        // by the suites of the services that mint and serve one.
+        session: None,
         account_id: engine::emulator_account_id().to_string(),
         user_agent: None,
         resources: vec![AuditedResource::new(
