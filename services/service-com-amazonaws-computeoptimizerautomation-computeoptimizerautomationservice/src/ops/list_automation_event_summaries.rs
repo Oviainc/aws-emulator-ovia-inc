@@ -199,6 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // filter list, since both operations narrow the same events with it.
         let filters = input.filters.unwrap_or_default();
 
+        // A filter carrying no value selects nothing, and the boundary admits
+        // one: `crate::state::filters_violation` is where this service judges
+        // that, for every operation that filters, and why.
+        if let Some(report) = crate::state::filters_violation(&filters) {
+            return Err(invalid_parameter(report));
+        }
+
         // The window bounds are modelled as plain STRINGS, so the framework
         // hands them over unparsed: each is read into the instant it names, and
         // text that names none is refused rather than ignored, which would

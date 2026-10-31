@@ -61,6 +61,8 @@ mod error_payloads;
 mod filter_name_enum_boundary;
 #[path = "all/filter_name_refusals.rs"]
 mod filter_name_refusals;
+#[path = "all/filter_value_lists.rs"]
+mod filter_value_lists;
 #[path = "all/member_account_association_gate.rs"]
 mod member_account_association_gate;
 #[path = "all/member_account_initiation_gate.rs"]

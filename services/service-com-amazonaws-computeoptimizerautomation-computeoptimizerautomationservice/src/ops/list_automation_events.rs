@@ -174,6 +174,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::event_matches_filters` selects on.
         let filters = input.filters.unwrap_or_default();
 
+        // A filter carrying no value selects nothing, and the boundary admits
+        // one: `crate::state::filters_violation` is where this service judges
+        // that, for every operation that filters, and why.
+        if let Some(report) = crate::state::filters_violation(&filters) {
+            return Err(invalid_parameter(report));
+        }
+
         // `endTimeExclusive` is exclusive, so a range whose end does not come
         // after its start can hold no event at all: refuse it rather than report
         // an empty page for a window the caller cannot have meant. The wording

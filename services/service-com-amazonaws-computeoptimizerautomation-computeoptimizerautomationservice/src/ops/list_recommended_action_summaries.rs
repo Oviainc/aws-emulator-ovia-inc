@@ -194,6 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operations narrow the same actions with it.
         let filters = input.filters.unwrap_or_default();
 
+        // A filter carrying no value selects nothing, and the boundary admits
+        // one: `crate::state::filters_violation` is where this service judges
+        // that, for every operation that filters, and why.
+        if let Some(report) = crate::state::filters_violation(&filters) {
+            return Err(invalid_parameter(report));
+        }
+
         // The page token carries this operation's name and the SELECTION those
         // filters perform — every filter's values as the set it tests membership
         // of, the filters in one order, a filter spelled twice once

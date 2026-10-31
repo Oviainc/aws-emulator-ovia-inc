@@ -607,6 +607,33 @@ pub fn canonical_filters<F: SelectionFilter>(filters: &[F]) -> Vec<F> {
     canonical
 }
 
+/// Why this listing's `filters` cannot narrow it, if they cannot: one of them
+/// carries no value to select on.
+///
+/// A filter's `values` are the alternatives it accepts for its dimension, and
+/// every filter evaluator of this service requires ALL of the request's filters
+/// to hold ([`rule_matches_filters`], [`event_matches_filters`],
+/// [`recommended_action_matches_filters`]), so a filter carrying no value states
+/// a condition nothing can satisfy: the request is refused under the floor every
+/// caller-supplied value list of this service is held to
+/// ([`empty_value_list_violation`]) rather than answered with an empty page that
+/// reads as an authoritative result set. The three filter shapes all target
+/// `FilterValues`, which bounds its MEMBER at `length(1..255)` and carries no
+/// `@length` of its own
+/// (`smithy_query(query="shape",shape="FilterValues,Filter,AutomationEventFilter,RecommendedActionFilter")`),
+/// so the protocol boundary admits the empty list — `@required` is satisfied by
+/// one — and the check lives here, once, for every operation that filters. The
+/// report names the offending filter by its position in the list, counted from
+/// one, exactly as the boundary's own refusal of a filter `name` does.
+pub fn filters_violation<F: SelectionFilter>(filters: &[F]) -> Option<String> {
+    filters.iter().enumerate().find_map(|(index, filter)| {
+        empty_value_list_violation(
+            &format!("filters.{}.member.values", index + 1),
+            filter.filter_values().len(),
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Error wording
 //
@@ -2884,14 +2911,15 @@ pub fn recommended_action_types_violation(action_types: &[String]) -> Option<Str
 ///
 /// A list a caller sends to say WHAT a call applies to — the accounts an
 /// association names, the action types a rule executes, the values a criteria
-/// condition compares against, the tags an addition carries, the keys a removal
-/// names — states the call's whole subject, so one carrying nothing states a
-/// call with nothing to do; such a request is refused rather than answered as
-/// though it had acted on something, or acted on a prefix of the list. The ONE
-/// place this service judges that floor, under the member's own name, so every
-/// such list is refused at the same bound and with the same report. None of the
-/// list shapes carries a `@length` minimum
-/// (`smithy_query(query="shape",shape="AccountIdList,RecommendedActionTypeList,TagKeyList,TagList,StringList")`),
+/// condition compares against, the values a listing's filter selects on, the
+/// tags an addition carries, the keys a removal names — states the call's whole
+/// subject, so one carrying nothing states a call with nothing to do; such a
+/// request is refused rather than answered as though it had acted on something,
+/// acted on a prefix of the list, or selected nothing at all. The ONE place this
+/// service judges that floor, under the member's own name, so every such list is
+/// refused at the same bound and with the same report. None of the list shapes
+/// carries a `@length` minimum
+/// (`smithy_query(query="shape",shape="AccountIdList,RecommendedActionTypeList,TagKeyList,TagList,StringList,FilterValues")`),
 /// so the protocol boundary admits the empty list — `@required` is satisfied by
 /// one — and the check lives here. A list member the model leaves OPTIONAL is
 /// not judged here when it is absent: omitting it leaves the stored value
@@ -3172,6 +3200,8 @@ pub const DATE_MEMBER_REQUIREMENT: &str =
 /// are ANDed. The names are the model's `AutomationEventFilterName` value set,
 /// and a name outside it never gets this far: the member is typed on that set,
 /// so the generated request walk refuses the request before the handler runs.
+/// Neither does a filter carrying no value, which selects nothing and is refused
+/// by [`filters_violation`] instead.
 pub fn event_matches_filters(event: &StoredEvent, filters: &[AutomationEventFilter]) -> bool {
     filters.iter().all(|filter| {
         let field: Option<&str> = match filter.name.as_str() {
@@ -3718,7 +3748,8 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
 /// filter's values; several filters are ANDed. The filter names are the model's
 /// `AutomationRuleFilterName` value set, and a name outside it never gets this
 /// far: the member is typed on that set, so the generated request walk refuses
-/// the request before the handler runs.
+/// the request before the handler runs. Neither does a filter carrying no value,
+/// which selects nothing and is refused by [`filters_violation`] instead.
 pub fn rule_matches_filters(rule: &StoredRule, filters: &[Filter]) -> bool {
     filters.iter().all(|filter| {
         let field: Option<String> = match filter.name.as_str() {
@@ -3753,6 +3784,8 @@ pub fn rule_matches_filters(rule: &StoredRule, filters: &[Filter]) -> bool {
 /// nothing. The names are the model's `RecommendedActionFilterName` value set,
 /// and a name outside it never gets this far: the member is typed on that set,
 /// so the generated request walk refuses the request before the handler runs.
+/// Neither does a filter carrying no value, which selects nothing and is refused
+/// by [`filters_violation`] instead.
 pub fn recommended_action_matches_filters(
     action: &RecommendedAction,
     filters: &[RecommendedActionFilter],
