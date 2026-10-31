@@ -113,7 +113,11 @@ fn with_record(
 
 /// Hold `account_id`'s TRN validation open, so its record stays the outstanding
 /// `Pending` one however long the test takes to reach the next call.
-fn hold_open(engine: &Arc<engine::InMemoryEngine>, account_id: &str) {
+///
+/// `pub(crate)` because `tests/all/batch_put_mixed_row_codes.rs` stages the same
+/// account state: one way to make a record outstanding, so two suites cannot
+/// stage it two different ways.
+pub(crate) fn hold_open(engine: &Arc<engine::InMemoryEngine>, account_id: &str) {
     with_record(engine, account_id, |stored| {
         stored.status = STATUS_PENDING.to_string();
         stored.validation_due_at = Some(Instant::now() + Duration::from_secs(3_600));
@@ -122,7 +126,9 @@ fn hold_open(engine: &Arc<engine::InMemoryEngine>, account_id: &str) {
 
 /// Put `account_id`'s record in `status`, with nothing left owed on it: that
 /// status IS the record's state, not one the clock is about to move.
-fn force_status(engine: &Arc<engine::InMemoryEngine>, account_id: &str, status: &str) {
+///
+/// `pub(crate)` for the reason [`hold_open`] gives.
+pub(crate) fn force_status(engine: &Arc<engine::InMemoryEngine>, account_id: &str, status: &str) {
     with_record(engine, account_id, |stored| {
         stored.status = status.to_string();
         stored.validation_due_at = None;

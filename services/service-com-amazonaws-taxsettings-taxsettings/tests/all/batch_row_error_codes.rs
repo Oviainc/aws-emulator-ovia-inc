@@ -206,7 +206,11 @@ impl Refusal {
 /// all for a type whose legal address AWS derives from the tax number (an entry
 /// of one may submit no address), the one country the model ties the type to
 /// when it ties it to one, and otherwise a country no per-type rule turns on.
-fn submitted_jurisdiction(registration_type: &str) -> Option<&'static str> {
+///
+/// `pub(crate)` because `tests/all/batch_put_mixed_row_codes.rs` submits the
+/// same entries: one jurisdiction per type, so the two suites cannot submit one
+/// type two different ways.
+pub(crate) fn submitted_jurisdiction(registration_type: &str) -> Option<&'static str> {
     if type_with_derived_legal_address(registration_type).is_some() {
         return None;
     }
@@ -232,7 +236,11 @@ async fn store(router: &MultiServiceRouter, case: &str, account_id: &str, entry:
 
 /// Fill the store to the last registration it keeps resident, so the next new
 /// record has no room.
-fn fill_the_store(engine: &Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` because `tests/all/batch_put_mixed_row_codes.rs` meets the same
+/// bound: the records it pads with are named apart from any account a test
+/// addresses, so an account that already holds one still holds it.
+pub(crate) fn fill_the_store(engine: &Arc<engine::InMemoryEngine>) {
     let state = engine.state::<ComAmazonawsTaxsettingsTaxsettingsState>();
     let mut store = state.lock();
     for index in 0..MAX_STORED_REGISTRATIONS {
@@ -249,7 +257,11 @@ fn fill_the_store(engine: &Arc<engine::InMemoryEngine>) {
 /// `pending_trn_conflict::error_rows` flattens an absent member to the empty
 /// string, which is the one distinction this rule turns on, so this suite reads
 /// the list itself.
-fn rows_of(answer: &Answer) -> Vec<(String, Option<String>, String)> {
+///
+/// `pub(crate)` because `tests/all/batch_put_mixed_row_codes.rs` turns on the
+/// same distinction: one reader, so the two suites cannot read an absent `code`
+/// two different ways.
+pub(crate) fn rows_of(answer: &Answer) -> Vec<(String, Option<String>, String)> {
     answer
         .get("errors")
         .as_array()
