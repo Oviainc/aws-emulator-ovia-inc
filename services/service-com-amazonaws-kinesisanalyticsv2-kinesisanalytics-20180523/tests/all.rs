@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
+#[path = "all/application_mode_and_maintenance_window.rs"]
+mod application_mode_and_maintenance_window;
 #[path = "all/error_envelope_wording.rs"]
 mod error_envelope_wording;
 #[path = "all/harness.rs"]

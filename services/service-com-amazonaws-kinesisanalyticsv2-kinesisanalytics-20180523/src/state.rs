@@ -11,9 +11,12 @@
 //!
 //! Beside the records themselves this module owns the two projections every reader
 //! needs ([`Application::detail`], [`Application::summary`]), the merge an update applies
-//! to a stored configuration ([`Application::apply_configuration_update`]), the
-//! resolution of a Studio notebook's catalog against the Glue Data Catalog
-//! ([`catalog_database_refusal`]) and the clock-owed status settlement
+//! to a stored configuration ([`Application::apply_configuration_update`]), the mode an
+//! application runs in when its create named none ([`default_application_mode`]), the
+//! maintenance window every application carries
+//! ([`Application::maintenance_configuration`]), the resolution of a Studio notebook's
+//! catalog against the Glue Data Catalog ([`catalog_database_refusal`]) and the
+//! clock-owed status settlement
 //! ([`ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State::settle`]),
 //! so an operation handler never re-derives them.
 
@@ -25,7 +28,8 @@ use ::aws_smithy_types::DateTime;
 use crate::ops::types::{
     ApplicationCodeConfigurationDescription, ApplicationConfiguration,
     ApplicationConfigurationDescription, ApplicationConfigurationUpdate, ApplicationDetail,
-    ApplicationEncryptionConfigurationDescription, ApplicationSnapshotConfigurationDescription,
+    ApplicationEncryptionConfigurationDescription,
+    ApplicationMaintenanceConfigurationDescription, ApplicationSnapshotConfigurationDescription,
     ApplicationSummary, ApplicationSystemRollbackConfigurationDescription,
     CatalogConfigurationDescription, CheckpointConfigurationDescription, CodeContentDescription,
     CustomArtifactConfigurationDescription, DeployAsApplicationConfigurationDescription,
@@ -157,8 +161,10 @@ pub struct Application {
     /// A `RuntimeEnvironment` enum value, as supplied at create.
     pub runtime_environment: String,
     pub service_execution_role: String,
-    /// An `ApplicationMode` enum value, when the creator supplied one.
-    pub application_mode: Option<String>,
+    /// The `ApplicationMode` enum value this application runs in: the one the creator
+    /// supplied, else the one its runtime implies ([`default_application_mode`]). Every
+    /// application runs in one of the two modes, so this is not optional.
+    pub application_mode: String,
     /// An `ApplicationStatus` enum value.
     pub status: String,
     /// The status change the clock owes, while one is outstanding.
@@ -172,8 +178,18 @@ pub struct Application {
     /// When the current application version was created; equal to `create_timestamp`
     /// until an operation that mints a new version lands.
     pub version_create_timestamp: DateTime,
-    pub last_update_timestamp: Option<DateTime>,
+    /// When this application last changed. The create is itself the first such change,
+    /// so an application that has never been updated since reports the instant it was
+    /// created and a reader never sees this member absent.
+    pub last_update_timestamp: DateTime,
     pub configuration: Option<ApplicationConfigurationDescription>,
+    /// The start of the window maintenance on this application runs in, as an
+    /// `ApplicationMaintenanceWindowStartTime` (`HH:MM`): the one the account is
+    /// assigned ([`DEFAULT_MAINTENANCE_WINDOW_START`]) until
+    /// `UpdateApplicationMaintenanceConfiguration` replaces it. The window's END is
+    /// derived from it ([`maintenance_window_end`]) rather than stored beside it, so the
+    /// two can never disagree about how long a maintenance window is.
+    pub maintenance_window_start: String,
     pub cloud_watch_logging_options: Vec<CloudWatchLoggingOptionDescription>,
     /// The optimistic-concurrency token for the current version.
     pub conditional_token: Option<String>,
@@ -202,7 +218,7 @@ impl Application {
             return;
         }
         self.status = pending.to_status;
-        self.last_update_timestamp = Some(pending.due_wall);
+        self.last_update_timestamp = pending.due_wall;
         if let Some(op) = self
             .operations
             .iter_mut()
@@ -248,13 +264,17 @@ impl Application {
             application_status: self.status.clone(),
             application_version_id: self.version_id,
             create_timestamp: Some(self.create_timestamp),
-            last_update_timestamp: self.last_update_timestamp,
+            last_update_timestamp: Some(self.last_update_timestamp),
             application_configuration_description: self.configuration.clone(),
             cloud_watch_logging_option_descriptions: (!self.cloud_watch_logging_options.is_empty())
                 .then(|| self.cloud_watch_logging_options.clone()),
-            // UpdateApplicationMaintenanceConfiguration is still scaffolded, so no
-            // maintenance window has ever been set on a stored application.
-            application_maintenance_configuration_description: None,
+            // Maintenance runs on every application in a window the service keeps for
+            // it, so the window is reported from the moment the application exists —
+            // the one the account is assigned until
+            // `UpdateApplicationMaintenanceConfiguration` replaces its start time.
+            application_maintenance_configuration_description: Some(
+                self.maintenance_configuration(),
+            ),
             // The version an accepted configuration update moved this application on
             // from, as [`ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State::advance_version`]
             // recorded it.
@@ -264,7 +284,19 @@ impl Application {
             application_version_create_timestamp: Some(self.version_create_timestamp),
             conditional_token: self.conditional_token.clone(),
             application_version_rolled_back_to: None,
-            application_mode: self.application_mode.clone(),
+            application_mode: Some(self.application_mode.clone()),
+        }
+    }
+
+    /// The `ApplicationMaintenanceConfigurationDescription` every reader of this
+    /// application reports: the stored start time and the end time
+    /// [`maintenance_window_end`] derives from it.
+    pub fn maintenance_configuration(&self) -> ApplicationMaintenanceConfigurationDescription {
+        ApplicationMaintenanceConfigurationDescription {
+            application_maintenance_window_start_time: self.maintenance_window_start.clone(),
+            application_maintenance_window_end_time: maintenance_window_end(
+                &self.maintenance_window_start,
+            ),
         }
     }
 
@@ -276,7 +308,7 @@ impl Application {
             application_status: self.status.clone(),
             application_version_id: self.version_id,
             runtime_environment: self.runtime_environment.clone(),
-            application_mode: self.application_mode.clone(),
+            application_mode: Some(self.application_mode.clone()),
         }
     }
 
@@ -800,6 +832,27 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
         hex_id(&format!("{kind}:{}:{nanos}", self.id_sequence))
     }
 
+    /// Replace `name`'s maintenance window start time and answer the window as it now
+    /// stands, or `None` when no application is stored under that name.
+    ///
+    /// The end time is not stored: it follows from the start
+    /// ([`maintenance_window_end`]), so one rule decides how long every application's
+    /// window is, however the start was set.
+    pub fn set_maintenance_window(
+        &mut self,
+        name: &str,
+        start_time: String,
+        now: DateTime,
+    ) -> Option<ApplicationMaintenanceConfigurationDescription> {
+        let app = self.applications.get_mut(name)?;
+        app.maintenance_window_start = start_time;
+        // The stored application changed, and `LastUpdateTimestamp` reports when it last
+        // did. The application's VERSION does not move: a version is the configuration
+        // the application runs under, and when maintenance runs on it is not part of that.
+        app.last_update_timestamp = now;
+        Some(app.maintenance_configuration())
+    }
+
     /// Record a new operation on `name` and return its `OperationId`.
     ///
     /// The id is the primary key of the stored [`AppOperation`], never a loose value. The
@@ -915,7 +968,7 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
         app.version_updated_from = Some(app.version_id);
         app.version_id += 1;
         app.version_create_timestamp = now;
-        app.last_update_timestamp = Some(now);
+        app.last_update_timestamp = now;
         app.conditional_token = Some(conditional_token);
         Some(app.version_id)
     }
@@ -1478,6 +1531,80 @@ const SQL_RUNTIME_FAMILY: &str = "SQL-";
 /// members are the exact strings a client sends, so the comparison is on those bytes.
 pub fn is_sql_runtime(runtime: &str) -> bool {
     runtime.starts_with(SQL_RUNTIME_FAMILY)
+}
+
+/// The `RuntimeEnvironment` family a Studio notebook runs on: Apache Zeppelin over
+/// Flink, `ZEPPELIN-FLINK-<major>_<minor>` (`ZEPPELIN-FLINK-1_0` … `ZEPPELIN-FLINK-3_0`
+/// today), beside the plain `FLINK-` family a streaming application runs on
+/// (`smithy_query(query="shape",shape="RuntimeEnvironment")`).
+const NOTEBOOK_RUNTIME_FAMILY: &str = "ZEPPELIN-";
+
+/// Whether `runtime` names a Studio notebook's runtime — any version of that family, so
+/// a later enum member of it is read the same way.
+pub fn is_notebook_runtime(runtime: &str) -> bool {
+    runtime.starts_with(NOTEBOOK_RUNTIME_FAMILY)
+}
+
+/// The `ApplicationMode` values, spelled exactly as the model's `ApplicationMode` enum
+/// does (`smithy_query(query="shape",shape="ApplicationMode")`).
+pub const APPLICATION_MODE_STREAMING: &str = "STREAMING";
+pub const APPLICATION_MODE_INTERACTIVE: &str = "INTERACTIVE";
+
+/// The mode an application runs in when its create named none.
+///
+/// `ApplicationSummary$ApplicationMode` states the rule: for a Managed Service for
+/// Apache Flink application the mode is `STREAMING`, and for a Studio notebook it is
+/// `INTERACTIVE` — and what makes an application a notebook is the Zeppelin runtime it
+/// runs on ([`is_notebook_runtime`]). So the mode is a property of the application
+/// rather than of the request that created it, and it is resolved for every runtime
+/// family rather than for the ones a caller happens to name explicitly.
+pub fn default_application_mode(runtime_environment: &str) -> &'static str {
+    if is_notebook_runtime(runtime_environment) {
+        APPLICATION_MODE_INTERACTIVE
+    } else {
+        APPLICATION_MODE_STREAMING
+    }
+}
+
+/// The `ApplicationMaintenanceWindowStartTime` an application is created with.
+///
+/// Maintenance runs on every application in a window the service keeps for it, so a
+/// window exists from the moment the application does and
+/// `UpdateApplicationMaintenanceConfiguration` only moves its start. Which start a
+/// freshly created application gets is per-account rather than part of the API
+/// contract, so this is the emulator's account-wide one, the start the API reference's
+/// `UpdateApplicationMaintenanceConfiguration` example answers with.
+pub const DEFAULT_MAINTENANCE_WINDOW_START: &str = "06:00";
+
+/// How long a maintenance window lasts: the API reference's
+/// `UpdateApplicationMaintenanceConfiguration` example answers an
+/// `ApplicationMaintenanceWindowStartTime` of `06:00` with an
+/// `ApplicationMaintenanceWindowEndTime` of `14:00` — eight hours.
+const MAINTENANCE_WINDOW_HOURS: u32 = 8;
+
+/// A day's length in hours, the modulus a maintenance window that runs past midnight
+/// wraps its end time by: `ApplicationMaintenanceWindowEndTime` is a time of day
+/// (`^([01][0-9]|2[0-3]):[0-5][0-9]$`), not an offset from the start.
+const HOURS_PER_DAY: u32 = 24;
+
+/// The `ApplicationMaintenanceWindowEndTime` that goes with `start`:
+/// [`MAINTENANCE_WINDOW_HOURS`] later, wrapped into the same day's clock, with the
+/// minutes the start carries.
+///
+/// `start` is an `ApplicationMaintenanceWindowStartTime` — `HH:MM`, refused at the
+/// boundary when it is anything else — so a value that does not parse can only be one
+/// this store never wrote, and is answered unchanged rather than guessed at.
+pub fn maintenance_window_end(start: &str) -> String {
+    let Some((hours, minutes)) = start.split_once(':') else {
+        return start.to_string();
+    };
+    match (hours.parse::<u32>(), minutes.parse::<u32>()) {
+        (Ok(hours), Ok(minutes)) if hours < HOURS_PER_DAY && minutes < 60 => {
+            let end = (hours + MAINTENANCE_WINDOW_HOURS) % HOURS_PER_DAY;
+            format!("{end:02}:{minutes:02}")
+        }
+        _ => start.to_string(),
+    }
 }
 
 /// How this service words a request whose `CurrentApplicationVersionId` is not the

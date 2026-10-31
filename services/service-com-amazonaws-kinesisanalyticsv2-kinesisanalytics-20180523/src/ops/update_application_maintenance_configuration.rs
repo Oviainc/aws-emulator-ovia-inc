@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApplicationMaintenanceConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApplicationMaintenanceConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApplicationMaintenanceConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: moves the start of the window maintenance on one stored application runs
+//! in, and reports the window as it then stands. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +163,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApplicationMaintenanceConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApplicationMaintenanceConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApplicationMaintenanceConfiguration"))
+        // Every modelled constraint on the input — `ApplicationName`'s length and
+        // `^[a-zA-Z0-9_.-]+$` pattern, and
+        // `ApplicationMaintenanceWindowStartTimeUpdate`'s presence, its length of 5 and
+        // its `^([01][0-9]|2[0-3]):[0-5][0-9]$` pattern — is refused at the boundary with
+        // HTTP 400 before this handler runs, so the start time reaching here is a time of
+        // day of the form `HH:MM`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateApplicationMaintenanceConfigurationErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(
+                            "this service is not mounted on a stateful engine, so no \
+                             application's maintenance configuration can be updated"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let name = input.application_name.clone();
+        let now = crate::state::now_timestamp();
+
+        let mut store = state.lock();
+        // Decide against the status the application has NOW: `settle_named` only
+        // materialises the status change the clock already owed.
+        store.settle_named(&name);
+
+        let Some(application) = store.applications.get(&name) else {
+            return Err(
+                UpdateApplicationMaintenanceConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_application_message(&name)),
+                    },
+                )
+                .into(),
+            );
+        };
+        let arn = application.arn.clone();
+        let status = application.status.clone();
+        let runtime_environment = application.runtime_environment.clone();
+
+        // "This operation is supported only for Managed Service for Apache Flink": a SQL
+        // application is maintained by the retired SQL service rather than by the Flink
+        // one, so it has no maintenance window of its own to move. The refusal is about
+        // the runtime the STORED application declares.
+        if crate::state::is_sql_runtime(&runtime_environment) {
+            return Err(
+                UpdateApplicationMaintenanceConfigurationErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(format!(
+                            "{} is not supported for SQL applications in this Region.",
+                            Self::NAME
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You can invoke this operation on an application that is in one of the two
+        // following states: READY or RUNNING. If you invoke it when the application is in
+        // a state other than these two states, it throws a ResourceInUseException" (this
+        // operation's doc). A transient status means a change is already outstanding, and
+        // the refusal is worded as this crate already words the same class for the same
+        // reason (`crate::ops::update_application`).
+        if status != crate::state::STATUS_READY && status != crate::state::STATUS_RUNNING {
+            return Err(
+                UpdateApplicationMaintenanceConfigurationErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(format!(
+                            "Application {name} cannot be updated while it is in the \
+                             {status} state"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Accepted: the window's start is persisted on the application and the answer is
+        // read back off what was stored, so it is exactly what a later
+        // DescribeApplication reports.
+        let application_maintenance_configuration_description = store.set_maintenance_window(
+            &name,
+            input
+                .application_maintenance_configuration_update
+                .application_maintenance_window_start_time_update,
+            now,
+        );
+
+        Ok(UpdateApplicationMaintenanceConfigurationOutput {
+            application_arn: Some(arn),
+            application_maintenance_configuration_description,
+        })
     }
 }

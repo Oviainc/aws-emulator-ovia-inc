@@ -84,9 +84,16 @@ async fn create_persists_an_application_that_describe_reports_identically() {
             Some(runtime),
             "case {name:?}: expected the stored runtime environment, got {created}"
         );
+        // The mode the creator named, else the one this runtime implies — the rule
+        // `application_mode_and_maintenance_window.rs` asserts over the whole runtime set.
+        let expected_mode = mode.unwrap_or(if runtime.starts_with("ZEPPELIN-") {
+            "INTERACTIVE"
+        } else {
+            "STREAMING"
+        });
         assert_eq!(
             created["ApplicationMode"].as_str(),
-            mode,
+            Some(expected_mode),
             "case {name:?}: expected the stored application mode, got {created}"
         );
         assert_eq!(

@@ -304,9 +304,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: crate::state::application_arn(&region, &name),
             name: name.clone(),
             description: input.application_description,
+            // Which mode the application runs in is a property of the application, so a
+            // create that named none still stores the one its runtime implies.
+            application_mode: input.application_mode.unwrap_or_else(|| {
+                crate::state::default_application_mode(&input.runtime_environment).to_string()
+            }),
             runtime_environment: input.runtime_environment,
             service_execution_role: input.service_execution_role,
-            application_mode: input.application_mode,
             // A newly created application is returned READY: it exists and is
             // configured, and only StartApplication moves it on from there.
             status: crate::state::STATUS_READY.to_string(),
@@ -316,8 +320,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version_updated_from: None,
             create_timestamp: now,
             version_create_timestamp: now,
-            last_update_timestamp: None,
+            // This create is the latest change the application has seen.
+            last_update_timestamp: now,
             configuration,
+            // The window maintenance on this application runs in until
+            // UpdateApplicationMaintenanceConfiguration moves its start.
+            maintenance_window_start: crate::state::DEFAULT_MAINTENANCE_WINDOW_START.to_string(),
             cloud_watch_logging_options,
             conditional_token: Some(conditional_token),
             tags: tags
