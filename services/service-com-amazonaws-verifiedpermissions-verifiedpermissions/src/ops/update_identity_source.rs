@@ -12,8 +12,17 @@
 //! configuration does not carry (an `entityIdPrefix`, a group configuration) is
 //! absent afterwards, exactly as it would be on a create carrying the same
 //! configuration. `principalEntityType` is a request member beside it and keeps
-//! its own rule: the request's value when it carries one, otherwise the stored
-//! one, because every read of an identity source requires it.
+//! its own rule, the one
+//! [`crate::ops::persisted_principal_entity_type`] states for both writers of
+//! the stored member: the request's value when it carries one, otherwise the
+//! stored one, because every read of an identity source requires it — except
+//! where the stored one is the default the SERVICE resolved for the provider
+//! kind this update points the source AWAY from, which belongs to that kind
+//! alone. An update that would leave such a default on a provider kind with no
+//! default of its own is therefore refused with the same 400
+//! `ValidationException` naming `principalEntityType` that a create carrying
+//! that provider and no entity type answers, and nothing is written: the two
+//! writers of one member cannot admit different states.
 //!
 //! A Cognito `userPoolArn` is resolved exactly as the create resolves it, and
 //! every other member is stored exactly as the create stores it, because both
@@ -223,14 +232,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(invalid)?;
 
-        source.configuration = configuration;
         // "Specifies the data type of principals generated for identities
         // authenticated by the identity source": optional here and REQUIRED on
-        // every read, so a request naming none leaves the stored value as it is
-        // rather than clearing a member a read must still report.
-        if let Some(principal_entity_type) = input.principal_entity_type.clone() {
-            source.principal_entity_type = principal_entity_type;
-        }
+        // every read, so a request naming none keeps the stored value rather
+        // than clearing a member a read must still report — unless that stored
+        // value is the one the SERVICE defaulted for the provider kind the
+        // source is being pointed AWAY from, which no read may report for the
+        // new kind. The same resolution the create goes through decides it, and
+        // refuses the write when nothing is left to resolve to, so this writer
+        // cannot leave a state the create refuses to make. It is resolved
+        // BEFORE anything is assigned, so a refused update still changes
+        // nothing.
+        let principal_entity_type = crate::ops::persisted_principal_entity_type(
+            input.principal_entity_type.as_deref(),
+            Some(&*source),
+            &configuration,
+        )
+        .map_err(invalid)?;
+
+        source.configuration = configuration;
+        source.principal_entity_type = principal_entity_type.value;
+        source.principal_entity_type_is_service_default = principal_entity_type.service_default;
         source.last_updated_date = crate::state::now();
 
         // Read the response back out of what was just persisted, so a value that

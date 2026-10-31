@@ -19,7 +19,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_verifiedpermissions_verifiedpermissions::ops::INVALID_INPUT_MESSAGE;
 
-use crate::harness::{call, error_code, fault_message, ok, router, store_with_mode, user_pool_arn};
+use crate::harness::{
+    call, error_code, fault_message, field_list, ok, router, store_with_mode, user_pool_arn,
+};
 use crate::schema::photo_app_schema;
 
 // ---------------------------------------------------------------------------
@@ -256,23 +258,6 @@ async fn a_boundary_refusal_states_one_clause_per_broken_constraint() {
 // ---------------------------------------------------------------------------
 // 2. Every reason the schema raised
 // ---------------------------------------------------------------------------
-
-/// The `fieldList` of a fault, as `(path, message)` pairs in the order the
-/// response carries them.
-fn field_list(body: &Value) -> Vec<(String, String)> {
-    body.get("fieldList")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|field| {
-            (
-                field["path"].as_str().unwrap_or_default().to_string(),
-                field["message"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect()
-}
 
 /// RULE: a policy the store's SCHEMA refuses in `STRICT` mode is answered with
 /// ONE `fieldList` entry per diagnostic the Cedar validator raised about it —

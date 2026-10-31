@@ -680,6 +680,81 @@ pub fn persisted_identity_source_configuration<
     }
 }
 
+/// The `principalEntityType` a WRITE of an identity source leaves stored, and
+/// whether the SERVICE rather than the caller decided it — what
+/// [`persisted_principal_entity_type`] resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedPrincipalEntityType {
+    /// The value [`crate::state::IdentitySource::principal_entity_type`] holds
+    /// after the write.
+    pub value: String,
+    /// Whether `value` is the default the service resolved for the provider kind
+    /// the write describes, rather than a value the caller named — what
+    /// [`crate::state::IdentitySource::principal_entity_type_is_service_default`]
+    /// records.
+    pub service_default: bool,
+}
+
+/// Resolve the `principalEntityType` a write of an identity source stores, from
+/// the member the request carried (`None` when it carried none), the source the
+/// write REPLACES (`None` on a create) and the provider the write points it at.
+///
+/// This is the SINGLE decision both writers of
+/// [`crate::state::IdentitySource::principal_entity_type`] go through —
+/// `CreateIdentitySource` and `UpdateIdentitySource` — the companion of
+/// [`persisted_identity_source_configuration`], which is the single decision for
+/// the configuration stored beside it. The two members are resolved together
+/// because the rule relates them:
+///
+/// * a value the CALLER named is stored as given, for either provider kind;
+/// * an omitted member keeps a stored value the caller once named, because an
+///   update leaves a member it does not carry as it is and every read requires
+///   this one;
+/// * an omitted member with nothing caller-chosen behind it falls to the
+///   service's own default, and that default belongs to ONE provider kind
+///   ([`crate::state::DEFAULT_COGNITO_PRINCIPAL_ENTITY_TYPE`], the type a Cognito
+///   user pool source's principals carry). An OIDC source's principals are of a
+///   type only the caller's Cedar schema supplies, so there is nothing to resolve
+///   to and the write is refused rather than left reporting a type nobody chose.
+///
+/// The last arm is why this is shared: a defaulted value cannot follow a source
+/// onto a provider kind that has no default, so the kind the write LANDS on
+/// decides, whether that kind arrived on a create or on an update. The refusal
+/// names [`paths::PRINCIPAL_ENTITY_TYPE`], the member the caller has to fix,
+/// which both operations declare under the same name.
+pub fn persisted_principal_entity_type(
+    requested: Option<&str>,
+    replacing: Option<&crate::state::IdentitySource>,
+    configuration: &crate::state::IdentitySourceConfiguration,
+) -> Result<PersistedPrincipalEntityType, InvalidInput> {
+    if let Some(entity_type) = requested {
+        return Ok(PersistedPrincipalEntityType {
+            value: entity_type.to_string(),
+            service_default: false,
+        });
+    }
+    if let Some(stored) = replacing.filter(|stored| !stored.principal_entity_type_is_service_default)
+    {
+        return Ok(PersistedPrincipalEntityType {
+            value: stored.principal_entity_type.clone(),
+            service_default: false,
+        });
+    }
+    match configuration {
+        crate::state::IdentitySourceConfiguration::CognitoUserPool(_) => {
+            Ok(PersistedPrincipalEntityType {
+                value: crate::state::DEFAULT_COGNITO_PRINCIPAL_ENTITY_TYPE.to_string(),
+                service_default: true,
+            })
+        }
+        crate::state::IdentitySourceConfiguration::OpenIdConnect(_) => Err(InvalidInput::new(
+            paths::PRINCIPAL_ENTITY_TYPE,
+            "an OpenID Connect identity source generates principals of the entity type \
+             the request names, so it cannot be omitted",
+        )),
+    }
+}
+
 /// The modelled `ResourceNotFoundException` an AUTHORIZATION call answers for a
 /// reference that names no live resource: the message NAMES the missing
 /// resource's kind and the id the request referenced it by

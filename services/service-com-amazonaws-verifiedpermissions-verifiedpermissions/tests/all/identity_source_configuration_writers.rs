@@ -23,7 +23,9 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, error_code, ok, router, store_with_validation_off, user_pool_arn};
+use crate::harness::{
+    call, error_code, field_list, ok, router, store_with_validation_off, user_pool_arn,
+};
 use crate::identity_source_refusal_pointers::POOL_ARN_IN_CONFIGURATION;
 
 /// The region every request in this suite is signed for, from the harness, so a
@@ -96,23 +98,6 @@ async fn read(router: &MultiServiceRouter, store_id: &str, id: &str) -> Value {
         &json!({ "policyStoreId": store_id, "identitySourceId": id }),
     )
     .await
-}
-
-/// The `fieldList` of a fault, as `(path, message)` pairs in the order the
-/// response carries them — what tells a caller which member to fix.
-fn field_list(body: &Value) -> Vec<(String, String)> {
-    body.get("fieldList")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|field| {
-            (
-                field["path"].as_str().unwrap_or_default().to_string(),
-                field["message"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect()
 }
 
 /// RULE: one provider description is stored identically whichever writer carried

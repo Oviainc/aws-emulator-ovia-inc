@@ -12,7 +12,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_verifiedpermissions_verifiedpermissions::ops::INVALID_INPUT_MESSAGE;
 
-use crate::harness::{call, error_code, fault_message, ok, router, store_with_validation_off};
+use crate::harness::{
+    call, error_code, fault_message, field_list, ok, router, store_with_validation_off,
+};
 
 /// The prefix every alias name carries, from the `aliasName` member's own model
 /// documentation on each of `CreatePolicyStoreAlias`, `GetPolicyStoreAlias` and
@@ -79,22 +81,6 @@ fn requests_naming(alias_name: &str, store_id: &str) -> Vec<(&'static str, Value
             json!({ "aliasName": alias_name, "deletionMode": "HardDelete" }),
         ),
     ]
-}
-
-/// The `fieldList` of a fault, as `(path, message)` pairs in wire order.
-fn field_list(body: &Value) -> Vec<(String, String)> {
-    body.get("fieldList")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|field| {
-            (
-                field["path"].as_str().unwrap_or_default().to_string(),
-                field["message"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect()
 }
 
 /// RULE: an `aliasName` that does not carry the documented prefix is refused with

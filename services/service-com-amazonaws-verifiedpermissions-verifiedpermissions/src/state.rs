@@ -91,14 +91,19 @@ pub const MAX_POLICY_TEMPLATES_PER_STORE: usize = 10_000;
 /// `ServiceQuotaExceededException` `CreateIdentitySource` models.
 pub const MAX_IDENTITY_SOURCES_PER_STORE: usize = 100;
 
-/// The Cedar entity type a Cognito identity source's principals carry when the
-/// create request named no `principalEntityType`.
+/// The Cedar entity type a Cognito identity source's principals carry when no
+/// write of the source ever named a `principalEntityType`.
 ///
 /// `CreateIdentitySource$principalEntityType` is optional while
 /// `GetIdentitySource$principalEntityType` is **required**, so an omitted value
 /// has to resolve to the service's own default; for an Amazon Cognito user pool
 /// source that default is the `AWS::Cognito` entity type Verified Permissions
 /// generates principals as when the policy store maps none of its own.
+///
+/// It is the default of ONE provider kind, so it is only ever stored on a
+/// Cognito user pool source — [`crate::ops::persisted_principal_entity_type`] is
+/// the one place that decides it, for every writer of
+/// [`IdentitySource::principal_entity_type`].
 pub const DEFAULT_COGNITO_PRINCIPAL_ENTITY_TYPE: &str = "AWS::Cognito";
 
 /// The region used for a request that carries no SigV4 credential scope — the
@@ -505,9 +510,22 @@ pub fn canonical_schema_json(definition: &str) -> String {
 pub struct IdentitySource {
     pub identity_source_id: String,
     pub policy_store_id: String,
-    /// The resolved `principalEntityType`: the request's value, or
-    /// [`DEFAULT_COGNITO_PRINCIPAL_ENTITY_TYPE`] when it named none.
+    /// The resolved `principalEntityType`, as
+    /// [`crate::ops::persisted_principal_entity_type`] decides it for either
+    /// writer: the value the write named, the value a previous write named when
+    /// this one named none, or [`DEFAULT_COGNITO_PRINCIPAL_ENTITY_TYPE`] when no
+    /// write ever named one and the source points at a Cognito user pool.
     pub principal_entity_type: String,
+    /// Whether `principal_entity_type` is the value the SERVICE resolved for a
+    /// Cognito user pool source rather than one the CALLER named.
+    ///
+    /// A defaulted value belongs to the provider kind it is the default of, so a
+    /// later write that points this source at a provider kind with no default of
+    /// its own cannot carry it over — that is the difference between a type the
+    /// caller chose and one only this source's current provider explains. It is
+    /// never reported: a read reports `principal_entity_type` alone, because the
+    /// API has no member for who decided it.
+    pub principal_entity_type_is_service_default: bool,
     pub created_date: DateTime,
     pub last_updated_date: DateTime,
     pub configuration: IdentitySourceConfiguration,

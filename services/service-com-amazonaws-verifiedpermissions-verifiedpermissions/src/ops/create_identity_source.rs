@@ -55,7 +55,11 @@
 //!   while required on every read, so an absent value resolves to
 //!   [`crate::state::DEFAULT_COGNITO_PRINCIPAL_ENTITY_TYPE`] for a Cognito
 //!   source; an OIDC source generates principals of a type only the caller can
-//!   name, so omitting it there is refused.
+//!   name, so omitting it there is refused. That decision is
+//!   [`crate::ops::persisted_principal_entity_type`], the one this operation
+//!   shares with [`crate::ops::update_identity_source`] — the other writer of
+//!   the same stored member — so a defaulted type is never left on a provider
+//!   kind that has no default, whichever writer pointed the source at it.
 //!
 //! ## Output
 //!
@@ -209,31 +213,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read (`GetIdentitySourceOutput`, `IdentitySourceItem`), so an omitted
         // value has to resolve to something here rather than at read time.
         //
-        // A Cognito source has a service default to resolve to
-        // (`AWS::Cognito`). An OIDC source does not: its principals are
+        // That resolution is the one both writers of the stored member share
+        // ([`crate::ops::persisted_principal_entity_type`]): a Cognito source
+        // has a service default to resolve to (`AWS::Cognito`), an OIDC source
+        // does not — its principals are
         // `Namespace::[Entity type]::[entityIdPrefix]|[attribute]`, and the
         // entity type is a name only the caller's own Cedar schema supplies —
-        // nothing in the model, the request or this emulator's state determines
-        // it. Rather than SYNTHESISE an entity type that would then be reported
+        // so rather than SYNTHESISE an entity type that would then be reported
         // as if the caller had chosen it, the request is refused with the 400
         // the model's `ValidationException` carries, naming the member. This is
         // this emulator's refusal, not a recorded AWS behaviour: the model
         // declares the member optional and documents no such requirement, and
         // the alternative (inventing the value a read must report) is the one
         // thing an emulator must not do.
-        let principal_entity_type = match (&input.principal_entity_type, &configuration) {
-            (Some(entity_type), _) => entity_type.clone(),
-            (None, crate::state::IdentitySourceConfiguration::CognitoUserPool(_)) => {
-                crate::state::DEFAULT_COGNITO_PRINCIPAL_ENTITY_TYPE.to_string()
-            }
-            (None, crate::state::IdentitySourceConfiguration::OpenIdConnect(_)) => {
-                return Err(invalid(crate::ops::InvalidInput::new(
-                    crate::ops::paths::PRINCIPAL_ENTITY_TYPE,
-                    "an OpenID Connect identity source generates principals of the entity type \
-                     the request names, so it cannot be omitted",
-                )));
-            }
-        };
+        let principal_entity_type = crate::ops::persisted_principal_entity_type(
+            input.principal_entity_type.as_deref(),
+            // A create REPLACES nothing, so there is no stored value to keep.
+            None,
+            &configuration,
+        )
+        .map_err(invalid)?;
 
         // `@idempotencyToken` replay: the same token answers with the identity
         // source the first call created, and the same token with different
@@ -246,7 +245,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let configuration_fingerprint = configuration.fingerprint();
         let parameters = crate::state::idempotency_parameters(&[
             ("store", Some(store_id.as_str())),
-            ("principalEntityType", Some(principal_entity_type.as_str())),
+            (
+                "principalEntityType",
+                Some(principal_entity_type.value.as_str()),
+            ),
             ("configuration", Some(configuration_fingerprint.as_str())),
         ]);
         if let Some(token) = input.client_token.as_deref() {
@@ -306,7 +308,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::IdentitySource {
                 identity_source_id: identity_source_id.clone(),
                 policy_store_id: store_id.clone(),
-                principal_entity_type,
+                principal_entity_type: principal_entity_type.value,
+                principal_entity_type_is_service_default: principal_entity_type.service_default,
                 created_date: created,
                 last_updated_date: created,
                 configuration,
