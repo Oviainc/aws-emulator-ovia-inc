@@ -77,6 +77,10 @@ const STATE_ACTIVE: &str = "ACTIVE";
 //   GridConfiguration$gridGap           "Default: 2."
 //   PipConfiguration$gridGap            "Default: 0."
 //   PipConfiguration$pipOffset          "Default: 0."
+//   GridConfiguration$featuredParticipantAttribute  "Default: \"\" (no featured
+//                                        participant)."
+//   PipConfiguration$featuredParticipantAttribute   the same sentence
+//   PipConfiguration$pipParticipantAttribute        "Default: \"\" (no PiP participant)."
 const DEFAULT_GRID_ASPECT_RATIO: &str = "VIDEO";
 const DEFAULT_GRID_FILL_MODE: &str = "COVER";
 const DEFAULT_PIP_FILL_MODE: &str = "COVER";
@@ -85,6 +89,8 @@ const DEFAULT_PIP_POSITION: &str = "BOTTOM_RIGHT";
 const DEFAULT_GRID_GAP: i64 = 2;
 const DEFAULT_PIP_GRID_GAP: i64 = 0;
 const DEFAULT_PIP_OFFSET: i64 = 0;
+const NO_FEATURED_PARTICIPANT: &str = "";
+const NO_PIP_PARTICIPANT: &str = "";
 
 /// Long enough that the `STARTING` -> `ACTIVE` transition the emulator owes has fallen
 /// due, whatever scheduling delay the test host adds.
@@ -625,6 +631,7 @@ async fn every_composition_reports_a_layout_with_the_documented_defaults() {
             "no layout at all: the documented grid fallback",
             None,
             json!({ "grid": {
+                "featuredParticipantAttribute": NO_FEATURED_PARTICIPANT,
                 "omitStoppedVideo": false,
                 "videoAspectRatio": DEFAULT_GRID_ASPECT_RATIO,
                 "videoFillMode": DEFAULT_GRID_FILL_MODE,
@@ -635,6 +642,7 @@ async fn every_composition_reports_a_layout_with_the_documented_defaults() {
             "an empty layout object",
             Some(json!({})),
             json!({ "grid": {
+                "featuredParticipantAttribute": NO_FEATURED_PARTICIPANT,
                 "omitStoppedVideo": false,
                 "videoAspectRatio": DEFAULT_GRID_ASPECT_RATIO,
                 "videoFillMode": DEFAULT_GRID_FILL_MODE,
@@ -645,6 +653,7 @@ async fn every_composition_reports_a_layout_with_the_documented_defaults() {
             "an empty grid",
             Some(json!({ "grid": {} })),
             json!({ "grid": {
+                "featuredParticipantAttribute": NO_FEATURED_PARTICIPANT,
                 "omitStoppedVideo": false,
                 "videoAspectRatio": DEFAULT_GRID_ASPECT_RATIO,
                 "videoFillMode": DEFAULT_GRID_FILL_MODE,
@@ -655,6 +664,7 @@ async fn every_composition_reports_a_layout_with_the_documented_defaults() {
             "a grid naming one member the model documents a default for",
             Some(json!({ "grid": { "videoAspectRatio": "PORTRAIT" } })),
             json!({ "grid": {
+                "featuredParticipantAttribute": NO_FEATURED_PARTICIPANT,
                 "omitStoppedVideo": false,
                 "videoAspectRatio": "PORTRAIT",
                 "videoFillMode": DEFAULT_GRID_FILL_MODE,
@@ -684,9 +694,11 @@ async fn every_composition_reports_a_layout_with_the_documented_defaults() {
             "an empty picture-in-picture layout",
             Some(json!({ "pip": {} })),
             json!({ "pip": {
+                "featuredParticipantAttribute": NO_FEATURED_PARTICIPANT,
                 "omitStoppedVideo": false,
                 "videoFillMode": DEFAULT_PIP_FILL_MODE,
                 "gridGap": DEFAULT_PIP_GRID_GAP,
+                "pipParticipantAttribute": NO_PIP_PARTICIPANT,
                 "pipBehavior": DEFAULT_PIP_BEHAVIOR,
                 "pipOffset": DEFAULT_PIP_OFFSET,
                 "pipPosition": DEFAULT_PIP_POSITION,
@@ -696,9 +708,11 @@ async fn every_composition_reports_a_layout_with_the_documented_defaults() {
             "a picture-in-picture layout naming a corner and a width",
             Some(json!({ "pip": { "pipPosition": "TOP_RIGHT", "pipWidth": 240 } })),
             json!({ "pip": {
+                "featuredParticipantAttribute": NO_FEATURED_PARTICIPANT,
                 "omitStoppedVideo": false,
                 "videoFillMode": DEFAULT_PIP_FILL_MODE,
                 "gridGap": DEFAULT_PIP_GRID_GAP,
+                "pipParticipantAttribute": NO_PIP_PARTICIPANT,
                 "pipBehavior": DEFAULT_PIP_BEHAVIOR,
                 "pipOffset": DEFAULT_PIP_OFFSET,
                 "pipPosition": "TOP_RIGHT",

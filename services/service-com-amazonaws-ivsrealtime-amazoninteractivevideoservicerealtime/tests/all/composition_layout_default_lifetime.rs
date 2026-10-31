@@ -59,6 +59,10 @@ const REGION: &str = "us-east-1";
 //   PipConfiguration$videoFillMode      "Default: COVER."
 //   PipConfiguration$pipBehavior        "Default: STATIC."
 //   PipConfiguration$pipPosition        "Default: BOTTOM_RIGHT."
+//   GridConfiguration$featuredParticipantAttribute  "Default: \"\" (no featured
+//                                        participant)."
+//   PipConfiguration$featuredParticipantAttribute   the same sentence
+//   PipConfiguration$pipParticipantAttribute        "Default: \"\" (no PiP participant)."
 const DEFAULT_GRID_GAP: i64 = 2;
 const DEFAULT_GRID_ASPECT_RATIO: &str = "VIDEO";
 const DEFAULT_GRID_FILL_MODE: &str = "COVER";
@@ -68,6 +72,8 @@ const DEFAULT_PIP_OFFSET: i64 = 0;
 const DEFAULT_PIP_FILL_MODE: &str = "COVER";
 const DEFAULT_PIP_BEHAVIOR: &str = "STATIC";
 const DEFAULT_PIP_POSITION: &str = "BOTTOM_RIGHT";
+const NO_FEATURED_PARTICIPANT: &str = "";
+const NO_PIP_PARTICIPANT: &str = "";
 
 /// The `CompositionState` a started composition reports once the clock has made its
 /// transition due, from `smithy_query(query="shape",shape="CompositionState")`.
@@ -160,6 +166,7 @@ fn arn_of(case: &str, resource: &Value) -> String {
 /// states.
 fn grid_reporting(members: Value) -> Value {
     let mut grid = json!({
+        "featuredParticipantAttribute": NO_FEATURED_PARTICIPANT,
         "omitStoppedVideo": DEFAULT_OMIT_STOPPED_VIDEO,
         "videoAspectRatio": DEFAULT_GRID_ASPECT_RATIO,
         "videoFillMode": DEFAULT_GRID_FILL_MODE,
@@ -175,9 +182,11 @@ fn grid_reporting(members: Value) -> Value {
 /// default.
 fn pip_reporting(members: Value) -> Value {
     let mut pip = json!({
+        "featuredParticipantAttribute": NO_FEATURED_PARTICIPANT,
         "omitStoppedVideo": DEFAULT_OMIT_STOPPED_VIDEO,
         "videoFillMode": DEFAULT_PIP_FILL_MODE,
         "gridGap": DEFAULT_PIP_GRID_GAP,
+        "pipParticipantAttribute": NO_PIP_PARTICIPANT,
         "pipBehavior": DEFAULT_PIP_BEHAVIOR,
         "pipOffset": DEFAULT_PIP_OFFSET,
         "pipPosition": DEFAULT_PIP_POSITION,

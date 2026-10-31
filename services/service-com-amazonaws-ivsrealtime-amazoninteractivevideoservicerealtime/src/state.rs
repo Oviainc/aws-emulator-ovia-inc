@@ -785,6 +785,21 @@ pub const DEFAULT_GRID_GAP_PIXELS: i32 = 2;
 /// value the model declares as the member's `@default`.
 pub const DEFAULT_OMIT_STOPPED_VIDEO: bool = false;
 
+/// `featuredParticipantAttribute` of a layout that features no participant.
+///
+/// Documented on `GridConfiguration$featuredParticipantAttribute` and, in the same words,
+/// on `PipConfiguration$featuredParticipantAttribute`: "Default: `\"\"` (no featured
+/// participant)." Both layouts report the member from here, the way every other
+/// empty-string documented default of this service is reported (see
+/// [`NO_STORAGE_CONFIGURATION_ARN`]).
+pub const NO_FEATURED_PARTICIPANT_ATTRIBUTE: &str = "";
+
+/// `pipParticipantAttribute` of a picture-in-picture layout that names no PiP participant.
+///
+/// Documented on `PipConfiguration$pipParticipantAttribute`: "Default: `\"\"` (no PiP
+/// participant)."
+pub const NO_PIP_PARTICIPANT_ATTRIBUTE: &str = "";
+
 /// Compositions this emulator keeps for one engine. Not an AWS quota — this emulator's
 /// own resource guard on the one store `StartComposition` grows, set the same way
 /// [`MAX_STAGES`] is and answered with the same modelled
@@ -813,16 +828,24 @@ pub fn composition_arn(region: &str, composition_id: &str) -> String {
 }
 
 /// The grid layout `requested` describes, with the documented default for every member
-/// it left out — each applied through [`documented_default`], so a value the request
-/// carried is reported as it arrived.
+/// it left out — each applied where the request carried no value, so a value the request
+/// did carry is reported as it arrived.
 ///
 /// `gridGap` is the member whose documented default (`2`) differs from the `@default`
 /// (`0`) the model declares for it, which is why the shape keeps every member's
 /// presence; `omitStoppedVideo` documents the value the model declares, so its default
 /// is reached by the same route and reports the same thing either way.
+///
+/// `participantOrderAttribute` is the one member left absent when the request omits it:
+/// its doc states no default, only that an unset and an empty attribute name order
+/// participants the same way.
 fn effective_grid(requested: GridConfiguration) -> GridConfiguration {
     GridConfiguration {
-        featured_participant_attribute: requested.featured_participant_attribute,
+        featured_participant_attribute: Some(
+            requested
+                .featured_participant_attribute
+                .unwrap_or_else(|| NO_FEATURED_PARTICIPANT_ATTRIBUTE.to_string()),
+        ),
         omit_stopped_video: Some(documented_default(
             requested.omit_stopped_video,
             DEFAULT_OMIT_STOPPED_VIDEO,
@@ -851,13 +874,24 @@ fn effective_grid(requested: GridConfiguration) -> GridConfiguration {
 /// `gridGap`, `pipOffset` and `omitStoppedVideo` each document the same default the model
 /// declares as their `@default`, so the value the framework materialised for an absent
 /// member is already the documented one and is reported as it arrived — which is why this
-/// shape is left to the macro where `GridConfiguration` is not.
+/// shape keeps the macro's members where `GridConfiguration` keeps its own presence.
 ///
 /// `pipWidth` and `pipHeight` are deliberately left absent when the request omits them:
 /// the model documents that each is then "based on the size of the composition and the
-/// aspect ratio of the participant's video" rather than taking a fixed value.
+/// aspect ratio of the participant's video" rather than taking a fixed value, and
+/// `participantOrderAttribute` is left absent because its doc states no default.
 fn effective_pip(requested: PipConfiguration) -> PipConfiguration {
     PipConfiguration {
+        featured_participant_attribute: Some(
+            requested
+                .featured_participant_attribute
+                .unwrap_or_else(|| NO_FEATURED_PARTICIPANT_ATTRIBUTE.to_string()),
+        ),
+        pip_participant_attribute: Some(
+            requested
+                .pip_participant_attribute
+                .unwrap_or_else(|| NO_PIP_PARTICIPANT_ATTRIBUTE.to_string()),
+        ),
         video_fill_mode: Some(
             requested
                 .video_fill_mode

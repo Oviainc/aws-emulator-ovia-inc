@@ -77,6 +77,8 @@ mod get_stage_session;
 mod get_storage_configuration;
 #[path = "all/ingest_configurations.rs"]
 mod ingest_configurations;
+#[path = "all/layout_empty_string_defaults.rs"]
+mod layout_empty_string_defaults;
 #[path = "all/list_compositions.rs"]
 mod list_compositions;
 #[path = "all/list_encoder_configurations.rs"]
