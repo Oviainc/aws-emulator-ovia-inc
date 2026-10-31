@@ -86,6 +86,9 @@ mod entity_composite_components;
 #[path = "all/entity_external_id_filter.rs"]
 mod entity_external_id_filter;
 
+#[path = "all/entity_property_value_data_type.rs"]
+mod entity_property_value_data_type;
+
 #[path = "all/entity_update.rs"]
 mod entity_update;
 

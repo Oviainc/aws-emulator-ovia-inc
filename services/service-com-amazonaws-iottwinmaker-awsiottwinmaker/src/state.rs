@@ -1569,9 +1569,35 @@ impl Workspace {
         properties: &BTreeMap<String, PropertyRecord>,
         property_name: &str,
     ) -> Option<crate::ops::types::PropertyDefinitionRequest> {
-        let own = properties
-            .get(property_name)
-            .and_then(|property| property.definition.as_ref());
+        self.refined_component_property_definition(
+            component_type_id,
+            properties
+                .get(property_name)
+                .and_then(|property| property.definition.as_ref()),
+            property_name,
+        )
+    }
+
+    /// [`effective_property_definition`](Self::effective_property_definition)
+    /// with the component's OWN declaration named explicitly: `own` is folded
+    /// over the declarations the component type `component_type_id` and the
+    /// types it extends make for `property_name`, nearest first.
+    ///
+    /// What a WRITER needs, because the declaration it is about to store is not
+    /// on the record yet: the definition a property ends up with is the one the
+    /// request carries where it carries one (a definition a request names
+    /// REPLACES the stored one) and the stored one otherwise, resolved over the
+    /// same inheritance chain a read resolves. A reader of the stored record
+    /// goes through
+    /// [`effective_property_definition`](Self::effective_property_definition),
+    /// which is this with the record's own declaration, so a writer and a
+    /// reader resolve one property one way.
+    pub fn refined_component_property_definition(
+        &self,
+        component_type_id: Option<&str>,
+        own: Option<&crate::ops::types::PropertyDefinitionRequest>,
+        property_name: &str,
+    ) -> Option<crate::ops::types::PropertyDefinitionRequest> {
         let chain = component_type_id
             .map(|component_type_id| self.component_type_chain(component_type_id))
             .unwrap_or_default();
@@ -1626,8 +1652,8 @@ impl Workspace {
     /// property EFFECTIVELY carries: the declaration the write itself holds,
     /// refined over the ones it INHERITS from the component type the holder
     /// instantiates and from the types that type extends
-    /// ([`refined_property_definition`]) — the same resolution every reader of
-    /// the property's definition makes
+    /// ([`refined_component_property_definition`](Self::refined_component_property_definition))
+    /// — the same resolution every reader of the property's definition makes
     /// ([`effective_property_definition`](Self::effective_property_definition)).
     /// A value is therefore judged against the `dataType` a read REPORTS for
     /// the property, whether the property declares it itself or inherits it,
@@ -1644,11 +1670,12 @@ impl Workspace {
         definition: Option<&crate::ops::types::PropertyDefinitionRequest>,
         value: &crate::ops::types::DataValue,
     ) -> Option<String> {
-        let inherited =
-            self.effective_property_definition(component_type_id, &BTreeMap::new(), property_name);
-        let effective =
-            refined_property_definition(definition.into_iter().chain(inherited.as_ref()));
-        data_value_type_violation(property_name, effective.as_ref(), value)
+        data_value_type_violation(
+            property_name,
+            self.refined_component_property_definition(component_type_id, definition, property_name)
+                .as_ref(),
+            value,
+        )
     }
 
     /// The component types one component type INHERITS from: the `extendsFrom`
