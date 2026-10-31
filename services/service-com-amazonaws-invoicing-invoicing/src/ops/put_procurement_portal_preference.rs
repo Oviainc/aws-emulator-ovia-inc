@@ -21,6 +21,14 @@
 //! configuration write of a preference: a plane this write enables reports a status, and a
 //! plane it disables reports none.
 //!
+//! Two combinations of members no modelled constraint can express are refused with the
+//! modelled `ValidationException`, by the rules every write of a preference reaches:
+//! `MarketplacePunchOutPreference` is required while `MarketplacePunchOutEnabled` is true
+//! — for EVERY portal, the scope this operation's own member states
+//! ([`crate::state::PunchOutConfigRequirement::EveryPortal`]) — and the approval redirect
+//! URL this write leaves on the preference has to name the host of the instance endpoint
+//! it leaves on it ([`crate::state::check_marketplace_punch_out_redirect_host`]).
+//!
 //! `@idempotent`: a replay — the same `ClientToken` against the same preference — answers
 //! with the ARN the first call returned and performs the write ONCE, through the ledger
 //! every idempotent write of this crate consults
@@ -321,13 +329,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `crate::state::resolve_marketplace_punch_out` — read against the portal the
             // STORED preference routes to: this operation's input does not carry
             // `ProcurementPortalName`, because a preference's portal is not something an
-            // update can change. The configuration already stored is what an update that
-            // keeps the feature enabled without restating it keeps.
+            // update can change. The scope the requirement reaches is this operation's
+            // own: `PutProcurementPortalPreferenceRequest$MarketplacePunchOutPreference`
+            // states it with no portal qualification ("Required when
+            // MarketplacePunchOutEnabled is true"), so every portal's update has to state
+            // the configuration to leave the feature enabled.
             let marketplace_punch_out = crate::state::resolve_marketplace_punch_out(
+                crate::state::PunchOutConfigRequirement::EveryPortal,
                 &stored.preference.procurement_portal_name,
                 input.marketplace_punch_out_enabled,
                 input.marketplace_punch_out_preference,
-                stored.preference.marketplace_punch_out_preference.clone(),
+            )
+            .map_err(PutProcurementPortalPreferenceErrorModeled::ValidationException)?;
+
+            // The pair of endpoints this write leaves on the preference: the approval
+            // redirect URL of the configuration it stores, and the instance endpoint it
+            // states — or, when it states none, the one the last write left. Their hosts
+            // have to match, the one rule
+            // `crate::state::check_marketplace_punch_out_redirect_host` holds for every
+            // write that sets either member.
+            let instance_endpoint = input
+                .procurement_portal_instance_endpoint
+                .clone()
+                .or_else(|| stored.preference.procurement_portal_instance_endpoint.clone());
+            crate::state::check_marketplace_punch_out_redirect_host(
+                marketplace_punch_out.preference.as_ref(),
+                instance_endpoint.as_deref(),
             )
             .map_err(PutProcurementPortalPreferenceErrorModeled::ValidationException)?;
 

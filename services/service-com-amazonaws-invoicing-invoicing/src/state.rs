@@ -1287,15 +1287,18 @@ pub fn check_plane_enabled_for_status(
     })
 }
 
-/// `ProcurementPortalName$COUPA` — the portal whose Marketplace PunchOut configuration
-/// the model documents as required (`MarketplacePunchOutPreference`: "Required for Coupa
-/// when MarketplacePunchOutEnabled is true"). One of the values the modelled enum admits
-/// ([`crate::ops::types::PROCUREMENT_PORTAL_NAME_VALUES`]).
+/// `ProcurementPortalName$COUPA` — the portal the CREATE's own member states its
+/// Marketplace PunchOut configuration requirement for
+/// (`CreateProcurementPortalPreferenceRequest$MarketplacePunchOutPreference`: "Required
+/// for Coupa when MarketplacePunchOutEnabled is true"), which is the narrower of the two
+/// scopes [`PunchOutConfigRequirement`] carries. One of the values the modelled enum
+/// admits ([`crate::ops::types::PROCUREMENT_PORTAL_NAME_VALUES`]).
 ///
 /// It lives beside the preference registry rather than inside one operation's module
 /// because the combination it gates is a rule about the RESOURCE: every write that sets
 /// a preference's Marketplace PunchOut configuration — the create and the update —
-/// refuses the same combination.
+/// applies the one rule [`resolve_marketplace_punch_out`] holds, each with the scope its
+/// own input member states.
 pub const PORTAL_COUPA: &str = "COUPA";
 
 /// The Marketplace PunchOut pair a write of a procurement portal preference stores: the
@@ -1311,19 +1314,64 @@ pub struct MarketplacePunchOut {
     pub preference: Option<MarketplacePunchOutPreference>,
 }
 
+/// Which portals a write's own `MarketplacePunchOutPreference` member states the
+/// configuration requirement for: the one part of the Marketplace PunchOut rule the two
+/// writes of a preference state differently, so the rule itself stays in one place
+/// ([`resolve_marketplace_punch_out`]) and each write hands it the scope its own input
+/// member documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PunchOutConfigRequirement {
+    /// Every portal, with no qualification —
+    /// `PutProcurementPortalPreferenceRequest$MarketplacePunchOutPreference`:
+    /// "Configuration for Marketplace PunchOut. Required when MarketplacePunchOutEnabled
+    /// is true."
+    EveryPortal,
+    /// Only [`PORTAL_COUPA`] —
+    /// `CreateProcurementPortalPreferenceRequest$MarketplacePunchOutPreference`:
+    /// "Required for Coupa when MarketplacePunchOutEnabled is true."
+    CoupaOnly,
+}
+
+impl PunchOutConfigRequirement {
+    /// Whether a write to `procurement_portal_name` has to state the configuration to
+    /// enable Marketplace PunchOut.
+    fn applies_to(self, procurement_portal_name: &str) -> bool {
+        match self {
+            Self::EveryPortal => true,
+            Self::CoupaOnly => procurement_portal_name == PORTAL_COUPA,
+        }
+    }
+
+    /// The refusal's text, worded as the member that states the requirement words it: the
+    /// scope that names no portal states none, and the scope stated FOR one portal names
+    /// the portal the write is acting on.
+    fn missing_config_message(self, procurement_portal_name: &str) -> String {
+        match self {
+            Self::EveryPortal => "MarketplacePunchOutPreference is required when \
+                                  MarketplacePunchOutEnabled is true"
+                .to_string(),
+            Self::CoupaOnly => format!(
+                "MarketplacePunchOutPreference is required when MarketplacePunchOutEnabled is \
+                 true and ProcurementPortalName is {procurement_portal_name}"
+            ),
+        }
+    }
+}
+
 /// The Marketplace PunchOut rule a write of a procurement portal preference applies, in
 /// one place: the flag and the configuration the write stores, or the modelled 400 it is
-/// refused with when it enables Marketplace PunchOut for a portal whose required
-/// configuration it did not state.
+/// refused with when it enables Marketplace PunchOut without stating the configuration
+/// its own input member documents as required for that.
 ///
 /// `MarketplacePunchOutEnabled` "defaults to false if not provided" — so an omitted
 /// member is `false` here rather than anything that was stored — and
-/// `MarketplacePunchOutPreference` is "required for Coupa when
-/// MarketplacePunchOutEnabled is true" — a combination of members the model cannot
-/// express, so the boundary validator passes it and it is refused here as the modelled
-/// `ValidationException`. The message names the portal the requirement is stated for, so
-/// it is built from what the write is acting on rather than from a constant, and it is
-/// keyed the way this plane's recorded bodies key it ([`MessageKey::Capitalised`]) —
+/// `MarketplacePunchOutPreference` is REQUIRED while that flag is true, which is a
+/// combination of members the model cannot express: the boundary validator passes it and
+/// it is refused here as the modelled `ValidationException`. How far that requirement
+/// reaches is `requirement`, the scope the write's own member states
+/// ([`PunchOutConfigRequirement`]) — the one part of the rule the two writes differ on.
+/// The message is worded from what the write is acting on rather than from a constant, and
+/// it is keyed the way this plane's recorded bodies key it ([`MessageKey::Capitalised`]) —
 /// every write that reaches this rule is a write of a procurement portal preference.
 ///
 /// The CONFIGURATION is part of the same rule, the way a disabled plane's status and
@@ -1334,8 +1382,9 @@ pub struct MarketplacePunchOut {
 /// describes the feature an ENABLED flag has and a write that leaves the feature DISABLED
 /// stores none of it — whether the request stated one or an earlier write left one behind,
 /// because there is no enabled feature for it to configure. A write that leaves the
-/// feature enabled stores the configuration it states, and keeps the one already stored
-/// when it states none (`stored`, which a create has nothing for).
+/// feature enabled stores the configuration it STATES: it is the write that enables the
+/// feature which has to carry it, so within the scope the requirement reaches there is no
+/// earlier configuration for an enabling write to fall back on.
 ///
 /// Both the DEFAULT and the combination that is refused live here, beside the preference
 /// registry, rather than in one operation's module, for the reason [`PORTAL_COUPA`]
@@ -1345,18 +1394,16 @@ pub struct MarketplacePunchOut {
 /// can reach differently: a create states it on the input, an update takes it off the
 /// stored preference, whose portal no update can change.
 pub fn resolve_marketplace_punch_out(
+    requirement: PunchOutConfigRequirement,
     procurement_portal_name: &str,
     marketplace_punch_out_enabled: Option<bool>,
     requested_preference: Option<MarketplacePunchOutPreference>,
-    stored_preference: Option<MarketplacePunchOutPreference>,
 ) -> Result<MarketplacePunchOut, ValidationException> {
     let enabled = marketplace_punch_out_enabled.unwrap_or(false);
-    if enabled && procurement_portal_name == PORTAL_COUPA && requested_preference.is_none() {
+    if enabled && requirement.applies_to(procurement_portal_name) && requested_preference.is_none()
+    {
         return Err(ValidationException {
-            message: Some(format!(
-                "MarketplacePunchOutPreference is required when MarketplacePunchOutEnabled is \
-                 true and ProcurementPortalName is {procurement_portal_name}"
-            )),
+            message: Some(requirement.missing_config_message(procurement_portal_name)),
             // `invalidInput` is one of the model's `ValidationExceptionReason` values
             // ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]).
             reason: Some("invalidInput".to_string()),
@@ -1364,12 +1411,74 @@ pub fn resolve_marketplace_punch_out(
             ..Default::default()
         });
     }
-    let preference = if enabled {
-        requested_preference.or(stored_preference)
-    } else {
-        None
-    };
+    let preference = if enabled { requested_preference } else { None };
     Ok(MarketplacePunchOut { enabled, preference })
+}
+
+/// The host part of an endpoint a caller configured, lowercased so two spellings of one
+/// host are one host — the model gives these members only `^\S+$`, so the parse is what
+/// decides whether a value names a host at all.
+///
+/// The parse is [`http::Uri`]'s, the same crate the request this write arrived on is
+/// carried in, rather than a hand-rolled scan for `//` and `/`.
+fn endpoint_host(endpoint: &str) -> Option<String> {
+    endpoint
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|uri| uri.host().map(str::to_ascii_lowercase))
+}
+
+/// The host rule a write of a procurement portal preference applies to the pair of
+/// endpoints it leaves on that preference:
+/// `MarketplacePunchOutPreference$ApprovalRequestRedirectUrl` is documented as "when
+/// provided together with the procurement portal instance endpoint, its host must match
+/// the host of that endpoint" (`smithy_query(query="doc",
+/// shape="MarketplacePunchOutPreference", member="ApprovalRequestRedirectUrl")`), so a
+/// write that would leave the preference holding a redirect URL on one host and an
+/// instance endpoint on another is refused with the modelled `ValidationException`.
+///
+/// The two values are taken as the write RESOLVED them — the redirect URL of the
+/// configuration the write stores (so a write that leaves Marketplace PunchOut disabled,
+/// and therefore stores no configuration at all, has no redirect URL for the rule to be
+/// about) and the instance endpoint the preference holds after it. Only the HOST is
+/// compared: the scheme, the port, the path and the query are each endpoint's own.
+///
+/// A value neither member's `^\S+$` pattern makes a URL is left alone here: the rule is
+/// about two hosts, and a value that names no host is not something this rule has an
+/// opinion on. The rule lives beside the preference registry, for the reason
+/// [`PORTAL_COUPA`] states: both writes that set either member apply it.
+pub fn check_marketplace_punch_out_redirect_host(
+    marketplace_punch_out_preference: Option<&MarketplacePunchOutPreference>,
+    procurement_portal_instance_endpoint: Option<&str>,
+) -> Result<(), ValidationException> {
+    let Some(redirect_url) = marketplace_punch_out_preference
+        .and_then(|preference| preference.approval_request_redirect_url.as_deref())
+    else {
+        return Ok(());
+    };
+    let Some(endpoint) = procurement_portal_instance_endpoint else {
+        return Ok(());
+    };
+    let (Some(redirect_host), Some(endpoint_host)) =
+        (endpoint_host(redirect_url), endpoint_host(endpoint))
+    else {
+        return Ok(());
+    };
+    if redirect_host == endpoint_host {
+        return Ok(());
+    }
+    Err(ValidationException {
+        message: Some(
+            "ApprovalRequestRedirectUrl must have the same host as \
+             ProcurementPortalInstanceEndpoint"
+                .to_string(),
+        ),
+        // `invalidInput` is one of the model's `ValidationExceptionReason` values
+        // ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]).
+        reason: Some("invalidInput".to_string()),
+        message_key: MessageKey::Capitalised,
+        ..Default::default()
+    })
 }
 
 /// The identity of a procurement portal preference: its portal, buyer domain and

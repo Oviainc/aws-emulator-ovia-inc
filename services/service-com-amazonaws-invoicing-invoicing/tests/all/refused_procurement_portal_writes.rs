@@ -35,9 +35,10 @@ use service_com_amazonaws_invoicing_invoicing::state::ComAmazonawsInvoicingInvoi
 /// shape="ProcurementPortalName")`).
 pub(crate) const PORTAL_NAMES: &[&str] = &["ZIP", "SAP_BUSINESS_NETWORK", "JAGGAER", "COUPA"];
 
-/// The portal whose Marketplace PunchOut configuration the model documents as required
-/// (`MarketplacePunchOutPreference`: "Required for Coupa when MarketplacePunchOutEnabled
-/// is true"), which is what makes one row's update refusable.
+/// The portal the CREATE's own member states its Marketplace PunchOut configuration
+/// requirement for (`CreateProcurementPortalPreferenceRequest$MarketplacePunchOutPreference`:
+/// "Required for Coupa when MarketplacePunchOutEnabled is true"); the UPDATE states it for
+/// every portal, which is what makes one row's update refusable.
 const PORTAL_REQUIRING_PUNCH_OUT_CONFIG: &str = "COUPA";
 
 /// A status every plane of a preference may hold: one of the values
@@ -277,8 +278,8 @@ fn accepted_update(subject: &Subject) -> Value {
     })
 }
 
-/// A configuration update that enables Marketplace PunchOut without the configuration the
-/// subject's portal requires for it.
+/// A configuration update that enables Marketplace PunchOut without the configuration its
+/// own input member documents as required while that flag is true.
 fn update_missing_required_punch_out_config(subject: &Subject) -> Value {
     let mut request = accepted_update(subject);
     request["MarketplacePunchOutEnabled"] = json!(true);
@@ -392,7 +393,7 @@ fn refusal_classes() -> Vec<Refusal> {
             error_code: "ValidationException",
         },
         Refusal {
-            label: "a configuration update missing the configuration its portal requires",
+            label: "a configuration update missing the configuration its own member requires",
             portal: PORTAL_REQUIRING_PUNCH_OUT_CONFIG,
             operation: "PutProcurementPortalPreference",
             request: update_missing_required_punch_out_config,

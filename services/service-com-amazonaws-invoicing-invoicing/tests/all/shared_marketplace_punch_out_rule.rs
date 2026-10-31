@@ -9,18 +9,25 @@
 //! sees.
 //!
 //! The rule: `MarketplacePunchOutEnabled` "defaults to false if not provided", and
-//! `MarketplacePunchOutPreference` is "required for Coupa when MarketplacePunchOutEnabled
-//! is true" — so a write that enables Marketplace PunchOut for that portal without stating
-//! that configuration is refused with the modelled `ValidationException`, and every other
-//! combination is accepted with the enable flag the request states or the default it omits.
+//! `MarketplacePunchOutPreference` is REQUIRED while that flag is true — so a write that
+//! enables Marketplace PunchOut without stating that configuration is refused with the
+//! modelled `ValidationException`, and every other combination is accepted with the enable
+//! flag the request states or the default it omits.
+//!
+//! How far that requirement reaches is the one part of the rule the two writes state
+//! differently, each on its own input member: the CREATE states it for one portal
+//! (`CreateProcurementPortalPreferenceRequest$MarketplacePunchOutPreference`: "Required
+//! for Coupa when MarketplacePunchOutEnabled is true") and the UPDATE states it with no
+//! portal qualification at all
+//! (`PutProcurementPortalPreferenceRequest$MarketplacePunchOutPreference`: "Required when
+//! MarketplacePunchOutEnabled is true").
 //!
 //! `CreateProcurementPortalPreference` and `PutProcurementPortalPreference` are the two
 //! writes that set a preference's Marketplace PunchOut configuration, so this table drives
-//! EVERY row through both and asserts they answer identically — the status, the error code
-//! and the worded text for a refusal, and the flag a reader reports for an acceptance. The
-//! rows span the whole portal catalog (not only the portal the requirement is stated for),
-//! the enable flag stated true, stated false and omitted, and the configuration present
-//! and absent.
+//! EVERY row through both: the status, the error code and the worded text for a refusal,
+//! and the flag a reader reports for an acceptance. The rows span the whole portal catalog
+//! (not only the portal the create's requirement is stated for), the enable flag stated
+//! true, stated false and omitted, and the configuration present and absent.
 
 use std::sync::Arc;
 
@@ -35,9 +42,9 @@ const PORTAL_PLANE_KEY: &str = "Message";
 /// (`smithy_query(query="shape", shape="ProcurementPortalName")`).
 const PORTALS: [&str; 4] = ["ZIP", "SAP_BUSINESS_NETWORK", "JAGGAER", "COUPA"];
 
-/// The portal whose Marketplace PunchOut configuration the model documents as required
-/// (`MarketplacePunchOutPreference`: "Required for Coupa when MarketplacePunchOutEnabled
-/// is true").
+/// The one portal the CREATE's own member states its configuration requirement for
+/// (`CreateProcurementPortalPreferenceRequest$MarketplacePunchOutPreference`: "Required
+/// for Coupa when MarketplacePunchOutEnabled is true").
 const PORTAL_REQUIRING_PUNCH_OUT_CONFIG: &str = "COUPA";
 
 /// A router carrying only this service, over one shared engine — the same assembly the
@@ -214,12 +221,19 @@ fn rows() -> Vec<Row> {
 }
 
 impl Row {
-    /// Whether the rule refuses this combination: Marketplace PunchOut enabled for the
-    /// portal whose configuration is required for it, without that configuration.
-    fn refused(&self) -> bool {
+    /// Whether the CREATE refuses this combination: Marketplace PunchOut enabled, without
+    /// the configuration, for the one portal the create's own member names.
+    fn create_refused(&self) -> bool {
         self.enabled == Some(true)
             && self.portal == PORTAL_REQUIRING_PUNCH_OUT_CONFIG
             && !self.config
+    }
+
+    /// Whether the UPDATE refuses this combination: Marketplace PunchOut enabled without
+    /// the configuration, for every portal — its own member qualifies the requirement by
+    /// no portal.
+    fn put_refused(&self) -> bool {
+        self.enabled == Some(true) && !self.config
     }
 
     /// The flag a reader must report once this combination is accepted: what the request
@@ -229,16 +243,18 @@ impl Row {
     }
 }
 
-/// The create and the configuration update answer one Marketplace PunchOut rule: the same
-/// status, the same refusal and the same stored flag for every combination of the members
-/// it reads.
+/// The create and the configuration update answer one Marketplace PunchOut rule, each
+/// within the scope its own input member states it for: the same default, the same
+/// refusal and the same stored flag, and the requirement reaching every portal on the
+/// update and the one portal the create names.
 #[tokio::test]
 async fn the_punch_out_rule_answers_the_same_from_the_create_and_the_update() {
     let router = emulator();
 
     for (index, row) in rows().iter().enumerate() {
         let case = &row.case;
-        let expected_status = if row.refused() { 400 } else { 200 };
+        let expected_create_status = if row.create_refused() { 400 } else { 200 };
+        let expected_put_status = if row.put_refused() { 400 } else { 200 };
 
         // The CREATE path states the portal on its own input. One identity per row, so a
         // conflict never stands in for the rule's answer.
@@ -276,21 +292,16 @@ async fn the_punch_out_rule_answers_the_same_from_the_create_and_the_update() {
         };
 
         assert_eq!(
-            create_answer.status, expected_status,
-            "case {case}: the create expected HTTP {expected_status}, got {:?}",
+            create_answer.status, expected_create_status,
+            "case {case}: the create expected HTTP {expected_create_status}, got {:?}",
             create_answer
         );
         assert_eq!(
-            put_answer.status, expected_status,
-            "case {case}: the update expected HTTP {expected_status}, got {put_answer:?}"
-        );
-        assert_eq!(
-            create_answer, put_answer,
-            "case {case}: both writes apply one rule, so they answer alike — the create \
-             answered {create_answer:?} and the update {put_answer:?}"
+            put_answer.status, expected_put_status,
+            "case {case}: the update expected HTTP {expected_put_status}, got {put_answer:?}"
         );
 
-        if row.refused() {
+        if row.create_refused() {
             assert_eq!(
                 create_answer.error_code, "ValidationException",
                 "case {case}: expected a ValidationException, got {create_answer:?}"
@@ -298,8 +309,22 @@ async fn the_punch_out_rule_answers_the_same_from_the_create_and_the_update() {
             let text = create_answer.message.clone().unwrap_or_default();
             assert!(
                 text.contains(row.portal),
-                "case {case}: the refusal must name the portal the requirement is stated \
-                 for, got {text:?}"
+                "case {case}: the create's refusal must name the portal its requirement is \
+                 stated for, got {text:?}"
+            );
+        }
+
+        if row.put_refused() {
+            assert_eq!(
+                put_answer.error_code, "ValidationException",
+                "case {case}: expected a ValidationException, got {put_answer:?}"
+            );
+            let text = put_answer.message.clone().unwrap_or_default();
+            assert!(
+                text.contains("MarketplacePunchOutPreference")
+                    && text.contains("MarketplacePunchOutEnabled"),
+                "case {case}: the update's refusal must name the two members whose \
+                 combination it refuses, got {text:?}"
             );
             // The rule runs before anything is written: the refused update left the
             // baseline preference with the flag its create stored.
@@ -308,17 +333,20 @@ async fn the_punch_out_rule_answers_the_same_from_the_create_and_the_update() {
                 Some(false),
                 "case {case}: a refused update must write nothing"
             );
-            continue;
         }
 
-        // Accepted: both writes stored the flag the request states, or the documented
-        // default for one that omits it.
+        // Accepted: a write that was accepted stored the flag the request states, or the
+        // documented default for one that omits it.
         let expected_flag = row.stored_flag();
-        for (path, arn) in [
-            ("the create", arn_of(&create_body)),
-            ("the update", arn_of(&put_body)),
-        ] {
-            let reported = reported_punch_out_enabled(&router, &arn).await;
+        let accepted = [
+            ("the create", row.create_refused(), &create_body),
+            ("the update", row.put_refused(), &put_body),
+        ];
+        for (path, refused, body) in accepted {
+            if refused {
+                continue;
+            }
+            let reported = reported_punch_out_enabled(&router, &arn_of(body)).await;
             assert_eq!(
                 reported,
                 Some(expected_flag),

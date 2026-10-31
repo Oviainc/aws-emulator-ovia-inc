@@ -7,6 +7,14 @@
 //! of the preference plane) report exactly what this call stored. `@idempotent`: a replay
 //! of the same request answers with the ARN the first call minted.
 //!
+//! Two combinations of members no modelled constraint can express are refused with the
+//! modelled `ValidationException`, by the rules every write of a preference reaches:
+//! `MarketplacePunchOutPreference` is required while `MarketplacePunchOutEnabled` is true
+//! — for the one portal this operation's own member states that for
+//! ([`crate::state::PunchOutConfigRequirement::CoupaOnly`]) — and the approval redirect
+//! URL this write stores has to name the host of the instance endpoint it stores beside it
+//! ([`crate::state::check_marketplace_punch_out_redirect_host`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -207,12 +215,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an enabled flag are the one rule every write of a preference applies, which this
         // create and the configuration update both reach at
         // `crate::state::resolve_marketplace_punch_out`. A create states the portal on its
-        // own input, and has no stored configuration a write could keep.
+        // own input, and the scope its own member states is the narrower one:
+        // `CreateProcurementPortalPreferenceRequest$MarketplacePunchOutPreference` is
+        // "required for Coupa when MarketplacePunchOutEnabled is true".
         let marketplace_punch_out = crate::state::resolve_marketplace_punch_out(
+            crate::state::PunchOutConfigRequirement::CoupaOnly,
             &input.procurement_portal_name,
             input.marketplace_punch_out_enabled,
             input.marketplace_punch_out_preference,
-            None,
+        )
+        .map_err(CreateProcurementPortalPreferenceErrorModeled::ValidationException)?;
+
+        // The approval redirect URL this create stores has to name the host of the
+        // instance endpoint it stores beside it, the one rule
+        // `crate::state::check_marketplace_punch_out_redirect_host` holds for every write
+        // that sets either member.
+        crate::state::check_marketplace_punch_out_redirect_host(
+            marketplace_punch_out.preference.as_ref(),
+            input.procurement_portal_instance_endpoint.as_deref(),
         )
         .map_err(CreateProcurementPortalPreferenceErrorModeled::ValidationException)?;
 

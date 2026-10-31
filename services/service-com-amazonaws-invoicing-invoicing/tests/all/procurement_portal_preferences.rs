@@ -236,8 +236,10 @@ fn create_cases() -> Vec<(&'static str, Value)> {
                 "EinvoiceDeliveryEnabled": true,
                 "PurchaseOrderRetrievalEnabled": false,
                 "MarketplacePunchOutEnabled": true,
+                // On the host of the instance endpoint below: a stored approval redirect
+                // URL and the instance endpoint beside it name one host.
                 "MarketplacePunchOutPreference": {
-                    "ApprovalRequestRedirectUrl": "https://example.com/approve"
+                    "ApprovalRequestRedirectUrl": "https://portal.example.com/approve"
                 },
                 "Selector": {
                     "InvoiceUnitArns": ["arn:aws:invoicing::000000000000:invoice-unit/000000000001"],

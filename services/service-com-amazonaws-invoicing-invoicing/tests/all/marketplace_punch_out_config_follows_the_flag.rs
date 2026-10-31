@@ -13,7 +13,8 @@
 //! configuration a reader reports belongs to an ENABLED feature: a write that leaves
 //! Marketplace PunchOut disabled stores no configuration for it — neither one the request
 //! states nor one an earlier write left — and a write that leaves it enabled reports the
-//! configuration it states, or the one already stored when it states none.
+//! configuration that write STATES, which is what the requirement each write's own member
+//! documents asks it for.
 //!
 //! The table spans the whole portal catalog, the enable flag stated true, stated false and
 //! omitted, the configuration stated and omitted, and — for the update, which acts on a
@@ -28,9 +29,11 @@ use crate::refused_procurement_portal_writes::{
     arn_of, call, emulator_with_engine, error_code, minimal_create, ok, PORTAL_NAMES,
 };
 
-/// The portal whose Marketplace PunchOut configuration the model documents as required
-/// (`MarketplacePunchOutPreference`: "Required for Coupa when MarketplacePunchOutEnabled
-/// is true"), the one combination a write of these members is refused for.
+/// The one portal the CREATE's own member states its configuration requirement for
+/// (`CreateProcurementPortalPreferenceRequest$MarketplacePunchOutPreference`: "Required
+/// for Coupa when MarketplacePunchOutEnabled is true"). The UPDATE's member states it with
+/// no portal qualification ("Required when MarketplacePunchOutEnabled is true"), so every
+/// portal's update needs it.
 const PORTAL_REQUIRING_PUNCH_OUT_CONFIG: &str = "COUPA";
 
 /// The `ApprovalRequestRedirectUrl` (`MarketplacePunchOutPreference`'s one member, a
@@ -123,12 +126,19 @@ struct Row {
 }
 
 impl Row {
-    /// Whether this combination is refused: Marketplace PunchOut enabled for the portal
-    /// whose configuration is required for it, without that configuration.
-    fn refused(&self) -> bool {
+    /// Whether the CREATE refuses this combination: Marketplace PunchOut enabled, without
+    /// the configuration, for the one portal the create's member names.
+    fn create_refused(&self) -> bool {
         self.enabled == Some(true)
             && self.portal == PORTAL_REQUIRING_PUNCH_OUT_CONFIG
             && !self.states_config
+    }
+
+    /// Whether the UPDATE refuses this combination: Marketplace PunchOut enabled without
+    /// the configuration, whatever the portal — the update's member qualifies the
+    /// requirement by no portal.
+    fn put_refused(&self) -> bool {
+        self.enabled == Some(true) && !self.states_config
     }
 
     /// The flag a reader reports once the write is accepted: what the request states, or
@@ -149,17 +159,12 @@ impl Row {
         }
     }
 
-    /// What the UPDATE leaves: the configuration it states, or the one already stored when
-    /// it states none — and nothing at all once the flag leaves the feature disabled.
+    /// What the UPDATE leaves: the configuration it states while it leaves the feature
+    /// enabled, and nothing at all once the flag leaves it disabled — so a configuration an
+    /// earlier write stored is never what a reader reports after an update.
     fn updated(&self) -> ReportedPunchOut {
-        let redirect_url = if !self.stored_flag() {
-            None
-        } else if self.states_config {
-            Some(STATED_REDIRECT_URL.to_string())
-        } else {
-            self.pre_stored_config
-                .then(|| PRE_STORED_REDIRECT_URL.to_string())
-        };
+        let redirect_url =
+            (self.stored_flag() && self.states_config).then(|| STATED_REDIRECT_URL.to_string());
         ReportedPunchOut {
             enabled: Some(self.stored_flag()),
             redirect_url,
@@ -246,21 +251,39 @@ async fn the_punch_out_configuration_is_stored_only_while_the_feature_is_enabled
         let (put_status, put_body) =
             call(&router, "PutProcurementPortalPreference", &updated).await;
 
-        if row.refused() {
-            for (path, status, body) in [
-                ("the create", create_status, &create_body),
-                ("the update", put_status, &put_body),
-            ] {
-                assert_eq!(
-                    status, 400,
-                    "case {case}: {path} expected HTTP 400, got {status} {body}"
-                );
-                assert_eq!(
-                    error_code(body),
-                    "ValidationException",
-                    "case {case}: {path} expected a ValidationException, got {body}"
-                );
-            }
+        if row.create_refused() {
+            assert_eq!(
+                create_status, 400,
+                "case {case}: the create expected HTTP 400, got {create_status} {create_body}"
+            );
+            assert_eq!(
+                error_code(&create_body),
+                "ValidationException",
+                "case {case}: the create expected a ValidationException, got {create_body}"
+            );
+        } else {
+            assert_eq!(
+                create_status, 200,
+                "case {case}: the create expected HTTP 200, got {create_status} {create_body}"
+            );
+            let created_report = reported(&router, &arn_of(&create_body)).await;
+            let expected_created = row.created();
+            assert_eq!(
+                created_report, expected_created,
+                "case {case}: the create must report {expected_created:?}, got {created_report:?}"
+            );
+        }
+
+        if row.put_refused() {
+            assert_eq!(
+                put_status, 400,
+                "case {case}: the update expected HTTP 400, got {put_status} {put_body}"
+            );
+            assert_eq!(
+                error_code(&put_body),
+                "ValidationException",
+                "case {case}: the update expected a ValidationException, got {put_body}"
+            );
             // A refused update wrote nothing, so the baseline still reports what its create
             // stored.
             let after = reported(&router, &baseline).await;
@@ -273,19 +296,8 @@ async fn the_punch_out_configuration_is_stored_only_while_the_feature_is_enabled
         }
 
         assert_eq!(
-            create_status, 200,
-            "case {case}: the create expected HTTP 200, got {create_status} {create_body}"
-        );
-        assert_eq!(
             put_status, 200,
             "case {case}: the update expected HTTP 200, got {put_status} {put_body}"
-        );
-
-        let created_report = reported(&router, &arn_of(&create_body)).await;
-        let expected_created = row.created();
-        assert_eq!(
-            created_report, expected_created,
-            "case {case}: the create must report {expected_created:?}, got {created_report:?}"
         );
 
         let updated_report = reported(&router, &arn_of(&put_body)).await;
@@ -296,24 +308,28 @@ async fn the_punch_out_configuration_is_stored_only_while_the_feature_is_enabled
         );
 
         // A configuration the update took off is GONE, not hidden behind the flag: a later
-        // update that enables the feature again without stating a configuration reports
-        // none. The portal whose configuration is required for an enabled feature cannot
-        // make that request at all, so the rows for the other portals carry this.
-        if !row.stored_flag()
-            && row.pre_stored_config
-            && row.portal != PORTAL_REQUIRING_PUNCH_OUT_CONFIG
-        {
+        // update that enables the feature again has to state a configuration of its own,
+        // and one that does not is refused rather than reviving the configuration the
+        // disabling update removed.
+        if !row.stored_flag() && row.pre_stored_config {
             let reenabled = with_punch_out(put_request(&baseline), Some(true), None);
-            ok(&router, "PutProcurementPortalPreference", &reenabled).await;
+            let (reenabled_status, reenabled_body) =
+                call(&router, "PutProcurementPortalPreference", &reenabled).await;
+            assert_eq!(
+                reenabled_status, 400,
+                "case {case}: re-enabling without stating a configuration expected HTTP 400, \
+                 got {reenabled_status} {reenabled_body}"
+            );
             let after = reported(&router, &baseline).await;
             let expected_after = ReportedPunchOut {
-                enabled: Some(true),
+                enabled: Some(false),
                 redirect_url: None,
             };
             assert_eq!(
                 after, expected_after,
-                "case {case}: the disabling update removed the configuration, so re-enabling \
-                 without stating one must report {expected_after:?}, got {after:?}"
+                "case {case}: the disabling update removed the configuration and the refused \
+                 one wrote nothing, so the preference must report {expected_after:?}, got \
+                 {after:?}"
             );
         }
     }

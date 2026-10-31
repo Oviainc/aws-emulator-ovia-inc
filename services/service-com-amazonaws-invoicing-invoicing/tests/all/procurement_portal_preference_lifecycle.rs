@@ -425,7 +425,11 @@ async fn a_put_leaves_the_members_it_does_not_state_alone() {
             "SupplierIdentifier": "AN0UPDATED002",
             "ProcurementPortalInstanceEndpoint": "https://updated.test.example.com/invoices",
         },
-        "MarketplacePunchOutPreference": {"ApprovalRequestRedirectUrl": "https://example.com/updated"},
+        // On the host of the instance endpoint this update states: a stored approval
+        // redirect URL and the instance endpoint beside it name one host.
+        "MarketplacePunchOutPreference": {
+            "ApprovalRequestRedirectUrl": "https://updated.portal.example.com/updated",
+        },
     });
     let omittable: Vec<String> = optional
         .as_object()
@@ -458,6 +462,11 @@ async fn a_put_leaves_the_members_it_does_not_state_alone() {
                     "SupplierDomain": "NetworkID",
                     "SupplierIdentifier": "AN0CREATED002",
                     "ProcurementPortalInstanceEndpoint": "https://created.test.example.com/invoices",
+                }),
+                // The create's own redirect URL, on the host of the endpoint this create
+                // states: the two endpoints a preference holds name one host.
+                "MarketplacePunchOutPreference" => json!({
+                    "ApprovalRequestRedirectUrl": "https://created.portal.example.com/approve",
                 }),
                 _ => value.clone(),
             };

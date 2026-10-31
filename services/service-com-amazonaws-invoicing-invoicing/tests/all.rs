@@ -61,6 +61,8 @@ mod procurement_portal_supplier_page_tokens;
 mod procurement_portal_suppliers;
 #[path = "all/procurement_portals.rs"]
 mod procurement_portals;
+#[path = "all/punch_out_requirement_and_redirect_host.rs"]
+mod punch_out_requirement_and_redirect_host;
 #[path = "all/put_preference_replay_is_one_write.rs"]
 mod put_preference_replay_is_one_write;
 #[path = "all/refused_procurement_portal_writes.rs"]
