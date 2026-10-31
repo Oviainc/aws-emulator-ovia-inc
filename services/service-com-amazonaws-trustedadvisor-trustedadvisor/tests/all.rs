@@ -15,6 +15,8 @@
 mod account_scoped_recommendation_identifier;
 #[path = "all/account_scoped_recommendation_list.rs"]
 mod account_scoped_recommendation_list;
+#[path = "all/batch_exclusion_foreign_account.rs"]
+mod batch_exclusion_foreign_account;
 #[path = "all/batch_exclusion_unique_arns.rs"]
 mod batch_exclusion_unique_arns;
 #[path = "all/cost_optimizing_aggregates.rs"]
