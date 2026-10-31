@@ -23,6 +23,8 @@ mod network_migration_execution_listing;
 mod request_body_validation;
 #[path = "all/resource_not_found_payload.rs"]
 mod resource_not_found_payload;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/source_server_discovery.rs"]
 mod source_server_discovery;
 #[path = "all/state_roundtrip.rs"]

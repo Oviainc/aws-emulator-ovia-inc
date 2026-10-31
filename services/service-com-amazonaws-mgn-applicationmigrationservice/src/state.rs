@@ -444,6 +444,102 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
         );
         true
     }
+
+    /// Which record of `account_id` carries `resource_arn` as its own ARN, or `None`
+    /// when no record of this account does.
+    ///
+    /// The tag operations address a resource by the ARN it was created with rather than
+    /// by a typed id, so the resolution is over the ARN every taggable record stores:
+    /// applications, source servers and network migration definitions — the kinds this
+    /// store mints an ARN for. An ARN is compared whole, so one naming another Region,
+    /// another vendor or another resource kind matches nothing, and a record of another
+    /// account is not this one's to read or write.
+    fn taggable_resource(&self, account_id: &str, resource_arn: &str) -> Option<TaggableResource> {
+        if let Some(application) = self
+            .applications
+            .values()
+            .find(|app| app.account_id == account_id && app.arn == resource_arn)
+        {
+            return Some(TaggableResource::Application(
+                application.application_id.clone(),
+            ));
+        }
+        if let Some(server) = self
+            .source_servers
+            .values()
+            .find(|server| server.account_id == account_id && server.arn == resource_arn)
+        {
+            return Some(TaggableResource::SourceServer(
+                server.source_server_id.clone(),
+            ));
+        }
+        self.network_migration_definitions
+            .values()
+            .find(|definition| {
+                definition.account_id == account_id && definition.arn == resource_arn
+            })
+            .map(|definition| {
+                TaggableResource::NetworkMigrationDefinition(
+                    definition.network_migration_definition_id.clone(),
+                )
+            })
+    }
+
+    /// The tags the resource `resource_arn` names within `account_id` carries, or
+    /// `None` when the account holds no resource under that ARN.
+    ///
+    /// One map per resource: the same one the resource's own reader reports, so a tag
+    /// write is visible through both.
+    pub fn resource_tags(
+        &self,
+        account_id: &str,
+        resource_arn: &str,
+    ) -> Option<&BTreeMap<String, String>> {
+        match self.taggable_resource(account_id, resource_arn)? {
+            TaggableResource::Application(id) => self.applications.get(&id).map(|app| &app.tags),
+            TaggableResource::SourceServer(id) => {
+                self.source_servers.get(&id).map(|server| &server.tags)
+            }
+            TaggableResource::NetworkMigrationDefinition(id) => self
+                .network_migration_definitions
+                .get(&id)
+                .map(|definition| &definition.configuration.tags),
+        }
+    }
+
+    /// [`Self::resource_tags`], for a tag write: the resource's own map, so an added or
+    /// removed pair is the one its reader reports afterwards.
+    pub fn resource_tags_mut(
+        &mut self,
+        account_id: &str,
+        resource_arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        match self.taggable_resource(account_id, resource_arn)? {
+            TaggableResource::Application(id) => {
+                self.applications.get_mut(&id).map(|app| &mut app.tags)
+            }
+            TaggableResource::SourceServer(id) => self
+                .source_servers
+                .get_mut(&id)
+                .map(|server| &mut server.tags),
+            TaggableResource::NetworkMigrationDefinition(id) => self
+                .network_migration_definitions
+                .get_mut(&id)
+                .map(|definition| &mut definition.configuration.tags),
+        }
+    }
+}
+
+/// Which record an ARN a tag operation named resolves to: the kind, and the id that
+/// kind's map is keyed by.
+///
+/// The id rather than a borrow, so the same resolution serves a read and a write of the
+/// record's tag map.
+#[derive(Debug)]
+enum TaggableResource {
+    Application(String),
+    SourceServer(String),
+    NetworkMigrationDefinition(String),
 }
 
 /// One stored network migration execution: the run of a network migration definition
@@ -984,7 +1080,11 @@ pub fn application_not_found(application_id: &str) -> ResourceNotFoundException 
 }
 
 /// The modelled `ResourceNotFoundException` for an id of `resource_type` that the
-/// account holds no record of — the ONE place this service words a missing resource.
+/// account holds no record of — the ONE place this service words a missing resource an
+/// operation named by its TYPED ID (an `applicationID`, a
+/// `networkMigrationDefinitionID`). An operation that names a resource by ARN instead
+/// knows no type for a value that resolves to nothing, and words its refusal in
+/// [`tagged_resource_not_found`].
 ///
 /// `resourceType` names the resource KIND the way the API spells it: the modelled
 /// resource shape's own name (`Application`, `NetworkMigrationDefinition`), which is
@@ -1070,6 +1170,54 @@ pub fn application_quota_exceeded(account_id: &str) -> ServiceQuotaExceededExcep
 /// record of.
 pub fn network_migration_definition_not_found(definition_id: &str) -> ResourceNotFoundException {
     resource_not_found(NETWORK_MIGRATION_DEFINITION_RESOURCE_TYPE, definition_id)
+}
+
+/// The modelled refusal for a `resourceArn` naming no resource the account holds — the
+/// ONE wording the tag operations state a missing resource with.
+///
+/// The request named an ARN and no typed id, and an ARN that resolves to nothing names
+/// no resource KIND either, so the sentence names neither: the service answers one
+/// fixed text for the condition ([`TAGGED_RESOURCE_NOT_FOUND_MESSAGE`]) and reports the
+/// value the caller submitted in `resourceId`, which is the only thing known about what
+/// was missing.
+pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(TAGGED_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+        code: None,
+        resource_id: Some(resource_arn.to_string()),
+        resource_type: None,
+    }
+}
+
+/// The message [`tagged_resource_not_found`] carries, as Application Migration Service
+/// words a not-found refusal of a resource addressed by ARN.
+const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The most tags one resource carries, as `TagResource` documents it ("Each resource
+/// can have a maximum of 50 tags") and the model's `TagsMap` bounds it (`@length`
+/// 0..50). One request's map is held to that bound at the boundary; the MERGED set a
+/// write would leave on the resource is held to it by the handler.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The modelled refusal for a tag write that would leave `resulting` tags on one
+/// resource, past [`MAX_TAGS_PER_RESOURCE`].
+///
+/// A field validation, named after the member the pairs arrived in, the way this
+/// service's other field refusals are.
+pub fn resource_tag_limit_exceeded(resulting: usize) -> ValidationException {
+    let message = format!(
+        "A resource can have a maximum of {MAX_TAGS_PER_RESOURCE} tags, and these tags \
+         would give it {resulting}."
+    );
+    ValidationException {
+        message: Some(message.clone()),
+        code: None,
+        reason: Some(VALIDATION_FIELD_FAILED.to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: Some("tags".to_string()),
+            message: Some(message),
+        }]),
+    }
 }
 
 /// The modelled refusal for an account already holding

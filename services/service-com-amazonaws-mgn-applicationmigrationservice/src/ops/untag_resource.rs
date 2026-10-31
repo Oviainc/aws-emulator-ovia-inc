@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes exactly the keys the request names from the resource its `resourceArn`
+//! names, leaving every other key as it was. A key the resource does not carry is not
+//! an error — the operation is `@idempotent`, so a repeat of a removal that already
+//! happened answers the same success. An ARN this account holds no resource under is
+//! refused with the modelled `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +162,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // `resourceArn`'s length bound and every key's own are refused at the boundary
+        // BEFORE this handler runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerException(crate::state::state_unavailable())
+        })?;
+        // The operation models no `accountID` member, so it writes only to the resources
+        // of the account the request is signed for.
+        let account = crate::state::account_key(None);
+        let mut store = state.lock();
+
+        let Some(tags) = store.resource_tags_mut(&account, &input.resource_arn) else {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &input.resource_arn,
+                "refused: ResourceNotFoundException",
+            );
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::tagged_resource_not_found(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // Remove exactly the keys the request names; a key the resource does not carry
+        // removes nothing, which is what makes a repeat of the same removal answer the
+        // same success.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &account,
+            &input.resource_arn,
+            "untagged",
+        );
+        Ok(UntagResourceOutput)
     }
 }

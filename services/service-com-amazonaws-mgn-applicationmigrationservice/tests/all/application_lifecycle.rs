@@ -88,9 +88,26 @@ impl Mgn {
         operation: &str,
         body: &Value,
     ) -> (u16, Option<String>, Value) {
+        self.call_http("POST", &format!("/{operation}"), Some(body))
+            .await
+    }
+
+    /// One request at `method` and `path`, for an operation whose modelled HTTP binding
+    /// is not a POST to `/<Operation>` — the `/tags/{resourceArn}` family is a GET, a
+    /// POST and a DELETE of ONE route. Answers the status, the `x-amzn-errortype` header
+    /// and the parsed body (`Value::Null` for an empty one).
+    pub(crate) async fn call_http(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> (u16, Option<String>, Value) {
+        let payload = body
+            .map(|body| serde_json::to_vec(body).expect("the request body serializes"))
+            .unwrap_or_default();
         let request = http::Request::builder()
-            .method("POST")
-            .uri(format!("https://mgn.{REGION}.amazonaws.com/{operation}"))
+            .method(method)
+            .uri(format!("https://mgn.{REGION}.amazonaws.com{path}"))
             .header("host", format!("mgn.{REGION}.amazonaws.com"))
             .header("content-type", "application/json")
             .header(
@@ -99,9 +116,7 @@ impl Mgn {
                     "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLEEXAMPLE/20260101/{REGION}/mgn/aws4_request, SignedHeaders=host, Signature=0000"
                 ),
             )
-            .body(bytes::Bytes::from(
-                serde_json::to_vec(body).expect("the request body serializes"),
-            ))
+            .body(bytes::Bytes::from(payload))
             .expect("a well-formed request");
 
         let response = self.router.dispatch(request).await;
@@ -116,7 +131,7 @@ impl Mgn {
             Value::Null
         } else {
             serde_json::from_slice(&raw).unwrap_or_else(|error| {
-                panic!("{operation} answered a body that is not JSON: {error}")
+                panic!("{method} {path} answered a body that is not JSON: {error}")
             })
         };
         (status, error_type, parsed)
