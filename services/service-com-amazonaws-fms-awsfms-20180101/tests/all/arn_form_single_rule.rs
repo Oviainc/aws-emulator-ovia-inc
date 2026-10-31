@@ -19,7 +19,8 @@
 //!
 //! The table in [`cases`] is the class the rule ranges over: the rows differ in
 //! which condition of the form they break (no prefix, another prefix, the prefix
-//! in another case, too few fields at three different counts, an empty partition,
+//! in another case, a value at the published minimum length of the modelled
+//! shape, too few fields at three different counts, an empty partition,
 //! service or resource), and the rows that ARE ARNs differ in whether the Region
 //! and account fields are filled, in whether the resource segment itself contains
 //! colons, and in partition — so the only thing the two operations are compared on
@@ -49,26 +50,41 @@ const DECLARED_TYPE: &str = "AWS::EC2::Instance";
 /// under test, and — when the value is NOT an ARN — the part of the refusal
 /// message that names the condition it breaks, or `None` when the value IS an
 /// ARN.
-struct Case {
-    name: &'static str,
-    value: String,
-    defect: Option<&'static str>,
+///
+/// `pub(crate)` so every suite that asserts the single form rule — through the
+/// tagging operations here, or through another door onto a caller-supplied
+/// `ResourceArn` — reads the SAME table rather than a copy of it.
+pub(crate) struct Case {
+    pub(crate) name: &'static str,
+    pub(crate) value: String,
+    pub(crate) defect: Option<&'static str>,
 }
 
 impl Case {
     /// Whether the shared form says this row's value is an ARN.
-    fn is_arn(&self) -> bool {
+    pub(crate) fn is_arn(&self) -> bool {
         self.defect.is_none()
     }
 }
 
 /// The class the form rule is asserted over: one row per way of breaking each
 /// condition, and one row per shape of ARN that satisfies all of them.
-fn cases() -> Vec<Case> {
+///
+/// `pub(crate)` for the same reason as [`Case`].
+pub(crate) fn cases() -> Vec<Case> {
     vec![
         Case {
             name: "no-prefix-at-all",
             value: "this-is-not-an-arn-at-all".to_string(),
+            defect: Some("must start with 'arn:'"),
+        },
+        Case {
+            // The published MINIMUM length of `com.amazonaws.fms#ResourceArn`
+            // (length 1..1024, from `smithy_query(operation="TagResource")`) is
+            // one character, which is shorter than any ARN: the modelled
+            // constraint admits it and the form does not.
+            name: "the-published-minimum-length",
+            value: "t".to_string(),
             defect: Some("must start with 'arn:'"),
         },
         Case {

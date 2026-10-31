@@ -19,12 +19,15 @@
 //! so an assertion cannot pass on a value that never reached persisted state.
 //!
 //! The table in [`cases`] is the class the rule ranges over: the rows differ in
-//! the length of the designated values at BOTH published bounds of
+//! the length of the designated values — from the shortest string the service's
+//! ARN form admits up to the published maximum of
 //! `com.amazonaws.fms#ResourceArn` (length 1..1024, from
-//! `smithy_query(operation="PutNotificationChannel")`), in the service and the
+//! `smithy_query(operation="PutNotificationChannel")`) — in the service and the
 //! Region segment of the topic ARN, in the role's path form, and in the
 //! punctuation the pattern admits; one value past the upper bound is asserted
-//! separately.
+//! separately. Every row is an ARN, because both members are caller-supplied
+//! `ResourceArn`s and a value that is not an ARN designates no channel at all
+//! (`notification_channel_arn_form`).
 
 use std::time::SystemTime;
 
@@ -80,18 +83,32 @@ pub(crate) fn cases() -> Vec<Case> {
             role: format!("arn:aws:iam::{ACCOUNT}:role/fms"),
         },
         Case {
-            // The published ResourceArn minimum: one character.
-            name: "both values at the published minimum length".to_string(),
-            topic: "t".to_string(),
-            role: "r".to_string(),
+            // The shortest string the service's ARN form admits: the `arn:`
+            // prefix, six fields, and a one-character partition, service and
+            // resource with the Region and account left empty.
+            name: "both values at the shortest ARN the form admits".to_string(),
+            topic: "arn:a:s:::t".to_string(),
+            role: "arn:a:i:::r".to_string(),
         },
         Case {
             // The published ResourceArn maximum: 1024 characters.
             name: "both values at the published maximum length".to_string(),
-            topic: long_value("arn:aws:sns:", RESOURCE_ARN_MAX),
-            role: long_value("arn:aws:iam::", RESOURCE_ARN_MAX),
+            topic: long_value(&topic_prefix(), RESOURCE_ARN_MAX),
+            role: long_value(&role_prefix(), RESOURCE_ARN_MAX),
         },
     ]
+}
+
+/// The leading fields of an SNS topic ARN of the signed Region and this account,
+/// up to and including the colon the resource segment follows.
+fn topic_prefix() -> String {
+    format!("arn:aws:sns:{REGION}:{ACCOUNT}:")
+}
+
+/// The leading fields of an IAM role ARN of this account: IAM is global, so its
+/// Region field is empty.
+fn role_prefix() -> String {
+    format!("arn:aws:iam::{ACCOUNT}:")
 }
 
 /// A `ResourceArn`-shaped value of exactly `len` characters: `prefix` padded with
@@ -340,7 +357,7 @@ async fn a_value_past_the_published_bound_designates_no_channel_to_delete() {
     let (router, engine) = emulator_with_engine();
     associate_admin(&router).await;
 
-    let too_long = long_value("arn:aws:sns:", RESOURCE_ARN_MAX + 1);
+    let too_long = long_value(&topic_prefix(), RESOURCE_ARN_MAX + 1);
     let role = format!("arn:aws:iam::{ACCOUNT}:role/fms-sns");
     let (status, body) = put_channel(&router, &too_long, &role).await;
     assert_eq!(

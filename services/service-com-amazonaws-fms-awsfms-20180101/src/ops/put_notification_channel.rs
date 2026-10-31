@@ -17,6 +17,13 @@
 //! refused call leaves NO channel behind and a following
 //! `GetNotificationChannel` is refused identically.
 //!
+//! Both members are caller-supplied `ResourceArn`s documented as Amazon Resource
+//! Names, so each is checked for the ARN FORM
+//! ([`crate::state::arn_format_error`]) before anything is stored — the same
+//! single rule every other operation of this service that reads a caller-given
+//! `ResourceArn` applies, so a value that is not an ARN is refused with a 400
+//! `ValidationException` instead of being persisted and reported back as one.
+//!
 //! The number of Regions that may each hold a channel is bounded
 //! ([`MAX_NOTIFICATION_CHANNEL_REGIONS`]), so the per-Region store cannot grow
 //! with the number of distinct Regions a caller signs for; a designation that
@@ -220,6 +227,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The authorization gate, BEFORE the payload is stored.
         crate::state::require_administrator(&store, &region)?;
 
+        // The FORM of every caller-supplied `ResourceArn` this request carries,
+        // BEFORE anything is stored: both members target
+        // `com.amazonaws.fms#ResourceArn` and are documented as Amazon Resource
+        // Names, and the modelled pattern cannot express the ARN form, so the
+        // service check does — the same check, through the same shared rule and
+        // with the same wording, that every other door onto a caller-given
+        // `ResourceArn` in this crate applies, as a 400 `ValidationException`
+        // and never a 501. The members are weighed in the order the model
+        // declares them, so a request that gets both wrong is answered about
+        // the first of them.
+        for value in [&input.sns_topic_arn, &input.sns_role_name] {
+            if let Some(reason) = crate::state::arn_format_error(value) {
+                return Err(crate::scaffolded::Scaffolded::validation(reason));
+            }
+        }
+
         // A channel in a Region that holds none is a new record, so it is what
         // the store's bound weighs; replacing the channel of a Region that
         // already holds one adds nothing and is never refused. The refusal is
@@ -241,12 +264,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Both members are modelled `ResourceArn`s and are stored exactly as the
-        // caller sent them: Firewall Manager's own checks on them (that the topic
-        // policy allows the role to publish, that the role trusts
-        // fms.amazonaws.com) are about resources of OTHER services, which this
-        // emulator does not hold, so there is nothing here to validate beyond the
-        // modelled length and pattern the boundary already enforced.
+        // Both members have been checked for the ARN form above and are stored
+        // exactly as the caller sent them: Firewall Manager's remaining checks
+        // on them (that the topic policy allows the role to publish, that the
+        // role trusts fms.amazonaws.com) are about resources of OTHER services,
+        // which this emulator does not hold.
         //
         // The insert replaces the channel of THIS Region only, so a second call
         // in another Region designates that Region's own channel instead of
