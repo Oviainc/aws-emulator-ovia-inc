@@ -356,6 +356,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let suffix = store.mint_endpoint_suffix();
 
+        // The fine-grained-access-control master user the create named: WHO the cluster
+        // grants everything to on a domain whose `AdvancedSecurityOptions$Enabled` is set
+        // (`crate::state::fgac`). Read BEFORE the options are stored, because
+        // `MasterUserOptions` is dropped on the way into the stored shape — no read path
+        // reports it — and the password it also carries is never held at all.
+        let master_user_options = input
+            .advanced_security_options
+            .as_ref()
+            .and_then(|options| options.master_user_options.clone());
+        let master_user_arn = master_user_options
+            .as_ref()
+            .and_then(|master| master.master_user_arn.clone());
+        let master_user_name = master_user_options
+            .as_ref()
+            .and_then(|master| master.master_user_name.clone());
+
         let mut domain = Domain {
             domain_id: domain_id(&name),
             domain_name: name.clone(),
@@ -402,6 +418,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             advanced_security_options: input
                 .advanced_security_options
                 .map(stored_advanced_security_options),
+            master_user_arn,
+            master_user_name,
+            // A new domain's security configuration holds no role and no role mapping;
+            // the domain's own security API is what writes one.
+            security_roles: BTreeMap::new(),
+            security_role_mappings: BTreeMap::new(),
+            // A new domain holds no index template either; the domain's own template API
+            // is what writes one.
+            index_templates: BTreeMap::new(),
             identity_center_options: input
                 .identity_center_options
                 .map(stored_identity_center_options),

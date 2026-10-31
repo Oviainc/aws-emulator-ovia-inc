@@ -57,6 +57,8 @@ mod kms_key_resolution;
 mod legacy_s3_destination_mirror;
 #[path = "all/opensearch_destination_delivery.rs"]
 mod opensearch_destination_delivery;
+#[path = "all/opensearch_fgac_destination_delivery.rs"]
+mod opensearch_fgac_destination_delivery;
 #[path = "all/processor_parameters.rs"]
 mod processor_parameters;
 #[path = "all/refusal_messages.rs"]

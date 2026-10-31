@@ -271,6 +271,19 @@ fn merge(domain: &mut Domain, input: UpdateDomainConfigInput, now: SystemTime) -
         touched.push(OPT_NODE_TO_NODE_ENCRYPTION_OPTIONS);
     }
     if let Some(advanced_security_options) = input.advanced_security_options {
+        // The master user this update names is persisted beside the stored options, for
+        // the reason `CreateDomain` persists it: it is WHO the cluster grants everything
+        // to on a domain with fine-grained access control switched on, and the stored
+        // shape every read path reports declares no member for it. An update that names
+        // the options without naming a master user leaves the one the domain already has.
+        if let Some(master_user) = advanced_security_options.master_user_options.as_ref() {
+            if master_user.master_user_arn.is_some() {
+                domain.master_user_arn = master_user.master_user_arn.clone();
+            }
+            if master_user.master_user_name.is_some() {
+                domain.master_user_name = master_user.master_user_name.clone();
+            }
+        }
         domain.advanced_security_options =
             Some(stored_advanced_security_options(advanced_security_options));
         touched.push(OPT_ADVANCED_SECURITY_OPTIONS);

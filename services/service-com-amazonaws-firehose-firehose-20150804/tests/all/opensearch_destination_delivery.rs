@@ -19,10 +19,9 @@
 //! requests a client sends.
 //!
 //! The documents a delivery INDEXED are read back out of the Amazon OpenSearch Service
-//! store they were written into — the one store that service's own reads report from. The
-//! domain's REST data plane, which is how a client would search them, is not served by this
-//! emulator yet (its own open issue), so the read here is of the store rather than of that
-//! endpoint.
+//! store they were written into — the one store that service's own reads report from. A
+//! sibling suite (`opensearch_fgac_destination_delivery`) reads them back through the
+//! domain's own REST data plane, which is how a client would search them.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};

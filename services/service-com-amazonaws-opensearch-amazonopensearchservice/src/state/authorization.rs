@@ -148,6 +148,52 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     }
 }
 
+/// The ARN of the principal a request speaks for, as `sts:GetCallerIdentity` reports it.
+///
+/// What a decision taken OUTSIDE a modelled operation's own gate needs — the domain's REST
+/// data plane ([`crate::service::domain_rest`]), which names no modelled operation and so
+/// has no `authorize` call of its own, yet has to know who is asking. The same resolution
+/// [`caller`] performs, so the principal a data-plane refusal names is the one the control
+/// plane names for the same credential.
+///
+/// `None` for an engine that carries no STS or IAM store, where no session and no user can
+/// exist, and for an expired session, which the layer that authenticates a request refuses.
+pub fn request_principal_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> Option<String> {
+    let sts = sts_store::service_state(engine)?;
+    let iam = iam_store::service_state(engine)?;
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    let long_term = sts_store::long_term_identity(Some(&iam.lock()), &access_key_id);
+    let identity = sts_store::resolve_request_caller(
+        &mut sts.lock(),
+        &access_key_id,
+        SystemTime::now(),
+        ctx.credential_store(),
+        long_term,
+    )
+    .ok()?
+    .identity;
+    Some(identity.arn)
+}
+
+/// The identity-based policy documents in force on the principal a request speaks for, or
+/// `None` for a caller this gate does not bound (see the module docs) — including the
+/// account's own published credential and a principal carrying a grant this emulator
+/// cannot read, for both of which "no evidence" is the answer rather than "no permissions".
+///
+/// The companion of [`request_principal_arn`] for a decision taken OUTSIDE a modelled
+/// operation's own gate, and the SAME lookup [`authorize`] performs, so the documents a
+/// data-plane decision reads are the ones the control plane reads for that credential.
+pub fn request_identity_documents<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> Option<Vec<String>> {
+    let caller = caller(engine, ctx)?;
+    (!caller.unreadable_attachment).then_some(caller.documents)
+}
+
 /// The identity-based policy documents in force on the IAM ROLE `role_arn` names, or
 /// `None` when this emulator holds none for it: an engine carrying no IAM store, a value
 /// that is not a role ARN, or a role the IAM store does not hold.

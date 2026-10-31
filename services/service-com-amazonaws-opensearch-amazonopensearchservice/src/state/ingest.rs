@@ -184,20 +184,53 @@ pub fn index_document<Eng: Send + Sync + 'static>(
     let identity = principal_documents(engine, write.principal_arn);
     let mut store = state.lock();
     let domain = provisioned_domain(&mut store, write.domain, write.now)?;
+    index_into(domain, write, identity.as_ref())
+}
+
+/// [`index_document`] against a domain record the caller ALREADY holds, with the identity
+/// policies it already read.
+///
+/// The same three decisions in the same order; it is the entry point for a caller that is
+/// already inside this service's store — the domain's own REST data plane
+/// ([`crate::service::domain_rest`]), which resolved the domain to answer the request at
+/// all — so a document written over the wire and one written by a producer land under one
+/// set of rules.
+pub fn index_into(
+    domain: &mut Domain,
+    write: &DocumentWrite<'_>,
+    identity: Option<&Vec<String>>,
+) -> Result<Indexed, WriteRefusal> {
     let domain_arn = domain.arn.clone();
-    authorize(write, &domain_arn, domain, identity.as_ref())?;
-    let document = parse_document(write)?;
-    // An index the domain already holds judges the document by the mappings it carries;
-    // one this write would create carries none yet, so there is nothing for the document
-    // to disagree with — and it is created only once the document has been accepted.
-    if let Some(index) = domain.indexes.get(write.index_name) {
-        accepted_by_mappings(
-            &index.schema,
-            &document,
-            write.document_id.unwrap_or_default(),
-        )?;
+    authorize(write, &domain_arn, domain, identity)?;
+    // IAM lets the request reach the cluster; the CLUSTER decides next. On a domain with
+    // fine-grained access control switched on, a principal that is neither the master
+    // user nor bound by a role mapping may do nothing at all, whatever IAM allows — the
+    // one decision every path into a domain takes ([`super::fgac`]).
+    if let Some(reason) = super::fgac::refusal(
+        domain,
+        write.principal_arn,
+        super::fgac::ACTION_INDEX_DOCUMENT,
+    ) {
+        return Err(WriteRefusal::Rejected {
+            error_type: SECURITY_EXCEPTION,
+            message: reason,
+        });
     }
-    let index = index_for(domain, write.index_name)?;
+    let document = parse_document(write)?;
+    // The mappings the document is judged by: an index the domain already holds judges it
+    // by the ones that index carries, and an index this write would CREATE by the ones an
+    // index template gives it — a template applies to an index as it is created, so a
+    // document those mappings refuse is refused rather than creating the index for it.
+    // With neither, nothing is mapped yet and there is nothing to disagree with.
+    let mappings = domain
+        .indexes
+        .get(write.index_name)
+        .map(|index| index.schema.clone())
+        .or_else(|| domain.templated_schema(write.index_name).cloned());
+    if let Some(schema) = &mappings {
+        accepted_by_mappings(schema, &document, write.document_id.unwrap_or_default())?;
+    }
+    let index = index_for(domain, write.index_name, mappings)?;
     store_document(index, write, document)
 }
 
@@ -206,7 +239,7 @@ pub fn index_document<Eng: Send + Sync + 'static>(
 /// carrying no IAM store at all, where what the principal may do is not evidence this
 /// emulator has. The same posture [`super::authorization`] takes for a grant it cannot
 /// read: refusing on it would deny access AWS permits.
-fn principal_documents<Eng: Send + Sync + 'static>(
+pub fn principal_documents<Eng: Send + Sync + 'static>(
     engine: &Eng,
     principal_arn: &str,
 ) -> Option<Vec<String>> {
@@ -258,10 +291,31 @@ fn authorize(
     domain: &Domain,
     identity: Option<&Vec<String>>,
 ) -> Result<(), WriteRefusal> {
-    let action = format!("{}:{WRITE_ACTION}", super::ARN_NAMESPACE);
-    let resource = index_resource(domain_arn, write.index_name);
-    let principals = principal_spellings(write.principal_arn);
-    let request = iam::Request::new(&action, &resource, &principals);
+    iam_decision(
+        domain,
+        write.principal_arn,
+        WRITE_ACTION,
+        &index_resource(domain_arn, write.index_name),
+        identity,
+    )
+}
+
+/// Whether IAM lets `principal_arn` perform this service's data-plane `action_name`
+/// (`ESHttpPost`, `ESHttpGet`, …) on `resource` of `domain`.
+///
+/// The decision a document write takes ([`authorize`]) and the one the domain's REST data
+/// plane takes ([`crate::service::domain_rest`]) are THIS one, so the two paths into a
+/// domain cannot disagree about what IAM allows.
+pub fn iam_decision(
+    domain: &Domain,
+    principal_arn: &str,
+    action_name: &str,
+    resource: &str,
+    identity: Option<&Vec<String>>,
+) -> Result<(), WriteRefusal> {
+    let action = format!("{}:{action_name}", super::ARN_NAMESPACE);
+    let principals = principal_spellings(principal_arn);
+    let request = iam::Request::new(&action, resource, &principals);
     let identity_decision = identity
         .map(|documents| iam::identity_decision(documents, &request))
         .unwrap_or(Decision::NotStated);
@@ -290,12 +344,12 @@ fn authorize(
         // carries one, and the principal's identity policies otherwise. Every value in it
         // comes from the write and from the stored policy.
         message: if access_policy.is_some() {
-            iam::not_authorized_by_resource_policy(write.principal_arn, &action, &resource)
+            iam::not_authorized_by_resource_policy(principal_arn, &action, resource)
         } else {
             super::authorization::not_authorized(
-                write.principal_arn,
+                principal_arn,
                 &action,
-                &resource,
+                resource,
                 &format!("because no identity-based policy allows the {action} action"),
             )
             .message
@@ -320,9 +374,10 @@ fn principal_spellings(principal_arn: &str) -> Vec<String> {
     spellings
 }
 
-/// The index `index_name` names on `domain`, CREATED with no mappings of its own if the
-/// domain does not hold it — which is what a cluster does for a write to an index that
-/// does not exist yet (`action.auto_create_index`, enabled by default).
+/// The index `index_name` names on `domain`, CREATED with `mappings` if the domain does
+/// not hold it — which is what a cluster does for a write to an index that does not exist
+/// yet (`action.auto_create_index`), carrying the schema an index template gives it and
+/// none where no template matches.
 ///
 /// Creating one is bounded by the same per-domain quota a `CreateIndex` call is held to
 /// ([`super::INDEX_QUOTA`]): a producer writing to a fresh index name per record must not
@@ -331,6 +386,7 @@ fn principal_spellings(principal_arn: &str) -> Vec<String> {
 fn index_for<'d>(
     domain: &'d mut Domain,
     index_name: &str,
+    mappings: Option<::aws_smithy_types::Document>,
 ) -> Result<&'d mut Index, WriteRefusal> {
     if !domain.indexes.contains_key(index_name) && domain.indexes.len() >= super::INDEX_QUOTA {
         return Err(WriteRefusal::Rejected {
@@ -348,9 +404,12 @@ fn index_for<'d>(
         .entry(index_name.to_string())
         .or_insert_with(|| Index {
             index_name: index_name.to_string(),
-            // An auto-created index carries no schema document: nothing named its
-            // mappings, so every field of the first document is dynamically mapped.
-            schema: ::aws_smithy_types::Document::Object(::std::collections::HashMap::new()),
+            // Nothing named this index's mappings unless a template did, in which case
+            // the index is created carrying them, exactly as a `CreateIndex` with that
+            // schema would have left it.
+            schema: mappings.unwrap_or_else(|| {
+                ::aws_smithy_types::Document::Object(::std::collections::HashMap::new())
+            }),
             documents: ::std::collections::BTreeMap::new(),
         }))
 }

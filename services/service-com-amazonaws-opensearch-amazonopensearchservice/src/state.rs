@@ -31,6 +31,10 @@ use std::time::{Duration, SystemTime};
 pub mod authorization;
 pub mod ingest;
 
+/// Fine-grained access control on a domain: the records its security API holds, and the
+/// one decision every request that reaches the domain is taken by.
+pub mod fgac;
+
 /// Whether the Amazon Cognito authentication a request asks a domain's Dashboards to be
 /// reached through is a configuration the service can provision — the check the create
 /// path and the update path share.
@@ -2348,11 +2352,36 @@ pub struct Index {
     pub documents: BTreeMap<String, ingest::IndexedDocument>,
 }
 
+/// One index TEMPLATE of a domain: the schema every index whose name matches one of its
+/// patterns is CREATED with.
+///
+/// "An index template is a way to tell OpenSearch how to configure an index when it is
+/// created": a template applies only to an index created AFTER it was written, and never
+/// to one that already exists, which is why it is read exactly where an index is minted
+/// without a schema of its own ([`Domain::templated_schema`]).
+#[derive(Debug, Clone)]
+pub struct IndexTemplate {
+    /// The template's name — unique on the domain, so the name IS the key.
+    pub name: String,
+    /// `index_patterns`: the index names this template applies to, each of which may
+    /// carry the `*` and `?` wildcards.
+    pub index_patterns: Vec<String>,
+    /// `priority`: of two templates matching one index name the HIGHER priority wins, and
+    /// a template naming none has priority 0.
+    pub priority: i64,
+    /// The schema an index this template applies to is created with, in the same
+    /// `{"mappings": …, "settings": …}` form a schema is stored in
+    /// ([`Index::schema`]), so a templated index and one a client created carry one shape.
+    pub schema: ::aws_smithy_types::Document,
+    /// The template document as it was written, which the template API reports back.
+    pub definition: ::serde_json::Value,
+}
+
 /// The `IndexSchema` section an index's field mappings live in: `UpdateIndex`
 /// carries "any changes to mappings, settings, and semantic enrichment
 /// configuration", and it is the mapped fields under this one whose types are
 /// settled once written.
-const SCHEMA_MAPPINGS: &str = "mappings";
+pub const SCHEMA_MAPPINGS: &str = "mappings";
 
 /// The member a mapped field names its field type in.
 const MAPPING_TYPE: &str = "type";
@@ -4803,6 +4832,31 @@ pub struct Domain {
     pub log_publishing_options: BTreeMap<String, LogPublishingOption>,
     pub domain_endpoint_options: Option<DomainEndpointOptions>,
     pub advanced_security_options: Option<AdvancedSecurityOptions>,
+    /// The ARN of the IAM principal `MasterUserOptions$MasterUserARN` named as this
+    /// domain's fine-grained-access-control master user, and the name
+    /// `MasterUserOptions$MasterUserName` named for an internal one.
+    ///
+    /// Held because the master user is WHO the cluster grants everything to
+    /// ([`fgac::is_master`]) — the decision every request to a domain with fine-grained
+    /// access control switched on is taken by — and it is reachable from nowhere else: the
+    /// `AdvancedSecurityOptions` shape every read path reports declares no member for
+    /// either, so neither is ever reported back, and the master user's PASSWORD is not
+    /// held at all.
+    pub master_user_arn: Option<String>,
+    /// See [`Self::master_user_arn`].
+    pub master_user_name: Option<String>,
+    /// The roles this domain's security configuration holds, keyed by their name — unique
+    /// in the configuration, so the name IS the key. Written and reported by the domain's
+    /// own security API ([`crate::service::domain_rest`]).
+    pub security_roles: BTreeMap<String, fgac::SecurityRole>,
+    /// The role MAPPINGS of that configuration, keyed by the role each binds principals
+    /// to — one mapping per role, so the role's name IS the key. What decides whether a
+    /// principal that is not the master user may reach this domain at all
+    /// ([`fgac::mapped_roles`]).
+    pub security_role_mappings: BTreeMap<String, fgac::SecurityRoleMapping>,
+    /// The index templates this domain holds, keyed by their name — unique on the domain,
+    /// so the name IS the key. See [`IndexTemplate`].
+    pub index_templates: BTreeMap<String, IndexTemplate>,
     pub identity_center_options: Option<IdentityCenterOptions>,
     /// Stored in the `DomainConfig` form; `DomainStatus` reports the
     /// `AutoTuneOptionsOutput` projection of it.
@@ -4899,6 +4953,30 @@ pub struct Domain {
 }
 
 impl Domain {
+    /// The schema an index named `index_name` is CREATED with on this domain when the
+    /// create itself names none: the schema of the matching index template, the
+    /// highest-priority one where several match, and `None` where no template matches.
+    ///
+    /// Of two templates of equal priority matching one name the earlier name in
+    /// configuration order wins, so the answer does not depend on iteration luck.
+    #[must_use]
+    pub fn templated_schema(&self, index_name: &str) -> Option<&::aws_smithy_types::Document> {
+        self.index_templates
+            .values()
+            .filter(|template| {
+                template.index_patterns.iter().any(|pattern| {
+                    ::service_common::iam_authorization::wildcard_match(pattern, index_name, true)
+                })
+            })
+            .fold(None, |best: Option<&IndexTemplate>, template| match best {
+                // A template of EQUAL priority does not displace one already chosen, and
+                // a `BTreeMap` iterates by name, so the first matching name wins.
+                Some(best) if best.priority >= template.priority => Some(best),
+                _ => Some(template),
+            })
+            .map(|template| &template.schema)
+    }
+
     /// Record that `option` was set by a call at `now`: mint its first revision, or
     /// bump the one it has.
     ///
@@ -10058,6 +10136,63 @@ pub fn domain_id(domain_name: &str) -> String {
 /// A domain's ARN: `arn:aws:es:<region>:<account-id>:domain/<domain-name>`.
 pub fn domain_arn(domain_name: &str, region: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("domain/{domain_name}"))
+}
+
+/// A schema document mirroring the JSON value a REST request carried.
+///
+/// An index's schema is stored as the modelled document `CreateIndex` carries
+/// ([`Index::schema`]), while the domain's own REST data plane reads and writes JSON, so
+/// the two meet here — one index record whichever path created it, rather than two stores
+/// that could report the same index differently.
+#[must_use]
+pub fn document_from_json(value: &::serde_json::Value) -> ::aws_smithy_types::Document {
+    use ::aws_smithy_types::{Document, Number};
+    match value {
+        ::serde_json::Value::Null => Document::Null,
+        ::serde_json::Value::Bool(flag) => Document::Bool(*flag),
+        ::serde_json::Value::String(text) => Document::String(text.clone()),
+        ::serde_json::Value::Number(number) => Document::Number(
+            number
+                .as_i64()
+                .map(Number::NegInt)
+                .unwrap_or_else(|| Number::Float(number.as_f64().unwrap_or_default())),
+        ),
+        ::serde_json::Value::Array(elements) => {
+            Document::Array(elements.iter().map(document_from_json).collect())
+        }
+        ::serde_json::Value::Object(members) => Document::Object(
+            members
+                .iter()
+                .map(|(name, member)| (name.clone(), document_from_json(member)))
+                .collect(),
+        ),
+    }
+}
+
+/// [`document_from_json`] the other way: the JSON value a stored schema document is
+/// reported as on the REST data plane.
+#[must_use]
+pub fn json_from_document(document: &::aws_smithy_types::Document) -> ::serde_json::Value {
+    use ::aws_smithy_types::{Document, Number};
+    match document {
+        Document::Null => ::serde_json::Value::Null,
+        Document::Bool(flag) => ::serde_json::Value::Bool(*flag),
+        Document::String(text) => ::serde_json::Value::String(text.clone()),
+        Document::Number(Number::PosInt(value)) => ::serde_json::Value::from(*value),
+        Document::Number(Number::NegInt(value)) => ::serde_json::Value::from(*value),
+        Document::Number(Number::Float(value)) => ::serde_json::Number::from_f64(*value)
+            .map(::serde_json::Value::Number)
+            .unwrap_or(::serde_json::Value::Null),
+        Document::Array(elements) => {
+            ::serde_json::Value::Array(elements.iter().map(json_from_document).collect())
+        }
+        Document::Object(members) => ::serde_json::Value::Object(
+            members
+                .iter()
+                .map(|(name, member)| (name.clone(), json_from_document(member)))
+                .collect(),
+        ),
+    }
 }
 
 /// The domain-specific endpoint index, search and data-upload requests go to.
