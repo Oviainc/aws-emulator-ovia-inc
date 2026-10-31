@@ -250,20 +250,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let api_key = crate::state::new_api_key(&input.scope, &input.token_domains);
+        // The key "contains a set of token domains", so the domains are stored as
+        // the SET they are: in one order, with a domain named twice named once.
+        let token_domains = crate::state::normalized_token_domains(&input.token_domains);
         let created_at_millis = crate::state::now_millis();
         let mut state = state.lock();
+
+        // A scope holds ONE key per token-domain set — the key a client copied into
+        // its CAPTCHA integration for those domains — so a mint for a set this scope
+        // already holds a key for answers that key rather than minting a second one.
+        // The lookup and the insert happen under one lock, so concurrent mints for
+        // one set all answer the one key.
+        if let Some(stored) = state.api_key_for_token_domains(&input.scope, &token_domains) {
+            let api_key = stored.api_key.clone();
+            let cursor = stored.cursor.clone();
+            crate::state::audit(Self::NAME, &input.scope, "", &cursor, "unchanged");
+            return Ok(CreateAPIKeyOutput {
+                api_key: Some(api_key),
+            });
+        }
+
+        let api_key = crate::state::new_api_key(&input.scope, &token_domains);
 
         // The store refuses a key past the per-scope bound, which is the quota
         // refusal this operation models; everything else about the record — its
         // place in the listing order, its creation instant, its version — is the
         // store's own bookkeeping.
-        let Some(entry) = state.insert_api_key(
-            &input.scope,
-            &api_key,
-            input.token_domains.clone(),
-            created_at_millis,
-        ) else {
+        let Some(entry) =
+            state.insert_api_key(&input.scope, &api_key, token_domains, created_at_millis)
+        else {
             crate::state::audit(Self::NAME, &input.scope, "", "", "WAFLimitsExceededException");
             return Err(CreateAPIKeyErrorModeled::WAFLimitsExceededException(
                 crate::state::limits_exceeded_exception(),

@@ -38,9 +38,11 @@ use crate::web_acl_lifecycle::{
 
 /// The WCUs one `ByteMatchStatement` over a single field, with one `NONE` text
 /// transformation and the `CONTAINS` positional constraint, costs: the recorded
-/// corpus prices a web ACL of three such rules at 30, as `state::BYTE_MATCH_WCU`
-/// documents. Written out as a number here rather than imported, so the table does
-/// not restate the code under test.
+/// corpus prices a web ACL of three such rules at 30, as
+/// `state::BYTE_MATCH_SCANNING_WCU` documents. Written out as a number here rather
+/// than imported, so the table does not restate the code under test. The whole cost
+/// model — the other positional constraints, the sensitivity split and every
+/// modifier — is spanned by `crate::wcu_cost_model`.
 const BYTE_MATCH_WCU: i64 = 10;
 
 /// The WCUs one `RateBasedStatement` costs before anything it nests: the recorded
@@ -48,9 +50,9 @@ const BYTE_MATCH_WCU: i64 = 10;
 /// (`state::RATE_BASED_WCU`). See [`BYTE_MATCH_WCU`].
 const RATE_BASED_WCU: i64 = 2;
 
-/// The WCUs a `RateBasedStatement` adds when it aggregates on CUSTOM KEYS: the same
-/// recorded web ACL, with its rate-based rule aggregating on a custom key, reports
-/// 32 (`state::RATE_BASED_CUSTOM_KEYS_WCU`). See [`BYTE_MATCH_WCU`].
+/// The WCUs a `RateBasedStatement` adds PER custom aggregation key: the same
+/// recorded web ACL, with its rate-based rule aggregating on one custom key, reports
+/// 32 (`state::RATE_BASED_CUSTOM_KEY_WCU`). See [`BYTE_MATCH_WCU`].
 const RATE_BASED_CUSTOM_KEYS_WCU: i64 = 30;
 
 /// The WCUs one `SqliMatchStatement` costs, as the WAF Developer Guide's

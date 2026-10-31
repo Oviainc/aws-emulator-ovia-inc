@@ -6,11 +6,12 @@
 //! answers "the generated, encrypted API key"; `GetDecryptedAPIKey` "returns your API
 //! key in decrypted form", so a caller can "check the token domains that you have
 //! defined for the key". The RULE these suites assert is therefore one round trip: a
-//! create STORES a key the service minted for the scope and token domains the request
-//! names, and every later read of that key — its decrypted form and its listing
-//! summary — reports the domains it was defined with, in their submitted order, and
-//! the instant it was created, out of that stored record. A value this service did not
-//! mint names no key, and a key of one scope names no key of the other.
+//! create STORES a key the service minted for the scope and token-domain SET the
+//! request names, and every later read of that key — its decrypted form and its
+//! listing summary — reports that set, in WAF's lexicographic order, and the instant
+//! it was created, out of that stored record. A value this service did not
+//! mint names no key, and a key of one scope names no key of the other. That a scope
+//! holds ONE key per domain set is spanned by `crate::api_key_identity`.
 //!
 //! Each suite asserts that over a TABLE spanning the class rather than over one
 //! request: both scopes, one to the documented maximum of five token domains, the
@@ -152,6 +153,15 @@ struct MintCase {
     token_domains: Vec<String>,
 }
 
+/// `domains` as the SET they name: sorted lexicographically, which is the order WAF
+/// normalizes a key's domains to and therefore the order every read reports.
+fn as_set(domains: &[String]) -> Vec<String> {
+    let mut set = domains.to_vec();
+    set.sort_unstable();
+    set.dedup();
+    set
+}
+
 /// The table the round-trip suites span: both scopes, one domain to the documented
 /// maximum of five, the shortest and the longest domain the model allows, and the
 /// punctuation `TokenDomain`'s pattern permits.
@@ -170,7 +180,7 @@ fn mint_cases() -> Vec<MintCase> {
             token_domains: vec!["example.com".to_string()],
         },
         MintCase {
-            case: "two domains, in the submitted order",
+            case: "two domains, given out of order",
             scope: SCOPE_REGIONAL,
             token_domains: vec![
                 "zeta.example.com".to_string(),
@@ -204,9 +214,9 @@ fn mint_cases() -> Vec<MintCase> {
     ]
 }
 
-/// A minted key decrypts to the domains it was defined with, in their submitted
-/// order, and to the instant it was created — and the same record is what its
-/// listing summary reports.
+/// A minted key decrypts to the domain set it was defined with, in WAF's
+/// lexicographic order, and to the instant it was created — and the same record is
+/// what its listing summary reports.
 #[tokio::test]
 async fn a_minted_key_decrypts_to_the_domains_it_was_defined_with() {
     let waf = Waf::new();
@@ -219,9 +229,9 @@ async fn a_minted_key_decrypts_to_the_domains_it_was_defined_with() {
         let decrypted = decrypt(&waf, case.scope, &api_key).await;
         assert_eq!(
             token_domains(&decrypted, case.case),
-            case.token_domains,
-            "case {:?}: the decrypted key must carry the domains it was defined with, \
-             in their submitted order, got {decrypted}",
+            as_set(&case.token_domains),
+            "case {:?}: the decrypted key must carry the domain set it was defined \
+             with, in lexicographic order, got {decrypted}",
             case.case
         );
         let created_at = decrypted["CreationTimestamp"].as_f64().unwrap_or_else(|| {
@@ -255,7 +265,7 @@ async fn a_minted_key_decrypts_to_the_domains_it_was_defined_with() {
                 token_domains(&summary, case.case),
                 summary["CreationTimestamp"].as_f64()
             ),
-            (case.token_domains.clone(), Some(created_at)),
+            (as_set(&case.token_domains), Some(created_at)),
             "case {:?}: the listing summary and the decrypted key must report one \
              stored record, got {summary}",
             case.case
@@ -278,11 +288,12 @@ async fn a_minted_key_decrypts_to_the_domains_it_was_defined_with() {
     }
 }
 
-/// Every mint answers a key of its own: two keys defined over the same domains in
-/// the same scope are two different keys, each decrypting to those domains, and the
-/// listing reports one summary per key.
+/// Every call for one definition answers the ONE key that definition has: a key
+/// "contains a set of token domains" and is the key of that set, so repeating the
+/// mint neither changes the value nor adds a summary, and a different set is a
+/// different key.
 #[tokio::test]
-async fn every_mint_answers_a_key_of_its_own() {
+async fn every_mint_for_one_definition_answers_the_same_key() {
     let waf = Waf::new();
     let domains = vec!["one.example.com".to_string(), "two.example.com".to_string()];
     let case = "three mints over one definition";
@@ -295,23 +306,45 @@ async fn every_mint_answers_a_key_of_its_own() {
     let distinct: std::collections::BTreeSet<&String> = minted.iter().collect();
     assert_eq!(
         distinct.len(),
-        minted.len(),
-        "case {case:?}: each mint must answer a key of its own, got {minted:?}"
+        1,
+        "case {case:?}: every mint over one definition must answer the one key of that \
+         definition, got {minted:?}"
     );
     for api_key in &minted {
         let decrypted = decrypt(&waf, SCOPE_REGIONAL, api_key).await;
         assert_eq!(
             token_domains(&decrypted, case),
-            domains,
-            "case {case:?}: every minted key must decrypt to the domains it was \
-             defined with, got {decrypted}"
+            as_set(&domains),
+            "case {case:?}: the key must decrypt to the domain set it was defined \
+             with, got {decrypted}"
         );
     }
     let listed = listed_keys(&waf, SCOPE_REGIONAL).await;
     assert_eq!(
-        listed, minted,
-        "case {case:?}: the listing must report one summary per minted key, in \
-         creation order"
+        listed,
+        minted[..1].to_vec(),
+        "case {case:?}: the listing must report one summary for the definition"
+    );
+
+    // A different definition is a key of its own, listed after the first.
+    let other = mint(
+        &waf,
+        SCOPE_REGIONAL,
+        &["three.example.com".to_string()],
+        "another definition",
+    )
+    .await;
+    assert_ne!(
+        other, minted[0],
+        "case {:?}: a different domain set must be a different key",
+        "another definition"
+    );
+    assert_eq!(
+        listed_keys(&waf, SCOPE_REGIONAL).await,
+        vec![minted[0].clone(), other],
+        "case {:?}: the listing must report one summary per domain set, in creation \
+         order",
+        "another definition"
     );
 }
 
@@ -589,18 +622,21 @@ async fn decrypting_a_key_changes_nothing_a_later_caller_sees() {
 #[tokio::test]
 async fn a_mint_past_the_per_scope_bound_is_refused() {
     let waf = Waf::new();
-    let domains = vec!["bounded.example.com".to_string()];
     let case = "a scope filled to its bound";
+    // One domain set per key, because a scope holds ONE key per set: filling the
+    // bound takes that many distinct definitions.
+    let definition = |index: usize| vec![format!("bounded{index}.example.com")];
 
     let mut minted: Vec<String> = Vec::new();
-    for _ in 0..MAX_API_KEYS_PER_SCOPE {
-        minted.push(mint(&waf, SCOPE_REGIONAL, &domains, case).await);
+    for index in 0..MAX_API_KEYS_PER_SCOPE {
+        minted.push(mint(&waf, SCOPE_REGIONAL, &definition(index), case).await);
     }
 
+    let past_the_bound = definition(MAX_API_KEYS_PER_SCOPE);
     let body = waf
         .refused(
             CREATE,
-            json!({ "Scope": SCOPE_REGIONAL, "TokenDomains": domains }),
+            json!({ "Scope": SCOPE_REGIONAL, "TokenDomains": &past_the_bound }),
             "WAFLimitsExceededException",
             case,
         )
@@ -615,19 +651,27 @@ async fn a_mint_past_the_per_scope_bound_is_refused() {
         "case {case:?}: the scope must hold exactly the {MAX_API_KEYS_PER_SCOPE} keys \
          it minted"
     );
-    for api_key in &minted {
+    for (index, api_key) in minted.iter().enumerate() {
         let decrypted = decrypt(&waf, SCOPE_REGIONAL, api_key).await;
         assert_eq!(
             token_domains(&decrypted, case),
-            domains,
+            definition(index),
             "case {case:?}: every key the scope holds must still decrypt, got \
              {decrypted}"
         );
     }
+    // A mint for a set the scope ALREADY holds a key for is not a new key, so it is
+    // not refused by the bound either.
+    let held = mint(&waf, SCOPE_REGIONAL, &definition(0), case).await;
+    assert_eq!(
+        held, minted[0],
+        "case {case:?}: a mint for a held definition must answer that key even at the \
+         bound"
+    );
 
     // The other scope still mints: the bound is per scope, because a scope is a
     // namespace.
-    let elsewhere = mint(&waf, SCOPE_CLOUDFRONT, &domains, "the other scope").await;
+    let elsewhere = mint(&waf, SCOPE_CLOUDFRONT, &past_the_bound, "the other scope").await;
     assert_eq!(
         listed_keys(&waf, SCOPE_CLOUDFRONT).await,
         [elsewhere],

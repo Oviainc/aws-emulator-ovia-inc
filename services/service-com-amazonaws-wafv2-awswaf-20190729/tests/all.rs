@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/api_key_deletion.rs"]
 mod api_key_deletion;
+#[path = "all/api_key_identity.rs"]
+mod api_key_identity;
 #[path = "all/api_key_listing.rs"]
 mod api_key_listing;
 #[path = "all/api_key_minting.rs"]
@@ -31,6 +33,8 @@ mod firewall_manager_rule_groups;
 mod get_web_acl_for_resource;
 #[path = "all/invalid_permission_policy_message.rs"]
 mod invalid_permission_policy_message;
+#[path = "all/ip_set_canonicalization.rs"]
+mod ip_set_canonicalization;
 #[path = "all/ip_set_listing.rs"]
 mod ip_set_listing;
 #[path = "all/ip_set_mutations.rs"]
@@ -113,6 +117,8 @@ mod tag_listing;
 mod tag_value_round_trip;
 #[path = "all/top_path_statistics.rs"]
 mod top_path_statistics;
+#[path = "all/wcu_cost_model.rs"]
+mod wcu_cost_model;
 #[path = "all/web_acl_association_fanout.rs"]
 mod web_acl_association_fanout;
 #[path = "all/web_acl_associations.rs"]

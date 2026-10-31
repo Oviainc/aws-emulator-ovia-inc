@@ -580,8 +580,9 @@ async fn a_web_acl_rule_can_reference_a_stored_rule_group_and_is_charged_its_cap
     let (_large_id, large_arn, _large_lock) =
         create_rule_group(&waf, "REGIONAL", "capacity-large", 500, json!([])).await;
 
-    // `state::BYTE_MATCH_WCU` is 10 and a SQLi match costs 20, as
-    // `web_acl_capacity_is_derived_from_the_stored_rules` pins them.
+    // A `CONTAINS` byte match costs 10 (`state::BYTE_MATCH_SCANNING_WCU`) and a SQLi
+    // match costs 20, as `web_acl_capacity_is_derived_from_the_stored_rules` pins
+    // them.
     let cases: Vec<(&str, Value, i64)> = vec![
         (
             "one reference to the smallest group",

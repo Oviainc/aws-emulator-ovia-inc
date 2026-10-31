@@ -300,11 +300,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // "This operation completely replaces the mutable specifications that you
         // already have for the IP set with the ones that you provide to this call":
-        // `Addresses` becomes exactly the submitted list, in the submitted order, and
+        // `Addresses` becomes exactly the submitted list, in the submitted order —
+        // with each IPv6 entry in the one canonical notation of its value, as a
+        // create stores it (`crate::state::canonical_ip_set_addresses`) — and
         // `Description` — which the request may omit — is CLEARED rather than kept,
         // because an update is a whole-resource overwrite and not a merge.
         // `Name`, `Id`, `ARN` and `IPAddressVersion` are immutable.
-        entry.ip_set.addresses = input.addresses;
+        entry.ip_set.addresses =
+            crate::state::canonical_ip_set_addresses(&ip_address_version, &input.addresses);
         entry.ip_set.description = crate::state::stored_description(input.description);
 
         // The token rotates on every successful mutation, so the one the caller just

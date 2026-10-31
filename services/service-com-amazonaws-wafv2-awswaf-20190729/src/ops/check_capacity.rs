@@ -253,7 +253,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let state = state.lock();
 
         // WAF prices a statement that runs a rule group from that group's own reported
         // capacity, so a reference naming an entity this service does not hold in this
@@ -266,10 +265,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::NONEXISTENT_ITEM_MESSAGE` and `tests/all/exception_messages.rs`),
         // and there is no audit record either, because `crate::state::audit` records what
         // a STATE-CHANGING call did and this call changes nothing.
-        if state
-            .unresolvable_rule_reference(&input.scope, &input.rules)
-            .is_some()
-        {
+        //
+        // The store is read in ONE short critical section — the resolution, and the
+        // capacities of this scope's rule groups — and the guard is dropped before the
+        // rules are priced, so a caller's own rule list is never walked while every
+        // other caller waits for the store.
+        let (unresolvable, rule_group_capacities) = {
+            let state = state.lock();
+            (
+                state
+                    .unresolvable_rule_reference(&input.scope, &input.rules)
+                    .is_some(),
+                state.rule_group_capacities(&input.scope),
+            )
+        };
+        if unresolvable {
             return Err(CheckCapacityErrorModeled::WAFNonexistentItemException(
                 crate::state::nonexistent_item_exception(),
             )
@@ -280,8 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request carries: "the capacity required by the rules and scope", summed per
         // rule, with each rule-group reference costing the referenced group's own
         // `Capacity`. This is a read: nothing is written to the store.
-        let capacity =
-            crate::state::web_acl_capacity(&input.rules, &state.rule_group_capacities(&input.scope));
+        let capacity = crate::state::web_acl_capacity(&input.rules, &rule_group_capacities);
 
         Ok(CheckCapacityOutput { capacity })
     }

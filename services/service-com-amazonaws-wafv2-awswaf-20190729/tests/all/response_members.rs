@@ -233,28 +233,38 @@ async fn every_web_acl_response_carries_description_rules_and_the_ddos_mode() {
 /// An `IPSet` response carries `Description` the same way a web ACL's does: the
 /// empty string when the save supplied none, both in the summary `CreateIPSet`
 /// answers and in the set `GetIPSet` answers. One row per description form and per
-/// address family.
+/// address family, each with the notation its family is stored in (an IPv6 entry is
+/// canonicalized — see `crate::ip_set_canonicalization`).
 #[tokio::test]
 async fn every_ip_set_response_carries_a_description() {
-    let cases: &[(&str, Option<&str>, &str, &str)] = &[
-        ("no description, IPv4", None, "IPV4", "10.0.0.0/8"),
+    // `(case, description, family, submitted address, the notation a read reports)`.
+    let cases: &[(&str, Option<&str>, &str, &str, &str)] = &[
+        ("no description, IPv4", None, "IPV4", "10.0.0.0/8", "10.0.0.0/8"),
         (
             "a description, IPv4",
             Some("has.a.description"),
             "IPV4",
             "192.0.2.0/24",
+            "192.0.2.0/24",
         ),
-        ("no description, IPv6", None, "IPV6", "2001:db8::/32"),
+        (
+            "no description, IPv6",
+            None,
+            "IPV6",
+            "2001:db8::/32",
+            "2001:0db8:0000:0000:0000:0000:0000:0000/32",
+        ),
         (
             "a description with a space, IPv6",
             Some("ipv6 blocks, described"),
             "IPV6",
             "2001:db8:1::/48",
+            "2001:0db8:0001:0000:0000:0000:0000:0000/48",
         ),
     ];
 
     let waf = Waf::new();
-    for (index, (case, description, version, address)) in cases.iter().enumerate() {
+    for (index, (case, description, version, address, stored)) in cases.iter().enumerate() {
         let name = format!("ips-{index}");
         let expected_description = description.unwrap_or("");
         let mut body = json!({
@@ -293,7 +303,7 @@ async fn every_ip_set_response_carries_a_description() {
         );
         assert_eq!(
             got["IPSet"]["Addresses"],
-            json!([address]),
+            json!([stored]),
             "case {case:?}: GetIPSet must answer the stored addresses, got {got}"
         );
     }

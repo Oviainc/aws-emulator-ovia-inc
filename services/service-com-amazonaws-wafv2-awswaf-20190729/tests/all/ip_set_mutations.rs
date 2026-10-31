@@ -79,6 +79,9 @@ struct Replacement {
     description_before: Option<&'static str>,
     /// The addresses the update submits.
     after: &'static [&'static str],
+    /// The notation a read reports those addresses in: the submitted list for the
+    /// single-notation IPv4 family, and the canonical one for IPv6.
+    stored_after: &'static [&'static str],
     /// The description the update submits, or `None` when it omits the member.
     description_after: Option<&'static str>,
 }
@@ -100,6 +103,7 @@ async fn update_ip_set_replaces_the_whole_specification() {
             before: &["10.0.0.0/24", "10.0.1.0/24"],
             description_before: Some("probe ipset"),
             after: &["172.16.0.0/16"],
+            stored_after: &["172.16.0.0/16"],
             description_after: None,
         },
         Replacement {
@@ -108,6 +112,7 @@ async fn update_ip_set_replaces_the_whole_specification() {
             before: &["192.0.2.0/24"],
             description_before: None,
             after: &["203.0.113.0/24", "198.51.100.0/24"],
+            stored_after: &["203.0.113.0/24", "198.51.100.0/24"],
             description_after: Some("two ranges"),
         },
         Replacement {
@@ -116,6 +121,7 @@ async fn update_ip_set_replaces_the_whole_specification() {
             before: &["10.0.0.0/24", "10.0.1.0/24"],
             description_before: Some("ordered"),
             after: &["10.0.1.0/24", "10.0.0.0/24"],
+            stored_after: &["10.0.1.0/24", "10.0.0.0/24"],
             description_after: Some("ordered"),
         },
         Replacement {
@@ -124,6 +130,7 @@ async fn update_ip_set_replaces_the_whole_specification() {
             before: &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
             description_before: Some("three ranges"),
             after: &[],
+            stored_after: &[],
             description_after: Some("emptied"),
         },
         Replacement {
@@ -136,6 +143,13 @@ async fn update_ip_set_replaces_the_whole_specification() {
                 "2001:db8:3::/48",
                 "2001:db8:2::/48",
             ],
+            // An IPv6 entry is stored in the one canonical notation of its value;
+            // see `crate::ip_set_canonicalization`.
+            stored_after: &[
+                "2001:0db8:0001:0000:0000:0000:0000:0000/48",
+                "2001:0db8:0003:0000:0000:0000:0000:0000/48",
+                "2001:0db8:0002:0000:0000:0000:0000:0000/48",
+            ],
             description_after: Some("v6 replaced"),
         },
         Replacement {
@@ -144,6 +158,7 @@ async fn update_ip_set_replaces_the_whole_specification() {
             before: &["10.1.0.0/16"],
             description_before: Some("global"),
             after: &["10.2.0.0/16", "10.3.0.0/16"],
+            stored_after: &["10.2.0.0/16", "10.3.0.0/16"],
             description_after: None,
         },
     ];
@@ -156,6 +171,7 @@ async fn update_ip_set_replaces_the_whole_specification() {
             before,
             description_before,
             after,
+            stored_after,
             description_after,
         } = *replacement;
         let scope = if case.contains("CLOUDFRONT") {
@@ -195,7 +211,7 @@ async fn update_ip_set_replaces_the_whole_specification() {
         let got = get_ip_set(&waf, scope, &name, &id).await;
         assert_eq!(
             got["IPSet"]["Addresses"],
-            json!(after),
+            json!(stored_after),
             "case {case:?}: expected exactly the submitted addresses in the \
              submitted order, got {got}"
         );
@@ -240,7 +256,7 @@ async fn update_ip_set_replaces_the_whole_specification() {
         let again = get_ip_set(&waf, scope, &name, &id).await;
         assert_eq!(
             again["IPSet"]["Addresses"],
-            json!(after),
+            json!(stored_after),
             "case {case:?}: a refused update must change nothing, got {again}"
         );
     }

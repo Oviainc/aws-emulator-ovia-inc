@@ -378,10 +378,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The price is the one this service PUBLISHES through `CheckCapacity`, which is
         // what `Capacity`'s doc tells a caller to size the limit against, so the two can
         // never disagree: a save is accepted exactly when the capacity the caller could
-        // have checked fits. Each figure [`crate::state::web_acl_capacity`] sums comes
-        // from the WAF Developer Guide's rule-statement list, with
-        // `BYTE_MATCH_WCU`/`RATE_BASED_WCU`/`RATE_BASED_CUSTOM_KEYS_WCU` additionally
-        // pinned by recorded responses, and a statement kind that table does not price
+        // have checked fits. Each figure [`crate::state::web_acl_capacity`] sums is a
+        // per-statement base cost with that statement's own modifiers applied — with
+        // the byte-match, rate-based and per-custom-key figures additionally pinned by
+        // recorded responses — and a statement kind that table does not price
         // contributes nothing — so the requirement understates rather than overstates a
         // cost it does not know, and this refusal does not invent one. NOTE for whoever
         // re-prices that table next: its figures now decide a SAVE as well as a report,

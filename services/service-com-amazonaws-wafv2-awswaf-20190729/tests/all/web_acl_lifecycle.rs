@@ -249,33 +249,46 @@ pub(crate) async fn create_web_acl(
 ///
 /// One row per way an address can differ — family, each published prefix-length
 /// bound, one past each bound, the wrong family, and a string that is not CIDR at
-/// all. An accepted row must read back with the address it was given; a refused
-/// one must store nothing.
+/// all. An accepted row must read back in the notation its family is stored in (an
+/// IPv4 address as submitted, an IPv6 one canonicalized — see
+/// `crate::ip_set_canonicalization`); a refused one must store nothing.
 #[tokio::test]
 async fn create_ip_set_accepts_cidr_of_the_declared_family_and_refuses_everything_else() {
-    let cases: &[(&str, &str, bool)] = &[
-        ("IPV4", "10.0.0.0/8", true),
-        ("IPV4", "192.0.2.44/32", true),
-        ("IPV4", "0.0.0.0/1", true),
-        ("IPV4", "192.0.2.0/0", false),
-        ("IPV4", "192.0.2.0/33", false),
-        ("IPV4", "192.0.2.44", false),
-        ("IPV4", "1111::/64", false),
-        ("IPV4", "not-an-address/24", false),
+    // `(family, submitted address, the notation a read reports, accepted)`.
+    let cases: &[(&str, &str, &str, bool)] = &[
+        ("IPV4", "10.0.0.0/8", "10.0.0.0/8", true),
+        ("IPV4", "192.0.2.44/32", "192.0.2.44/32", true),
+        ("IPV4", "0.0.0.0/1", "0.0.0.0/1", true),
+        ("IPV4", "192.0.2.0/0", "", false),
+        ("IPV4", "192.0.2.0/33", "", false),
+        ("IPV4", "192.0.2.44", "", false),
+        ("IPV4", "1111::/64", "", false),
+        ("IPV4", "not-an-address/24", "", false),
         (
             "IPV6",
             "1111:0000:0000:0000:0000:0000:0000:0111/128",
+            "1111:0000:0000:0000:0000:0000:0000:0111/128",
             true,
         ),
-        ("IPV6", "1111::/64", true),
-        ("IPV6", "::/1", true),
-        ("IPV6", "1111::/0", false),
-        ("IPV6", "1111::/129", false),
-        ("IPV6", "192.0.2.0/24", false),
+        (
+            "IPV6",
+            "1111::/64",
+            "1111:0000:0000:0000:0000:0000:0000:0000/64",
+            true,
+        ),
+        (
+            "IPV6",
+            "::/1",
+            "0000:0000:0000:0000:0000:0000:0000:0000/1",
+            true,
+        ),
+        ("IPV6", "1111::/0", "", false),
+        ("IPV6", "1111::/129", "", false),
+        ("IPV6", "192.0.2.0/24", "", false),
     ];
 
     let waf = Waf::new();
-    for (index, (version, address, accepted)) in cases.iter().enumerate() {
+    for (index, (version, address, stored, accepted)) in cases.iter().enumerate() {
         let name = format!("cidr-case-{index}");
         let case = format!("{version} {address:?}");
         let (status, body) = waf
@@ -304,7 +317,7 @@ async fn create_ip_set_accepts_cidr_of_the_declared_family_and_refuses_everythin
                 .await;
             assert_eq!(
                 read_back["IPSet"]["Addresses"],
-                json!([address]),
+                json!([stored]),
                 "case {case:?}: GetIPSet must answer the stored addresses, got {read_back}"
             );
             assert_eq!(
@@ -829,12 +842,14 @@ async fn delete_ip_set_refuses_while_any_rule_tree_references_it() {
 
 /// `WebACL$Capacity` is "the web ACL capacity units (WCUs) currently being used by
 /// this web ACL", so it is derived from the stored rules: each statement's own WCU
-/// cost, summed, with a logical statement costing what it nests. One row per
-/// statement kind and per nesting form. Three rows are the costs the recorded
-/// corpus pins: a web ACL of three byte-match rules reports 30
-/// (`state::BYTE_MATCH_WCU`), one holding a bare `IP`-aggregated rate-based rule
-/// reports 2 (`state::RATE_BASED_WCU`), and the same rule aggregating on a custom
-/// key reports 32 (plus `state::RATE_BASED_CUSTOM_KEYS_WCU`).
+/// cost with the modifiers it carries, summed, with a logical statement costing what
+/// it nests. One row per statement kind and per nesting form. Three rows are the
+/// costs the recorded corpus pins: a web ACL of three `CONTAINS` byte-match rules
+/// reports 30 (`state::BYTE_MATCH_SCANNING_WCU`), one holding a bare `IP`-aggregated
+/// rate-based rule reports 2 (`state::RATE_BASED_WCU`), and the same rule
+/// aggregating on one custom key reports 32 (plus
+/// `state::RATE_BASED_CUSTOM_KEY_WCU`, charged per key). The whole cost model — every
+/// base cost and every modifier — is spanned by `crate::wcu_cost_model`.
 #[tokio::test]
 async fn web_acl_capacity_is_derived_from_the_stored_rules() {
     let waf = Waf::new();
@@ -909,7 +924,9 @@ async fn web_acl_capacity_is_derived_from_the_stored_rules() {
                     }
                 })
             )]),
-            32,
+            // Every aggregation key is extracted and hashed per request, so each
+            // one is charged.
+            92,
         ),
         ("one SQLi match", json!([sqli_rule("a")]), 20),
         ("one XSS match", json!([rule("a", xss_statement())]), 40),

@@ -125,6 +125,24 @@ fn domain_sets() -> Vec<(&'static str, Vec<String>)> {
     ]
 }
 
+/// `domains` as the SET they name: sorted lexicographically, the order WAF stores a
+/// key's domains in and therefore the order every read reports.
+fn as_set(domains: &[String]) -> Vec<String> {
+    let mut set = domains.to_vec();
+    set.sort_unstable();
+    set.dedup();
+    set
+}
+
+/// `domains` with `suffix` appended to each, so one row yields as many DISTINCT
+/// definitions as it needs keys: a scope holds one key per domain set.
+fn variant(domains: &[String], suffix: usize) -> Vec<String> {
+    domains
+        .iter()
+        .map(|domain| format!("{domain}.v{suffix}"))
+        .collect()
+}
+
 /// A deleted key is gone from the scope that held it: neither the listing nor the
 /// decrypted read reports it, and every other key of that scope is untouched.
 #[tokio::test]
@@ -135,10 +153,13 @@ async fn a_deleted_key_is_gone_from_every_later_read() {
             let case = format!("{scope}, {domains_case}");
 
             // Three keys, so a delete has to remove exactly one of them, and one key
-            // of the OTHER scope, which a delete here must never touch.
+            // of the OTHER scope, which a delete here must never touch. A scope holds
+            // one key per domain set, so the three keys are three definitions.
+            let definitions: Vec<Vec<String>> =
+                (0..3).map(|index| variant(&domains, index)).collect();
             let mut minted: Vec<String> = Vec::new();
-            for _ in 0..3 {
-                minted.push(mint(&waf, scope, &domains, &case).await);
+            for definition in &definitions {
+                minted.push(mint(&waf, scope, definition, &case).await);
             }
             let elsewhere = mint(
                 &waf,
@@ -167,13 +188,13 @@ async fn a_deleted_key_is_gone_from_every_later_read() {
                  {status} and body {body}"
             );
             // Every key left still decrypts to its own definition.
-            for api_key in &minted {
+            for (api_key, definition) in minted.iter().zip([&definitions[0], &definitions[2]]) {
                 let decrypted = waf
                     .ok(DECRYPT, json!({ "Scope": scope, "APIKey": api_key }))
                     .await;
                 assert_eq!(
                     decrypted["TokenDomains"],
-                    json!(domains),
+                    json!(as_set(definition)),
                     "case {case:?}: a delete must leave the other keys alone, got \
                      {decrypted}"
                 );
@@ -193,11 +214,14 @@ async fn a_deleted_key_is_gone_from_every_later_read() {
 async fn deleting_every_key_empties_the_scope_and_a_later_mint_still_works() {
     let waf = Waf::new();
     let case = "five keys deleted in turn";
-    let domains = vec!["drained.example.com".to_string()];
+    // One definition per key: a scope holds one key per domain set.
+    let definitions: Vec<Vec<String>> = (0..5)
+        .map(|index| vec![format!("drained{index}.example.com")])
+        .collect();
 
     let mut remaining: Vec<String> = Vec::new();
-    for _ in 0..5 {
-        remaining.push(mint(&waf, SCOPE_REGIONAL, &domains, case).await);
+    for definition in &definitions {
+        remaining.push(mint(&waf, SCOPE_REGIONAL, definition, case).await);
     }
 
     // Deleted from the middle outwards, so the order of the remaining keys is
@@ -218,7 +242,7 @@ async fn deleting_every_key_empties_the_scope_and_a_later_mint_still_works() {
     );
 
     // A mint after the deletes is a key of its own, and the scope reports it alone.
-    let fresh = mint(&waf, SCOPE_REGIONAL, &domains, case).await;
+    let fresh = mint(&waf, SCOPE_REGIONAL, &definitions[0], case).await;
     assert_eq!(
         listed_keys(&waf, SCOPE_REGIONAL).await,
         vec![fresh.clone()],
@@ -229,7 +253,7 @@ async fn deleting_every_key_empties_the_scope_and_a_later_mint_still_works() {
         .await;
     assert_eq!(
         decrypted["TokenDomains"],
-        json!(domains),
+        json!(as_set(&definitions[0])),
         "case {case:?}: the fresh key must decrypt to its own definition, got \
          {decrypted}"
     );
