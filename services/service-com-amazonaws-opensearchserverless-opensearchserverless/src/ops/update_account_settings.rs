@@ -7,7 +7,9 @@
 //! from the stored settings, which is what a later `GetAccountSettings` reports. A limit
 //! that would take a capacity type past the account's non-adjustable OCU quota is refused
 //! with `ServiceQuotaExceededException` and stores nothing. Every
-//! exit leaves one structured `emulator::audit` record for the call.
+//! exit leaves one structured `emulator::audit` record for the call, whose outcome names
+//! what the call did: a write of the limits, or a report of them for a call that changed
+//! none.
 //!
 //! ## Shape of an operation
 //!
@@ -167,6 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // Whether this call CHANGED the stored settings, which is what the audit record
+        // below names: set by the only write in this handler.
+        let mut wrote = false;
         // Both `CapacityLimits` members carry `@range(min: 2)`, so the boundary validator
         // has already refused anything below that floor; the model states no ceiling, but
         // the account's own OCU quota does — see
@@ -193,12 +198,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-            store.account_settings.apply(limits);
+            wrote = store.account_settings.apply(limits);
         }
+        // The record names what this call actually did to the settings: a call that left
+        // `store.account_settings` exactly as it found it — one naming no `capacityLimits`,
+        // one naming a `capacityLimits` with neither member, or one restating only limits
+        // the account already holds — reported the settings rather than writing them, so it
+        // is not logged as a write.
         crate::state::audit(
             Self::NAME,
             ctx,
-            AuditOutcome::SettingsUpdated,
+            if wrote {
+                AuditOutcome::SettingsUpdated
+            } else {
+                AuditOutcome::SettingsUnchanged
+            },
             Some(resource),
         );
 

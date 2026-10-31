@@ -1147,13 +1147,19 @@ impl AccountSettingsRecord {
     /// Apply the limits an `UpdateAccountSettings` request named, leaving a limit the
     /// request did NOT name at its stored value: both `CapacityLimits` members are
     /// optional, so a request may raise or lower one limit without restating the other.
-    pub fn apply(&mut self, limits: &CapacityLimits) {
+    ///
+    /// Answers whether the stored settings CHANGED, so the caller can report what really
+    /// happened: a request naming neither member, or naming only values the account
+    /// already holds, leaves this record exactly as it was.
+    pub fn apply(&mut self, limits: &CapacityLimits) -> bool {
+        let before = *self;
         if let Some(value) = limits.max_indexing_capacity_in_ocu {
             self.max_indexing_capacity_in_ocu = value;
         }
         if let Some(value) = limits.max_search_capacity_in_ocu {
             self.max_search_capacity_in_ocu = value;
         }
+        *self != before
     }
 
     /// The limit this record holds for `kind`.
@@ -3879,6 +3885,9 @@ pub enum AuditOutcome {
     PolicyRead,
     /// The account's own settings were written (`UpdateAccountSettings`).
     SettingsUpdated,
+    /// The call reported the account's own settings as they stand: it named no limit the
+    /// account did not already hold, so nothing was written (`UpdateAccountSettings`).
+    SettingsUnchanged,
     /// The request was refused as invalid (400 `ValidationException`).
     ValidationRefused,
     /// A policy with that `(type, name)` pair already exists (409 `ConflictException`).
@@ -3902,6 +3911,7 @@ impl AuditOutcome {
             Self::IdempotentReplay => "idempotent-replay",
             Self::PolicyRead => "policy-read",
             Self::SettingsUpdated => "settings-updated",
+            Self::SettingsUnchanged => "settings-unchanged",
             Self::ValidationRefused => "validation-refused",
             Self::AlreadyExists => "already-exists",
             Self::QuotaExceeded => "quota-exceeded",

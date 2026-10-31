@@ -114,7 +114,11 @@ async fn every_account_settings_call_emits_one_structured_audit_record() {
             "UpdateAccountSettings",
             json!({}),
             200,
-            "settings-updated",
+            // Nothing was written, so the record reports the settings rather than
+            // claiming a change of them; the outcome a call that really changes a limit
+            // records is pinned, over a table, by the `account_settings_write_outcome`
+            // suite.
+            "settings-unchanged",
         ),
         (
             "the write asks for more than the account's OCU quota",

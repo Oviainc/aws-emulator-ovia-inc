@@ -19,6 +19,8 @@ mod access_policy_listing;
 mod account_settings;
 #[path = "all/account_settings_audit.rs"]
 mod account_settings_audit;
+#[path = "all/account_settings_write_outcome.rs"]
+mod account_settings_write_outcome;
 #[path = "all/audit_capture.rs"]
 mod audit_capture;
 #[path = "all/batch_selector_rule.rs"]
