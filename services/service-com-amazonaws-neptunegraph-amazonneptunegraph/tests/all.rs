@@ -91,6 +91,8 @@ mod private_graph_endpoint_read;
 mod query_cancellation;
 #[path = "all/query_listing.rs"]
 mod query_listing;
+#[path = "all/query_projection_parity.rs"]
+mod query_projection_parity;
 #[path = "all/query_status_reporting.rs"]
 mod query_status_reporting;
 #[path = "all/records_outlive_their_graph.rs"]

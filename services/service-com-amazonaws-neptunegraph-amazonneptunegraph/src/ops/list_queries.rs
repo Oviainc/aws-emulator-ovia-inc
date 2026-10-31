@@ -74,6 +74,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::QueryRecordOutput;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -225,13 +226,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting only: the sole write the listing makes is reclaiming the queries the
         // clock had already ended at this instant — each accepted cancellation that has
         // fallen due, and each query whose own run span is out — so the answer reports the
-        // queries as they stood at `now` and never one that has stopped.
+        // queries as they stood at `now` and never one that has stopped. Each summary is
+        // rendered by the one projection `crate::state` renders a query record with,
+        // which `GetQuery` reports a single query through too.
         let queries: Vec<QuerySummary> = store
             .live_queries_on(&graph_id, now)
             .into_iter()
             .filter(|query| wanted_state == ALL_STATES || query.state.as_wire() == wanted_state)
             .take(reported_at_most)
-            .map(|query| summarise(query, now))
+            .map(|query| QuerySummary::from_query(query, now))
             .collect();
 
         Ok(ListQueriesOutput { queries })
@@ -249,16 +252,3 @@ const MIN_MAX_RESULTS: i32 = 1;
 /// (`crate::ops::types::QUERY_STATE_INPUT_VALUES`) that is not a state a stored query
 /// can be in, and the behaviour of an absent member.
 const ALL_STATES: &str = "ALL";
-
-/// One stored query as the listing reports it: the same five facts `GetQuery` reports
-/// about one query, with both durations read off the clock at `now` against the instants
-/// the record holds.
-fn summarise(query: &crate::state::Query, now: ::std::time::Instant) -> QuerySummary {
-    QuerySummary {
-        id: Some(query.id.clone()),
-        query_string: Some(query.query_string.clone()),
-        state: Some(query.state.as_wire().to_string()),
-        waited: Some(query.waited_millis(now)),
-        elapsed: Some(query.elapsed_millis(now)),
-    }
-}

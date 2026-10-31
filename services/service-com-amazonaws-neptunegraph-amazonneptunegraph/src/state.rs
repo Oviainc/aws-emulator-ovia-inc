@@ -3755,6 +3755,41 @@ private_graph_endpoint_output!(
     PrivateGraphEndpointSummary,
 );
 
+/// One stored [`Query`] rendered into the shape an operation reports it with, as of
+/// `now`.
+///
+/// A query's projection carries two members measured off the CLOCK
+/// ([`Query::waited_millis`], [`Query::elapsed_millis`]), so it takes `now` rather than
+/// being a plain `From<&Query>` — the same reason [`ExportTask::get_output`] takes it.
+pub trait QueryRecordOutput {
+    /// This stored query as this shape reports it, measured against `now`.
+    fn from_query(query: &Query, now: Instant) -> Self;
+}
+
+/// The shapes that carry a whole query record are structurally identical
+/// (`smithy_query(query="shape",shape="GetQueryOutput,QuerySummary")`: both declare
+/// exactly `id`, `queryString`, `waited`, `elapsed`, `state`), so one macro renders the
+/// stored query into each rather than one hand-copied field list per operation, which
+/// could drift apart. The listing projection (`QuerySummary`) is rendered here too, so a
+/// listed query cannot differ from what a single-query read answers.
+macro_rules! query_record_output {
+    ($($ty:ident),+ $(,)?) => {$(
+        impl QueryRecordOutput for crate::ops::types::$ty {
+            fn from_query(query: &Query, now: Instant) -> Self {
+                Self {
+                    id: Some(query.id.clone()),
+                    query_string: Some(query.query_string.clone()),
+                    state: Some(query.state.as_wire().to_string()),
+                    waited: Some(query.waited_millis(now)),
+                    elapsed: Some(query.elapsed_millis(now)),
+                }
+            }
+        }
+    )+};
+}
+
+query_record_output!(GetQueryOutput, QuerySummary);
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

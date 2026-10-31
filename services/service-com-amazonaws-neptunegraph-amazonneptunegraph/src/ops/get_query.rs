@@ -77,6 +77,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::QueryRecordOutput;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -200,13 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every member is read off the stored record, and the two durations are read
-        // off the clock against the instants that record holds.
-        Ok(GetQueryOutput {
-            id: Some(query.id.clone()),
-            query_string: Some(query.query_string.clone()),
-            state: Some(query.state.as_wire().to_string()),
-            waited: Some(query.waited_millis(now)),
-            elapsed: Some(query.elapsed_millis(now)),
-        })
+        // off the clock against the instants that record holds — by the one projection
+        // `crate::state` renders a query record with, which `ListQueries` reports a
+        // listed query through too.
+        Ok(GetQueryOutput::from_query(query, now))
     }
 }
