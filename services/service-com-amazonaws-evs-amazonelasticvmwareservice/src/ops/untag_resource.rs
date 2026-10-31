@@ -4,7 +4,8 @@
 //! Removes the named tag keys from the stored environment the ARN names. `@idempotent`:
 //! a key the resource does not carry is not an error. A key in AWS's reserved `aws:`
 //! namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased)
-//! is refused with this operation's own tag-policy refusal and removes nothing: that
+//! is refused with a `ValidationException` (HTTP 400) naming the `tagKeys` member and
+//! removes nothing: that
 //! namespace is Amazon Web Services' own, so a caller can neither create nor delete a
 //! tag key in it. That is a rule about the REQUEST, so it is judged before the ARN is
 //! resolved, exactly as in `TagResource`. An ARN this service holds no
@@ -87,15 +88,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.evs#UntagResource",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    /// Listed by the model and LEFT UNUSED: its own documentation says this shape is
+    /// superseded by `ValidationException`, which is what the reserved-tag-key refusal
+    /// below answers.
     TagPolicyException(TagPolicyException),
     /// Widened in from the service's own error set (this operation does not list it):
     /// the one honest answer when this service's store cannot be reached at all.
     InternalServerException(InternalServerException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the shape the deprecated tag-policy error names as its replacement, and the one
+    /// this service reports a refused input member with everywhere else.
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -171,18 +179,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The reserved `aws:` namespace is Amazon Web Services' own: a caller can no
         // more delete a tag in it than create one, so a request naming such a key is
-        // refused with this operation's tag-policy refusal (HTTP 400) and removes
-        // nothing — the same rule `TagResource` applies to the keys it writes.
-        if let Some(refusal) = crate::state::reserved_tag_key_refusal(
+        // refused with a `ValidationException` (HTTP 400) naming the member that carried
+        // it, and removes nothing — the same rule, in the same shape, `TagResource`
+        // applies to the keys it writes and `CreateEnvironment` to the keys it mints.
+        if let Some(refusal) = crate::state::reserved_tag_key_validation_error(
             "tagKeys",
             input.tag_keys.iter().map(String::as_str),
         ) {
-            return Err(
-                UntagResourceErrorModeled::TagPolicyException(TagPolicyException {
-                    message: refusal,
-                })
-                .into(),
-            );
+            return Err(UntagResourceErrorModeled::ValidationException(refusal).into());
         }
 
         let environment = state

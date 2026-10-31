@@ -4,8 +4,8 @@
 //!
 //! The rule under test: a tag key that claims the reserved `aws:` prefix (however the
 //! prefix is cased) belongs to Amazon Web Services and not to the caller — so every
-//! operation of this service that takes tag keys from the request refuses one, with the
-//! refusal that operation models, and the stored tags are left exactly as they were.
+//! operation of this service that takes tag keys from the request refuses one, and the
+//! stored tags are left exactly as they were.
 //! That is `TagResource` and `CreateEnvironment`, which write keys, and
 //! `UntagResource`, which deletes them: a caller can no more delete a tag Amazon Web
 //! Services applies than create one.
@@ -16,11 +16,12 @@
 //! which admits a colon, so the boundary validator passes every key below and what
 //! refuses the reserved ones is the handler.
 //!
-//! Which refusal each operation answers with comes from its modelled error set
-//! (`smithy_query(query="operation",operation="TagResource,UntagResource,CreateEnvironment")`):
-//! `TagResource` and `UntagResource` declare `TagPolicyException` (HTTP 400) — the
-//! tag-policy refusal — while `CreateEnvironment` declares only `ValidationException`,
-//! so a reserved `tags` key is one more entry of its aggregated field refusal.
+//! Every one of them answers it with a `ValidationException` (HTTP 400) whose
+//! `fieldList` names the member that carried the reserved key: the tag-policy shape the
+//! tagging operations also declare documents itself as superseded by that one
+//! (`smithy_query(query="shape",shape="TagPolicyException")`), so the refusal is the
+//! replacement, and for `CreateEnvironment` it is one more entry of its aggregated
+//! field refusal. `tests/all/deprecated_tagging_errors.rs` owns that deprecation rule.
 //!
 //! The refused rows differ along the casing of the prefix, what follows it (nothing, one
 //! character, a real AWS system key, the longest key the modelled length allows) and
@@ -53,7 +54,7 @@ fn longest_reserved_key() -> String {
 ///
 /// The prefix itself is read from the handler-side constant rather than re-spelled
 /// here, so the rows and the rule cannot drift apart.
-fn reserved_keys() -> Vec<(String, String)> {
+pub(crate) fn reserved_keys() -> Vec<(String, String)> {
     let prefix = RESERVED_TAG_KEY_PREFIX;
     vec![
         ("the bare prefix".to_string(), prefix.to_string()),
@@ -95,7 +96,7 @@ fn accepted_keys() -> Vec<(&'static str, &'static str)> {
 }
 
 /// A JSON tag map from key/value pairs, so a key can be an expression.
-fn tag_map(entries: &[(&str, &str)]) -> Value {
+pub(crate) fn tag_map(entries: &[(&str, &str)]) -> Value {
     let mut map = serde_json::Map::new();
     for (key, value) in entries {
         map.insert((*key).to_string(), json!(value));
@@ -105,7 +106,7 @@ fn tag_map(entries: &[(&str, &str)]) -> Value {
 
 /// The tags a test environment starts with, so a refusal can be shown to have changed
 /// nothing rather than to have landed on an empty map.
-fn starting_tags() -> Value {
+pub(crate) fn starting_tags() -> Value {
     tag_map(&[("team", "platform"), ("cost", "42")])
 }
 
@@ -119,7 +120,7 @@ async fn create_with_tags(router: &Emulator, name: &str, tags: Option<Value>) ->
 }
 
 /// Create an environment carrying [`starting_tags`] and answer its ARN.
-async fn tagged_environment(router: &Emulator, name: &str) -> String {
+pub(crate) async fn tagged_environment(router: &Emulator, name: &str) -> String {
     let (status, body) = create_with_tags(router, name, Some(starting_tags())).await;
     assert_eq!(
         status, 200,
@@ -133,7 +134,7 @@ async fn tagged_environment(router: &Emulator, name: &str) -> String {
 
 /// The tags the service reports for `resource_arn`, read back through
 /// `ListTagsForResource`.
-async fn stored_tags(router: &Emulator, case: &str, resource_arn: &str) -> Value {
+pub(crate) async fn stored_tags(router: &Emulator, case: &str, resource_arn: &str) -> Value {
     let (status, body) = call(
         router,
         "ListTagsForResource",
@@ -147,9 +148,10 @@ async fn stored_tags(router: &Emulator, case: &str, resource_arn: &str) -> Value
     body["tags"].clone()
 }
 
-/// Assert one tag-policy refusal: HTTP 400, a `TagPolicyException`, and a message built
-/// from the request — it names the offending key and the prefix that is reserved.
-fn assert_tag_policy_refusal(case: &str, status: u16, body: &Value, key: &str) {
+/// Assert one reserved-key refusal: HTTP 400, a `ValidationException` naming `member` in
+/// its `fieldList`, and a message built from the request — it names the offending key and
+/// the prefix that is reserved.
+fn assert_reserved_key_refusal(case: &str, status: u16, body: &Value, member: &str, key: &str) {
     assert_eq!(
         status,
         400,
@@ -158,9 +160,21 @@ fn assert_tag_policy_refusal(case: &str, status: u16, body: &Value, key: &str) {
     );
     assert_eq!(
         error_type(body),
-        "TagPolicyException",
-        "case {case:?}: expected a TagPolicyException, got {}",
+        "ValidationException",
+        "case {case:?}: expected a ValidationException, got {}",
         error_type(body)
+    );
+    let names: BTreeSet<&str> = body["fieldList"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: no fieldList in {body}"))
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        BTreeSet::from([member]),
+        "case {case:?}: expected the refusal to name the {member:?} member, got {names:?} in \
+         {body}"
     );
     let message = body["message"].as_str().unwrap_or_default();
     assert!(
@@ -190,7 +204,7 @@ async fn tag_resource_refuses_a_reserved_key_and_writes_nothing() {
             }),
         )
         .await;
-        assert_tag_policy_refusal(&case, status, &body, &key);
+        assert_reserved_key_refusal(&case, status, &body, "tags", &key);
 
         // Nothing was written: the stored tags are still the ones the create set, and
         // the refused key is not among them.
@@ -220,7 +234,7 @@ async fn tag_resource_refuses_a_reserved_key_and_writes_nothing() {
         }),
     )
     .await;
-    assert_tag_policy_refusal(case, status, &body, &reserved);
+    assert_reserved_key_refusal(case, status, &body, "tags", &reserved);
     let tags = stored_tags(&router, case, &arn).await;
     assert_eq!(
         tags,
@@ -280,7 +294,7 @@ async fn untag_resource_refuses_a_reserved_key_and_removes_nothing() {
             }),
         )
         .await;
-        assert_tag_policy_refusal(&case, status, &body, &key);
+        assert_reserved_key_refusal(&case, status, &body, "tagKeys", &key);
 
         let tags = stored_tags(&router, &case, &arn).await;
         assert_eq!(
@@ -425,7 +439,7 @@ async fn untag_resource_refuses_the_whole_request_wherever_the_reserved_key_sits
             &json!({ "resourceArn": arn, "tagKeys": keys }),
         )
         .await;
-        assert_tag_policy_refusal(&case, status, &body, &named[0]);
+        assert_reserved_key_refusal(&case, status, &body, "tagKeys", &named[0]);
         let message = body["message"].as_str().unwrap_or_default();
         for key in &named[1..] {
             assert!(

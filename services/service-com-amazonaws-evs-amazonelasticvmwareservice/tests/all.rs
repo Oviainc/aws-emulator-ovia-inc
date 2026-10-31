@@ -48,6 +48,8 @@ mod created_environment_hosts;
 mod delete_entitlement;
 #[path = "all/depot_url.rs"]
 mod depot_url;
+#[path = "all/deprecated_tagging_errors.rs"]
+mod deprecated_tagging_errors;
 #[path = "all/eip_allocation_existence.rs"]
 mod eip_allocation_existence;
 #[path = "all/eip_association_existence.rs"]

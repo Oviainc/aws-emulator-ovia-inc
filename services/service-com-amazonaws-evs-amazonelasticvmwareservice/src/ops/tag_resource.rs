@@ -6,10 +6,11 @@
 //! `@idempotent`, so a merge that leaves the stored tag map exactly as it was modified
 //! the resource not at all and its `modifiedAt` stays where it was. A tag key in
 //! AWS's reserved `aws:` namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched
-//! however it is cased) is refused with this operation's own tag-policy refusal and
+//! however it is cased) is refused with a `ValidationException` (HTTP 400) naming the
+//! `tags` member, and
 //! writes nothing — a rule about the REQUEST, so it is judged before the ARN is
-//! resolved: a request that is both unservable and addressed to no resource draws the
-//! tag-policy refusal. A resource with
+//! resolved: a request that is both unservable and addressed to no resource draws that
+//! refusal. A resource with
 //! more than 200 tags is refused; an ARN this service holds no environment for is a
 //! `ResourceNotFoundException` — the tagging surface's own, answered with HTTP 400 and
 //! carrying the request's `resourceArn` (see `crate::scaffolded`). An environment is a
@@ -106,17 +107,26 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.evs#TagResource",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
+    /// Listed by the model and LEFT UNUSED: its own documentation says this shape is
+    /// superseded by `ValidationException`, which is what the reserved-tag-key refusal
+    /// below answers — the same reading that leaves `TooManyTagsException` unused.
     TagPolicyException(TagPolicyException),
+    /// Listed by the model and LEFT UNUSED: superseded by
+    /// `ServiceQuotaExceededException`, which is what the 200-tag bound answers.
     TooManyTagsException(TooManyTagsException),
     /// Widened in from the service's own error set (this operation does not list it):
     /// the one honest answer when this service's store cannot be reached at all.
     InternalServerException(InternalServerException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the shape each deprecated tagging error names as its replacement, and the one
+    /// this service reports a refused input member with everywhere else.
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -193,18 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A tag key in AWS's reserved namespace is not the caller's to write: the
         // `aws:` prefix marks a tag Amazon Web Services applies itself, and the
         // modelled `TagKey` pattern admits a colon, so the refusal is this handler's.
-        // It is the operation's own tag-policy refusal (HTTP 400), and nothing is
-        // stored — the request is judged before any tag is merged.
-        if let Some(refusal) = crate::state::reserved_tag_key_refusal(
+        // It is reported as a `ValidationException` (HTTP 400) naming the member that
+        // carried the key: the tag-policy shape this operation lists documents itself
+        // as superseded by that one, exactly as the 200-tag shape below documents
+        // itself as superseded by the quota error. Nothing is stored — the request is
+        // judged before any tag is merged.
+        if let Some(refusal) = crate::state::reserved_tag_key_validation_error(
             "tags",
             input.tags.keys().map(String::as_str),
         ) {
-            return Err(
-                TagResourceErrorModeled::TagPolicyException(TagPolicyException {
-                    message: refusal,
-                })
-                .into(),
-            );
+            return Err(TagResourceErrorModeled::ValidationException(refusal).into());
         }
 
         let environment = state

@@ -552,6 +552,22 @@ pub fn reserved_tag_key_failure<'a, I: IntoIterator<Item = &'a str>>(
         .map(|message| field_failure_stated(member, message))
 }
 
+/// The `ValidationException` refusing `member` for carrying tag keys in the reserved
+/// [`RESERVED_TAG_KEY_PREFIX`] namespace, or `None` when it carries none.
+///
+/// The single refusal every operation that takes tag keys from the request answers
+/// with: the reservation is one service rule, so it is reported in one shape, with the
+/// `reason` and `fieldList` a client reads to learn WHICH member it must correct. The
+/// two deprecated tagging error shapes the model still binds (`TagPolicyException`,
+/// `TooManyTagsException`) each name their replacement in their own documentation, so
+/// the refusal is the replacement.
+pub fn reserved_tag_key_validation_error<'a, I: IntoIterator<Item = &'a str>>(
+    member: &str,
+    keys: I,
+) -> Option<ValidationException> {
+    reserved_tag_key_failure(member, keys).map(|failure| aggregate_validation_error(vec![failure]))
+}
+
 /// A `ValidationException` refusing a request that no single member explains.
 pub fn request_validation_error(message: impl Into<String>) -> ValidationException {
     ValidationException {
