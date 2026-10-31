@@ -4811,12 +4811,21 @@ pub struct IngestPublisher {
 /// `IngestConfiguration$state` is `ACTIVE` "if a publisher currently is publishing to
 /// the stage associated with the ingest configuration", so a publisher of a
 /// configuration is a participant of a session of THAT stage which is still
-/// [`PARTICIPANT_STATE_CONNECTED`] and which reached the stage with this
+/// [`PARTICIPANT_STATE_CONNECTED`], which is publishing MEDIA to that session right now
+/// ([`StageSessionRecord::is_publishing`]), and which reached the stage with this
 /// configuration's credentials — recorded with the configuration's ARN, or publishing
 /// as one of the participants its ingest credentials were minted for. Those are the
 /// records the stage's data plane writes ([`join_stage_session`]) and
 /// `ListParticipants` reports; a configuration associated with no stage
 /// ([`NO_ASSOCIATED_STAGE_ARN`]) has nothing to publish to, so it has no publisher.
+///
+/// Connection alone is NOT enough: a participant that joined to subscribe only, and one
+/// whose media has stopped, is connected to the stage without publishing to it, and the
+/// member's condition is "currently is publishing". The same wording governs what hangs
+/// off this lookup — a delete refuses only while "the publisher is actively streaming to
+/// a stage", and `force` disconnects the participant only "when a participant is actively
+/// publishing" — so publishing is required here, in the one place, rather than at each
+/// caller.
 ///
 /// The ONE lookup for "is a publisher broadcasting with this configuration", so what a
 /// read reports about a configuration and what a delete refuses over cannot disagree.
@@ -4834,6 +4843,12 @@ pub fn ingest_configuration_publishers(
     for session in sessions {
         for participant in &session.participants {
             if participant.state != PARTICIPANT_STATE_CONNECTED {
+                continue;
+            }
+            // Publishing right now, read off the session's own occurrences through the
+            // crate's single answer to that question — not `ParticipantRecord::published`,
+            // which is "whether the participant EVER published" and stays set once set.
+            if !session.is_publishing(&participant.participant_id) {
                 continue;
             }
             let publishes_with_configuration = configuration.publishes_participant(participant);

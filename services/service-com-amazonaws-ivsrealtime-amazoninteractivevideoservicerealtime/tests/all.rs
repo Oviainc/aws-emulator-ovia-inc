@@ -75,6 +75,8 @@ mod get_participant;
 mod get_stage_session;
 #[path = "all/get_storage_configuration.rs"]
 mod get_storage_configuration;
+#[path = "all/ingest_configuration_publishing_state.rs"]
+mod ingest_configuration_publishing_state;
 #[path = "all/ingest_configurations.rs"]
 mod ingest_configurations;
 #[path = "all/layout_empty_string_defaults.rs"]
