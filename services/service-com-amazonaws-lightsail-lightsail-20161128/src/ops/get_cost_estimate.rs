@@ -202,18 +202,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // against — exactly as it is for the operations that report them.
         let region = crate::state::request_region(ctx.parts());
 
+        // "The cost estimate start time" / "The cost estimate end time": the
+        // modelled `TimePeriod` is "start date is inclusive, but the end date is
+        // exclusive", so a window whose end does not follow its start holds no
+        // instant at all and there is nothing to estimate over it. The refusal is
+        // [`crate::state::inverted_window_refusal`], which names both bounds as
+        // the instants they are — this service answers that pair the same way
+        // wherever it takes one.
+        if let Some(message) =
+            crate::state::inverted_window_refusal(input.start_time, input.end_time)
+        {
+            return Err(invalid(message));
+        }
+
         let start_ms = epoch_millis(input.start_time, "startTime")?;
         let end_ms = epoch_millis(input.end_time, "endTime")?;
-        // The modelled `TimePeriod` is "start date is inclusive, but the end date
-        // is exclusive", so a window whose end is not after its start holds no
-        // instant at all and there is nothing to estimate over it.
-        if end_ms <= start_ms {
-            return Err(invalid(
-                "endTime must name an instant after startTime: a cost estimate window \
-                 includes startTime and excludes endTime"
-                    .to_string(),
-            ));
-        }
 
         let billed = crate::state::with_state(&*self.engine, |store| {
             billed_resources(store, &region, &input.resource_name)

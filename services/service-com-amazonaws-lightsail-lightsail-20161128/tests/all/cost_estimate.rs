@@ -910,6 +910,183 @@ async fn a_request_that_cannot_be_estimated_is_refused() {
     }
 }
 
+/// One window this operation refuses, and the text each of its bounds is named
+/// by in the refusal.
+///
+/// Every sub-second part below is a negative power of two, so the JSON number
+/// the request carries is the instant exactly and the expected text is the one
+/// rendering of it.
+#[derive(Debug)]
+struct RefusedWindow {
+    case: &'static str,
+    start: f64,
+    end: f64,
+    start_text: &'static str,
+    end_text: &'static str,
+}
+
+/// The windows an estimate cannot be made over: inverted by whole seconds, by a
+/// fraction of one second, across and before the epoch, and the two ways one
+/// instant can be named twice.
+const REFUSED_WINDOWS: &[RefusedWindow] = &[
+    RefusedWindow {
+        case: "inverted by whole seconds",
+        start: 1_700_000_000.0,
+        end: 1_699_999_000.0,
+        start_text: "1700000000",
+        end_text: "1699999000",
+    },
+    RefusedWindow {
+        case: "inverted inside one second",
+        start: 1_700_000_000.75,
+        end: 1_700_000_000.25,
+        start_text: "1700000000.75",
+        end_text: "1700000000.25",
+    },
+    RefusedWindow {
+        case: "inverted by an eighth of a second, ending on a whole one",
+        start: 1_700_000_000.125,
+        end: 1_700_000_000.0,
+        start_text: "1700000000.125",
+        end_text: "1700000000",
+    },
+    RefusedWindow {
+        case: "inverted across the epoch",
+        start: 0.5,
+        end: -0.5,
+        start_text: "0.5",
+        end_text: "-0.5",
+    },
+    RefusedWindow {
+        case: "inverted before the epoch, inside one second",
+        start: -0.25,
+        end: -0.75,
+        start_text: "-0.25",
+        end_text: "-0.75",
+    },
+    RefusedWindow {
+        case: "inverted before the epoch, by whole seconds",
+        start: -100.0,
+        end: -200.0,
+        start_text: "-100",
+        end_text: "-200",
+    },
+    RefusedWindow {
+        case: "the same whole second twice",
+        start: 1_700_000_000.0,
+        end: 1_700_000_000.0,
+        start_text: "1700000000",
+        end_text: "1700000000",
+    },
+    RefusedWindow {
+        case: "the same sub-second instant twice",
+        start: 1_700_000_000.5,
+        end: 1_700_000_000.5,
+        start_text: "1700000000.5",
+        end_text: "1700000000.5",
+    },
+];
+
+/// RULE: a window whose `endTime` does not follow its `startTime` is refused
+/// with the one sentence this service answers that pair with wherever it takes
+/// one, naming each bound as the INSTANT that member carried — sub-second part
+/// and sign included — so a window inverted inside one second, or one lying
+/// before the epoch, states the reason for its own refusal rather than two equal
+/// whole seconds. The `inverted_time_window` suite pins the same sentence across
+/// every operation that takes such a pair.
+#[tokio::test(flavor = "current_thread")]
+async fn an_inverted_window_refusal_names_each_bound_as_the_instant_it_carried() {
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateBucket",
+            json!({"bucketName": "window-probe", "bundleId": "small_1_0"}),
+        )
+        .await;
+
+    for window in REFUSED_WINDOWS {
+        let case = window.case;
+        let (status, refused) = emulator
+            .call(
+                "GetCostEstimate",
+                json!({
+                    "resourceName": "window-probe",
+                    "startTime": window.start,
+                    "endTime": window.end,
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case a window {case}: expected HTTP 400, got {status} {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "InvalidInputException",
+            "case a window {case}: expected the wire error InvalidInputException, got {refused:?}"
+        );
+        let want = crate::inverted_time_window::inverted_window_message(
+            window.start_text,
+            window.end_text,
+        );
+        assert_eq!(
+            refused["message"].as_str(),
+            Some(want.as_str()),
+            "case a window {case}: expected the refusal to name both instants, {want:?}, \
+             got {refused:?}"
+        );
+    }
+}
+
+/// RULE: the refusal keys on the ORDER of the two instants, so a window whose
+/// end follows its start — by a whole hour, by a fraction of a second, or by a
+/// fraction of a millisecond — is estimated like any other.
+#[tokio::test(flavor = "current_thread")]
+async fn a_forward_window_inside_one_second_is_estimated() {
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateBucket",
+            json!({"bucketName": "forward-probe", "bundleId": "small_1_0"}),
+        )
+        .await;
+
+    // A whole second, so the millisecond each bound falls in is the one its own
+    // fraction names: the last row's two bounds share one millisecond and are
+    // still two instants in order.
+    let base = (now_epoch_seconds() + WINDOW_STARTS_IN_SECONDS).floor();
+    let windows: &[(&str, f64, f64)] = &[
+        ("one hour", base, base + 3_600.0),
+        ("half a second", base + 0.25, base + 0.75),
+        ("an eighth of a millisecond", base + 0.001, base + 0.001_125),
+    ];
+
+    for (case, start, end) in windows {
+        let (status, body) = emulator
+            .call(
+                "GetCostEstimate",
+                json!({
+                    "resourceName": "forward-probe",
+                    "startTime": start,
+                    "endTime": end,
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case a window of {case}: expected HTTP 200, got {status} {body:?}"
+        );
+        let estimates = body["resourcesBudgetEstimate"].as_array().unwrap_or_else(|| {
+            panic!("case a window of {case}: expected a resourcesBudgetEstimate array, got {body:?}")
+        });
+        assert_eq!(
+            estimates.len(),
+            1,
+            "case a window of {case}: expected the one resource the name addresses, got {body:?}"
+        );
+    }
+}
+
 /// RULE: estimating a cost is a READ — two estimates of the same window agree,
 /// and the resources they were made from are untouched afterwards.
 #[tokio::test(flavor = "current_thread")]

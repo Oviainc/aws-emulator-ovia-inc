@@ -81,8 +81,10 @@ type WindowRequest = fn(f64, f64) -> Value;
 /// SOURCE: the modelled inputs carrying both members, from
 /// `smithy_query(query="operation",operation="GetInstanceMetricData,\
 /// GetContainerServiceMetricData,GetBucketMetricData,GetDistributionMetricData,\
-/// GetContainerLog,GetRelationalDatabaseLogEvents")` — the two log readers model
-/// the pair as optional, the four metric readers as `@required`.
+/// GetLoadBalancerMetricData,GetRelationalDatabaseMetricData,GetContainerLog,\
+/// GetRelationalDatabaseLogEvents,GetCostEstimate")` — the two log readers model
+/// the pair as optional, the six metric readers and the cost estimator as
+/// `@required`.
 const WINDOW_TAKERS: &[(&str, Option<&str>, WindowRequest)] = &[
     ("GetInstanceMetricData", None, instance_metric_request),
     (
@@ -96,12 +98,23 @@ const WINDOW_TAKERS: &[(&str, Option<&str>, WindowRequest)] = &[
         Some(DISTRIBUTION_REGION),
         distribution_metric_request,
     ),
+    (
+        "GetLoadBalancerMetricData",
+        None,
+        load_balancer_metric_request,
+    ),
+    (
+        "GetRelationalDatabaseMetricData",
+        None,
+        relational_database_metric_request,
+    ),
     ("GetContainerLog", None, container_log_request),
     (
         "GetRelationalDatabaseLogEvents",
         None,
         relational_database_log_request,
     ),
+    ("GetCostEstimate", None, cost_estimate_request),
 ];
 
 fn instance_metric_request(start: f64, end: f64) -> Value {
@@ -151,6 +164,30 @@ fn distribution_metric_request(start: f64, end: f64) -> Value {
     })
 }
 
+fn load_balancer_metric_request(start: f64, end: f64) -> Value {
+    json!({
+        "loadBalancerName": "window-probe",
+        "metricName": "RequestCount",
+        "unit": "Count",
+        "period": 300,
+        "statistics": ["Sum"],
+        "startTime": start,
+        "endTime": end,
+    })
+}
+
+fn relational_database_metric_request(start: f64, end: f64) -> Value {
+    json!({
+        "relationalDatabaseName": "window-probe",
+        "metricName": "CPUUtilization",
+        "unit": "Percent",
+        "period": 300,
+        "statistics": ["Average"],
+        "startTime": start,
+        "endTime": end,
+    })
+}
+
 fn container_log_request(start: f64, end: f64) -> Value {
     json!({
         "serviceName": "window-probe",
@@ -164,6 +201,14 @@ fn relational_database_log_request(start: f64, end: f64) -> Value {
     json!({
         "relationalDatabaseName": "window-probe",
         "logStreamName": "error",
+        "startTime": start,
+        "endTime": end,
+    })
+}
+
+fn cost_estimate_request(start: f64, end: f64) -> Value {
+    json!({
+        "resourceName": "window-probe",
         "startTime": start,
         "endTime": end,
     })
