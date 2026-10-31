@@ -3551,6 +3551,11 @@ pub fn customer_ephemeris_metadata(ephemeris: &Ephemeris) -> EphemerisMetaData {
 /// The tie-breaks are CHOSEN, so the answer is total and stable whatever order the store
 /// iterates in: of equal priority the most recently created wins (the later upload is the
 /// newer trajectory), and of equal creation instant the larger `ephemerisId`.
+///
+/// This is the ONE order every caller that asks the question takes, both the satellite
+/// coupling ([`ComAmazonawsGroundstationGroundstationState::ephemerides_in_force`]) and the
+/// availability search that reads a pass's geometry from the ephemeris in force for the
+/// instants it covers ([`ComAmazonawsGroundstationGroundstationState::pointing_passes`]).
 fn ephemeris_precedence(left: &Ephemeris, right: &Ephemeris) -> ::std::cmp::Ordering {
     left.priority
         .cmp(&right.priority)
@@ -5854,12 +5859,12 @@ impl ComAmazonawsGroundstationGroundstationState {
     /// multiple ephemerides overlap", so two that do NOT overlap each describe passes of
     /// their own.
     ///
-    /// Where two ephemerides describe the same instants, the HIGHER PRIORITY one is the one
-    /// used — `priority` is "a priority score that determines which ephemeris to use when
-    /// multiple ephemerides overlap. Higher numbers take precedence."
-    /// (`smithy_query(query="shape", shape="EphemerisItem")`) — so a pass overlapping one
-    /// already read from a higher-priority ephemeris is left out, and ties are broken by
-    /// `ephemerisId` so the answer is the same on every call.
+    /// Where two ephemerides describe the same instants, the one of higher PRECEDENCE is the
+    /// one used — the crate's one order for "which of several held for a satellite is in
+    /// force" ([`ephemeris_precedence`]), so a pass overlapping one already read from an
+    /// ephemeris of higher precedence is left out, and the answer a caller is offered names
+    /// the same ephemeris a satellite read reports as the one its trajectory is computed
+    /// from.
     ///
     /// Only the az/el form yields a pass: it IS pointing angles for one station, so the
     /// geometry is READ rather than computed. A `tle` or `oem` ephemeris carries orbital
@@ -5900,13 +5905,12 @@ impl ComAmazonawsGroundstationGroundstationState {
                     .map(|segments| (ephemeris, segments))
             })
             .collect();
-        in_force.sort_by(|first, second| {
-            second
-                .0
-                .priority
-                .cmp(&first.0.priority)
-                .then_with(|| first.0.ephemeris_id.cmp(&second.0.ephemeris_id))
-        });
+        // Precedence-DESCENDING, so the one in force is read first and whatever it describes
+        // is what an overlapping pass is left out in favour of. The order is
+        // [`ephemeris_precedence`]'s, the crate's single answer to this question, so this
+        // search and a satellite read cannot name two different ephemerides as the one in
+        // force for the same satellite at the same instant.
+        in_force.sort_by(|first, second| ephemeris_precedence(second.0, first.0));
 
         let mut budget = MAX_POINTING_POINTS_READ;
         // Held in start-time order and never overlapping, so the pass before the candidate

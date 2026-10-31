@@ -155,7 +155,7 @@ async fn update_ok(router: &MultiServiceRouter, case: &str, ephemeris_id: &str, 
 
 /// The `ephemerisId` `GetSatellite` reports as the satellite's `currentEphemeris`, or
 /// `None` where the account holds none in force for it.
-async fn current_ephemeris(
+pub(crate) async fn current_ephemeris(
     router: &MultiServiceRouter,
     case: &str,
     satellite_id: &str,

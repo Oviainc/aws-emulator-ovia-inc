@@ -57,7 +57,7 @@ use crate::scheduling_loop::{
 /// pointing data is supplied for. A `GroundStationName` is 4..97 characters of
 /// `[ a-zA-Z0-9-._:=]` (`smithy_query(query="shape", shape="GroundStationName")`), so the
 /// space is part of the name AWS spells its stations with.
-const GROUND_STATION: &str = "Ohio 1";
+pub(crate) const GROUND_STATION: &str = "Ohio 1";
 
 /// A second ground station, so "supplied for another station" is a case this suite can put.
 const OTHER_GROUND_STATION: &str = "Oregon 1";
@@ -69,7 +69,7 @@ const NORAD: (i32, i32) = (25_994, 27_424);
 /// `now`, in epoch seconds: the availability rules are about what can STILL be flown, so
 /// every window this suite stores is placed relative to the clock rather than at a fixed
 /// instant.
-fn now_seconds() -> i64 {
+pub(crate) fn now_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after the epoch")
@@ -79,10 +79,10 @@ fn now_seconds() -> i64 {
 /// One segment of azimuth-elevation pointing data: the reference epoch its points are offset
 /// from, the validity range the segment declares its data covers, and its time-tagged
 /// elevations as `(dt, el)`.
-struct Segment {
-    reference_epoch: i64,
-    valid: (i64, i64),
-    points: Vec<(f64, f64)>,
+pub(crate) struct Segment {
+    pub(crate) reference_epoch: i64,
+    pub(crate) valid: (i64, i64),
+    pub(crate) points: Vec<(f64, f64)>,
 }
 
 impl Segment {
@@ -105,7 +105,7 @@ impl Segment {
 /// An `azEl` ephemeris body: pointing angles for `ground_station`, measured in `angle_unit`
 /// (an `AngleUnits` value — `smithy_query(query="shape", shape="AngleUnits")`), carrying
 /// `segments`.
-fn az_el(ground_station: &str, angle_unit: &str, segments: &[Segment]) -> Value {
+pub(crate) fn az_el(ground_station: &str, angle_unit: &str, segments: &[Segment]) -> Value {
     let list: Vec<Value> = segments.iter().map(Segment::body).collect();
     json!({"azEl": {
         "groundStation": ground_station,
@@ -115,7 +115,7 @@ fn az_el(ground_station: &str, angle_unit: &str, segments: &[Segment]) -> Value 
 
 /// A `CreateEphemeris` body for `data`, named `name`, applying to `satellite_id` when one is
 /// named, asking for it to be enabled or not, at `priority` when one is named.
-fn ephemeris_body(
+pub(crate) fn ephemeris_body(
     name: &str,
     satellite_id: Option<&str>,
     enabled: bool,
@@ -180,7 +180,7 @@ async fn list(router: &MultiServiceRouter, body: Value) -> Reply {
 }
 
 /// `ListContacts` with `body`, asserting it was ANSWERED, and the page it carries.
-async fn list_ok(router: &MultiServiceRouter, case: &str, body: Value) -> Vec<Value> {
+pub(crate) async fn list_ok(router: &MultiServiceRouter, case: &str, body: Value) -> Vec<Value> {
     let reply = list(router, body).await;
     assert_eq!(
         reply.status, 200,
@@ -250,7 +250,7 @@ async fn offered_pages(
 
 /// An `AVAILABLE` search over `window` for the pairing of `satellite_arn`, [`GROUND_STATION`]
 /// and `profile_arn`, with the members of `extra` added.
-fn availability(
+pub(crate) fn availability(
     window: (i64, i64),
     satellite_arn: &str,
     profile_arn: &str,
@@ -272,12 +272,12 @@ fn availability(
 
 /// A number-valued member of `item`, or `f64::NAN` when it carries none — so a missing
 /// member fails the comparison it is part of rather than panicking here.
-fn number(item: &Value, member: &str) -> f64 {
+pub(crate) fn number(item: &Value, member: &str) -> f64 {
     item.get(member).and_then(Value::as_f64).unwrap_or(f64::NAN)
 }
 
 /// A string-valued member of `item`, empty when it carries none.
-fn text(item: &Value, member: &str) -> String {
+pub(crate) fn text(item: &Value, member: &str) -> String {
     item.get(member)
         .and_then(Value::as_str)
         .unwrap_or_default()

@@ -85,6 +85,8 @@ mod ephemeris_deletion;
 mod ephemeris_description;
 #[path = "all/ephemeris_expiration.rs"]
 mod ephemeris_expiration;
+#[path = "all/ephemeris_in_force_agreement.rs"]
+mod ephemeris_in_force_agreement;
 #[path = "all/ephemeris_in_use_writes.rs"]
 mod ephemeris_in_use_writes;
 #[path = "all/ephemeris_supersession.rs"]
