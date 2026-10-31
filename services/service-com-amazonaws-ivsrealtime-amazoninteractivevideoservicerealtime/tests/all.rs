@@ -113,6 +113,8 @@ mod participant_replication_stop;
 mod participants;
 #[path = "all/region_scoped_resources.rs"]
 mod region_scoped_resources;
+#[path = "all/replica_participant_recording.rs"]
+mod replica_participant_recording;
 #[path = "all/replica_rejoin_identity.rs"]
 mod replica_rejoin_identity;
 #[path = "all/replicated_participant_views.rs"]

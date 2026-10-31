@@ -252,6 +252,22 @@ pub fn effective_recording_configuration(
     }
 }
 
+/// Whether `configuration` records a participant that is a REPLICA of another stage.
+///
+/// `recordParticipantReplicas` is the member that says so — "Optional field to disable
+/// replica participant recording" — carrying what the request set it to where it set it,
+/// and [`DEFAULT_RECORD_PARTICIPANT_REPLICAS`] where it did not. The ONE reading of that
+/// member, so what a read of a participant reports about its recording and what an update
+/// refuses over cannot disagree about it.
+pub fn records_participant_replicas(
+    configuration: &AutoParticipantRecordingConfiguration,
+) -> bool {
+    documented_default(
+        configuration.record_participant_replicas,
+        DEFAULT_RECORD_PARTICIPANT_REPLICAS,
+    )
+}
+
 /// The dotted path of the member that names the storage configuration a stage records
 /// its participants into, as the wire spells it — what a refusal of that member names.
 pub const RECORDING_STORAGE_CONFIGURATION_MEMBER: &str =
@@ -2299,16 +2315,24 @@ pub fn participant_recording_prefix(session_id: &str, participant_id: &str) -> S
 /// recorded, or [`ParticipantRecordingLocation::not_recorded`] when nothing records it.
 ///
 /// Both members report their value only "if individual participant recording is
-/// enabled", which takes two things. Recording is enabled on the STAGE: its
-/// `autoParticipantRecordingConfiguration` names the storage configuration the media is
-/// written to, and [`NO_STORAGE_CONFIGURATION_ARN`] is that member's documented "no
-/// storage configuration is specified". And it is the RECORDER that reports whether this
+/// enabled", and the stage's `autoParticipantRecordingConfiguration` states every
+/// condition of that, each on one of its members. Recording has somewhere to go:
+/// `storageConfigurationArn` names the storage configuration the media is written to, and
+/// [`NO_STORAGE_CONFIGURATION_ARN`] is that member's documented "no storage configuration
+/// is specified". And the configuration does not EXCLUDE this participant:
+/// `recordParticipantReplicas` is "an optional field to disable replica participant
+/// recording. If this is set to `false` when a participant is a replica, replica
+/// participants are not recorded" — so a participant this session holds as a
+/// [`REPLICATION_TYPE_REPLICA`] ([`session_participant_is_replica`], the one answer the
+/// reported `replicationType` is read from too) is recorded nowhere on a stage whose
+/// configuration turns replica recording off, whatever storage it names.
+///
+/// Beside the stage's own configuration it is the RECORDER that reports whether this
 /// participant is being recorded, which [`ParticipantRecord::recording_state`] holds:
 /// [`NOT_RECORDED_PARTICIPANT_RECORDING_STATE`] is the one value of
 /// `ParticipantRecordingState` that is not a state of a running recording, so a
-/// participant carrying it is recorded nowhere even on a stage that configures storage,
-/// and the two members answer the empty string exactly when `recordingState` says
-/// nothing records it.
+/// participant carrying it is recorded nowhere even on a stage that configures storage.
+/// The two members answer the empty string exactly when one of those conditions fails.
 ///
 /// The bucket is then the one that storage configuration holds
 /// ([`StorageConfigurationRecord::bucket_name`]) and the prefix is
@@ -2324,20 +2348,24 @@ pub fn participant_recording_location(
     if record.recording_state == NOT_RECORDED_PARTICIPANT_RECORDING_STATE {
         return ParticipantRecordingLocation::not_recorded();
     }
-    let configured = state
+    let Some(configuration) = state
         .stages
         .get(stage_arn)
-        .map(|stage| {
-            stage
-                .auto_participant_recording_configuration
-                .storage_configuration_arn
-                .as_str()
-        })
+        .map(|stage| &stage.auto_participant_recording_configuration)
+    else {
+        return ParticipantRecordingLocation::not_recorded();
+    };
+    if !records_participant_replicas(configuration)
+        && session_participant_is_replica(state, stage_arn, session_id, &record.participant_id)
+    {
+        return ParticipantRecordingLocation::not_recorded();
+    }
+    let storage = Some(configuration.storage_configuration_arn.as_str())
         .filter(|arn| *arn != NO_STORAGE_CONFIGURATION_ARN)
         .and_then(|arn| state.storage_configurations.get(arn));
-    match configured {
-        Some(configuration) => ParticipantRecordingLocation {
-            bucket_name: configuration.bucket_name.clone(),
+    match storage {
+        Some(storage) => ParticipantRecordingLocation {
+            bucket_name: storage.bucket_name.clone(),
             prefix: participant_recording_prefix(session_id, &record.participant_id),
         },
         None => ParticipantRecordingLocation::not_recorded(),
@@ -2363,12 +2391,14 @@ pub struct RecordingParticipant {
 /// participant reports about its recording and what an update refuses over cannot
 /// disagree: a recording is running for a participant that is still
 /// [`PARTICIPANT_STATE_CONNECTED`], whose recorder state is a running one
-/// ([`participant_recording_running`]), and whose media has somewhere to go — the stage's
-/// `autoParticipantRecordingConfiguration` names a storage configuration this store
-/// holds, which is exactly when [`participant_recording_location`] reports a bucket for
-/// it ("Individual participant recording cannot be started unless a storage configuration
-/// is specified", as `AutoParticipantRecordingConfiguration$storageConfigurationArn`
-/// states).
+/// ([`participant_recording_running`]), and whose media has somewhere to go that the
+/// stage's `autoParticipantRecordingConfiguration` does not exclude it from — which is
+/// exactly when [`participant_recording_location`] reports a bucket for it: the
+/// configuration names a storage configuration this store holds ("Individual participant
+/// recording cannot be started unless a storage configuration is specified", as
+/// `AutoParticipantRecordingConfiguration$storageConfigurationArn` states) and, for a
+/// participant that is a replica, it has not turned replica recording off
+/// ([`records_participant_replicas`]).
 pub fn stage_recording_participants(
     state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     stage_arn: &str,
@@ -3758,6 +3788,24 @@ pub fn session_participant_replications(
         }
     }
     replications
+}
+
+/// Whether the participant `participant_id` of the session `session_id` of `stage_arn` is
+/// a [`REPLICATION_TYPE_REPLICA`] there — a participant a replication runs INTO this
+/// session.
+///
+/// Read off [`session_participant_replications`], the crate's one answer to what a
+/// participant of a session reports about replication, so "is this participant a replica"
+/// and the `replicationType` that same participant reports cannot disagree.
+pub fn session_participant_is_replica(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    session_id: &str,
+    participant_id: &str,
+) -> bool {
+    session_participant_replications(state, stage_arn, session_id)
+        .get(participant_id)
+        .is_some_and(|replication| replication.replication_type == REPLICATION_TYPE_REPLICA)
 }
 
 /// Which of two replications a participant of one session reports, when more than one
