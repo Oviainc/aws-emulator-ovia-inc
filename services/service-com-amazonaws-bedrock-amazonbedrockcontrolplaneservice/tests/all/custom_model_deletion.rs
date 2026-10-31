@@ -14,9 +14,15 @@
 //!    untouched, and the operation answers 200 with an empty body (its output shape has no
 //!    members).
 //! 2. **An identifier that resolves to no custom model of this account and Region is
-//!    refused** with 404 `ResourceNotFoundException` carrying this resource's one not-found
-//!    sentence — including the identifier of a model this suite has already deleted, which
-//!    is what makes two deletes racing for one model answer exactly one success.
+//!    refused as the spelling it IS** — including the identifier of a model this suite has
+//!    already deleted, which is what makes two deletes racing for one model answer exactly
+//!    one success: an ARN that names no model is the missing ARN `ResourceNotFoundException`
+//!    reports (404, "The specified resource Amazon Resource Name (ARN) was not found",
+//!    `smithy_query(query="shape",shape="ResourceNotFoundException")`) carrying this
+//!    resource's not-found sentence, while a bare NAME that resolves to nothing is no ARN to
+//!    report missing but an identifier the service could not resolve — 400
+//!    `ValidationException` with Amazon Bedrock's one sentence for that class, exactly as
+//!    `GetCustomModel` refuses the same two spellings.
 //! 3. **A delete leaves the model's NAME free**, so a later create may mint a new model
 //!    under it — a different model, with its own ARN.
 //! 4. **A model a custom model deployment is still serving is not removed**: that
@@ -43,9 +49,13 @@ use crate::support::{emulator, label, Emulator, Reply, ACCOUNT, REGION};
 // Values this service and the model fix for these rows.
 // ---------------------------------------------------------------------------------------
 
-/// The one sentence a request addressing a custom model this account does not hold is
+/// The one sentence a request addressing a custom model ARN this account does not hold is
 /// refused with, as the service states it.
 const NOT_FOUND: &str = bedrock::state::CUSTOM_MODEL_NOT_FOUND_MESSAGE;
+
+/// The one sentence Amazon Bedrock states for a model identifier it cannot resolve to a
+/// model at all, as the service states it. Fixed text: it quotes no part of the request.
+const INVALID_IDENTIFIER: &str = bedrock::state::INVALID_MODEL_IDENTIFIER_MESSAGE;
 
 /// The base-model segment a `CustomModelArn` carries for a model created from artifacts.
 const IMPORTED_BASE: &str = bedrock::state::CUSTOM_MODEL_IMPORTED_BASE;
@@ -236,19 +246,38 @@ fn listed_arns(case: &str, reply: &Reply) -> Vec<String> {
         .collect()
 }
 
-/// Assert that `reply` is this resource's 404 refusal, carrying its one not-found sentence.
-fn assert_not_found(case: &str, reply: &Reply) {
+/// The refusal an identifier that resolves to no custom model draws, by the spelling it is:
+/// the missing-ARN report for an ARN, and the unresolvable-identifier report for a bare
+/// name.
+fn unresolved(spelling: Spelling) -> (Verdict, &'static str) {
+    match spelling {
+        Spelling::Arn => (
+            (404, Some("ResourceNotFoundException".to_string())),
+            NOT_FOUND,
+        ),
+        Spelling::Name => (
+            (400, Some("ValidationException".to_string())),
+            INVALID_IDENTIFIER,
+        ),
+    }
+}
+
+/// Assert that `reply` is the refusal an unresolvable identifier of `spelling` draws, status,
+/// error code and sentence together.
+fn assert_unresolved(case: &str, spelling: Spelling, reply: &Reply) {
+    let (expected, message) = unresolved(spelling);
     assert_eq!(
         verdict(reply),
-        (404, Some("ResourceNotFoundException".to_string())),
-        "case {case:?}: expected 404 ResourceNotFoundException, got {} {:?}",
+        expected,
+        "case {case:?}: expected {expected:?} for a {spelling:?} that resolves to no model, \
+         got {} {:?}",
         reply.status,
         reply.body
     );
     assert_eq!(
         reply.get("message"),
-        json!(NOT_FOUND),
-        "case {case:?}: expected the message {NOT_FOUND:?}, got {:?}",
+        json!(message),
+        "case {case:?}: expected the message {message:?}, got {:?}",
         reply.body
     );
 }
@@ -398,18 +427,11 @@ async fn a_delete_removes_the_model_whichever_spelling_names_it() {
             deleted.body
         );
 
-        // The model is gone from every way of reaching it. A read of the ARN reports it
-        // missing with this resource's not-found sentence; a read of the bare NAME is
-        // refused as the spelling it is — `GetCustomModel`'s own rule for an identifier it
-        // cannot resolve — so what this asserts of it is that it reports no model.
-        assert_not_found(case, &get(&emu, &arn).await);
-        let by_name = get(&emu, name).await;
-        assert_ne!(
-            by_name.status, 200,
-            "case {case:?}: a read of the deleted name {name} must report no model, got {} \
-             {:?}",
-            by_name.status, by_name.body
-        );
+        // The model is gone from every way of reaching it, and each way is refused as the
+        // spelling it carries: the ARN reports the missing ARN, the bare NAME reports an
+        // identifier that resolves to nothing.
+        assert_unresolved(case, Spelling::Arn, &get(&emu, &arn).await);
+        assert_unresolved(case, Spelling::Name, &get(&emu, name).await);
         let listed = listed_arns(case, &list(&emu).await);
         assert!(
             !listed.contains(&arn),
@@ -424,13 +446,13 @@ async fn a_delete_removes_the_model_whichever_spelling_names_it() {
 
         // A second delete finds nothing left — which is what makes two deletes racing for
         // one model answer exactly one success.
-        assert_not_found(case, &delete(&emu, &identifier).await);
-        assert_not_found(case, &delete(&emu, &arn).await);
+        assert_unresolved(case, spelling, &delete(&emu, &identifier).await);
+        assert_unresolved(case, Spelling::Arn, &delete(&emu, &arn).await);
     }
 }
 
 #[tokio::test]
-async fn an_identifier_that_names_no_custom_model_is_refused_as_not_found() {
+async fn an_identifier_that_names_no_custom_model_is_refused_as_the_spelling_it_is() {
     let emu = emulator();
 
     let live = "cm-present";
@@ -444,23 +466,54 @@ async fn an_identifier_that_names_no_custom_model_is_refused_as_not_found() {
         elsewhere.status, elsewhere.body
     );
 
-    // (case, the identifier the delete carries)
-    let unknown: Vec<(&str, String)> = vec![
-        ("a name no create ever used", "cm-absent".to_string()),
-        ("a prefix of a live name", "cm-presen".to_string()),
+    // `modelName` is `@length(min: 1, max: 63)`, so the name rows span both bounds beside
+    // the everyday spellings.
+    let longest_name = "a".repeat(63);
+    // (case, the identifier the delete carries, the spelling it is)
+    let unknown: Vec<(&str, String, Spelling)> = vec![
+        (
+            "a name no create ever used",
+            "cm-absent".to_string(),
+            Spelling::Name,
+        ),
+        (
+            "a prefix of a live name",
+            "cm-presen".to_string(),
+            Spelling::Name,
+        ),
         (
             "the name of a model that lives only in another region",
             "cm-elsewhere".to_string(),
+            Spelling::Name,
+        ),
+        (
+            "a shortest-possible name that names nothing",
+            "z".to_string(),
+            Spelling::Name,
+        ),
+        (
+            "a longest-possible name that names nothing",
+            longest_name,
+            Spelling::Name,
+        ),
+        (
+            // The member's pattern admits a bare `provider.model` id too, and no such id
+            // names a CUSTOM model: it is an identifier this operation cannot resolve.
+            "a bare foundation-model id",
+            fine_tuning_base_model().to_string(),
+            Spelling::Name,
         ),
         (
             "an in-region ARN of this account that names nothing",
             format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:custom-model/{IMPORTED_BASE}/aaaaaaaaaaaa"),
+            Spelling::Arn,
         ),
         (
             "an in-region ARN of another account",
             format!(
                 "arn:aws:bedrock:{REGION}:123456789012:custom-model/{IMPORTED_BASE}/aaaaaaaaaaaa"
             ),
+            Spelling::Arn,
         ),
         (
             "an in-region ARN whose base-model segment names a foundation model",
@@ -468,10 +521,11 @@ async fn an_identifier_that_names_no_custom_model_is_refused_as_not_found() {
                 "arn:aws:bedrock:{REGION}:{ACCOUNT}:custom-model/{}/aaaaaaaaaaaa",
                 fine_tuning_base_model()
             ),
+            Spelling::Arn,
         ),
     ];
-    for (case, identifier) in unknown {
-        assert_not_found(case, &delete(&emu, &identifier).await);
+    for (case, identifier, spelling) in unknown {
+        assert_unresolved(case, spelling, &delete(&emu, &identifier).await);
         // A refused delete removes nothing.
         assert_eq!(
             listed_arns(case, &list(&emu).await),

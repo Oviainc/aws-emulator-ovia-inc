@@ -1043,6 +1043,65 @@ pub const MAX_CUSTOM_MODELS_PER_ACCOUNT: usize = 100;
 /// model refuses an identifier it cannot resolve to one the same way.
 pub const CUSTOM_MODEL_NOT_FOUND_MESSAGE: &str = "Custom model not found.";
 
+/// The one sentence Amazon Bedrock states for a model identifier it cannot resolve to a
+/// model at all: RECORDED behaviour, and a FIXED sentence — it quotes no part of the
+/// request, so there is nothing of the caller's value in it.
+///
+/// Taken from the Bedrock Runtime emulator, which states the same refusal for the same
+/// class on the inference surface, rather than spelled a second time here: one wording for
+/// one sentence.
+pub const INVALID_MODEL_IDENTIFIER_MESSAGE: &str =
+    ::service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::state::INVALID_MODEL_IDENTIFIER_MESSAGE;
+
+/// How a `ModelIdentifier` that resolves to no custom model of this account and Region is
+/// refused — the ONE reading of that failure every operation addressing a custom model by
+/// that member shares ([`unresolved_custom_model`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnresolvedCustomModel {
+    /// The value is a `custom-model` ARN of this service's namespace that names no stored
+    /// model, so it is an ARN to report missing: `ResourceNotFoundException` (404), which is
+    /// what that error documents itself as ("The specified resource Amazon Resource Name
+    /// (ARN) was not found. Check the Amazon Resource Name (ARN) and try your request
+    /// again"), carrying [`CUSTOM_MODEL_NOT_FOUND_MESSAGE`].
+    MissingArn,
+    /// The value is one of the member's other spellings — a bare model NAME — that names no
+    /// model, so there is no ARN to report missing: it is an identifier this service could
+    /// not resolve, which is `ValidationException` (400) carrying
+    /// [`INVALID_MODEL_IDENTIFIER_MESSAGE`].
+    UnresolvableIdentifier,
+}
+
+impl UnresolvedCustomModel {
+    /// The sentence this refusal carries. Fixed text in both readings: neither quotes the
+    /// identifier the request addressed, so the two spellings of one missing model are told
+    /// apart by the error, never by a value echoed back.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::MissingArn => CUSTOM_MODEL_NOT_FOUND_MESSAGE,
+            Self::UnresolvableIdentifier => INVALID_MODEL_IDENTIFIER_MESSAGE,
+        }
+    }
+}
+
+/// How `identifier` — a `ModelIdentifier` that [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::custom_model`]
+/// resolved to nothing — is refused.
+///
+/// The member's `@pattern` admits the model's ARN **or** its bare name
+/// (`smithy_query(query="operation",operation="GetCustomModel,DeleteCustomModel")`), and the
+/// two unresolvable spellings are not the same failure, so which one the caller sent is read
+/// off the value through this crate's one ARN parse ([`names_arn_of`]). Stated once because
+/// the reading belongs to the RESOURCE rather than to one operation: a read and a delete of
+/// an identifier that resolves to no custom model refuse it alike.
+#[must_use]
+pub fn unresolved_custom_model(identifier: &str) -> UnresolvedCustomModel {
+    if names_arn_of(identifier, CUSTOM_MODEL_RESOURCE_TYPE) {
+        UnresolvedCustomModel::MissingArn
+    } else {
+        UnresolvedCustomModel::UnresolvableIdentifier
+    }
+}
+
 /// What a create whose artifacts are named by a `modelSourceConfig` answers as its
 /// `ValidationException` message when the request names no role Amazon Bedrock can read
 /// those artifacts as.

@@ -119,16 +119,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The one sentence Amazon Bedrock states for a model identifier it cannot resolve to a
-/// model: RECORDED behaviour, and a FIXED sentence — it quotes no part of the request, so
-/// there is nothing of the caller's value in it.
-///
-/// Taken from the Bedrock Runtime emulator, which states the same refusal for the same
-/// class on the inference surface, rather than spelled a second time here: one wording for
-/// one sentence.
-const INVALID_MODEL_IDENTIFIER: &str =
-    ::service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::state::INVALID_MODEL_IDENTIFIER_MESSAGE;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -215,36 +205,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(record) = store.custom_model(&input.model_identifier, &region, now) else {
             // `modelIdentifier` admits the model's ARN or its bare NAME, and the two
-            // unresolvable spellings are not the same failure. `ResourceNotFoundException`
-            // is documented as being about an ARN — "The specified resource Amazon
-            // Resource Name (ARN) was not found. Check the Amazon Resource Name (ARN) and
-            // try your request again" — so an ARN that names no model of this account and
-            // Region is what it reports, carrying the one sentence Amazon Bedrock states for
-            // a custom model it cannot find
-            // ([`crate::state::CUSTOM_MODEL_NOT_FOUND_MESSAGE`]) — the sentence every
-            // operation of this resource refuses that class with. A bare name is no ARN to
-            // report missing: it is an
-            // identifier this service could not resolve to a model at all, which is the
-            // modelled `ValidationException` carrying the one sentence Amazon Bedrock
-            // states for an identifier it cannot resolve
-            // ([`INVALID_MODEL_IDENTIFIER`]) — a sentence with no variable part, so
-            // nothing of the request is quoted back.
-            if crate::state::names_arn_of(
-                &input.model_identifier,
-                crate::state::CUSTOM_MODEL_RESOURCE_TYPE,
-            ) {
-                return Err(GetCustomModelErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::CUSTOM_MODEL_NOT_FOUND_MESSAGE.to_string()),
-                    },
-                )
-                .into());
+            // unresolvable spellings are not the same failure — the reading every operation
+            // of this resource shares ([`crate::state::unresolved_custom_model`]), each
+            // answering it with the error its own model declares for that class.
+            let refusal = crate::state::unresolved_custom_model(&input.model_identifier);
+            let message = Some(refusal.message().to_string());
+            return Err(match refusal {
+                crate::state::UnresolvedCustomModel::MissingArn => {
+                    GetCustomModelErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException { message },
+                    )
+                }
+                crate::state::UnresolvedCustomModel::UnresolvableIdentifier => {
+                    GetCustomModelErrorModeled::ValidationException(ValidationException { message })
+                }
             }
-            return Err(GetCustomModelErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(INVALID_MODEL_IDENTIFIER.to_string()),
-                },
-            )
             .into());
         };
         let record = record.clone();

@@ -24,12 +24,17 @@
 //!   ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::custom_model`]),
 //!   so both spellings delete the same model. An identifier that resolves to no custom
 //!   model of this account and Region — including one a concurrent delete has already
-//!   removed — is 404 `ResourceNotFoundException` carrying the one sentence Amazon Bedrock
-//!   states for a custom model it cannot find
-//!   ([`crate::state::CUSTOM_MODEL_NOT_FOUND_MESSAGE`]), whichever of the two spellings the
-//!   request carried: that sentence names no ARN and quotes no part of the request, so
-//!   there is nothing in it that distinguishes them. So of two deletes racing for one
-//!   model exactly one deletes it and the other finds nothing left;
+//!   removed — is refused as the spelling it IS, the one reading of that failure every
+//!   operation addressing this resource shares
+//!   ([`crate::state::unresolved_custom_model`]): 404 `ResourceNotFoundException` for an
+//!   ARN, which is what that error documents ("The specified resource Amazon Resource Name
+//!   (ARN) was not found"), carrying this resource's not-found sentence
+//!   ([`crate::state::CUSTOM_MODEL_NOT_FOUND_MESSAGE`]); while a bare NAME that resolves to
+//!   no model is no ARN to report missing but an identifier this service could not resolve,
+//!   which is 400 `ValidationException` carrying the one sentence Amazon Bedrock states for
+//!   that class ([`crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE`]). Neither sentence
+//!   quotes any part of the request. So of two deletes racing for one model exactly one
+//!   deletes it and the other finds nothing left;
 //! * a model a custom model deployment is still serving is NOT removed: that deployment
 //!   would be left serving a model that no longer exists, which is the conflicting change
 //!   `ConflictException` (400) names
@@ -176,11 +181,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .custom_model(&input.model_identifier, &region, now)
             .map(|record| record.arn.clone())
         else {
-            return Err(DeleteCustomModelErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::CUSTOM_MODEL_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
+            // An identifier that resolves to nothing is refused as the spelling it IS —
+            // this resource's one reading of that failure
+            // ([`crate::state::unresolved_custom_model`]), answered here with the errors
+            // this operation's own model declares for the two classes.
+            let refusal = crate::state::unresolved_custom_model(&input.model_identifier);
+            let message = Some(refusal.message().to_string());
+            return Err(match refusal {
+                crate::state::UnresolvedCustomModel::MissingArn => {
+                    DeleteCustomModelErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException { message },
+                    )
+                }
+                crate::state::UnresolvedCustomModel::UnresolvableIdentifier => {
+                    DeleteCustomModelErrorModeled::ValidationException(ValidationException {
+                        message,
+                    })
+                }
+            }
             .into());
         };
 
