@@ -17,6 +17,10 @@ mod archived_media_read_path;
 mod control_plane_stream_resolution;
 #[path = "all/get_images_generation.rs"]
 mod get_images_generation;
+#[path = "all/get_images_request_bounds.rs"]
+mod get_images_request_bounds;
+#[path = "all/get_images_sampling.rs"]
+mod get_images_sampling;
 #[path = "all/refusal_message_wording.rs"]
 mod refusal_message_wording;
 #[path = "all/registered_stream_reads.rs"]

@@ -35,11 +35,11 @@ use crate::archived_media_read_path::{body_json, seeded, Harness};
 const REGION: &str = "us-east-1";
 
 /// The stream whose fragments carry a real frame each.
-const IMAGES_STREAM: &str = "get-images-stream";
+pub(crate) const IMAGES_STREAM: &str = "get-images-stream";
 /// A stream whose single fragment's archived bytes carry no frame at all.
 const OPAQUE_STREAM: &str = "get-images-opaque-stream";
 /// A retention-enabled stream nothing has ever been ingested into.
-const EMPTY_STREAM: &str = "get-images-empty-stream";
+pub(crate) const EMPTY_STREAM: &str = "get-images-empty-stream";
 /// A stream with `DataRetentionInHours` of 0.
 const NO_RETENTION_STREAM: &str = "get-images-no-retention-stream";
 
@@ -60,8 +60,8 @@ const SERVER_OFFSET_SECS: i64 = 600;
 const FRAGMENT_BASE: u64 = 9_134_385_233_318_143_200;
 
 /// The size of the frame the seeded fragments of `IMAGES_STREAM` carry.
-const FRAME_WIDTH: u32 = 40;
-const FRAME_HEIGHT: u32 = 20;
+pub(crate) const FRAME_WIDTH: u32 = 40;
+pub(crate) const FRAME_HEIGHT: u32 = 20;
 
 /// A stream whose one fragment carries a frame of an extreme aspect ratio, so a single
 /// requested side derives an enormous other side.
@@ -71,15 +71,15 @@ const TALL_FRAME_WIDTH: u32 = 1;
 const TALL_FRAME_HEIGHT: u32 = 2_048;
 
 /// The largest `WidthPixels` the model admits (`WidthPixels` range 1..3840).
-const MAX_WIDTH_PIXELS: u32 = 3_840;
+pub(crate) const MAX_WIDTH_PIXELS: u32 = 3_840;
 
 /// The refusal a window the archive holds no fragment in is answered with.
-const NO_FRAGMENTS: &str = "No fragments found in the stream for the GetImages request.";
+pub(crate) const NO_FRAGMENTS: &str = "No fragments found in the stream for the GetImages request.";
 /// The refusal a window that does not run forwards is answered with.
 const RANGE_ORDER: &str = "StartTimestamp must be before EndTimestamp.";
 /// The refusal a window wider than the documented 300 seconds is answered with.
-const WINDOW_TOO_WIDE: &str =
-    "The time range between StartTimestamp and EndTimestamp must not be more than 300 seconds.";
+pub(crate) const WINDOW_TOO_WIDE: &str =
+    "EndTimestamp must be within 300 seconds of StartTimestamp.";
 /// The refusal a sampling interval under the documented minimum is answered with.
 const INTERVAL_TOO_SMALL: &str = "SamplingInterval must be at least 200 ms.";
 /// The refusal a `JPEGQuality` outside the documented 1..100 is answered with.
@@ -89,7 +89,7 @@ const QUALITY_OUT_OF_RANGE: &str = "The JPEGQuality value must be an integer fro
 const MAX_RENDEZVOUS_SPINS: usize = 10_000;
 
 /// The producer timestamp of the `index`-th seeded fragment, in epoch seconds.
-fn producer_secs(index: i64) -> i64 {
+pub(crate) fn producer_secs(index: i64) -> i64 {
     T0_SECS + FRAGMENT_SPACING_SECS * index
 }
 
@@ -122,7 +122,7 @@ fn frame_png(width: u32, height: u32) -> Vec<u8> {
 
 /// The harness of `archived_media_read_path`, with this suite's four streams seeded
 /// into the same engine.
-fn harness() -> Harness {
+pub(crate) fn harness() -> Harness {
     let harness = seeded();
     {
         let state = service_state(&*harness.engine).expect("the service store");
@@ -193,7 +193,7 @@ fn harness() -> Harness {
 }
 
 /// The `__type` and message of a refusal.
-fn reported(response: &http::Response<bytes::Bytes>) -> (String, String) {
+pub(crate) fn reported(response: &http::Response<bytes::Bytes>) -> (String, String) {
     let body = body_json(response);
     let code = body["__type"].as_str().unwrap_or_default().to_string();
     let message = body["Message"]
@@ -205,7 +205,7 @@ fn reported(response: &http::Response<bytes::Bytes>) -> (String, String) {
 }
 
 /// A `GetImages` request body naming `stream`, over `[start_secs, end_secs]`.
-fn request(
+pub(crate) fn request(
     stream: &str,
     selector: &str,
     start_secs: i64,
@@ -222,7 +222,7 @@ fn request(
 }
 
 /// `base` with every member of `extra` added.
-fn with(base: &serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+pub(crate) fn with(base: &serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
     let mut object = base.as_object().cloned().unwrap_or_default();
     for (key, value) in extra.as_object().expect("an object of members") {
         object.insert(key.clone(), value.clone());
@@ -231,7 +231,7 @@ fn with(base: &serde_json::Value, extra: serde_json::Value) -> serde_json::Value
 }
 
 /// The images of a 200 answer.
-fn images(response: &http::Response<bytes::Bytes>) -> Vec<serde_json::Value> {
+pub(crate) fn images(response: &http::Response<bytes::Bytes>) -> Vec<serde_json::Value> {
     body_json(response)["Images"]
         .as_array()
         .cloned()
@@ -245,7 +245,7 @@ fn image_millis(image: &serde_json::Value) -> i64 {
 }
 
 /// The bytes an `Image$ImageContent` carries.
-fn image_bytes(image: &serde_json::Value) -> Vec<u8> {
+pub(crate) fn image_bytes(image: &serde_json::Value) -> Vec<u8> {
     let content = image["ImageContent"].as_str().unwrap_or_default();
     ::aws_smithy_types::base64::decode(content).unwrap_or_default()
 }
@@ -668,20 +668,15 @@ async fn an_image_is_the_archived_frame_in_the_requested_form() {
             expected: (FRAME_WIDTH * 2, FRAME_HEIGHT / 2),
         },
         FormCase {
-            case: "a width alone: the frame's own ratio",
-            format: "JPEG",
-            width: Some(FRAME_WIDTH * 2),
-            height: None,
-            expected: (FRAME_WIDTH * 2, FRAME_HEIGHT * 2),
-        },
-        FormCase {
-            case: "a height alone: the frame's own ratio",
+            case: "both sides given, as PNG",
             format: "PNG",
-            width: None,
+            width: Some(FRAME_WIDTH * 3),
             height: Some(FRAME_HEIGHT * 3),
             expected: (FRAME_WIDTH * 3, FRAME_HEIGHT * 3),
         },
     ];
+    // One side ALONE is not a row here: `WidthPixels` documents that such a request is
+    // refused, and the refusal is pinned in `get_images_request_bounds`.
 
     for row in rows {
         let FormCase {
@@ -888,38 +883,37 @@ async fn an_image_that_cannot_be_generated_reports_the_modelled_error() {
     }
 }
 
-/// RULE: the image a request asks for is generated only inside this emulator's frame
-/// budget — a size past it is the modelled `MEDIA_ERROR` rather than an allocation
-/// attempt — and a size inside it is generated from the archived frame as asked.
+/// RULE: the image a request asks for is generated at the size it names, inside this
+/// emulator's own frame budget.
 ///
 /// The rows differ along the one thing the budget generalises over: how large the
-/// requested side makes the side derived from the archived frame's own ratio.
+/// requested size is — the archived frame's own ratio scaled up, and the two modelled
+/// side maxima together. A size PAST the budget is not reachable from a request at all,
+/// because the modelled side ranges (1..3840 by 1..2160) multiply to fewer pixels than
+/// the budget allows; the refusal arm is exercised against the generation helper itself
+/// in that handler's own unit tests.
 #[tokio::test]
-async fn a_frame_past_the_generation_budget_reports_media_error() {
+async fn a_frame_is_generated_at_the_requested_size_inside_the_budget() {
     let harness = harness();
     let at = producer_secs(0);
-    // (case, the requested width, the width and height the image decodes at, or none
-    // for an image that may not be generated)
-    let rows: Vec<(&str, u32, Option<u32>, Option<u32>)> = vec![
+    // (case, the requested width and height, the size the image decodes at)
+    let rows: Vec<(&str, u32, u32)> = vec![
         (
-            "a requested width whose derived height stays inside the budget",
-            2,
-            Some(2),
-            Some(TALL_FRAME_HEIGHT * 2),
+            "the archived frame stretched off its own ratio",
+            TALL_FRAME_WIDTH * 2,
+            TALL_FRAME_HEIGHT,
         ),
         (
-            "the modelled maximum width, deriving a height far past the budget",
+            "both modelled side maxima, still inside the frame budget",
             MAX_WIDTH_PIXELS,
-            None,
-            None,
+            2_160,
         ),
     ];
 
-    for (case, width, expected_width, expected_height) in rows {
-        let expected = expected_width.zip(expected_height);
+    for (case, width, height) in rows {
         let body = with(
             &request(TALL_FRAME_STREAM, "PRODUCER_TIMESTAMP", at, at + 1, "PNG"),
-            serde_json::json!({ "WidthPixels": width }),
+            serde_json::json!({ "WidthPixels": width, "HeightPixels": height }),
         );
         let response = harness.post("/getImages", &body).await;
         assert_eq!(
@@ -930,34 +924,17 @@ async fn a_frame_past_the_generation_budget_reports_media_error() {
             String::from_utf8_lossy(response.body())
         );
         let first = images(&response).first().cloned().unwrap_or_default();
-        match expected {
-            None => {
-                assert_eq!(
-                    first["Error"].as_str(),
-                    Some("MEDIA_ERROR"),
-                    "case {case:?}: expected MEDIA_ERROR, got {first:?}"
-                );
-                assert_eq!(
-                    first["ImageContent"],
-                    serde_json::Value::Null,
-                    "case {case:?}: expected no image content, got {first:?}"
-                );
-            }
-            Some((expected_width, expected_height)) => {
-                let bytes = image_bytes(&first);
-                let decoded = ::image::load_from_memory(&bytes).unwrap_or_else(|error| {
-                    panic!("case {case:?}: expected a decodable image, got {error}");
-                });
-                assert_eq!(
-                    (decoded.width(), decoded.height()),
-                    (expected_width, expected_height),
-                    "case {case:?}: expected a {expected_width}x{expected_height} image, got \
-                     {}x{}",
-                    decoded.width(),
-                    decoded.height()
-                );
-            }
-        }
+        let bytes = image_bytes(&first);
+        let decoded = ::image::load_from_memory(&bytes).unwrap_or_else(|error| {
+            panic!("case {case:?}: expected a decodable image, got {error}");
+        });
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (width, height),
+            "case {case:?}: expected a {width}x{height} image, got {}x{}",
+            decoded.width(),
+            decoded.height()
+        );
     }
 }
 

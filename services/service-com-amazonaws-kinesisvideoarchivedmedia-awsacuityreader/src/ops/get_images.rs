@@ -215,6 +215,13 @@ const MEDIA_ERROR: &str = "MEDIA_ERROR";
 /// stream nor the window.
 const NO_FRAGMENTS_MESSAGE: &str = "No fragments found in the stream for the GetImages request.";
 
+/// The refusal a request that names only ONE of `WidthPixels` and `HeightPixels`
+/// carries. `WidthPixels` states the rule — "If only the WidthPixels parameter is
+/// provided or if only the HeightPixels is provided, a ValidationException will be
+/// thrown" — and this operation refuses such a request as a bad argument before the
+/// archive is consulted. Entirely fixed text, with no part taken from the request.
+const INCOMPLETE_RESIZE_MESSAGE: &str = "Height and width for the images need to be provided or none.";
+
 /// The largest frame side one decode or one resize may produce. NOT an AWS limit: it
 /// bounds what the archived bytes of a single fragment may expand into, both while the
 /// frame is decoded and while it is scaled to the requested size.
@@ -427,6 +434,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(invalid)?;
             let height = bounded_side(input.height_pixels, "HeightPixels", MAX_HEIGHT_PIXELS)
                 .map_err(invalid)?;
+            // The output size is a PAIR: "When both WidthPixels and HeightPixels
+            // parameters are provided, the image will be stretched to fit the specified
+            // aspect ratio. If only the WidthPixels parameter is provided or if only the
+            // HeightPixels is provided, a ValidationException will be thrown. If neither
+            // parameter is provided, the original image size from the stream will be
+            // returned." So one side alone is a bad argument, not a frame kept at its
+            // own ratio, and the request is refused before the archive is read.
+            if width.is_some() != height.is_some() {
+                return Err(invalid(INCOMPLETE_RESIZE_MESSAGE.to_string()));
+            }
 
             let start_millis = date_time_millis(&input.start_timestamp);
             let end_millis = date_time_millis(&input.end_timestamp);
@@ -438,8 +455,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             if end_millis.saturating_sub(start_millis) > MAX_WINDOW_MILLIS {
                 return Err(invalid(format!(
-                    "The time range between StartTimestamp and EndTimestamp must not be more \
-                     than {} seconds.",
+                    "EndTimestamp must be within {} seconds of StartTimestamp.",
                     MAX_WINDOW_MILLIS / 1000
                 )));
             }
@@ -747,10 +763,11 @@ fn decode_frame(media: &[u8]) -> Option<::image::DynamicImage> {
 /// frame budget — the `MEDIA_ERROR` case.
 ///
 /// Both sides given stretches the frame to that aspect ratio ("the image will be
-/// stretched to fit the specified aspect ratio"); one side alone keeps the frame's own
-/// ratio, as `HeightPixels` documents ("its original aspect ratio will be used to
-/// calculate the WidthPixels ratio") and symmetrically for a width alone; neither
-/// returns "the original image size from the stream".
+/// stretched to fit the specified aspect ratio"); neither returns "the original image
+/// size from the stream". A HALF-named size never reaches here from a request — the
+/// handler refuses one, as `WidthPixels` documents — so the one-sided arms below are
+/// this helper's own behaviour for a caller inside this module, keeping the frame's
+/// ratio as `HeightPixels` describes.
 ///
 /// The size it generates is BOUNDED by the same budget the decode runs under
 /// ([`MAX_FRAME_SIDE`], [`MAX_FRAME_PIXELS`]), checked before anything is allocated. A
