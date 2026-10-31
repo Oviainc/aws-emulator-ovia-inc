@@ -155,6 +155,8 @@ mod route_request_parameter;
 mod route_response_lifecycle;
 #[path = "all/route_response_update.rs"]
 mod route_response_update;
+#[path = "all/route_settings_deletion.rs"]
+mod route_settings_deletion;
 #[path = "all/route_update.rs"]
 mod route_update;
 #[path = "all/route_validation.rs"]
