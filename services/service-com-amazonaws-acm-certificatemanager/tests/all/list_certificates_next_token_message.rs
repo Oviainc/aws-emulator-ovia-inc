@@ -21,6 +21,12 @@
 //! A token the operation DID issue is in the table too, as the row that must be
 //! served: a message assertion over refusals alone could pass against an operation
 //! that refused every token.
+//!
+//! The second table spans the VALUE the refusal has to echo rather than the way the
+//! token fails: every character class `NextToken`'s modelled pattern admits (its
+//! whitespace characters, spaces and punctuation, and its highest code points) and
+//! both published length bounds plus one value past the upper one — so a message that
+//! quoted, trimmed, escaped or truncated the token it names would fail some row.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -38,6 +44,29 @@ fn expected_message(token: &str) -> String {
 /// One `ListCertificates` call.
 async fn list(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "ListCertificates", body).await
+}
+
+/// Assert that `token` is refused by the operation itself — the modelled
+/// `InvalidArgsException` at HTTP 400 — and that the refusal's message is ACM's
+/// sentence carrying that very token.
+///
+/// Both tables below assert exactly this, so they assert it through one helper and
+/// report a failure the same way.
+async fn assert_refused_with_the_token(router: &MultiServiceRouter, case: &str, token: &str) {
+    let (status, response) = list(router, &json!({ "NextToken": token })).await;
+    assert_eq!(
+        (status, error_code(&response).as_str()),
+        (400, "InvalidArgsException"),
+        "case {case:?}: expected 400 InvalidArgsException for a token of {} character(s), \
+         got {status} {response}",
+        token.chars().count()
+    );
+    let stated = error_message(&response);
+    let expected = expected_message(token);
+    assert_eq!(
+        stated, expected,
+        "case {case:?}: expected the message {expected:?}, got {stated:?}"
+    );
 }
 
 #[tokio::test]
@@ -98,29 +127,18 @@ async fn an_unreadable_next_token_is_refused_with_the_token_it_carried() {
     ];
 
     for (case, token) in rows {
-        let (status, response) = list(&router, &json!({ "NextToken": token })).await;
         // The empty token is outside `NextToken`'s modelled 1..10000 length, so the
         // boundary refuses it before the handler: what the row pins is that it is
         // refused, not which of the two sentences it carries.
         if token.is_empty() {
+            let (status, response) = list(&router, &json!({ "NextToken": token })).await;
             assert_eq!(
                 status, 400,
                 "case {case:?}: expected the empty token to be refused, got {status} {response}"
             );
             continue;
         }
-        assert_eq!(
-            (status, error_code(&response).as_str()),
-            (400, "InvalidArgsException"),
-            "case {case:?}: expected 400 InvalidArgsException for {token:?}, got {status} \
-             {response}"
-        );
-        let stated = error_message(&response);
-        let expected = expected_message(&token);
-        assert_eq!(
-            stated, expected,
-            "case {case:?}: expected the message {expected:?}, got {stated:?}"
-        );
+        assert_refused_with_the_token(&router, case, &token).await;
     }
 
     // The token this operation issued is read, not refused — so the rule above is
@@ -139,5 +157,65 @@ async fn an_unreadable_next_token_is_refused_with_the_token_it_carried() {
         1,
         "case {:?}: expected the resumed page to carry one summary, got {resumed}",
         "the issued token"
+    );
+}
+
+/// The refusal copies the token out of the request as it arrived, whatever the member
+/// admits.
+///
+/// The rows walk `NextToken`'s modelled character set and its published length bounds
+/// (`NextToken` @length(min 1, max 10000) @pattern `^[\u0009\u000A\u000D\u0020-\u00FF]*$`,
+/// from `smithy_query(query="operation",operation="ListCertificates")`): the three
+/// whitespace characters the pattern names, a value with spaces and punctuation, its
+/// highest admitted code points, the shortest and the longest admissible token, and one
+/// value past the upper bound. None of them is a token this operation issued, so each
+/// one the boundary admits must come back with the token itself in the message —
+/// unquoted, untrimmed and whole.
+#[tokio::test]
+async fn the_refusal_echoes_the_token_verbatim_across_the_member_it_accepts() {
+    let router = router();
+    request_certificate(
+        &router,
+        &json!({ "DomainName": "echo.example.com", "ValidationMethod": "DNS" }),
+    )
+    .await;
+
+    /// The modelled maximum length of `NextToken`.
+    const MAX_TOKEN_LEN: usize = 10_000;
+
+    let rows: Vec<(&str, String)> = vec![
+        ("the shortest admissible token", "z".to_string()),
+        (
+            "the whitespace characters the pattern admits",
+            "stale\u{9}cursor\u{a}from\u{d}a-paginator".to_string(),
+        ),
+        (
+            "spaces and punctuation",
+            "page 2 of 7 (cursor: \"stale\")".to_string(),
+        ),
+        (
+            "the highest code points the pattern admits",
+            "¡cursor÷caducadoÿ".to_string(),
+        ),
+        ("the longest admissible token", "z".repeat(MAX_TOKEN_LEN)),
+    ];
+
+    for (case, token) in rows {
+        assert_refused_with_the_token(&router, case, &token).await;
+    }
+
+    // One character past the modelled maximum: outside the member, so the boundary
+    // refuses it before the handler reads it. The row pins that it is refused, not
+    // which of the two sentences it carries.
+    let case = "one character past the longest admissible token";
+    let (status, response) = list(
+        &router,
+        &json!({ "NextToken": "z".repeat(MAX_TOKEN_LEN + 1) }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected a token longer than {MAX_TOKEN_LEN} characters to be \
+         refused, got {status} {response}"
     );
 }
