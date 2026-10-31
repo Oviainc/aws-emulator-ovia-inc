@@ -517,18 +517,46 @@ pub const MAX_STORED_RULE_ASSOCIATIONS: usize = 1_000;
 /// owes it no transition.
 pub const FIREWALL_DOMAIN_LIST_STATUS_COMPLETE: &str = "COMPLETE";
 
-/// The `FirewallDomainListStatus` a domain list reports while a change to its
-/// domains is still settling, the model's `UPDATING`: it is what
-/// `UpdateFirewallDomains` reports as "the status of the UpdateFirewallDomains
-/// request". The move to [`FIREWALL_DOMAIN_LIST_STATUS_COMPLETE`] is the one
-/// the clock owes, [`PROVISIONING_DELAY`] after the call that started it.
-pub const FIREWALL_DOMAIN_LIST_STATUS_UPDATING: &str = "UPDATING";
-
 /// The `FirewallDomainListStatus` a domain list reports once a delete has been
 /// accepted for it, the model's `DELETING`: `DeleteFirewallDomainList` answers
 /// with "the domain list that you just deleted", which is on its way out and so
 /// is no longer in the settled status it held until that call.
 pub const FIREWALL_DOMAIN_LIST_STATUS_DELETING: &str = "DELETING";
+
+/// The `StatusMessage` a domain list reports while it holds
+/// [`FIREWALL_DOMAIN_LIST_STATUS_COMPLETE`].
+///
+/// `FirewallDomainList$StatusMessage` is "additional information about the
+/// status of the list, if available"
+/// (`smithy_query(query="doc",shape="FirewallDomainList",member="StatusMessage")`),
+/// and what DNS Firewall states there is the lifecycle step the list reached:
+/// the sentence is fixed text for that step and carries no part of the request,
+/// so one list's message is every list's message while it stands in that step.
+pub const FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_COMPLETE: &str = "Created Firewall Domain List";
+
+/// The `StatusMessage` a domain list reports once it holds
+/// [`FIREWALL_DOMAIN_LIST_STATUS_DELETING`] — the delete step's own sentence,
+/// distinct from [`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_COMPLETE`] and likewise
+/// carrying nothing from the request.
+pub const FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_DELETING: &str =
+    "Deleting the Firewall Domain List";
+
+/// The `StatusMessage` the lifecycle step `status` leaves on a domain list, or
+/// `None` for a step DNS Firewall states nothing for.
+///
+/// It is DERIVED from the status rather than held beside it, so no projection of
+/// a list can report one step's status with another step's message.
+pub fn firewall_domain_list_status_message(status: &str) -> Option<String> {
+    match status {
+        FIREWALL_DOMAIN_LIST_STATUS_COMPLETE => {
+            Some(FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_COMPLETE.to_string())
+        }
+        FIREWALL_DOMAIN_LIST_STATUS_DELETING => {
+            Some(FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_DELETING.to_string())
+        }
+        _ => None,
+    }
+}
 
 /// The most domains one `UpdateFirewallDomains` request may carry.
 ///
@@ -574,12 +602,30 @@ pub const MAX_STORED_FIREWALL_DOMAIN_LISTS: usize = 1_000;
 /// is settled the moment it exists, so the clock owes it no transition.
 pub const FIREWALL_RULE_GROUP_STATUS_COMPLETE: &str = "COMPLETE";
 
-/// The `FirewallRuleGroupStatus` a rule group reports once a delete has been
-/// accepted for it, the model's `DELETING`: `DeleteFirewallRuleGroup` answers
-/// with the rule group it just deleted, which is on its way out and so is no
-/// longer in the settled status it held until that call — the same role
-/// [`FIREWALL_DOMAIN_LIST_STATUS_DELETING`] plays for a domain list.
-pub const FIREWALL_RULE_GROUP_STATUS_DELETING: &str = "DELETING";
+/// The `StatusMessage` a rule group reports while it holds
+/// [`FIREWALL_RULE_GROUP_STATUS_COMPLETE`].
+///
+/// `FirewallRuleGroup$StatusMessage` is "additional information about the status
+/// of the rule group, if available"
+/// (`smithy_query(query="doc",shape="FirewallRuleGroup",member="StatusMessage")`):
+/// as for a domain list
+/// ([`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_COMPLETE`]), what DNS Firewall states
+/// there is the lifecycle step the group reached, as fixed text with no part of
+/// the request in it.
+pub const FIREWALL_RULE_GROUP_STATUS_MESSAGE_COMPLETE: &str = "Created Firewall Rule Group";
+
+/// The `StatusMessage` the lifecycle step `status` leaves on a rule group, or
+/// `None` for a step DNS Firewall states nothing for — the rule-group twin of
+/// [`firewall_domain_list_status_message`], and derived from the status for the
+/// same reason.
+pub fn firewall_rule_group_status_message(status: &str) -> Option<String> {
+    match status {
+        FIREWALL_RULE_GROUP_STATUS_COMPLETE => {
+            Some(FIREWALL_RULE_GROUP_STATUS_MESSAGE_COMPLETE.to_string())
+        }
+        _ => None,
+    }
+}
 
 /// `ResourceNotFoundException$ResourceType` for a firewall rule group: the
 /// modelled shape name of the resource, as for
@@ -2264,7 +2310,12 @@ impl ManagedFirewallDomainList {
             // invented.
             domain_count: Some(0),
             status: Some(FIREWALL_DOMAIN_LIST_STATUS_COMPLETE.to_string()),
-            status_message: None,
+            // The published list stands in the same settled step a list of this
+            // account stands in, and `StatusMessage` states that step
+            // ([`firewall_domain_list_status_message`]).
+            status_message: firewall_domain_list_status_message(
+                FIREWALL_DOMAIN_LIST_STATUS_COMPLETE,
+            ),
             managed_owner_name: Some(MANAGED_FIREWALL_DOMAIN_LIST_OWNER.to_string()),
             creator_request_id: None,
             creation_time: None,
@@ -2328,9 +2379,9 @@ pub struct FirewallDomainListRecord {
     pub domains: Vec<String>,
     /// The `FirewallDomainListStatus` this list reports; see
     /// [`FIREWALL_DOMAIN_LIST_STATUS_COMPLETE`] on why a created list is
-    /// already settled.
+    /// already settled. The `StatusMessage` that goes with it is DERIVED from
+    /// it ([`Self::status_message_at`]), so it is never held beside it.
     pub status: String,
-    pub status_message: Option<String>,
     /// `CreateFirewallDomainList$Tags`, kept with the record so they are not
     /// silently discarded. `FirewallDomainList` models no `Tags` member, so no
     /// response reports them: `ListTagsForResource` is a separate operation.
@@ -2350,15 +2401,23 @@ impl FirewallDomainListRecord {
         i32::try_from(self.domains.len()).unwrap_or(i32::MAX)
     }
 
-    /// This list's `FirewallDomainListStatus` as of `now`: the transient status
+    /// This list's `FirewallDomainListStatus` as of `now`: the status it holds
     /// until the transition the clock owes falls due,
     /// [`FIREWALL_DOMAIN_LIST_STATUS_COMPLETE`] after it — the same shape as
-    /// [`ResolverEndpointRecord::status_at`].
+    /// [`FirewallRuleGroupRecord::status_at`], so a list the clock owes nothing
+    /// reports the step it stands in.
     pub fn status_at(&self, now: Instant) -> &str {
         match self.settled_at {
             Some(due) if now < due => &self.status,
-            _ => FIREWALL_DOMAIN_LIST_STATUS_COMPLETE,
+            Some(_) => FIREWALL_DOMAIN_LIST_STATUS_COMPLETE,
+            None => &self.status,
         }
+    }
+
+    /// This list's `StatusMessage` as of `now`: the sentence the lifecycle step
+    /// it reports then ([`Self::status_at`]) leaves on it.
+    pub fn status_message_at(&self, now: Instant) -> Option<String> {
+        firewall_domain_list_status_message(self.status_at(now))
     }
 
     /// Project the record onto the modelled `FirewallDomainList`.
@@ -2369,7 +2428,7 @@ impl FirewallDomainListRecord {
             name: Some(self.name.clone()),
             domain_count: Some(self.domain_count()),
             status: Some(self.status_at(now).to_string()),
-            status_message: self.status_message.clone(),
+            status_message: self.status_message_at(now),
             // `ManagedOwnerName`, `Category` and `ManagedListType` describe "the
             // managed domain list" kinds AWS itself publishes; a list this
             // account created is not one, so all three stay unset.
@@ -2935,9 +2994,9 @@ pub struct FirewallRuleGroupRecord {
     /// populate it.
     pub rules: Vec<FirewallRuleRecord>,
     /// The `FirewallRuleGroupStatus` this group reports, as of
-    /// [`Self::settled_at`].
+    /// [`Self::settled_at`]. The `StatusMessage` that goes with it is DERIVED
+    /// from it ([`Self::status_message_at`]), so it is never held beside it.
     pub status: String,
-    pub status_message: Option<String>,
     /// `CreateFirewallRuleGroup$Tags`, kept with the record so they are not
     /// silently discarded. `FirewallRuleGroup` models no `Tags` member, so no
     /// response reports them: `ListTagsForResource` is a separate operation.
@@ -2979,6 +3038,13 @@ impl FirewallRuleGroupRecord {
         }
     }
 
+    /// This group's `StatusMessage` as of `now`: the sentence the lifecycle
+    /// step it reports then ([`Self::status_at`]) leaves on it — the
+    /// rule-group twin of [`FirewallDomainListRecord::status_message_at`].
+    pub fn status_message_at(&self, now: Instant) -> Option<String> {
+        firewall_rule_group_status_message(self.status_at(now))
+    }
+
     /// Project the record onto the modelled `FirewallRuleGroup`.
     pub fn to_rule_group(&self, now: Instant) -> FirewallRuleGroup {
         FirewallRuleGroup {
@@ -2987,7 +3053,7 @@ impl FirewallRuleGroupRecord {
             name: Some(self.name.clone()),
             rule_count: Some(self.rule_count()),
             status: Some(self.status_at(now).to_string()),
-            status_message: self.status_message.clone(),
+            status_message: self.status_message_at(now),
             owner_id: Some(self.owner_id.clone()),
             creator_request_id: Some(self.creator_request_id.clone()),
             share_status: Some(self.share_status.clone()),

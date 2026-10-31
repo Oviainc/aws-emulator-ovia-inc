@@ -15,6 +15,11 @@ use super::harness::{
     call, emulator, error_type, expect_error, ok, parse_time, string_member, ACCOUNT, REGION,
 };
 
+/// The sentence DNS Firewall states in `FirewallDomainList$StatusMessage` for a
+/// list that reached its created, settled lifecycle step: fixed text for the
+/// step, with no part of the request in it.
+const CREATED_DOMAIN_LIST_MESSAGE: &str = "Created Firewall Domain List";
+
 /// The `FirewallDomainList` of a create/get response.
 fn domain_list(body: &Value) -> &Value {
     body.get("FirewallDomainList")
@@ -143,21 +148,22 @@ async fn a_created_domain_list_is_read_back_from_state() {
         );
         // "The owner of the list, used only for lists that are not managed by
         // you", and the managed-list members beside it, say nothing about a list
-        // this account just created; `StatusMessage` carries "additional
-        // information about the status of the list, IF AVAILABLE", and a settled
-        // empty list has none.
-        for member in [
-            "ManagedOwnerName",
-            "ManagedListType",
-            "Category",
-            "StatusMessage",
-        ] {
+        // this account just created.
+        for member in ["ManagedOwnerName", "ManagedListType", "Category"] {
             assert_eq!(
                 made.get(member),
                 None,
                 "case {case:?}: {member} must be unset for a list this account just created, got {made}"
             );
         }
+        // `StatusMessage` carries "additional information about the status of
+        // the list, if available": the step the list reached is stated there,
+        // the same way for every list that stands in it.
+        assert_eq!(
+            string_member(&made, "StatusMessage"),
+            CREATED_DOMAIN_LIST_MESSAGE,
+            "case {case:?}: a settled, created list states the step it reached, got {made}"
+        );
         let created_at = parse_time(case, "CreationTime", &string_member(&made, "CreationTime"));
         let modified_at = parse_time(
             case,

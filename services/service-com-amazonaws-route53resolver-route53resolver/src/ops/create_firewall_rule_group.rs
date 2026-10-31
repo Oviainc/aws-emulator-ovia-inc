@@ -254,12 +254,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // created reports `RuleCount` 0.
             rules: Vec::new(),
             status: crate::state::FIREWALL_RULE_GROUP_STATUS_COMPLETE.to_string(),
-            // `StatusMessage` is "additional information about the status of the
-            // rule group, IF AVAILABLE", and the model states no text for it; a
-            // group that reached its settled status with nothing to report adds
-            // nothing, so it is left unset rather than carrying an invented
-            // sentence.
-            status_message: None,
             tags: input.tags.clone().unwrap_or_default(),
             creation_time: timestamp.clone(),
             modification_time: timestamp,

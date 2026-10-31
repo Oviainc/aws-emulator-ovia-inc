@@ -329,23 +329,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         record.domains = updated;
         record.modification_time = timestamp;
-        // The change is applied to the stored domains at once and the list
-        // reports `UPDATING` while it settles: the move to `COMPLETE` is the
-        // one the clock owes, so a caller reading the list straight after this
-        // call still observes the transient status.
-        record.status = crate::state::FIREWALL_DOMAIN_LIST_STATUS_UPDATING.to_string();
-        record.settled_at = Some(now + crate::state::PROVISIONING_DELAY);
+        // The whole set operation is applied to the stored domains inside this
+        // call, so the list is in its settled step by the time the response is
+        // built and the clock owes it nothing: the model's `UPDATING` describes
+        // an update that is still in flight, which a change applied here is
+        // not.
+        record.status = crate::state::FIREWALL_DOMAIN_LIST_STATUS_COMPLETE.to_string();
+        record.settled_at = None;
 
         Ok(UpdateFirewallDomainsOutput {
             id: Some(record.id.clone()),
             name: Some(record.name.clone()),
             // "Status of the UpdateFirewallDomains request", which is this
-            // list's status as of now.
+            // list's status as of now, and the sentence that lifecycle step
+            // leaves on the list beside it.
             status: Some(record.status_at(now).to_string()),
-            // "Additional information about the status of the list, IF
-            // AVAILABLE": the model states no text for it and the record
-            // carries none, so none is invented here.
-            status_message: record.status_message.clone(),
+            status_message: record.status_message_at(now),
         })
     }
 }

@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(record) = store
+        let Some(mut record) = store
             .firewall_domain_lists
             .remove(&input.firewall_domain_list_id)
         else {
@@ -210,15 +210,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .firewall_domain_list_creator_request_ids
             .remove(&record.creator_request_id);
 
-        let mut domain_list = record.to_domain_list(now);
-        // "The domain list that you just deleted": the list is on its way out,
-        // so it reports the model's `DELETING` rather than the settled status it
-        // held until this call.
-        domain_list.status = Some(crate::state::FIREWALL_DOMAIN_LIST_STATUS_DELETING.to_string());
-        domain_list.modification_time = Some(crate::state::now_rfc3339());
+        // "The domain list that you just deleted": the delete has been
+        // accepted, so the list stands in its deleting step rather than in the
+        // settled one it held until this call, and the status and the status
+        // message the projection reports both come from that step. The step is
+        // reached as the call is served, so the clock owes nothing on it.
+        record.status = crate::state::FIREWALL_DOMAIN_LIST_STATUS_DELETING.to_string();
+        record.settled_at = None;
+        record.modification_time = crate::state::now_rfc3339();
 
         Ok(DeleteFirewallDomainListOutput {
-            firewall_domain_list: Some(domain_list),
+            firewall_domain_list: Some(record.to_domain_list(now)),
         })
     }
 }

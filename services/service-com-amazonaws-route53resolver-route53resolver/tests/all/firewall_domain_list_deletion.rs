@@ -17,13 +17,18 @@
 //! not make — a list the service itself publishes, or one whose last change has
 //! not settled — is refused and changes nothing.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_route53resolver_route53resolver::state::PROVISIONING_DELAY;
+use service_com_amazonaws_route53resolver_route53resolver::state::{
+    service_state, PROVISIONING_DELAY,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{emulator, expect_error, ok, parse_time, string_member, ACCOUNT, REGION};
+use super::harness::{
+    emulator, emulator_on, expect_error, ok, parse_time, string_member, ACCOUNT, REGION,
+};
 
 /// The `FirewallDomainListStatus` values the model declares
 /// (`smithy_query(query="shape",shape="FirewallDomainListStatus")`), which any
@@ -35,6 +40,18 @@ const DOMAIN_LIST_STATUSES: &[&str] = &[
     "DELETING",
     "UPDATING",
 ];
+
+/// The `FirewallDomainListStatus` values of [`DOMAIN_LIST_STATUSES`] that
+/// describe work on the list still being carried out — the two `COMPLETE`
+/// forms are the settled ones. A list in one of these has a state transition in
+/// flight, which is what the model's `ConflictException` ("you can't delete a
+/// firewall domain list if it is in the process of being deleted") is about.
+const IN_FLIGHT_DOMAIN_LIST_STATUSES: &[&str] = &["IMPORTING", "UPDATING", "DELETING"];
+
+/// The sentence DNS Firewall states in `FirewallDomainList$StatusMessage` once
+/// a delete has been accepted for the list: fixed text for that lifecycle step,
+/// with no part of the request in it.
+const DELETING_DOMAIN_LIST_MESSAGE: &str = "Deleting the Firewall Domain List";
 
 /// A domain list DNS Firewall publishes itself. The first is named in
 /// `FirewallDomainList$ManagedOwnerName`'s doc
@@ -160,9 +177,6 @@ async fn a_deleted_domain_list_is_removed_from_state() {
                 }),
             )
             .await;
-            // The change the clock owes falls due first, so the delete below is
-            // about deleting a settled list and not about a transition.
-            settle().await;
         }
 
         let before = read(&router, &id).await;
@@ -203,6 +217,17 @@ async fn a_deleted_domain_list_is_removed_from_state() {
         assert!(
             DOMAIN_LIST_STATUSES.contains(&status.as_str()),
             "case {case:?}: Status must be a modelled FirewallDomainListStatus, got {status:?}"
+        );
+        // The status message goes with the step the status names, so the delete
+        // states the delete step and not the one the list held before it.
+        let message = string_member(&deleted, "StatusMessage");
+        assert_eq!(
+            message, DELETING_DOMAIN_LIST_MESSAGE,
+            "case {case:?}: the delete must state the step the list reached, got {deleted}"
+        );
+        assert!(
+            message.len() <= 255,
+            "case {case:?}: StatusMessage must satisfy its modelled length 0..255, got {message:?}"
         );
         let created_at = parse_time(case, "CreationTime", &string_member(&deleted, "CreationTime"));
         let modified_at = parse_time(
@@ -381,51 +406,65 @@ async fn a_published_domain_list_is_not_this_accounts_to_delete() {
 /// flight, so the delete is refused with the `ConflictException` the operation
 /// models and the list keeps its domains. Once the clock has made the settled
 /// status due, the very same delete is served.
+///
+/// The rows are the `FirewallDomainListStatus` values that describe work still
+/// being carried out ([`IN_FLIGHT_DOMAIN_LIST_STATUSES`]), put on a stored list
+/// through the store the service reads: every write this service serves applies
+/// its change inside the call, so no operation leaves a list in one of them.
 #[tokio::test]
 async fn a_list_whose_change_has_not_settled_cannot_be_deleted_yet() {
-    let router = emulator();
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(Arc::clone(&engine));
 
-    for (case, operation, domains) in [
-        ("an ADD that has not settled", "ADD", vec!["a.example.com"]),
-        (
-            "a REPLACE that has not settled",
-            "REPLACE",
-            vec!["b.example.com", "c.example.com"],
-        ),
-    ] {
+    for transient in IN_FLIGHT_DOMAIN_LIST_STATUSES {
+        let case = format!("a list reported {transient}");
+        let domains = vec!["a.example.com", "b.example.com"];
         let id = string_member(
             &create(
                 &router,
                 json!({
-                    "CreatorRequestId": format!("req-{operation}"),
-                    "Name": format!("settling-{operation}"),
+                    "CreatorRequestId": format!("req-{transient}"),
+                    "Name": format!("settling-{transient}"),
                 }),
             )
             .await,
             "Id",
         );
-
-        let updated = ok(
+        ok(
             &router,
             "UpdateFirewallDomains",
             json!({
                 "FirewallDomainListId": id.clone(),
-                "Operation": operation,
+                "Operation": "ADD",
                 "Domains": domains.clone(),
             }),
         )
         .await;
+
+        {
+            let state = service_state(&*engine)
+                .expect("the store is reachable from the engine the service is mounted on");
+            let mut store = state.lock();
+            let record = store
+                .firewall_domain_lists
+                .get_mut(&id)
+                .expect("the create wrote a record for the list it answered with");
+            record.status = (*transient).to_string();
+            record.settled_at = Some(Instant::now() + PROVISIONING_DELAY);
+        }
+
+        let reported = read(&router, &id).await;
         assert_eq!(
-            string_member(&updated, "Status"),
-            "UPDATING",
-            "case {case:?}: the change has not settled yet, got {updated}"
+            string_member(&reported, "Status"),
+            *transient,
+            "case {case:?}: the change has not settled yet, got {reported}"
         );
 
         expect_error(
             &router,
             "DeleteFirewallDomainList",
             json!({ "FirewallDomainListId": id.clone() }),
-            case,
+            &case,
             "ConflictException",
         )
         .await;
@@ -455,11 +494,16 @@ async fn a_list_whose_change_has_not_settled_cannot_be_deleted_yet() {
             "DELETING",
             "case {case:?}: once the change has settled the delete is served, got {deleted}"
         );
+        assert_eq!(
+            string_member(&deleted, "StatusMessage"),
+            DELETING_DOMAIN_LIST_MESSAGE,
+            "case {case:?}: the served delete states the step the list reached, got {deleted}"
+        );
         expect_error(
             &router,
             "GetFirewallDomainList",
             json!({ "FirewallDomainListId": id }),
-            case,
+            &case,
             "ResourceNotFoundException",
         )
         .await;

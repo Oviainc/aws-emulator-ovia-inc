@@ -251,12 +251,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // list that was just created reports `DomainCount` 0.
             domains: Vec::new(),
             status: crate::state::FIREWALL_DOMAIN_LIST_STATUS_COMPLETE.to_string(),
-            // `StatusMessage` is "additional information about the status of the
-            // list, IF AVAILABLE", and the model states no text for it; a list
-            // that reached its settled status with nothing to report adds
-            // nothing, so it is left unset rather than carrying an invented
-            // sentence.
-            status_message: None,
             tags: input.tags.clone().unwrap_or_default(),
             creation_time: timestamp.clone(),
             modification_time: timestamp,

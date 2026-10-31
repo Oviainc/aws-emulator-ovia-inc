@@ -210,14 +210,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove(&record.creator_request_id);
 
         // The answer is the group this call took out, as it stood — with the
-        // rules it held counted — and it is on its way out, so it reports the
-        // model's `DELETING` rather than the settled status it held until now.
-        let mut rule_group = record.to_rule_group(now);
-        rule_group.status = Some(crate::state::FIREWALL_RULE_GROUP_STATUS_DELETING.to_string());
-        rule_group.modification_time = Some(crate::state::now_rfc3339());
-
+        // rules it held counted, and in the lifecycle step it last reached,
+        // whose own sentence the projection reports beside it: the delete is
+        // carried out inside this call, so there is no step still in flight for
+        // the group to report.
         Ok(DeleteFirewallRuleGroupOutput {
-            firewall_rule_group: Some(rule_group),
+            firewall_rule_group: Some(record.to_rule_group(now)),
         })
     }
 }

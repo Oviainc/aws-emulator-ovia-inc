@@ -35,6 +35,8 @@ mod firewall_domain_list_listing;
 mod firewall_domain_lists;
 #[path = "all/firewall_domains.rs"]
 mod firewall_domains;
+#[path = "all/firewall_lifecycle_status_messages.rs"]
+mod firewall_lifecycle_status_messages;
 #[path = "all/firewall_rule_group_deletion.rs"]
 mod firewall_rule_group_deletion;
 #[path = "all/firewall_rule_group_listing.rs"]

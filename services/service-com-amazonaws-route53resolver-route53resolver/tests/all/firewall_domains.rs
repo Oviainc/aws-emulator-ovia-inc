@@ -356,8 +356,8 @@ async fn one_update_applies_exactly_one_set_operation_to_the_stored_domains() {
             "case {case:?}: Status must be one of {DOMAIN_LIST_STATUSES:?}, got {status:?}"
         );
         assert_eq!(
-            status, "UPDATING",
-            "case {case:?}: a change that has not settled yet reports UPDATING, got {answered}"
+            status, "COMPLETE",
+            "case {case:?}: a set operation applied inside the call leaves the list settled, got {answered}"
         );
 
         assert_domains(&router, &id, &owned(&expected), case).await;
@@ -378,10 +378,12 @@ async fn one_update_applies_exactly_one_set_operation_to_the_stored_domains() {
     }
 }
 
-/// The update AWS answers `UPDATING` reaches `COMPLETE` on its own, with the
-/// domains it wrote untouched: the status is the only member the clock moves.
+/// The update is applied inside the call it was made in: the list reports the
+/// settled status straight away and still reports it once the span the clock
+/// owes a change that IS in flight has passed, with the domains it wrote
+/// untouched.
 #[tokio::test]
-async fn the_updating_status_settles_to_complete_on_its_own() {
+async fn the_update_is_settled_by_the_time_it_answers() {
     let router = emulator();
     let id = seed_list(&router, "settling").await;
     let domains = owned(&["a.example.com", "b.example.com"]);
@@ -389,26 +391,26 @@ async fn the_updating_status_settles_to_complete_on_its_own() {
     let answered = update(&router, &id, "ADD", &domains).await;
     assert_eq!(
         string_member(&answered, "Status"),
-        "UPDATING",
-        "case \"straight after the update\": the change has not settled yet, got {answered}"
+        "COMPLETE",
+        "case \"straight after the update\": the change is applied inside the call, got {answered}"
     );
     let read = read_list(&router, &id).await;
     assert_eq!(
         string_member(&read, "Status"),
-        "UPDATING",
+        "COMPLETE",
         "case \"straight after the update\": the list reports the same status as the update, got {read}"
     );
     assert_domains(&router, &id, &domains, "straight after the update").await;
 
     tokio::time::sleep(PROVISIONING_DELAY + Duration::from_millis(250)).await;
 
-    let settled = read_list(&router, &id).await;
+    let later = read_list(&router, &id).await;
     assert_eq!(
-        string_member(&settled, "Status"),
+        string_member(&later, "Status"),
         "COMPLETE",
-        "case \"once the owed transition falls due\": the list must report COMPLETE, got {settled}"
+        "case \"a span later\": a settled list stays settled, got {later}"
     );
-    assert_domains(&router, &id, &domains, "once the owed transition falls due").await;
+    assert_domains(&router, &id, &domains, "a span later").await;
 }
 
 /// Paging walks every domain of the list exactly once, whatever the page size,

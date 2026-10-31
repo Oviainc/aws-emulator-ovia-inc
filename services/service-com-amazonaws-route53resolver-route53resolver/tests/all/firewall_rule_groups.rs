@@ -21,6 +21,11 @@ fn rule_group(body: &Value) -> &Value {
         .expect("the response carries a FirewallRuleGroup")
 }
 
+/// The sentence DNS Firewall states in `FirewallRuleGroup$StatusMessage` for a
+/// group that reached its created, settled lifecycle step: fixed text for the
+/// step, with no part of the request in it.
+const CREATED_RULE_GROUP_MESSAGE: &str = "Created Firewall Rule Group";
+
 /// One row of the create table: what the call hands over.
 struct CreateCase {
     case: &'static str,
@@ -151,11 +156,12 @@ async fn a_created_rule_group_is_read_back_from_state() {
             "case {case:?}: a group this account just created is shared with nobody, got {made}"
         );
         // `StatusMessage` carries "additional information about the status of
-        // the rule group, IF AVAILABLE", and a settled empty group has none.
+        // the rule group, if available": the step the group reached is stated
+        // there, the same way for every group that stands in it.
         assert_eq!(
-            made.get("StatusMessage"),
-            None,
-            "case {case:?}: StatusMessage must be unset for a settled empty group, got {made}"
+            string_member(&made, "StatusMessage"),
+            CREATED_RULE_GROUP_MESSAGE,
+            "case {case:?}: a settled, created group states the step it reached, got {made}"
         );
         let created_at = parse_time(case, "CreationTime", &string_member(&made, "CreationTime"));
         let modified_at = parse_time(
