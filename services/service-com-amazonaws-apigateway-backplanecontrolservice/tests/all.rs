@@ -321,6 +321,11 @@ mod refusal_sentence_targets;
 // the byte spelling of the YAML serialization.
 #[path = "all/stage_export_content_types.rs"]
 mod stage_export_content_types;
+// Appended for the reason the note above gives: the MAPPING TEMPLATES a deployed stage
+// applies — what an integration's request template and an integration response's response
+// template are RENDERED against, and which of them this emulator does not render.
+#[path = "all/stage_mapping_templates.rs"]
+mod stage_mapping_templates;
 // Appended for the reason the note above gives: the ACCOUNT-level CloudWatch Logs role a
 // stage configuration that turns execution logging on is refused without.
 #[path = "all/stage_execution_logging_account_role.rs"]

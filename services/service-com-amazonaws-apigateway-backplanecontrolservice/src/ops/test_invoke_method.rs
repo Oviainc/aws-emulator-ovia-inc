@@ -128,9 +128,10 @@ use super::types::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::service::invoke::{
-    perform_integration, refusal_rendering, with_stage_variables, MethodRequest,
-    JSON_CONTENT_TYPE,
+    matched_path_parameters, perform_integration, refusal_rendering, sent_query_parameters,
+    with_stage_variables, MethodRequest, JSON_CONTENT_TYPE,
 };
+use crate::service::mapping_template::TemplateInputs;
 
 /// The request this operation's execution log is a log of. A simulated invocation never
 /// reaches the data plane, so it has no request id of its own: the log names the kind of
@@ -230,6 +231,26 @@ fn header_names(input: &TestInvokeMethodInput) -> Vec<String> {
             .map(|(key, _)| key.as_str()),
     );
     names.into_iter().map(str::to_owned).collect()
+}
+
+/// The headers a simulated request carries, by name: both members a caller may carry one
+/// in, as [`simulated_header`] reads them — `headers`, then the FIRST value of a
+/// `multiValueHeaders` entry, which is the value a single-valued read of a multi-valued
+/// header sees. A name in both keeps the single-valued one.
+///
+/// Read for the same reason the template-selecting header is: a header the caller simulated
+/// must be the one the template renders against, whichever member carried it.
+fn simulated_headers(input: &TestInvokeMethodInput) -> BTreeMap<String, String> {
+    let mut carried: BTreeMap<String, String> = BTreeMap::new();
+    for (name, values) in input.multi_value_headers.iter().flatten() {
+        if let Some(first) = values.first() {
+            carried.insert(name.clone(), first.clone());
+        }
+    }
+    for (name, value) in input.headers.iter().flatten() {
+        carried.insert(name.clone(), value.clone());
+    }
+    carried
 }
 
 /// The path and the query string of `pathWithQueryString` — "The URI path, including query
@@ -407,10 +428,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or("none")
         ));
 
-        let call = MethodRequest::simulated(
-            simulated_header(&input, CONTENT_TYPE),
-            simulated_header(&input, ACCEPT),
-        );
         // The stage variables the caller asked to simulate are what the integration's
         // configuration is read against: `stageVariables` is "a key-value map of stage
         // variables to simulate an invocation on a deployed Stage", so a configuration
@@ -422,6 +439,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .flatten()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
+        // What a MAPPING TEMPLATE of this simulated call renders against: the same members
+        // the data plane reads off the wire, taken from the ones a caller simulates the
+        // request with, so one stored template renders one way whichever side drives it.
+        // The path parameters are bound against the RESOURCE's own template, because
+        // `pathWithQueryString` is where a caller "specif[ies] path parameters and query
+        // string parameters". A simulated call reaches no stage, so it carries no stage of
+        // its own to name.
+        let inputs = TemplateInputs {
+            payload: Some(
+                input
+                    .body
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            path: matched_path_parameters(&resource.path, path.unwrap_or("")),
+            querystring: sent_query_parameters(query.unwrap_or_default()),
+            header: simulated_headers(&input),
+            stage_variables: simulated_variables.clone(),
+            context: BTreeMap::from([
+                ("apiId".to_string(), input.rest_api_id.clone()),
+                ("httpMethod".to_string(), verb.clone()),
+                ("resourcePath".to_string(), resource.path.clone()),
+                (
+                    "path".to_string(),
+                    path.unwrap_or(resource.path.as_str()).to_string(),
+                ),
+            ]),
+        };
+        let call = MethodRequest::simulated(
+            simulated_header(&input, CONTENT_TYPE),
+            simulated_header(&input, ACCEPT),
+            inputs,
+        );
         let performed = with_stage_variables(method, &simulated_variables)
             .and_then(|resolved| perform_integration(Some(&resolved), &call));
         let (status, body, headers) = match performed {

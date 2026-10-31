@@ -104,7 +104,9 @@
 //! integration response stored UNDER THAT STATUS CODE, and otherwise the default one — a
 //! `selectionPattern` is not matched against it, because a pattern is documented as
 //! choosing "an integration response based on the response from the back end" and a `MOCK`
-//! produces no back-end response to match.
+//! produces no back-end response to match. What a `MOCK` DID answer is its request
+//! template rendered against the call, so that is the payload its response template reads
+//! `$input` off.
 //!
 //! An `HTTP_PROXY` integration — the type `IntegrationType` gives "for integrating with the
 //! HTTP proxy integration" — is PASSED THROUGH rather than mapped: its answer is the
@@ -144,10 +146,16 @@
 //! ran would be indistinguishable from a real one. They are answered as API Gateway
 //! answers an integration it could not perform — the `API_CONFIGURATION_ERROR` gateway
 //! response, `500` with `{"message":"Internal server error"}` — and the reason is logged.
-//! The same goes for a mapping template that is a Velocity TEMPLATE rather than a literal
-//! body: evaluating Velocity is not something this emulator does, and a hand-written
-//! subset of it would silently produce the wrong body, so such a template is an
-//! integration this call cannot perform rather than a body built by guesswork.
+//! The same goes for a mapping template that would have to be EXECUTED. A mapping template
+//! is "a map of Velocity templates" whose REFERENCES name values of the call — the method
+//! request, the stage's variables and the call's context — so the template that keys the
+//! call is RENDERED from those values ([`rendered_mapping_template`],
+//! [`mapping_template`]) and the text it produced is the integration request and the
+//! response body. What is NOT rendered is the half that is statements rather than values —
+//! a DIRECTIVE (`#set`, `#if`, …) — and a reference naming anything outside that set: a
+//! hand-written stand-in for either would silently produce the wrong body, so such a
+//! template is an integration this call cannot perform rather than a body built by
+//! guesswork.
 //!
 //! # The stage's response cache
 //!
@@ -221,6 +229,7 @@ use crate::state::{
 
 use ::service_com_amazonaws_wafv2_awswaf_20190729::service::edge as waf_edge;
 
+use super::mapping_template::{self, TemplateInputs};
 use super::resource_policy;
 
 /// The second label of every `execute-api` endpoint host: `{api-id}.execute-api.…`.
@@ -1240,7 +1249,20 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
             None
         };
 
-        let call = MethodRequest::of_request(req);
+        let call = MethodRequest::of_request(
+            req,
+            // What a mapping template of this call renders against: the method request as
+            // it arrived, the path parameters the matched resource template binds, and the
+            // STAGE's own variables and identity.
+            TemplateInputs {
+                payload: req.body().bytes().map(<[u8]>::to_vec),
+                path: matched_path_parameters(matched_path, &resource_path),
+                querystring: sent_query_parameters(query_of(req.uri())),
+                header: sent_headers(req),
+                stage_variables: stage.variables.clone(),
+                context: call_context(&api.id, &stage.stage_name, verb, matched_path, req.uri()),
+            },
+        );
         // The method's own request validator, before the integration is reached: a
         // request the method declares invalid never gets to the backend. The PARAMETERS
         // half is decided here, from the request's own query string and headers; the BODY
@@ -1908,7 +1930,11 @@ fn cache_key(
 /// `method.request.path.{name}` source names a `{name}` segment of that template and its
 /// value is the segment the REQUEST carried in that position; a greedy `{name+}` takes
 /// every remaining segment, which is what makes it greedy.
-fn matched_path_parameters(matched_path: &str, request_path: &str) -> BTreeMap<String, String> {
+///
+/// `pub` because a mapping template reads the same binding through `$input.params(x)`, and
+/// `TestInvokeMethod` binds the path a caller simulates against the resource's own template
+/// the same way: one binding, so no two readers of a path parameter can disagree.
+pub fn matched_path_parameters(matched_path: &str, request_path: &str) -> BTreeMap<String, String> {
     let declared = path_segments(matched_path);
     let sent = path_segments(request_path);
     let mut parameters = BTreeMap::new();
@@ -2520,23 +2546,34 @@ pub struct MethodRequest {
     media_type: String,
     /// The first media type of the request's `Accept`, or `None` when it accepts anything.
     accepted: Option<String>,
+    /// What a MAPPING TEMPLATE this call selects is rendered against: the method request's
+    /// own payload, parameters and context, and the stage's variables
+    /// ([`mapping_template`]).
+    inputs: TemplateInputs,
 }
 
 impl MethodRequest {
-    /// What a request off the wire declares and accepts.
-    fn of_request(req: &RtRequest) -> Self {
+    /// What a request off the wire declares and accepts, and what its templates render
+    /// against.
+    fn of_request(req: &RtRequest, inputs: TemplateInputs) -> Self {
         Self {
             media_type: declared_media_type(req.headers().get("content-type")),
             accepted: first_media_type(req.headers().get("accept")),
+            inputs,
         }
     }
 
     /// What a SIMULATED request declares and accepts, from the two header values a caller
-    /// supplied as members rather than on the wire.
-    pub fn simulated(content_type: Option<&str>, accept: Option<&str>) -> Self {
+    /// supplied as members rather than on the wire, and what its templates render against.
+    pub fn simulated(
+        content_type: Option<&str>,
+        accept: Option<&str>,
+        inputs: TemplateInputs,
+    ) -> Self {
         Self {
             media_type: declared_media_type(content_type),
             accepted: first_media_type(accept),
+            inputs,
         }
     }
 
@@ -2599,9 +2636,10 @@ pub struct UnservedIntegration {
 /// (`Integration$requestParameters`), so a stage variable is not one of the forms that
 /// member takes — and a value outside them is already stated as a mapping this emulator
 /// does not read ([`mapped_request_parameter`]). `requestTemplates` and
-/// `responseTemplates` are not substituted either: a template that references anything is
-/// a Velocity template, which this emulator states rather than evaluates
-/// ([`is_velocity_template`]).
+/// `responseTemplates` are not substituted here either: a template is RENDERED against the
+/// call when it is applied ([`rendered_mapping_template`]), and the stage's variables are
+/// among the values it is rendered from, so rewriting the stored text first would resolve
+/// them twice.
 pub fn with_stage_variables(
     method: &MethodEntry,
     variables: &BTreeMap<String, String>,
@@ -3021,9 +3059,35 @@ pub fn perform_integration(
         });
     }
 
-    let mapped_status = match request_mapping(integration, call) {
-        RequestMapping::Mapped(template) => mock_status_code(template),
-        RequestMapping::PassedThrough => None,
+    // The status the call maps to, and what the integration ANSWERED — which a response
+    // template reads its payload off. A `MOCK` has no backend, so its answer is the request
+    // template's own rendering.
+    let (mapped_status, integrated_payload) = match request_mapping(integration, call) {
+        // The integration request a `MOCK` answers with is its request template RENDERED
+        // against this call: the `statusCode` the rendered text names is the integration
+        // response the call maps to, and the rendered text IS what the integration
+        // answered, which is what a response template then reads its payload off. A
+        // template this emulator does not render is an integration the call cannot be
+        // performed through — the same exit its response template takes — rather than a
+        // call served with a status and a body nothing produced.
+        RequestMapping::Mapped(template) => {
+            let body = rendered_mapping_template(template, &call.inputs).map_err(|reason| {
+                UnservedIntegration {
+                    refusal: API_CONFIGURATION_ERROR,
+                    reason: format!(
+                        "the {} request template of {} bytes is not one this emulator \
+                         renders: {reason}",
+                        call.media_type,
+                        template.len()
+                    ),
+                }
+            })?;
+            (mock_status_code(&body), Some(body.into_bytes()))
+        }
+        // Nothing is mapped, so the integration answers the method request's own payload:
+        // that is what "passes the method request body through the integration request
+        // without transformation" means.
+        RequestMapping::PassedThrough => (None, call.inputs.payload.clone()),
         RequestMapping::Unsupported => {
             return Err(UnservedIntegration {
                 refusal: UNSUPPORTED_MEDIA_TYPE,
@@ -3064,13 +3128,18 @@ pub fn perform_integration(
         });
     };
 
-    let (content_type, body) = response_body(selected, call).map_err(|template| {
+    // The response template is rendered against the same call, with the payload it reads
+    // being the one the INTEGRATION answered rather than the one the client sent.
+    let response_inputs = TemplateInputs {
+        payload: integrated_payload,
+        ..call.inputs.clone()
+    };
+    let (content_type, body) = response_body(selected, call, &response_inputs).map_err(|template| {
         UnservedIntegration {
             refusal: API_CONFIGURATION_ERROR,
             reason: format!(
-                "the {} response template of {} bytes is a Velocity template, which this \
-                 emulator does not evaluate: no body is invented for it",
-                template.content_type, template.bytes
+                "the {} response template of {} bytes is not one this emulator renders: {}",
+                template.content_type, template.bytes, template.reason
             ),
         }
     })?;
@@ -3230,14 +3299,12 @@ fn first_media_type(accepted: Option<&str>) -> Option<String> {
 /// A `MOCK` integration's request template is where the call's status comes from: the
 /// documented form is a literal object carrying the status to return
 /// (`{"statusCode": 200}`), and that code is the key of the integration response the call
-/// maps to. A template this emulator cannot render — a Velocity one — names no code, and
-/// neither does one that is not such an object: the call then maps to the default
-/// integration response rather than to a code guessed at.
-fn mock_status_code(template: &str) -> Option<String> {
-    if is_velocity_template(template) {
-        return None;
-    }
-    let value: ::serde_json::Value = ::serde_json::from_str(template).ok()?;
+/// maps to. This reads the template as it was RENDERED against the call, so a template that
+/// computes the status from the request names the code it produced; a rendering that is not
+/// such an object names no code, and the call then maps to the default integration response
+/// rather than to a code guessed at.
+fn mock_status_code(rendered: &str) -> Option<String> {
+    let value: ::serde_json::Value = ::serde_json::from_str(rendered).ok()?;
     let status = value.get("statusCode")?;
     // A JSON number, and the string spelling a template written with quotes produces;
     // both name the same integration response.
@@ -3274,12 +3341,32 @@ fn default_integration_response(
 }
 
 /// A response template this emulator does not render, described for the log: the content
-/// type it is keyed by and its size. The template itself is a developer's configuration and
-/// is not copied into the log.
+/// type it is keyed by, its size and why it was not rendered. The template itself is a
+/// developer's configuration and is not copied into the log; the reason names the one
+/// reference or bound that stopped the rendering, clipped.
 #[derive(Debug)]
 struct UnrenderableTemplate {
     content_type: String,
     bytes: usize,
+    reason: String,
+}
+
+/// `template` rendered against the call, or why this emulator does not render it.
+///
+/// A mapping template is "a map of Velocity templates" (`Integration$requestTemplates`),
+/// which has two halves: REFERENCES, which name values of the call and are rendered from
+/// them ([`mapping_template`]), and DIRECTIVES, which are statements that would have to be
+/// EXECUTED. This emulator renders the first and states the second, so a template it cannot
+/// render is reported as the integration it cannot perform rather than passed through as if
+/// it were a literal body. A template with neither half IS the body, and renders to itself
+/// through the same path.
+fn rendered_mapping_template(template: &str, inputs: &TemplateInputs) -> Result<String, String> {
+    if carries_velocity_directive(template) {
+        return Err("it carries a Velocity directive, which is a statement this emulator \
+                    does not execute"
+            .to_string());
+    }
+    mapping_template::rendered(template, inputs).map_err(|unrendered| unrendered.reason)
 }
 
 /// The content type and body the selected integration response renders.
@@ -3287,11 +3374,12 @@ struct UnrenderableTemplate {
 /// The template is chosen by the content type the caller asked for (`Accept`), then the
 /// JSON one, then the single template an integration response that declares exactly one
 /// carries. `Ok` with an EMPTY body when no template applies — a `MOCK` with no template
-/// answers no body — and `Err` when rendering the chosen template would mean evaluating
-/// Velocity, which this emulator does not do.
+/// answers no body — and `Err` when the chosen template is not one this emulator renders
+/// ([`rendered_mapping_template`]).
 fn response_body(
     selected: &GetIntegrationResponseOutput,
     call: &MethodRequest,
+    inputs: &TemplateInputs,
 ) -> Result<(String, Vec<u8>), UnrenderableTemplate> {
     let Some(templates) = selected
         .response_templates
@@ -3313,13 +3401,14 @@ fn response_body(
     let Some((content_type, template)) = chosen else {
         return Ok((JSON_CONTENT_TYPE.to_string(), Vec::new()));
     };
-    if is_velocity_template(template) {
-        return Err(UnrenderableTemplate {
+    match rendered_mapping_template(template, inputs) {
+        Ok(body) => Ok((content_type.clone(), body.into_bytes())),
+        Err(reason) => Err(UnrenderableTemplate {
             content_type: content_type.clone(),
             bytes: template.len(),
-        });
+            reason,
+        }),
     }
-    Ok((content_type.clone(), template.clone().into_bytes()))
 }
 
 /// The Velocity directives a mapping template may carry, from the Velocity Template
@@ -3331,56 +3420,22 @@ const VELOCITY_DIRECTIVES: &[&str] = &[
     "include", "evaluate", "define",
 ];
 
-/// Whether `template` carries Velocity Template Language rather than being a literal body.
-///
-/// The language has exactly two constructs: a REFERENCE, `$` (optionally `$!`) followed by
-/// an identifier or `{`, and a DIRECTIVE, `#` followed by one of [`VELOCITY_DIRECTIVES`]
-/// (optionally braced) or by a comment marker (`##`, `#*`). A template carrying neither
-/// needs no evaluation at all: it IS the body, and passing it through is not interpreting a
-/// language. One carrying either does need evaluation, and this emulator does not evaluate
-/// Velocity, so it is reported as a template that cannot be rendered rather than passed
-/// through as if it were literal.
-///
-/// TOTAL over every `&str`, including a template carrying non-ASCII text: a template is
-/// caller-stored data that nothing restricts to ASCII, and this runs while serving a
-/// request, so it must not be able to fail. The two bytes it keys on are ASCII, so the
-/// position after one is always a character boundary; the remainder is still taken with
-/// `str::get`, which answers `None` rather than panicking for any position that is not.
-fn is_velocity_template(template: &str) -> bool {
-    for (index, byte) in template.as_bytes().iter().enumerate() {
-        if *byte != b'$' && *byte != b'#' {
-            continue;
-        }
-        let Some(rest) = template.get(index + 1..) else {
-            continue;
-        };
-        if *byte == b'$' {
-            let reference = rest.strip_prefix('!').unwrap_or(rest);
-            let identifier = reference.strip_prefix('{').unwrap_or(reference);
-            if identifier
-                .chars()
-                .next()
-                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-            {
-                return true;
-            }
-            continue;
-        }
-        if carries_directive_at(rest) {
-            return true;
-        }
-    }
-    false
-}
-
 /// Whether `template` carries a Velocity DIRECTIVE — the half of the language that is
 /// statements rather than references, and the half no substitution can stand in for.
 ///
-/// Split out from [`is_velocity_template`] so the one place that DOES resolve references —
-/// a gateway response's body template, whose variables are a documented, closed set
-/// ([`gateway_context`]) — can tell "a template naming a variable" from "a template that
-/// has to be executed". TOTAL over every `&str` for the reason [`is_velocity_template`]
-/// gives.
+/// The language has exactly two constructs: a REFERENCE, `$` (optionally `$!`) followed by
+/// an identifier or `{`, which names a value and is RENDERED from the call
+/// ([`rendered_mapping_template`], [`rendered_gateway_template`]); and a DIRECTIVE, `#`
+/// followed by one of [`VELOCITY_DIRECTIVES`] (optionally braced) or by a comment marker
+/// (`##`, `#*`), which is a statement that would have to be EXECUTED. This tells the two
+/// apart, so the halves that resolve references can refuse the half that cannot be resolved
+/// at all.
+///
+/// TOTAL over every `&str`, including a template carrying non-ASCII text: a template is
+/// caller-stored data that nothing restricts to ASCII, and this runs while serving a
+/// request, so it must not be able to fail. The byte it keys on is ASCII, so the position
+/// after one is always a character boundary; the remainder is still taken with `str::get`,
+/// which answers `None` rather than panicking for any position that is not.
 fn carries_velocity_directive(template: &str) -> bool {
     for (index, byte) in template.as_bytes().iter().enumerate() {
         if *byte != b'#' {
@@ -3397,7 +3452,7 @@ fn carries_velocity_directive(template: &str) -> bool {
 }
 
 /// Whether the text right after a `#` begins a directive or a comment marker; see
-/// [`is_velocity_template`] for why the NAME has to end where an identifier cannot
+/// [`carries_velocity_directive`] for why the NAME has to end where an identifier cannot
 /// continue.
 fn carries_directive_at(rest: &str) -> bool {
     if rest.starts_with('#') || rest.starts_with('*') {
@@ -3553,6 +3608,65 @@ fn split_stage(path: &str) -> Option<(&str, String)> {
 /// The non-empty `/`-separated segments of a path.
 fn path_segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|segment| !segment.is_empty()).collect()
+}
+
+/// The QUERY-STRING parameters `query` carries, by name: the FIRST value under each name,
+/// which is the one a single-valued reference names.
+///
+/// Decoded by the FRAMEWORK's own query reader
+/// (`aws_smithy_schema_server::parse_form_urlencoded`, the reader
+/// [`super::query_coercion`] reads a modelled query string with), so a `%XX` escape and a
+/// `+` are the characters the rest of this emulator reads them as rather than the text they
+/// were written with. One pass over what it decoded: the first pair under a name wins, as
+/// that reader's own single-valued read does.
+///
+/// `pub` because `TestInvokeMethod` reads the query string of the `pathWithQueryString` a
+/// caller simulates the request with, and one query string must be read one way.
+pub fn sent_query_parameters(query: &str) -> BTreeMap<String, String> {
+    let mut sent: BTreeMap<String, String> = BTreeMap::new();
+    for (name, value) in ::aws_smithy_schema_server::parse_form_urlencoded(query.as_bytes()) {
+        if name.is_empty() {
+            continue;
+        }
+        sent.entry(name).or_insert(value);
+    }
+    sent
+}
+
+/// The HEADERS `req` carries, by name as it was sent: the first value under each name.
+fn sent_headers(req: &RtRequest) -> BTreeMap<String, String> {
+    let mut sent = BTreeMap::new();
+    for (name, value) in req.headers().iter() {
+        sent.entry(name.to_string())
+            .or_insert_with(|| value.to_string());
+    }
+    sent
+}
+
+/// The `$context` values of this call, keyed by the member path a mapping template writes.
+///
+/// Only what the api's own records and the request itself say about the call: which api and
+/// stage answered it, the method it reached and the path it arrived at. The per-request id
+/// is NOT among them — it is minted where the response reports it (`service_common` owns
+/// both the minting and the header), so it is not a value this call carries — and a member
+/// no value here names is a reference the template is not rendered from at all.
+fn call_context(
+    api_id: &str,
+    stage: &str,
+    verb: &str,
+    resource_path: &str,
+    uri: &str,
+) -> BTreeMap<String, String> {
+    [
+        ("apiId", api_id.to_string()),
+        ("stage", stage.to_string()),
+        ("httpMethod", verb.to_string()),
+        ("resourcePath", resource_path.to_string()),
+        ("path", path_of(uri).to_string()),
+    ]
+    .into_iter()
+    .map(|(member, value)| (member.to_string(), value))
+    .collect()
 }
 
 /// Whether the request presents a SigV4 credential at all — in the `Authorization` header a
@@ -3843,10 +3957,10 @@ mod tests {
     }
 
     #[test]
-    fn a_template_is_velocity_only_when_it_carries_a_reference_or_a_directive() {
+    fn a_template_carries_a_directive_only_where_it_states_one() {
         // Rows differ along the construct and along the literal characters that merely
-        // LOOK like one: a body that needs no evaluation is served verbatim, so the
-        // detector must not claim it does.
+        // LOOK like one: a template that states no directive is RENDERED, so the detector
+        // must not claim it has to be executed — and a reference is not a directive.
         let cases: &[(&str, bool)] = &[
             (r#"{"ok":true}"#, false),
             ("", false),
@@ -3859,12 +3973,12 @@ mod tests {
             (r#"{"msg":"café"}"#, false),
             ("☃", false),
             ("🙂 $ 🙂", false),
-            (r#"{"msg":"café $input.params('x')"}"#, true),
             ("☃#set($x = 1)", true),
-            // References.
-            (r#"{"id":"$input.params('id')"}"#, true),
-            (r#"{"id":"${input}"}"#, true),
-            (r#"{"id":"$!input"}"#, true),
+            // References are the half that is rendered, not executed.
+            (r#"{"msg":"café $input.params('x')"}"#, false),
+            (r#"{"id":"$input.params('id')"}"#, false),
+            (r#"{"id":"${input}"}"#, false),
+            (r#"{"id":"$!input"}"#, false),
             // Directives and comments.
             ("#set($root = $input.path('$'))", true),
             ("#if($x)a#end", true),
@@ -3877,12 +3991,12 @@ mod tests {
             ("## a comment", true),
             ("#* a block comment *#", true),
         ];
-        for (template, velocity) in cases {
-            let detected = is_velocity_template(template);
+        for (template, directive) in cases {
+            let detected = carries_velocity_directive(template);
             assert_eq!(
-                detected, *velocity,
-                "case {template:?}: expected is_velocity_template to be {velocity}, got \
-                 {detected}"
+                detected, *directive,
+                "case {template:?}: expected carries_velocity_directive to be {directive}, \
+                 got {detected}"
             );
         }
     }

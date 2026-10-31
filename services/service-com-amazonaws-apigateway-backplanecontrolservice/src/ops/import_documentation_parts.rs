@@ -8,12 +8,11 @@
 //!
 //! The import is ALL-OR-NOTHING: an entry this service cannot store refuses the whole
 //! body with the modelled 400 and leaves the API's documentation set exactly as it was.
-//! This emulator recognises no warning-level condition on an import it DOES carry out:
-//! every entry of an accepted body is applied, so `warnings` is always absent and
-//! `failOnWarnings` has nothing to roll back. What AWS warns about here — and the sentence
-//! it words that warning with, which decides the refusal `failOnWarnings` answers — is the
-//! subject of its own open issue report; see
-//! `issues/things-that-do-not-work/20261027T101902Z-apigateway-2-causes-of-the-request-validator-issue-remain-open.md`.
+//! What it WARNS about is what the document it read does not hold together — a `$ref`
+//! naming a model the document does not declare — read and worded by the definition
+//! importer's own reader ([`import_warnings`]), so one document earns one set of warnings
+//! whichever import reads it. `failOnWarnings` turns that set into the modelled 400 before
+//! anything is stored, and an import carried out reports it in `warnings` instead.
 //!
 //! ## Shape of an operation
 //!
@@ -98,7 +97,7 @@ use ::serde_json::Value;
 use crate::state::DocumentationPartEntry;
 
 use super::create_documentation_part::{location_key, validated_location, validated_properties};
-use super::put_rest_api::{put_mode, PutModeKind};
+use super::put_rest_api::{model_reference_warnings, put_mode, warnings_refusal, Node, PutModeKind};
 
 /// The OpenAPI extension API Gateway carries a documentation set in, and the member of
 /// it that holds the parts.
@@ -274,6 +273,29 @@ fn import_errors(problem: &str) -> String {
     format!("Errors found during import: {problem}")
 }
 
+/// What this import REPORTS about the document it read: the warnings the document itself
+/// earns, in document order.
+///
+/// The body is an OpenAPI document ("To import from an OpenAPI file, this is a JSON
+/// object", `ImportDocumentationParts$body`) carrying the documentation set in an
+/// extension of it, so what an import warns about is what that DOCUMENT does not hold
+/// together: a `$ref` naming a model the document does not declare names no model, and the
+/// part of the document carrying it is passed over. The reader and the wording are the
+/// definition importer's ([`model_reference_warnings`]), so the same document earns the
+/// same warnings whichever import reads it.
+///
+/// The document is read again as a definition NODE rather than from the value the
+/// documentation set was read out of: the reference walk is bounded and shared with that
+/// importer, and a body this operation already read as JSON cannot fail to parse here — a
+/// body that somehow does carries no warning rather than refusing an import this service
+/// can otherwise perform.
+fn import_warnings(body: &[u8]) -> Vec<String> {
+    match ::serde_json::from_slice::<Node>(body) {
+        Ok(document) => model_reference_warnings(&document),
+        Err(_) => Vec::new(),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -367,11 +389,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `failOnWarnings` is "a query parameter to specify whether to rollback the
         // documentation importation (true) or not (false) when a warning is encountered":
-        // an import this service carries out applies every entry its body declares, so
-        // there is no entry left over to warn about and nothing for the rollback to undo.
-        // An entry that cannot be stored has already refused the whole request above,
-        // whichever way this parameter is set. What AWS warns about instead, and how it
-        // words that warning, is the open issue report the module docs name.
+        // the warnings are what the document earns ([`import_warnings`]), and the rollback
+        // is decided BEFORE the store is touched, so a refused import leaves the API's
+        // documentation set exactly as it was. With the flag off the same body is imported
+        // and the warnings are reported instead ([`ImportDocumentationPartsOutput`]'s
+        // `warnings`).
+        let warnings = import_warnings(&input.body);
+        if input.fail_on_warnings && !warnings.is_empty() {
+            return Err(bad_request(warnings_refusal(&warnings)));
+        }
+
+        // `failOnWarnings` is "a query parameter to specify whether to rollback the
+        // documentation importation (true) or not (false) when a warning is encountered":
+        // an import this service carries out applies every entry its body declares, and
+        // the warnings the document earns were decided above — before the store was
+        // touched, which is what makes the rollback "nothing was applied" rather than an
+        // undo.
 
         let mut store = state.lock();
 
@@ -508,10 +541,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         Ok(ImportDocumentationPartsOutput {
             ids: Some(imported),
-            // An import that is carried out carried over every entry its body declared,
-            // so there is nothing to warn about; a body with an entry this service cannot
-            // store is refused instead of reported.
-            warnings: None,
+            // "A list of warning messages reported during import of documentation parts":
+            // what the document earned, which an import carried out reports rather than
+            // refuses. A document that earns none reports none at all, exactly as the
+            // sibling definition import reports none.
+            warnings: (!warnings.is_empty()).then_some(warnings),
         })
     }
 }

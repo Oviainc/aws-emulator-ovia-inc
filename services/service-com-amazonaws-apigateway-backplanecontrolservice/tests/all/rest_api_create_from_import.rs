@@ -1012,14 +1012,20 @@ async fn a_definition_the_import_cannot_carry_over_in_full_reports_what_it_dropp
              \"paths\": {\"/thing\": {\"get\": {\"responses\": {\"200\": {\"description\": \"ok\", \
                  \"content\": {\"application/json\": {\"schema\": \
                      {\"$ref\": \"#/components/schemas/Missing\"}}}}}}}}}",
-            &["#/components/schemas/Missing"],
+            &[
+                "Reference to model 'Missing' not found. Ignoring.",
+                "Invalid format for model application/json for method GET",
+            ],
         ),
         (
             "a reference to another document",
             "{\"swagger\": \"2.0\", \"info\": {\"title\": \"w\"}, \
              \"paths\": {\"/thing\": {\"get\": {\"responses\": {\"200\": {\"description\": \"ok\", \
                  \"schema\": {\"$ref\": \"shared.json#/definitions/Thing\"}}}}}}}",
-            &["shared.json#/definitions/Thing"],
+            &[
+                "Reference to model 'Thing' not found. Ignoring.",
+                "Invalid format for model application/json for method GET",
+            ],
         ),
     ];
 
@@ -1030,16 +1036,22 @@ async fn a_definition_the_import_cannot_carry_over_in_full_reports_what_it_dropp
         let warnings = created["warnings"]
             .as_array()
             .unwrap_or_else(|| panic!("case {case}: expected warnings, got {created:?}"));
-        assert_eq!(
-            warnings.len(),
-            1,
-            "case {case}: expected exactly one warning, got {warnings:?}"
+        // Every row's diagnostics, as one text: a row may report more than one — an
+        // unresolvable model reference loses both the MODEL and the FORMAT the method would
+        // have read that media type under — and what is asserted is that each is named.
+        let reported = warnings
+            .iter()
+            .filter_map(|warning| warning.as_str())
+            .collect::<Vec<&str>>()
+            .join("\n");
+        assert!(
+            !warnings.is_empty(),
+            "case {case}: expected the import to report what it dropped, got {created:?}"
         );
-        let warning = warnings[0].as_str().unwrap_or_default();
         for part in *named {
             assert!(
-                warning.contains(part),
-                "case {case}: the warning must name {part:?}, got {warning:?}"
+                reported.contains(part),
+                "case {case}: the warnings must name {part:?}, got {reported:?}"
             );
         }
 

@@ -9,6 +9,10 @@ Issue-Commit: 3bfaf82953d93db9f40ee26ed0fb0b9c83dbff8e
 
 # API Gateway: 2 of the seven causes of the request-validator issue are still open — ImportDocumentationParts' failOnWarnings refusal cannot be worded from any source available in this repo, and the four-mode validator check still times out with no response captured
 
+> _RESOLVED for cause 2: the four-mode validator check passes. Its mechanism was the one this report hypothesised — a mapping template that has to be RENDERED. The integration response of the check's routes is `{"ran": "<route>", "tenant": "$input.params('tenant')"}`, which the emulator answered `API_CONFIGURATION_ERROR` (500) for, so the positive control never reached 200 and the check ran past the harness cap. Mapping templates are now rendered against the call (`src/service/mapping_template.rs`), and the unit passes._
+>
+> _Cause 1 is NOT closed. Its CONDITION, its gate and its atomicity are implemented and pinned by tests — the recorded check now gets past its own key and onto its whole-message comparison — but the SENTENCE the refusal states is still not sourced. That key, the recorded import body (established by this fix) and the fourteen wordings now tried and rejected are carried by `issues/things-that-do-not-work/20261103T120000Z-apigateway-importdocumentationparts-failonwarnings-refusal-sentence.md`, so no key is carried by both reports._
+
 > _Split out of `issues/things-that-now-work/20261027T101902Z-apigateway-api-gateway-7-net-new-root-causes-request.md`, whose other five causes are fixed and whose units pass. This report carries the two replay keys that do NOT pass, so neither cause is claimed closed. Everything below is what that fix established about them; a later fixer starts from here rather than from scratch._
 
 ## Operation

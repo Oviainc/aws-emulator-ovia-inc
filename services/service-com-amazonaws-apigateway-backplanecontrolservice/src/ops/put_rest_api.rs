@@ -882,14 +882,22 @@ fn read_definition(document: &Node, scope: &ImportScope) -> Result<ImportedDefin
     definition.gateway_responses =
         imported_gateway_responses(document, scope, &mut definition.warnings);
 
-    // The references the document does not resolve. A `$ref` names the schema a part of
+    // The references the document does not resolve. A `$ref` names the model a part of
     // the document stands for, and one whose target the document does not declare — or
-    // whose target is outside the document altogether — names nothing an import could
+    // whose target is outside the document altogether — names no model an import could
     // carry over, so it is reported rather than silently dropped.
-    for reference in unresolved_references(document) {
+    for warning in model_reference_warnings(document) {
+        warn(&mut definition.warnings, warning);
+    }
+    // And what THIS import loses with it: a method's body is read under the model the
+    // schema reference names, so a reference that resolves to nothing leaves the method
+    // with no format for that media type. Reported here rather than beside the reference
+    // above, because it is about the METHODS this import creates — which a documentation
+    // import, reading the same document through the same reader, creates none of.
+    for (media_type, verb) in unreadable_body_formats(document) {
         warn(
             &mut definition.warnings,
-            format!("Unable to resolve reference '{reference}'. Ignoring."),
+            format!("Invalid format for model {media_type} for method {verb}"),
         );
     }
 
@@ -1039,6 +1047,201 @@ pub fn warnings_refusal(warnings: &[String]) -> String {
         message.push_str(warning);
     }
     message
+}
+
+/// The model a `$ref` names: the last token of its JSON Pointer, which is the name the
+/// document declares that model under (`#/components/schemas/<name>` in OpenAPI 3,
+/// `#/definitions/<name>` in Swagger 2.0) and the name an import reports the reference
+/// by. A reference carrying no separator at all names that model directly.
+fn referenced_model(reference: &str) -> &str {
+    reference
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(reference)
+}
+
+/// The warnings a document earns for the MODEL REFERENCES it does not itself resolve, in
+/// document order and each reported once.
+///
+/// A `$ref` names the model a part of the document stands for, so one whose target the
+/// document does not declare — or whose target is outside the document altogether — names
+/// no model at all: API Gateway reports it by the MODEL's own name ([`referenced_model`])
+/// rather than by the pointer that failed, and carries on with the rest of the document,
+/// which is what "Ignoring." says.
+///
+/// `pub` because `ImportDocumentationParts` reads the same OpenAPI document — its `body`
+/// is "a JSON object" of the same shape, carrying the documentation set in an extension of
+/// it — and reports the same condition, so neither importer can word it differently. What
+/// is NOT here is what an import loses BESIDE the model ([`unreadable_body_formats`]):
+/// that is about the methods a definition import creates, which a documentation import
+/// creates none of.
+pub fn model_reference_warnings(document: &Node) -> Vec<String> {
+    unresolved_references(document)
+        .iter()
+        .map(|reference| {
+            format!(
+                "Reference to model '{}' not found. Ignoring.",
+                referenced_model(reference)
+            )
+        })
+        .collect()
+}
+
+/// The media type a body or a response is read as when the document names none for it:
+/// the type API Gateway assumes for a payload, and the one it reports such a model's
+/// format by.
+const DEFAULT_BODY_MEDIA_TYPE: &str = "application/json";
+
+/// The media types whose model an operation declares by a reference the document does not
+/// resolve, as `(media type, HTTP method)` in document order and each reported once.
+///
+/// A model is what a method reads one media type of its payload — or of one of its
+/// responses — under, so a schema reference that names no model leaves that method with no
+/// format for that media type. Both spellings of a declaration are read: OpenAPI 3's
+/// `content` map, which keys the schema by media type, and Swagger 2.0's bare `schema`,
+/// whose media type is the `consumes`/`produces` the operation or the document declares.
+///
+/// Bounded exactly as the sibling reference walk is, and for the same reason: resolving a
+/// reference looks through the document it points into, so the PRODUCT of how many
+/// references a body carries and how much document each resolution looks through is what
+/// has to be bounded, not either factor. Each distinct reference is resolved ONCE
+/// ([`ReferenceWalk::resolved`] does the same for the other walk), at most
+/// [`MAX_DEFINITION_REFERENCES`] resolutions happen, and the walk stops as soon as it holds
+/// as many entries as a response can report — finding more than a response can carry is
+/// work no caller sees.
+fn unreadable_body_formats(document: &Node) -> Vec<(String, String)> {
+    let mut reported: Vec<(String, String)> = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut resolved: BTreeMap<String, bool> = BTreeMap::new();
+    let mut budget = MAX_DEFINITION_REFERENCES;
+    // The DOCUMENT's own fallback media types, read once here rather than per schema: they
+    // are the same for every body of every operation, so deriving them inside the walk
+    // would cost the product of how many bodies the document declares and how long its own
+    // list is.
+    let consumed = first_media_type(document, "consumes");
+    let produced = first_media_type(document, "produces");
+    for (_, item) in document
+        .member("paths")
+        .and_then(Node::entries)
+        .unwrap_or_default()
+    {
+        for (operation, declared) in item.entries().unwrap_or_default() {
+            let operation = operation.to_ascii_lowercase();
+            let Some((_, verb)) = OPERATION_KEYS
+                .iter()
+                .find(|(candidate, _)| *candidate == operation.as_str())
+            else {
+                continue;
+            };
+            // Checked BEFORE the operation's bodies are read, so the bound covers reading
+            // them as well as resolving what they reference.
+            if budget == 0 || reported.len() >= crate::state::MAX_COLLECTION_ENTRIES {
+                return reported;
+            }
+            for (media_type, schema) in
+                declared_body_schemas(declared, consumed.as_deref(), produced.as_deref())
+            {
+                if budget == 0 || reported.len() >= crate::state::MAX_COLLECTION_ENTRIES {
+                    return reported;
+                }
+                let Some(reference) = schema.member(REFERENCE_KEY).and_then(Node::text) else {
+                    continue;
+                };
+                // Resolved at most once per distinct reference, so a document that repeats
+                // one costs a single resolution however many bodies declare it.
+                let unresolved = match resolved.get(reference) {
+                    Some(known) => !known,
+                    None => {
+                        budget -= 1;
+                        let known = resolves(document, reference);
+                        resolved.insert(reference.to_string(), known);
+                        !known
+                    }
+                };
+                let entry = (media_type, (*verb).to_string());
+                if unresolved && seen.insert(entry.clone()) {
+                    reported.push(entry);
+                }
+            }
+        }
+    }
+    reported
+}
+
+/// The FIRST media type `node` lists under `key` (`consumes`, `produces`), read without
+/// materialising the list: only its first entry decides the media type a bare `schema` is
+/// declared for, so the rest of a caller-sized list is never copied.
+fn first_media_type(node: &Node, key: &str) -> Option<String> {
+    node.member(key)
+        .and_then(Node::items)
+        .and_then(<[Node]>::first)
+        .and_then(Node::text)
+        .map(str::to_string)
+}
+
+/// The schemas `operation` declares for a payload of its own or of one of its responses,
+/// each beside the media type it is declared for.
+///
+/// OpenAPI 3 keys them by media type under `content` (`requestBody` and each response);
+/// Swagger 2.0 writes one bare `schema` (a `body` parameter and each response) whose media
+/// type is what the operation `consumes`/`produces`, failing that what the DOCUMENT does
+/// (`consumed`/`produced`, resolved once by the caller), and failing that
+/// [`DEFAULT_BODY_MEDIA_TYPE`]. Reading one operation costs what that operation declares,
+/// so the walk over a document stays linear in it.
+fn declared_body_schemas<'d>(
+    operation: &'d Node,
+    consumed: Option<&str>,
+    produced: Option<&str>,
+) -> Vec<(String, &'d Node)> {
+    let media_type = |key: &str, document: Option<&str>| -> String {
+        first_media_type(operation, key)
+            .or_else(|| document.map(str::to_string))
+            .unwrap_or_else(|| DEFAULT_BODY_MEDIA_TYPE.to_string())
+    };
+    let mut declared = Vec::new();
+    // The request payload: OpenAPI 3's `requestBody.content`, then Swagger 2.0's `body`
+    // parameter.
+    if let Some(content) = operation
+        .member("requestBody")
+        .and_then(|body| body.member("content"))
+        .and_then(Node::entries)
+    {
+        for (keyed, schema) in content {
+            if let Some(schema) = schema.member("schema") {
+                declared.push((keyed.clone(), schema));
+            }
+        }
+    }
+    for parameter in operation
+        .member("parameters")
+        .and_then(Node::items)
+        .unwrap_or_default()
+    {
+        if parameter.string_member("in").as_deref() == Some("body") {
+            if let Some(schema) = parameter.member("schema") {
+                declared.push((media_type("consumes", consumed), schema));
+            }
+        }
+    }
+    // Each response: the same two spellings.
+    for (_, response) in operation
+        .member("responses")
+        .and_then(Node::entries)
+        .unwrap_or_default()
+    {
+        if let Some(content) = response.member("content").and_then(Node::entries) {
+            for (keyed, schema) in content {
+                if let Some(schema) = schema.member("schema") {
+                    declared.push((keyed.clone(), schema));
+                }
+            }
+        }
+        if let Some(schema) = response.member("schema") {
+            declared.push((media_type("produces", produced), schema));
+        }
+    }
+    declared
 }
 
 /// Report what an import could not carry over, up to the entries this emulator reports

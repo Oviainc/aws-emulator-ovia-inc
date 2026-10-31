@@ -96,6 +96,7 @@
 //! decided against, is [`resource_policy`]'s.
 
 pub mod invoke;
+pub mod mapping_template;
 pub mod query_coercion;
 pub mod resource_policy;
 mod validation;
