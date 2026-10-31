@@ -45,11 +45,13 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_ssoadmin_swbexternalservice::state::{
     ABAC_ENABLE_SPAN, ENCRYPTION_UPDATE_DELAY, KEY_TYPE_AWS_OWNED, KEY_TYPE_CUSTOMER_MANAGED,
-    STATUS_ACTIVE, STATUS_ADDING,
+    STATUS_ADDING,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ssoadmin_permission_sets::{call, organization_engine, router_over, with_store};
+use crate::ssoadmin_permission_sets::{
+    call, hold_region_activation, organization_engine, region_activated, router_over, with_store,
+};
 
 /// A customer managed key ARN in the hyphenated-UUID spelling the model's `KmsKeyArn`
 /// pattern admits (`smithy_query(query="shape",shape="KmsKeyArn")`).
@@ -201,43 +203,6 @@ async fn start_region_addition(
         Some(STATUS_ADDING),
         "case {case:?}: an extension workflow starts ADDING, got {body}"
     );
-}
-
-/// Put that Region's activation on `due_at` — and back into the `ADDING` its `AddRegion`
-/// left it in, through the state's own transition, so only the due INSTANT is the test's
-/// doing.
-fn hold_region_activation(
-    engine: &Arc<engine::InMemoryEngine>,
-    instance_arn: &str,
-    region_name: &str,
-    due_at: SystemTime,
-) {
-    with_store(engine, |store| {
-        let region = store
-            .instance_mut(instance_arn)
-            .expect("the instance")
-            .region_mut(region_name)
-            .expect("the added Region");
-        region.start_addition();
-        region.active_due = Some(due_at);
-    });
-}
-
-/// Whether the call that just ran found that Region's activation already owed: the
-/// workflow has been applied, so the record is `ACTIVE` with nothing left owing.
-fn region_activated(
-    engine: &Arc<engine::InMemoryEngine>,
-    instance_arn: &str,
-    region_name: &str,
-) -> bool {
-    with_store(engine, |store| {
-        let region = store
-            .instance(instance_arn)
-            .expect("the instance")
-            .region(region_name)
-            .expect("the added Region");
-        region.status == STATUS_ACTIVE && region.active_due.is_none()
-    })
 }
 
 /// One row: the write, the Region whose activation is pending while it runs, and where

@@ -89,6 +89,8 @@ mod application_update;
 mod client_token_conflict_message;
 #[path = "all/create_tag_fingerprint.rs"]
 mod create_tag_fingerprint;
+#[path = "all/created_date_resolution_instant.rs"]
+mod created_date_resolution_instant;
 #[path = "all/customer_managed_policy_reference_independence.rs"]
 mod customer_managed_policy_reference_independence;
 #[path = "all/customer_managed_policy_reference_order.rs"]

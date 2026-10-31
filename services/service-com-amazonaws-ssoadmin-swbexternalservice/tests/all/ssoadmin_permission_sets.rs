@@ -87,6 +87,49 @@ pub(crate) fn hold_deletion(engine: &Arc<engine::InMemoryEngine>, due_at: std::t
     });
 }
 
+/// Put the activation of one Region of `instance_arn` on `due_at` — and back into the
+/// `ADDING` its `AddRegion` left it in, through the state's own transition, so only the due
+/// INSTANT is the test's doing.
+///
+/// The shared set-up of the suites whose subject is WHICH INSTANT a call decides and stamps
+/// from: an instance carrying a transition the clock owes it is what makes that instant
+/// observable.
+pub(crate) fn hold_region_activation(
+    engine: &Arc<engine::InMemoryEngine>,
+    instance_arn: &str,
+    region_name: &str,
+    due_at: std::time::SystemTime,
+) {
+    with_store(engine, |store| {
+        let region = store
+            .instance_mut(instance_arn)
+            .expect("the instance")
+            .region_mut(region_name)
+            .expect("the added Region");
+        region.start_addition();
+        region.active_due = Some(due_at);
+    });
+}
+
+/// Whether the call that just ran found that Region's activation already owed: the workflow
+/// has been applied, so the record is `ACTIVE` with nothing left owing.
+pub(crate) fn region_activated(
+    engine: &Arc<engine::InMemoryEngine>,
+    instance_arn: &str,
+    region_name: &str,
+) -> bool {
+    use service_com_amazonaws_ssoadmin_swbexternalservice::state::STATUS_ACTIVE;
+
+    with_store(engine, |store| {
+        let region = store
+            .instance(instance_arn)
+            .expect("the instance")
+            .region(region_name)
+            .expect("the added Region");
+        region.status == STATUS_ACTIVE && region.active_due.is_none()
+    })
+}
+
 /// The same router, over an engine the caller already holds (so a test can seed state
 /// through [`service_com_amazonaws_ssoadmin_swbexternalservice::state`] the way the
 /// service's own `Default` does).
