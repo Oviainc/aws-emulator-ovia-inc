@@ -113,7 +113,11 @@ async fn create_profile(client: &Client, body: Value) -> Answer {
 
 /// `PUT /api/v1/agent-profiles/{profileArn}`: the ARN is a non-greedy `@httpLabel`, so it
 /// travels percent-encoded in one path segment, exactly as an SDK sends it.
-async fn update_profile(client: &Client, profile_arn: &str, body: Value) -> Answer {
+///
+/// `pub(crate)` because an agent profile is changed by exactly ONE operation, so the suite
+/// about the update that supplies no member (`super::agent_no_op_updates`) sends its
+/// requests through this builder rather than building the same request again.
+pub(crate) async fn update_profile(client: &Client, profile_arn: &str, body: Value) -> Answer {
     client
         .send(
             "PUT",
@@ -276,12 +280,11 @@ fn assert_updated_body(created: &Value, overrides: &Value, updated: &Answer, cas
 /// Every row of the update table: the case name and the members the `UpdateAgentProfile`
 /// request carries. The rows differ along WHICH members are sent, how many values each
 /// carries and whether the profile is left with a scope to analyse — because the rule is
-/// about the members a request carries, not about one particular request.
+/// about the members a request carries, not about one particular request. Every row sends
+/// at least one writable member, so every row records a modification; a request that sends
+/// NONE of them asks for no change and is pinned by `super::agent_no_op_updates` instead.
 fn update_cases() -> Vec<(&'static str, Value)> {
     vec![
-        // A request that carries no updatable member changes nothing but the
-        // modification record.
-        ("no-member-sent", json!({})),
         (
             "display-name-only",
             json!({ "displayName": "Display name after the update" }),

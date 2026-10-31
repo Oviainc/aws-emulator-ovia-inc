@@ -78,7 +78,16 @@ const TITLE_MAX: usize = 1000;
 /// `PUT /api/v1/agent-profiles/{profileArn}/contexts/{id}` — the modelled route of
 /// `UpdateAgentContext`. The ARN is a non-greedy `@httpLabel`, so it travels
 /// percent-encoded in one path segment, exactly as an SDK sends it.
-async fn update_context(client: &Client, profile_arn: &str, id: &str, body: Value) -> Answer {
+///
+/// `pub(crate)` because a context is changed by exactly ONE operation, so the suite about
+/// the update that supplies no member (`super::agent_no_op_updates`) sends its requests
+/// through this builder rather than building the same request again.
+pub(crate) async fn update_context(
+    client: &Client,
+    profile_arn: &str,
+    id: &str,
+    body: Value,
+) -> Answer {
     client
         .send(
             "PUT",
@@ -168,10 +177,12 @@ async fn an_update_merges_the_members_it_carries_and_leaves_the_rest() {
     let client = Client::new();
     let profile_arn = profile_arn_of(&client, "context-update-host", 1).await;
 
-    // The rows differ along WHICH members the request carries (one, the other, both,
-    // none), along the title's length at each published `@length(1, 1000)` bound, and
-    // along the shape of the content: empty, one member, every list at several entries,
-    // and enum values the issue did not cite.
+    // The rows differ along WHICH members the request carries (one, the other, both),
+    // along the title's length at each published `@length(1, 1000)` bound, and along the
+    // shape of the content: empty, one member, every list at several entries, and enum
+    // values the issue did not cite. A request that carries NEITHER writable member asks
+    // for no change, so it stamps no modification and is pinned by
+    // `super::agent_no_op_updates` instead.
     let rows: Vec<(&str, Value)> = vec![
         ("title-only", json!({ "title": "a retitled context" })),
         ("shortest-title", json!({ "title": "x".repeat(TITLE_MIN) })),
@@ -223,7 +234,6 @@ async fn an_update_merges_the_members_it_carries_and_leaves_the_rest() {
                 "content": base_body()["content"].clone(),
             }),
         ),
-        ("no-updatable-member", json!({})),
     ];
 
     for (case, patch) in rows {

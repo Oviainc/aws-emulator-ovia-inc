@@ -4,8 +4,9 @@
 //! IMPLEMENTED: merges the members the request carries into the goal the
 //! `(profileArn, id)` pair resolves to — an absent member is left at its stored value,
 //! never nulled — records the identity and instant the change is attributed to, and
-//! answers the stored goal's `GoalSummary`. A `profileArn` that names no stored agent
-//! profile, and an `id` that names no goal OF that profile, are both a
+//! answers the stored goal's `GoalSummary`. A request that supplies no writable member
+//! asks for no change, so it records no modification. A `profileArn` that names no stored
+//! agent profile, and an `id` that names no goal OF that profile, are both a
 //! `ResourceNotFoundException` (404).
 //!
 //! A `clientToken` makes the update idempotent: the same token with the same parameters
@@ -245,6 +246,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // optional, so the request carries the members it changes and the STORED value
         // stands for every member it leaves out. The goal's identity — its id, the profile
         // it belongs to, and who created it when — is not updatable and is untouched.
+        //
+        // EVERY member a request can write here is optional, so a request that supplies
+        // NONE of them asks for no change: it reports the goal as it stands and leaves the
+        // members recording a modification where they were, rather than recording an update
+        // nothing wrote. A member the request DOES supply is a write, whatever value it
+        // carries — the same rule `UpdateWorkload` applies to its `UpdatedAt`.
+        let writes_a_member =
+            input.pillars.is_some() || input.title.is_some() || input.description.is_some();
+
         if let Some(pillars) = input.pillars {
             record.pillars = pillars;
         }
@@ -256,8 +266,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Every request this emulator serves is attributed to its one account, so that is
         // the identity the change is recorded under — never a value read off the request.
-        record.last_modified_by = Some(::engine::emulator_account_id().to_string());
-        record.last_modified_at = Some(now);
+        // A request that wrote nothing records no modification at all.
+        if writes_a_member {
+            record.last_modified_by = Some(::engine::emulator_account_id().to_string());
+            record.last_modified_at = Some(now);
+        }
         let goal = record.to_summary();
 
         // Written through the ledger's bounded `remember`, which holds the remembered

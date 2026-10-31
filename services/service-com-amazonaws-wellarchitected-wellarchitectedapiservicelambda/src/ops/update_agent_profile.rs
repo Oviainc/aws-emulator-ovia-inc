@@ -6,9 +6,10 @@
 //! (`lastModifiedBy`, `lastModifiedAt`) and answers the profile as it now stands, with
 //! the members the SERVICE owns (`arn`, `name`, `createdBy`, `createdAt`) and the ones it
 //! DERIVES from the stored profile (`eligibleForScheduledGeneration`,
-//! `eligibleForArchitectureGeneration`, `fieldErrors`). A later `GetAgentProfile` of that
-//! ARN reports the same profile. An ARN that names no stored profile is a
-//! `ResourceNotFoundException` (404) carrying the ARN as sent.
+//! `eligibleForArchitectureGeneration`, `fieldErrors`). A request that supplies no
+//! writable member asks for no change, so it records no modification. A later
+//! `GetAgentProfile` of that ARN reports the same profile. An ARN that names no stored
+//! profile is a `ResourceNotFoundException` (404) carrying the ARN as sent.
 //!
 //! A `clientToken` makes the update idempotent: the same token with the same parameters
 //! against the same profile applies nothing a second time — it answers the profile as it
@@ -246,6 +247,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // EVERY member a request can write here is optional, so a request that supplies
+        // NONE of them asks for no change: it reports the profile as it stands and leaves
+        // the members recording a modification where they were, rather than recording an
+        // update nothing wrote. A member the request DOES supply is a write, whatever value
+        // it carries — the same rule `UpdateWorkload` applies to its `UpdatedAt`.
+        let writes_a_member = input.display_name.is_some()
+            || input.description.is_some()
+            || input.business_overview.is_some()
+            || input.pillars.is_some()
+            || input.deletion_protection.is_some()
+            || input.execution_role_arn.is_some()
+            || input.aggregation_configuration.is_some();
+
         // `@idempotencyToken` replay: the token is remembered WITH the profile and the
         // parameters it was spent on, so only a retry of that same request is a replay,
         // and a replay applies nothing — it answers the profile as the store holds it,
@@ -303,9 +317,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The identifier of the user or system that last modified this profile":
             // every request this emulator serves is attributed to its one account, as the
             // create attributes `createdBy`, and the instant is the clock's — never a
-            // value read off the request.
-            record.last_modified_by = Some(::engine::emulator_account_id().to_string());
-            record.last_modified_at = Some(std::time::SystemTime::now());
+            // value read off the request. A request that wrote nothing records no
+            // modification at all.
+            if writes_a_member {
+                record.last_modified_by = Some(::engine::emulator_account_id().to_string());
+                record.last_modified_at = Some(std::time::SystemTime::now());
+            }
         }
 
         let output = profile_output(record);

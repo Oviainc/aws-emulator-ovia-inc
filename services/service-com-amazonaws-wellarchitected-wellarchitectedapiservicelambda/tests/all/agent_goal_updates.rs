@@ -44,7 +44,16 @@ const AGENT_PROFILE_RESOURCE_TYPE: &str = "AGENT_PROFILE";
 
 /// `PUT /api/v1/agent-profiles/{profileArn}/goals/{id}` — the modelled route of
 /// `UpdateAgentGoal` (`smithy_query(query="operation", operation="UpdateAgentGoal")`).
-async fn update_goal(client: &Client, profile_arn: &str, id: &str, body: Value) -> Answer {
+///
+/// `pub(crate)` because a goal is changed by exactly ONE operation, so the suite about the
+/// update that supplies no member (`super::agent_no_op_updates`) sends its requests through
+/// this builder rather than building the same request again.
+pub(crate) async fn update_goal(
+    client: &Client,
+    profile_arn: &str,
+    id: &str,
+    body: Value,
+) -> Answer {
     client
         .send(
             "PUT",
@@ -105,11 +114,13 @@ async fn an_update_merges_the_members_it_carries_and_leaves_the_rest() {
     let client = Client::new();
     let profile_arn = profile_arn_of(&client, "goal-update-host", 1).await;
 
-    // The rows differ along WHICH members the request carries (one, two, all, none) and
-    // along the values themselves — the single-pillar and five-pillar bounds of
+    // The rows differ along WHICH members the request carries (one, two, all) and along
+    // the values themselves — the single-pillar and five-pillar bounds of
     // `@length(1, 5)`, the one-character and 1000-character bounds of `title`'s
     // `@length(1, 1000)`, and the one-character and 4000-character bounds of
-    // `description`'s `@length(1, 4000)`.
+    // `description`'s `@length(1, 4000)`. A request that carries NONE of them asks for no
+    // change, so it stamps no modification and is pinned by `super::agent_no_op_updates`
+    // instead.
     let rows: Vec<(&str, Value)> = vec![
         ("pillars-only", json!({ "pillars": ["RESILIENCE"] })),
         ("pillars-every-published-value", json!({ "pillars": PILLARS })),
@@ -145,7 +156,6 @@ async fn an_update_merges_the_members_it_carries_and_leaves_the_rest() {
                 "description": "the stored description",
             }),
         ),
-        ("no-updatable-member", json!({})),
     ];
 
     for (case, patch) in rows {

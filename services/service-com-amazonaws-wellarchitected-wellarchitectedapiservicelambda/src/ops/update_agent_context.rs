@@ -6,7 +6,8 @@
 //! request carries replace the stored ones, every member it leaves out keeps the value the
 //! context already has, and the change is stamped with the instant and the identity it is
 //! attributed to — so `GetAgentContext` and `ListAgentContexts` report what this call
-//! left. A `clientToken` makes the update idempotent the same way `UpdateAgentGoal`'s
+//! left. A request that supplies no writable member asks for no change, so it stamps
+//! nothing. A `clientToken` makes the update idempotent the same way `UpdateAgentGoal`'s
 //! does.
 //!
 //! ## Shape of an operation
@@ -245,6 +246,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stands for every member it leaves out. The context's identity — its id, the
         // profile it belongs to, the type it was created as, and who created it when — is
         // not updatable and is untouched.
+        //
+        // EVERY member a request can write here is optional, so a request that supplies
+        // NONE of them asks for no change: it reports the context as it stands and leaves
+        // the members recording a modification where they were, rather than recording an
+        // update nothing wrote. A member the request DOES supply is a write, whatever value
+        // it carries — the same rule `UpdateWorkload` applies to its `UpdatedAt`.
+        let writes_a_member = input.title.is_some() || input.content.is_some();
+
         if let Some(title) = input.title {
             record.title = title;
         }
@@ -257,8 +266,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Every request this emulator serves is attributed to its one account, so that is
         // the identity the change is recorded under — never a value read off the request.
-        record.last_modified_by = Some(::engine::emulator_account_id().to_string());
-        record.last_modified_at = Some(now);
+        // A request that wrote nothing records no modification at all.
+        if writes_a_member {
+            record.last_modified_by = Some(::engine::emulator_account_id().to_string());
+            record.last_modified_at = Some(now);
+        }
         let context = record.to_summary();
 
         // Written through the ledger's bounded `remember`, which holds the remembered
