@@ -208,70 +208,41 @@ const READ_REPLICAS_PER_MASTER_QUOTA: i64 = 15;
 /// so nothing is used toward it.
 const RESERVED_DB_INSTANCES_QUOTA: i64 = 40;
 
-/// The account quotas this service reports, in the order the `AccountQuota` shape's own
-/// documentation lists them (`smithy_query(query="doc",shape="AccountQuota")`), each
-/// with the usage that documentation defines for it.
+/// How many zero-ETL integrations one account may hold: Amazon RDS's published default
+/// quota for integrations, which `DescribeAccountAttributes` reports as the `Integrations`
+/// maximum and `CreateIntegration` refuses past.
+const INTEGRATIONS_QUOTA: i64 = crate::state::INTEGRATION_QUOTA_PER_REGION as i64;
+
+/// The account quotas this service reports, in the order the service publishes them on
+/// the wire (corpus `simparity-wire-aws-v1`, fixture
+/// `rds-maintenance-and-account-attributes`), which is NOT the alphabetical order the
+/// `AccountQuota` shape's prose happens to list them in
+/// (`smithy_query(query="doc",shape="AccountQuota")`): the per-instance quotas first, then
+/// the per-cluster ones, then the integration quota. Each row carries the usage that
+/// documentation defines for it.
+///
+/// `Integrations` is not one of the quotas the shape's prose lists; it is published on the
+/// wire, and a client that reads a named quota to decide whether a create will fit has to
+/// find it there.
 const ACCOUNT_QUOTAS: &[Quota] = &[
-    // "The total allocated storage per account, in GiB."
-    Quota {
-        name: "AllocatedStorage",
-        max: TOTAL_ALLOCATED_STORAGE_GIB,
-        used: allocated_storage_used,
-    },
-    // "The number of ingress rules per DB security group. The used value is the highest
-    // number of ingress rules in a DB security group in the account."
-    Quota {
-        name: "AuthorizationsPerDBSecurityGroup",
-        max: crate::state::MAX_AUTHORIZATIONS_PER_DB_SECURITY_GROUP as i64,
-        used: db_security_group_ingress_used,
-    },
-    // "The number of custom endpoints per DB cluster. The used value is the highest
-    // number of custom endpoints in a DB clusters in the account."
-    Quota {
-        name: "CustomEndpointsPerDBCluster",
-        max: CUSTOM_ENDPOINTS_PER_DB_CLUSTER_QUOTA,
-        used: custom_endpoints_used,
-    },
-    // "The number of DB cluster parameter groups per account, excluding default
-    // parameter groups." A `default.<family>` group is the service's own and is not a
-    // stored record, so the stored groups are exactly the nondefault ones.
-    Quota {
-        name: "DBClusterParameterGroups",
-        max: crate::state::DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION as i64,
-        used: cluster_parameter_groups_used,
-    },
-    // "The number of associated ... (IAM) roles per DB cluster. The used value is the
-    // highest number of associated IAM roles for a DB cluster in the account."
-    Quota {
-        name: "DBClusterRoles",
-        max: IAM_ROLES_PER_RESOURCE_QUOTA,
-        used: cluster_roles_used,
-    },
-    // "The number of DB clusters per account."
-    Quota {
-        name: "DBClusters",
-        max: crate::state::DB_CLUSTER_QUOTA_PER_REGION as i64,
-        used: clusters_used,
-    },
-    // "The number of associated IAM roles per DB instance. The used value is the highest
-    // number of associated IAM roles for a DB instance in the account."
-    Quota {
-        name: "DBInstanceRoles",
-        max: IAM_ROLES_PER_RESOURCE_QUOTA,
-        used: instance_roles_used,
-    },
     // "The number of DB instances per account."
     Quota {
         name: "DBInstances",
         max: crate::state::DB_INSTANCE_QUOTA_PER_REGION as i64,
         used: instances_used,
     },
-    // "The number of DB parameter groups per account, excluding default parameter
-    // groups."
+    // "The number of reserved DB instances per account. The used value is the count of
+    // the active reserved DB instances in the account."
     Quota {
-        name: "DBParameterGroups",
-        max: crate::state::DB_PARAMETER_GROUP_QUOTA_PER_REGION as i64,
-        used: parameter_groups_used,
+        name: "ReservedDBInstances",
+        max: RESERVED_DB_INSTANCES_QUOTA,
+        used: reserved_db_instances_used,
+    },
+    // "The total allocated storage per account, in GiB."
+    Quota {
+        name: "AllocatedStorage",
+        max: TOTAL_ALLOCATED_STORAGE_GIB,
+        used: allocated_storage_used,
     },
     // "The number of DB security groups (not VPC security groups) per account, excluding
     // the default security group."
@@ -280,11 +251,25 @@ const ACCOUNT_QUOTAS: &[Quota] = &[
         max: crate::state::DB_SECURITY_GROUP_QUOTA_PER_REGION as i64,
         used: db_security_groups_used,
     },
-    // "The number of DB subnet groups per account."
+    // "The number of ingress rules per DB security group. The used value is the highest
+    // number of ingress rules in a DB security group in the account."
     Quota {
-        name: "DBSubnetGroups",
-        max: crate::state::DB_SUBNET_GROUP_QUOTA_PER_REGION as i64,
-        used: db_subnet_groups_used,
+        name: "AuthorizationsPerDBSecurityGroup",
+        max: crate::state::MAX_AUTHORIZATIONS_PER_DB_SECURITY_GROUP as i64,
+        used: db_security_group_ingress_used,
+    },
+    // "The number of DB parameter groups per account, excluding default parameter
+    // groups."
+    Quota {
+        name: "DBParameterGroups",
+        max: crate::state::DB_PARAMETER_GROUP_QUOTA_PER_REGION as i64,
+        used: parameter_groups_used,
+    },
+    // "The number of manual DB instance snapshots per account."
+    Quota {
+        name: "ManualSnapshots",
+        max: crate::state::DB_SNAPSHOT_QUOTA_PER_REGION as i64,
+        used: manual_snapshots_used,
     },
     // "The number of event subscriptions per account."
     Quota {
@@ -292,17 +277,11 @@ const ACCOUNT_QUOTAS: &[Quota] = &[
         max: crate::state::EVENT_SUBSCRIPTION_QUOTA_PER_REGION as i64,
         used: event_subscriptions_used,
     },
-    // "The number of manual DB cluster snapshots per account."
+    // "The number of DB subnet groups per account."
     Quota {
-        name: "ManualClusterSnapshots",
-        max: crate::state::DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION as i64,
-        used: manual_cluster_snapshots_used,
-    },
-    // "The number of manual DB instance snapshots per account."
-    Quota {
-        name: "ManualSnapshots",
-        max: crate::state::DB_SNAPSHOT_QUOTA_PER_REGION as i64,
-        used: manual_snapshots_used,
+        name: "DBSubnetGroups",
+        max: crate::state::DB_SUBNET_GROUP_QUOTA_PER_REGION as i64,
+        used: db_subnet_groups_used,
     },
     // "The number of DB option groups per account, excluding default option groups." A
     // `default:<engine>-<version>` group is the service's own and is not a stored
@@ -312,6 +291,13 @@ const ACCOUNT_QUOTAS: &[Quota] = &[
         max: crate::state::OPTION_GROUP_QUOTA_PER_REGION as i64,
         used: option_groups_used,
     },
+    // "The number of subnets per DB subnet group. The used value is highest number of
+    // subnets for a DB subnet group in the account."
+    Quota {
+        name: "SubnetsPerDBSubnetGroup",
+        max: crate::state::MAX_SUBNETS_PER_DB_SUBNET_GROUP as i64,
+        used: subnets_per_group_used,
+    },
     // "The number of read replicas per DB instance. The used value is the highest number
     // of read replicas for a DB instance in the account."
     Quota {
@@ -319,19 +305,53 @@ const ACCOUNT_QUOTAS: &[Quota] = &[
         max: READ_REPLICAS_PER_MASTER_QUOTA,
         used: read_replicas_used,
     },
-    // "The number of reserved DB instances per account. The used value is the count of
-    // the active reserved DB instances in the account."
+    // "The number of DB clusters per account."
     Quota {
-        name: "ReservedDBInstances",
-        max: RESERVED_DB_INSTANCES_QUOTA,
-        used: reserved_db_instances_used,
+        name: "DBClusters",
+        max: crate::state::DB_CLUSTER_QUOTA_PER_REGION as i64,
+        used: clusters_used,
     },
-    // "The number of subnets per DB subnet group. The used value is highest number of
-    // subnets for a DB subnet group in the account."
+    // "The number of associated ... (IAM) roles per DB cluster. The used value is the
+    // highest number of associated IAM roles for a DB cluster in the account."
     Quota {
-        name: "SubnetsPerDBSubnetGroup",
-        max: crate::state::MAX_SUBNETS_PER_DB_SUBNET_GROUP as i64,
-        used: subnets_per_group_used,
+        name: "DBClusterRoles",
+        max: IAM_ROLES_PER_RESOURCE_QUOTA,
+        used: cluster_roles_used,
+    },
+    // "The number of associated IAM roles per DB instance. The used value is the highest
+    // number of associated IAM roles for a DB instance in the account."
+    Quota {
+        name: "DBInstanceRoles",
+        max: IAM_ROLES_PER_RESOURCE_QUOTA,
+        used: instance_roles_used,
+    },
+    // "The number of DB cluster parameter groups per account, excluding default
+    // parameter groups." A `default.<family>` group is the service's own and is not a
+    // stored record, so the stored groups are exactly the nondefault ones.
+    Quota {
+        name: "DBClusterParameterGroups",
+        max: crate::state::DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION as i64,
+        used: cluster_parameter_groups_used,
+    },
+    // "The number of manual DB cluster snapshots per account."
+    Quota {
+        name: "ManualClusterSnapshots",
+        max: crate::state::DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION as i64,
+        used: manual_cluster_snapshots_used,
+    },
+    // "The number of custom endpoints per DB cluster. The used value is the highest
+    // number of custom endpoints in a DB clusters in the account."
+    Quota {
+        name: "CustomEndpointsPerDBCluster",
+        max: CUSTOM_ENDPOINTS_PER_DB_CLUSTER_QUOTA,
+        used: custom_endpoints_used,
+    },
+    // The zero-ETL integrations of the account, counted out of the ones
+    // `CreateIntegration` stored.
+    Quota {
+        name: "Integrations",
+        max: INTEGRATIONS_QUOTA,
+        used: integrations_used,
     },
 ];
 
@@ -479,6 +499,12 @@ fn manual_snapshots_used(store: &Store, region: &str) -> i64 {
 /// compares against its limit.
 fn option_groups_used(store: &Store, region: &str) -> i64 {
     count(store.option_groups_in(region).len())
+}
+
+/// The zero-ETL integrations the region holds — the count `CreateIntegration` compares
+/// against its limit.
+fn integrations_used(store: &Store, region: &str) -> i64 {
+    count(store.integrations_in(region).len())
 }
 
 /// The read replicas of the DB instance that has the most of them, read off the

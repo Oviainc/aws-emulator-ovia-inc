@@ -7,17 +7,17 @@
 //! `crate::state::option_catalog` itself, so it cannot tell whether a row of that
 //! catalogue carries the values the published option table does. The table below
 //! restates those values LITERALLY — one row per published setting — and asserts them
-//! over the wire, so a row whose name, default, apply type, data type, allowed-value
-//! list, modifiability or collection flag drifts from the published definition fails
-//! here.
+//! over the wire, so a row whose name, description, default, apply type, data type,
+//! allowed-value list, modifiability or collection flag drifts from the published
+//! definition fails here.
 //!
 //! The rule under test: a group reports, for each option it holds, EVERY setting the
-//! option's published table defines, each with that table's name, description-bearing
-//! metadata (apply type, data type), its published default, its published allowed-value
-//! list (and no `AllowedValues` member at all where the table publishes no list), and
-//! its published modifiability — with `Value` being what a request set on a modifiable
-//! setting and the published default everywhere else, on both the mutation echo and the
-//! `DescribeOptionGroups` read-back.
+//! option's published table defines, each with that table's name, the description that
+//! table binds to THAT name, its metadata (apply type, data type), its published default,
+//! its published allowed-value list (and no `AllowedValues` member at all where the table
+//! publishes no list), and its published modifiability — with `Value` being what a
+//! request set on a modifiable setting and the published default everywhere else, on both
+//! the mutation echo and the `DescribeOptionGroups` read-back.
 //!
 //! The rows span what the rule generalises over: four options on four engine families
 //! (and one option on BOTH engines that publish it), settings of both published data
@@ -38,6 +38,9 @@ use crate::option_group_options::{create_group, describe, modify, the_option};
 struct PublishedSetting {
     /// `OptionSetting$Name`.
     name: &'static str,
+    /// `OptionSetting$Description` — the sentence the published table gives for THIS
+    /// setting name, which is what a client renders as the setting's help text.
+    description: &'static str,
     /// `OptionSetting$DefaultValue`.
     default_value: &'static str,
     /// `OptionSetting$AllowedValues`, EMPTY where the table publishes no list, which is
@@ -74,6 +77,7 @@ struct PublishedOption {
 const MARIADB_AUDIT_PLUGIN_SETTINGS: &[PublishedSetting] = &[
     PublishedSetting {
         name: "SERVER_AUDIT_LOGGING",
+        description: "Determines if logging is turned on",
         default_value: "ON",
         allowed_values: "ON",
         apply_type: "DYNAMIC",
@@ -84,6 +88,7 @@ const MARIADB_AUDIT_PLUGIN_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "SERVER_AUDIT_INCL_USERS",
+        description: "Include specified users",
         default_value: "",
         allowed_values: "",
         apply_type: "DYNAMIC",
@@ -94,6 +99,8 @@ const MARIADB_AUDIT_PLUGIN_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "SERVER_AUDIT",
+        description: "This setting is enabled for security and ensures that the plugin cannot \
+                      be uninstalled at runtime",
         default_value: "FORCE_PLUS_PERMANENT",
         allowed_values: "FORCE_PLUS_PERMANENT",
         apply_type: "STATIC",
@@ -104,6 +111,7 @@ const MARIADB_AUDIT_PLUGIN_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "SERVER_AUDIT_QUERY_LOG_LIMIT",
+        description: "Limit on the length of the query string in a record.",
         default_value: "1024",
         allowed_values: "0-2147483647",
         apply_type: "DYNAMIC",
@@ -114,6 +122,7 @@ const MARIADB_AUDIT_PLUGIN_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "SERVER_AUDIT_FILE_ROTATE_SIZE",
+        description: "Size limit of a log file before rotating",
         default_value: "1000000",
         allowed_values: "1-1000000000",
         apply_type: "DYNAMIC",
@@ -125,6 +134,7 @@ const MARIADB_AUDIT_PLUGIN_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "SERVER_AUDIT_FILE_PATH",
+        description: "File location for logs",
         default_value: "/rdsdbdata/log/audit/",
         allowed_values: "",
         apply_type: "DYNAMIC",
@@ -135,6 +145,7 @@ const MARIADB_AUDIT_PLUGIN_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "SERVER_AUDIT_EVENTS",
+        description: "Types of actions to be logged (connect, query, or table)",
         default_value: "CONNECT,QUERY",
         allowed_values: "CONNECT,QUERY,QUERY_DDL,QUERY_DML,QUERY_DCL,QUERY_DML_NO_SELECT",
         apply_type: "DYNAMIC",
@@ -145,6 +156,7 @@ const MARIADB_AUDIT_PLUGIN_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "SERVER_AUDIT_EXCL_USERS",
+        description: "Exclude specified users",
         default_value: "",
         allowed_values: "",
         apply_type: "DYNAMIC",
@@ -155,6 +167,7 @@ const MARIADB_AUDIT_PLUGIN_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "SERVER_AUDIT_FILE_ROTATIONS",
+        description: "Number of log rotations to save",
         default_value: "9",
         allowed_values: "0-100",
         apply_type: "DYNAMIC",
@@ -171,6 +184,7 @@ const MARIADB_AUDIT_PLUGIN_SETTINGS: &[PublishedSetting] = &[
 const MEMCACHED_SETTINGS: &[PublishedSetting] = &[
     PublishedSetting {
         name: "DAEMON_MEMCACHED_R_BATCH_SIZE",
+        description: "The number of memcached read operations before a commit.",
         default_value: "1",
         allowed_values: "1-1073741824",
         apply_type: "STATIC",
@@ -181,6 +195,7 @@ const MEMCACHED_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "DAEMON_MEMCACHED_W_BATCH_SIZE",
+        description: "The number of memcached write operations before a commit.",
         default_value: "1",
         allowed_values: "1-1073741824",
         apply_type: "STATIC",
@@ -191,6 +206,7 @@ const MEMCACHED_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "DAEMON_MEMCACHED_OPTION",
+        description: "The memcached daemon options passed on startup.",
         default_value: "",
         allowed_values: "",
         apply_type: "STATIC",
@@ -201,6 +217,7 @@ const MEMCACHED_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "INNODB_API_DISABLE_ROWLOCK",
+        description: "Whether row locks are disabled for memcached operations.",
         default_value: "0",
         allowed_values: "0,1",
         apply_type: "STATIC",
@@ -211,6 +228,7 @@ const MEMCACHED_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "INNODB_API_ENABLE_MDL",
+        description: "Whether metadata locking is enabled for memcached operations.",
         default_value: "0",
         allowed_values: "0,1",
         apply_type: "STATIC",
@@ -221,6 +239,7 @@ const MEMCACHED_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "INNODB_API_TRX_LEVEL",
+        description: "The transaction isolation level of memcached operations.",
         default_value: "0",
         allowed_values: "0-3",
         apply_type: "STATIC",
@@ -236,6 +255,7 @@ const MEMCACHED_SETTINGS: &[PublishedSetting] = &[
 const NATIVE_NETWORK_ENCRYPTION_SETTINGS: &[PublishedSetting] = &[
     PublishedSetting {
         name: "SQLNET.ENCRYPTION_SERVER",
+        description: "Whether the server requires, requests, accepts or rejects encryption.",
         default_value: "REQUESTED",
         allowed_values: "ACCEPTED,REJECTED,REQUESTED,REQUIRED",
         apply_type: "DYNAMIC",
@@ -246,6 +266,7 @@ const NATIVE_NETWORK_ENCRYPTION_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "SQLNET.ENCRYPTION_TYPES_SERVER",
+        description: "The encryption algorithms the server accepts.",
         default_value: "AES256,AES192,AES128",
         allowed_values: "AES256,AES192,AES128,3DES168,3DES112,DES,DES40,RC4_256,RC4_128,RC4_56,RC4_40",
         apply_type: "DYNAMIC",
@@ -256,6 +277,8 @@ const NATIVE_NETWORK_ENCRYPTION_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "SQLNET.CRYPTO_CHECKSUM_SERVER",
+        description: "Whether the server requires, requests, accepts or rejects data \
+                      integrity checksums.",
         default_value: "REQUESTED",
         allowed_values: "ACCEPTED,REJECTED,REQUESTED,REQUIRED",
         apply_type: "DYNAMIC",
@@ -266,6 +289,7 @@ const NATIVE_NETWORK_ENCRYPTION_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "SQLNET.CRYPTO_CHECKSUM_TYPES_SERVER",
+        description: "The data integrity algorithms the server accepts.",
         default_value: "SHA1",
         allowed_values: "SHA1,MD5",
         apply_type: "DYNAMIC",
@@ -281,6 +305,8 @@ const NATIVE_NETWORK_ENCRYPTION_SETTINGS: &[PublishedSetting] = &[
 const SQLSERVER_AUDIT_SETTINGS: &[PublishedSetting] = &[
     PublishedSetting {
         name: "IAM_ROLE_ARN",
+        description: "The ARN of the IAM role with write access to the S3 bucket audit logs \
+                      are uploaded to.",
         default_value: "",
         allowed_values: "",
         apply_type: "DYNAMIC",
@@ -291,6 +317,7 @@ const SQLSERVER_AUDIT_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "S3_BUCKET_ARN",
+        description: "The ARN of the S3 bucket audit logs are uploaded to.",
         default_value: "",
         allowed_values: "",
         apply_type: "DYNAMIC",
@@ -301,6 +328,7 @@ const SQLSERVER_AUDIT_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "ENABLE_COMPRESSION",
+        description: "Whether audit logs are compressed before upload.",
         default_value: "true",
         allowed_values: "true,false",
         apply_type: "DYNAMIC",
@@ -311,6 +339,7 @@ const SQLSERVER_AUDIT_SETTINGS: &[PublishedSetting] = &[
     },
     PublishedSetting {
         name: "RETENTION_TIME",
+        description: "The number of hours audit logs are kept on the DB instance.",
         default_value: "0",
         allowed_values: "0-840",
         apply_type: "DYNAMIC",
@@ -414,13 +443,10 @@ fn assert_published_definition(
     } else {
         assert_setting_member(&case, &setting, "AllowedValues", published.allowed_values);
     }
-    // Every setting carries a description: it is what a client reads to learn what the
-    // setting does.
-    let description = optional_text(&setting, "Description").unwrap_or_default();
-    assert!(
-        !description.is_empty(),
-        "case {case:?}: expected a non-empty <Description>, got {description:?} in {setting}"
-    );
+    // Every setting carries the description published for ITS OWN name: it is what a
+    // client renders as the setting's help text, so a sentence bound to another setting
+    // is help text for the wrong setting.
+    assert_setting_member(&case, &setting, "Description", published.description);
     assert_setting_member(&case, &setting, "Value", expected_value);
 }
 

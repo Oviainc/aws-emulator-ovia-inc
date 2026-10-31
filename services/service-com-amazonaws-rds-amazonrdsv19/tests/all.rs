@@ -153,6 +153,8 @@ mod resource_tags;
 mod sibling_control_plane_clusters;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/static_reference_catalogs.rs"]
+mod static_reference_catalogs;
 #[path = "all/valid_db_instance_modifications.rs"]
 mod valid_db_instance_modifications;
 #[path = "all/wire_decimal_doubles.rs"]

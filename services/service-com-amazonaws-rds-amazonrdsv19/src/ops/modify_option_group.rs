@@ -377,9 +377,7 @@ fn resolve_additions(
                 ));
             };
             crate::state::check_option_text("OptionsToInclude.OptionSettings.Value", value)?;
-            option
-                .settings
-                .insert(published.name.to_string(), value.clone());
+            option.set_setting(published.name, value);
         }
         additions.push(option);
     }

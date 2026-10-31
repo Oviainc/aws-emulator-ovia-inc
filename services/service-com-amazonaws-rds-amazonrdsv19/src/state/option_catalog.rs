@@ -225,8 +225,11 @@ const SQLSERVER_FULL_EDITIONS: &[&str] = &["sqlserver-ee", "sqlserver-se"];
 /// `SERVER_AUDIT_FILE_PATH` reports the RDS audit-log directory, which is likewise not
 /// a group's to change.
 ///
-/// Each row's `Description` is the wording published for that setting — the audit
-/// plugin's own documented variable description where it has one.
+/// Each row's `Description` is the sentence published for THAT setting name, so a client
+/// surfacing a setting's help text reads the help for the setting it is showing. The rows
+/// are held in the order the option publishes its settings, which is the order a group
+/// reports the ones no request configured (corpus `simparity-wire-aws-v1`, fixtures
+/// `rds-option-group-add-remove-option` and `rds-option-group-mutation-envelopes`).
 const MARIADB_AUDIT_PLUGIN_SETTINGS: &[OptionSettingFacts] = &[
     fixed_setting(
         "SERVER_AUDIT_LOGGING",
@@ -246,7 +249,8 @@ const MARIADB_AUDIT_PLUGIN_SETTINGS: &[OptionSettingFacts] = &[
     ),
     fixed_setting(
         "SERVER_AUDIT",
-        "Forces the plugin to be loaded.",
+        "This setting is enabled for security and ensures that the plugin cannot be \
+         uninstalled at runtime",
         STATIC,
         STRING,
         "FORCE_PLUS_PERMANENT",
@@ -261,16 +265,16 @@ const MARIADB_AUDIT_PLUGIN_SETTINGS: &[OptionSettingFacts] = &[
         "0-2147483647",
     ),
     setting(
-        "SERVER_AUDIT_FILE_ROTATE_SIZE",
-        "Maximum size of the log to start the rotation.",
+        "SERVER_AUDIT_FILE_ROTATIONS",
+        "Number of log rotations to save",
         DYNAMIC,
         INTEGER,
-        "1000000",
-        "1-1000000000",
+        "9",
+        "0-100",
     ),
     fixed_setting(
         "SERVER_AUDIT_FILE_PATH",
-        "Path to the log file.",
+        "File location for logs",
         DYNAMIC,
         STRING,
         "/rdsdbdata/log/audit/",
@@ -284,6 +288,14 @@ const MARIADB_AUDIT_PLUGIN_SETTINGS: &[OptionSettingFacts] = &[
         "CONNECT,QUERY",
         "CONNECT,QUERY,QUERY_DDL,QUERY_DML,QUERY_DCL,QUERY_DML_NO_SELECT",
     ),
+    setting(
+        "SERVER_AUDIT_FILE_ROTATE_SIZE",
+        "Size limit of a log file before rotating",
+        DYNAMIC,
+        INTEGER,
+        "1000000",
+        "1-1000000000",
+    ),
     collection_setting(
         "SERVER_AUDIT_EXCL_USERS",
         "Exclude specified users",
@@ -291,14 +303,6 @@ const MARIADB_AUDIT_PLUGIN_SETTINGS: &[OptionSettingFacts] = &[
         STRING,
         "",
         "",
-    ),
-    setting(
-        "SERVER_AUDIT_FILE_ROTATIONS",
-        "Number of rotations before log is removed.",
-        DYNAMIC,
-        INTEGER,
-        "9",
-        "0-100",
     ),
 ];
 

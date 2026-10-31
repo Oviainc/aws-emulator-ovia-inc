@@ -9,14 +9,16 @@
 //! another's records, and no entry can claim more usage than its own maximum allows.
 //!
 //! The table below spans the classes the rule generalises over: the resource kind each
-//! quota counts (instances, clusters, snapshots, the four group kinds, subscriptions),
-//! how the usage is derived (a count of records, a sum over them, a maximum over them,
-//! and a kind no operation creates yet), and the counts themselves (none, one, several).
-//! The quota names, the maxima of the resources this service does not store and the
-//! usage each name is defined by come from the `AccountQuota` shape's own documentation
-//! (`smithy_query(query="doc",shape="AccountQuota")`) and Amazon RDS's published
-//! quotas; the maxima of the resources it does store are the constants its own create
-//! paths enforce, imported here rather than copied.
+//! quota counts (instances, clusters, snapshots, the four group kinds, subscriptions,
+//! integrations), how the usage is derived (a count of records, a sum over them, a
+//! maximum over them, and a kind no operation creates yet), and the counts themselves
+//! (none, one, several). The quota names and the usage each name is defined by come from
+//! the `AccountQuota` shape's own documentation
+//! (`smithy_query(query="doc",shape="AccountQuota")`) and, for the `Integrations` quota
+//! the shape's prose does not list, from the wire catalog the service publishes; the
+//! order is the service's publication order, and the maxima of the resources this service
+//! stores are the constants its own create paths enforce, imported here rather than
+//! copied.
 //!
 //! Every call goes over the wire through the harness in `db_instances.rs`, so the
 //! assertions read the XML the emulator itself answered with.
@@ -26,7 +28,8 @@ use service_com_amazonaws_rds_amazonrdsv19::state::{
     DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION, DB_INSTANCE_QUOTA_PER_REGION,
     DB_PARAMETER_GROUP_QUOTA_PER_REGION, DB_SNAPSHOT_QUOTA_PER_REGION,
     DB_SUBNET_GROUP_QUOTA_PER_REGION, EVENT_SUBSCRIPTION_QUOTA_PER_REGION,
-    MAX_SUBNETS_PER_DB_SUBNET_GROUP, OPTION_GROUP_QUOTA_PER_REGION,
+    INTEGRATION_QUOTA_PER_REGION, MAX_SUBNETS_PER_DB_SUBNET_GROUP,
+    OPTION_GROUP_QUOTA_PER_REGION,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -55,14 +58,26 @@ struct QuotaCase {
     used_after_setup: i64,
 }
 
-/// Every entry the report must carry, in the order `AccountQuota`'s documentation lists
-/// them. The maxima that are not imported constants are Amazon RDS's published default
+/// Every entry the report must carry, in the order the service publishes them on the
+/// wire. The maxima that are not imported constants are Amazon RDS's published default
 /// quotas for a resource this service stores none of ("Total storage for all DB
 /// instances": 100,000 GiB; "DB security groups": 25; "Authorizations per DB security
 /// group": 20; "Custom endpoints per DB cluster": 5; "IAM roles per DB cluster" and "IAM
 /// roles per DB instance": 5; "Read replicas per primary": 15; "Reserved DB instances":
 /// 40).
 const QUOTA_CASES: &[QuotaCase] = &[
+    QuotaCase {
+        name: "DBInstances",
+        max: DB_INSTANCE_QUOTA_PER_REGION as i64,
+        used_when_empty: 0,
+        used_after_setup: 2,
+    },
+    QuotaCase {
+        name: "ReservedDBInstances",
+        max: 40,
+        used_when_empty: 0,
+        used_after_setup: 0,
+    },
     QuotaCase {
         name: "AllocatedStorage",
         max: 100_000,
@@ -71,13 +86,74 @@ const QUOTA_CASES: &[QuotaCase] = &[
         used_after_setup: 120,
     },
     QuotaCase {
+        name: "DBSecurityGroups",
+        max: 25,
+        used_when_empty: 0,
+        used_after_setup: 0,
+    },
+    QuotaCase {
         name: "AuthorizationsPerDBSecurityGroup",
         max: 20,
         used_when_empty: 0,
         used_after_setup: 0,
     },
     QuotaCase {
-        name: "CustomEndpointsPerDBCluster",
+        name: "DBParameterGroups",
+        max: DB_PARAMETER_GROUP_QUOTA_PER_REGION as i64,
+        used_when_empty: 0,
+        used_after_setup: 3,
+    },
+    QuotaCase {
+        name: "ManualSnapshots",
+        max: DB_SNAPSHOT_QUOTA_PER_REGION as i64,
+        used_when_empty: 0,
+        used_after_setup: 1,
+    },
+    QuotaCase {
+        name: "EventSubscriptions",
+        max: EVENT_SUBSCRIPTION_QUOTA_PER_REGION as i64,
+        used_when_empty: 0,
+        used_after_setup: 1,
+    },
+    QuotaCase {
+        name: "DBSubnetGroups",
+        max: DB_SUBNET_GROUP_QUOTA_PER_REGION as i64,
+        used_when_empty: 0,
+        used_after_setup: 2,
+    },
+    QuotaCase {
+        name: "OptionGroups",
+        max: OPTION_GROUP_QUOTA_PER_REGION as i64,
+        used_when_empty: 0,
+        used_after_setup: 2,
+    },
+    QuotaCase {
+        name: "SubnetsPerDBSubnetGroup",
+        max: MAX_SUBNETS_PER_DB_SUBNET_GROUP as i64,
+        used_when_empty: 0,
+        // The fuller of the two subnet groups below names three subnets.
+        used_after_setup: 3,
+    },
+    QuotaCase {
+        name: "ReadReplicasPerMaster",
+        max: 15,
+        used_when_empty: 0,
+        used_after_setup: 0,
+    },
+    QuotaCase {
+        name: "DBClusters",
+        max: DB_CLUSTER_QUOTA_PER_REGION as i64,
+        used_when_empty: 0,
+        used_after_setup: 1,
+    },
+    QuotaCase {
+        name: "DBClusterRoles",
+        max: 5,
+        used_when_empty: 0,
+        used_after_setup: 0,
+    },
+    QuotaCase {
+        name: "DBInstanceRoles",
         max: 5,
         used_when_empty: 0,
         used_after_setup: 0,
@@ -89,89 +165,22 @@ const QUOTA_CASES: &[QuotaCase] = &[
         used_after_setup: 1,
     },
     QuotaCase {
-        name: "DBClusterRoles",
-        max: 5,
-        used_when_empty: 0,
-        used_after_setup: 0,
-    },
-    QuotaCase {
-        name: "DBClusters",
-        max: DB_CLUSTER_QUOTA_PER_REGION as i64,
-        used_when_empty: 0,
-        used_after_setup: 1,
-    },
-    QuotaCase {
-        name: "DBInstanceRoles",
-        max: 5,
-        used_when_empty: 0,
-        used_after_setup: 0,
-    },
-    QuotaCase {
-        name: "DBInstances",
-        max: DB_INSTANCE_QUOTA_PER_REGION as i64,
-        used_when_empty: 0,
-        used_after_setup: 2,
-    },
-    QuotaCase {
-        name: "DBParameterGroups",
-        max: DB_PARAMETER_GROUP_QUOTA_PER_REGION as i64,
-        used_when_empty: 0,
-        used_after_setup: 3,
-    },
-    QuotaCase {
-        name: "DBSecurityGroups",
-        max: 25,
-        used_when_empty: 0,
-        used_after_setup: 0,
-    },
-    QuotaCase {
-        name: "DBSubnetGroups",
-        max: DB_SUBNET_GROUP_QUOTA_PER_REGION as i64,
-        used_when_empty: 0,
-        used_after_setup: 2,
-    },
-    QuotaCase {
-        name: "EventSubscriptions",
-        max: EVENT_SUBSCRIPTION_QUOTA_PER_REGION as i64,
-        used_when_empty: 0,
-        used_after_setup: 1,
-    },
-    QuotaCase {
         name: "ManualClusterSnapshots",
         max: DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION as i64,
         used_when_empty: 0,
         used_after_setup: 0,
     },
     QuotaCase {
-        name: "ManualSnapshots",
-        max: DB_SNAPSHOT_QUOTA_PER_REGION as i64,
-        used_when_empty: 0,
-        used_after_setup: 1,
-    },
-    QuotaCase {
-        name: "OptionGroups",
-        max: OPTION_GROUP_QUOTA_PER_REGION as i64,
-        used_when_empty: 0,
-        used_after_setup: 2,
-    },
-    QuotaCase {
-        name: "ReadReplicasPerMaster",
-        max: 15,
+        name: "CustomEndpointsPerDBCluster",
+        max: 5,
         used_when_empty: 0,
         used_after_setup: 0,
     },
     QuotaCase {
-        name: "ReservedDBInstances",
-        max: 40,
+        name: "Integrations",
+        max: INTEGRATION_QUOTA_PER_REGION as i64,
         used_when_empty: 0,
         used_after_setup: 0,
-    },
-    QuotaCase {
-        name: "SubnetsPerDBSubnetGroup",
-        max: MAX_SUBNETS_PER_DB_SUBNET_GROUP as i64,
-        used_when_empty: 0,
-        // The fuller of the two subnet groups below names three subnets.
-        used_after_setup: 3,
     },
 ];
 

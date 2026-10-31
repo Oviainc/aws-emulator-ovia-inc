@@ -21,7 +21,8 @@
 //!   (description, permanence, persistence, port) and with EVERY setting that option
 //!   publishes, each carrying its published default, data type, apply type, allowed
 //!   values and modifiability, and its `Value` being the value a request set or, failing
-//!   that, that default;
+//!   that, that default, with the settings a request CONFIGURED reported ahead of the
+//!   ones left at their default, in the order the request named them;
 //! * a request naming an option the group's engine does not publish, a setting the
 //!   option does not publish, a setting the option publishes as not modifiable, or one
 //!   option in both `OptionsToInclude` and `OptionsToRemove`, is refused and leaves the
@@ -34,7 +35,9 @@
 //! value given in a first and in a second call, and the engines that publish no options
 //! at all.
 
-use service_com_amazonaws_rds_amazonrdsv19::state::option_catalog::{OptionFacts, OPTIONS};
+use service_com_amazonaws_rds_amazonrdsv19::state::option_catalog::{
+    OptionFacts, OptionSettingFacts, OPTIONS,
+};
 use service_com_amazonaws_rds_amazonrdsv19::state::MAX_OPTIONS_PER_REQUEST;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -207,16 +210,23 @@ fn assert_member(case: &str, xml: &str, tag: &str, expected: &str) {
 }
 
 /// Assert the option subtree reports exactly the settings its catalogue entry
-/// publishes, in order, each with its published metadata and with `Value` equal to
-/// `set` where that names it and to the published default everywhere else.
+/// publishes, each with its published metadata and with `Value` equal to `set` where that
+/// names it and to the published default everywhere else, in the order the service
+/// reports them: the settings `set` configured first, in the order it names them, then
+/// the rest in the order the option publishes them.
 fn assert_published_settings(case: &str, option_xml: &str, facts: &OptionFacts, set: &[(&str, &str)]) {
     let settings = subtrees(option_xml, "OptionSetting");
     let reported: Vec<String> = settings
         .iter()
         .map(|setting| text(setting, "Name"))
         .collect();
-    let published: Vec<String> = facts
+    let configured = set.iter().filter_map(|(name, _)| facts.setting(name));
+    let defaulted = facts
         .settings
+        .iter()
+        .filter(|setting| !set.iter().any(|(name, _)| *name == setting.name));
+    let expected: Vec<&OptionSettingFacts> = configured.chain(defaulted).collect();
+    let published: Vec<String> = expected
         .iter()
         .map(|setting| setting.name.to_string())
         .collect();
@@ -225,7 +235,7 @@ fn assert_published_settings(case: &str, option_xml: &str, facts: &OptionFacts, 
         "case {case:?}: expected the published settings {published:?}, got {reported:?} in \
          {option_xml}"
     );
-    for (setting, published) in settings.iter().zip(facts.settings.iter()) {
+    for (setting, published) in settings.iter().zip(expected.iter()) {
         let case = format!("{case} setting {}", published.name);
         assert_member(&case, setting, "DefaultValue", published.default_value);
         assert_member(&case, setting, "Description", published.description);

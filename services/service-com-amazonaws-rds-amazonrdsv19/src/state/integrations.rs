@@ -14,10 +14,12 @@ use std::time::Instant;
 use super::{PendingChange, PendingStatus, ARN_NAMESPACE};
 use crate::ops::types::{CreateIntegrationOutput, Tag};
 
-/// How many integrations one region holds. The cap is this emulator's, for the reason
-/// every other per-region quota in `src/state.rs` exists: it bounds the store and every
-/// scan over it.
-pub const INTEGRATION_QUOTA_PER_REGION: usize = 20;
+/// How many integrations one region holds: Amazon RDS's published default quota for
+/// zero-ETL integrations (100 per Region), which `DescribeAccountAttributes` reports as
+/// the `Integrations` maximum and `CreateIntegration` refuses past, so the report and the
+/// refusal state one and the same number. It bounds the store and every scan over it, the
+/// way every other per-region quota in `src/state.rs` does.
+pub const INTEGRATION_QUOTA_PER_REGION: usize = 100;
 
 /// `IntegrationStatus` — the status a just-created integration reports while this service
 /// brings it up.

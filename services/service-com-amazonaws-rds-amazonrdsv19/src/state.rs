@@ -305,24 +305,21 @@ pub const SNAPSHOT_STATUS_CREATING: &str = "creating";
 /// `automated` for the backups it schedules itself — and this service schedules none.
 pub const SNAPSHOT_TYPE_MANUAL: &str = "manual";
 
-/// How many cluster parameter groups one region may hold.
-///
-/// Emulator resource guard, NOT an AWS quota: AWS publishes none for cluster parameter
-/// groups, and every group is created by a caller and reclaimed only by an explicit delete,
-/// so the growth site carries a cap. Reaching it is the modelled
+/// How many cluster parameter groups one region may hold: Amazon RDS's published default
+/// quota ("DB cluster parameter groups": 50 per Region), which
+/// `DescribeAccountAttributes` reports as the `DBClusterParameterGroups` maximum, so the
+/// report and the refusal state one and the same number. Reaching it is the modelled
 /// `DBParameterGroupQuotaExceededFault` — "this request would cause you to exceed the
-/// allowed number of parameter groups" — rather than an unbounded store.
-pub const DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION: usize = 100;
+/// allowed number of parameter groups".
+pub const DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION: usize = 50;
 
-/// How many DB (instance) parameter groups one region may hold.
-///
-/// Emulator resource guard, NOT an AWS quota, for the same reason as
-/// [`DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION`]: every group is created by a caller and
-/// reclaimed only by an explicit delete, so the growth site carries a cap. Reaching it is
-/// the modelled `DBParameterGroupQuotaExceededFault` — "The request would result in the
-/// user exceeding the allowed number of DB parameter groups" — rather than an unbounded
-/// store.
-pub const DB_PARAMETER_GROUP_QUOTA_PER_REGION: usize = 100;
+/// How many DB (instance) parameter groups one region may hold: Amazon RDS's published
+/// default quota ("DB parameter groups": 50 per Region), reported as the
+/// `DBParameterGroups` maximum for the same reason as
+/// [`DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION`]. Reaching it is the modelled
+/// `DBParameterGroupQuotaExceededFault` — "The request would result in the user exceeding
+/// the allowed number of DB parameter groups".
+pub const DB_PARAMETER_GROUP_QUOTA_PER_REGION: usize = 50;
 
 /// How many parameters one cluster parameter group may carry.
 ///
@@ -4513,13 +4510,36 @@ pub struct OptionRecord {
     pub db_security_group_memberships: Vec<String>,
     /// `OptionConfiguration$VpcSecurityGroupMemberships`.
     pub vpc_security_group_memberships: Vec<String>,
-    /// The values the caller set, by setting name — only for the settings it set. A
-    /// setting absent here reports the catalogue's default, which is what makes
-    /// `Value` fall back to `DefaultValue`.
-    pub settings: BTreeMap<String, String>,
+    /// The values the caller set, each with the setting's catalogue name, in the order
+    /// the requests that set them named them — only for the settings it set. A setting
+    /// absent here reports the catalogue's default, which is what makes `Value` fall back
+    /// to `DefaultValue`, and the order is kept because it is the order the configured
+    /// settings are REPORTED in (see [`OptionRecord::to_wire`]).
+    pub settings: Vec<(String, String)>,
 }
 
 impl OptionRecord {
+    /// The value the caller set for the setting `name`, or `None` where it set none and
+    /// the setting reports its published default.
+    pub fn setting_value(&self, name: &str) -> Option<&str> {
+        self.settings
+            .iter()
+            .find(|(stored, _)| stored == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Record `value` for the setting `name`, which must be the catalogue's own spelling.
+    ///
+    /// A setting the same request, or a later one, sets again keeps the position its
+    /// first configuration gave it and reports the newest value: configuring a setting is
+    /// not the same event as configuring it for the first time.
+    pub fn set_setting(&mut self, name: &str, value: &str) {
+        match self.settings.iter_mut().find(|(stored, _)| stored == name) {
+            Some(stored) => stored.1 = value.to_string(),
+            None => self.settings.push((name.to_string(), value.to_string())),
+        }
+    }
+
     /// Project the stored option onto the modelled `Option` wire shape, in the context
     /// of the group's engine: the engine is half of the catalogue key, because an
     /// option one engine publishes is a different catalogue entry than another's.
@@ -4527,18 +4547,31 @@ impl OptionRecord {
         let facts = option_catalog::option_facts(engine_name, &self.name);
         let settings = facts
             .map(|facts| {
-                facts
+                // A setting the caller CONFIGURED is reported ahead of the ones left at
+                // their published default, in the order the request named them; the rest
+                // follow in the order the option publishes them. That is the order the
+                // recorded service reports an option's settings in: a group whose option
+                // was added with one setting configured reports that setting first and
+                // the remaining ones in catalogue order, and a group that configured none
+                // reports the catalogue order unchanged.
+                let configured = self
                     .settings
                     .iter()
+                    .filter_map(|(name, _)| facts.setting(name));
+                let defaulted = facts
+                    .settings
+                    .iter()
+                    .filter(|setting| self.setting_value(setting.name).is_none());
+                configured
+                    .chain(defaulted)
                     .map(|setting| OptionSetting {
                         name: Some(setting.name.to_string()),
                         // The value the caller set, else the published default: that
                         // is what "The current value of the option setting" is for a
                         // setting nobody has set.
                         value: Some(
-                            self.settings
-                                .get(setting.name)
-                                .cloned()
+                            self.setting_value(setting.name)
+                                .map(str::to_string)
                                 .unwrap_or_else(|| setting.default_value.to_string()),
                         ),
                         default_value: Some(setting.default_value.to_string()),
@@ -5720,10 +5753,9 @@ pub fn paginate<T>(
 ///
 /// Source: the certificate authorities Amazon RDS publishes in "Using SSL/TLS to
 /// encrypt a connection to a DB instance" (Amazon RDS User Guide) and reports through
-/// `DescribeCertificates`. AWS publishes a validity DATE for each, not a time of day, so
-/// the instants below are that date at midnight UTC. `Thumbprint` is deliberately absent
-/// rather than invented: it is the fingerprint of a certificate this emulator does not
-/// hold.
+/// `DescribeCertificates`, with the validity instants and fingerprint the published
+/// catalogue carries for an authority where it states them and the published validity
+/// DATE at midnight UTC where only the date is published.
 #[derive(Debug, Clone, Copy)]
 pub struct CaCertificate {
     /// `Certificate$CertificateIdentifier` — "The unique key that identifies a
@@ -5735,6 +5767,12 @@ pub struct CaCertificate {
     pub valid_from: &'static str,
     /// `Certificate$ValidTill`, as an ISO-8601 instant.
     pub valid_till: &'static str,
+    /// `Certificate$Thumbprint` — "The thumbprint of the certificate", the SHA-1
+    /// fingerprint of the published authority's certificate, as the published catalogue
+    /// carries it. EMPTY for an authority whose fingerprint this emulator does not hold:
+    /// a fingerprint is a digest of certificate bytes, so one that is not published is
+    /// reported as no `Thumbprint` member at all rather than as an invented digest.
+    pub thumbprint: &'static str,
     /// The key this authority signs with, which the identifier itself names
     /// (`rds-ca-rsa2048-g1`, `rds-ca-ecc384-g1`).
     pub key: CertificateKey,
@@ -5782,7 +5820,10 @@ impl CaCertificate {
         Certificate {
             certificate_identifier: Some(self.identifier.to_string()),
             certificate_type: Some(self.certificate_type.to_string()),
-            thumbprint: None,
+            // A fingerprint the catalogue does not carry is reported as an absent
+            // member, never as an empty string: a client pinning a thumbprint must be
+            // able to tell "not published" from a digest.
+            thumbprint: (!self.thumbprint.is_empty()).then(|| self.thumbprint.to_string()),
             valid_from: catalog_instant(self.valid_from),
             valid_till: catalog_instant(self.valid_till),
             certificate_arn: Some(ca_certificate_arn(region, self.identifier)),
@@ -5824,36 +5865,43 @@ pub fn ca_certificate(identifier: &str) -> Option<&'static CaCertificate> {
         .find(|certificate| certificate.identifier.eq_ignore_ascii_case(identifier))
 }
 
-/// Every CA certificate `DescribeCertificates` reports. See [`CaCertificate`] for the
-/// source; the expired `rds-ca-2019` is included because AWS still reports it.
+/// Every CA certificate `DescribeCertificates` reports, in the order the service
+/// publishes them: the strongest authority first — every elliptic-curve authority before
+/// every RSA one, and within a kind the longest key first ([`CertificateKey`]) — and an
+/// authority whose validity has passed after the ones a database can still be launched
+/// with. The expired `rds-ca-2019` is published because AWS still reports it.
 pub const CA_CERTIFICATES: &[CaCertificate] = &[
+    CaCertificate {
+        identifier: "rds-ca-ecc384-g1",
+        certificate_type: "CA",
+        valid_from: "2021-05-24T22:06:59Z",
+        valid_till: "2121-05-24T23:06:59Z",
+        thumbprint: "2ee3dcc06e50192559b13929e73484354f23387d",
+        key: CertificateKey::EllipticCurve(384),
+    },
+    CaCertificate {
+        identifier: "rds-ca-rsa4096-g1",
+        certificate_type: "CA",
+        valid_from: "2021-05-24T00:00:00Z",
+        valid_till: "2121-05-24T00:00:00Z",
+        thumbprint: "",
+        key: CertificateKey::Rsa(4096),
+    },
+    CaCertificate {
+        identifier: "rds-ca-rsa2048-g1",
+        certificate_type: "CA",
+        valid_from: "2021-05-24T00:00:00Z",
+        valid_till: "2061-05-24T00:00:00Z",
+        thumbprint: "",
+        key: CertificateKey::Rsa(2048),
+    },
     CaCertificate {
         identifier: "rds-ca-2019",
         certificate_type: "CA",
         valid_from: "2019-08-22T00:00:00Z",
         valid_till: "2024-08-22T00:00:00Z",
+        thumbprint: "",
         key: CertificateKey::Rsa(2048),
-    },
-    CaCertificate {
-        identifier: "rds-ca-ecc384-g1",
-        certificate_type: "CA",
-        valid_from: "2021-05-25T00:00:00Z",
-        valid_till: "2121-05-25T00:00:00Z",
-        key: CertificateKey::EllipticCurve(384),
-    },
-    CaCertificate {
-        identifier: "rds-ca-rsa2048-g1",
-        certificate_type: "CA",
-        valid_from: "2021-05-25T00:00:00Z",
-        valid_till: "2061-05-25T00:00:00Z",
-        key: CertificateKey::Rsa(2048),
-    },
-    CaCertificate {
-        identifier: "rds-ca-rsa4096-g1",
-        certificate_type: "CA",
-        valid_from: "2021-05-25T00:00:00Z",
-        valid_till: "2121-05-25T00:00:00Z",
-        key: CertificateKey::Rsa(4096),
     },
 ];
 
@@ -5866,9 +5914,9 @@ pub const CA_CERTIFICATES: &[CaCertificate] = &[
 /// certificates — minus any entry whose `ValidTill` has passed: a caller picks the
 /// `CACertificateIdentifier` of a new instance out of this list, and an expired
 /// certificate is not something it can be launched with. The order is the one an engine
-/// version publishes its authorities in ([`CertificateKey::publication_rank`]) rather than
-/// the catalogue's own identifier order, which is what `DescribeCertificates` reports the
-/// catalogue in.
+/// version publishes its authorities in ([`CertificateKey::publication_rank`]), which the
+/// catalogue is itself held in, so dropping the expired entries cannot reorder what is
+/// left.
 ///
 /// Which of these a given engine publishes is [`ca_certificates_offered_to`]: this is the
 /// whole set, for an engine offered every authority.
