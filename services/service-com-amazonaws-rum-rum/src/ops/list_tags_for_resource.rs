@@ -269,9 +269,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // That covers the deleted monitor too: a delete takes the record and its tags
         // together, so its ARN resolves to nothing afterwards. Read under a SHORT lock,
         // because the decision that follows reads the IAM and STS stores and needs no lock
-        // of this service's.
+        // of this service's. Only what the decision is made FROM is taken here — the
+        // resolved resource's own ARN and the policy in force on it — and never the answer,
+        // which is projected below off the record this operation resolves again.
         let region = crate::state::request_region(ctx.parts());
-        let (resource_arn, resource_policy, tags) = {
+        let (resource_arn, resource_policy) = {
             let store = state.lock();
             let Some(record) = store.app_monitor_by_arn(&region, &input.resource_arn) else {
                 return Err(TaggingRefusal::not_found().into());
@@ -282,11 +284,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // of that monitor sees.
                 record.arn.clone(),
                 record.resource_policy_document(),
-                // `Tags` is required, and it is projected through the record's one
-                // `tag_map()` — the same projection `GetAppMonitor` reports
-                // `AppMonitor$Tags` through, so the two readers cannot disagree. A monitor
-                // carrying no tags is reported as the EMPTY map, never as an absent member.
-                record.tag_map(),
             )
         };
         // May this caller read THIS resource's tags? Evaluated per call against the
@@ -303,6 +300,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(TaggingRefusal::denied(&denial).into());
         }
 
-        Ok(ListTagsForResourceOutput { resource_arn, tags })
+        // `@readonly`: the lock is taken for READING only, so what this call reports is
+        // exactly what the next caller sees. Resolved again under it: the decision above
+        // held no lock, so a concurrent `DeleteAppMonitor` may have removed the resource in
+        // between — which is why the ARN-addressed siblings `TagResource`/`UntagResource`
+        // and every other reader of this crate resolve their record after the decision too,
+        // and answer the frontend's 404 when it is gone.
+        let store = state.lock();
+        let Some(record) = store.app_monitor_by_arn(&region, &resource_arn) else {
+            return Err(TaggingRefusal::not_found().into());
+        };
+
+        Ok(ListTagsForResourceOutput {
+            resource_arn: record.arn.clone(),
+            // `Tags` is required, and it is projected through the record's one `tag_map()` —
+            // the same projection `GetAppMonitor` reports `AppMonitor$Tags` through, so the
+            // two readers cannot disagree. A monitor carrying no tags is reported as the
+            // EMPTY map, never as an absent member.
+            tags: record.tag_map(),
+        })
     }
 }

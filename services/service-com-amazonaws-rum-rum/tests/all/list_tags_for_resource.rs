@@ -14,11 +14,18 @@
 //! 50) and what a key and a value may be (every class of character `TagKey`'s pattern
 //! admits, both of its length bounds, an empty value, a maximal value); the invariance
 //! test asserts a read changes nothing a later caller sees; the refusal table walks one
-//! ARN component per row; and the after-a-write test asserts the read follows the store.
+//! ARN component per row; the after-a-write test asserts the read follows the store; and
+//! the window table holds a read open at its authorization decision — the one point where
+//! the handler holds no lock of this service's — while a concurrent commit changes the
+//! store under it, so what the read projects its answer from is asserted rather than
+//! assumed.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
+use service_com_amazonaws_rum_rum::state as rum_store;
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 // The ONE wire harness, shared with this crate's app-monitor suite.
@@ -607,6 +614,234 @@ async fn an_arn_resolves_only_from_the_region_that_owns_the_resource() {
             Some(minted.as_str()),
             "case {case:?}: expected ResourceArn {minted:?}, got {:?}",
             document["ResourceArn"]
+        );
+    }
+}
+
+/// How long a case leaves a read parked in its authorization decision before the
+/// concurrent commit lands.
+///
+/// Not a correctness requirement — the lock below is what pins the window, and a read that
+/// has not reached the decision yet resolves the ALREADY-committed store and answers the
+/// same. It is only long enough that the read has got past its own resolution, which is
+/// what makes the difference between answering a pre-decision snapshot and answering the
+/// store observable.
+const DECISION_WINDOW: Duration = Duration::from_millis(50);
+
+/// Drive one `ListTagsForResource` for `arn` whose authorization decision is held open
+/// while `commit` changes RUM's store, and answer what that read replied.
+///
+/// The window is PINNED rather than raced for. Every RUM authorization decision resolves
+/// the calling principal out of the IAM service's own store, so holding that store's lock
+/// parks a read that has passed its own resolution exactly at the decision — the point
+/// where the handler holds no lock of RUM's, which is what lets `commit` take RUM's lock
+/// and land strictly inside the window. The read is driven on its own thread because it
+/// blocks there.
+fn read_with_a_commit_in_the_decision_window(
+    router: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
+    arn: &str,
+    commit: impl FnOnce(&mut rum_store::ComAmazonawsRumRumState),
+) -> crate::support::Reply {
+    let iam = iam_store::service_state(engine).expect("the IAM store a decision is made from");
+    let rum = rum_store::service_state(engine).expect("RUM's own store");
+    let decision_held_open = iam.lock();
+
+    let reading = {
+        let router = router.clone();
+        let path = tags_path(arn);
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime for the parked read")
+                .block_on(async move { call(&router, "GET", &path, None).await })
+        })
+    };
+
+    std::thread::sleep(DECISION_WINDOW);
+    commit(&mut rum.lock());
+    drop(decision_held_open);
+    reading.join().expect("the parked read answered")
+}
+
+/// One row of the window table: what a concurrent caller commits to the store while the
+/// read is parked in its decision, and what the read must then answer.
+struct WindowCase {
+    case: &'static str,
+    /// The commit, taking RUM's store and the monitor's name.
+    commit: fn(&mut rum_store::ComAmazonawsRumRumState, &str),
+    /// The tag map the read must report, or `None` when it must answer the frontend's 404
+    /// because the store no longer holds the resource.
+    expected: Option<&'static [(&'static str, &'static str)]>,
+}
+
+/// The tags the monitor each row reads is created with.
+const SEEDED_TAGS: [(&str, &str); 2] = [("Team", "web"), ("Env", "prod")];
+
+/// The window table. Rows differ along WHAT the concurrent commit does to the record the
+/// read resolved — nothing, removes it, adds a tag, removes one, empties the map, replaces
+/// it — because the rule under test is about WHICH store state the answer is projected
+/// from, not about any one change: whatever the store holds once the decision is made is
+/// what the read reports, and a resource it no longer holds is refused.
+fn window_cases() -> Vec<WindowCase> {
+    vec![
+        WindowCase {
+            case: "nothing commits in the window",
+            commit: |_, _| {},
+            expected: Some(&SEEDED_TAGS),
+        },
+        WindowCase {
+            case: "the resource is removed in the window, as DeleteAppMonitor removes it",
+            commit: |store, name| {
+                store
+                    .remove_app_monitor(REGION, name)
+                    .expect("the monitor the case created");
+            },
+            expected: None,
+        },
+        WindowCase {
+            case: "a tag is added in the window, as TagResource adds one",
+            commit: |store, name| {
+                store
+                    .app_monitor_mut(REGION, name)
+                    .expect("the monitor the case created")
+                    .tags
+                    .insert("Owner".to_string(), "rum".to_string());
+            },
+            expected: Some(&[("Team", "web"), ("Env", "prod"), ("Owner", "rum")]),
+        },
+        WindowCase {
+            case: "a tag is removed in the window, as UntagResource removes one",
+            commit: |store, name| {
+                store
+                    .app_monitor_mut(REGION, name)
+                    .expect("the monitor the case created")
+                    .tags
+                    .remove("Env");
+            },
+            expected: Some(&[("Team", "web")]),
+        },
+        WindowCase {
+            case: "every tag is removed in the window",
+            commit: |store, name| {
+                store
+                    .app_monitor_mut(REGION, name)
+                    .expect("the monitor the case created")
+                    .tags
+                    .clear();
+            },
+            expected: Some(&[]),
+        },
+        WindowCase {
+            case: "the whole map is replaced in the window",
+            commit: |store, name| {
+                let record = store
+                    .app_monitor_mut(REGION, name)
+                    .expect("the monitor the case created");
+                record.tags.clear();
+                record.tags.insert("Stage".to_string(), "beta".to_string());
+                record.tags.insert("Tier".to_string(), "gold".to_string());
+            },
+            expected: Some(&[("Stage", "beta"), ("Tier", "gold")]),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn the_read_answers_the_store_as_it_stands_once_the_decision_is_made() {
+    // The rule: a reporting operation projects its answer from the record it resolves from
+    // the store AFTER its authorization decision — the decision is made with no lock of
+    // this service's held — so a resource the store no longer holds by then is refused with
+    // the frontend's 404 and a change committed in that window is what the read reports.
+    // Each row drives the real wire path with the decision held open, so the commit lands
+    // inside the window every time instead of being raced for.
+    for WindowCase {
+        case,
+        commit,
+        expected,
+    } in window_cases()
+    {
+        let (router, engine) = emulator();
+        let name = "monitor-in-the-window";
+        create(
+            &router,
+            case,
+            json!({
+                "Name": name,
+                "Domain": "example.com",
+                "Tags": tag_object(SEEDED_TAGS.iter().copied()),
+            }),
+        )
+        .await;
+        let arn = app_monitor_arn(REGION, ACCOUNT, name);
+
+        let reply = read_with_a_commit_in_the_decision_window(&router, &engine, &arn, |store| {
+            commit(store, name)
+        });
+
+        let Some(expected) = expected else {
+            assert_eq!(
+                reply.status,
+                404,
+                "case {case:?}: expected 404 for a resource the store no longer holds, got \
+                 {} {:?}",
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            );
+            let code = reply.error_code(case);
+            assert_eq!(
+                code, NOT_FOUND_ERROR_CODE,
+                "case {case:?}: expected the wire error code {NOT_FOUND_ERROR_CODE:?}, got \
+                 {code:?}"
+            );
+            let document = reply.json(case);
+            assert_eq!(
+                message(&document),
+                Some(NOT_FOUND_MESSAGE),
+                "case {case:?}: expected the message {NOT_FOUND_MESSAGE:?}, got {:?}",
+                message(&document)
+            );
+            // The sibling name-addressed reader answers for the same instant, and the two
+            // readers of one record cannot disagree about whether it is there.
+            let gone = call(&router, "GET", &format!("/appmonitor/{name}"), None).await;
+            assert_eq!(
+                gone.status,
+                404,
+                "case {case:?}: expected GetAppMonitor to answer 404 for the same instant, \
+                 got {} {:?}",
+                gone.status,
+                String::from_utf8_lossy(&gone.body)
+            );
+            continue;
+        };
+
+        assert_eq!(
+            reply.status,
+            200,
+            "case {case:?}: expected 200, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+        let document = reply.json(case);
+        assert_eq!(
+            document["ResourceArn"].as_str(),
+            Some(arn.as_str()),
+            "case {case:?}: expected ResourceArn {arn:?}, got {:?}",
+            document["ResourceArn"]
+        );
+        let answered = tag_map(&document);
+        let expected = tag_object(expected.iter().copied());
+        assert_eq!(
+            answered, expected,
+            "case {case:?}: expected Tags {expected:?}, got {answered:?}"
+        );
+        // And the answer is the state the store holds, not a copy taken before the
+        // decision: the other reader of that record reports the same map.
+        let from_get = tag_map(&get_app_monitor(&router, case, name).await);
+        assert_eq!(
+            from_get, expected,
+            "case {case:?}: GetAppMonitor must report the same tags, got {from_get:?}"
         );
     }
 }
