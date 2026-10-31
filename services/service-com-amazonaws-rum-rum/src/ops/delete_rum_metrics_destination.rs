@@ -8,7 +8,9 @@
 //! the same identity `PutRumMetricsDestination` creates-or-updates — so this removes
 //! exactly the destination the pair names and leaves the monitor's other destinations in
 //! place. `ListRumMetricsDestinations` reads the same map, so it stops reporting the
-//! removed destination; a pair the monitor holds no record under is the modelled 404.
+//! removed destination; a pair the monitor holds no record under is the `@idempotent`
+//! no-op success, since the state the call asks for already holds, and only an app monitor
+//! that is not stored is the modelled 404.
 //!
 //! ## Shape of an operation
 //!
@@ -231,23 +233,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The `(Destination, DestinationArn)` pair is a destination's identity, so this
         // removes exactly the one the request names and leaves the monitor's other
-        // destinations in place. A pair the monitor holds no record under names no
-        // resource, which is the 404 this operation models rather than a silent success.
-        if monitor
-            .remove_metric_destination(&input.destination, destination_arn)
-            .is_none()
-        {
-            return Err(
-                DeleteRumMetricsDestinationErrorModeled::ResourceNotFoundException(
-                    crate::state::metric_destination_not_found(
-                        &input.app_monitor_name,
-                        &input.destination,
-                        destination_arn,
-                    ),
-                )
-                .into(),
-            );
-        }
+        // destinations in place. A pair the monitor holds no record under is a SUCCESS: the
+        // operation is `@idempotent` and its post-condition — this monitor does not send
+        // metrics to that destination — already holds, so there is nothing left to do and
+        // nothing to report. Only an app monitor that is not stored keeps the modelled 404,
+        // which is what lets a caller tell "no such monitor" from "that destination is
+        // already gone".
+        monitor.remove_metric_destination(&input.destination, destination_arn);
 
         // Removed under the lock this call still holds, so a `ListRumMetricsDestinations`
         // that follows no longer reports it. The response carries no members.

@@ -409,9 +409,17 @@ pub(crate) async fn batch_create_metric_definitions(
     .await
 }
 
-/// The definitions an accepted `BatchCreateRumMetricDefinitions` reported, asserting it
-/// refused none of them: a 200 whose `Errors` is the empty list the `@required` member
-/// carries when nothing was refused.
+/// The definitions an accepted `BatchCreateRumMetricDefinitions` created, in REQUEST
+/// order, asserting it refused none of them: a 200 whose `Errors` is the empty list the
+/// `@required` member carries when nothing was refused.
+///
+/// The create's own answer reports NO definition: `MetricDefinitions` carries the EMPTY
+/// list whatever the call created, which this helper asserts on every create it drives —
+/// so the definitions it created, and the ids the service minted for them, are read back
+/// through `BatchGetRumMetricDefinitions`, which is the operation that reports them. Each
+/// requested definition is resolved to the definition the destination now holds for it, in
+/// the canonical form the service stores one in ([`canonical_metric_definition`]), so a
+/// request naming one definition twice resolves to that one definition twice.
 pub(crate) async fn created_metric_definitions(
     router: &MultiServiceRouter,
     case: &str,
@@ -437,8 +445,112 @@ pub(crate) async fn created_metric_definitions(
         "case {case:?}: expected no per-definition errors, got {:?}",
         answered["Errors"]
     );
-    reported_metric_definitions(&answered)
+    assert_eq!(
+        answered["MetricDefinitions"],
+        json!([]),
+        "case {case:?}: expected the create to report no MetricDefinitions, got {:?}",
+        answered["MetricDefinitions"]
+    );
+    held_metric_definitions(router, case, monitor, destination, destination_arn, definitions).await
 }
+
+/// The definition the destination now holds for each of `definitions`, in request order —
+/// the read-back that stands in for an answer the create does not carry.
+pub(crate) async fn held_metric_definitions(
+    router: &MultiServiceRouter,
+    case: &str,
+    monitor: &str,
+    destination: &str,
+    destination_arn: Option<&str>,
+    definitions: &[Value],
+) -> Vec<Value> {
+    let held = all_metric_definitions(router, case, monitor, destination, destination_arn, None)
+        .await
+        .into_values()
+        .collect::<Vec<Value>>();
+    definitions
+        .iter()
+        .map(|requested| matching_metric_definition(case, &held, requested).clone())
+        .collect()
+}
+
+/// The one of `held` that IS `requested`: the definition whose every member equals the
+/// canonical form the service stores that request in
+/// ([`canonical_metric_definition`]) — the `MetricDefinitionId` aside, which is the handle
+/// the service minted and so is what the caller is looking for.
+///
+/// ONE definition of "the stored definition this request names" for every suite, so no two
+/// of them resolve a requested definition differently.
+pub(crate) fn matching_metric_definition<'a>(
+    case: &str,
+    held: &'a [Value],
+    requested: &Value,
+) -> &'a Value {
+    let wanted = canonical_metric_definition(requested);
+    held.iter()
+        .find(|reported| {
+            METRIC_DEFINITION_MEMBERS
+                .iter()
+                .all(|member| reported[member] == wanted[member])
+        })
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: no definition is stored for {wanted}, got {held:?}")
+        })
+}
+
+/// The same, for a suite that holds a destination's definitions as the id -> definition map
+/// [`all_metric_definitions`] reports.
+pub(crate) fn held_metric_definition(
+    case: &str,
+    held: &BTreeMap<String, Value>,
+    requested: &Value,
+) -> Value {
+    let held: Vec<Value> = held.values().cloned().collect();
+    matching_metric_definition(case, &held, requested).clone()
+}
+
+/// The form the service stores a requested `MetricDefinitionRequest` in, which is the form
+/// every read reports it in:
+///
+/// * an `EventPattern` is the pattern left once the whitespace around it is gone, and one
+///   that declares nothing at all is an ABSENT member;
+/// * a `DimensionKeys` map with no entry is an absent member;
+/// * an omitted `Namespace` is the namespace the metric is published to: a definition that
+///   names none is an extended metric, and extended metrics go to RUM's own
+///   [`EXTENDED_METRICS_NAMESPACE`].
+///
+/// A member the definition does not carry is spelled as JSON `null`, which is how
+/// restJson1 reports an absent member back.
+pub(crate) fn canonical_metric_definition(requested: &Value) -> Value {
+    let mut canonical = json!({});
+    for member in METRIC_DEFINITION_MEMBERS {
+        canonical[member] = requested.get(member).cloned().unwrap_or(Value::Null);
+    }
+    if let Some(pattern) = canonical["EventPattern"].as_str() {
+        let declared = pattern.trim();
+        canonical["EventPattern"] = if declared.is_empty() {
+            Value::Null
+        } else {
+            json!(declared)
+        };
+    }
+    if canonical["DimensionKeys"]
+        .as_object()
+        .is_some_and(|keys| keys.is_empty())
+    {
+        canonical["DimensionKeys"] = Value::Null;
+    }
+    if canonical["Namespace"].is_null() {
+        canonical["Namespace"] = json!(EXTENDED_METRICS_NAMESPACE);
+    }
+    canonical
+}
+
+/// The namespace RUM publishes EXTENDED metrics to — the namespace a definition that names
+/// none is read back under.
+/// Source: `smithy_query(query="doc", shape="MetricDefinitionRequest")` — "The `Namespace`
+/// parameter must be omitted or set to `AWS/RUM`".
+pub(crate) const EXTENDED_METRICS_NAMESPACE: &str = "AWS/RUM";
 
 /// Create ONE metric definition under a destination and report the `MetricDefinitionId`
 /// the service minted for it.
@@ -548,19 +660,21 @@ pub(crate) const METRIC_DEFINITION_MEMBERS: [&str; 6] = [
 ];
 
 /// Assert `reported` is the definition `expected` spells, under the id `id`: every member
-/// that definition carries reported with its value, and every member it leaves out absent
-/// (restJson1 draws no distinction between an absent member and a null one, so an omitted
-/// member reads as `Null` either way).
+/// of the form the service stores that definition in ([`canonical_metric_definition`])
+/// reported with its value, and every member it leaves out absent (restJson1 draws no
+/// distinction between an absent member and a null one, so an omitted member reads as
+/// `Null` either way).
 pub(crate) fn assert_metric_definition(case: &str, reported: &Value, expected: &Value, id: &str) {
     assert_eq!(
         reported["MetricDefinitionId"].as_str(),
         Some(id),
         "case {case:?}: expected the definition to be reported under {id:?}, got {reported}"
     );
+    let canonical = canonical_metric_definition(expected);
     for member in METRIC_DEFINITION_MEMBERS {
-        let wanted = expected.get(member).cloned().unwrap_or(Value::Null);
+        let wanted = &canonical[member];
         assert_eq!(
-            reported[member], wanted,
+            &reported[member], wanted,
             "case {case:?}: expected {member} to be {wanted:?}, got {:?}",
             reported[member]
         );

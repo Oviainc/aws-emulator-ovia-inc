@@ -30,17 +30,16 @@ use crate::metric_definitions::{
     custom, dimension_keys, event_pattern, extended, extended_with_dimensions, with,
     EXTENDED_DIMENSION_KEYS, EXTENDED_METRICS,
 };
-use crate::support::{call, create, emulator, message, Reply};
+use crate::support::{call, canonical_metric_definition, create, emulator, message, Reply};
 
 /// The `ErrorCode` a per-definition error carries for a definition the service will not
 /// store — the modelled error the single-definition update answers with.
 const VALIDATION_CODE: &str = "ValidationException";
 
 /// The namespace RUM publishes extended metrics to, the one value an extended metric's
-/// `Namespace` may carry.
-/// Source: `smithy_query(query="doc", shape="MetricDefinitionRequest")` — "The `Namespace`
-/// parameter must be omitted or set to `AWS/RUM`".
-const EXTENDED_NAMESPACE: &str = "AWS/RUM";
+/// `Namespace` may carry — the shared constant, so this suite and the read-back rule name
+/// one namespace.
+use crate::support::EXTENDED_METRICS_NAMESPACE as EXTENDED_NAMESPACE;
 
 /// `definition` without `member`, so a row can state the ABSENCE of a member as its one
 /// difference from a definition the model declares valid.
@@ -168,17 +167,25 @@ const DEFINITION_MEMBERS: [&str; 6] = [
     "Namespace",
 ];
 
-/// Assert `reported` carries exactly the members `requested` asked for.
+/// Assert `reported` carries exactly the members `requested` asked for, in the form the
+/// service stores a definition in ([`canonical_metric_definition`]).
 fn assert_definition(case: &str, reported: &Value, requested: &Value) {
+    let canonical = canonical_metric_definition(requested);
     for member in DEFINITION_MEMBERS {
-        let expected = requested.get(member).cloned().unwrap_or(Value::Null);
+        let expected = &canonical[member];
         assert_eq!(
-            reported[member], expected,
+            &reported[member], expected,
             "case {case:?}: expected {member} to be {expected:?}, got {:?}",
             reported[member]
         );
     }
 }
+
+/// The definition the destination holds for `requested` — the read-back that stands in for
+/// an answer the create does not carry. The shared
+/// [`crate::support::matching_metric_definition`] is what resolves it, so every suite
+/// resolves a requested definition the same way.
+use crate::support::matching_metric_definition as held_definition;
 
 /// Definitions the model declares VALID, each with the reason it is one.
 fn accepted_definitions() -> Vec<(String, Value)> {
@@ -393,19 +400,17 @@ async fn every_definition_the_model_declares_valid_is_created_and_read_back() {
         "accepted",
         answered["Errors"]
     );
-    let created = answered["MetricDefinitions"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    // The create reports no definition of its own — `MetricDefinitions` carries the EMPTY
+    // list whatever the call created — so what it created is read back through the
+    // operation that reports it.
     assert_eq!(
-        created.len(),
-        rows.len(),
-        "case {:?}: expected {} created definitions, got {created:?}",
-        "accepted",
-        rows.len()
+        answered["MetricDefinitions"],
+        json!([]),
+        "case {:?}: expected the create to report no MetricDefinitions, got {answered}",
+        "accepted"
     );
 
-    // Each is reported, and read back, as the definition that was asked for.
+    // Each is read back as the definition that was asked for.
     let held = stored(&router, "accepted", monitor).await;
     assert_eq!(
         held.len(),
@@ -414,16 +419,8 @@ async fn every_definition_the_model_declares_valid_is_created_and_read_back() {
         "accepted",
         rows.len()
     );
-    for ((case, requested), reported) in rows.iter().zip(created.iter()) {
-        assert_definition(case, reported, requested);
-        let id = reported["MetricDefinitionId"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {case:?}: the definition carries no id: {reported}"));
-        let read_back = held
-            .iter()
-            .find(|definition| definition["MetricDefinitionId"].as_str() == Some(id))
-            .unwrap_or_else(|| panic!("case {case:?}: no definition {id:?} was stored"));
-        assert_definition(case, read_back, requested);
+    for (case, requested) in rows.iter() {
+        assert_definition(case, held_definition(case, &held, requested), requested);
     }
 
     // The same definitions are accepted by the update, which judges one the same way. The
@@ -443,7 +440,11 @@ async fn every_definition_the_model_declares_valid_is_created_and_read_back() {
         seeded.status,
         String::from_utf8_lossy(&seeded.body)
     );
-    let subject = seeded.json("accepted")["MetricDefinitions"][0]["MetricDefinitionId"]
+    let subject = held_definition(
+        "accepted",
+        &stored(&router, "accepted", update_monitor).await,
+        &rows[0].1,
+    )["MetricDefinitionId"]
         .as_str()
         .expect("the seeded definition carries an id")
         .to_string();
@@ -483,10 +484,9 @@ async fn no_definition_the_model_declares_invalid_is_stored_by_either_operation(
         String::from_utf8_lossy(&reply.body)
     );
     let answered = reply.json("refused");
-    let created = answered["MetricDefinitions"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    // Only the valid definition was stored, read back through the operation that reports
+    // what the create wrote.
+    let created = stored(&router, "refused", monitor).await;
     assert_eq!(
         created.len(),
         1,

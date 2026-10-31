@@ -37,7 +37,7 @@ use crate::support::{
 const REGIONS: [&str; 4] = ["us-east-1", "eu-west-2", "ap-southeast-1", "sa-east-1"];
 
 /// The literal an app-monitor not-found message starts with, ahead of the requested name.
-/// Source: `crate::state`'s `NOT_FOUND_MESSAGE_PREFIX`, pinned by this crate's
+/// Source: `crate::state`'s `NOT_FOUND_MESSAGE`, pinned by this crate's
 /// not-found-body suite.
 const NOT_FOUND_PREFIX: &str = "Resource not found ";
 

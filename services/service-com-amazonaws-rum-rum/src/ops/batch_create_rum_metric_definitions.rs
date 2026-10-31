@@ -5,15 +5,18 @@
 //! Creates metric definitions — extended metrics and custom metrics — under ONE
 //! extended-metrics destination of the app monitor the request names, in this service's
 //! persisted state. A definition the destination does not hold yet is stored under a
-//! freshly minted `MetricDefinitionId` and reported back under it; a definition it already
-//! holds is reported under the id it already carries and stored no second time, which is
-//! the `@idempotent` the model declares for this operation — re-sending a batch leaves the
-//! state its first delivery did. Each definition the call refuses is reported in `Errors`
-//! while the rest still succeed, which is what the model asks for: "If some
+//! freshly minted `MetricDefinitionId`; a definition it already holds keeps the id it
+//! already carries and is stored no second time, which is the `@idempotent` the model
+//! declares for this operation — re-sending a batch leaves the state its first delivery
+//! did. The answer reports NO definition: `MetricDefinitions` carries the empty list
+//! whatever the call created, so the ids it minted are learned from
+//! `BatchGetRumMetricDefinitions`, which reads the same map back (and
+//! `UpdateRumMetricDefinition` replaces one entry of it). Each definition the call refuses
+//! is reported in `Errors` while the rest still succeed, which is what the model asks for:
+//! "If some
 //! metric definitions specified in a BatchCreateRumMetricDefinitions operations are not
 //! valid, those metric definitions fail and return errors, but all valid metric
-//! definitions in the same operation still succeed." `BatchGetRumMetricDefinitions` reads
-//! the same map back and `UpdateRumMetricDefinition` replaces one entry of it.
+//! definitions in the same operation still succeed."
 //!
 //! ## Shape of an operation
 //!
@@ -308,11 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !monitor.has_metric_destination(&input.destination, destination_arn) {
             return Err(
                 BatchCreateRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
-                    crate::state::metric_destination_not_found(
-                        &input.app_monitor_name,
-                        &input.destination,
-                        destination_arn,
-                    ),
+                    crate::state::adding_metrics_destination_not_found(&input.destination),
                 )
                 .into(),
             );
@@ -326,8 +325,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // definitions fit is decided once rather than per insert.
         let mut held = monitor.metric_definition_count(&input.destination, destination_arn);
         let mut errors: Vec<BatchCreateRumMetricDefinitionsError2> = Vec::new();
-        // One entry per definition the call accepted, in request order.
-        let mut planned: Vec<Planned> = Vec::new();
         // The definitions this call has to CREATE, in the order their ids are minted.
         let mut to_create: Vec<&MetricDefinitionRequest> = Vec::new();
         for requested in &input.metric_definitions {
@@ -346,21 +343,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // retried or re-sent batch leaves exactly the state its first delivery did —
             // it also takes no second slot of the destination's capacity and needs no
             // second delete to undo.
-            if let Some(stored) = monitor.metric_definition_defining(
-                &input.destination,
-                destination_arn,
-                requested,
-            ) {
-                planned.push(Planned::Stored(stored.to_metric_definition()));
+            if monitor
+                .metric_definition_defining(&input.destination, destination_arn, requested)
+                .is_some()
+            {
                 continue;
             }
             // The same identity, within the one request: a definition named twice in one
-            // batch is one definition too, so the second entry reports the definition the
-            // first entry creates.
-            if let Some(index) = to_create.iter().position(|earlier| {
+            // batch is one definition too, so the second entry creates nothing of its own.
+            if to_create.iter().any(|earlier| {
                 crate::state::MetricDefinitionRecord::same_definition(earlier, requested)
             }) {
-                planned.push(Planned::Created(index));
                 continue;
             }
             if held >= crate::state::MAX_METRIC_DEFINITIONS_PER_DESTINATION {
@@ -376,12 +369,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             held += 1;
             to_create.push(requested);
-            planned.push(Planned::Created(to_create.len() - 1));
         }
 
         // The ids are minted from the state's own counter, so they come from the store
         // rather than from the monitor record; the records are then written under the SAME
-        // lock, so every id reported here names a stored definition.
+        // lock, so a read that follows this call sees every definition it created.
         let records: Vec<crate::state::MetricDefinitionRecord> = to_create
             .into_iter()
             .map(|requested| {
@@ -397,33 +389,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let created: Vec<MetricDefinition> = records
-            .into_iter()
-            .map(|record| {
-                let reported = record.to_metric_definition();
-                monitor.insert_metric_definition(&input.destination, destination_arn, record);
-                reported
-            })
-            .collect();
-
-        // Every accepted definition, in request order, reported under the id it is stored
-        // as — whether this call minted that id or an earlier one did. Each
-        // `Planned::Created` indexes the records this call just minted, so the lookup is
-        // always a hit; it is written as one anyway, so no request can make the handler
-        // index out of bounds.
-        let metric_definitions: Vec<MetricDefinition> = planned
-            .into_iter()
-            .filter_map(|plan| match plan {
-                Planned::Created(index) => created.get(index).cloned(),
-                Planned::Stored(definition) => Some(definition),
-            })
-            .collect();
+        for record in records {
+            monitor.insert_metric_definition(&input.destination, destination_arn, record);
+        }
 
         Ok(BatchCreateRumMetricDefinitionsOutput {
             // `Errors` is `@required`, so a call that refused nothing reports the EMPTY
             // list rather than leaving the member off the wire.
             errors,
-            metric_definitions: Some(metric_definitions),
+            // `MetricDefinitions` carries NO definition: the create does not echo what it
+            // created, so the ids it minted are learned from
+            // `BatchGetRumMetricDefinitions`, which reads the map this call wrote. The
+            // member is still PRESENT, as the empty list: that is the body recorded
+            // behaviour answers for a batch of any size, and a successful create whose
+            // body leaves the member out instead diverges from it on every call (the
+            // wire-replay check of this operation's success steps is what settles which of
+            // the two the optional member is).
+            metric_definitions: Some(Vec::new()),
         })
     }
 }
@@ -441,16 +423,3 @@ const VALIDATION_ERROR_CODE: &str = "ValidationException";
 /// (`ServiceQuotaExceededException`), reported per definition because the rest of the list
 /// still succeeds.
 const QUOTA_ERROR_CODE: &str = "ServiceQuotaExceededException";
-
-/// What this call does with ONE accepted definition, decided before anything is written.
-///
-/// Keeping the decision and the write apart is what lets the answer report the accepted
-/// definitions in REQUEST order while the ids of the definitions this call creates are
-/// minted in one pass over the store.
-enum Planned {
-    /// A definition this call creates, at this index into the records it mints.
-    Created(usize),
-    /// A definition the destination already holds, reported as it is stored — under the id
-    /// the call that created it minted.
-    Stored(MetricDefinition),
-}

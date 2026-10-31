@@ -249,17 +249,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A definition lives under the destination it was created for, so a pair naming a
-        // destination this monitor does not have addresses no definition at all — a
-        // different missing resource from a definition id that is not there, and reported
-        // as such.
+        // destination this monitor does not have addresses no definition at all — the
+        // destination the metrics were to be added to is the resource that is missing, and
+        // the refusal names it ([`crate::state::adding_metrics_destination_not_found`]).
         if !monitor.has_metric_destination(&input.destination, destination_arn) {
             return Err(
                 UpdateRumMetricDefinitionErrorModeled::ResourceNotFoundException(
-                    crate::state::metric_destination_not_found(
-                        &input.app_monitor_name,
-                        &input.destination,
-                        destination_arn,
-                    ),
+                    crate::state::adding_metrics_destination_not_found(&input.destination),
                 )
                 .into(),
             );
@@ -286,23 +282,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|held| held.metric_definition_id.clone())
             .filter(|held| held != &input.metric_definition_id);
 
+        // The destination exists, so an id it holds nothing under leaves this add with no
+        // definition to carry the request's definition over onto. That is not a resource
+        // the caller named wrongly but a failure of the add itself, which the service
+        // reports as the `retryable` server error the model declares for it
+        // ([`crate::state::metric_definitions_not_added`]).
         let Some(stored) = monitor.metric_definition_mut(
             &input.destination,
             destination_arn,
             &input.metric_definition_id,
         ) else {
             return Err(
-                UpdateRumMetricDefinitionErrorModeled::ResourceNotFoundException(
-                    crate::state::metric_definition_not_found(
-                        &input.app_monitor_name,
-                        &input.metric_definition_id,
-                    ),
+                UpdateRumMetricDefinitionErrorModeled::InternalServerException(
+                    crate::state::metric_definitions_not_added(&input.app_monitor_name),
                 )
                 .into(),
             );
         };
         // Judged after the addressed definition is resolved, so a request naming no stored
-        // definition at all is still the missing resource it is, and nothing is written on
+        // definition at all is still that failure of the add, and nothing is written on
         // either refused path.
         if let Some(held) = conflicting_id {
             return Err(UpdateRumMetricDefinitionErrorModeled::ConflictException(

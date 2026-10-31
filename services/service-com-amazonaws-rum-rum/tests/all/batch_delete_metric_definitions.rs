@@ -59,6 +59,11 @@ const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 const VALIDATION_CODE: &str = "ValidationException";
 const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
 
+/// The whole `ErrorMessage` such an id is reported with: the error class's own fixed
+/// sentence, with no part of the request in it — the item is already named by the entry's
+/// own `MetricDefinitionId`.
+const NOT_FOUND_MESSAGE: &str = "Resource not found";
+
 /// How many definitions each destination of a row's monitor is seeded with.
 const SEEDED: usize = 5;
 
@@ -170,6 +175,11 @@ async fn put_destination(router: &MultiServiceRouter, case: &str, monitor: &str,
 }
 
 /// `BatchCreateRumMetricDefinitions`, returning the ids it minted in request order.
+///
+/// The create's answer reports no definition — `MetricDefinitions` carries the EMPTY list
+/// whatever the call created — so the ids are read back through
+/// `BatchGetRumMetricDefinitions` and matched to the definitions the request named by the
+/// `Name` each carries, which is unique across the seeded rows.
 async fn create_definitions(
     router: &MultiServiceRouter,
     case: &str,
@@ -200,24 +210,33 @@ async fn create_definitions(
         "case {case:?}: expected the seed to refuse no definition, got {:?}",
         answered["Errors"]
     );
-    let created = answered["MetricDefinitions"]
-        .as_array()
-        .unwrap_or_else(|| panic!("case {case:?}: the seed reported no MetricDefinitions"))
-        .clone();
     assert_eq!(
-        created.len(),
-        count,
-        "case {case:?}: expected {count} definitions to be created, got {created:?}"
+        answered["MetricDefinitions"],
+        json!([]),
+        "case {case:?}: expected the create to report no MetricDefinitions, got {answered}"
     );
-    created
-        .iter()
-        .map(|reported| {
-            reported["MetricDefinitionId"]
-                .as_str()
-                .unwrap_or_else(|| {
-                    panic!("case {case:?}: a created definition carries no MetricDefinitionId")
+    let held = stored_definitions(router, case, monitor, &target.query()).await;
+    assert_eq!(
+        held.len(),
+        count,
+        "case {case:?}: expected {count} definitions to be created, got {held:?}"
+    );
+    (0..count)
+        .map(|index| {
+            let wanted = definition(index);
+            held.iter()
+                .find(|reported| reported["Name"] == wanted["Name"])
+                .map(|reported| {
+                    reported["MetricDefinitionId"]
+                        .as_str()
+                        .unwrap_or_else(|| {
+                            panic!("case {case:?}: a stored definition carries no id")
+                        })
+                        .to_string()
                 })
-                .to_string()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: no definition was created for {wanted}: {held:?}")
+                })
         })
         .collect()
 }
@@ -245,7 +264,27 @@ async fn stored_ids(
     monitor: &str,
     query: &str,
 ) -> BTreeSet<String> {
-    let mut held = BTreeSet::new();
+    stored_definitions(router, case, monitor, query)
+        .await
+        .into_iter()
+        .map(|reported| {
+            reported["MetricDefinitionId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Every definition a destination holds, read back through the paginated
+/// `BatchGetRumMetricDefinitions` and following its tokens to the end.
+async fn stored_definitions(
+    router: &MultiServiceRouter,
+    case: &str,
+    monitor: &str,
+    query: &str,
+) -> Vec<Value> {
+    let mut held = Vec::new();
     let mut extra = String::new();
     loop {
         let reply = call(
@@ -262,17 +301,12 @@ async fn stored_ids(
             String::from_utf8_lossy(&reply.body)
         );
         let page = reply.json(case);
-        for reported in page["MetricDefinitions"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: a page reported no MetricDefinitions"))
-        {
-            held.insert(
-                reported["MetricDefinitionId"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-            );
-        }
+        held.extend(
+            page["MetricDefinitions"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: a page reported no MetricDefinitions"))
+                .clone(),
+        );
         match page["NextToken"].as_str() {
             Some(token) => extra = format!("&nextToken={}", percent_encoded(token)),
             None => return held,
@@ -426,10 +460,10 @@ async fn batch_delete_removes_the_named_definitions_and_reports_the_ids_it_holds
                     "case {case:?}: expected ErrorCode {NOT_FOUND_CODE}, got {reported}"
                 );
                 let text = reported["ErrorMessage"].as_str().unwrap_or_default();
-                assert!(
-                    text.contains(failed) && text.contains(&monitor),
-                    "case {case:?}: expected the per-id message to name the monitor and the \
-                     id, got {text:?}"
+                assert_eq!(
+                    text, NOT_FOUND_MESSAGE,
+                    "case {case:?}: expected the per-id message {NOT_FOUND_MESSAGE:?}, got \
+                     {text:?}"
                 );
             }
 
@@ -744,12 +778,31 @@ async fn deleting_metric_definitions_is_authorized_and_a_refusal_deletes_nothing
             )
             .await;
         assert_eq!(
-            seed.status, 200,
+            created.status, 200,
             "case {case:?}: seeding the definition must succeed, got {} {:?}",
             created.status,
             String::from_utf8_lossy(&created.body)
         );
-        let id = created.json(case)["MetricDefinitions"][0]["MetricDefinitionId"]
+        assert_eq!(
+            created.json(case)["MetricDefinitions"],
+            json!([]),
+            "case {case:?}: expected the create to report no MetricDefinitions, got {:?}",
+            String::from_utf8_lossy(&created.body)
+        );
+        // The create reports no definition, so the id it minted is read back through
+        // `BatchGetRumMetricDefinitions`, with the account's own credential.
+        let seeded = authorized
+            .rum(
+                ACCOUNT_KEY,
+                "GET",
+                &format!(
+                    "/rummetrics/{monitor}/metrics?{}",
+                    destination_query("CloudWatch", None)
+                ),
+                None,
+            )
+            .await;
+        let id = seeded.json(case)["MetricDefinitions"][0]["MetricDefinitionId"]
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: the seed minted no MetricDefinitionId"))
             .to_string();

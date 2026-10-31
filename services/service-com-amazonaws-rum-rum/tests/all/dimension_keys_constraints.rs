@@ -501,16 +501,21 @@ async fn a_dimension_entry_inside_the_modelled_constraints_is_stored_and_read_ba
             "case {case:?}: expected the definition to be accepted, got {:?}",
             answered["Errors"]
         );
-        let id = answered["MetricDefinitions"][0]["MetricDefinitionId"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {case:?}: the create reported no id: {answered:?}"))
-            .to_string();
+        assert_eq!(
+            answered["MetricDefinitions"],
+            json!([]),
+            "case {case:?}: expected the create to report no MetricDefinitions, got {answered:?}"
+        );
 
         // Read back through the implemented reader: the map is persisted whole, key for key.
+        // The create reports no definition, so the id it minted is the one the destination
+        // now holds this very definition under.
         let held = stored(&router, &case, monitor).await;
-        let reported = held
-            .get(&id)
-            .unwrap_or_else(|| panic!("case {case:?}: no definition stored under {id:?}"));
+        let (id, reported) = held
+            .iter()
+            .find(|(_, held)| held["DimensionKeys"] == requested["DimensionKeys"])
+            .unwrap_or_else(|| panic!("case {case:?}: the definition was not stored: {held:?}"));
+        let id = id.clone();
         assert_eq!(
             reported["DimensionKeys"], requested["DimensionKeys"],
             "case {case:?}: expected the stored DimensionKeys to be {:?}, got {:?}",

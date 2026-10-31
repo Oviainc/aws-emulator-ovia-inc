@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use crate::support::{call, create, emulator, get_app_monitor, message, rum_events_body};
 
 /// The literal a not-found message starts with, ahead of the requested name.
-/// Source: `crate::state`'s `NOT_FOUND_MESSAGE_PREFIX`, which the recorded corpus pins
+/// Source: `crate::state`'s `NOT_FOUND_MESSAGE`, which the recorded corpus pins
 /// across nine clusters and many operations.
 const NOT_FOUND_PREFIX: &str = "Resource not found ";
 

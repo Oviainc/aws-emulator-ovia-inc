@@ -31,8 +31,8 @@ use crate::metric_definitions::{
     EXTENDED_DIMENSION_KEYS, EXTENDED_METRICS,
 };
 use crate::support::{
-    all_metric_definitions, call, create, emulator, message, metric_definition_id,
-    put_metrics_destination, sole_metric_definition, Reply,
+    all_metric_definitions, call, create, emulator, held_metric_definition, message,
+    metric_definition_id, put_metrics_destination, sole_metric_definition, Reply,
 };
 
 /// The destination every case stores its definitions under: the one that carries no ARN.
@@ -43,10 +43,9 @@ const DESTINATION: &str = "CloudWatch";
 const VALIDATION_CODE: &str = "ValidationException";
 
 /// The namespace RUM publishes extended metrics to, the one value an extended metric's
-/// `Namespace` may carry.
-/// Source: `smithy_query(query="doc", shape="MetricDefinitionRequest")` — "The `Namespace`
-/// parameter must be omitted or set to `AWS/RUM`".
-const EXTENDED_NAMESPACE: &str = "AWS/RUM";
+/// `Namespace` may carry — the shared constant, so this suite and the read-back rule name
+/// one namespace.
+use crate::support::EXTENDED_METRICS_NAMESPACE as EXTENDED_NAMESPACE;
 
 /// A namespace of the caller's own, which is what makes a definition a CUSTOM metric.
 const CUSTOM_NAMESPACE: &str = "MyApp/Custom";
@@ -285,19 +284,15 @@ async fn every_listed_dimension_entry_is_created_and_read_back() {
         "accepted",
         answered["Errors"]
     );
-    let created = answered["MetricDefinitions"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let created = answered["MetricDefinitions"].clone();
     assert_eq!(
-        created.len(),
-        rows.len(),
-        "case {:?}: expected {} created definitions, got {created:?}",
-        "accepted",
-        rows.len()
+        created,
+        json!([]),
+        "case {:?}: expected the create to report no MetricDefinitions, got {answered}",
+        "accepted"
     );
 
-    // Each is reported, and read back, as the definition that was asked for.
+    // Each is read back as the definition that was asked for.
     let held = all_metric_definitions(&router, "accepted", monitor, DESTINATION, None, None).await;
     assert_eq!(
         held.len(),
@@ -306,13 +301,12 @@ async fn every_listed_dimension_entry_is_created_and_read_back() {
         "accepted",
         rows.len()
     );
-    for ((case, requested), reported) in rows.iter().zip(created.iter()) {
-        assert_reported(case, reported, requested);
-        let id = metric_definition_id(case, reported);
-        let read_back = held
-            .get(&id)
-            .unwrap_or_else(|| panic!("case {case:?}: no definition {id:?} was stored"));
-        assert_reported(case, read_back, requested);
+    for (case, requested) in rows.iter() {
+        assert_reported(
+            case,
+            &held_metric_definition(case, &held, requested),
+            requested,
+        );
     }
 
     // The single-definition update accepts each of them too, judging a definition the same
@@ -367,10 +361,13 @@ async fn no_dimension_entry_outside_the_list_is_stored_by_either_operation() {
         String::from_utf8_lossy(&reply.body)
     );
     let answered = reply.json("refused");
-    let created = answered["MetricDefinitions"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    // The create reports no definition, so what it stored is read back from the
+    // destination.
+    let created: Vec<Value> =
+        all_metric_definitions(&router, "refused", monitor, DESTINATION, None, None)
+            .await
+            .into_values()
+            .collect();
     assert_eq!(
         created.len(),
         1,

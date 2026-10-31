@@ -26,8 +26,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     AccessDeniedException, AppMonitor, AppMonitorConfiguration, AppMonitorDetails,
     AppMonitorSummary, ConflictException, CustomEvents, CwLog, DataStorage,
-    DeobfuscationConfiguration, InvalidPolicyRevisionIdException, JavaScriptSourceMaps,
-    MetricDefinition, MetricDefinitionRequest, MetricDestinationSummary,
+    DeobfuscationConfiguration, InternalServerException, InvalidPolicyRevisionIdException,
+    JavaScriptSourceMaps, MetricDefinition, MetricDefinitionRequest, MetricDestinationSummary,
     PolicyNotFoundException, ResourceNotFoundException, ServiceQuotaExceededException,
     ValidationException, METRIC_DESTINATION_VALUES,
 };
@@ -776,8 +776,17 @@ impl MetricDefinitionRecord {
     }
 
     /// Project the stored record onto the model's `MetricDefinition` — the one conversion
-    /// `BatchCreateRumMetricDefinitions` and `BatchGetRumMetricDefinitions` go through, so
-    /// the create's answer and a later read cannot report one definition differently.
+    /// `BatchGetRumMetricDefinitions` goes through, so every read reports one definition
+    /// the same way.
+    ///
+    /// `Namespace` is reported as the namespace the metric is PUBLISHED to, which is what
+    /// a caller reads it back for (to locate the metric in CloudWatch). A custom metric
+    /// carries the namespace its request named; a definition that named none is an
+    /// extended metric (the kind rule every operation accepting a definition judges by,
+    /// [`metric_definition_refusal`]), and extended metrics are published to RUM's own
+    /// vended namespace — so the member is settled to [`EXTENDED_METRICS_NAMESPACE`]
+    /// rather than reported absent, which would leave "an extended metric" and "namespace
+    /// unknown" spelled the same way.
     pub fn to_metric_definition(&self) -> MetricDefinition {
         MetricDefinition {
             metric_definition_id: self.metric_definition_id.clone(),
@@ -790,7 +799,11 @@ impl MetricDefinitionRecord {
                     .collect()
             }),
             event_pattern: self.event_pattern.clone(),
-            namespace: self.namespace.clone(),
+            namespace: Some(
+                self.namespace
+                    .clone()
+                    .unwrap_or_else(|| EXTENDED_METRICS_NAMESPACE.to_string()),
+            ),
         }
     }
 }
@@ -1849,22 +1862,30 @@ pub fn metric_destination_role_refusal(
 /// shape (see [`crate::ops::types::ResourceNotFoundException`]).
 pub fn app_monitor_not_found(name_or_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("{NOT_FOUND_MESSAGE_PREFIX}{name_or_id}"),
+        message: format!("{NOT_FOUND_MESSAGE} {name_or_id}"),
     }
 }
 
-/// The literal the app-monitor not-found message starts with, ahead of the requested
-/// name or id.
-pub const NOT_FOUND_MESSAGE_PREFIX: &str = "Resource not found ";
+/// The whole sentence this service reports for a resource that is not there, which the
+/// app-monitor refusal above then names the requested monitor after.
+///
+/// It is also the message ON ITS OWN of a BATCH operation's per-item not-found error
+/// (`BatchDeleteRumMetricDefinitionsError$ErrorMessage`): a per-item error reports the
+/// error class's own fixed text, with no part of the request interpolated into it — the
+/// item the text is about is already named by the error entry's own id member.
+pub const NOT_FOUND_MESSAGE: &str = "Resource not found";
 
 /// `ResourceNotFoundException` for a destination the named app monitor does not have —
-/// what `DeleteRumMetricsDestination` answers for a `(Destination, DestinationArn)` pair
-/// the monitor holds no record under.
+/// what the operations that READ a destination's metric definitions answer for a
+/// `(Destination, DestinationArn)` pair the monitor holds no record under.
 ///
 /// The message is built from the request: the destination kind it named, and the Evidently
 /// experiment ARN only where there is one to name. Like every other not-found body of this
 /// service it carries `message` ALONE — `resourceName`/`resourceType` are off the wire for
 /// this shape (see [`crate::ops::types::ResourceNotFoundException`]).
+///
+/// The operations that ADD metric definitions to a destination refuse the same missing
+/// destination in their own words ([`adding_metrics_destination_not_found`]).
 pub fn metric_destination_not_found(
     app_monitor_name: &str,
     destination: &str,
@@ -2413,20 +2434,36 @@ fn event_pattern_names_field(pattern: &::serde_json::Value, path: &str) -> bool 
     true
 }
 
-/// `ResourceNotFoundException` for a `MetricDefinitionId` the destination the request
-/// named holds no definition under.
+/// `ResourceNotFoundException` for an operation that ADDS metric definitions to a
+/// destination the named app monitor does not have.
 ///
-/// The message is built from the request: the app monitor it addressed and the id it asked
-/// for. Like every other not-found body of this service it carries `message` ALONE (see
-/// [`crate::ops::types::ResourceNotFoundException`]).
-pub fn metric_definition_not_found(
-    app_monitor_name: &str,
-    metric_definition_id: &str,
-) -> ResourceNotFoundException {
+/// The operations that send metrics to a destination — the batch create and the
+/// single-definition update, both of which "add metric definitions … to destination" —
+/// report the missing destination as a failure of that ADD, so the only part of the
+/// request the message carries is the `Destination` it was asked to add the metrics to.
+/// The app monitor is not named: it exists, and naming it would say the wrong resource is
+/// the missing one.
+pub fn adding_metrics_destination_not_found(destination: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
+        message: format!("Error adding metrics - Destination {destination} not found."),
+    }
+}
+
+/// `InternalServerException` for an update that addresses no stored metric definition.
+///
+/// `UpdateRumMetricDefinition` replaces the definition one `MetricDefinitionId` names, and
+/// the destination it replaces it under exists; an id that destination holds nothing under
+/// leaves the service with no definition to carry the request's definition over onto, and
+/// RUM reports that as a failure of the service's own add rather than as a resource the
+/// caller named wrongly: HTTP 500, which the model declares `retryable`, so an SDK's
+/// standard retry policy retries the call. The only variable part of the message is the
+/// app monitor the request named.
+pub fn metric_definitions_not_added(app_monitor_name: &str) -> InternalServerException {
+    InternalServerException {
         message: format!(
-            "App monitor {app_monitor_name} has no metric definition {metric_definition_id}."
+            "Error adding metric definitions for app monitor {app_monitor_name} to destination."
         ),
+        retry_after_seconds: None,
     }
 }
 

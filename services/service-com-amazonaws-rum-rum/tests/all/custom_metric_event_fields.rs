@@ -27,8 +27,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use crate::support::{
-    all_metric_definitions, call, create, emulator, message, metric_definition_id,
-    put_metrics_destination, sole_metric_definition, Reply,
+    all_metric_definitions, call, create, emulator, held_metric_definition, message,
+    metric_definition_id, put_metrics_destination, sole_metric_definition, Reply,
 };
 
 /// Every field a RUM event carries, which is every first-level key a custom metric's
@@ -390,19 +390,14 @@ async fn every_custom_metric_naming_only_rum_event_fields_is_created_and_read_ba
         "accepted",
         answered["Errors"]
     );
-    let created = answered["MetricDefinitions"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
     assert_eq!(
-        created.len(),
-        rows.len(),
-        "case {:?}: expected {} created definitions, got {created:?}",
-        "accepted",
-        rows.len()
+        answered["MetricDefinitions"],
+        json!([]),
+        "case {:?}: expected the create to report no MetricDefinitions, got {answered}",
+        "accepted"
     );
 
-    // Each is reported, and read back, as the definition that was asked for.
+    // Each is read back as the definition that was asked for.
     let held = all_metric_definitions(&router, "accepted", monitor, DESTINATION, None, None).await;
     assert_eq!(
         held.len(),
@@ -411,13 +406,12 @@ async fn every_custom_metric_naming_only_rum_event_fields_is_created_and_read_ba
         "accepted",
         rows.len()
     );
-    for ((case, requested), reported) in rows.iter().zip(created.iter()) {
-        assert_reported(case, reported, requested);
-        let id = metric_definition_id(case, reported);
-        let read_back = held
-            .get(&id)
-            .unwrap_or_else(|| panic!("case {case:?}: no definition {id:?} was stored"));
-        assert_reported(case, read_back, requested);
+    for (case, requested) in rows.iter() {
+        assert_reported(
+            case,
+            &held_metric_definition(case, &held, requested),
+            requested,
+        );
     }
 
     // The single-definition update accepts each of them too, judging a definition the same
@@ -478,10 +472,13 @@ async fn no_custom_metric_naming_a_field_no_rum_event_has_is_stored_by_either_op
         String::from_utf8_lossy(&reply.body)
     );
     let answered = reply.json("refused");
-    let created = answered["MetricDefinitions"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    // The create reports no definition, so what it stored is read back from the
+    // destination.
+    let created: Vec<Value> =
+        all_metric_definitions(&router, "refused", monitor, DESTINATION, None, None)
+            .await
+            .into_values()
+            .collect();
     assert_eq!(
         created.len(),
         1,

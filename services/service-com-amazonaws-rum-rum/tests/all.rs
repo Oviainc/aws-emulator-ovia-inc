@@ -55,6 +55,8 @@ mod list_app_monitors_page_size;
 mod list_tags_for_resource;
 #[path = "all/member_check_precedence.rs"]
 mod member_check_precedence;
+#[path = "all/metric_definition_answers.rs"]
+mod metric_definition_answers;
 #[path = "all/metric_definition_declared_members.rs"]
 mod metric_definition_declared_members;
 #[path = "all/metric_definition_identity.rs"]

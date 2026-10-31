@@ -404,11 +404,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 errors.push(BatchDeleteRumMetricDefinitionsError2 {
                     metric_definition_id: metric_definition_id.clone(),
                     error_code: NOT_FOUND_ERROR_CODE.to_string(),
-                    error_message: crate::state::metric_definition_not_found(
-                        &input.app_monitor_name,
-                        metric_definition_id,
-                    )
-                    .message,
+                    // The error class's own fixed sentence, with nothing of the request in
+                    // it: the item this entry is about is already named by its
+                    // `MetricDefinitionId`, so the message states only WHAT went wrong.
+                    error_message: crate::state::NOT_FOUND_MESSAGE.to_string(),
                 });
             }
         }

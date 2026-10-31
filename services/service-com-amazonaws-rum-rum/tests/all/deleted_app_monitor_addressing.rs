@@ -26,7 +26,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_rum_rum::state::{
-    CALLER_LACKS_PERMISSIONS_MESSAGE, NOT_FOUND_MESSAGE_PREFIX, TAGGED_RESOURCE_NOT_FOUND_MESSAGE,
+    CALLER_LACKS_PERMISSIONS_MESSAGE, NOT_FOUND_MESSAGE, TAGGED_RESOURCE_NOT_FOUND_MESSAGE,
 };
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
@@ -63,7 +63,7 @@ fn expected_refusal(addressing: Addressing, name: &str) -> (u16, &'static str, S
         Addressing::Name => (
             404,
             "ResourceNotFoundException",
-            format!("{NOT_FOUND_MESSAGE_PREFIX}{name}"),
+            format!("{NOT_FOUND_MESSAGE} {name}"),
         ),
         // The tagging frontend answers the SAME `ResourceNotFoundException` shape and
         // status under the shorter wire code it puts in `__type`

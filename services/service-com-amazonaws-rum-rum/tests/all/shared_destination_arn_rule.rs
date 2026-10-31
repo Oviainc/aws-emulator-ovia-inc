@@ -36,7 +36,7 @@ use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use crate::support::{
     all_metric_definitions, call, create, emulator, experiment_arn, metric_definition_id,
-    metrics_destination_query, metrics_role_arn, percent_encoded, reported_metric_definitions,
+    metrics_destination_query, metrics_role_arn, percent_encoded,
 };
 
 /// The two values `MetricDestination` admits: a `CloudWatch` destination carries no ARN and
@@ -267,7 +267,18 @@ async fn create_definition(
         "case {case:?}: expected no per-definition errors, got {:?}",
         answered["Errors"]
     );
-    let created = reported_metric_definitions(&answered);
+    assert_eq!(
+        answered["MetricDefinitions"],
+        json!([]),
+        "case {case:?}: expected the create to report no MetricDefinitions, got {answered}"
+    );
+    // The create reports no definition, so the id it minted is read back through
+    // `BatchGetRumMetricDefinitions` — under the same spelling of the pair, which is what
+    // makes this a check of the ARN rule rather than of the create's own answer.
+    let created = all_metric_definitions(router, case, monitor, destination, destination_arn, None)
+        .await
+        .into_values()
+        .collect::<Vec<Value>>();
     assert_eq!(
         created.len(),
         1,

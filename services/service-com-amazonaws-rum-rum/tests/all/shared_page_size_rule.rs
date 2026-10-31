@@ -19,7 +19,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use crate::support::{
-    call, create, emulator, experiment_arn, metrics_destination_query, put_metrics_destination,
+    all_metric_definitions, call, create, emulator, experiment_arn, metrics_destination_query,
+    put_metrics_destination,
 };
 
 /// The page every one of these listings returns when the request names no `MaxResults`.
@@ -211,10 +212,16 @@ async fn seeded_metric_definitions() -> (MultiServiceRouter, Listing) {
         "case {case:?}: expected no per-definition errors, got {:?}",
         answered["Errors"]
     );
-    let created = answered["MetricDefinitions"]
-        .as_array()
-        .map(Vec::len)
-        .unwrap_or_default();
+    // The create reports no definition of its own, so what it stored is counted through
+    // `BatchGetRumMetricDefinitions` at the modelled maximum page size.
+    assert_eq!(
+        answered["MetricDefinitions"],
+        json!([]),
+        "case {case:?}: expected the create to report no MetricDefinitions, got {answered}"
+    );
+    let created = all_metric_definitions(&router, case, &monitor, CLOUD_WATCH, None, Some(100))
+        .await
+        .len();
     assert_eq!(
         created, STORE_SIZE,
         "case {case:?}: expected {STORE_SIZE} definitions to be created, got {created}"

@@ -12,10 +12,10 @@
 //! The assertions pin RULES over a SET of inputs rather than one request: the removal
 //! table spans the whole `MetricDestination` catalog and several Evidently experiments
 //! and walks them one delete at a time, asserting after each that EVERY destination not
-//! named is still reported; the not-found table walks every way a request can name a
-//! `(Destination, DestinationArn)` pair the monitor holds no record under; and the
-//! refusal table walks the pairings the model forbids in prose plus a destination
-//! outside the catalog.
+//! named is still reported; the no-op table walks every way a request can name a
+//! `(Destination, DestinationArn)` pair the monitor holds no record under, which the
+//! `@idempotent` delete answers as the empty 200 success; and the refusal table walks the
+//! pairings the model forbids in prose plus a destination outside the catalog.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
@@ -257,20 +257,19 @@ async fn delete_removes_only_the_destination_it_names() {
 }
 
 #[tokio::test]
-async fn deleting_a_destination_the_monitor_does_not_have_is_not_found() {
+async fn deleting_a_destination_the_monitor_does_not_have_is_an_idempotent_no_op() {
     let (router, _engine) = emulator();
     let monitor = "absent-destination-monitor";
     create_monitor(&router, "setup", monitor).await;
 
-    // One Evidently destination exists, so each refusal is about the pair the request
-    // names rather than about a monitor with no destination at all.
+    // One Evidently destination exists, so each case is about the pair the request names
+    // rather than about a monitor with no destination at all.
     let present = Destination::evidently("present", "rum-writer");
     put_destination(&router, "setup", monitor, &present).await;
 
     // Every way a request can name a pair the monitor holds no record under: the other
     // destination kind, the right kind with an experiment it never had, and a pair that
-    // WAS stored but has already been deleted (so a retried delete is not a silent
-    // success either).
+    // WAS stored but has already been deleted (so a retried delete succeeds too).
     let deleted = Destination::evidently("deleted", "rum-writer");
     put_destination(&router, "setup", monitor, &deleted).await;
     let reply = delete(&router, monitor, &deleted).await;
@@ -291,29 +290,35 @@ async fn deleting_a_destination_the_monitor_does_not_have_is_not_found() {
         ("an Evidently destination already deleted", deleted.clone()),
     ];
     for (case, missing) in rows {
-        let reply = delete(&router, monitor, &missing).await;
-        assert_eq!(
-            reply.status,
-            404,
-            "case {case:?}: expected HTTP 404 for {}, got {} {:?}",
-            missing.label(),
-            reply.status,
-            String::from_utf8_lossy(&reply.body)
-        );
-        assert_eq!(
-            reply.error_code(case),
-            "ResourceNotFoundException",
-            "case {case:?}: expected a ResourceNotFoundException, got {:?}",
-            String::from_utf8_lossy(&reply.body)
-        );
+        // The operation is `@idempotent`: the state the call asks for — this monitor does
+        // not send metrics to that destination — already holds, so the answer is the empty
+        // 200 success of a call with nothing left to do, twice over.
+        for attempt in ["first", "repeated"] {
+            let reply = delete(&router, monitor, &missing).await;
+            assert_eq!(
+                reply.status,
+                200,
+                "case {case:?} ({attempt}): expected HTTP 200 for {}, got {} {:?}",
+                missing.label(),
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            );
+            assert_eq!(
+                reply.json(case),
+                json!({}),
+                "case {case:?} ({attempt}): DeleteRumMetricsDestinationResponse models no \
+                 members, got {:?}",
+                String::from_utf8_lossy(&reply.body)
+            );
+        }
     }
 
-    // None of the refused deletes touched the destination that IS stored.
-    let listed = reported(&router, "after the refusals", monitor).await;
+    // None of those no-ops touched the destination that IS stored.
+    let listed = reported(&router, "after the no-ops", monitor).await;
     assert_eq!(
         listed,
         vec![present.summary()],
-        "case \"after the refusals\": a refused delete must remove nothing, got {listed:?}"
+        "case \"after the no-ops\": a delete of another pair must remove nothing, got {listed:?}"
     );
 }
 

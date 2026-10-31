@@ -32,7 +32,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
-use crate::support::{call, create, emulator, message, percent_encoded, Reply, REGION};
+use crate::support::{
+    call, canonical_metric_definition, create, emulator, message, percent_encoded, Reply, REGION,
+};
 
 /// Every value `MetricDestination` admits.
 /// Source: `smithy_query(query="shape", shape="MetricDestination")`.
@@ -384,8 +386,12 @@ async fn batch_create(
     .await
 }
 
-/// The definitions a successful `BatchCreateRumMetricDefinitions` created, asserting it
-/// refused none of them.
+/// The definitions a successful `BatchCreateRumMetricDefinitions` created, in request
+/// order, asserting it refused none of them.
+///
+/// The create's answer reports no definition — `MetricDefinitions` carries the EMPTY list
+/// whatever the call created — so what the call created, and the ids it minted, are read
+/// back through `BatchGetRumMetricDefinitions`.
 async fn create_definitions(
     router: &MultiServiceRouter,
     case: &str,
@@ -408,12 +414,38 @@ async fn create_definitions(
         "case {case:?}: expected no per-definition errors, got {:?}",
         answered["Errors"]
     );
-    answered["MetricDefinitions"]
-        .as_array()
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: the create reported no MetricDefinitions: {answered}")
-        })
-        .clone()
+    assert_eq!(
+        answered["MetricDefinitions"],
+        json!([]),
+        "case {case:?}: expected the create to report no MetricDefinitions, got {:?}",
+        answered["MetricDefinitions"]
+    );
+    held_definitions(router, case, monitor, destination, definitions).await
+}
+
+/// The definition the destination now holds for each of `definitions`, in request order —
+/// the read-back that stands in for an answer the create does not carry.
+///
+/// One definition of "the definition the destination holds for this request" for the whole
+/// crate: the shared [`crate::support::held_metric_definitions`], which resolves each
+/// requested definition in the canonical form the service stores one in, so a request
+/// naming one definition twice resolves to that one definition twice.
+async fn held_definitions(
+    router: &MultiServiceRouter,
+    case: &str,
+    monitor: &str,
+    destination: &Destination,
+    definitions: &[Value],
+) -> Vec<Value> {
+    crate::support::held_metric_definitions(
+        router,
+        case,
+        monitor,
+        &destination.destination,
+        destination.destination_arn.as_deref(),
+        definitions,
+    )
+    .await
 }
 
 /// `UpdateRumMetricDefinition`: `PATCH /rummetrics/{AppMonitorName}/metrics`.
@@ -542,19 +574,21 @@ fn id_of(case: &str, reported: &Value) -> String {
 }
 
 /// Assert `reported` is exactly the definition `requested` asked for, under the id `id`:
-/// every member the request carried reported with the value it carried, and every member
-/// it left out absent (restJson1 draws no distinction between an absent member and a null
-/// one, so an omitted member reads as `Null` either way).
+/// every member of the form the service stores that definition in
+/// ([`canonical_metric_definition`]) reported with its value, and every member it leaves
+/// out absent (restJson1 draws no distinction between an absent member and a null one, so
+/// an omitted member reads as `Null` either way).
 fn assert_definition(case: &str, reported: &Value, requested: &Value, id: &str) {
     assert_eq!(
         reported["MetricDefinitionId"].as_str(),
         Some(id),
         "case {case:?}: expected the definition to be reported under {id:?}, got {reported}"
     );
+    let canonical = canonical_metric_definition(requested);
     for member in DEFINITION_MEMBERS {
-        let expected = requested.get(member).cloned().unwrap_or(Value::Null);
+        let expected = &canonical[member];
         assert_eq!(
-            reported[member], expected,
+            &reported[member], expected,
             "case {case:?}: expected {member} to be {expected:?}, got {:?}",
             reported[member]
         );
@@ -837,8 +871,11 @@ async fn an_update_the_service_cannot_apply_is_refused_and_changes_nothing() {
     let id = id_of("setup", &created[0]);
     let valid = extended(EXTENDED_METRICS[9].name);
 
-    // Each row refuses for ONE reason: a target that names no resource (404), or a
-    // definition the service will not store / a destination pairing the model forbids
+    // Each row refuses for ONE reason: an app monitor or a destination that names no
+    // resource (404 `ResourceNotFoundException`), a `MetricDefinitionId` the destination
+    // holds nothing under, which is the add failing on a service that has the destination
+    // but no definition to replace (500 `InternalServerException`, modelled `retryable`),
+    // or a definition the service will not store / a destination pairing the model forbids
     // (400). `absent` is the app monitor the row addresses.
     let rows: Vec<(&str, &str, Destination, String, Value, u16, &str)> = vec![
         (
@@ -865,8 +902,8 @@ async fn an_update_the_service_cannot_apply_is_refused_and_changes_nothing() {
             cloud_watch.clone(),
             "00000000-0000-4000-8000-000000000000".to_string(),
             valid.clone(),
-            404,
-            "ResourceNotFoundException",
+            500,
+            "InternalServerException",
         ),
         (
             "an id that belongs to another destination of the same monitor",
@@ -874,8 +911,8 @@ async fn an_update_the_service_cannot_apply_is_refused_and_changes_nothing() {
             evidently.clone(),
             id.clone(),
             valid.clone(),
-            404,
-            "ResourceNotFoundException",
+            500,
+            "InternalServerException",
         ),
         (
             "CloudWatch with a DestinationArn",
@@ -1057,11 +1094,13 @@ async fn the_reserved_namespace_prefix_is_the_only_namespace_a_definition_cannot
             String::from_utf8_lossy(&create_reply.body)
         );
         let answered = create_reply.json(case);
-        let created = answered["MetricDefinitions"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or_default();
         let refused = answered["Errors"].as_array().map(Vec::len).unwrap_or_default();
+        // The create reports no definition of its own, so what it stored is read back from
+        // the destination it was asked to store it under — a fresh one per row, so every
+        // definition it holds is one this row created.
+        let created = all_definitions(&router, case, &monitor, &destination)
+            .await
+            .len();
         assert_eq!(
             (created, refused),
             if *accepted { (1, 0) } else { (0, 1) },
@@ -1169,15 +1208,26 @@ async fn a_batch_create_refuses_only_the_definitions_it_cannot_store() {
     );
     let answered = reply.json("mixed batch");
 
-    // The valid definitions still succeed, in the order the request named them.
-    let created = answered["MetricDefinitions"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    // The valid definitions still succeed, read back from the destination they were
+    // created under: the create's answer carries the per-definition errors alone.
+    assert_eq!(
+        answered["MetricDefinitions"],
+        json!([]),
+        "case {:?}: expected the create to report no MetricDefinitions, got {answered}",
+        "mixed batch"
+    );
+    let created = held_definitions(
+        &router,
+        "mixed batch",
+        monitor,
+        &destination,
+        &[good_one.clone(), good_two.clone()],
+    )
+    .await;
     assert_eq!(
         created.len(),
         2,
-        "case {:?}: expected the two valid definitions to be created, got {answered}",
+        "case {:?}: expected the two valid definitions to be created, got {created:?}",
         "mixed batch"
     );
     for (wanted, reported) in [&good_one, &good_two].iter().zip(created.iter()) {

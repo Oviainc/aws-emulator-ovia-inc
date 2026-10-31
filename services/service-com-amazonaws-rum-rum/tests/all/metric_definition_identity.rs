@@ -460,7 +460,7 @@ async fn one_metric_may_be_defined_once_per_destination() {
 }
 
 #[tokio::test]
-async fn an_id_that_names_no_definition_is_the_missing_resource_whatever_the_request_defines() {
+async fn an_id_that_names_no_definition_is_not_the_conflict_whatever_the_request_defines() {
     let (router, _engine) = emulator();
     let case = "a duplicate definition under an id that names nothing";
     let monitor = "identity-absent-id";
@@ -485,8 +485,9 @@ async fn an_id_that_names_no_definition_is_the_missing_resource_whatever_the_req
     let stored_id = metric_definition_id(case, &created[0]);
 
     // The request defines a metric the destination already has a definition for, but the id
-    // it addresses names no definition at all: the resource the call is about is the one
-    // that is missing, so it is the 404 and not the conflict.
+    // it addresses names no definition at all: there is nothing to replace, so the add
+    // fails as the service's own `InternalServerException` (500, modelled `retryable`)
+    // rather than as the conflict a duplicate under a STORED id would be.
     let reply = update_metric_definition_reply(
         &router,
         monitor,
@@ -498,15 +499,15 @@ async fn an_id_that_names_no_definition_is_the_missing_resource_whatever_the_req
     .await;
     assert_eq!(
         reply.status,
-        404,
-        "case {case:?}: expected 404 for an id that names no definition, got {} {:?}",
+        500,
+        "case {case:?}: expected 500 for an id that names no definition, got {} {:?}",
         reply.status,
         String::from_utf8_lossy(&reply.body)
     );
     assert_eq!(
         reply.error_code(case),
-        "ResourceNotFoundException",
-        "case {case:?}: expected the refusal to be ResourceNotFoundException, got {:?}",
+        "InternalServerException",
+        "case {case:?}: expected the refusal to be InternalServerException, got {:?}",
         String::from_utf8_lossy(&reply.body)
     );
 
