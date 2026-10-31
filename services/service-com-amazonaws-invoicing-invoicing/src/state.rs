@@ -549,6 +549,115 @@ impl ComAmazonawsInvoicingInvoicingState {
         }
         accounts
     }
+
+    /// The rule a WRITE of an invoice unit holds its `Rule` to: an account is linked into
+    /// at most ONE invoice unit, and is named at most once in the one it is linked into.
+    ///
+    /// The model documents the resource as "a set of mutually exclusive accounts that
+    /// correspond to your business entity" (`smithy_query(query="shape",
+    /// shape="InvoiceUnit")`), and `LinkedAccounts` as "the list of `LINKED_ACCOUNT` IDs
+    /// where charges are included within the invoice unit"
+    /// (`smithy_query(query="shape", shape="InvoiceUnitRule")`): one account's charges
+    /// belong to one business entity, so a second unit linking an account the first one
+    /// already links would place those charges in two entities at once, and an account
+    /// repeated inside one rule is not a SET either. The model names the refusal reason
+    /// for exactly this class, `ValidationExceptionReason$mutualExclusionError`
+    /// ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]), which is what both
+    /// faces are refused with.
+    ///
+    /// The condition is a combination of the request and the STORED units, which no
+    /// modelled trait can express — `RuleAccountIdList` carries no `@uniqueItems` and
+    /// knows nothing of state — so it is refused here rather than by the boundary
+    /// validator, the way [`resolve_marketplace_punch_out`] refuses the combination a
+    /// single request cannot express.
+    ///
+    /// It lives beside the registry rather than in one operation's module because it is
+    /// one rule about the RESOURCE which every write of an invoice unit applies whole —
+    /// the create and the update — so neither path can drift from the other. `unit_arn` is
+    /// the unit the write is CHANGING, if any: the accounts a unit already links are its
+    /// own, so keeping or re-stating them is not an overlap, while a create (`None`) is
+    /// held against every live unit.
+    ///
+    /// Only each live unit's CURRENT rule holds accounts: a superseded configuration is
+    /// history kept for point-in-time reads, so an account an update dropped from a rule
+    /// is linkable again, and a retired unit takes its accounts with it. `BillSourceAccounts`
+    /// is deliberately not part of the rule: the model documents those as accounts that
+    /// "can be payer accounts from other organizations that have authorized billing
+    /// transfer to this account", which no part of the model says is exclusive.
+    ///
+    /// The message states the rule over the offending account, which is enclosed in angle
+    /// brackets the way this plane's other request-derived refusal spells the value it
+    /// names, and the unit the account is already linked into travels in the shape's own
+    /// `resourceName` member so a client can read it mechanically.
+    pub fn check_linked_account_exclusivity(
+        &self,
+        rule: &InvoiceUnitRule,
+        unit_arn: Option<&str>,
+    ) -> Result<(), ValidationException> {
+        let Some(requested) = rule.linked_accounts.as_deref() else {
+            return Ok(());
+        };
+        // The request's own accounts, by the position each one holds in its list, so a
+        // repeat is caught as the list is walked and an overlap is reported for the FIRST
+        // offending account of the REQUEST rather than of the registry. Keyed by the
+        // request's list, which the model bounds (`RuleAccountIdList`, `@length(0..1000)`),
+        // rather than by the whole registry.
+        let mut positions: BTreeMap<&str, usize> = BTreeMap::new();
+        for (position, account) in requested.iter().enumerate() {
+            if positions.insert(account.as_str(), position).is_some() {
+                return Err(mutual_exclusion(
+                    format!("Account <{account}> is listed more than once in the invoice unit rule"),
+                    None,
+                ));
+            }
+        }
+
+        // The earliest account of the request that another live unit's current rule links,
+        // and the unit that links it: the first such unit in `InvoiceUnitArn` order, so
+        // one request is always refused the same way.
+        let mut overlap: Option<(usize, &str, &str)> = None;
+        for unit in self.live_invoice_units() {
+            if Some(unit.arn.as_str()) == unit_arn {
+                continue;
+            }
+            for account in unit.current.rule.linked_accounts.iter().flatten() {
+                let Some(&position) = positions.get(account.as_str()) else {
+                    continue;
+                };
+                if overlap.is_none_or(|(earliest, _, _)| position < earliest) {
+                    overlap = Some((position, account.as_str(), unit.arn.as_str()));
+                }
+            }
+        }
+        if let Some((_, account, other_unit)) = overlap {
+            return Err(mutual_exclusion(
+                format!("Account <{account}> is already linked to another invoice unit"),
+                Some(other_unit),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The 400 a write of an invoice unit is refused with when its `Rule` breaks the
+/// mutual-exclusion rule [`ComAmazonawsInvoicingInvoicingState::check_linked_account_exclusivity`]
+/// applies: the model's own `mutualExclusionError` reason, so a client branches on the
+/// reason rather than on the prose.
+///
+/// `message` is held to the bound the model gives the member it travels in
+/// ([`crate::service::validation::bounded_message`]), as every message this service words
+/// from a request is, and `other_unit` — the invoice unit the account is already linked
+/// into — is reported in `resourceName` under the same rule every ARN this service reports
+/// is held to ([`crate::service::validation::reportable_resource_arn`]). The text is keyed
+/// as the invoice-unit plane keys it ([`MessageKey::ModelMemberName`]).
+fn mutual_exclusion(message: String, other_unit: Option<&str>) -> ValidationException {
+    ValidationException {
+        message: Some(crate::service::validation::bounded_message(message)),
+        resource_name: other_unit.and_then(crate::service::validation::reportable_resource_arn),
+        reason: Some("mutualExclusionError".to_string()),
+        message_key: MessageKey::ModelMemberName,
+        ..Default::default()
+    }
 }
 
 /// The REQUEST half of an `@idempotent` replay key ([`IdempotencyKey`]): a stable digest

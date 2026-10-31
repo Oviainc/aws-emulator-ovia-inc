@@ -610,6 +610,19 @@ async fn an_invoice_unit_update_under_a_spent_token_writes_its_own_configuration
             Some(tax_disabled),
             "case {label}: expected TaxInheritanceDisabled {tax_disabled}, got {reported}"
         );
+
+        // An account is linked into at most one invoice unit and every row links the same
+        // one, so the row retires its unit once it has been read: the next row's create is
+        // about the `ClientToken`, not about the accounts.
+        ok(
+            &router,
+            "DeleteInvoiceUnit",
+            &json!({
+                "InvoiceUnitArn": arn,
+                "ClientToken": format!("unit-update-cleanup-{index}"),
+            }),
+        )
+        .await;
     }
 }
 
@@ -840,6 +853,19 @@ async fn an_invoice_unit_create_under_a_spent_token_is_not_replayed_for_another_
             Some("the recorded unit"),
             "case {label}: the stored unit keeps the recorded description, got {reported}"
         );
+
+        // An account is linked into at most one invoice unit and every row links the same
+        // one, so the row retires its unit once it has been read: the next row's create is
+        // about the `ClientToken`, not about the accounts.
+        ok(
+            &router,
+            "DeleteInvoiceUnit",
+            &json!({
+                "InvoiceUnitArn": arn,
+                "ClientToken": format!("unit-create-cleanup-{index}"),
+            }),
+        )
+        .await;
     }
 }
 

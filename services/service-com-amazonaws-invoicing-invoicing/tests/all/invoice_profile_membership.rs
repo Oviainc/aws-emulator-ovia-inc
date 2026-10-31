@@ -273,8 +273,9 @@ async fn arrange(
         }
         Arrangement::OnlyInADeletedUnit => {
             let arn = create_unit(router, "deleted-unit", subject, &[account(2)], &[]).await;
-            // A unit naming the bystander survives, so the row still has its control.
-            create_unit(router, "surviving-unit", &other, &[account(2)], &[]).await;
+            // A unit naming the bystander survives, so the row still has its control. An
+            // account is linked into at most one invoice unit, so it links its own.
+            create_unit(router, "surviving-unit", &other, &[account(3)], &[]).await;
             ok(
                 router,
                 "DeleteInvoiceUnit",

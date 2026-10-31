@@ -151,9 +151,13 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answe
 }
 
 /// A `CreateInvoiceUnit` request body: the members every row needs, plus `tags`.
+///
+/// `linked` is the account the unit links. An account is linked into at most one invoice
+/// unit, so two units a test creates link different accounts.
 fn create_request(
     name: &str,
     receiver: &str,
+    linked: &str,
     client_token: &str,
     tags: &[(&str, &str)],
 ) -> Value {
@@ -161,7 +165,7 @@ fn create_request(
         "Name": name,
         "InvoiceReceiver": receiver,
         "TaxInheritanceDisabled": false,
-        "Rule": {"LinkedAccounts": ["210987654321"]},
+        "Rule": {"LinkedAccounts": [linked]},
         "ClientToken": client_token,
     });
     if !tags.is_empty() {
@@ -174,12 +178,17 @@ fn create_request(
     request
 }
 
-/// Create one invoice unit and answer with its ARN.
-async fn create_unit(router: &MultiServiceRouter, name: &str, tags: &[(&str, &str)]) -> String {
+/// Create one invoice unit linking `linked`, and answer with its ARN.
+async fn create_unit(
+    router: &MultiServiceRouter,
+    name: &str,
+    linked: &str,
+    tags: &[(&str, &str)],
+) -> String {
     let created = ok(
         router,
         "CreateInvoiceUnit",
-        &create_request(name, "123456789012", &format!("token-{name}"), tags),
+        &create_request(name, "123456789012", linked, &format!("token-{name}"), tags),
     )
     .await;
     created
@@ -210,14 +219,20 @@ fn listed_tags(answer: &Answer) -> Vec<(String, String)> {
 #[tokio::test]
 async fn a_success_announces_the_media_type_of_its_plane() {
     let router = emulator();
-    let arn = create_unit(&router, "MediaTypeUnit", &[("env", "test")]).await;
+    let arn = create_unit(&router, "MediaTypeUnit", "210987654321", &[("env", "test")]).await;
 
     // Every implemented operation, with the plane it belongs to. The create above is a
     // row too: it is the same question asked of the operation that mints the resource.
     let cases: Vec<(&str, Value, &str)> = vec![
         (
             "CreateInvoiceUnit",
-            create_request("SecondUnit", "210987654321", "token-second", &[]),
+            create_request(
+                "SecondUnit",
+                "210987654321",
+                "310987654321",
+                "token-second",
+                &[],
+            ),
             INVOICE_UNIT_MEDIA_TYPE,
         ),
         (
@@ -327,7 +342,7 @@ async fn an_absent_resource_reports_the_documented_message_and_the_arn_in_its_ow
     let router = emulator();
     // One unit exists, so these rows are reported absent on their own account rather
     // than because the store is empty.
-    create_unit(&router, "PresentUnit", &[]).await;
+    create_unit(&router, "PresentUnit", "210987654321", &[]).await;
 
     // ARNs differing along what the rule generalises over: the id's characters and
     // length, and (for the invoice-unit operations, whose `InvoiceUnitArnString` admits
@@ -416,13 +431,25 @@ async fn a_rejected_member_is_stated_as_a_field_validation_failure() {
         RefusedCase {
             operation: "CreateInvoiceUnit",
             member: "invoiceReceiver",
-            request: create_request("PatternUnit", "not-an-account-id", "tok-a", &[]),
+            request: create_request(
+                "PatternUnit",
+                "not-an-account-id",
+                "210987654321",
+                "tok-a",
+                &[],
+            ),
         },
         // `InvoiceUnitName` carries `@length(1..50)`.
         RefusedCase {
             operation: "CreateInvoiceUnit",
             member: "name",
-            request: create_request(&"n".repeat(51), "123456789012", "tok-b", &[]),
+            request: create_request(
+                &"n".repeat(51),
+                "123456789012",
+                "210987654321",
+                "tok-b",
+                &[],
+            ),
         },
         // `Name` is `@required`, and absence is a refusal of the same class.
         RefusedCase {
@@ -559,7 +586,7 @@ async fn tag_state_is_what_list_tags_reports() {
     let router = emulator();
     // The create carries tags, so the first row's "after" state is already a read-back
     // of what the create persisted.
-    let arn = create_unit(&router, "TaggedUnit", &[("Environment", "Test")]).await;
+    let arn = create_unit(&router, "TaggedUnit", "210987654321", &[("Environment", "Test")]).await;
 
     let created = ok(&router, "ListTagsForResource", &json!({"ResourceArn": arn})).await;
     assert_eq!(
@@ -649,7 +676,7 @@ async fn tag_state_is_what_list_tags_reports() {
 
     // Tags belong to the resource they were written against: a second unit is untouched
     // by every write above.
-    let other = create_unit(&router, "UntaggedUnit", &[]).await;
+    let other = create_unit(&router, "UntaggedUnit", "310987654321", &[]).await;
     let other_tags = ok(
         &router,
         "ListTagsForResource",
@@ -671,7 +698,7 @@ async fn tag_state_is_what_list_tags_reports() {
 #[tokio::test]
 async fn a_tag_write_past_the_modelled_maximum_is_refused() {
     let router = emulator();
-    let arn = create_unit(&router, "QuotaUnit", &[]).await;
+    let arn = create_unit(&router, "QuotaUnit", "210987654321", &[]).await;
 
     let full: Vec<Value> = (0..MAX_RESOURCE_TAGS)
         .map(|index| json!({"Key": format!("key-{index}"), "Value": "v"}))
@@ -732,7 +759,7 @@ async fn a_tag_write_past_the_modelled_maximum_is_refused() {
 
     // The per-CALL array maximum is not the quota: a single legal call carrying that
     // many tags is still refused, because the RESOURCE may not hold them.
-    let fresh = create_unit(&router, "QuotaUnitPerCall", &[]).await;
+    let fresh = create_unit(&router, "QuotaUnitPerCall", "310987654321", &[]).await;
     let per_call_max: Vec<Value> = (0..MAX_TAGS_PER_CALL)
         .map(|index| json!({"Key": format!("key-{index}"), "Value": "v"}))
         .collect();

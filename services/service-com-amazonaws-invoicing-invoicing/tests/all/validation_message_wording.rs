@@ -665,6 +665,9 @@ async fn a_request_inside_every_constraint_is_not_refused() {
             let mut request = create_request();
             request["Name"] = json!("n".repeat(50));
             request["InvoiceReceiver"] = json!("210987654321");
+            // An account is linked into at most one invoice unit, and the row above
+            // already created one: this unit links its own account.
+            request["Rule"] = json!({"LinkedAccounts": ["310987654321"]});
             request
         }),
         ("ListInvoiceUnits", json!({"MaxResults": 1})),

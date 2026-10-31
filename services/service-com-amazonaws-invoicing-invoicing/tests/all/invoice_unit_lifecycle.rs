@@ -975,7 +975,9 @@ async fn creating_past_the_maximum_is_refused() {
                 "Name": format!("unit-{index}"),
                 "InvoiceReceiver": "123456789012",
                 "TaxInheritanceDisabled": false,
-                "Rule": {"LinkedAccounts": ["210987654321"]},
+                // An account is linked into at most one invoice unit, so each of these
+                // links its own: what this row is about is the unit COUNT.
+                "Rule": {"LinkedAccounts": [format!("{:012}", 700 + index)]},
                 "ClientToken": format!("bulk-{index}"),
             }),
         )
@@ -993,7 +995,7 @@ async fn creating_past_the_maximum_is_refused() {
             "Name": "one-too-many",
             "InvoiceReceiver": "123456789012",
             "TaxInheritanceDisabled": false,
-            "Rule": {"LinkedAccounts": ["210987654321"]},
+            "Rule": {"LinkedAccounts": [format!("{:012}", 700 + maximum)]},
             "ClientToken": "one-too-many",
         }),
     )

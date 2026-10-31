@@ -25,6 +25,8 @@ mod invoice_profile_membership;
 mod invoice_profiles;
 #[path = "all/invoice_summaries.rs"]
 mod invoice_summaries;
+#[path = "all/invoice_unit_accounts_are_mutually_exclusive.rs"]
+mod invoice_unit_accounts_are_mutually_exclusive;
 #[path = "all/invoice_unit_lifecycle.rs"]
 mod invoice_unit_lifecycle;
 #[path = "all/marketplace_punch_out_config_follows_the_flag.rs"]

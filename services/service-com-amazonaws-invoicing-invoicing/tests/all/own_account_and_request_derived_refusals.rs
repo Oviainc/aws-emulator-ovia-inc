@@ -593,7 +593,9 @@ async fn a_duplicate_name_is_refused_with_the_name_in_the_templates_delimiters()
             "Name": name,
             "InvoiceReceiver": account(9),
             "TaxInheritanceDisabled": false,
-            "Rule": {"LinkedAccounts": [account(1)]},
+            // An account is linked into at most one invoice unit, and every row leaves
+            // its unit in state: each row links its own account.
+            "Rule": {"LinkedAccounts": [account(20 + index as u32)]},
             "ClientToken": format!("dup-{index}"),
         });
         ok(&router, "CreateInvoiceUnit", &request).await;

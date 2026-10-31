@@ -216,13 +216,20 @@ fn preference_create(portal: &str, identity: &str, tags: usize) -> Value {
     request
 }
 
-/// A `CreateInvoiceUnit` body for one name, carrying `tags` tags.
-fn invoice_unit_create(name: &str, tags: usize) -> Value {
+/// An account id of the modelled `AccountIdString` form (`@pattern ^\d{12}$`), derived
+/// from a row index: an account is linked into at most one invoice unit, so each row's
+/// unit links its own.
+fn account(index: usize) -> String {
+    format!("{:012}", 700 + index)
+}
+
+/// A `CreateInvoiceUnit` body for one row, carrying `tags` tags.
+fn invoice_unit_create(index: usize, name: &str, tags: usize) -> Value {
     let mut request = json!({
         "Name": name,
         "InvoiceReceiver": "123456789012",
         "TaxInheritanceDisabled": false,
-        "Rule": {"LinkedAccounts": ["210987654321"]},
+        "Rule": {"LinkedAccounts": [account(index)]},
     });
     if tags > 0 {
         request["ResourceTags"] = tag_list(tags);
@@ -357,7 +364,7 @@ async fn the_tag_quota_decides_an_invoice_unit_create() {
         let (status, body) = call(
             &router,
             "CreateInvoiceUnit",
-            &invoice_unit_create(&name, row.tags),
+            &invoice_unit_create(index, &name, row.tags),
         )
         .await;
 
@@ -415,7 +422,7 @@ async fn the_tag_quota_decides_an_invoice_unit_create() {
             let retried = ok(
                 &router,
                 "CreateInvoiceUnit",
-                &invoice_unit_create(&name, 1),
+                &invoice_unit_create(index, &name, 1),
             )
             .await;
             assert!(

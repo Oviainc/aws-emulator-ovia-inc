@@ -215,12 +215,15 @@ async fn fixture(router: &MultiServiceRouter) -> Fixture {
     .await;
 
     // A linked account an update later drops: it left the invoice unit's rule, not the
-    // organization, and the configuration naming it is still retained.
+    // organization, and the configuration naming it is still retained. An account is
+    // linked into at most one invoice unit, so the account this unit keeps after the drop
+    // is its own rather than one `alpha-unit` already links.
+    let gamma_own = account(8);
     let gamma = create_unit(
         router,
         "gamma-unit",
         &f.receiver,
-        &[f.linked_first.clone(), f.dropped_from_a_rule.clone()],
+        &[gamma_own.clone(), f.dropped_from_a_rule.clone()],
         &[],
     )
     .await;
@@ -229,7 +232,7 @@ async fn fixture(router: &MultiServiceRouter) -> Fixture {
         "UpdateInvoiceUnit",
         &json!({
             "InvoiceUnitArn": gamma,
-            "Rule": {"LinkedAccounts": [f.linked_first]},
+            "Rule": {"LinkedAccounts": [gamma_own]},
             "ClientToken": "gamma-drop",
         }),
     )

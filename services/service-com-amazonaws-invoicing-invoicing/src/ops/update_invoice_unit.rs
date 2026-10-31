@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is history kept for point-in-time reads, not something an update can
             // change, so it is reported missing like any other ARN that names nothing.
             let unit = store
-                .live_invoice_unit_mut(&input.invoice_unit_arn)
+                .live_invoice_unit(&input.invoice_unit_arn)
                 .ok_or_else(|| {
                     UpdateInvoiceUnitErrorModeled::ResourceNotFoundException(
                         crate::state::no_such_resource(&input.invoice_unit_arn),
@@ -220,7 +220,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 rule: input.rule.unwrap_or_else(|| unit.current.rule.clone()),
                 last_modified: crate::state::now(),
             };
-            unit.apply(next);
+            // An invoice unit is "a set of mutually exclusive accounts", so an account is
+            // linked into at most one of them: the rule this update would leave stored is
+            // held against the OTHER units that exist, from the one place both writes of
+            // an invoice unit apply it. The accounts this unit already links are its own,
+            // so restating them is not an overlap.
+            store
+                .check_linked_account_exclusivity(&next.rule, Some(&input.invoice_unit_arn))
+                .map_err(UpdateInvoiceUnitErrorModeled::ValidationException)?;
+            if let Some(unit) = store.live_invoice_unit_mut(&input.invoice_unit_arn) {
+                unit.apply(next);
+            }
         }
 
         store.record_result(

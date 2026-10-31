@@ -250,6 +250,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An invoice unit is "a set of mutually exclusive accounts", so an account is
+        // linked into at most one of them: the rule this create would store is held
+        // against the units that already exist, from the one place both writes of an
+        // invoice unit apply it.
+        store
+            .check_linked_account_exclusivity(&input.rule, None)
+            .map_err(CreateInvoiceUnitErrorModeled::ValidationException)?;
+
         let arn = store.mint_invoice_unit_arn();
         let created_at = crate::state::now();
         let name = input.name;

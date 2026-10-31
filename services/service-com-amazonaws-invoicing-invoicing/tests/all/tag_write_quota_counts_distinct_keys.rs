@@ -252,6 +252,17 @@ async fn listed_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String,
         .collect()
 }
 
+/// A distinct account id of the modelled `AccountIdString` form (`@pattern ^\d{12}$`)
+/// per invoice unit this slice mints: an account is linked into at most one invoice unit,
+/// so no two units here link the same one.
+fn next_linked_account() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(700);
+    format!(
+        "{:012}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 /// Mint a resource of `kind` and return its ARN.
 async fn resource(router: &MultiServiceRouter, kind: Kind, label: &str) -> String {
     match kind {
@@ -263,7 +274,7 @@ async fn resource(router: &MultiServiceRouter, kind: Kind, label: &str) -> Strin
                     "Name": format!("TagShapeUnit{label}"),
                     "InvoiceReceiver": "123456789012",
                     "TaxInheritanceDisabled": false,
-                    "Rule": {"LinkedAccounts": ["210987654321"]},
+                    "Rule": {"LinkedAccounts": [next_linked_account()]},
                 }),
             )
             .await;

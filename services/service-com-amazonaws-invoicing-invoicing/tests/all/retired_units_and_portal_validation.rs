@@ -494,7 +494,9 @@ async fn the_per_resource_tag_quota_is_reachable_and_atomic() {
                     "Name": format!("quota-batch-{batch}"),
                     "InvoiceReceiver": "123456789012",
                     "TaxInheritanceDisabled": false,
-                    "Rule": {"LinkedAccounts": ["210987654321"]},
+                    // An account is linked into at most one invoice unit, and each row
+                    // leaves its unit in state: every row links its own account.
+                    "Rule": {"LinkedAccounts": [format!("{:012}", 700 + batch)]},
                     "ClientToken": format!("quota-{batch}"),
                 }),
             )
@@ -1088,7 +1090,9 @@ async fn a_duplicate_name_is_refused_with_the_services_template() {
             "Name": name,
             "InvoiceReceiver": "123456789012",
             "TaxInheritanceDisabled": false,
-            "Rule": {"LinkedAccounts": ["210987654321"]},
+            // An account is linked into at most one invoice unit, and each row leaves a
+            // unit of its own in state: every row links its own account.
+            "Rule": {"LinkedAccounts": [format!("{:012}", 700 + index)]},
         });
         let arn = arn_of(&ok(&router, "CreateInvoiceUnit", &request).await);
 
