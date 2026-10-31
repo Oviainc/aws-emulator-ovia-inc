@@ -157,9 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `MaxResults` is modelled `range 1..25`, already enforced at the boundary; a
         // caller that sends none gets that modelled maximum as the page size.
-        let page_size = input
-            .max_results
-            .map_or(crate::state::DEFAULT_MAX_RESULTS, |n| n as usize);
+        let page_size = crate::state::page_size(input.max_results, crate::state::DEFAULT_MAX_RESULTS);
 
         let mut state = state.lock();
         // The moves the clock already owes (`ALLOCATING -> ALLOCATED`,
@@ -170,28 +168,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_all(std::time::Instant::now());
 
         // The `NextToken` this operation mints carries the `WorkspaceInstanceId` the
-        // next page resumes at, in this service's one token encoding
-        // ([`crate::state::decode_next_token`]): a token must decode to a resume point
-        // THIS listing can name — a record this Region holds, which is what
-        // `instance_resume_point` answers — so one this service did not issue is
-        // refused rather than guessed at, just as the sibling paginated operation
-        // resolves its own resume point against the catalog it pages.
-        let resume_from = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => {
-                let decoded = crate::state::decode_next_token(token)
-                    .and_then(|id| state.instance_resume_point(&region, &id));
-                match decoded {
-                    Some(id) => Some(id),
-                    None => {
-                        return Err(ListWorkspaceInstancesErrorModeled::ValidationException(
-                            crate::state::invalid_next_token(),
-                        )
-                        .into());
-                    }
-                }
-            }
-        };
+        // next page resumes at, in this service's one token encoding, and the cursor
+        // rule around it is the crate's single one ([`crate::state::resume_point`]):
+        // a token must decode to a resume point THIS listing can name — a record this
+        // Region holds, which is what `instance_resume_point` answers — so one this
+        // service did not issue is refused rather than guessed at, exactly as the
+        // sibling paginated operation's token resolves against the catalog it pages.
+        let resume_from = crate::state::resume_point(input.next_token.as_deref(), |id| {
+            state.instance_resume_point(&region, id)
+        })
+        .map_err(ListWorkspaceInstancesErrorModeled::ValidationException)?;
 
         // Iteration is in id order (the store is a `BTreeMap`), which is creation
         // order, so a resolved resume point names a well-defined place to continue
@@ -216,22 +202,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .is_none_or(|wanted| wanted.is_empty() || wanted.contains(&record.provision_state))
             });
 
-        let mut workspace_instances = Vec::new();
-        let mut next_token = None;
-        for record in matching {
-            if workspace_instances.len() == page_size {
-                // One past the page: its id is what the next page resumes at.
-                next_token = Some(crate::state::encode_next_token(&record.id));
-                break;
-            }
-            workspace_instances.push(WorkspaceInstance {
+        // The page bound and the token minted one past it are the crate's single rule
+        // too ([`crate::state::paginate`]): what this operation supplies is the
+        // collection it pages, the key a token is minted from, and how a record is
+        // reported.
+        let (workspace_instances, next_token) = crate::state::paginate(
+            matching,
+            page_size,
+            |record| record.id.clone(),
+            |record| WorkspaceInstance {
                 provision_state: Some(record.provision_state.clone()),
                 workspace_instance_id: Some(record.id.clone()),
                 ec2_managed_instance: Some(EC2ManagedInstance {
                     instance_id: Some(record.ec2_instance_id.clone()),
                 }),
-            });
-        }
+            },
+        );
 
         Ok(ListWorkspaceInstancesOutput {
             workspace_instances,

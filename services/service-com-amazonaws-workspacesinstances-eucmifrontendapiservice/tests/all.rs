@@ -37,6 +37,8 @@ mod list_pagination_resume_points;
 mod next_token_canonical_spelling;
 #[path = "all/next_token_rule_sharing.rs"]
 mod next_token_rule_sharing;
+#[path = "all/pagination_rule_sharing.rs"]
+mod pagination_rule_sharing;
 #[path = "all/region_catalog.rs"]
 mod region_catalog;
 #[path = "all/regional_scoping.rs"]

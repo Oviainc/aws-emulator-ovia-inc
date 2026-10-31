@@ -2355,7 +2355,8 @@ pub fn encode_next_token(resume_point: &str) -> String {
 /// round-trip and validation device, so a token that does not decode (or decodes to
 /// a resume point the caller's list cannot name) is refused with
 /// [`invalid_next_token`] rather than guessed at. Both paginated operations that mint
-/// a token use this, so the scheme lives in one place.
+/// a token use this, so the scheme lives in one place — and so do the cursor and
+/// page-bound rules built on it ([`resume_point`], [`paginate`]).
 ///
 /// Accepted ONLY when the token is byte for byte what [`encode_next_token`] mints for
 /// the resume point it carries: the decoder's acceptance set is the encoder's output
@@ -2379,6 +2380,68 @@ pub fn decode_next_token(token: &str) -> Option<String> {
 /// member, and `FieldList` names that member.
 pub fn invalid_next_token() -> ValidationException {
     field_validation_failed("NextToken", "NextToken is not a token this service issued")
+}
+
+/// The page size a paginated request asks for: its `MaxResults`, or `modelled_max`
+/// when it carries none.
+///
+/// `MaxResults` is modelled with a range of its own per operation and the boundary
+/// validator has already refused anything outside it, so the only decision left is
+/// what an ABSENT member means, and it means the same for every list here: the whole
+/// page that member admits, which is why the caller passes that member's own modelled
+/// maximum ([`DEFAULT_MAX_RESULTS`], [`DEFAULT_INSTANCE_TYPES_MAX_RESULTS`]).
+pub fn page_size(max_results: Option<i32>, modelled_max: usize) -> usize {
+    max_results.map_or(modelled_max, |n| n as usize)
+}
+
+/// Resolve the `NextToken` a paginated request carries to the resume point the
+/// listing it was presented to can name.
+///
+/// The CURSOR half of this service's one pagination rule, stated here so no list can
+/// word it differently: a request carrying no token starts at the beginning
+/// (`Ok(None)`), and a request carrying one is served only where that token both
+/// decodes ([`decode_next_token`]) and `resolve` answers a resume point THAT listing
+/// holds; anything else is a token this service did not issue, refused with
+/// [`invalid_next_token`] rather than seeked to a guessed-at place. `resolve` is the
+/// only part a list supplies — the collection it pages is what decides whether a
+/// decoded value names a place in it.
+pub fn resume_point<T>(
+    token: Option<&str>,
+    resolve: impl FnOnce(&str) -> Option<T>,
+) -> Result<Option<T>, ValidationException> {
+    match token {
+        None => Ok(None),
+        Some(token) => decode_next_token(token)
+            .and_then(|point| resolve(&point))
+            .map(Some)
+            .ok_or_else(invalid_next_token),
+    }
+}
+
+/// Take one page out of `items`, with the `NextToken` the page after it resumes at.
+///
+/// The PAGE-BOUND half of the same rule: `items` is the collection this request pages
+/// — already resumed ([`resume_point`]) and filtered — `project` renders one member as
+/// the list reports it, and `resume_key` names the member the next page starts at. At
+/// most `page_size` members are reported, and a token is minted ONLY when the
+/// collection holds one more, from that member's own key, so a list ending exactly on
+/// the page boundary hands back no token and no caller following a token is answered
+/// an empty page. Every token this service mints goes through [`encode_next_token`]
+/// here, so what a token carries is what [`resume_point`] resolves.
+pub fn paginate<Item, Reported>(
+    items: impl IntoIterator<Item = Item>,
+    page_size: usize,
+    resume_key: impl Fn(&Item) -> String,
+    mut project: impl FnMut(Item) -> Reported,
+) -> (Vec<Reported>, Option<String>) {
+    let mut page = Vec::new();
+    for item in items {
+        if page.len() == page_size {
+            return (page, Some(encode_next_token(&resume_key(&item))));
+        }
+        page.push(project(item));
+    }
+    (page, None)
 }
 
 /// The modelled `ValidationException` (HTTP 400) for ONE member of a request this

@@ -175,34 +175,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The `NextToken` this operation mints carries the catalogued instance type the
-        // next page resumes at, in this service's one token encoding
-        // ([`crate::state::decode_next_token`]). A token must decode to an instance type
-        // this catalog holds, so one this service did not issue is refused rather than
-        // guessed at.
-        let resume_from = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                let decoded = crate::state::decode_next_token(token)
-                    .and_then(|name| crate::state::instance_type_index(&name));
-                match decoded {
-                    Some(index) => index,
-                    None => {
-                        return Err(ListInstanceTypesErrorModeled::ValidationException(
-                            crate::state::invalid_next_token(),
-                        )
-                        .into());
-                    }
-                }
-            }
-        };
+        // next page resumes at, in this service's one token encoding, and the cursor
+        // rule around it is the crate's single one
+        // ([`crate::state::resume_point`]): a token must decode to an instance type
+        // this catalog holds — which is what `instance_type_index` answers — so one
+        // this service did not issue is refused rather than guessed at. No token means
+        // the first page, which for this catalog is its first row.
+        let resume_from = crate::state::resume_point(input.next_token.as_deref(), |name| {
+            crate::state::instance_type_index(name)
+        })
+        .map_err(ListInstanceTypesErrorModeled::ValidationException)?
+        .unwrap_or(0);
 
         // `MaxResults` is modelled `range 1..600`, already enforced at the boundary; a
         // caller that sends none gets that modelled maximum as the page size.
-        let page_size = input
-            .max_results
-            .map_or(crate::state::DEFAULT_INSTANCE_TYPES_MAX_RESULTS, |n| {
-                n as usize
-            });
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::DEFAULT_INSTANCE_TYPES_MAX_RESULTS,
+        );
 
         // Every member of `InstanceConfigurationFilter` is `@required`, so a filter that
         // reaches here names one complete configuration combination, and the instance
@@ -210,21 +200,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // filter narrows nothing.
         let filter = input.instance_configuration_filter.as_ref();
 
-        let mut instance_types = Vec::new();
-        let mut next_token = None;
-        for spec in &crate::state::instance_type_catalog()[resume_from..] {
-            if filter.is_some_and(|wanted| {
-                !spec.supports(&wanted.billing_mode, &wanted.platform_type, &wanted.tenancy)
-            }) {
-                continue;
-            }
-            if instance_types.len() == page_size {
-                // One past the page: its name is what the next page resumes at.
-                next_token = Some(crate::state::encode_next_token(&spec.instance_type));
-                break;
-            }
-            instance_types.push(spec.info());
-        }
+        // The page bound and the token minted one past it are the crate's single rule
+        // too ([`crate::state::paginate`]): what this operation supplies is the
+        // collection it pages — the catalog from the resume point on, narrowed by the
+        // filter — the key a token is minted from, and how a row is reported.
+        let (instance_types, next_token) = crate::state::paginate(
+            crate::state::instance_type_catalog()[resume_from..]
+                .iter()
+                .filter(|spec| {
+                    filter.is_none_or(|wanted| {
+                        spec.supports(&wanted.billing_mode, &wanted.platform_type, &wanted.tenancy)
+                    })
+                }),
+            page_size,
+            |spec| spec.instance_type.clone(),
+            |spec| spec.info(),
+        );
 
         Ok(ListInstanceTypesOutput {
             instance_types,
