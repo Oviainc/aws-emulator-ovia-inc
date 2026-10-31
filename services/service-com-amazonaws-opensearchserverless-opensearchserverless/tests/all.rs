@@ -27,6 +27,8 @@ mod client_error_status;
 mod client_token_scope;
 #[path = "all/collection_group_capacity.rs"]
 mod collection_group_capacity;
+#[path = "all/collection_group_collection_count.rs"]
+mod collection_group_collection_count;
 #[path = "all/collection_group_delete.rs"]
 mod collection_group_delete;
 #[path = "all/collection_group_lifecycle.rs"]

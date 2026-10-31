@@ -7,7 +7,9 @@
 //! and `storageConfiguration` rendered by the stored record itself, so a read reports the
 //! same limits the create did — and an unknown one as the modelled
 //! `NOT_FOUND` error detail. `ids` and `names` in the same request, or neither, are a
-//! `ValidationException`. This operation only READS: it writes nothing.
+//! `ValidationException`. This operation REPORTS: it stores nothing of its own, and writes
+//! only to apply the collection transitions the clock had already made due before the
+//! count is taken.
 //!
 //! ## Shape of an operation
 //!
@@ -170,7 +172,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // `numberOfCollections` is counted over the stored collections, so the transitions
+        // the clock has already made due — the status a collection settles into, and the
+        // PURGE of one whose deletion was accepted — are applied before the count is taken.
+        // Otherwise this read would report a collection the service has already moved on
+        // from, and disagree with every other read of the same state.
+        store.settle_due_transitions();
 
         let mut details: Vec<CollectionGroupDetail> = Vec::new();
         let mut errors: Vec<CollectionGroupErrorDetail> = Vec::new();
