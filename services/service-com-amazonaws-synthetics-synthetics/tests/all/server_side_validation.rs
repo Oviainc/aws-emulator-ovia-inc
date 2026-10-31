@@ -15,11 +15,12 @@
 //!    modelled maximum are served, and only a value past the service's own ceiling of 1000
 //!    is refused — naming the member `maxResults` and that ceiling.
 //!
-//! 3. **An unanchored `@pattern`.** A pattern-constrained member is reported against the
-//!    EXPRESSION a value has to satisfy, without the `^` / `$` pair the model writes to
-//!    make the match total. The rule belongs to the service's refusal wording, not to one
-//!    operation, so the rows below span body, URI-label and query-string members of
-//!    several operations — implemented and still scaffolded.
+//! 3. **A `@pattern` as the model declares it.** A pattern-constrained member is reported
+//!    against the EXPRESSION the model declares, character for character — the `^` / `$`
+//!    pair a model writes to make the match total included, because those characters are
+//!    part of the expression the service evaluated. The rule belongs to the service's
+//!    refusal wording, not to one operation, so the rows below span body, URI-label and
+//!    query-string members of several operations — implemented and still scaffolded.
 //!
 //! Every modelled constraint quoted here is read with
 //! `smithy_query(query="operation",operation="…",model_path="services/service-com-amazonaws-synthetics-synthetics/smithy-model/com-amazonaws-synthetics-synthetics.json")`.
@@ -238,7 +239,7 @@ async fn describe_canaries_honours_page_sizes_up_to_the_service_ceiling() {
     }
 }
 
-/// One refused request and the modelled `@pattern` its member carries, anchors included.
+/// One refused request and the shape whose modelled `@pattern` its member carries.
 struct PatternCase {
     case: &'static str,
     method: &'static str,
@@ -246,16 +247,32 @@ struct PatternCase {
     body: Option<Value>,
     member_path: &'static str,
     value: &'static str,
-    /// The expression as the MODEL declares it, with the `^` / `$` that make the match
-    /// total.
-    declared: &'static str,
+    /// The shape the member targets. Its `@pattern` is READ FROM the shipped model rather
+    /// than written out here, so a row cannot pass against a re-spelled expression.
+    shape: &'static str,
 }
 
-/// A `@pattern` requirement is reported as the expression itself, without the anchors the
-/// model spells it with — for every pattern-constrained member, whatever the operation and
-/// whatever the member's binding.
+/// The `@pattern` the model declares for `shape`, read from the model this crate ships —
+/// the one source for the expression the service must quote back.
+fn declared_pattern(shape: &str) -> String {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-synthetics-synthetics.json"
+    );
+    let text = std::fs::read_to_string(path).expect("this crate ships its Smithy model");
+    let model: Value = serde_json::from_str(&text).expect("the Smithy model is JSON");
+    let id = format!("com.amazonaws.synthetics#{shape}");
+    model["shapes"][&id]["traits"]["smithy.api#pattern"]
+        .as_str()
+        .unwrap_or_else(|| panic!("shape {shape} declares no @pattern in the shipped model"))
+        .to_string()
+}
+
+/// A `@pattern` requirement is reported as the expression the model declares, anchors
+/// included — for every pattern-constrained member, whatever the operation and whatever
+/// the member's binding.
 #[tokio::test]
-async fn a_reported_pattern_carries_no_anchors() {
+async fn a_reported_pattern_is_the_declared_expression() {
     let aws = Synthetics::new("us-east-1");
 
     let cases = vec![
@@ -269,7 +286,7 @@ async fn a_reported_pattern_carries_no_anchors() {
             body: Some(json!({ "Tags": { "team": "synthetics" } })),
             member_path: "resourceArn",
             value: "not-an-arn",
-            declared: r"^arn:(aws[a-zA-Z-]*)?:synthetics:[a-z]{2,4}(-[a-z]{2,4})?-[a-z]+-\d{1}:\d{12}:(canary|group):[0-9a-z_\-]+$",
+            shape: "ResourceArn",
         },
         // A BODY member of an implemented operation.
         PatternCase {
@@ -279,7 +296,7 @@ async fn a_reported_pattern_carries_no_anchors() {
             body: Some(create_with("placeholder", "Name", json!("Bad Name!"))),
             member_path: "name",
             value: "Bad Name!",
-            declared: r"^[0-9a-z_\-]+$",
+            shape: "CanaryName",
         },
         // A second body member, with a different expression.
         PatternCase {
@@ -293,7 +310,7 @@ async fn a_reported_pattern_carries_no_anchors() {
             )),
             member_path: "executionRoleArn",
             value: "role/CanaryRole",
-            declared: r"^arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$",
+            shape: "RoleArn",
         },
         // A third, whose expression carries escapes and a character class.
         PatternCase {
@@ -307,7 +324,17 @@ async fn a_reported_pattern_carries_no_anchors() {
             )),
             member_path: "kmsKeyArn",
             value: "arn:aws:kms:us-east-1:123456789012:alias/synthetics",
-            declared: r"^arn:(aws[a-zA-Z-]*)?:kms:[a-z]{2,4}(-[a-z]{2,4})?-[a-z]+-\d{1}:\d{12}:key/[\w\-\/]+$",
+            shape: "KmsKeyArn",
+        },
+        // A body member of ANOTHER operation, targeting the canary-only ARN shape.
+        PatternCase {
+            case: "associate-resource-arn",
+            method: "PATCH",
+            path: "/group/live-group/associate".to_string(),
+            body: Some(json!({ "ResourceArn": "not-an-arn" })),
+            member_path: "resourceArn",
+            value: "not-an-arn",
+            shape: "CanaryArn",
         },
         // A URI-LABEL member on a read operation.
         PatternCase {
@@ -317,7 +344,7 @@ async fn a_reported_pattern_carries_no_anchors() {
             body: None,
             member_path: "name",
             value: "BADNAME",
-            declared: r"^[0-9a-z_\-]+$",
+            shape: "CanaryName",
         },
         // A QUERY-STRING member.
         PatternCase {
@@ -327,7 +354,7 @@ async fn a_reported_pattern_carries_no_anchors() {
             body: None,
             member_path: "dryRunId",
             value: "not-a-uuid",
-            declared: r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+            shape: "UUID",
         },
     ];
 
@@ -338,16 +365,17 @@ async fn a_reported_pattern_carries_no_anchors() {
         body,
         member_path,
         value,
-        declared,
+        shape,
     } in cases
     {
-        // The row proves something only if the model's own expression IS anchored.
+        let declared = declared_pattern(shape);
+        // The row proves something only if the model's own expression IS anchored: that is
+        // what the emulator used to strip.
         assert!(
             declared.starts_with('^') && declared.ends_with('$'),
             "case {case}: the modelled pattern {declared:?} is not anchored, so this row \
              asserts nothing"
         );
-        let expression = &declared[1..declared.len() - 1];
 
         let answer = aws.call(method, &path, body).await;
         assert_eq!(
@@ -364,18 +392,13 @@ async fn a_reported_pattern_carries_no_anchors() {
         let expected = one_violation(
             value,
             member_path,
-            &format!("Member must satisfy regular expression pattern: {expression}"),
+            &format!("Member must satisfy regular expression pattern: {declared}"),
         );
         assert_eq!(
             answer.at("Message").as_str(),
             Some(expected.as_str()),
             "case {case}: expected Message {expected:?}, got {:?}",
             answer.body
-        );
-        let message = answer.at("Message").as_str().unwrap_or_default();
-        assert!(
-            !message.contains('^') && !message.contains('$'),
-            "case {case}: the reported pattern must carry no anchors, got {message:?}"
         );
     }
 }

@@ -67,7 +67,7 @@ use super::types::*;
 use std::time::SystemTime;
 
 use crate::state::{
-    group_not_found, CANARY_NOT_FOUND, MAX_CANARIES_PER_GROUP, MAX_GROUPS_PER_CANARY,
+    canary_not_found, group_not_found, MAX_CANARIES_PER_GROUP, MAX_GROUPS_PER_CANARY,
     STORE_UNAVAILABLE,
 };
 
@@ -162,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .group_key(&input.group_identifier)
             .ok_or_else(|| not_found(group_not_found(&input.group_identifier)))?;
         if guard.canary_by_arn(&input.resource_arn).is_none() {
-            return Err(not_found(CANARY_NOT_FOUND.to_string()));
+            return Err(not_found(canary_not_found(&input.resource_arn)));
         }
 
         // Membership is a set: a canary already in the group is already associated, so
@@ -207,9 +207,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The modelled 404 for a resource this store does not hold. The message is the sentence
-/// the service answers that lookup with: `state::group_not_found` for a group, which names
-/// the identifier as supplied, and the fixed `state::CANARY_NOT_FOUND` for a canary, which
-/// is request-independent.
+/// the service answers that lookup with, and both sides of the association are worded the
+/// same way: `state::group_not_found` for a group and `state::canary_not_found` for a
+/// canary, each naming the identifier the request supplied.
 fn not_found(message: String) -> AssociateResourceError {
     AssociateResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(message),

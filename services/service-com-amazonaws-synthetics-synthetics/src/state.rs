@@ -190,15 +190,35 @@ pub const CREATE_IN_PROGRESS_REASON_CODE: &str = "CREATE_IN_PROGRESS";
 /// constant so the handlers that can hit it word it identically.
 pub const STORE_UNAVAILABLE: &str = "the synthetics canary store is unavailable";
 
-/// `ResourceNotFoundException$Message` for a canary that does not exist.
+/// `ResourceNotFoundException$Message` for a canary an operation whose wording is CHOSEN
+/// rather than recorded cannot resolve.
 ///
 /// The model says of the error only "One of the specified resources was not found." and
-/// documents no text, but the recorded service answers every canary lookup that misses —
-/// whichever operation asked — with one fixed sentence that never names the requested
-/// canary. The message is therefore request-independent: it is a constant here, not
-/// built from the lookup key, so the identifier the real service withholds is not handed
-/// back to the caller.
+/// documents no text, so where nothing records the sentence this service answers one fixed,
+/// identifier-free one: the operations that take a canary `Name` (`GetCanary`,
+/// `DeleteCanary`, `StartCanary`, `StopCanary`, `GetCanaryRuns`, `StartCanaryDryRun`) and
+/// `ListAssociatedGroups`. For those the message is request-independent: a constant here,
+/// not built from the lookup key, so no identifier is handed back to the caller.
+///
+/// The operation whose wording IS recorded echoes the identifier instead — see
+/// [`canary_not_found`] — which is why this is a per-operation choice rather than one
+/// service-wide constant, exactly as it is for groups ([`GROUP_NOT_FOUND`] beside
+/// [`group_not_found`]).
 pub const CANARY_NOT_FOUND: &str = "Canary not found.";
+
+/// `ResourceNotFoundException$Message` for a canary an operation whose wording is KNOWN
+/// cannot resolve: it echoes the identifier the request supplied.
+///
+/// The recorded service answers an `AssociateResource` whose `ResourceArn` resolves to no
+/// canary with `Canary does not exist: <the ARN as supplied>`, the same construction it
+/// uses on that same call for a group identifier it cannot resolve ([`group_not_found`]).
+/// What is a REQUIREMENT is that construction and not a remembered string: the sentence
+/// plus the request's own value, whichever ARN the caller sent, which is why every
+/// assertion over it is a table of ARNs rather than one recorded value
+/// (`tests/all/client_error_message_wording.rs`).
+pub fn canary_not_found(identifier: &str) -> String {
+    format!("Canary does not exist: {identifier}")
+}
 
 /// `ResourceNotFoundException$Message` for a dry run that does not exist, by the same
 /// rule as [`CANARY_NOT_FOUND`]: a missing-resource message names the resource KIND that

@@ -42,7 +42,20 @@ use crate::canary_lifecycle::{create_body, Answer, Synthetics};
 /// One construction for the whole target, defined beside the group lifecycle suite.
 use crate::group_lifecycle::group_not_found_message as recorded_group_not_found;
 
-/// The fixed sentence a canary lookup that misses answers with.
+/// How `AssociateResource` words a canary lookup that misses
+/// (`state::canary_not_found`): the recorded service builds the message FROM THE REQUEST,
+/// naming the `ResourceArn` it could not resolve, the same construction it uses for an
+/// unresolvable `GroupIdentifier` on that same call.
+///
+/// `pub(crate)` because the suite that asserts this wording as a rule
+/// (`client_error_message_wording`) asserts this one construction.
+pub(crate) fn canary_not_found_message(resource_arn: &str) -> String {
+    format!("Canary does not exist: {resource_arn}")
+}
+
+/// The fixed sentence a canary lookup whose wording is NOT recorded answers with: the
+/// operations addressed by canary `Name` (`tests/all/missing_resource_errors.rs`) and
+/// `ListAssociatedGroups` (`tests/all/associated_groups.rs`).
 pub(crate) const CANARY_NOT_FOUND: &str = "Canary not found.";
 
 /// "Each group can contain as many as 10 canaries." — `CreateGroup`'s documentation.
@@ -400,8 +413,10 @@ async fn associate_resource_reports_a_missing_group_or_canary_as_not_found() {
         let message = error_of(&case, &answer, 404, "ResourceNotFoundException")
             .unwrap_or_else(|| panic!("case {case}: expected a Message, got {:?}", answer.body));
         assert_eq!(
-            message, CANARY_NOT_FOUND,
-            "case {case}: expected the fixed missing-canary sentence, got {message:?}"
+            message,
+            canary_not_found_message(resource_arn),
+            "case {case}: expected the missing-canary sentence naming the ARN as supplied, \
+             got {message:?}"
         );
     }
 

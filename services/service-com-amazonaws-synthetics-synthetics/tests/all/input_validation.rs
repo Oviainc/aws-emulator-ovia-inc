@@ -28,19 +28,19 @@ use serde_json::{json, Value};
 
 use super::canary_lifecycle::{create_body, Synthetics};
 
-/// `CanaryName`'s `@pattern` (`CreateCanary$Name`, `GetCanary$Name`), as the service
-/// STATES it: the expression a value has to satisfy, without the `^` / `$` the model
-/// spells it with. See `tests/all/server_side_validation.rs` for that rule itself.
-const CANARY_NAME_PATTERN: &str = r"[0-9a-z_\-]+";
+/// `CanaryName`'s `@pattern` (`CreateCanary$Name`, `GetCanary$Name`), as the model
+/// DECLARES it: the expression a value has to satisfy, anchors included, which is what the
+/// service quotes. See `tests/all/server_side_validation.rs` for that rule itself.
+const CANARY_NAME_PATTERN: &str = r"^[0-9a-z_\-]+$";
 
-/// `RoleArn`'s `@pattern` (`CreateCanary$ExecutionRoleArn`), likewise unanchored.
-const ROLE_ARN_PATTERN: &str = r"arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+";
+/// `RoleArn`'s `@pattern` (`CreateCanary$ExecutionRoleArn`), likewise as declared.
+const ROLE_ARN_PATTERN: &str = r"^arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$";
 
-/// `UUID`'s `@pattern` (`GetCanary$DryRunId`), likewise unanchored.
-const UUID_PATTERN: &str = r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
+/// `UUID`'s `@pattern` (`GetCanary$DryRunId`), likewise as declared.
+const UUID_PATTERN: &str = r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$";
 
-/// `ResourceArn`'s `@pattern` (`TagResource$ResourceArn`), likewise unanchored.
-const RESOURCE_ARN_PATTERN: &str = r"arn:(aws[a-zA-Z-]*)?:synthetics:[a-z]{2,4}(-[a-z]{2,4})?-[a-z]+-\d{1}:\d{12}:(canary|group):[0-9a-z_\-]+";
+/// `ResourceArn`'s `@pattern` (`TagResource$ResourceArn`), likewise as declared.
+const RESOURCE_ARN_PATTERN: &str = r"^arn:(aws[a-zA-Z-]*)?:synthetics:[a-z]{2,4}(-[a-z]{2,4})?-[a-z]+-\d{1}:\d{12}:(canary|group):[0-9a-z_\-]+$";
 
 /// How Synthetics words a malformed artifact location (`src/state.rs`).
 const ARTIFACT_LOCATION_MALFORMED: &str = "ArtifactS3Location: The location is malformed.";

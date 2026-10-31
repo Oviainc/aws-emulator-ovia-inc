@@ -187,11 +187,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if guard.groups.contains_key(&stored.name) {
             // "The names for all groups in your account, across all Regions, must be
             // unique" (`CreateGroupRequest$Name`): a second create of a live name
-            // conflicts with the group that already holds it.
+            // conflicts with the group that already holds it. The name is reported
+            // SINGLE-QUOTED, which is what delimits it: a group name "can include any
+            // Unicode characters", spaces among them, so an unquoted name could not be
+            // read back out of the sentence.
             drop(guard);
             audit(ctx, &region, "rejected_name_conflict");
             return Err(CreateGroupErrorModeled::ConflictException(ConflictException {
-                message: Some(format!("Group with name {} already exists", stored.name)),
+                message: Some(format!(
+                    "Group with the name '{}' already exists",
+                    stored.name
+                )),
             })
             .into());
         }

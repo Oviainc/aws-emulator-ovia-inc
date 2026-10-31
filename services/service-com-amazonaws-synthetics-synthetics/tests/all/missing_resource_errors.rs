@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The missing-resource rule for this service: when an operation resolves a resource by
-//! an identifier the store does not hold, the `ResourceNotFoundException` it answers with
-//! carries ONE fixed sentence — the same one whichever operation asked and whatever the
-//! request asked for — and that sentence never contains the identifier from the request.
+//! The missing-canary rule for the operations whose wording is CHOSEN rather than
+//! recorded: when one of them resolves a canary the store does not hold, the
+//! `ResourceNotFoundException` it answers with carries ONE fixed sentence — the same one
+//! whichever of them asked and whatever the request asked for — and that sentence never
+//! contains the identifier from the request.
+//!
+//! (`AssociateResource`, whose wording IS recorded, builds its refusal from the request's
+//! own `ResourceArn` instead; that construction is asserted in
+//! `tests/all/group_membership.rs` and `tests/all/client_error_message_wording.rs`.)
 //!
 //! The model pins only the shape of the error (`ResourceNotFoundException = structure
 //! {Message: ErrorMessage}`, `errorKind client`, `httpError 404`, documented as "One of
@@ -20,8 +25,8 @@ use serde_json::json;
 
 use crate::canary_lifecycle::{create_body, Answer, Synthetics};
 
-/// The fixed sentence a canary lookup that misses answers with — constant, so it is
-/// written here once and compared against every case.
+/// The fixed sentence a canary lookup BY NAME that misses answers with — constant, so it
+/// is written here once and compared against every case.
 const CANARY_NOT_FOUND: &str = "Canary not found.";
 
 /// A canary name that exists in the store for the near-miss rows below.
