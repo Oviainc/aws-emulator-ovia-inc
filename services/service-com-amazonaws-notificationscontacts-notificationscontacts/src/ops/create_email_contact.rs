@@ -151,20 +151,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `name`'s 1..64 length, `emailAddress` (6..254, `^(.+)@(.+)$`) and the `tags`
-        // map's 0..200 length and value length are modelled in a form the centralized
-        // walk applies, so a value outside them is already a 400 `ValidationException`
-        // before this body runs. Two modelled patterns in this input are NOT: the tag
-        // KEY pattern, which the walk captures no map-key constraints for and could not
-        // compile anyway, and `name`'s own `EmailContactName` pattern, whose character
-        // class the walk's regex engine cannot compile either — and a pattern it cannot
-        // compile is treated there as matching every value. So this handler applies both
-        // (see `crate::state::check_email_contact_name` and
+        // `name`'s 1..64 length, `emailAddress`'s 6..254 length and the `tags` map's
+        // 0..200 length and value length are modelled in a form the centralized walk
+        // applies, so a value outside them is already a 400 `ValidationException` before
+        // this body runs. Every modelled `@pattern` in this input is applied HERE
+        // instead, because the walk's engine does not reproduce the modelled expression
+        // for any of them: it captures no map-key constraints for the tag KEY pattern
+        // (and could not compile its look-ahead anyway), it cannot compile `name`'s
+        // `EmailContactName` character class at all — a pattern it cannot compile is
+        // treated there as matching every value — and it reads the `.` of
+        // `emailAddress`'s `^(.+)@(.+)$` as excluding a line feed alone, where the
+        // modelled ECMA-262 expression's `.` excludes every line terminator. So this
+        // handler applies all three (see `crate::state::check_email_contact_name`,
+        // `crate::state::check_email_contact_address` and
         // `crate::state::satisfies_tag_key_pattern`) before it touches the store,
-        // because a create the shape refuses persists nothing. `name` is judged first,
-        // the order the walk visits the input's members in.
+        // because a create the shape refuses persists nothing. They are judged in the
+        // order the walk visits the input's members in.
         let _ = ctx;
         crate::state::check_email_contact_name("name", &input.name)
+            .map_err(CreateEmailContactErrorModeled::ValidationException)?;
+        crate::state::check_email_contact_address("emailAddress", &input.email_address)
             .map_err(CreateEmailContactErrorModeled::ValidationException)?;
         if let Some(tags) = input.tags.as_ref() {
             crate::state::check_tag_map_keys("tags", tags.keys().map(String::as_str))

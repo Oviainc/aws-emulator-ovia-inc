@@ -115,13 +115,20 @@ pub const MIN_TAG_KEY_LEN: usize = 1;
 /// The most characters [`TAG_KEY_PATTERN`]'s `.{1,128}` admits, from the same pattern.
 pub const MAX_TAG_KEY_LEN: usize = 128;
 
-/// The characters [`TAG_KEY_PATTERN`]'s `.` does NOT match.
+/// The characters a modelled `@pattern`'s `.` does NOT match.
 ///
 /// A Smithy `@pattern` is an ECMA-262 regular expression, and there `.` matches every
 /// character except a LINE TERMINATOR: line feed, carriage return, line separator and
-/// paragraph separator. A key carrying any of them therefore cannot be `.{1,128}`,
-/// however many characters it has.
-pub const TAG_KEY_EXCLUDED_CHARS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
+/// paragraph separator. A value carrying any of them therefore cannot be matched by a
+/// `.` of such an expression, however many characters it has — so a key carrying one is
+/// not `.{1,128}` ([`TAG_KEY_PATTERN`]) and an address carrying one is not `(.+)@(.+)`
+/// ([`EMAIL_CONTACT_ADDRESS_PATTERN`]).
+///
+/// Stated once for every pattern this service applies by hand, because the engine the
+/// framework's centralized constraint walk compiles a `@pattern` with — the `regex`
+/// crate — reads `.` as every character except a line FEED alone, so the other three are
+/// admitted there whatever the modelled expression says.
+pub const PATTERN_DOT_EXCLUDED_CHARS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
 
 /// Whether `key` satisfies the modelled `TagKey` `@pattern` ([`TAG_KEY_PATTERN`]).
 ///
@@ -142,7 +149,7 @@ pub const TAG_KEY_EXCLUDED_CHARS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}
 /// [`RESERVED_TAG_KEY_PREFIX`]" — a prefix test, case-SENSITIVE because the pattern is
 /// (`AWS:` is admitted by it). What remains is `.{1,128}` anchored at both ends: 1 to
 /// 128 characters, counted as the Unicode scalar values `.` matches, none of them one of
-/// the [`TAG_KEY_EXCLUDED_CHARS`] it does not.
+/// the [`PATTERN_DOT_EXCLUDED_CHARS`] it does not.
 ///
 /// WHICH of those parts a key broke is deliberately not reported: the model declares ONE
 /// expression for this member, so a key outside it is refused with that expression —
@@ -150,7 +157,7 @@ pub const TAG_KEY_EXCLUDED_CHARS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}
 pub fn satisfies_tag_key_pattern(key: &str) -> bool {
     !key.starts_with(RESERVED_TAG_KEY_PREFIX)
         && (MIN_TAG_KEY_LEN..=MAX_TAG_KEY_LEN).contains(&key.chars().count())
-        && !key.chars().any(|c| TAG_KEY_EXCLUDED_CHARS.contains(&c))
+        && !carries_excluded_char(key)
 }
 
 /// `Ok` when every KEY of a `TagMap` member in `keys` satisfies [`TAG_KEY_PATTERN`],
@@ -276,6 +283,72 @@ pub fn check_email_contact_name(member: &str, name: &str) -> Result<(), Validati
         EMAIL_CONTACT_NAME_PATTERN,
         (!satisfies_email_contact_name_pattern(name)).then(|| (member.to_string(), name)),
     )
+}
+
+/// The modelled `EmailContactAddress` pattern, verbatim
+/// (`smithy_query(query="shape",shape="EmailContactAddress")`).
+///
+/// Stated here because this one, too, has to be applied by hand: see
+/// [`satisfies_email_contact_address_pattern`].
+pub const EMAIL_CONTACT_ADDRESS_PATTERN: &str = r"^(.+)@(.+)$";
+
+/// The character [`EMAIL_CONTACT_ADDRESS_PATTERN`] requires between its two `.+` runs.
+pub const EMAIL_CONTACT_ADDRESS_SEPARATOR: char = '@';
+
+/// Whether `address` satisfies the modelled `EmailContactAddress` `@pattern`
+/// ([`EMAIL_CONTACT_ADDRESS_PATTERN`]).
+///
+/// The framework's centralized constraint walk compiles this expression and applies it,
+/// but it compiles it with the `regex` crate, whose `.` excludes a line FEED alone —
+/// where the modelled ECMA-262 expression's `.` excludes every one of the
+/// [`PATTERN_DOT_EXCLUDED_CHARS`]. So a value carrying a carriage return, a line
+/// separator or a paragraph separator satisfies the compiled expression while the
+/// modelled one excludes it, and the member that reports the stored value back
+/// (`EmailContact$address`) declares that same modelled expression. The expression is
+/// therefore applied here as the parts it is, by the one operation that accepts an
+/// address (`CreateEmailContact`): no character of the value is one `.` does not match,
+/// and `(.+)@(.+)` anchored at both ends wants a [`EMAIL_CONTACT_ADDRESS_SEPARATOR`]
+/// with at least one such character on each side of it.
+///
+/// WHICH part a value broke is deliberately not reported, for the reason
+/// [`satisfies_tag_key_pattern`] gives: the model declares ONE expression for this
+/// member, so a value outside it is refused with that expression.
+pub fn satisfies_email_contact_address_pattern(address: &str) -> bool {
+    if carries_excluded_char(address) {
+        return false;
+    }
+    let characters = address.chars().count();
+    address
+        .chars()
+        .enumerate()
+        .any(|(position, character)| {
+            character == EMAIL_CONTACT_ADDRESS_SEPARATOR
+                && position > 0
+                && position + 1 < characters
+        })
+}
+
+/// `Ok` when `address` satisfies the modelled `EmailContactAddress` `@pattern`, else the
+/// modelled 400 for the input member it arrived through.
+///
+/// `member` is the member the caller named, so the refusal blames what the request wrote
+/// rather than the shape behind it.
+pub fn check_email_contact_address(
+    member: &str,
+    address: &str,
+) -> Result<(), ValidationException> {
+    refuse_outside_pattern(
+        EMAIL_CONTACT_ADDRESS_PATTERN,
+        (!satisfies_email_contact_address_pattern(address)).then(|| (member.to_string(), address)),
+    )
+}
+
+/// Whether `value` carries a character a modelled `@pattern`'s `.` does not match (one of
+/// the [`PATTERN_DOT_EXCLUDED_CHARS`]) — the one test every pattern applied here shares.
+fn carries_excluded_char(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| PATTERN_DOT_EXCLUDED_CHARS.contains(&character))
 }
 
 /// The most email contacts one account may hold: the service's PUBLISHED per-account

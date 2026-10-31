@@ -17,6 +17,8 @@ mod activation_code_bounds;
 mod activation_refusal_turns_on_the_token;
 #[path = "all/activation_token_resource.rs"]
 mod activation_token_resource;
+#[path = "all/email_contact_address_pattern.rs"]
+mod email_contact_address_pattern;
 #[path = "all/email_contact_name_pattern.rs"]
 mod email_contact_name_pattern;
 #[path = "all/email_contact_quota_refusal.rs"]
