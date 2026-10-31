@@ -15,13 +15,14 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::time::{Duration, SystemTime};
 
+use ::aws_smithy_types::date_time::Format as DateTimeFormat;
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    ApplicationLayerAutomaticResponseConfiguration, EmergencyContact, Limit, Protection,
-    ProtectionGroup, ProtectionGroupArbitraryPatternLimits, ProtectionGroupLimits,
-    ProtectionGroupPatternTypeLimits, ProtectionLimits, Subscription, SubscriptionLimits, Tag,
-    PROTECTED_RESOURCE_TYPE_VALUES,
+    ApplicationLayerAutomaticResponseConfiguration, AttackStatisticsDataItem, AttackVolume,
+    AttackVolumeStatistics, EmergencyContact, Limit, Protection, ProtectionGroup,
+    ProtectionGroupArbitraryPatternLimits, ProtectionGroupLimits, ProtectionGroupPatternTypeLimits,
+    ProtectionLimits, Subscription, SubscriptionLimits, Tag, PROTECTED_RESOURCE_TYPE_VALUES,
 };
 
 /// The `SubscriptionState` an account with a live Shield Advanced subscription is in.
@@ -453,6 +454,86 @@ impl ProtectionGroupEntry {
     }
 }
 
+/// One DDoS attack Shield detected against a resource of the account, as this emulator
+/// persists it.
+///
+/// Shield detects attacks rather than being asked to create them, so no modelled
+/// operation writes a record here; the attack log is the single place every attack
+/// reader of this service (`DescribeAttackStatistics`, and `ListAttacks` /
+/// `DescribeAttack` once they are implemented) derives its answer from, so an account
+/// with no detected attacks and one with several are the same code path.
+#[derive(Debug, Clone)]
+pub struct AttackRecord {
+    /// The `AttackId` that identifies this attack.
+    pub attack_id: String,
+    /// The ARN of the account resource the attack was directed at.
+    pub resource_arn: String,
+    /// When Shield started detecting the attack: the instant that places the attack in
+    /// a reporting window.
+    pub start_time: SystemTime,
+    /// When the attack ended, or `None` while it is still ongoing.
+    pub end_time: Option<SystemTime>,
+    /// The peak bits per second observed, set for a network-level attack —
+    /// `AttackVolume$BitsPerSecond`: "A statistics object that uses bits per second as
+    /// the unit. This is included for network level attacks."
+    pub max_bits_per_second: Option<f64>,
+    /// The peak packets per second observed, set for a network-level attack, like
+    /// [`AttackRecord::max_bits_per_second`].
+    pub max_packets_per_second: Option<f64>,
+    /// The peak requests per second observed, set for an application-level attack —
+    /// `AttackVolume$RequestsPerSecond` is "included for application level attacks".
+    pub max_requests_per_second: Option<f64>,
+}
+
+/// How many calendar years back the attack statistics window reaches, as
+/// `DescribeAttackStatistics` documents its own range: "the time range of midnight UTC,
+/// one year ago, to midnight UTC, today".
+const ATTACK_STATISTICS_WINDOW_YEARS: i32 = 1;
+
+/// The last day of February in a year that is not a leap year — where a 29 February
+/// lands when it is carried back to a year that has no 29 February.
+const LAST_SHORT_FEBRUARY_DAY: &str = "02-28";
+
+/// The UTC calendar year, and the `MM-DD` within it, that an instant falls in.
+///
+/// The civil-date conversion is the modelled timestamp type's own
+/// (`::aws_smithy_types::DateTime`, which every response of this service already renders
+/// through), so this service keeps no calendar of its own.
+fn utc_year_and_month_day(instant: SystemTime) -> Option<(i32, String)> {
+    let rendered = DateTime::from(instant).fmt(DateTimeFormat::DateTime).ok()?;
+    let date = rendered.split('T').next()?;
+    let (year, month_day) = date.split_once('-')?;
+    Some((year.parse().ok()?, month_day.to_string()))
+}
+
+/// Midnight UTC of a calendar date, or `None` when the year has no such date (only a
+/// 29 February can fail here). The date is resolved by the modelled timestamp type, so
+/// an impossible date is rejected rather than wrapped into the next month.
+fn midnight_utc(year: i32, month_day: &str) -> Option<SystemTime> {
+    let rendered = format!("{year:04}-{month_day}T00:00:00Z");
+    let parsed = DateTime::from_str(&rendered, DateTimeFormat::DateTime).ok()?;
+    SystemTime::try_from(parsed).ok()
+}
+
+/// The window `DescribeAttackStatistics` reports over at `now`, as `[from, to)` —
+/// midnight UTC one year before the current UTC day, up to (and excluding) midnight UTC
+/// of the current UTC day.
+///
+/// The span is a calendar year rather than a fixed count of days, so the lower bound is
+/// midnight of the same month and day one year earlier; a 29 February has no counterpart
+/// in the preceding year and so falls back to that year's last day of February.
+pub fn attack_statistics_window(now: SystemTime) -> (SystemTime, SystemTime) {
+    let Some((year, month_day)) = utc_year_and_month_day(now) else {
+        return (now, now);
+    };
+    let to_exclusive = midnight_utc(year, &month_day).unwrap_or(now);
+    let earlier_year = year - ATTACK_STATISTICS_WINDOW_YEARS;
+    let from_inclusive = midnight_utc(earlier_year, &month_day)
+        .or_else(|| midnight_utc(earlier_year, LAST_SHORT_FEBRUARY_DAY))
+        .unwrap_or(to_exclusive);
+    (from_inclusive, to_exclusive)
+}
+
 /// Which of this service's taggable resources an ARN names.
 #[derive(Debug, Clone)]
 enum TaggableResource {
@@ -483,12 +564,61 @@ pub struct ComAmazonawsShieldAwsshield20160616State {
     /// account authorized them (`AssociateDRTLogBucket`, withdrawn again by
     /// `DisassociateDRTLogBucket`): empty while the account has authorized none.
     pub drt_log_buckets: Vec<String>,
+    /// Every DDoS attack Shield has detected against a resource of the account: the log
+    /// `DescribeAttackStatistics` aggregates. Empty for an account no attack has hit.
+    pub attacks: Vec<AttackRecord>,
     /// The creation order counter behind [`ProtectionEntry::sequence`] and
     /// [`ProtectionGroupEntry::sequence`].
     next_sequence: u64,
 }
 
 impl ComAmazonawsShieldAwsshield20160616State {
+    /// The attack statistics for the window `[from_inclusive, to_exclusive)`, as
+    /// `DescribeAttackStatistics` answers with them.
+    ///
+    /// One data record summarises the whole window (`AttackStatisticsDataItem`: "A
+    /// single attack statistics data record ... returned by `DescribeAttackStatistics`
+    /// along with a time range indicating the time period that the attack statistics
+    /// apply to"): `AttackCount` is how many stored attacks started inside the window,
+    /// and the volume statistics are the maxima the counted attacks reported, per unit.
+    /// A unit no counted attack reported is left unset, and the whole `AttackVolume` is
+    /// unset when no unit has a value — `AttackVolume`: "If the accompanying
+    /// `AttackCount` in the statistics object is zero, this setting might be empty."
+    pub fn attack_statistics_in(
+        &self,
+        from_inclusive: SystemTime,
+        to_exclusive: SystemTime,
+    ) -> Vec<AttackStatisticsDataItem> {
+        let counted: Vec<&AttackRecord> = self
+            .attacks
+            .iter()
+            .filter(|attack| {
+                attack.start_time >= from_inclusive && attack.start_time < to_exclusive
+            })
+            .collect();
+
+        let peak = |unit: fn(&AttackRecord) -> Option<f64>| -> Option<AttackVolumeStatistics> {
+            counted
+                .iter()
+                .filter_map(|attack| unit(attack))
+                .max_by(f64::total_cmp)
+                .map(|max| AttackVolumeStatistics { max })
+        };
+        let volume = AttackVolume {
+            bits_per_second: peak(|attack| attack.max_bits_per_second),
+            packets_per_second: peak(|attack| attack.max_packets_per_second),
+            requests_per_second: peak(|attack| attack.max_requests_per_second),
+        };
+        let reported_any_unit = volume.bits_per_second.is_some()
+            || volume.packets_per_second.is_some()
+            || volume.requests_per_second.is_some();
+
+        vec![AttackStatisticsDataItem {
+            attack_count: counted.len() as i64,
+            attack_volume: reported_any_unit.then_some(volume),
+        }]
+    }
+
     /// The `SubscriptionState` the account is in at `now`.
     pub fn subscription_state_at(&self, now: SystemTime) -> &'static str {
         match self.subscription.as_ref() {
