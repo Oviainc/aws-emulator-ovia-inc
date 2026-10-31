@@ -45,6 +45,8 @@ mod outpost_departure;
 mod region_scoping;
 #[path = "all/shared_endpoint_listing.rs"]
 mod shared_endpoint_listing;
+#[path = "all/shared_test_harness.rs"]
+mod shared_test_harness;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/subnet_vpc_region_scope.rs"]

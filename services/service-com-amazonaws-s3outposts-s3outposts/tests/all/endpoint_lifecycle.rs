@@ -10,9 +10,10 @@
 //! those records.
 //!
 //! It is also the crate's single home for the test harness every other suite drives the
-//! service through: the emulator fixtures, the request helpers, the [`Answer`] reader and
-//! the [`Listing`] harness every listing suite pages a listing with — so one listing rule
-//! is written down once and no suite carries a second copy of it.
+//! service through: the emulator fixtures, the request helpers, the [`Answer`] reader, the
+//! one [`assert_not_found`] the service's modelled 404 is judged by and the [`Listing`]
+//! harness every listing suite pages a listing with — so one listing rule is written down
+//! once and no suite carries a second copy of it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -368,6 +369,15 @@ pub(crate) async fn list_shared(router: &MultiServiceRouter, query: &str) -> Ans
     list_shared_in(router, REGION, query).await
 }
 
+/// One page large enough for a whole answer: the ceiling `MaxResults` publishes.
+pub(crate) const WHOLE_PAGE: &str = "?maxResults=100";
+
+/// The `ListSharedEndpoints` query for the whole listing of one Outpost: one page large
+/// enough for every set these suites store, at `MaxResults`'s own published maximum.
+pub(crate) fn shared_query(outpost_id: &str) -> String {
+    format!("?outpostId={outpost_id}&maxResults=100")
+}
+
 pub(crate) async fn delete_endpoint_in(
     router: &MultiServiceRouter,
     region: &str,
@@ -457,7 +467,7 @@ pub(crate) async fn another_accounts_endpoint_id(
     router: &MultiServiceRouter,
     outpost_id: &str,
 ) -> String {
-    let listing = list_shared(router, &format!("?outpostId={outpost_id}&maxResults=100")).await;
+    let listing = list_shared(router, &shared_query(outpost_id)).await;
     let mine = format!(":{}:", engine::emulator_account_id());
     let arn = listing
         .endpoints()
@@ -486,6 +496,55 @@ pub(crate) fn endpoint_with_arn(answer: &Answer, arn: &str) -> Value {
         .find(|endpoint| endpoint["EndpointArn"].as_str() == Some(arn))
         .unwrap_or_else(|| panic!("no endpoint with ARN {arn} in {:?}", answer.body))
         .clone()
+}
+
+/// The one text a reference under an `OutpostId` that does not resolve is answered with.
+/// Recorded AWS behaviour: the model states no message for `ResourceNotFoundException`.
+///
+/// Written out here rather than imported from the crate, so a wrong constant in the service
+/// cannot make a case pass.
+pub(crate) const OUTPOST_MISSING: &str =
+    "The specified outpost does not exist, or does not have S3 capacity provisioned on it.";
+
+/// The authorization wording a 404 must never carry: an authorization failure is this
+/// service's `AccessDeniedException` (403), per
+/// `smithy_query(query="operation", operation="CreateEndpoint")`, which lists both errors.
+pub(crate) const AUTHORIZATION_TEXT: &str = "Access Denied";
+
+/// The modelled 404 with exactly the one fixed text as its Message, with nothing of the
+/// request in it and no authorization wording.
+///
+/// This is the crate's ONE 404 assertion: every suite that drives a reference the service
+/// does not resolve — whichever door it knocks on — judges the answer by this function, so
+/// the rule is written down once and no suite can hold a weaker copy of it. `request_ids`
+/// are the ids the refused request carried, none of which the Message may disclose.
+pub(crate) fn assert_not_found(case: &str, answer: &Answer, request_ids: &[&str]) {
+    assert_eq!(
+        (answer.status, answer.error_code()),
+        (404, "ResourceNotFoundException"),
+        "case {case:?}: expected 404/ResourceNotFoundException, got {}/{:?} with {:?}",
+        answer.status,
+        answer.error_code(),
+        answer.body
+    );
+    assert_eq!(
+        answer.message(),
+        OUTPOST_MISSING,
+        "case {case:?}: expected Message {OUTPOST_MISSING:?}, got {:?}",
+        answer.message()
+    );
+    assert!(
+        !answer.message().contains(AUTHORIZATION_TEXT),
+        "case {case:?}: a not-found answer must not report an authorization failure, got {:?}",
+        answer.message()
+    );
+    for id in request_ids {
+        assert!(
+            !answer.message().contains(id),
+            "case {case:?}: the Message must not disclose the requested id {id:?}, got {:?}",
+            answer.message()
+        );
+    }
 }
 
 /// `EndpointId`'s `^[a-zA-Z0-9]{19}$`, checked here rather than through the crate's own
@@ -1664,7 +1723,7 @@ async fn a_coip_pool_is_required_by_customer_owned_ip_and_admitted_with_any_acce
 
     // The same pairing holds in the other listing's projection of the same record.
     let arn = customer_owned_arn.expect("the CustomerOwnedIp create with its pool was accepted");
-    let shared = list_shared(&router, &format!("?outpostId={outpost_id}&maxResults=100")).await;
+    let shared = list_shared(&router, &shared_query(&outpost_id)).await;
     let endpoint = endpoint_with_arn(&shared, &arn);
     assert_eq!(
         endpoint["AccessType"],
@@ -1711,7 +1770,7 @@ async fn list_shared_endpoints_reports_the_endpoints_of_the_named_outpost() {
 
     // The shared Outpost: every endpoint stored against it is reported — this account's
     // own and the sharing account's — and no endpoint of any other Outpost is.
-    let answer = list_shared(&router, &format!("?outpostId={shared}&maxResults=100")).await;
+    let answer = list_shared(&router, &shared_query(&shared)).await;
     assert_eq!(
         answer.status, 200,
         "case {shared:?}: ListSharedEndpoints must answer 200, got {} with {:?}",
@@ -1756,7 +1815,7 @@ async fn list_shared_endpoints_reports_the_endpoints_of_the_named_outpost() {
     // operation reports endpoints for — even while it carries an endpoint of this
     // account's that `ListEndpoints` does report.
     for outpost_id in &owned {
-        let answer = list_shared(&router, &format!("?outpostId={outpost_id}&maxResults=100")).await;
+        let answer = list_shared(&router, &shared_query(outpost_id)).await;
         assert_eq!(
             (answer.status, answer.error_code()),
             (404, "ResourceNotFoundException"),
@@ -1775,7 +1834,7 @@ async fn list_shared_endpoints_reports_the_endpoints_of_the_named_outpost() {
 
     // Every form `OutpostId` admits, for an Outpost the store does not hold.
     for unknown in [UNKNOWN_OUTPOST_ID, "123456789012", "ec2"] {
-        let answer = list_shared(&router, &format!("?outpostId={unknown}&maxResults=100")).await;
+        let answer = list_shared(&router, &shared_query(unknown)).await;
         assert_eq!(
             (answer.status, answer.error_code()),
             (404, "ResourceNotFoundException"),

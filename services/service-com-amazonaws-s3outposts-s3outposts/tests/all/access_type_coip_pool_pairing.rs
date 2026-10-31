@@ -17,8 +17,8 @@
 use serde_json::{json, Value};
 
 use crate::endpoint_lifecycle::{
-    create, emulator, endpoint_with_arn, list_endpoints, list_shared, owned_outposts,
-    shared_outpost, string_at, unprovisioned_emulator,
+    assert_not_found, create, emulator, endpoint_with_arn, list_endpoints, list_shared,
+    owned_outposts, shared_outpost, shared_query, string_at, unprovisioned_emulator,
 };
 
 /// Values of `CustomerOwnedIpv4Pool`, whose pattern (from `smithy_query(query="shape",
@@ -45,11 +45,6 @@ const UNRESOLVABLE_OUTPOSTS: &[(&str, &str)] = &[
     ("ec2 branch", "ec2"),
 ];
 
-/// The one text this service answers an `OutpostId` that does not resolve with, written
-/// out here so a wrong constant in the service cannot make this pass.
-const OUTPOST_MISSING: &str =
-    "The specified outpost does not exist, or does not have S3 capacity provisioned on it.";
-
 /// A create request for `outpost_id` with ids keyed to `index`, so no two cases commit the
 /// same subnet and security group to the same Outpost.
 fn request_for(outpost_id: &str, index: usize) -> Value {
@@ -69,19 +64,10 @@ async fn a_coip_pool_does_not_change_the_answer_for_an_unresolvable_outpost() {
 
     for (branch, outpost_id) in UNRESOLVABLE_OUTPOSTS {
         let baseline = create(&router, request_for(outpost_id, 0)).await;
-        assert_eq!(
-            (baseline.status, baseline.error_code()),
-            (404, "ResourceNotFoundException"),
-            "case {branch:?}: the baseline create must be the modelled 404, got {}/{:?} with {:?}",
-            baseline.status,
-            baseline.error_code(),
-            baseline.body
-        );
-        assert_eq!(
-            baseline.message(),
-            OUTPOST_MISSING,
-            "case {branch:?}: the baseline Message must be the fixed not-found text, got {:?}",
-            baseline.message()
+        assert_not_found(
+            &format!("{branch}: the baseline create carrying no pool"),
+            &baseline,
+            &[*outpost_id],
         );
 
         for (form, access_type) in WITHOUT_REQUIREMENT {
@@ -175,7 +161,7 @@ async fn a_coip_pool_is_stored_and_reported_whatever_the_access_type() {
         let from_own = endpoint_with_arn(&list_endpoints(&router, "?maxResults=100").await, &arn);
         let from_shared = if outpost_id == shared {
             Some(endpoint_with_arn(
-                &list_shared(&router, &format!("?outpostId={outpost_id}&maxResults=100")).await,
+                &list_shared(&router, &shared_query(&outpost_id)).await,
                 &arn,
             ))
         } else {

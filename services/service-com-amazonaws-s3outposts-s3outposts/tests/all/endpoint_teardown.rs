@@ -28,15 +28,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_s3outposts_s3outposts::state::ENDPOINT_TRANSITION;
 
 use crate::endpoint_lifecycle::{
-    create, delete_endpoint, emulator, endpoint_id_of, endpoint_with_arn, list_endpoints,
-    list_shared, owned_outposts, reported_arns, shared_outpost, string_at,
+    assert_not_found, create, delete_endpoint, emulator, endpoint_id_of, endpoint_with_arn,
+    list_endpoints, list_shared, owned_outposts, reported_arns, shared_outpost, shared_query,
+    string_at,
 };
-
-/// The one text a reference under an `OutpostId` that does not resolve answers with,
-/// written out here rather than imported so a wrong constant in the service cannot make a
-/// case pass (`not_found_messages.rs` is that text's own subject).
-const OUTPOST_MISSING: &str =
-    "The specified outpost does not exist, or does not have S3 capacity provisioned on it.";
 
 /// The status the endpoint carries when the delete arrives.
 #[derive(Debug, Clone, Copy)]
@@ -130,7 +125,7 @@ async fn a_deleted_endpoint_reports_deleting_until_the_clock_completes_the_teard
         );
         let arn = string_at(&created.body, "EndpointArn");
         let endpoint_id = endpoint_id_of(&arn);
-        let outpost_query = format!("?outpostId={outpost_id}&maxResults=100");
+        let outpost_query = shared_query(&outpost_id);
 
         if matches!(row.arrives, Arrives::WhenAvailable) {
             std::thread::sleep(ENDPOINT_TRANSITION + Duration::from_millis(200));
@@ -236,21 +231,13 @@ async fn a_deleted_endpoint_reports_deleting_until_the_clock_completes_the_teard
         }
 
         let gone = delete_endpoint(&router, &outpost_id, &endpoint_id).await;
-        assert_eq!(
-            (gone.status, gone.error_code()),
-            (404, "ResourceNotFoundException"),
-            "case {:?}: a delete naming an endpoint whose teardown completed must be the \
-             modelled 404, got {} with {:?}",
-            row.case,
-            gone.status,
-            gone.body
-        );
-        assert_eq!(
-            gone.message(),
-            OUTPOST_MISSING,
-            "case {:?}: the 404 must carry the one service text, got {:?}",
-            row.case,
-            gone.message()
+        assert_not_found(
+            &format!(
+                "{}: a delete naming an endpoint whose teardown completed",
+                row.case
+            ),
+            &gone,
+            &[outpost_id.as_str(), endpoint_id.as_str()],
         );
 
         // And what the removed endpoint held is free again: the very create that was the

@@ -18,18 +18,13 @@
 //! Every case goes through the router, so each exercises routing, deserialization,
 //! boundary validation, the handler, the persisted state and serialization.
 
-use std::sync::Arc;
-
 use serde_json::Value;
-use service_com_amazonaws_s3outposts_s3outposts::state::OutpostRecord;
-use service_com_amazonaws_s3outposts_s3outposts::ComAmazonawsS3outpostsS3outpostsState;
-use service_com_amazonaws_s3outposts_s3outposts::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::endpoint_lifecycle::{call_in, minimal_create, string_at, Answer, SHARING_ACCOUNT_ID};
-
-/// One tebibyte, the unit `Outpost$CapacityInBytes` ("in bytes") is stated in here.
-const TEBIBYTE: i64 = 1024 * 1024 * 1024 * 1024;
+use crate::endpoint_lifecycle::{
+    create_in, emulator_holding_owned, list_endpoints_in, list_outposts_in, list_shared_in,
+    minimal_create, shared_query, string_at, Answer, SHARING_ACCOUNT_ID, WHOLE_PAGE,
+};
 
 /// A Region and the partition its ARNs name, limited to the partitions the three ARN
 /// patterns' own alternation lists (`^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):…`):
@@ -150,31 +145,6 @@ fn owner_of(row: &Row) -> String {
     }
 }
 
-/// One emulator whose inventory holds exactly the Outpost `row` declares, installed in
-/// `region` — an Outpost has a home Region, so a case reading in a Region needs its
-/// fixture provisioned there.
-fn emulator_holding(row: &Row, region: &str) -> MultiServiceRouter {
-    let owner = owner_of(row);
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    {
-        let state = engine.state::<ComAmazonawsS3outpostsS3outpostsState>();
-        let mut store = state.lock();
-        store.provision_outpost(
-            OutpostRecord::provisioned(row.outpost_id, &owner, 48 * TEBIBYTE, region)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{} owned by {owner} in {region} must be provisionable",
-                        row.outpost_id
-                    )
-                }),
-        );
-    }
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
 /// Which of the Outpost's two ARN members have a legal value for an `OutpostId`, read off
 /// the members' own patterns (`smithy_query(query="shape",
 /// shape="OutpostArn,S3OutpostArn")`): `OutpostArn` lists `(op-[a-f0-9]{17}|ec2)` as its
@@ -204,14 +174,7 @@ pub(crate) fn optional_member(value: &Value, name: &str) -> Option<String> {
 
 /// The single Outpost a one-Outpost inventory reports in `region`.
 pub(crate) async fn the_outpost(router: &MultiServiceRouter, region: &str) -> Value {
-    let answer = call_in(
-        router,
-        region,
-        "GET",
-        "/S3Outposts/ListOutpostsWithS3?maxResults=100",
-        None,
-    )
-    .await;
+    let answer = list_outposts_in(router, region, WHOLE_PAGE).await;
     assert_eq!(
         answer.status, 200,
         "ListOutpostsWithS3 must answer 200, got {} with {:?}",
@@ -225,39 +188,6 @@ pub(crate) async fn the_outpost(router: &MultiServiceRouter, region: &str) -> Va
         answer.body
     );
     outposts[0].clone()
-}
-
-async fn create_in(router: &MultiServiceRouter, region: &str, outpost_id: &str) -> Answer {
-    call_in(
-        router,
-        region,
-        "POST",
-        "/S3Outposts/CreateEndpoint",
-        Some(minimal_create(outpost_id)),
-    )
-    .await
-}
-
-async fn list_endpoints_in(router: &MultiServiceRouter, region: &str) -> Answer {
-    call_in(
-        router,
-        region,
-        "GET",
-        "/S3Outposts/ListEndpoints?maxResults=100",
-        None,
-    )
-    .await
-}
-
-async fn list_shared_in(router: &MultiServiceRouter, region: &str, outpost_id: &str) -> Answer {
-    call_in(
-        router,
-        region,
-        "GET",
-        &format!("/S3Outposts/ListSharedEndpoints?outpostId={outpost_id}&maxResults=100"),
-        None,
-    )
-    .await
 }
 
 /// `ListOutpostsWithS3` reports, for every branch of `OutpostId` and in every partition,
@@ -275,7 +205,7 @@ async fn an_outpost_reports_only_the_arns_its_members_patterns_admit() {
         for (region, partition) in REGIONS {
             let case = format!("{} in {region}", row.case);
             // Its own emulator per Region, since the Outpost is installed in one Region.
-            let router = emulator_holding(row, region);
+            let router = emulator_holding_owned(&[(id, owner.as_str(), region)]).0;
             let outpost = the_outpost(&router, region).await;
 
             // The Outpost itself is reported whatever its id's branch: an ARN a pattern
@@ -352,13 +282,14 @@ async fn an_endpoint_reports_only_an_arn_its_pattern_admits() {
 
     for row in ROWS {
         let id = row.outpost_id;
+        let owner = owner_of(row);
 
         for (region, partition) in REGIONS {
             let case = format!("{} in {region}", row.case);
             // Its own emulator per case, so the endpoint created here is the only one.
-            let router = emulator_holding(row, region);
+            let router = emulator_holding_owned(&[(id, owner.as_str(), region)]).0;
 
-            let created = create_in(&router, region, id).await;
+            let created = create_in(&router, region, minimal_create(id)).await;
             assert_eq!(
                 created.status, 200,
                 "case {case:?}: CreateEndpoint must answer 200, got {} with {:?}",
@@ -404,15 +335,17 @@ async fn an_endpoint_reports_only_an_arn_its_pattern_admits() {
             // this account's own endpoints — and, for an Outpost another account shared
             // with this caller, by the Outpost-scoped listing too, which serves exactly
             // those (`shared_endpoint_listing.rs`).
-            let mut answers: Vec<(&str, Answer)> =
-                vec![("ListEndpoints", list_endpoints_in(&router, region).await)];
+            let mut answers: Vec<(&str, Answer)> = vec![(
+                "ListEndpoints",
+                list_endpoints_in(&router, region, WHOLE_PAGE).await,
+            )];
             match row.owner {
                 Owner::Sharing => answers.push((
                     "ListSharedEndpoints",
-                    list_shared_in(&router, region, id).await,
+                    list_shared_in(&router, region, &shared_query(id)).await,
                 )),
                 Owner::Caller => {
-                    let refused = list_shared_in(&router, region, id).await;
+                    let refused = list_shared_in(&router, region, &shared_query(id)).await;
                     assert_eq!(
                         (refused.status, refused.error_code()),
                         (404, "ResourceNotFoundException"),

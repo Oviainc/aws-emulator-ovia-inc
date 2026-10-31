@@ -26,16 +26,10 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::endpoint_lifecycle::{
-    create_in, delete_endpoint_in, emulator_holding_shared, emulator_in_region_with_engine,
-    endpoint_id_of, list_endpoints_in, list_shared_in, owned_outposts_in, shared_outpost_in,
-    string_at, Answer, REGION,
+    assert_not_found, create_in, delete_endpoint_in, emulator_holding_shared,
+    emulator_in_region_with_engine, endpoint_id_of, list_endpoints_in, list_shared_in,
+    owned_outposts_in, shared_outpost_in, string_at, Answer, REGION,
 };
-
-/// The one `ResourceNotFoundException$Message` an `OutpostId` that resolves to nothing is
-/// answered with. Written out here rather than imported from the crate, so a wrong
-/// constant in the service cannot make these cases pass.
-const OUTPOST_MISSING: &str =
-    "The specified outpost does not exist, or does not have S3 capacity provisioned on it.";
 
 /// One `OutpostId` per branch of its `^(op-[a-f0-9]{17}|\d{12}|ec2)$` (from
 /// `smithy_query(query="shape", shape="OutpostId")`), none of which any fixture here
@@ -220,7 +214,7 @@ impl Door {
         let answer = self
             .knock(router, region, outpost_id, NEVER_ISSUED_ENDPOINT_ID)
             .await;
-        assert_not_found(case, &answer);
+        assert_not_found(case, &answer, &[outpost_id, NEVER_ISSUED_ENDPOINT_ID]);
     }
 }
 
@@ -294,24 +288,6 @@ async fn endpoint_on(
     endpoint_id_of(&string_at(&created.body, "EndpointArn"))
 }
 
-/// The modelled 404 with exactly the one fixed text, carrying nothing of the request.
-fn assert_not_found(case: &str, answer: &Answer) {
-    assert_eq!(
-        (answer.status, answer.error_code()),
-        (404, "ResourceNotFoundException"),
-        "case {case:?}: expected 404/ResourceNotFoundException, got {}/{:?} with {:?}",
-        answer.status,
-        answer.error_code(),
-        answer.body
-    );
-    assert_eq!(
-        answer.message(),
-        OUTPOST_MISSING,
-        "case {case:?}: expected Message {OUTPOST_MISSING:?}, got {:?}",
-        answer.message()
-    );
-}
-
 /// Every door serves an `OutpostId` the signing Region resolves: an Outpost of this
 /// account's own and one another account shared with it are each reached through all three
 /// doors, in two Regions — the Outpost-scoped listing answering its own modelled 404 for
@@ -372,7 +348,7 @@ async fn every_door_refuses_an_unresolvable_outpost_identically() {
                 let answer = door
                     .knock(&router, region, outpost_id, NEVER_ISSUED_ENDPOINT_ID)
                     .await;
-                assert_not_found(&case, &answer);
+                assert_not_found(&case, &answer, &[outpost_id, NEVER_ISSUED_ENDPOINT_ID]);
                 bodies.push((case, answer.body));
             }
         }
@@ -396,7 +372,7 @@ async fn every_door_refuses_an_unresolvable_outpost_identically() {
             let answer = door
                 .knock(&router, signed_for, outpost_id, &endpoint_id)
                 .await;
-            assert_not_found(&case, &answer);
+            assert_not_found(&case, &answer, &[outpost_id, endpoint_id.as_str()]);
             bodies.push((case, answer.body));
         }
     }

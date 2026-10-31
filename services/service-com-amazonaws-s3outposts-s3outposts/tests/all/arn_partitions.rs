@@ -24,12 +24,8 @@ use crate::arn_patterns::optional_member;
 use crate::endpoint_lifecycle::{
     create_in, emulator_holding, emulator_in_region, endpoint_id_of, list_endpoints_in,
     list_outposts_in, list_shared_in, minimal_create, owned_outposts_in, shared_outpost_in,
-    string_at, Answer,
+    shared_query, string_at, Answer, WHOLE_PAGE,
 };
-
-/// The query every listing below is driven with: one page big enough for the whole answer,
-/// `MaxResults`'s own published maximum.
-const WHOLE_PAGE: &str = "?maxResults=100";
 
 /// A Region and the partition its ARNs belong to.
 ///
@@ -112,11 +108,6 @@ const ROWS: &[Row] = &[
         partition: None,
     },
 ];
-
-/// The `ListSharedEndpoints` query for one Outpost's whole listing.
-fn shared_query(outpost_id: &str) -> String {
-    format!("?outpostId={outpost_id}&maxResults=100")
-}
 
 /// The partition field of an ARN: its second colon-separated field.
 fn partition_of(arn: &str) -> &str {

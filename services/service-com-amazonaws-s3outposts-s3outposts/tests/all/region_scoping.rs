@@ -24,17 +24,11 @@ use serde_json::Value;
 use service_com_amazonaws_s3outposts_s3outposts::state::ENDPOINT_TRANSITION;
 
 use crate::endpoint_lifecycle::{
-    create_in, delete_endpoint_in, emulator_holding, emulator_in_region, endpoint_id_of,
-    list_endpoints_in, list_outposts_in, list_shared_in, minimal_create, reported_arns,
-    shared_outpost_in, string_at, Answer,
+    assert_not_found, create_in, delete_endpoint_in, emulator_holding, emulator_in_region,
+    endpoint_id_of, list_endpoints_in, list_outposts_in, list_shared_in, minimal_create,
+    reported_arns, shared_outpost_in, shared_query, string_at, Answer,
 };
 use smithy_server_runtime::MultiServiceRouter;
-
-/// The one text a reference under an `OutpostId` that does not resolve answers with,
-/// written out here rather than imported so a wrong constant in the service cannot make a
-/// case pass (`not_found_messages.rs` is that text's own subject).
-const OUTPOST_MISSING: &str =
-    "The specified outpost does not exist, or does not have S3 capacity provisioned on it.";
 
 /// The Region a resource is installed in, and a DIFFERENT Region it is read from.
 struct Row {
@@ -94,23 +88,6 @@ fn reported_outposts(answer: &Answer) -> Vec<String> {
         .collect()
 }
 
-/// The `Message` a refusal carries, checked to be the service's own 404 text.
-fn assert_outpost_missing(case: &str, what: &str, answer: &Answer) {
-    assert_eq!(
-        (answer.status, answer.error_code()),
-        (404, "ResourceNotFoundException"),
-        "case {case:?}: {what} must answer 404 ResourceNotFoundException, got {} with {:?}",
-        answer.status,
-        answer.body
-    );
-    assert_eq!(
-        answer.message(),
-        OUTPOST_MISSING,
-        "case {case:?}: {what} must carry the service's own 404 text, got {:?}",
-        answer.message()
-    );
-}
-
 /// A resource is reached only through the Region it lives in: the Region it was created in
 /// serves it and reports its ARN, and another Region reports nothing for it and refuses
 /// every reference to it — without touching what is stored.
@@ -155,8 +132,7 @@ async fn a_resource_is_reached_only_through_the_region_it_lives_in() {
             "case {case:?}: {home} must report exactly the endpoint created in it, got {:?}",
             at_home.body
         );
-        let shared_at_home =
-            list_shared_in(&router, home, &format!("?outpostId={outpost_id}&maxResults=100")).await;
+        let shared_at_home = list_shared_in(&router, home, &shared_query(&outpost_id)).await;
         let on_the_outpost = reported_arns(&shared_at_home);
         // Exactly the two endpoints the fixture holds on that Outpost: the one created
         // above and the sharing account's own, which that fixture seeds on it.
@@ -213,25 +189,21 @@ async fn a_resource_is_reached_only_through_the_region_it_lives_in() {
         );
 
         // And every reference to it from that Region is the modelled 404.
-        assert_outpost_missing(
-            case,
-            &format!("ListSharedEndpoints in {reader}"),
-            &list_shared_in(
-                &router,
-                reader,
-                &format!("?outpostId={outpost_id}&maxResults=100"),
-            )
-            .await,
+        let refused_ids = [outpost_id.as_str(), endpoint_id.as_str()];
+        assert_not_found(
+            &format!("{case}: ListSharedEndpoints in {reader}"),
+            &list_shared_in(&router, reader, &shared_query(&outpost_id)).await,
+            &refused_ids,
         );
-        assert_outpost_missing(
-            case,
-            &format!("CreateEndpoint in {reader}"),
+        assert_not_found(
+            &format!("{case}: CreateEndpoint in {reader}"),
             &create_in(&router, reader, minimal_create(&outpost_id)).await,
+            &refused_ids,
         );
-        assert_outpost_missing(
-            case,
-            &format!("DeleteEndpoint in {reader}"),
+        assert_not_found(
+            &format!("{case}: DeleteEndpoint in {reader}"),
             &delete_endpoint_in(&router, reader, &outpost_id, &endpoint_id).await,
+            &refused_ids,
         );
 
         // None of those refusals changed what is stored, and the ARN did not move.
@@ -356,15 +328,10 @@ async fn each_region_answers_with_its_own_records_and_one_arn_per_record() {
         empty_inventory.body
     );
     for (outpost_id, region, _) in &minted {
-        assert_outpost_missing(
-            &format!("{outpost_id} of {region}"),
-            &format!("ListSharedEndpoints in {UNPROVISIONED}"),
-            &list_shared_in(
-                &router,
-                UNPROVISIONED,
-                &format!("?outpostId={outpost_id}&maxResults=100"),
-            )
-            .await,
+        assert_not_found(
+            &format!("{outpost_id} of {region}: ListSharedEndpoints in {UNPROVISIONED}"),
+            &list_shared_in(&router, UNPROVISIONED, &shared_query(outpost_id)).await,
+            &[outpost_id.as_str()],
         );
     }
 

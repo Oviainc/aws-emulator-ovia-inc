@@ -19,17 +19,11 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::endpoint_lifecycle::{
-    create, create_endpoints, create_in, emulator_holding_owned, emulator_with_engine,
-    list_endpoints, list_endpoints_in, list_shared, list_shared_in, minimal_create,
-    owned_outposts, reported_arns, shared_outpost, string_at, Answer, Listing,
-    SHARING_ACCOUNT_ID,
+    assert_not_found, create, create_endpoints, create_in, emulator_holding_owned,
+    emulator_with_engine, list_endpoints, list_endpoints_in, list_shared, list_shared_in,
+    minimal_create, owned_outposts, reported_arns, shared_outpost, shared_query, string_at, Answer,
+    Listing, SHARING_ACCOUNT_ID,
 };
-
-/// The one `ResourceNotFoundException$Message` an `OutpostId` this operation does not serve
-/// is answered with. Written out here rather than imported from the crate, so a wrong
-/// constant in the service cannot make these cases pass.
-const OUTPOST_NOT_SERVED: &str =
-    "The specified outpost does not exist, or does not have S3 capacity provisioned on it.";
 
 /// A THIRD account, neither the caller nor [`SHARING_ACCOUNT_ID`]: a second account that can
 /// share an Outpost, so no case passes by comparing against one other account id. A
@@ -204,30 +198,6 @@ async fn endpoints_of_this_account(
     subnets
 }
 
-/// The modelled 404 with exactly the one fixed text, carrying nothing of the request.
-fn assert_not_served(case: &str, answer: &Answer, outpost_id: &str) {
-    assert_eq!(
-        (answer.status, answer.error_code()),
-        (404, "ResourceNotFoundException"),
-        "case {case:?}: an Outpost this listing does not serve must be 404/\
-         ResourceNotFoundException, got {}/{:?} with {:?}",
-        answer.status,
-        answer.error_code(),
-        answer.body
-    );
-    assert_eq!(
-        answer.message(),
-        OUTPOST_NOT_SERVED,
-        "case {case:?}: expected Message {OUTPOST_NOT_SERVED:?}, got {:?}",
-        answer.message()
-    );
-    assert!(
-        !answer.message().contains(outpost_id),
-        "case {case:?}: the Message must not disclose the requested id {outpost_id:?}, got {:?}",
-        answer.message()
-    );
-}
-
 /// An Outpost another account shared with this caller is served and every endpoint stored
 /// against it is reported; an Outpost the calling account owns is not an Outpost this
 /// listing serves, and is the modelled 404 — whatever its id's branch, its Region, and
@@ -258,7 +228,7 @@ async fn only_an_outpost_another_account_shared_is_one_this_listing_serves() {
             let answer = list_shared_in(&router, row.region, &query).await;
 
             match row.owner {
-                Owner::Caller => assert_not_served(&case, &answer, row.outpost_id),
+                Owner::Caller => assert_not_found(&case, &answer, &[row.outpost_id]),
                 Owner::Another(_) => {
                     assert_eq!(
                         answer.status, 200,
@@ -335,7 +305,7 @@ async fn the_listing_of_a_shared_outpost_is_every_endpoint_stored_against_it() {
         let outpost = outpost_id(&router, which).await;
         let created = create_endpoints(&router, &outpost, count, index).await;
 
-        let answer = list_shared(&router, &format!("?outpostId={outpost}&maxResults=100")).await;
+        let answer = list_shared(&router, &shared_query(&outpost)).await;
         assert_eq!(
             answer.status, 200,
             "case {case:?}: ListSharedEndpoints must answer 200, got {} with {:?}",
@@ -392,8 +362,8 @@ async fn an_endpoint_on_an_owned_outpost_is_reported_by_this_accounts_own_listin
         let outpost = outpost_id(&router, which).await;
         let created = create_endpoints(&router, &outpost, count, index + 0x20).await;
 
-        let refused = list_shared(&router, &format!("?outpostId={outpost}&maxResults=100")).await;
-        assert_not_served(case, &refused, &outpost);
+        let refused = list_shared(&router, &shared_query(&outpost)).await;
+        assert_not_found(case, &refused, &[outpost.as_str()]);
 
         let own = reported_arns(&list_endpoints(&router, "?maxResults=100").await);
         for arn in &created {
@@ -448,8 +418,7 @@ async fn an_endpoint_created_on_a_shared_outpost_is_listed_with_its_stored_membe
         );
         let arn = string_at(&created.body, "EndpointArn");
 
-        let shared_listing = list_shared(&router, &format!("?outpostId={shared}&maxResults=100"))
-            .await;
+        let shared_listing = list_shared(&router, &shared_query(&shared)).await;
         let from_shared = shared_listing
             .endpoints()
             .iter()

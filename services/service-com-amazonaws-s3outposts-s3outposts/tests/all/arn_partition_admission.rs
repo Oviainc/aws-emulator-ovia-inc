@@ -23,7 +23,7 @@
 
 use crate::arn_patterns::{optional_member, outpost_arn_members, the_outpost};
 use crate::endpoint_lifecycle::{
-    create_in, emulator_holding, list_endpoints_in, minimal_create, string_at,
+    create_in, emulator_holding, list_endpoints_in, minimal_create, string_at, WHOLE_PAGE,
 };
 
 /// A Region, and the partition its ARNs name when the members' own alternation lists it.
@@ -86,9 +86,6 @@ const OUTPOST_IDS: &[(&str, &str)] = &[
     ("the 12-digit branch", "123456789012"),
     ("the ec2 branch", "ec2"),
 ];
-
-/// The query one whole page of a listing is asked for with, `MaxResults`'s own maximum.
-const WHOLE_PAGE: &str = "?maxResults=100";
 
 /// Whether `Endpoint$EndpointArn`'s own `…:outpost/(op-[a-f0-9]{17}|ec2)/endpoint/…` admits
 /// an Outpost identified by `outpost_id`: the 12-digit form is not one of its branches.

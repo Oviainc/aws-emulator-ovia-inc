@@ -12,8 +12,9 @@
 //!
 //! Every case here goes through the router, so each exercises routing, deserialization,
 //! boundary validation, the handler and serialization — the path a client takes. The
-//! expected text is written out here rather than imported from the crate, so a wrong
-//! constant in the service cannot make these cases pass.
+//! expected text and the one assertion that judges it live in the crate's test harness
+//! ([`crate::endpoint_lifecycle::assert_not_found`]) rather than being imported from the
+//! service, so a wrong constant in the service cannot make these cases pass.
 
 use std::time::Duration;
 
@@ -21,19 +22,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_s3outposts_s3outposts::state::ENDPOINT_TRANSITION;
 
 use crate::endpoint_lifecycle::{
-    another_accounts_endpoint_id, create, delete_endpoint, emulator, endpoint_id_of, list_shared,
-    minimal_create, owned_outposts, shared_outpost, string_at, Answer,
+    another_accounts_endpoint_id, assert_not_found, create, delete_endpoint, emulator,
+    endpoint_id_of, list_shared, minimal_create, owned_outposts, shared_outpost, string_at, Answer,
+    AUTHORIZATION_TEXT, OUTPOST_MISSING,
 };
-
-/// The one text an unresolvable reference under an `OutpostId` answers with. Recorded AWS
-/// behaviour: the model states no message for `ResourceNotFoundException`.
-const OUTPOST_MISSING: &str =
-    "The specified outpost does not exist, or does not have S3 capacity provisioned on it.";
-
-/// The authorization wording a 404 must never carry: an authorization failure is this
-/// service's `AccessDeniedException` (403), per
-/// `smithy_query(query="operation", operation="CreateEndpoint")`, which lists both errors.
-const AUTHORIZATION_TEXT: &str = "Access Denied";
 
 /// Every branch of `OutpostId`'s `^(op-[a-f0-9]{17}|\d{12}|ec2)$`. Source of the
 /// catalogue: `smithy_query(query="shape", shape="OutpostId")`. None of these ids is in
@@ -60,37 +52,6 @@ const NEVER_ISSUED_ENDPOINT_IDS: &[&str] = &[
     "0000000000000000000",
     "zzzzzzzzzzzzzzzzzzz",
 ];
-
-/// The modelled 404 with exactly the one fixed text as its Message, with nothing of the
-/// request in it and no authorization wording.
-fn assert_not_found(case: &str, answer: &Answer, request_ids: &[&str]) {
-    assert_eq!(
-        (answer.status, answer.error_code()),
-        (404, "ResourceNotFoundException"),
-        "case {case:?}: expected 404/ResourceNotFoundException, got {}/{:?} with {:?}",
-        answer.status,
-        answer.error_code(),
-        answer.body
-    );
-    assert_eq!(
-        answer.message(),
-        OUTPOST_MISSING,
-        "case {case:?}: expected Message {OUTPOST_MISSING:?}, got {:?}",
-        answer.message()
-    );
-    assert!(
-        !answer.message().contains(AUTHORIZATION_TEXT),
-        "case {case:?}: a not-found answer must not report an authorization failure, got {:?}",
-        answer.message()
-    );
-    for id in request_ids {
-        assert!(
-            !answer.message().contains(id),
-            "case {case:?}: the Message must not disclose the requested id {id:?}, got {:?}",
-            answer.message()
-        );
-    }
-}
 
 /// Create requests that differ in every member beyond `OutpostId`: both widths
 /// `SubnetId` / `SecurityGroupId` admit, each `EndpointAccessType` value, whether the

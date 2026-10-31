@@ -32,12 +32,7 @@ use service_com_amazonaws_s3outposts_s3outposts::state::OutpostRecord;
 use crate::control_plane_inventory::{
     deliver_orders, reported_ids, string_at, Catalog, Emulator, Item, REGION, SHARING_ACCOUNT_ID,
 };
-
-/// The one text a reference under an `OutpostId` that does not resolve answers with,
-/// written out here rather than imported so a wrong constant in the service cannot make a
-/// case pass (`not_found_messages.rs` is that text's own subject).
-const OUTPOST_MISSING: &str =
-    "The specified outpost does not exist, or does not have S3 capacity provisioned on it.";
+use crate::endpoint_lifecycle::OUTPOST_MISSING;
 
 /// The Outpost the withdrawal row has another account share with the caller: an id of
 /// `OutpostId`'s `op-[a-f0-9]{17}` branch.
