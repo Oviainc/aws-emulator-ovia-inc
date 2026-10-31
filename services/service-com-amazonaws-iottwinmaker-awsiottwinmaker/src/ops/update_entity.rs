@@ -56,6 +56,10 @@
 //! definition left with no `dataType` — neither its own nor one inherited from
 //! the component type its holder instantiates
 //! ([`crate::state::Workspace::component_property_definition_needs_data_type`]),
+//! asked of every definition the patched component would hold rather than only
+//! of the ones the request carried wherever the entry re-points the
+//! `componentTypeId` those definitions inherit from
+//! ([`crate::state::Workspace::stranded_component_property_definition`]),
 //! a property `value` that is not a value of the `dataType` the property has,
 //! its own or the inherited one
 //! ([`crate::state::Workspace::component_property_value_violation`], the rule
@@ -471,6 +475,9 @@ fn apply_component_update(
             component_name: component_name.to_string(),
             ..crate::state::ComponentRecord::default()
         });
+    // Whether this entry DECLARES the member the `dataType` rule resolves
+    // against, captured before the patch moves it onto the component.
+    let declares_component_type_id = update.component_type_id.is_some();
     if let Some(component_type_id) = update.component_type_id {
         component.component_type_id = Some(component_type_id);
     }
@@ -488,6 +495,32 @@ fn apply_component_update(
         &member,
         update.property_updates,
     )?;
+    // Every definition the patched component would hold has to be reportable,
+    // not just the ones this request carried: a declaration of the component's
+    // own may omit its `dataType` because it REFINES one the component type it
+    // instantiates declares, so an entry that re-points `componentTypeId` takes
+    // the inheritance an older, already-stored declaration was relying on away
+    // with it — the rule
+    // [`crate::state::Workspace::component_property_definition_needs_data_type`]
+    // asked of the whole record
+    // ([`crate::state::Workspace::stranded_component_property_definition`]),
+    // exactly as `UpdateComponentType` asks it of every definition its patched
+    // record would hold rather than only of the ones its request named.
+    //
+    // Checked only where the entry DECLARES that member: a record some earlier
+    // write left with a definition nothing supplies a `dataType` for is not
+    // this call's to refuse, since refusing it would make an unrelated patch (a
+    // description, say) of such a component impossible.
+    if declares_component_type_id {
+        if let Some(property_name) = workspace.stranded_component_property_definition(
+            component_type_id.as_deref(),
+            &component.properties,
+        ) {
+            return Err(validation(format!(
+                "{member}.propertyUpdates.{property_name}.definition.dataType is required"
+            )));
+        }
+    }
     apply_property_group_updates(
         &mut component.property_groups,
         &member,

@@ -1644,6 +1644,36 @@ impl Workspace {
                 .is_none()
     }
 
+    /// The first property, in property-NAME order, whose definition a component
+    /// instantiating `component_type_id` would hold with no `dataType` at all —
+    /// `None` when every definition the component holds is one a read can
+    /// report.
+    ///
+    /// [`component_property_definition_needs_data_type`](Self::component_property_definition_needs_data_type)
+    /// asked of the definitions a component ALREADY HOLDS rather than of one a
+    /// request carries, because the rule's other input is the component type
+    /// those declarations inherit a `dataType` from: a writer that re-points it
+    /// is the call that takes the inheritance away, so it answers the rule over
+    /// the WHOLE record it would store instead of over the entries the request
+    /// happened to name. Walked in name order, the way every writer of a
+    /// requested map walks one ([`requested_in_key_order`]), so a record holding
+    /// more than one such definition is always refused for the same one.
+    pub fn stranded_component_property_definition<'properties>(
+        &self,
+        component_type_id: Option<&str>,
+        properties: &'properties BTreeMap<String, PropertyRecord>,
+    ) -> Option<&'properties str> {
+        properties.iter().find_map(|(property_name, property)| {
+            let definition = property.definition.as_ref()?;
+            self.component_property_definition_needs_data_type(
+                component_type_id,
+                property_name,
+                definition,
+            )
+            .then_some(property_name.as_str())
+        })
+    }
+
     /// Why `value` cannot be written to the property `property_name` of a
     /// component that instantiates `component_type_id` and declares
     /// `definition` for it — `None` when it can.
