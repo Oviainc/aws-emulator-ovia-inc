@@ -46,6 +46,17 @@
 //!   existing one to be idempotent about: that is the "wasn't possible" case of
 //!   `InvalidOperationException`.
 //!
+//! ### One reading of the clock for the whole request
+//!
+//! This handler is a WRITER of the administrator slot: it resolves the current
+//! association, decides from it, and then persists a record carrying an instant.
+//! `SystemTime` is not monotonic, so every one of those steps is made at the ONE
+//! instant taken at the top of `handle` and handed to
+//! [`crate::state::ComAmazonawsFmsAwsfms20180101State::active_admin_account_mut_at`]
+//! — the resolver that exists for a handler that changes the slot — rather than
+//! each step reading the clock for itself. The sibling writer
+//! `DisassociateAdminAccount` follows the same discipline.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -221,12 +232,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // ONE reading of the clock for the whole request: this handler resolves
+        // the association, decides from it and then writes it, and `SystemTime`
+        // is not monotonic, so a second reading could see the slot free and then
+        // taken, and would stamp the record it persists from an instant other
+        // than the one the decision was made at.
+        let now = ::std::time::SystemTime::now();
+
         let mut store = state.lock();
-        // `active_admin_account` settles what the clock owes before it answers, so a
-        // disassociation already completed frees the administrator slot for this
-        // request rather than blocking it.
+        // Resolved AS OF `now`: this resolver settles what the clock owes at that
+        // instant before it answers, so a disassociation already completed frees
+        // the administrator slot for this request rather than blocking it, and
+        // the write below neither re-derives the active-association predicate nor
+        // reads the clock again.
         let current = store
-            .active_admin_account()
+            .active_admin_account_mut_at(now)
             .map(|admin| (admin.account_id.clone(), admin.removal_pending()));
         match current {
             // Idempotent re-association: this account already IS the default
@@ -267,7 +287,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 store.admin_account = Some(crate::state::AdminAccountRecord {
                     account_id: input.admin_account.clone(),
                     role_status: crate::state::ROLE_STATUS_READY.to_string(),
-                    associated_at: ::std::time::SystemTime::now(),
+                    // The instant the decision above was made at, not a second
+                    // reading of the clock.
+                    associated_at: now,
                     removal_due: None,
                 });
                 Ok(AssociateAdminAccountOutput)

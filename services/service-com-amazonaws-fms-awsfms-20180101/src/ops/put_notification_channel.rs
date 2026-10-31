@@ -13,9 +13,12 @@
 //! Administrator-gated, like every organisation-scoped Firewall Manager
 //! operation: with no Firewall Manager default administrator association in this
 //! account/Region the write is refused by
-//! [`crate::state::require_administrator`] BEFORE anything is stored, so a
+//! [`crate::state::require_administrator_at`] BEFORE anything is stored, so a
 //! refused call leaves NO channel behind and a following
-//! `GetNotificationChannel` is refused identically.
+//! `GetNotificationChannel` is refused identically. The gate is decided at the
+//! SAME instant the record this call writes is stamped with: `SystemTime` is not
+//! monotonic, so one request that both decides from the clock and persists an
+//! instant takes ONE reading of it.
 //!
 //! Both members are caller-supplied `ResourceArn`s documented as Amazon Resource
 //! Names, so each is checked for the ARN FORM
@@ -224,8 +227,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         let mut store = state.lock();
-        // The authorization gate, BEFORE the payload is stored.
-        crate::state::require_administrator(&store, &region)?;
+        // The authorization gate, BEFORE the payload is stored, decided AT the
+        // instant this request stamps the record it writes: `SystemTime` is not
+        // monotonic, so a handler that both decides from the clock and persists
+        // an instant takes ONE reading for the whole request.
+        let now = ::std::time::SystemTime::now();
+        crate::state::require_administrator_at(&store, &region, now)?;
 
         // The FORM of every caller-supplied `ResourceArn` this request carries,
         // BEFORE anything is stored: both members target
@@ -278,7 +285,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::NotificationChannelRecord {
                 sns_topic_arn: input.sns_topic_arn.clone(),
                 sns_role_name: input.sns_role_name.clone(),
-                configured_at: ::std::time::SystemTime::now(),
+                // The instant the gate above admitted this request at, not a
+                // second reading of the clock.
+                configured_at: now,
             },
         );
         Ok(PutNotificationChannelOutput)
