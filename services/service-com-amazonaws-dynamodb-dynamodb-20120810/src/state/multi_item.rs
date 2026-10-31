@@ -164,9 +164,9 @@ pub const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
 ///
 /// The token is caller-chosen, so the number of DISTINCT tokens one client can present
 /// inside [`TRANSACTION_IDEMPOTENCY_WINDOW`] is caller-chosen too; like every other
-/// growth site in this store ([`MAX_ITEMS_PER_TABLE`], [`MAX_TABLE_SIZE_BYTES`],
-/// [`MAX_REGIONS`]) it is budgeted, so what the store retains is not a function of what
-/// a caller sends. This emulator CHOOSES 1024: far more than a client retrying a
+/// growth site in this store ([`MAX_STORE_SIZE_BYTES`], [`MAX_REGIONS`]) it is budgeted,
+/// so what the store retains is not a function of what a caller sends. This emulator
+/// CHOOSES 1024: far more than a client retrying a
 /// handful of transactions needs, and bounded. Each record is a constant size — a
 /// digest of the actions, not the actions ([`action_fingerprint`]) — plus the capacity
 /// figures of at most one transaction, and the OLDEST record is dropped once the
@@ -263,11 +263,21 @@ impl WriteLedger {
 
     /// The `ConsumedCapacity` list the operation reports, one entry per table it wrote
     /// to, or `None` when the request asked for no capacity detail.
-    pub fn consumed_capacity(&self, requested: Option<&str>) -> Option<Vec<ConsumedCapacity>> {
+    ///
+    /// `kind` is the capacity the operation BILLS these figures as
+    /// ([`crate::state::CapacityKind`]): the write it performed, or the read a
+    /// `ClientRequestToken` replay bills instead of re-applying the transaction.
+    pub fn consumed_capacity(
+        &self,
+        requested: Option<&str>,
+        kind: CapacityKind,
+    ) -> Option<Vec<ConsumedCapacity>> {
         let reported: Vec<ConsumedCapacity> = self
             .capacity
             .iter()
-            .filter_map(|(table, capacity)| consumed_write_capacity(requested, table, capacity))
+            .filter_map(|(table, capacity)| {
+                consumed_write_capacity(requested, table, capacity, kind)
+            })
             .collect();
         (!reported.is_empty()).then_some(reported)
     }

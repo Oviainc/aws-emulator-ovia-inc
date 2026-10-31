@@ -297,14 +297,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::parse_statement(&input.statement, &parameters).map_err(lift)?;
         let name = crate::state::resolve_table_name(statement.table()).map_err(lift)?;
 
+        // WHO this request speaks for, resolved before this service's store is locked
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
         {
-            // A table whose resource-based policy denies the caller this statement's
-            // own action is not read or written at all. PartiQL has its own four
-            // actions, which is what `statement.action()` names.
+            // A table the policies in force do not let this caller act on with this
+            // statement's own action is not read or written at all. PartiQL has its own
+            // four actions, which is what `statement.action()` names.
             let table = store.active_table(&region, &name, now).map_err(lift)?;
-            if let Some(denial) = crate::state::policy_denial(table, statement.action(), now) {
+            if let Some(denial) =
+                crate::state::policy_denial(&caller, table, statement.action(), now)
+            {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
         }
@@ -557,6 +562,26 @@ fn select_items(
         ),
         _ => (None, None),
     };
+    let units =
+        crate::state::read_capacity_units(page_size, input.consistent_read.unwrap_or(false));
+    // The read is ADMITTED against the read capacity the table is provisioned for, the
+    // same as the item API's reads: a statement past that capacity is refused rather
+    // than served.
+    if let Err(throttle) = store
+        .active_table_mut(region, name, now)
+        .map_err(lift)?
+        .admit_read(units, now)
+    {
+        return Err(
+            ExecuteStatementErrorModeled::ProvisionedThroughputExceededException(
+                crate::state::read_throughput_exceeded(
+                    &crate::state::table_arn(region, name),
+                    throttle,
+                ),
+            )
+            .into(),
+        );
+    }
     Ok(ExecuteStatementOutput {
         items: Some(items),
         next_token,
@@ -564,7 +589,7 @@ fn select_items(
         consumed_capacity: crate::state::consumed_capacity(
             input.return_consumed_capacity.as_deref(),
             name,
-            crate::state::read_capacity_units(page_size, input.consistent_read.unwrap_or(false)),
+            units,
         ),
     })
 }
@@ -628,6 +653,7 @@ fn insert_item(
             input.return_consumed_capacity.as_deref(),
             name,
             &capacity,
+            crate::state::CapacityKind::Write,
         ),
     })
 }
@@ -732,6 +758,7 @@ fn update_item(
             input.return_consumed_capacity.as_deref(),
             name,
             &capacity,
+            crate::state::CapacityKind::Write,
         ),
     })
 }
@@ -790,6 +817,7 @@ fn delete_item(
             input.return_consumed_capacity.as_deref(),
             name,
             &capacity,
+            crate::state::CapacityKind::Write,
         ),
     })
 }

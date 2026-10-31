@@ -254,24 +254,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // WHO this request speaks for, resolved before this service's store is locked:
+        // the table's resource policy and the caller's own identity-based policies decide
+        // the read ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
-        let table = store.active_table(&region, &name, now).map_err(lift)?;
-        // A table whose resource-based policy denies the caller this action answers
-        // the denial, not the item: the deny is decided before anything is read.
-        if let Some(denial) = crate::state::policy_denial(table, "dynamodb:GetItem", now) {
-            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
-        }
-        let key = table.key_of_key_map(&input.key).map_err(lift)?;
-        let item = table.items.get(&key).cloned();
+        let item = {
+            let table = store.active_table(&region, &name, now).map_err(lift)?;
+            // A table the policies in force do not let this caller read answers the
+            // denial, not the item: it is decided before anything is read.
+            if let Some(denial) =
+                crate::state::policy_denial(&caller, table, "dynamodb:GetItem", now)
+            {
+                return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+            }
+            let key = table.key_of_key_map(&input.key).map_err(lift)?;
+            table.items.get(&key).cloned()
+        };
 
         let size = item.as_ref().map_or(0, crate::state::item_size);
+        let units =
+            crate::state::read_capacity_units(size, input.consistent_read.unwrap_or(false));
+        // The read is ADMITTED against the read capacity the table is provisioned for:
+        // the units it consumes are the ones this response bills, and a read past that
+        // capacity is refused rather than served.
+        if let Err(throttle) = store
+            .active_table_mut(&region, &name, now)
+            .map_err(lift)?
+            .admit_read(units, now)
+        {
+            return Err(GetItemErrorModeled::ProvisionedThroughputExceededException(
+                crate::state::read_throughput_exceeded(
+                    &crate::state::table_arn(&region, &name),
+                    throttle,
+                ),
+            )
+            .into());
+        }
         Ok(GetItemOutput {
             item,
             consumed_capacity: crate::state::consumed_capacity(
                 input.return_consumed_capacity.as_deref(),
                 &name,
-                crate::state::read_capacity_units(size, input.consistent_read.unwrap_or(false)),
+                units,
             ),
         })
     }

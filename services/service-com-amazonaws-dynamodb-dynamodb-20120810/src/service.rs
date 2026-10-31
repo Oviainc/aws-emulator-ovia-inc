@@ -41,10 +41,40 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## Naming the request a response answers
+//!
+//! Every response AWS sends names the request it answered, in the response header the
+//! protocol reports that id in (`x-amzn-RequestId` for `awsJson1_0`) — on a success
+//! exactly as on a failure, and freshly per HTTP ATTEMPT, so two deliveries of one
+//! retried call are two responses naming two different requests. It is a property of the
+//! RESPONSE, not of any modelled shape: no output and no error shape of this model
+//! declares it, so no handler can set it, and the framework's `awsJson` renderers do not
+//! write it.
+//!
+//! The rule is not restated here: [`service_common::query_error_envelope`] owns it for
+//! every emulated service, and this file only chooses the report this protocol takes (the
+//! header alone — `awsJson1_0` has no envelope element for the id) and wires it at the two
+//! layers every response of this service passes through:
+//!
+//! * [`OperationScopedClauseForm`], the dispatch [`Service::override_operation`] hands the
+//!   router in place of each modelled operation, covers everything an operation answers —
+//!   a success, a modelled error, and a constraint refusal raised while that operation was
+//!   being served;
+//! * [`RequestIdEnvelopeDefinition::header_only`], the definition wrapper
+//!   [`Service::definition`] hands back, covers a response NO operation produced: a
+//!   routing failure, a transport failure detected up front, and a pre-dispatch
+//!   authentication refusal.
+//!
+//! Nothing else about a response changes: the status, the other headers and every byte of
+//! the body stay as the renderer wrote them.
 
+use service_common::query_error_envelope::{
+    with_request_id_header, RequestIdEnvelopeDefinition,
+};
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service, Violation,
-    ViolationKind,
+    http, BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, Refusal, Refused,
+    Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -257,7 +287,8 @@ fn served_clause_form() -> ClauseForm {
 }
 
 /// Serves a request as the operation the generated routing table names, with that
-/// operation's clause form ([`clause_form`]) in scope for the whole run.
+/// operation's clause form ([`clause_form`]) in scope for the whole run, and names the
+/// request in the response's header (see "Naming the request a response answers").
 ///
 /// It adds nothing else: the request, the service and the context are handed to the
 /// modelled operation unchanged, so deserialization, validation, the handler and the
@@ -285,10 +316,22 @@ impl ErasedOperation for OperationScopedClauseForm {
             let Some((operation, op)) = routed else {
                 return svc.definition().routing_error_response(req);
             };
-            SERVED_CLAUSE_FORM
+            let answered = SERVED_CLAUSE_FORM
                 .scope(clause_form(operation), op.run(svc, req, ctx))
-                .await
+                .await;
+            // This is the ONE place every response an operation of this service produces
+            // passes through, so no operation can answer without naming the request it
+            // answered — and each attempt gets its own id, because each attempt is served
+            // here once.
+            with_request_id_header(answered)
         })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // `None` is "defer to the modelled operation the routing key names" — the
+        // operation this dispatch delegates to — so its model-declared schemes decide and
+        // this wrapper cannot weaken them.
+        None
     }
 }
 
@@ -392,10 +435,13 @@ const STREAMS_TARGET_SERVICE_KEY: &str = "dynamodbstreams";
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with its three framework-level error renderers wrapped so a
+    /// response no operation produced still names the request it answers.
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
     /// The dispatch `override_operation` hands back, which carries the served
-    /// operation's clause form into [`Service::override_refusal`]. Held on the
-    /// service because that seam returns a borrow of `self`.
+    /// operation's clause form into [`Service::override_refusal`] and names the request
+    /// on the response. Held on the service because that seam returns a borrow of
+    /// `self`.
     clause_form_scope: OperationScopedClauseForm,
 }
 
@@ -405,7 +451,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(engine)),
             clause_form_scope: OperationScopedClauseForm,
         }
     }

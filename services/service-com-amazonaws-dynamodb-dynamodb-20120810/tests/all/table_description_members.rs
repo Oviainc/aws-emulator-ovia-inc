@@ -188,11 +188,8 @@ fn create_request(row: &TableRow) -> Value {
 }
 
 /// Every rule above, over one description of one row's table. `origin` names the
-/// operation the description came from, so a failure says which of the four diverged, and
-/// `mode_in_effect` says whether the capacity mode the table was created with has taken
-/// effect by then — a `PAY_PER_REQUEST` mode reports the instant it was set only once it
-/// is in force, which for a create is when the table becomes `ACTIVE`.
-fn assert_description(row: &TableRow, origin: &str, mode_in_effect: bool, description: &Value) {
+/// operation the description came from, so a failure says which of the four diverged.
+fn assert_description(row: &TableRow, origin: &str, description: &Value) {
     let case = row.case;
     assert!(
         is_uuid(&description["TableId"]),
@@ -217,18 +214,35 @@ fn assert_description(row: &TableRow, origin: &str, mode_in_effect: bool, descri
          {description}"
     );
     assert_eq!(
-        description["BillingModeSummary"]["BillingMode"],
+        description["TableThroughputModeSummary"]["TableThroughputMode"],
         json!(row.expected_billing_mode),
         "case {case:?} from {origin}: expected the resolved capacity mode, got {description}"
     );
-    let last_on_demand = description["BillingModeSummary"].get("LastUpdateToPayPerRequestDateTime");
-    let expected_instant = row.pay_per_request_set && mode_in_effect;
+    // "You may need to switch to on-demand mode at least once in order to return a
+    // BillingModeSummary response" (that shape's own note): the summary — and the instant
+    // it carries — is there exactly for a table that has been on-demand.
+    let billing = description.get("BillingModeSummary");
     assert_eq!(
-        last_on_demand.and_then(Value::as_f64).is_some(),
-        expected_instant,
-        "case {case:?} from {origin}: expected LastUpdateToPayPerRequestDateTime \
-         present={expected_instant}, got {description}"
+        billing.is_some(),
+        row.pay_per_request_set,
+        "case {case:?} from {origin}: expected BillingModeSummary \
+         present={}, got {description}",
+        row.pay_per_request_set
     );
+    if let Some(billing) = billing {
+        assert_eq!(
+            billing["BillingMode"],
+            json!(row.expected_billing_mode),
+            "case {case:?} from {origin}: expected the resolved capacity mode, got \
+             {description}"
+        );
+        assert_eq!(
+            billing["LastUpdateToPayPerRequestDateTime"],
+            description["CreationDateTime"],
+            "case {case:?} from {origin}: a table created on-demand had PAY_PER_REQUEST \
+             set when it was created, got {description}"
+        );
+    }
     assert_eq!(
         (
             description["WarmThroughput"]["ReadUnitsPerSecond"].clone(),
@@ -263,14 +277,14 @@ async fn every_table_description_carries_the_members_read_from_the_stored_table(
         let case = row.case;
         let created = ok(&router, "CreateTable", create_request(row)).await;
         let created = &created["TableDescription"];
-        // The create response reports the table CREATING, so a capacity mode set by this
-        // call is not in force yet.
-        assert_description(row, "CreateTable", false, created);
+        // The create response reports the table CREATING, and the capacity mode it was
+        // created with is the one it has had from that instant.
+        assert_description(row, "CreateTable", created);
 
         wait_out_transition();
         let described = ok(&router, "DescribeTable", json!({"TableName": row.name})).await;
         let described = &described["Table"];
-        assert_description(row, "DescribeTable", true, described);
+        assert_description(row, "DescribeTable", described);
         assert_eq!(
             described["TableId"], created["TableId"],
             "case {case:?}: DescribeTable must echo the TableId the create minted, got \
@@ -286,7 +300,7 @@ async fn every_table_description_carries_the_members_read_from_the_stored_table(
         )
         .await;
         let updated = &updated["TableDescription"];
-        assert_description(row, "UpdateTable", true, updated);
+        assert_description(row, "UpdateTable", updated);
         assert_eq!(
             updated["TableId"], created["TableId"],
             "case {case:?}: UpdateTable must echo the same TableId, got {updated}"
@@ -295,7 +309,7 @@ async fn every_table_description_carries_the_members_read_from_the_stored_table(
         wait_out_transition();
         let deleted = ok(&router, "DeleteTable", json!({"TableName": row.name})).await;
         let deleted = &deleted["TableDescription"];
-        assert_description(row, "DeleteTable", true, deleted);
+        assert_description(row, "DeleteTable", deleted);
         assert_eq!(
             deleted["TableId"], created["TableId"],
             "case {case:?}: DeleteTable must report the id of the table it is deleting, \
@@ -339,14 +353,14 @@ async fn last_update_to_pay_per_request_records_when_on_demand_was_last_set() {
     .await;
     wait_out_transition();
 
-    // A table created PROVISIONED has never had PAY_PER_REQUEST set, so the member is
-    // absent rather than zero.
+    // A table created PROVISIONED has never had PAY_PER_REQUEST set, so it carries no
+    // BillingModeSummary at all ("you may need to switch to on-demand mode at least once
+    // in order to return a BillingModeSummary response").
     let described = ok(&router, "DescribeTable", json!({"TableName": "ModeSwitch"})).await;
     assert_eq!(
-        described["Table"]["BillingModeSummary"].get("LastUpdateToPayPerRequestDateTime"),
+        described["Table"].get("BillingModeSummary"),
         None,
-        "case \"never on-demand\": expected no LastUpdateToPayPerRequestDateTime, got \
-         {described}"
+        "case \"never on-demand\": expected no BillingModeSummary, got {described}"
     );
 
     let switched = ok(
@@ -355,13 +369,16 @@ async fn last_update_to_pay_per_request_records_when_on_demand_was_last_set() {
         json!({"TableName": "ModeSwitch", "BillingMode": "PAY_PER_REQUEST"}),
     )
     .await;
-    // The switch is still settling, and the instant the member reports is when the mode
-    // TAKES EFFECT, so this response carries none yet.
-    assert_eq!(
-        switched["TableDescription"]["BillingModeSummary"].get("LastUpdateToPayPerRequestDateTime"),
-        None,
-        "case \"the switch still settling\": expected no instant before the mode is in \
-         force, got {switched}"
+    // The instant the member reports is the instant of the CALL that set the mode, so
+    // this response — the switch's own echo, with the capacity move still settling —
+    // already carries it.
+    assert!(
+        switched["TableDescription"]["BillingModeSummary"]
+            ["LastUpdateToPayPerRequestDateTime"]
+            .as_f64()
+            .is_some_and(|instant| instant > 0.0),
+        "case \"the switch's own echo\": expected the instant the switch was made, got \
+         {switched}"
     );
     assert_eq!(
         switched["TableDescription"]["ProvisionedThroughput"]["ReadCapacityUnits"],
@@ -407,14 +424,17 @@ async fn last_update_to_pay_per_request_records_when_on_demand_was_last_set() {
     );
     wait_out_transition();
 
-    // Once the mode is in force, the instant it was set is reported, and every later
-    // description reports the same one.
+    // Every later description reports the same instant.
     let on_demand = ok(&router, "DescribeTable", json!({"TableName": "ModeSwitch"})).await;
     let set_at = on_demand["Table"]["BillingModeSummary"]["LastUpdateToPayPerRequestDateTime"]
         .as_f64();
-    assert!(
-        set_at.is_some_and(|instant| instant > 0.0),
-        "case \"switched to on-demand\": expected the instant it was set, got {on_demand}"
+    assert_eq!(
+        set_at,
+        switched["TableDescription"]["BillingModeSummary"]
+            ["LastUpdateToPayPerRequestDateTime"]
+            .as_f64(),
+        "case \"switched to on-demand\": expected the instant the switch reported to \
+         stand, got {on_demand}"
     );
 
     // A request that RESTATES the mode already in force sets nothing: the mode was

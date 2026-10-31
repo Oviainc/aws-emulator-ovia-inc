@@ -1240,7 +1240,15 @@ async fn a_policy_that_would_lock_the_caller_out_needs_the_confirmation() {
 
     // One row per way a document can take the caller's own ability to change the policy
     // away: each of the three policy-management actions by name, and the wildcards that
-    // cover them.
+    // cover them — each stated against every spelling a `Principal` element names THIS
+    // account by, because a statement that denies the account denies each of its
+    // principals: the wildcard, the account's root user, and the bare account id that
+    // stands for that root.
+    let principals = [
+        json!("*"),
+        json!({"AWS": "arn:aws:iam::000000000000:root"}),
+        json!({"AWS": "000000000000"}),
+    ];
     for action in [
         "dynamodb:PutResourcePolicy",
         "dynamodb:DeleteResourcePolicy",
@@ -1248,53 +1256,47 @@ async fn a_policy_that_would_lock_the_caller_out_needs_the_confirmation() {
         "dynamodb:*",
         "*",
     ] {
-        let document = json!({
-            "Version": "2012-10-17",
-            "Statement": [{"Effect": "Deny", "Principal": "*", "Action": action,
-                           "Resource": arn}],
-        })
-        .to_string();
-        let stated = refusal(
-            &router,
-            action,
-            "PutResourcePolicy",
-            json!({"ResourceArn": arn, "Policy": document}),
-            "AccessDeniedException",
-        )
-        .await;
-        assert_eq!(
-            stated,
-            "The new resource policy will not allow you to update the resource policy in the \
-             future.",
-            "case a Deny of {action:?}: got {stated:?}"
-        );
-        // Nothing was attached, so the next attempt starts from no policy at all.
-        let (status, body) = call(
-            &router,
-            "GetResourcePolicy",
-            json!({"ResourceArn": arn}),
-        )
-        .await;
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "PolicyNotFoundException"),
-            "case a Deny of {action:?}: the refused attach stored nothing, got {status} {body}"
-        );
-        // The same document WITH the confirmation is accepted: the member is what makes
-        // the choice deliberate, not something the service refuses outright.
-        ok(
-            &router,
-            "PutResourcePolicy",
-            json!({"ResourceArn": arn, "Policy": document,
-                   "ConfirmRemoveSelfResourceAccess": true}),
-        )
-        .await;
-        ok(
-            &router,
-            "DeleteResourcePolicy",
-            json!({"ResourceArn": arn}),
-        )
-        .await;
+        for principal in &principals {
+            let document = json!({
+                "Version": "2012-10-17",
+                "Statement": [{"Effect": "Deny", "Principal": principal, "Action": action,
+                               "Resource": arn}],
+            })
+            .to_string();
+            let stated = refusal(
+                &router,
+                action,
+                "PutResourcePolicy",
+                json!({"ResourceArn": arn, "Policy": document}),
+                "AccessDeniedException",
+            )
+            .await;
+            assert_eq!(
+                stated,
+                "The new resource policy will not allow you to update the resource policy in \
+                 the future.",
+                "case a Deny of {action:?} for {principal}: got {stated:?}"
+            );
+            // Nothing was attached, so the next attempt starts from no policy at all.
+            let (status, body) =
+                call(&router, "GetResourcePolicy", json!({"ResourceArn": arn})).await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "PolicyNotFoundException"),
+                "case a Deny of {action:?} for {principal}: the refused attach stored \
+                 nothing, got {status} {body}"
+            );
+            // The same document WITH the confirmation is accepted: the member is what
+            // makes the choice deliberate, not something the service refuses outright.
+            ok(
+                &router,
+                "PutResourcePolicy",
+                json!({"ResourceArn": arn, "Policy": document,
+                       "ConfirmRemoveSelfResourceAccess": true}),
+            )
+            .await;
+            ok(&router, "DeleteResourcePolicy", json!({"ResourceArn": arn})).await;
+        }
     }
 
     // A document that denies something ELSE leaves the caller's own access alone, so it

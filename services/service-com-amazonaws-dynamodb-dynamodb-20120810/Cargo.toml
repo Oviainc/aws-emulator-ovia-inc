@@ -38,6 +38,17 @@ hex = { workspace = true }
 # enabling a stream on CreateTable/UpdateTable registers it through that crate's
 # `state::register_stream` seam, which is what its own consumers then read.
 service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810 = { workspace = true }
+# `query_error_envelope`: the tree's one statement of how a response names the request it
+# answers (`x-amzn-RequestId`), wired into this service's operation dispatch and its
+# framework-level error renderers (`service::EmulatedService`).
+# `iam_authorization`: the tree's one evaluation of IAM policy documents, which the
+# data-plane authorization gate judges the caller's identity-based policies by
+# (`state::authorization`).
+service-common = { path = "../common" }
+# `state::authorization` resolves WHO a data-plane request speaks for from the same place
+# `sts:GetCallerIdentity` answers from, and reads the identity-based policies the IAM store
+# holds for that principal through STS's own view of it.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

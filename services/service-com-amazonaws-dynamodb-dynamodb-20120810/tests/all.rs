@@ -23,8 +23,12 @@ mod batch_execute_statement;
 mod batch_write_capacity_residue;
 #[path = "all/batch_write_provisioned_budget.rs"]
 mod batch_write_provisioned_budget;
+#[path = "all/billing_mode_and_table_class_summaries.rs"]
+mod billing_mode_and_table_class_summaries;
 #[path = "all/collection_cap_constraint_reports.rs"]
 mod collection_cap_constraint_reports;
+#[path = "all/consumed_capacity_arms.rs"]
+mod consumed_capacity_arms;
 #[path = "all/continuous_backups.rs"]
 mod continuous_backups;
 #[path = "all/contributor_insights.rs"]
@@ -87,6 +91,8 @@ mod parallel_scan_segment_refusals;
 mod partiql_statements;
 #[path = "all/partiql_transactions.rs"]
 mod partiql_transactions;
+#[path = "all/provisioned_read_capacity.rs"]
+mod provisioned_read_capacity;
 #[path = "all/refusal_contracts_and_expression_pre_images.rs"]
 mod refusal_contracts_and_expression_pre_images;
 
@@ -97,6 +103,9 @@ mod regions_indexes_and_capacity;
 
 #[path = "all/resource_policy_not_found_messages.rs"]
 mod resource_policy_not_found_messages;
+
+#[path = "all/response_request_id.rs"]
+mod response_request_id;
 
 #[path = "all/resource_tags.rs"]
 mod resource_tags;

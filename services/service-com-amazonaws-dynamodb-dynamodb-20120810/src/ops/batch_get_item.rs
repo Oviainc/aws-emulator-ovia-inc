@@ -278,6 +278,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // WHO this request speaks for, resolved before this service's store is locked
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
 
@@ -289,6 +292,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut responses: std::collections::HashMap<String, Vec<crate::state::Item>> =
             std::collections::HashMap::new();
+        let mut unprocessed: std::collections::HashMap<String, KeysAndAttributes> =
+            std::collections::HashMap::new();
+        let mut processed = 0usize;
+        // The resolved name of the first table that ran out of read capacity, which is the
+        // resource a refusal of the whole batch names.
+        let mut throttled_table: Option<String> = None;
         let mut ledger = crate::state::ReadLedger::default();
         // One key is read at most once per TABLE, keyed by the RESOLVED name, and one
         // table is addressed at most once: "each table name or ARN can be used only
@@ -305,15 +314,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
             let consistent_read = requested_keys.consistent_read.unwrap_or(false);
-            let table = store.active_table(&region, &name, now).map_err(lift)?;
-            // A table whose resource-based policy denies the caller this action answers
-            // the denial, not its items.
+            let table = store.active_table_mut(&region, &name, now).map_err(lift)?;
+            // A table the policies in force do not let this caller read answers the
+            // denial, not its items.
             if let Some(denial) =
-                crate::state::policy_denial(table, "dynamodb:BatchGetItem", now)
+                crate::state::policy_denial(&caller, table, "dynamodb:BatchGetItem", now)
             {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
             let mut found: Vec<crate::state::Item> = Vec::new();
+            let mut withheld: Vec<crate::state::Item> = Vec::new();
             for key_map in &requested_keys.keys {
                 for (attribute, value) in key_map {
                     crate::state::check_attribute_value(attribute, value).map_err(lift)?;
@@ -324,17 +334,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::DUPLICATE_BATCH_KEYS_MESSAGE,
                     ));
                 }
-                let item = table.items.get(&key);
+                let item = table.items.get(&key).cloned();
                 // A key that holds no item still consumed the read it asked for, which
                 // is why the capacity is charged for every key and the list only grows
                 // for the ones that were there.
-                let size = item.map_or(0, crate::state::item_size);
-                ledger.record(
-                    &name,
-                    crate::state::read_capacity_units(size, consistent_read),
-                );
+                let size = item.as_ref().map_or(0, crate::state::item_size);
+                let units = crate::state::read_capacity_units(size, consistent_read);
+                // Once this table is out of the read capacity it is provisioned for,
+                // the keys it has not reached are HANDED BACK rather than read: "if
+                // DynamoDB returns any unprocessed items, you should retry the batch
+                // operation on those items" (`BatchGetItem$UnprocessedKeys`), which is
+                // how a batch keeps serving what the table's capacity covers.
+                if !withheld.is_empty() || table.admit_read(units, now).is_err() {
+                    withheld.push(key_map.clone());
+                    throttled_table.get_or_insert_with(|| name.clone());
+                    continue;
+                }
+                ledger.record(&name, units);
+                processed += 1;
                 if let Some(item) = item {
-                    found.push(item.clone());
+                    found.push(item);
                 }
             }
             // "Each element in the response consists of a table name, along with a map
@@ -343,15 +362,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // results up under — while the store and the capacity report use the
             // resolved table name.
             responses.insert(table_name.clone(), found);
+            if !withheld.is_empty() {
+                // The residue is handed back in the form it was sent, so it can be
+                // passed straight to a later `BatchGetItem`.
+                unprocessed.insert(
+                    table_name.clone(),
+                    KeysAndAttributes {
+                        keys: withheld,
+                        ..requested_keys.clone()
+                    },
+                );
+            }
+        }
+
+        // "If none of the items can be processed due to insufficient provisioned
+        // throughput on all of the tables in the request, then BatchGetItem returns a
+        // ProvisionedThroughputExceededException" (the operation's own doc): a batch
+        // that got no read done at all is that refusal rather than an empty answer.
+        if let Some(throttled) = throttled_table.filter(|_| processed == 0) {
+            return Err(
+                BatchGetItemErrorModeled::ProvisionedThroughputExceededException(
+                    crate::state::read_throughput_exceeded(
+                        &crate::state::table_arn(&region, &throttled),
+                        crate::state::ReadThrottle::TableProvisioned,
+                    ),
+                )
+                .into(),
+            );
         }
 
         Ok(BatchGetItemOutput {
             responses: Some(responses),
             // "A map of tables and their respective keys that were not processed":
-            // every key this emulator accepted was read, so the map is EMPTY — the
-            // member AWS answers with, which is what lets a client's retry loop
-            // terminate.
-            unprocessed_keys: Some(std::collections::HashMap::new()),
+            // empty when every key the request addressed was read, which is what lets a
+            // client's retry loop terminate, and carrying the keys a table had no
+            // capacity left for when it did not.
+            unprocessed_keys: Some(unprocessed),
             consumed_capacity: ledger.consumed_capacity(input.return_consumed_capacity.as_deref()),
         })
     }

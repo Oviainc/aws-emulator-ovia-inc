@@ -278,14 +278,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ])
         .map_err(lift)?;
 
+        // WHO this request speaks for, resolved before this service's store is locked
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let table = store
             .active_table(&region, &table_name, now)
             .map_err(lift)?;
-        // A table whose resource-based policy denies the caller this action answers the
-        // denial, not its items.
-        if let Some(denial) = crate::state::policy_denial(table, "dynamodb:SearchVectors", now) {
+        // A table the policies in force do not let this caller read answers the denial,
+        // not its items.
+        if let Some(denial) =
+            crate::state::policy_denial(&caller, table, "dynamodb:SearchVectors", now)
+        {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
         // An `IndexName` the table declares no vector index for is the REQUEST's mistake:

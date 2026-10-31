@@ -292,18 +292,26 @@ pub const MAX_ATTRIBUTE_DEFINITIONS: usize = MAX_TABLE_KEY_ELEMENTS
     + MAX_LOCAL_SECONDARY_INDEXES * MAX_INDEX_KEY_ELEMENTS
     + MAX_VECTOR_INDEXES * (1 + MAX_VECTOR_SEARCH_SCHEMA_ELEMENTS);
 
-/// What one table, and the whole store, may hold in items.
+/// What the whole store, and any one table, may hold in items.
 ///
-/// Real DynamoDB puts no ceiling on a table's size — it has a fleet behind it, and
-/// this emulator has one process's memory — so these are the EMULATOR's own budgets,
-/// not a documented AWS quota: large enough for the data a client's test writes,
-/// small enough that a runaway writer is refused with a `ValidationException` naming
-/// the budget rather than exhausting the host. Admission control measures against
-/// [`Table::stored_bytes`], a running total each table keeps, so the check costs
-/// O(tables) and never a walk over every item.
-pub const MAX_ITEMS_PER_TABLE: usize = 50_000;
-pub const MAX_TABLE_SIZE_BYTES: i64 = 16 * 1024 * 1024;
-pub const MAX_STORE_SIZE_BYTES: i64 = 64 * 1024 * 1024;
+/// Real DynamoDB puts no ceiling on a table's size or on how many items it holds — it has
+/// a fleet behind it — so no legal item write is refused for how much data a table already
+/// carries: the only size a write earns a refusal for is the documented per-item limit
+/// ([`MAX_ITEM_SIZE_BYTES`]). This emulator has one process's memory, and the item store is
+/// the one thing a caller can grow without limit, so these are its own HOST-PROTECTION
+/// ceilings: deliberately far above the data any test stores — sixty-four times the 16 MiB
+/// a table could hold before, which is what made the old ceiling reachable by a legal
+/// workload — and low enough that a runaway writer is refused rather than taking the
+/// machine down with it. They are measured against [`Table::stored_bytes`] and
+/// [`ComAmazonawsDynamodbDynamodb20120810State::stored_bytes`], running totals each table
+/// keeps, so the check costs O(tables) and never a walk over every item, and they are
+/// enforced at the store's ONE growth site
+/// ([`ComAmazonawsDynamodbDynamodb20120810State::put_item`]) so every write path — the item
+/// API, the batch and transactional APIs, PartiQL and a restore — is bounded before it
+/// allocates.
+pub const MAX_ITEMS_PER_TABLE: usize = 1_000_000;
+pub const MAX_TABLE_SIZE_BYTES: i64 = 1024 * 1024 * 1024;
+pub const MAX_STORE_SIZE_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 
 /// The significant digits an `N` value may carry, and the decimal exponent range its
 /// magnitude may fall in: "Number: ... can have up to 38 digits of precision.
@@ -2099,6 +2107,43 @@ impl WriteThrottle {
     }
 }
 
+/// Why the read path refused a read: the ceiling that bound it.
+///
+/// The read counterpart of [`WriteThrottle`], reported the same way — a
+/// `ProvisionedThroughputExceededException` carrying the sentence and the
+/// `ThrottlingReason` of the ceiling ([`throughput_exceeded`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadThrottle {
+    /// The read capacity the TABLE is provisioned for was exhausted.
+    TableProvisioned,
+}
+
+impl ReadThrottle {
+    /// The `ThrottlingReason$reason`: "The throttling reason follows a specific format:
+    /// `ResourceType+OperationType+LimitType`" with the resource `Table`, the operation
+    /// `Read` and the limit type of the ceiling that bound (that member's doc).
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::TableProvisioned => "TableReadProvisionedThroughputExceeded",
+        }
+    }
+
+    /// The sentence DynamoDB states for this refusal — the same provisioning sentence a
+    /// write past the table's capacity earns, because it is the same ceiling in the other
+    /// direction.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::TableProvisioned => THROUGHPUT_EXCEEDED_MESSAGE,
+        }
+    }
+
+    /// The error code a surface that reports a per-slot failure (`BatchStatementError`)
+    /// carries for it.
+    pub fn code(self) -> &'static str {
+        "ProvisionedThroughputExceeded"
+    }
+}
+
 /// How a write past the capacity its table is provisioned for is reported: the sentence
 /// DynamoDB states for that refusal, naming the table's provisioning and the call that
 /// raises it.
@@ -3573,6 +3618,23 @@ pub fn backup_not_found(backup_arn: &str) -> RequestError {
     RequestError::NotFound(format!("Backup not found: {backup_arn}"))
 }
 
+/// How a write this emulator's own host-protection ceilings cannot admit is refused
+/// ([`MAX_ITEMS_PER_TABLE`], [`MAX_TABLE_SIZE_BYTES`], [`MAX_STORE_SIZE_BYTES`]).
+///
+/// NOT an AWS quota, and not a value the request got wrong: DynamoDB bounds ONE item and
+/// not what a table holds, and these ceilings sit far above the data any workload stores.
+/// So the message names THE EMULATOR as what ran out, and says the service itself imposes
+/// no such limit, rather than sending a client to fix its own input; it is the one refusal
+/// this store answers for its own exhaustion.
+fn store_exhausted(table: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "This emulator cannot hold more data for table {table}: its in-process item store \
+         is full (at most {MAX_ITEMS_PER_TABLE} items and {MAX_TABLE_SIZE_BYTES} bytes per \
+         table, and {MAX_STORE_SIZE_BYTES} bytes across all tables). DynamoDB itself \
+         imposes no such limit; delete items to make room."
+    ))
+}
+
 /// Hold an ARN-addressed BACKUP operation's `BackupArn` to the form such an ARN takes in
 /// the scope the request itself was made in.
 ///
@@ -3865,6 +3927,11 @@ pub struct Table {
     /// never stored as one.
     pub vector_indexes: Vec<VectorIndex>,
     pub table_class: Option<String>,
+    /// When the table's class was last UPDATED, which is what
+    /// `TableClassSummary.LastUpdateDateTime` reports: "the date and time at which the
+    /// table class was last updated" (that member's doc). `None` while the class is
+    /// still the one the table was created with, which no call has updated.
+    pub table_class_updated_at: Option<SystemTime>,
     pub deletion_protection_enabled: bool,
     /// This table's continuous-backups settings: whether point-in-time recovery is on
     /// and for how long a period, as `UpdateContinuousBackups` left them and both
@@ -3881,19 +3948,19 @@ pub struct Table {
     /// `ACTIVE` transition. `None` once no update is in flight, which is also the case
     /// for an update the service applies with the call itself (see `UpdateTable`).
     pub updated_at: Option<SystemTime>,
-    /// When `PAY_PER_REQUEST` TAKES EFFECT as this table's read/write capacity mode,
+    /// When `PAY_PER_REQUEST` was LAST SET as this table's read/write capacity mode,
     /// which is what `BillingModeSummary.LastUpdateToPayPerRequestDateTime` reports:
     /// "Represents the time when `PAY_PER_REQUEST` was last set as the read/write
     /// capacity mode" (that member's doc). `None` for a table that has never been
-    /// on-demand.
+    /// on-demand — which is also what makes `BillingModeSummary` itself absent
+    /// ([`Table::billing_mode_summary`]).
     ///
-    /// The instant stored is when the mode takes effect — the end of the `CreateTable`
-    /// or `UpdateTable` that set it, not the instant that call was accepted — so a
-    /// description taken while the table is still becoming on-demand reports no
-    /// timestamp yet ([`Table::describe`] withholds a future one), and every later
-    /// description reports the same instant. It survives a switch back to
-    /// `PROVISIONED`, because the member records when the mode was LAST SET rather than
-    /// which mode is current.
+    /// The instant stored is the one the CALL that set the mode was made at — the
+    /// create that created the table on-demand, which is that table's creation instant,
+    /// or the `UpdateTable` that switched it — so every description from then on reports
+    /// the same instant, including one taken while the capacity move that switch asked
+    /// for is still settling. It survives a switch back to `PROVISIONED`, because the
+    /// member records when the mode was LAST SET rather than which mode is current.
     pub pay_per_request_at: Option<SystemTime>,
     /// When the clock owes this table its removal, set by `DeleteTable`.
     pub removed_at: Option<SystemTime>,
@@ -3922,6 +3989,10 @@ pub struct Table {
     /// ([`Table::admit_write`]). Like [`Table::stored_bytes`] it is admission-control
     /// bookkeeping: no response reports it.
     pub write_budget: CapacityBudget,
+    /// What is left of the READ capacity this table is provisioned for
+    /// ([`Table::admit_read`]). Admission-control bookkeeping like
+    /// [`Table::write_budget`]: no response reports it.
+    pub read_budget: CapacityBudget,
     /// What is left of the write capacity of each partition key value recently written
     /// to ([`Table::admit_item_write`]). Admission-control bookkeeping like
     /// [`Table::write_budget`]: no response reports it.
@@ -4960,6 +5031,71 @@ impl Table {
         self.write_budget.take(provisioned, units, now)
     }
 
+    /// Admit a read that consumes `units` read capacity units, reporting the throttle
+    /// when the capacity this table is provisioned for did not cover it.
+    ///
+    /// The read side of [`Self::admit_write`], and for the same documented reason:
+    /// "provisioned throughput is the maximum amount of capacity that an application can
+    /// consume from a table or index" per second, in reads as in writes, so a
+    /// PROVISIONED table serves its provisioned read units each second plus whatever of
+    /// them went unused inside [`BURST_CAPACITY_WINDOW`], and a read past that is
+    /// refused with `ProvisionedThroughputExceededException` rather than served. A table
+    /// on-demand (`PAY_PER_REQUEST`) is provisioned for no capacity to exceed, so every
+    /// read of one is served.
+    ///
+    /// What the read SEES is untouched by this: the items, and everything a later caller
+    /// reads back, are exactly what they were. What it spends is the capacity the service
+    /// itself bills a read for — the figure the same call reports as
+    /// `ConsumedCapacity.ReadCapacityUnits` — which is why a read is held to it at all.
+    ///
+    /// A read the budget cannot cover takes nothing from it, so a throttled read is not
+    /// charged for work it was refused.
+    pub fn admit_read(&mut self, units: f64, now: SystemTime) -> Result<(), ReadThrottle> {
+        let Some(provisioned) = self.provisioned_read_rate() else {
+            return Ok(());
+        };
+        if self.read_budget.take(provisioned, units, now) {
+            Ok(())
+        } else {
+            Err(ReadThrottle::TableProvisioned)
+        }
+    }
+
+    /// Whether the read capacity this table is provisioned for would cover `units` at
+    /// `now`, WITHOUT taking them.
+    ///
+    /// What lets a read that spans SEVERAL tables be admitted all-or-nothing — a
+    /// transactional get is one read, and "the entire transaction is rejected" when any
+    /// part of it cannot be served, so no table is debited unless every one of them has
+    /// the capacity ([`Self::admit_read`] is what takes it once they all do).
+    pub fn read_admits(&self, units: f64, now: SystemTime) -> Result<(), ReadThrottle> {
+        let Some(provisioned) = self.provisioned_read_rate() else {
+            return Ok(());
+        };
+        if self
+            .read_budget
+            .covers_within(provisioned, BURST_CAPACITY_WINDOW, units, now)
+        {
+            Ok(())
+        } else {
+            Err(ReadThrottle::TableProvisioned)
+        }
+    }
+
+    /// The read units per second this table is PROVISIONED for, or `None` for a table
+    /// on-demand (`PAY_PER_REQUEST`), which is provisioned for no capacity to exceed.
+    fn provisioned_read_rate(&self) -> Option<i64> {
+        match (
+            self.billing_mode.as_str(),
+            self.provisioned_throughput.as_ref(),
+        ) {
+            ("PROVISIONED", Some(throughput)) if throughput.read_capacity_units > 0 => {
+                Some(throughput.read_capacity_units)
+            }
+            _ => None,
+        }
+    }
+
     /// Admit one ITEM write — a put, an update or a delete of the item whose partition
     /// key value is `partition` — against BOTH ceilings a write is held to, reporting
     /// which one refused it.
@@ -5163,19 +5299,38 @@ impl Table {
     /// create, the metered counters of the last refresh, the billing mode and the
     /// instant `PAY_PER_REQUEST` was last set, the throughput and its history, and the
     /// warm throughput in force. `AttributeDefinitions` is reported in the order
-    /// When `PAY_PER_REQUEST` was LAST SET as this table's read/write mode, as a
-    /// description taken at `now` reports it: "Represents the time when
-    /// `PAY_PER_REQUEST` was last set as the read/write capacity mode"
-    /// (`BillingModeSummary$LastUpdateToPayPerRequestDateTime`).
+    /// When `PAY_PER_REQUEST` was LAST SET as this table's read/write mode:
+    /// "Represents the time when `PAY_PER_REQUEST` was last set as the read/write
+    /// capacity mode" (`BillingModeSummary$LastUpdateToPayPerRequestDateTime`).
     ///
-    /// Withheld while the switch that set it is still settling — the stored instant is
-    /// when the mode takes effect — and `None` for a table that has never been
-    /// on-demand. Every summary member that reports the switch reads it from here, so
-    /// they all report the same instant.
-    fn pay_per_request_in_effect_at(&self, now: SystemTime) -> Option<::aws_smithy_types::DateTime> {
-        self.pay_per_request_at
-            .filter(|in_effect_at| now >= *in_effect_at)
-            .map(::aws_smithy_types::DateTime::from)
+    /// The instant of the CALL that set the mode — the create that created the table
+    /// on-demand, which is that table's own creation instant, or the `UpdateTable` that
+    /// switched it — and `None` for a table that has never been on-demand. Every summary
+    /// member that reports the switch reads it from here, so they all report the same
+    /// instant, and a description taken while the switch is still settling reports the
+    /// instant the switch was asked for rather than nothing.
+    fn pay_per_request_set_at(&self) -> Option<::aws_smithy_types::DateTime> {
+        self.pay_per_request_at.map(::aws_smithy_types::DateTime::from)
+    }
+
+    /// The `BillingModeSummary` a description carries, or `None` for a table whose
+    /// read/write mode has never been on-demand.
+    ///
+    /// "You may need to switch to on-demand mode at least once in order to return a
+    /// `BillingModeSummary` response" (that shape's own note): the summary records the
+    /// `PAY_PER_REQUEST` switch, so a table that has only ever been `PROVISIONED` has
+    /// nothing to report under it and the member is absent. The mode of EVERY table is
+    /// still reported, through `TableThroughputModeSummary`, which carries no such note.
+    ///
+    /// A table that HAS been on-demand carries the summary from then on: the mode in
+    /// force — which may be `PROVISIONED` again, for a table that has switched back —
+    /// beside the instant `PAY_PER_REQUEST` was last set.
+    fn billing_mode_summary(&self) -> Option<BillingModeSummary> {
+        let last_set = self.pay_per_request_set_at()?;
+        Some(BillingModeSummary {
+            billing_mode: Some(self.billing_mode.clone()),
+            last_update_to_pay_per_request_date_time: Some(last_set),
+        })
     }
 
     /// Project this table into the `TableDescription` every table operation returns.
@@ -5200,22 +5355,14 @@ impl Table {
             creation_date_time: Some(::aws_smithy_types::DateTime::from(self.creation_date_time)),
             item_count: Some(self.reported_counters.item_count),
             table_size_bytes: Some(self.reported_counters.size_bytes),
-            billing_mode_summary: Some(BillingModeSummary {
-                billing_mode: Some(self.billing_mode.clone()),
-                // Reported only once the mode it records is in effect: the stored
-                // instant is when the call that set `PAY_PER_REQUEST` settles, so while
-                // that call is still settling there is nothing to report yet.
-                last_update_to_pay_per_request_date_time: self
-                    .pay_per_request_in_effect_at(now),
-            }),
+            billing_mode_summary: self.billing_mode_summary(),
             // The SAME read/write mode, reported through the newer summary member every
             // recorded table description carries beside `BillingModeSummary`: one stored
             // mode and one stored switch instant feed both, so the two can never disagree
             // about which mode a table is in.
             table_throughput_mode_summary: Some(TableThroughputModeSummary {
                 table_throughput_mode: Some(self.billing_mode.clone()),
-                last_update_to_pay_per_request_date_time: self
-                    .pay_per_request_in_effect_at(now),
+                last_update_to_pay_per_request_date_time: self.pay_per_request_set_at(),
             }),
             provisioned_throughput: Some(ProvisionedThroughputDescription {
                 // A PAY_PER_REQUEST table reports zeroes: on-demand mode does not use
@@ -5250,7 +5397,14 @@ impl Table {
             }),
             table_class_summary: self.table_class.as_ref().map(|class| TableClassSummary {
                 table_class: Some(class.clone()),
-                last_update_date_time: None,
+                // "The date and time at which the table class was last updated"
+                // (`TableClassSummary$LastUpdateDateTime`): the instant of the
+                // `UpdateTable` that last set the class, and absent on a table whose
+                // class has only ever been the one its create named — that class was
+                // never updated.
+                last_update_date_time: self
+                    .table_class_updated_at
+                    .map(::aws_smithy_types::DateTime::from),
             }),
             // Every table has a warm throughput, so every description carries one: the
             // pair in force — the one a request named, or the capacity the table keeps
@@ -5977,12 +6131,15 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     /// that is absent or not `ACTIVE` is still answered with that refusal rather than
     /// with a number's.
     ///
-    /// This is the store's only growth site, so it is also where the budgets are
-    /// enforced: a write that would push the table past
-    /// [`MAX_ITEMS_PER_TABLE`]/[`MAX_TABLE_SIZE_BYTES`], or the store past
-    /// [`MAX_STORE_SIZE_BYTES`], is refused instead of accepted. Replacing an
-    /// existing item frees that item's bytes, so a steady overwrite loop is never
-    /// refused.
+    /// This is the store's only growth site, so it is where this emulator's own
+    /// HOST-PROTECTION ceilings are enforced ([`MAX_ITEMS_PER_TABLE`],
+    /// [`MAX_TABLE_SIZE_BYTES`], [`MAX_STORE_SIZE_BYTES`]): the clamp precedes the insert,
+    /// so no write path can grow the process past them. They are not AWS quotas — the
+    /// service bounds ONE item ("the maximum item size in DynamoDB is 400 KB",
+    /// [`MAX_ITEM_SIZE_BYTES`], checked where the item is built) and not what a table
+    /// holds — and they sit far above the data any workload stores, so a legal item is
+    /// written however much the table already carries. Replacing an existing item frees
+    /// that item's bytes, so a steady overwrite loop is never refused.
     pub fn put_item(
         &mut self,
         region: &str,
@@ -5995,31 +6152,19 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         let size = item_size(&item);
         let stored = self.stored_bytes();
         let table = self.active_table_mut(region, name, now)?;
-        // Whether this write INSERTS is whether the key is held, not whether the item
-        // it holds sizes to zero — an item can legitimately size to nothing.
+        // Whether this write INSERTS is whether the key is held, not whether the item it
+        // holds sizes to zero — an item can legitimately size to nothing.
         let replaced = table.items.get(&key);
         let replaced_size = replaced.map_or(0, item_size);
-        if replaced.is_none() && table.items.len() >= MAX_ITEMS_PER_TABLE {
-            return Err(RequestError::Validation(format!(
-                "Table {name} already holds this emulator's maximum of \
-                 {MAX_ITEMS_PER_TABLE} items"
-            )));
-        }
         let table_bytes = table
             .stored_bytes
             .saturating_sub(replaced_size)
             .saturating_add(size);
-        if table_bytes > MAX_TABLE_SIZE_BYTES {
-            return Err(RequestError::Validation(format!(
-                "Table {name} would exceed this emulator's maximum stored size of \
-                 {MAX_TABLE_SIZE_BYTES} bytes"
-            )));
-        }
-        if stored.saturating_sub(replaced_size).saturating_add(size) > MAX_STORE_SIZE_BYTES {
-            return Err(RequestError::Validation(format!(
-                "The write would exceed this emulator's maximum stored size of \
-                 {MAX_STORE_SIZE_BYTES} bytes across all tables"
-            )));
+        if (replaced.is_none() && table.items.len() >= MAX_ITEMS_PER_TABLE)
+            || table_bytes > MAX_TABLE_SIZE_BYTES
+            || stored.saturating_sub(replaced_size).saturating_add(size) > MAX_STORE_SIZE_BYTES
+        {
+            return Err(store_exhausted(name));
         }
         table.stored_bytes = table_bytes;
         // "DynamoDB Streams captures a time-ordered sequence of item-level
@@ -6407,10 +6552,29 @@ pub fn throughput_exceeded(
     table_arn: &str,
     throttle: WriteThrottle,
 ) -> ProvisionedThroughputExceededException {
+    exceeded(table_arn, throttle.reason(), throttle.message())
+}
+
+/// The modelled `ProvisionedThroughputExceededException` one refused READ earns, built
+/// the same way from the read ceiling that bound it ([`ReadThrottle`]).
+pub fn read_throughput_exceeded(
+    table_arn: &str,
+    throttle: ReadThrottle,
+) -> ProvisionedThroughputExceededException {
+    exceeded(table_arn, throttle.reason(), throttle.message())
+}
+
+/// The one `ProvisionedThroughputExceededException` builder both kinds of throttle are
+/// reported through, so a refused read and a refused write are worded alike.
+fn exceeded(
+    table_arn: &str,
+    reason: &str,
+    message: &str,
+) -> ProvisionedThroughputExceededException {
     ProvisionedThroughputExceededException {
-        message: Some(throttle.message().to_string()),
+        message: Some(message.to_string()),
         throttling_reasons: Some(vec![ThrottlingReason {
-            reason: Some(throttle.reason().to_string()),
+            reason: Some(reason.to_string()),
             resource: Some(table_arn.to_string()),
         }]),
     }
@@ -7085,6 +7249,51 @@ impl WriteCapacity {
     }
 }
 
+/// WHICH KIND of capacity an operation consumed, which decides the arm every figure it
+/// reports is carried in beside the aggregate.
+///
+/// `ConsumedCapacity` and `Capacity` each carry an aggregate (`CapacityUnits`, "the total
+/// number of capacity units consumed") and one figure per kind: `ReadCapacityUnits` is
+/// "the total number of read capacity units consumed" and `WriteCapacityUnits` the write
+/// equivalent. A data-plane operation spends capacity of ONE kind — a read reads and a
+/// write writes — so the figure of that kind is the aggregate, and the other kind's is
+/// absent because the operation consumed none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityKind {
+    /// Read capacity: what `GetItem`, `Query`, `Scan` and the transactional and batch
+    /// reads consume.
+    Read,
+    /// Write capacity: what `PutItem`, `UpdateItem`, `DeleteItem` and the transactional
+    /// and batch writes consume.
+    Write,
+}
+
+impl CapacityKind {
+    /// One `Capacity` line — a table's or an index's — of `units` of this kind: the
+    /// aggregate and this kind's own figure, which are the same number.
+    fn line(self, units: f64) -> Capacity {
+        Capacity {
+            capacity_units: Some(units),
+            read_capacity_units: (self == Self::Read).then_some(units),
+            write_capacity_units: (self == Self::Write).then_some(units),
+        }
+    }
+
+    /// A `ConsumedCapacity` reporting `units` of this kind for `table_name`, with no
+    /// per-table or per-index breakdown yet: the operation's aggregate and this kind's
+    /// own figure, filled from [`Self::line`] so one rule decides every arm.
+    fn consumed(self, table_name: &str, units: f64) -> ConsumedCapacity {
+        let aggregate = self.line(units);
+        ConsumedCapacity {
+            table_name: Some(table_name.to_string()),
+            capacity_units: aggregate.capacity_units,
+            read_capacity_units: aggregate.read_capacity_units,
+            write_capacity_units: aggregate.write_capacity_units,
+            ..ConsumedCapacity::default()
+        }
+    }
+}
+
 /// The `ConsumedCapacity` a WRITE that asked for it gets back, or `None` when it asked
 /// for `NONE` (or did not ask at all).
 ///
@@ -7094,10 +7303,18 @@ impl WriteCapacity {
 /// `ReturnConsumedCapacity` doc), so the `Table` and per-index breakdown is returned
 /// only then — and only for the indexes the write actually affected, since an index it
 /// did not reach consumed nothing on it.
+///
+/// Every figure is reported in `kind`'s own arm as well as in the aggregate
+/// ([`CapacityKind`]). The breakdown is a WRITE's — the table's units and those of each
+/// index the write fanned out to — while the arm is the kind the operation BILLED it as,
+/// which is `Write` for a write that was applied and `Read` where the service bills the
+/// same figures as a read (a `ClientRequestToken` replay, which reads the transaction's
+/// items rather than writing them).
 pub fn consumed_write_capacity(
     requested: Option<&str>,
     table_name: &str,
     capacity: &WriteCapacity,
+    kind: CapacityKind,
 ) -> Option<ConsumedCapacity> {
     let detail = match requested {
         Some("TOTAL") => false,
@@ -7105,38 +7322,28 @@ pub fn consumed_write_capacity(
         _ => return None,
     };
     Some(ConsumedCapacity {
-        table_name: Some(table_name.to_string()),
-        capacity_units: Some(capacity.total()),
-        table: detail.then(|| Capacity {
-            capacity_units: Some(capacity.table),
-            ..Capacity::default()
-        }),
+        table: detail.then(|| kind.line(capacity.table)),
         local_secondary_indexes: detail
-            .then(|| capacity_breakdown(&capacity.local_secondary_indexes))
+            .then(|| capacity_breakdown(kind, &capacity.local_secondary_indexes))
             .flatten(),
         global_secondary_indexes: detail
-            .then(|| capacity_breakdown(&capacity.global_secondary_indexes))
+            .then(|| capacity_breakdown(kind, &capacity.global_secondary_indexes))
             .flatten(),
-        ..ConsumedCapacity::default()
+        ..kind.consumed(table_name, capacity.total())
     })
 }
 
 /// One per-index `ConsumedCapacity` map, or `None` when no index of that kind was
 /// reached at all — an index an operation did not touch consumed nothing on it, so it is
 /// left out rather than reported as zero.
-fn capacity_breakdown(units: &BTreeMap<String, f64>) -> Option<HashMap<String, Capacity>> {
+fn capacity_breakdown(
+    kind: CapacityKind,
+    units: &BTreeMap<String, f64>,
+) -> Option<HashMap<String, Capacity>> {
     (!units.is_empty()).then(|| {
         units
             .iter()
-            .map(|(name, units)| {
-                (
-                    name.clone(),
-                    Capacity {
-                        capacity_units: Some(*units),
-                        ..Capacity::default()
-                    },
-                )
-            })
+            .map(|(name, units)| (name.clone(), kind.line(*units)))
             .collect()
     })
 }
@@ -7197,22 +7404,18 @@ pub fn consumed_index_capacity(
         Some("INDEXES") => true,
         _ => return None,
     };
+    let kind = CapacityKind::Read;
     let mut per_index: BTreeMap<String, f64> = BTreeMap::new();
     per_index.insert(index.name.to_string(), units);
-    let breakdown = detail.then(|| capacity_breakdown(&per_index)).flatten();
+    let breakdown = detail.then(|| capacity_breakdown(kind, &per_index)).flatten();
     Some(ConsumedCapacity {
-        table_name: Some(table_name.to_string()),
-        capacity_units: Some(units),
         // The read did not go to the table, so its own line is zero rather than absent:
         // `INDEXES` asks for "each table and secondary index that was accessed", and the
         // table that holds the index is named by every line of the breakdown.
-        table: detail.then(|| Capacity {
-            capacity_units: Some(0.0),
-            ..Capacity::default()
-        }),
+        table: detail.then(|| kind.line(0.0)),
         local_secondary_indexes: (!index.global).then(|| breakdown.clone()).flatten(),
         global_secondary_indexes: index.global.then_some(breakdown).flatten(),
-        ..ConsumedCapacity::default()
+        ..kind.consumed(table_name, units)
     })
 }
 
@@ -7223,6 +7426,9 @@ pub fn consumed_index_capacity(
 /// table there is no index to break out, so the table's own capacity is the whole of
 /// it (the `ReturnConsumedCapacity` doc: "specifying INDEXES will only return
 /// ConsumedCapacity information for table(s)").
+///
+/// Every figure is reported in the read arm as well as the aggregate
+/// ([`CapacityKind`]).
 pub fn consumed_capacity(
     requested: Option<&str>,
     table_name: &str,
@@ -7233,14 +7439,10 @@ pub fn consumed_capacity(
         Some("INDEXES") => true,
         _ => return None,
     };
+    let kind = CapacityKind::Read;
     Some(ConsumedCapacity {
-        table_name: Some(table_name.to_string()),
-        capacity_units: Some(units),
-        table: detail.then(|| Capacity {
-            capacity_units: Some(units),
-            ..Capacity::default()
-        }),
-        ..ConsumedCapacity::default()
+        table: detail.then(|| kind.line(units)),
+        ..kind.consumed(table_name, units)
     })
 }
 
@@ -10259,20 +10461,41 @@ impl AttachedPolicy {
         })
     }
 
-    /// Whether this policy EXPLICITLY DENIES `action` on `resource_arn` to `caller`,
-    /// and whether the statement that denied it carried a `Condition` the emulator did
-    /// not evaluate.
+    /// Whether this policy EXPLICITLY DENIES `action` on `resource_arn` to a caller any
+    /// of `principals` names, and whether the statement that denied it carried a
+    /// `Condition` the emulator did not evaluate.
     ///
-    /// Only a Deny decides anything here. The caller is in the resource's own account —
-    /// the only account this emulator serves — so a resource-based policy's Allow
-    /// grants it nothing it does not already hold, while "an explicit deny in any
-    /// policy overrides any allow" (the IAM policy evaluation logic). A Deny that
-    /// matches the request is therefore the one outcome a resource policy changes.
-    pub fn denies(&self, caller: &str, action: &str, resource_arn: &str) -> Option<bool> {
+    /// Only a Deny decides anything here: "an explicit deny in any policy overrides any
+    /// allow" (the IAM policy evaluation logic), so a Deny that matches the request is the
+    /// one outcome this half of the decision reaches. `principals` is every spelling the
+    /// caller may be named by — its own ARN, the ARN of the role an assumed-role session
+    /// is a session of, and the spellings that name its whole account, since a statement
+    /// denying the account denies each of its principals. What GRANTS is
+    /// [`Self::grants_any`], which is decided against the caller's own spellings alone.
+    pub fn denies_any(
+        &self,
+        principals: &[String],
+        action: &str,
+        resource_arn: &str,
+    ) -> Option<bool> {
         self.statements
             .iter()
-            .find(|statement| statement.denies(caller, action, resource_arn))
+            .find(|statement| statement.denies(principals, action, resource_arn))
             .map(PolicyStatement::conditioned)
+    }
+
+    /// Whether this policy GRANTS `action` on `resource_arn` to a caller any of
+    /// `principals` names.
+    ///
+    /// A resource-based policy's `Allow` is a permission of its own where it names the
+    /// CALLER: "the resource-based policy and the identity-based policy are evaluated
+    /// together, and access is granted if either allows it". Only the caller's OWN
+    /// spellings may be passed — a statement naming the account delegates to that
+    /// account's identity-based policies rather than granting (see [`authorization`]).
+    pub fn grants_any(&self, principals: &[String], action: &str, resource_arn: &str) -> bool {
+        self.statements
+            .iter()
+            .any(|statement| statement.grants(principals, action, resource_arn))
     }
 }
 
@@ -10396,12 +10619,27 @@ impl PolicyStatement {
     /// Whether this statement denies the request.
     ///
     /// A `Condition` is not evaluated (see the field's doc) and does not stop a Deny
-    /// from applying.
-    fn denies(&self, caller: &str, action: &str, resource_arn: &str) -> bool {
-        self.deny
-            && self
-                .principal
-                .matches(|value| principal_names(value, caller))
+    /// from applying. `principals` is every spelling the caller may be named by; a
+    /// statement naming any of them is about this request.
+    fn denies(&self, principals: &[String], action: &str, resource_arn: &str) -> bool {
+        self.deny && self.about(principals, action, resource_arn)
+    }
+
+    /// Whether this statement GRANTS the request.
+    ///
+    /// A conditioned `Allow` grants nothing: the condition is not evaluated (see the
+    /// field's doc), so the same fail-closed reading that applies a conditioned Deny
+    /// withholds a conditioned grant — the emulator never serves on a condition it did
+    /// not check.
+    fn grants(&self, principals: &[String], action: &str, resource_arn: &str) -> bool {
+        !self.deny && !self.conditioned && self.about(principals, action, resource_arn)
+    }
+
+    /// Whether this statement is ABOUT the request at all: its principal, action and
+    /// resource elements each select it.
+    fn about(&self, principals: &[String], action: &str, resource_arn: &str) -> bool {
+        self.principal
+            .matches(|value| principal_names(value, principals))
             && self.action.matches(|pattern| action_matches(pattern, action))
             && self
                 .resource
@@ -10500,30 +10738,31 @@ fn principal_values(value: &serde_json::Value) -> Option<Vec<String>> {
     }
 }
 
-/// The identity every request to this emulator carries: the root of the single account
-/// it serves.
+/// The identity every request to this emulator carries when nothing more is known about
+/// it: the root of the single account it serves.
 ///
-/// The emulator verifies a request's signature but has no IAM identity behind the
-/// credential it was signed with, and it serves exactly one account (the store does not
-/// even key by account), so the one principal a policy can be evaluated against is
-/// that account's root.
+/// What the POLICY-MANAGEMENT lock-out is decided against ([`locks_the_caller_out`]),
+/// which asks whether a document would take the ACCOUNT's own ability to change that
+/// policy away. Who a DATA-PLANE request speaks for is resolved from the credential it
+/// signed with instead ([`authorization::request_caller`]).
 pub fn caller_principal() -> String {
     ::engine::emulator_arn("iam", "", "root")
 }
 
 /// Whether a policy `Principal` value names the identity this emulator serves.
 ///
-/// An ACCOUNT-level principal names the caller: `*`, a bare account id, or an
-/// `…:root` ARN. An identity-specific principal — a user, a role, an assumed role, a
-/// service — does not, because this emulator cannot tell which identity is calling.
-/// The account id itself is not compared: every resource here belongs to the one
-/// account whatever account id the document spells.
-fn principal_names(value: &str, caller: &str) -> bool {
-    if wildcard_match(value, caller) {
-        return true;
-    }
-    let account_id = value.len() == 12 && value.bytes().all(|byte| byte.is_ascii_digit());
-    account_id || (value.starts_with("arn:") && value.ends_with(":root"))
+/// `principals` is every spelling the caller may be named by — its own ARN, the role
+/// behind an assumed-role session, and (where a DENY is being decided) the ARN and bare
+/// id of its account, because a statement about the account is about each of its
+/// principals. A value matches when it names any of them, with IAM's wildcards.
+///
+/// A principal of a kind that names no IAM identity — a `Service`, a `Federated` or a
+/// `CanonicalUser` — is kept WITH its kind by [`principal_values`], so it matches no
+/// spelling here rather than being read as one.
+fn principal_names(value: &str, principals: &[String]) -> bool {
+    principals
+        .iter()
+        .any(|named| wildcard_match(value, named))
 }
 
 /// Whether a policy `Action` value names the action being performed. IAM action names
@@ -10611,40 +10850,43 @@ const POLICY_MANAGEMENT_ACTIONS: [&str; 3] = [
 /// Checked against the policy the request is attaching rather than the one the table
 /// carries: the lock-out is what the NEW document would do, and it is decided before
 /// anything is stored so a refused request leaves the table exactly as it was.
+///
+/// Every spelling a statement may name this account by is compared — the root user's ARN
+/// and the bare account id that stands for it ([`::service_common::iam_authorization::account_principals`]) —
+/// because a statement that denies the ACCOUNT denies each of its principals, so a
+/// document that names the account by its id takes the same access away as one that names
+/// its root.
 pub fn locks_the_caller_out(policy: &AttachedPolicy, resource_arn: &str) -> bool {
     let caller = caller_principal();
+    let mut named = vec![caller.clone()];
+    named.extend(::service_common::iam_authorization::account_principals(
+        &caller,
+    ));
     POLICY_MANAGEMENT_ACTIONS
         .iter()
-        .any(|action| policy.denies(&caller, action, resource_arn).is_some())
+        .any(|action| policy.denies_any(&named, action, resource_arn).is_some())
 }
 
-/// The `AccessDeniedException` message a data-plane request earns when the table's
-/// resource-based policy explicitly denies the caller that action, or `None` when
-/// nothing denies it.
+/// The `AccessDeniedException` message a data-plane request earns when the policies in
+/// force do not permit it, or `None` when they do.
 ///
-/// `action` is the IAM action the operation performs (`dynamodb:GetItem`). A table
-/// with no policy attached — or one whose application is not due yet — denies nothing,
-/// which is why this is the whole check an operation makes.
-pub fn policy_denial(table: &Table, action: &str, now: SystemTime) -> Option<String> {
-    let policy = table.resource_policy.as_ref()?;
-    // A policy whose application is not due yet authorizes nothing: the attach was
-    // asynchronous (see `AttachedPolicy::effective_at`).
-    if now < policy.effective_at {
-        return None;
-    }
-    let caller = caller_principal();
-    let conditioned = policy.denies(&caller, action, &table.arn)?;
-    let mut message = format!(
-        "User: {caller} is not authorized to perform: {action} on resource: {} with an \
-         explicit deny in a resource-based policy",
-        table.arn
-    );
-    if conditioned {
-        // Say what was not evaluated rather than imply the condition matched.
-        message.push_str(
-            " (the statement carries a Condition, which this emulator does not evaluate: \
-             it refuses rather than serves what the policy may deny)",
-        );
-    }
-    Some(message)
+/// `caller` is who the request speaks for ([`authorization::request_caller`], resolved
+/// before this store was locked) and `action` is the IAM action the operation performs
+/// (`dynamodb:GetItem`). The decision itself is [`authorization::denial`]'s, which is the
+/// one place this service makes it.
+pub fn policy_denial(
+    caller: &authorization::Caller,
+    table: &Table,
+    action: &str,
+    now: SystemTime,
+) -> Option<String> {
+    authorization::denial(caller, table, action, now)
 }
+
+/// Who a data-plane request speaks for, and whether the policies in force let it act on
+/// the table it addresses, in its own file: it is about the CALLER and the documents of
+/// other services, while this module is the table and item store itself. Re-exported
+/// below, so every caller still names it `crate::state::…`.
+pub mod authorization;
+
+pub use authorization::request_caller;

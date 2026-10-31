@@ -299,6 +299,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(lift(crate::state::too_many_batch_items("BatchWriteItem")));
         }
 
+        // WHO this request speaks for, resolved before this service's store is locked
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
 
@@ -314,10 +317,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (table_name, requests) in addressed {
             let name = crate::state::resolve_table_name(table_name).map_err(lift)?;
             // The table and the caller's authorization for it are decided BEFORE any of
-            // its requests is read: a table that is not there, or whose resource-based
-            // policy denies the caller this action, is answered with that rather than
-            // with whatever is wrong with the items it was sent.
+            // its requests is read: a table that is not there, or that the policies in
+            // force do not let this caller write, is answered with that rather than with
+            // whatever is wrong with the items it was sent.
             if let Some(denial) = crate::state::policy_denial(
+                &caller,
                 store.active_table(&region, &name, now).map_err(lift)?,
                 "dynamodb:BatchWriteItem",
                 now,
@@ -492,7 +496,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // what lets a client's retry loop terminate.
             unprocessed_items: Some(unprocessed),
             item_collection_metrics: ledger.item_collection_metrics(),
-            consumed_capacity: ledger.consumed_capacity(input.return_consumed_capacity.as_deref()),
+            consumed_capacity: ledger.consumed_capacity(
+                input.return_consumed_capacity.as_deref(),
+                crate::state::CapacityKind::Write,
+            ),
         })
     }
 }

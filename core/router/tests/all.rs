@@ -422,6 +422,8 @@ mod connect_signing_name_routing;
 // appends, so it is the contended region, while these neighbouring lines are stable.
 #[path = "all/ddb_stream_lambda_esm_provisioning.rs"]
 mod ddb_stream_lambda_esm_provisioning;
+#[path = "all/dynamodb_data_plane_authorization.rs"]
+mod dynamodb_data_plane_authorization;
 #[path = "all/dynamodb_streams_routing.rs"]
 mod dynamodb_streams_routing;
 // Declared HERE, in the sorted list, rather than appended at the end of this file: the

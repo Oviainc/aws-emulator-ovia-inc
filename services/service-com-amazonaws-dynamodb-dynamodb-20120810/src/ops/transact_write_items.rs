@@ -302,6 +302,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .filter(|token| !token.is_empty());
 
+        // WHO this request speaks for, resolved before this service's store is locked
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
 
@@ -327,9 +330,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     );
                 }
                 return Ok(TransactWriteItemsOutput {
-                    consumed_capacity: completed
-                        .ledger
-                        .consumed_capacity(input.return_consumed_capacity.as_deref()),
+                    // A repeat under the token APPLIES NOTHING, so it is billed as the
+                    // read it was: "subsequent TransactWriteItems calls with the same
+                    // client token return the number of read capacity units consumed in
+                    // reading the item" (`TransactWriteItems$ClientRequestToken`) — the
+                    // figures the first call recorded, reported in the read arm.
+                    consumed_capacity: completed.ledger.consumed_capacity(
+                        input.return_consumed_capacity.as_deref(),
+                        crate::state::CapacityKind::Read,
+                    ),
                     item_collection_metrics: report_item_collection
                         .then(|| completed.ledger.item_collection_metrics())
                         .flatten(),
@@ -402,7 +411,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ));
                     }
                     let table = store.active_table(&region, &name, now).map_err(lift)?;
-                    deny(table, action, now)?;
+                    deny(&caller, table, action, now)?;
                     table.check_index_key_types(&item).map_err(keying)?;
                     table.check_index_key_values(&item).map_err(lift)?;
                     Prepared {
@@ -416,7 +425,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::check_attribute_value(attribute, value).map_err(lift)?;
                     }
                     let table = store.active_table(&region, &name, now).map_err(lift)?;
-                    deny(table, action, now)?;
+                    deny(&caller, table, action, now)?;
                     Prepared {
                         key: table.key_of_key_map(&delete.key).map_err(lift)?,
                         addressed: delete.key.clone(),
@@ -428,7 +437,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::check_attribute_value(attribute, value).map_err(lift)?;
                     }
                     let table = store.active_table(&region, &name, now).map_err(lift)?;
-                    deny(table, action, now)?;
+                    deny(&caller, table, action, now)?;
                     Prepared {
                         key: table.key_of_key_map(&check.key).map_err(lift)?,
                         addressed: check.key.clone(),
@@ -446,7 +455,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .map_err(lift)?;
                     let table = store.active_table(&region, &name, now).map_err(lift)?;
-                    deny(table, action, now)?;
+                    deny(&caller, table, action, now)?;
                     let key = table.key_of_key_map(&update.key).map_err(lift)?;
                     let partition_key = table.partition_key_name().to_string();
                     let sort_key = table.sort_key_name().map(ToString::to_string);
@@ -662,7 +671,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::publish_item_changes(&*self.engine, &mut store, now);
 
         Ok(TransactWriteItemsOutput {
-            consumed_capacity: ledger.consumed_capacity(input.return_consumed_capacity.as_deref()),
+            // The transaction was APPLIED, so what it consumed is write capacity: "the
+            // initial TransactWriteItems call returns the amount of write capacity units
+            // consumed in making the changes" (`TransactWriteItems$ClientRequestToken`).
+            consumed_capacity: ledger.consumed_capacity(
+                input.return_consumed_capacity.as_deref(),
+                crate::state::CapacityKind::Write,
+            ),
             item_collection_metrics: report_item_collection
                 .then(|| ledger.item_collection_metrics())
                 .flatten(),
@@ -794,15 +809,16 @@ impl<'a> Requested<'a> {
     }
 }
 
-/// `AccessDeniedException` when `table`'s resource-based policy denies the caller the
-/// action `requested` performs, so authorization is decided before any item is read or
-/// keyed.
+/// `AccessDeniedException` when the policies in force do not let `caller` perform the
+/// action `requested` performs on `table`, so authorization is decided before any item is
+/// read or keyed.
 fn deny(
+    caller: &crate::state::authorization::Caller,
     table: &crate::state::Table,
     requested: &Requested<'_>,
     now: ::std::time::SystemTime,
 ) -> Result<(), TransactWriteItemsError> {
-    match crate::state::policy_denial(table, requested.policy_action(), now) {
+    match crate::state::policy_denial(caller, table, requested.policy_action(), now) {
         Some(denial) => Err(crate::scaffolded::Scaffolded::access_denied(denial)),
         None => Ok(()),
     }

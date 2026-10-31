@@ -16,9 +16,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_dynamodb_dynamodb_20120810::state::{
-    NumberKey, MAX_TABLE_SIZE_BYTES, STATUS_TRANSITION,
-};
+use service_com_amazonaws_dynamodb_dynamodb_20120810::state::{NumberKey, STATUS_TRANSITION};
 use service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -190,9 +188,18 @@ async fn table_and_item_round_trip_reports_what_was_written() {
         "case create Music: a new table holds no items, got {description}"
     );
     assert_eq!(
-        description["BillingModeSummary"]["BillingMode"],
+        description["TableThroughputModeSummary"]["TableThroughputMode"],
         json!("PROVISIONED"),
-        "case create Music: BillingMode defaults to PROVISIONED, got {description}"
+        "case create Music: the throughput mode defaults to PROVISIONED, got {description}"
+    );
+    // A table that has only ever been PROVISIONED carries no BillingModeSummary: "you may
+    // need to switch to on-demand mode at least once in order to return a
+    // BillingModeSummary response" (that shape's own note).
+    assert_eq!(
+        description.get("BillingModeSummary"),
+        None,
+        "case create Music: a never-on-demand table carries no BillingModeSummary, got \
+         {description}"
     );
     assert_eq!(
         description["ProvisionedThroughput"]["ReadCapacityUnits"],
@@ -1113,7 +1120,7 @@ async fn list_tables_pages_in_name_order() {
 }
 
 #[tokio::test]
-async fn a_write_past_the_stores_budget_is_refused_and_a_delete_frees_it() {
+async fn a_legal_item_is_stored_however_much_the_table_already_holds() {
     let router = emulator();
     create_active_table(
         &router,
@@ -1122,11 +1129,10 @@ async fn a_write_past_the_stores_budget_is_refused_and_a_delete_frees_it() {
     )
     .await;
 
-    // Items just under the documented 400 KB per-item limit, so the emulator's
-    // per-table budget is reached in a few dozen writes rather than millions. Each one
-    // goes to its OWN partition key: the per-partition-key write ceiling is a different
-    // budget (a hot key is throttled, not refused), and what this suite is about is the
-    // store's own size budget.
+    // Items just under the documented 400 KB per-item limit, so a few dozen writes carry
+    // far more than one process would casually hold. Each one goes to its OWN partition
+    // key: the per-partition-key write ceiling is a different budget (a hot key is
+    // throttled, not refused), and what this suite is about is the SIZE a table holds.
     let payload = "x".repeat(399 * 1024);
     let item = |index: usize| {
         json!({
@@ -1139,40 +1145,37 @@ async fn a_write_past_the_stores_budget_is_refused_and_a_delete_frees_it() {
         })
     };
 
-    let mut accepted = 0usize;
-    let mut refusal = None;
+    // 64 writes of 399 KB store about 25 MB — well past the 16 MiB this emulator used to
+    // refuse a table at, and well under the host-protection ceiling that replaced it
+    // (`state::MAX_TABLE_SIZE_BYTES`, a gigabyte): DynamoDB imposes no stored-size limit,
+    // so every one of these writes is served.
+    let mut stored_bytes = 0usize;
     for index in 0..64 {
         let (status, body) = call(&router, "PutItem", &item(index)).await;
-        if status == 200 {
-            accepted += 1;
-            continue;
-        }
-        refusal = Some((index, status, body));
-        break;
+        assert_eq!(
+            status, 200,
+            "case write {index} with {stored_bytes} bytes already stored: a legal item is \
+             accepted however much the table holds, got {status} {body}"
+        );
+        stored_bytes += payload.len();
     }
-    let (index, status, body) = refusal.expect(
-        "case bulk writes: the per-table budget must refuse a write within 64 items of 399 KB",
-    );
+
+    // Every one of them is readable back, so what was accepted was really stored.
+    let read = ok(
+        &router,
+        "GetItem",
+        json!({
+            "TableName": "Bulk",
+            "Key": {"Part": {"S": "p63"}, "Sort": {"N": "63"}},
+        }),
+    )
+    .await;
     assert_eq!(
-        (status, error_code(&body).as_str()),
-        (400, "ValidationException"),
-        "case write {index} past the budget: expected 400 ValidationException, got {status} {body}"
-    );
-    assert_eq!(
-        accepted, index,
-        "case bulk writes: every write before the refusal must have been accepted, got {accepted} of {index}"
+        read["Item"]["Part"]["S"],
+        json!("p63"),
+        "case read back the last item: expected the item the 64th write stored, got {read}"
     );
 
-    // The budget bounds what was ACCEPTED, which is where it is enforced: every item that
-    // landed carries at least the 399 KB payload, and together they fit inside it.
-    let accepted_bytes = i64::try_from(accepted)
-        .unwrap_or(i64::MAX)
-        .saturating_mul(i64::try_from(payload.len()).unwrap_or(i64::MAX));
-    assert!(
-        accepted_bytes <= MAX_TABLE_SIZE_BYTES,
-        "case budget reached: the {accepted} accepted writes must fit the \
-         {MAX_TABLE_SIZE_BYTES}-byte budget, got at least {accepted_bytes} bytes"
-    );
     // What a description reports is the metered snapshot, which those writes do not move.
     let described = ok(&router, "DescribeTable", json!({"TableName": "Bulk"})).await;
     assert_eq!(
@@ -1181,22 +1184,26 @@ async fn a_write_past_the_stores_budget_is_refused_and_a_delete_frees_it() {
             described["Table"]["TableSizeBytes"].clone(),
         ),
         (json!(0), json!(0)),
-        "case budget reached: expected the metered figures, which {accepted} accepted \
-         writes do not move, got {described}"
+        "case 64 writes stored: expected the metered figures, which those writes do not \
+         move, got {described}"
     );
 
-    // Deleting an item gives its bytes back, so the write that was just refused is
-    // accepted now: the budget tracks the store rather than counting writes.
-    ok(
-        &router,
-        "DeleteItem",
-        json!({"TableName": "Bulk", "Key": {"Part": {"S": "p0"}, "Sort": {"N": "0"}}}),
-    )
-    .await;
-    let (status, retried) = call(&router, "PutItem", &item(index)).await;
+    // The one size-related refusal DynamoDB does state is the per-ITEM limit: "the
+    // maximum item size in DynamoDB is 400 KB" ("Service, Account, and Table Quotas").
+    let oversize = json!({
+        "TableName": "Bulk",
+        "Item": {
+            "Part": {"S": "too-big"},
+            "Sort": {"N": "0"},
+            "Blob": {"S": "x".repeat(401 * 1024)},
+        },
+    });
+    let (status, body) = call(&router, "PutItem", &oversize).await;
     assert_eq!(
-        status, 200,
-        "case retry after a delete freed the budget: expected 200, got {status} {retried}"
+        (status, error_code(&body).as_str()),
+        (400, "ValidationException"),
+        "case an item past the documented 400 KB limit: expected 400 ValidationException, \
+         got {status} {body}"
     );
 }
 

@@ -3,12 +3,15 @@
 //! Two rules of the `TableDescription` projection every table operation returns, both
 //! about the table's read/write throughput mode and the capacity it keeps warm:
 //!
-//! 1. a table's read/write mode is reported by BOTH summary members a description
-//!    carries — `BillingModeSummary` and `TableThroughputModeSummary` — and the instant
-//!    `PAY_PER_REQUEST` was LAST SET is reported by both, in both cases only once that
-//!    mode is in effect. One stored mode and one stored switch instant feed both
-//!    summaries, so a client that reads the mode from either sees the same answer, from
-//!    `CreateTable`, `DescribeTable`, `UpdateTable` and `DeleteTable` alike;
+//! 1. a table's read/write mode is reported by `TableThroughputModeSummary` on every
+//!    description, and by `BillingModeSummary` exactly when the table has been on-demand
+//!    at least once ("You may need to switch to on-demand mode at least once in order to
+//!    return a `BillingModeSummary` response" — that shape's own note); the instant
+//!    `PAY_PER_REQUEST` was LAST SET is the instant of the call that set it, reported by
+//!    whichever of the two summaries a description carries. One stored mode and one stored
+//!    switch instant feed both summaries, so a client that reads the mode from either sees
+//!    the same answer, from `CreateTable`, `DescribeTable`, `UpdateTable` and `DeleteTable`
+//!    alike;
 //! 2. warm throughput is "the minimum provisioned capacity maintained for immediate data
 //!    access" (the `TableWarmThroughputDescription` doc), so a table — and every global
 //!    secondary index on it — keeps warm the capacity it is provisioned for; WITHDRAWING
@@ -40,11 +43,6 @@ struct Switch {
     mode: &'static str,
     /// The `ProvisionedThroughput` it must carry when that mode is `PROVISIONED`.
     capacity: Option<(i64, i64)>,
-    /// Whether the switch's OWN echo already reports the `PAY_PER_REQUEST` instant: a
-    /// switch TO on-demand records an instant that falls due when the update settles, so
-    /// its own echo carries none, while a switch back to `PROVISIONED` leaves the instant
-    /// an earlier call recorded standing.
-    echo_reports_instant: bool,
 }
 
 /// One row of the throughput-mode table: how the table is created, whether it is then
@@ -106,7 +104,6 @@ const MODE_TABLE: &[ModeRow] = &[
         switch: Some(Switch {
             mode: "PAY_PER_REQUEST",
             capacity: None,
-            echo_reports_instant: false,
         }),
         expected_mode: "PAY_PER_REQUEST",
         expected_instant: true,
@@ -119,7 +116,6 @@ const MODE_TABLE: &[ModeRow] = &[
         switch: Some(Switch {
             mode: "PROVISIONED",
             capacity: Some((4, 4)),
-            echo_reports_instant: true,
         }),
         expected_mode: "PROVISIONED",
         // The switch back does not erase when PAY_PER_REQUEST was last set.
@@ -144,34 +140,46 @@ fn create_body(row: &ModeRow) -> Value {
     body
 }
 
-/// Rule 1 over one description: both summaries report `mode`, and both report the
-/// `PAY_PER_REQUEST` instant exactly when `instant` says they must — the same instant in
-/// both, since one stored value feeds them.
+/// Rule 1 over one description: `TableThroughputModeSummary` reports `mode`,
+/// `BillingModeSummary` is there exactly when the table has been on-demand (which is also
+/// when there is a `PAY_PER_REQUEST` instant to report) and reports the same mode and the
+/// same instant, since one stored value feeds them.
 fn assert_mode(case: &str, origin: &str, description: &Value, mode: &str, instant: bool) {
-    let billing = &description["BillingModeSummary"];
     let throughput = &description["TableThroughputModeSummary"];
     assert_eq!(
-        (
-            billing["BillingMode"].clone(),
-            throughput["TableThroughputMode"].clone(),
-        ),
-        (json!(mode), json!(mode)),
-        "case {case:?} from {origin}: expected both summaries to report {mode}, got \
-         {description}"
+        throughput["TableThroughputMode"].clone(),
+        json!(mode),
+        "case {case:?} from {origin}: expected TableThroughputModeSummary to report {mode}, \
+         got {description}"
     );
-    let billing_instant = billing["LastUpdateToPayPerRequestDateTime"].clone();
     let throughput_instant = throughput["LastUpdateToPayPerRequestDateTime"].clone();
     assert_eq!(
-        billing_instant, throughput_instant,
-        "case {case:?} from {origin}: expected one switch instant in both summaries, got \
-         {description}"
-    );
-    assert_eq!(
-        billing_instant.is_number(),
+        throughput_instant.is_number(),
         instant,
         "case {case:?} from {origin}: expected the PAY_PER_REQUEST instant \
          present={instant}, got {description}"
     );
+    let billing = description.get("BillingModeSummary");
+    assert_eq!(
+        billing.is_some(),
+        instant,
+        "case {case:?} from {origin}: expected BillingModeSummary present={instant} \
+         (a table must have been on-demand at least once to carry one), got {description}"
+    );
+    if let Some(billing) = billing {
+        assert_eq!(
+            billing["BillingMode"].clone(),
+            json!(mode),
+            "case {case:?} from {origin}: expected both summaries to report {mode}, got \
+             {description}"
+        );
+        assert_eq!(
+            billing["LastUpdateToPayPerRequestDateTime"].clone(),
+            throughput_instant,
+            "case {case:?} from {origin}: expected one switch instant in both summaries, got \
+             {description}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -181,15 +189,25 @@ async fn every_table_description_reports_the_tables_throughput_mode_in_both_summ
         let case = row.case;
         let created = ok(&router, "CreateTable", create_body(row)).await;
         // The create echo reports the mode the table was created in. A table created
-        // on-demand has PAY_PER_REQUEST set by this very call, and the mode takes effect
-        // when the table does, so no instant is reported yet.
+        // on-demand has PAY_PER_REQUEST set by this very call, so the instant it reports
+        // is that table's own creation instant.
+        let created_on_demand = row.created_mode == Some("PAY_PER_REQUEST");
         assert_mode(
             case,
             "CreateTable",
             &created["TableDescription"],
             row.created_mode.unwrap_or("PROVISIONED"),
-            false,
+            created_on_demand,
         );
+        if created_on_demand {
+            let description = &created["TableDescription"];
+            assert_eq!(
+                description["BillingModeSummary"]["LastUpdateToPayPerRequestDateTime"].clone(),
+                description["CreationDateTime"].clone(),
+                "case {case:?}: a table created on-demand had PAY_PER_REQUEST set when it \
+                 was created, got {description}"
+            );
+        }
 
         wait_out_transition();
         if let Some(switch) = &row.switch {
@@ -199,12 +217,14 @@ async fn every_table_description_reports_the_tables_throughput_mode_in_both_summ
                     json!({"ReadCapacityUnits": read, "WriteCapacityUnits": write});
             }
             let switched = ok(&router, "UpdateTable", body).await;
+            // The switch's own echo reports the instant: it is the instant of this call,
+            // not of the capacity move it starts.
             assert_mode(
                 case,
                 "the switching UpdateTable",
                 &switched["TableDescription"],
                 switch.mode,
-                switch.echo_reports_instant,
+                true,
             );
             wait_out_transition();
         }

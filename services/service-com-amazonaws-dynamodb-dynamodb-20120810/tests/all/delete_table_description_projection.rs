@@ -297,11 +297,23 @@ async fn the_reported_description_carries_every_member_the_table_was_created_wit
             "case {case:?}: a table created without deletion protection reports it off, got \
              {description}"
         );
+        // `BillingModeSummary` is carried only by a table that has been on-demand at
+        // least once ("you may need to switch to on-demand mode at least once in order to
+        // return a BillingModeSummary response"), which here is the row created
+        // PAY_PER_REQUEST; the mode of every table is reported by the throughput-mode
+        // summary beside it.
+        let on_demand = row.billing == "PAY_PER_REQUEST";
         assert_eq!(
-            description["BillingModeSummary"]["BillingMode"], json!(row.billing),
-            "case {case:?}: expected BillingModeSummary to report {:?}, got {description}",
-            row.billing
+            description.get("BillingModeSummary").is_some(), on_demand,
+            "case {case:?}: expected BillingModeSummary present={on_demand}, got {description}"
         );
+        if on_demand {
+            assert_eq!(
+                description["BillingModeSummary"]["BillingMode"], json!(row.billing),
+                "case {case:?}: expected BillingModeSummary to report {:?}, got {description}",
+                row.billing
+            );
+        }
         assert_eq!(
             description["TableThroughputModeSummary"]["TableThroughputMode"], json!(row.billing),
             "case {case:?}: expected TableThroughputModeSummary to report {:?}, got {description}",

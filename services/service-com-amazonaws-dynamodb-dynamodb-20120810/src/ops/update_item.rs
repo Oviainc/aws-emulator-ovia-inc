@@ -380,13 +380,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (None, None) => crate::state::ParsedUpdate::nothing(),
         };
 
+        // WHO this request speaks for, resolved before this service's store is locked
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let (key, partition_key, sort_key) = {
             let table = store.active_table(&region, &name, now).map_err(lift)?;
-            // A table whose resource-based policy denies the caller this action is not
-            // written to at all: authorization is decided before the item is keyed.
-            if let Some(denial) = crate::state::policy_denial(table, "dynamodb:UpdateItem", now) {
+            // A table the policies in force do not let this caller write is not written
+            // to at all: authorization is decided before the item is keyed.
+            if let Some(denial) =
+                crate::state::policy_denial(&caller, table, "dynamodb:UpdateItem", now)
+            {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
             (
@@ -514,6 +519,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.return_consumed_capacity.as_deref(),
                 &name,
                 &capacity,
+                crate::state::CapacityKind::Write,
             ),
             item_collection_metrics: item_collection_metrics.flatten(),
         })

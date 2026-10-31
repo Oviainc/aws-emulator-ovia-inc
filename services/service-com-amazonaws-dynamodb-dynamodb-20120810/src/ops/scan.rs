@@ -409,12 +409,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation)?;
         let consistent_read = input.consistent_read.unwrap_or(false);
 
+        // WHO this request speaks for, resolved before this service's store is locked
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let table = store.active_table(&region, &name, now).map_err(lift)?;
-        // A table whose resource-based policy denies the caller this action answers
-        // the denial, not its items: the deny is decided before anything is read.
-        if let Some(denial) = crate::state::policy_denial(table, "dynamodb:Scan", now) {
+        // A table the policies in force do not let this caller read answers the denial,
+        // not its items: it is decided before anything is read.
+        if let Some(denial) = crate::state::policy_denial(&caller, table, "dynamodb:Scan", now) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
         // "The name of a secondary index to scan. This index can be any local secondary
@@ -464,10 +467,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // table's items in primary-key order, or the entries one secondary index holds
         // in the order the index orders them ([`crate::state::IndexItemKey`]). Either
         // way it is the order a `LastEvaluatedKey` resumes from. The list is one entry
-        // per STORED item, so its size is the store's own admission ceilings
-        // ([`crate::state::MAX_ITEMS_PER_TABLE`]) and not anything this request chose;
-        // the entry each row is read as is built inside the page below, where the page
-        // budget bounds it.
+        // per STORED item, so its size is what the table HOLDS and not anything this
+        // request chose; the entry each row is read as is built inside the page below,
+        // where the page budget bounds it.
         let candidates: Vec<(Position<'_>, &crate::state::Item)> = match index {
             None => table
                 .items
@@ -601,20 +603,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let units = crate::state::read_capacity_units(page_size, consistent_read);
         let requested_capacity = input.return_consumed_capacity.as_deref();
+        // Projected while the index this scan read is still borrowed from the table, so
+        // what the response bills is decided before the table is reached for again.
+        let consumed_capacity = match index {
+            Some(index) => {
+                crate::state::consumed_index_capacity(requested_capacity, &name, &index, units)
+            }
+            None => crate::state::consumed_capacity(requested_capacity, &name, units),
+        };
+        // The read is ADMITTED against the read capacity the table is provisioned for:
+        // the units it consumes are the ones this response bills — every item the page
+        // scanned, filtered or not — and a read past that capacity is refused rather
+        // than served. A read served from an index spends the TABLE's provisioned
+        // capacity here, because an index of a provisioned table has no capacity of its
+        // own in this store.
+        if let Err(throttle) = store
+            .active_table_mut(&region, &name, now)
+            .map_err(lift)?
+            .admit_read(units, now)
+        {
+            return Err(ScanErrorModeled::ProvisionedThroughputExceededException(
+                crate::state::read_throughput_exceeded(
+                    &crate::state::table_arn(&region, &name),
+                    throttle,
+                ),
+            )
+            .into());
+        }
         Ok(ScanOutput {
             items,
             count,
             scanned_count,
             last_evaluated_key,
-            consumed_capacity: match index {
-                Some(index) => crate::state::consumed_index_capacity(
-                    requested_capacity,
-                    &name,
-                    &index,
-                    units,
-                ),
-                None => crate::state::consumed_capacity(requested_capacity, &name, units),
-            },
+            consumed_capacity,
         })
     }
 }

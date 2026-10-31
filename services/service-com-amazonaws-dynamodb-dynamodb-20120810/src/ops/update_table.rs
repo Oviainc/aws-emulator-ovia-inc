@@ -508,11 +508,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         table.updated_at = settles_later.then_some(settles_at);
         // "The time when PAY_PER_REQUEST was last set as the read/write capacity mode"
-        // (`BillingModeSummary$LastUpdateToPayPerRequestDateTime`) is the instant the
-        // SWITCH takes effect, so a request that re-states the mode the table is
-        // already in records nothing new.
+        // (`BillingModeSummary$LastUpdateToPayPerRequestDateTime`) is the instant of the
+        // CALL that set it, which is this one, so a description taken while the capacity
+        // move is still settling already reports it — and a request that re-states the
+        // mode the table is already in records nothing new.
         if billing_mode == "PAY_PER_REQUEST" && table.billing_mode != "PAY_PER_REQUEST" {
-            table.pay_per_request_at = Some(settles_at);
+            table.pay_per_request_at = Some(now);
         }
         table.billing_mode = billing_mode;
         table.provisioned_throughput = table_throughput;
@@ -521,6 +522,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         table.global_secondary_indexes = indexes;
         table.stream = stream;
         if let Some(table_class) = input.table_class.clone() {
+            // "The date and time at which the table class was last updated"
+            // (`TableClassSummary$LastUpdateDateTime`): this call is that update, so it
+            // is stamped at the instant the call was made — a request that re-states the
+            // class the table is already in updates nothing and stamps nothing.
+            if table.table_class.as_deref() != Some(table_class.as_str()) {
+                table.table_class_updated_at = Some(now);
+            }
             table.table_class = Some(table_class);
         }
         if let Some(protection) = input.deletion_protection_enabled {

@@ -291,6 +291,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .filter(|token| !token.is_empty());
 
+        // WHO this request speaks for, resolved before this service's store is locked
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
 
@@ -324,17 +327,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     responses: Some(vec![ItemResponse::default(); parsed.len()]),
                     consumed_capacity: completed
                         .ledger
-                        .consumed_capacity(requested_capacity)
-                        .map(|entries| entries.into_iter().map(read_units).collect()),
+                        .consumed_capacity(requested_capacity, crate::state::CapacityKind::Read),
                 });
             }
         }
 
         if reads == parsed.len() {
-            return read_transaction(&store, &region, now, &parsed, requested_capacity);
+            return read_transaction(
+                &mut store,
+                &caller,
+                &region,
+                now,
+                &parsed,
+                requested_capacity,
+            );
         }
         let answered = write_transaction(
             &mut store,
+            &caller,
             &region,
             now,
             &input.transact_statements,
@@ -376,54 +386,6 @@ const ORDER_BY_MESSAGE: &str =
     "ORDER BY is not supported for a read statement in a transaction, which reports at most one \
      item";
 
-/// Report every figure of `entry` as READ capacity as well as in the aggregate, and
-/// [`write_units`] the same as WRITE capacity.
-///
-/// "The entire transaction must consist of either read statements or write statements":
-/// a transaction's capacity is therefore wholly read units or wholly write units, so
-/// each aggregate figure it reports is also that kind's figure
-/// (`ConsumedCapacity$ReadCapacityUnits` / `$WriteCapacityUnits`, "the total number of
-/// read/write capacity units consumed by the operation").
-fn read_units(entry: ConsumedCapacity) -> ConsumedCapacity {
-    by_kind(entry, false)
-}
-
-/// The same for a write transaction. See [`read_units`].
-fn write_units(entry: ConsumedCapacity) -> ConsumedCapacity {
-    by_kind(entry, true)
-}
-
-/// Fill the read or the write figure of every `Capacity` in `entry` from its aggregate.
-fn by_kind(mut entry: ConsumedCapacity, write: bool) -> ConsumedCapacity {
-    fn split(capacity: &mut Capacity, write: bool) {
-        if write {
-            capacity.write_capacity_units = capacity.capacity_units;
-        } else {
-            capacity.read_capacity_units = capacity.capacity_units;
-        }
-    }
-    if write {
-        entry.write_capacity_units = entry.capacity_units;
-    } else {
-        entry.read_capacity_units = entry.capacity_units;
-    }
-    if let Some(table) = entry.table.as_mut() {
-        split(table, write);
-    }
-    for indexes in [
-        entry.local_secondary_indexes.as_mut(),
-        entry.global_secondary_indexes.as_mut(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        for capacity in indexes.values_mut() {
-            split(capacity, write);
-        }
-    }
-    entry
-}
-
 /// The request's statements, canonically encoded: what a repeated `ClientRequestToken`
 /// is compared against (through [`crate::state::action_fingerprint`], which is what the
 /// store keeps).
@@ -464,7 +426,8 @@ fn canonical_statements(entries: &[ParameterizedStatement]) -> String {
 /// A READ transaction: each `SELECT` reports the ONE item it addresses, and the store is
 /// not written at all.
 fn read_transaction(
-    store: &Store,
+    store: &mut Store,
+    caller: &crate::state::authorization::Caller,
     region: &str,
     now: ::std::time::SystemTime,
     parsed: &[crate::state::PartiqlStatement],
@@ -474,6 +437,11 @@ fn read_transaction(
     let mut consumed: Vec<ConsumedCapacity> = Vec::new();
     let mut keyed: ::std::collections::BTreeSet<(String, crate::state::ItemKey)> =
         ::std::collections::BTreeSet::new();
+    // What each table this transaction reads would consume, totalled: the read is admitted
+    // ALL-OR-NOTHING below, once every table's share is known, because a transaction that
+    // is refused consumed nothing anywhere.
+    let mut per_table: ::std::collections::BTreeMap<String, f64> =
+        ::std::collections::BTreeMap::new();
     for statement in parsed {
         let crate::state::PartiqlStatement::Select(select) = statement else {
             return Err(crate::scaffolded::Scaffolded::validation(
@@ -482,9 +450,9 @@ fn read_transaction(
         };
         let name = crate::state::resolve_table_name(&select.table).map_err(lift)?;
         let table = store.active_table(region, &name, now).map_err(lift)?;
-        // A table whose resource-based policy denies the caller this statement's own
-        // action is not read at all. PartiQL has its own four actions.
-        if let Some(denial) = crate::state::policy_denial(table, statement.action(), now) {
+        // A table the policies in force do not let this caller act on with this
+        // statement's own action is not read at all. PartiQL has its own four actions.
+        if let Some(denial) = crate::state::policy_denial(caller, table, statement.action(), now) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
         if select.index.is_some() {
@@ -521,12 +489,43 @@ fn read_transaction(
         let units =
             crate::state::read_capacity_units(found.as_ref().map_or(0, crate::state::item_size), true)
                 * crate::state::TRANSACTIONAL_CAPACITY_FACTOR;
-        consumed.extend(
-            crate::state::consumed_capacity(requested_capacity, &name, units).map(read_units),
-        );
+        consumed.extend(crate::state::consumed_capacity(
+            requested_capacity,
+            &name,
+            units,
+        ));
+        *per_table.entry(name.clone()).or_default() += units;
         responses.push(ItemResponse {
             item: found.map(|item| crate::state::project_item(&item, select.projection.as_ref())),
         });
+    }
+    // The read capacity each table is provisioned for bounds a PartiQL read transaction
+    // exactly as it bounds `TransactGetItems`: every table is asked whether it covers its
+    // whole share BEFORE any of them is debited, so a refused transaction leaves every
+    // budget where it was.
+    for (name, units) in &per_table {
+        if let Err(throttle) = store
+            .active_table(region, name, now)
+            .map_err(lift)?
+            .read_admits(*units, now)
+        {
+            return Err(
+                ExecuteTransactionErrorModeled::ProvisionedThroughputExceededException(
+                    crate::state::read_throughput_exceeded(
+                        &crate::state::table_arn(region, name),
+                        throttle,
+                    ),
+                )
+                .into(),
+            );
+        }
+    }
+    for (name, units) in &per_table {
+        // Every table covered its share a moment ago, so this takes it.
+        let _ = store
+            .active_table_mut(region, name, now)
+            .map_err(lift)?
+            .admit_read(*units, now);
     }
     Ok(ExecuteTransactionOutput {
         responses: Some(responses),
@@ -542,6 +541,7 @@ fn read_transaction(
 #[allow(clippy::too_many_arguments)]
 fn write_transaction(
     store: &mut Store,
+    caller: &crate::state::authorization::Caller,
     region: &str,
     now: ::std::time::SystemTime,
     entries: &[ParameterizedStatement],
@@ -569,7 +569,9 @@ fn write_transaction(
             entry.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD");
         {
             let table = store.active_table(region, &name, now).map_err(lift)?;
-            if let Some(denial) = crate::state::policy_denial(table, statement.action(), now) {
+            if let Some(denial) =
+                crate::state::policy_denial(caller, table, statement.action(), now)
+            {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
         }
@@ -832,10 +834,11 @@ fn write_transaction(
                 per_statement.scale(crate::state::TRANSACTIONAL_CAPACITY_FACTOR);
                 consumed.extend(
                     per_statement
-                        .consumed_capacity(requested_capacity)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(write_units),
+                        .consumed_capacity(
+                            requested_capacity,
+                            crate::state::CapacityKind::Write,
+                        )
+                        .unwrap_or_default(),
                 );
                 recorded.record(&statement.table, &capacity);
             }

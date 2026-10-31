@@ -493,7 +493,7 @@ async fn deletion_protection_refuses_the_delete_until_an_update_clears_it() {
 }
 
 #[tokio::test]
-async fn pay_per_request_is_dated_from_the_instant_the_mode_takes_effect() {
+async fn pay_per_request_is_dated_from_the_call_that_set_the_mode() {
     let router = emulator();
 
     /// The `LastUpdateToPayPerRequestDateTime` of a description, when present.
@@ -501,13 +501,14 @@ async fn pay_per_request_is_dated_from_the_instant_the_mode_takes_effect() {
         description["BillingModeSummary"]["LastUpdateToPayPerRequestDateTime"].as_f64()
     }
 
-    // A table's capacity mode at CREATE time: only an on-demand table is ever dated, and
-    // only once the mode is in effect — the create response still reports CREATING.
+    // A table's capacity mode at CREATE time: only a table that has been on-demand
+    // carries a `BillingModeSummary` at all, and the instant it reports is the instant of
+    // the call that set the mode — for a create, the table's own creation instant.
     let cases: [(&str, &str, bool); 2] = [
         ("created on-demand", "PAY_PER_REQUEST", true),
         ("created provisioned", "PROVISIONED", false),
     ];
-    for (case, mode, dated_once_active) in cases {
+    for (case, mode, on_demand) in cases {
         let name = format!("Dated{}", case.replace(' ', ""));
         let mut create = json!({
             "TableName": name,
@@ -522,11 +523,21 @@ async fn pay_per_request_is_dated_from_the_instant_the_mode_takes_effect() {
         let created = ok(&router, "CreateTable", create).await;
         assert_eq!(
             (
-                created["TableDescription"]["BillingModeSummary"]["BillingMode"].clone(),
+                created["TableDescription"]["TableThroughputModeSummary"]
+                    ["TableThroughputMode"]
+                    .clone(),
                 dated(&created["TableDescription"]),
             ),
-            (json!(mode), None),
-            "case {case}: the create response reports the mode but no instant yet, got {created}"
+            (
+                json!(mode),
+                on_demand.then(|| {
+                    created["TableDescription"]["CreationDateTime"]
+                        .as_f64()
+                        .unwrap_or_default()
+                }),
+            ),
+            "case {case}: the create response reports the mode, and the creation instant \
+             for a table it created on-demand, got {created}"
         );
 
         settle().await;
@@ -534,17 +545,17 @@ async fn pay_per_request_is_dated_from_the_instant_the_mode_takes_effect() {
         let first = dated(&described["Table"]);
         assert_eq!(
             first.is_some(),
-            dated_once_active,
-            "case {case}: expected dated={dated_once_active} once ACTIVE, got {described}"
+            on_demand,
+            "case {case}: expected dated={on_demand} once ACTIVE, got {described}"
         );
         if let Some(instant) = first {
             let creation = described["Table"]["CreationDateTime"]
                 .as_f64()
                 .unwrap_or_default();
-            assert!(
-                instant >= creation,
-                "case {case}: the mode took effect no earlier than the table did, got {instant} \
-                 against {creation}"
+            assert_eq!(
+                instant, creation,
+                "case {case}: a table created on-demand had the mode set when it was \
+                 created, got {instant} against {creation}"
             );
         }
         // Reading twice reports the same instant: it records when the mode was set, and
@@ -557,10 +568,10 @@ async fn pay_per_request_is_dated_from_the_instant_the_mode_takes_effect() {
         );
     }
 
-    // Switching an existing table's mode: the switch is asynchronous, so its own
-    // response carries no instant yet, and the instant appears once the switch is in
-    // effect. Switching back to PROVISIONED does not erase when PAY_PER_REQUEST was
-    // last set.
+    // Switching an existing table's mode: the capacity move is asynchronous, but the
+    // instant the member reports is the instant of the CALL, so the switch's own response
+    // already carries it and every later description reports the same one. Switching back
+    // to PROVISIONED does not erase when PAY_PER_REQUEST was last set.
     ok(
         &router,
         "CreateTable",
@@ -580,20 +591,23 @@ async fn pay_per_request_is_dated_from_the_instant_the_mode_takes_effect() {
         json!({"TableName": "Switched", "BillingMode": "PAY_PER_REQUEST"}),
     )
     .await;
+    let switch_echo = dated(&switched["TableDescription"]);
     assert_eq!(
         (
             status_of(&switched["TableDescription"]).clone(),
-            dated(&switched["TableDescription"]),
+            switch_echo.is_some(),
         ),
-        (json!("UPDATING"), None),
-        "case switch to on-demand: the accepted switch is not in effect yet, got {switched}"
+        (json!("UPDATING"), true),
+        "case switch to on-demand: the capacity move is still in flight, and the instant \
+         the switch was asked for is already reported, got {switched}"
     );
     settle().await;
     let in_effect = ok(&router, "DescribeTable", json!({"TableName": "Switched"})).await;
     let switch_instant = dated(&in_effect["Table"]);
     assert!(
-        switch_instant.is_some() && status_of(&in_effect["Table"]) == &json!("ACTIVE"),
-        "case switch to on-demand: the instant appears once the switch settles, got {in_effect}"
+        switch_instant == switch_echo && status_of(&in_effect["Table"]) == &json!("ACTIVE"),
+        "case switch to on-demand: the instant the switch reported stands once it settles, \
+         got {in_effect}"
     );
 
     ok(

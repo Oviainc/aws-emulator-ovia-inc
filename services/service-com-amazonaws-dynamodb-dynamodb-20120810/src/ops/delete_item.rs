@@ -340,13 +340,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
         }
 
+        // WHO this request speaks for, resolved before this service's store is locked
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let key = {
             let table = store.active_table(&region, &name, now).map_err(lift)?;
-            // A table whose resource-based policy denies the caller this action is not
-            // deleted from: authorization is decided before anything is removed.
-            if let Some(denial) = crate::state::policy_denial(table, "dynamodb:DeleteItem", now) {
+            // A table the policies in force do not let this caller write is not deleted
+            // from: authorization is decided before anything is removed.
+            if let Some(denial) =
+                crate::state::policy_denial(&caller, table, "dynamodb:DeleteItem", now)
+            {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
             table.key_of_key_map(&input.key).map_err(lift)?
@@ -422,6 +427,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.return_consumed_capacity.as_deref(),
                 &name,
                 &capacity,
+                crate::state::CapacityKind::Write,
             ),
             item_collection_metrics: item_collection_metrics.flatten(),
         })

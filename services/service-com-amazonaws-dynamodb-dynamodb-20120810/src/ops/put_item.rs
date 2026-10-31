@@ -50,10 +50,9 @@
 //! secondary index report nothing.
 //!
 //! Sizes a request can choose are bounded before the write lands: the item's own size
-//! (the documented 400 KB limit), its nesting (the documented 32 levels) and the
-//! emulator's own budgets for what one table and the whole store may hold
-//! ([`crate::state::MAX_TABLE_SIZE_BYTES`] and friends, enforced by
-//! [`crate::state::ComAmazonawsDynamodbDynamodb20120810State::put_item`]).
+//! (the documented 400 KB limit, [`crate::state::MAX_ITEM_SIZE_BYTES`]) and its nesting
+//! (the documented 32 levels). The service puts no ceiling on how much a table HOLDS, so
+//! a legal item is stored however much data the table already carries.
 //!
 //! The VALUES a request carries are held to the documented rules for their type before
 //! the write lands too: a key attribute's size and emptiness
@@ -411,13 +410,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // precision and range), BEFORE any table is looked up, because none of those
         // rules depends on the table.
 
+        // WHO this request speaks for, resolved before this service's store is locked
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let key = {
             let table = store.active_table(&region, &name, now).map_err(lift)?;
-            // A table whose resource-based policy denies the caller this action is not
-            // written to at all: authorization is decided before the item is keyed.
-            if let Some(denial) = crate::state::policy_denial(table, "dynamodb:PutItem", now) {
+            // A table the policies in force do not let this caller write is not written
+            // to at all: authorization is decided before the item is keyed.
+            if let Some(denial) =
+                crate::state::policy_denial(&caller, table, "dynamodb:PutItem", now)
+            {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
             // The key attributes are bounded by the documented key-value limits, for
@@ -504,6 +508,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.return_consumed_capacity.as_deref(),
                 &name,
                 &capacity,
+                crate::state::CapacityKind::Write,
             ),
             item_collection_metrics: item_collection_metrics.flatten(),
         })

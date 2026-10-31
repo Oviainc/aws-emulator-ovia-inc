@@ -344,10 +344,19 @@ async fn a_restore_creates_the_table_the_backup_recorded() {
             restored["TableId"]
         );
         assert_eq!(
-            restored["BillingModeSummary"]["BillingMode"],
+            restored["TableThroughputModeSummary"]["TableThroughputMode"],
             json!(billing_mode),
-            "case {case}: expected BillingMode {billing_mode}, got {}",
-            restored["BillingModeSummary"]
+            "case {case}: expected the throughput mode {billing_mode}, got {}",
+            restored["TableThroughputModeSummary"]
+        );
+        // A restored table carries a `BillingModeSummary` only where the restore put it
+        // on-demand: "you may need to switch to on-demand mode at least once in order to
+        // return a BillingModeSummary response".
+        assert_eq!(
+            restored.get("BillingModeSummary").is_some(),
+            billing_mode == "PAY_PER_REQUEST",
+            "case {case}: expected BillingModeSummary present={}, got {restored}",
+            billing_mode == "PAY_PER_REQUEST"
         );
         assert_eq!(
             reported_capacity(&restored),

@@ -240,6 +240,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(MIXED_BATCH_MESSAGE));
         }
 
+        // WHO this request speaks for, resolved before this service's store is locked
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
         check_distinct_write_targets(&store, &region, now, &parsed)?;
@@ -253,6 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let served = statement.map_err(SlotFailure::from).and_then(|statement| {
                 run_slot(
                     &mut store,
+                    &caller,
                     &region,
                     now,
                     request,
@@ -418,6 +422,7 @@ type SlotOutcome = (BatchStatementResponse, Option<ConsumedCapacity>);
 /// Serve one statement of the batch.
 fn run_slot(
     store: &mut Store,
+    caller: &crate::state::authorization::Caller,
     region: &str,
     now: ::std::time::SystemTime,
     request: &BatchStatementRequest,
@@ -426,13 +431,13 @@ fn run_slot(
 ) -> Result<SlotOutcome, SlotFailure> {
     let name = crate::state::resolve_table_name(statement.table())?;
     {
-        // A table that is not there, and a table whose resource-based policy denies the
-        // caller this statement's own PartiQL action, are decided before the statement
-        // reads or writes anything.
+        // A table that is not there, and a table the policies in force do not let this
+        // caller act on with this statement's own PartiQL action, are decided before the
+        // statement reads or writes anything.
         let table = store
             .active_table(region, &name, now)
             .map_err(|error| SlotFailure::from(error).at(&name))?;
-        if let Some(denial) = crate::state::policy_denial(table, statement.action(), now) {
+        if let Some(denial) = crate::state::policy_denial(caller, table, statement.action(), now) {
             return Err(SlotFailure::new(ACCESS_DENIED_CODE, denial).at(&name));
         }
     }
@@ -560,6 +565,14 @@ fn read_item(
         found.as_ref().map_or(0, crate::state::item_size),
         consistent_read,
     );
+    // The read is ADMITTED against the read capacity the table is provisioned for, the
+    // same as every other read surface: a statement past that capacity reports the
+    // throttling code in its OWN slot rather than failing the batch as a whole, which is
+    // how a batch reports a per-statement refusal ([`admit_write`] does it for a write).
+    store
+        .active_table_mut(region, name, now)?
+        .admit_read(units, now)
+        .map_err(|throttle| SlotFailure::new(throttle.code(), throttle.message()).at(name))?;
     Ok((
         BatchStatementResponse {
             item: found.map(|item| crate::state::project_item(&item, select.projection.as_ref())),
@@ -628,7 +641,12 @@ fn insert_item(
         // An `INSERT` states no `RETURNING` clause, so its slot reports the write and
         // no item.
         BatchStatementResponse::default(),
-        crate::state::consumed_write_capacity(requested_capacity, name, &capacity),
+        crate::state::consumed_write_capacity(
+            requested_capacity,
+            name,
+            &capacity,
+            crate::state::CapacityKind::Write,
+        ),
     ))
 }
 
@@ -717,7 +735,12 @@ fn update_item(
             item: reported,
             ..BatchStatementResponse::default()
         },
-        crate::state::consumed_write_capacity(requested_capacity, name, &capacity),
+        crate::state::consumed_write_capacity(
+            requested_capacity,
+            name,
+            &capacity,
+            crate::state::CapacityKind::Write,
+        ),
     ))
 }
 
@@ -770,7 +793,12 @@ fn delete_item(
             item: reported,
             ..BatchStatementResponse::default()
         },
-        crate::state::consumed_write_capacity(requested_capacity, name, &capacity),
+        crate::state::consumed_write_capacity(
+            requested_capacity,
+            name,
+            &capacity,
+            crate::state::CapacityKind::Write,
+        ),
     ))
 }
 

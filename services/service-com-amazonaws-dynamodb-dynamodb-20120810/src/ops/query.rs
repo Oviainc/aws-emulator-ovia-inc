@@ -440,14 +440,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ])
         .map_err(lift)?;
 
+        // WHO this request speaks for, resolved before this service's store is locked
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let table = store.active_table(&region, &name, now).map_err(lift)?;
-        // A table whose resource-based policy denies the caller this action answers the
-        // denial, not its items.
-        if let Some(denial) = crate::state::policy_denial(table, "dynamodb:Query", now) {
+        // A table the policies in force do not let this caller read answers the denial,
+        // not its items.
+        if let Some(denial) = crate::state::policy_denial(&caller, table, "dynamodb:Query", now) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
-        }        let condition = KeyCondition::resolve(table, comparisons).map_err(lift)?;
+        }
+        let condition = KeyCondition::resolve(table, comparisons).map_err(lift)?;
         // "A FilterExpression does not allow key attributes. You cannot define a
         // filter expression based on a partition key or a sort key": which attributes
         // the expression reads comes from the parsed tree, judged against the table's
@@ -552,6 +556,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let count = i32::try_from(kept.len()).unwrap_or(i32::MAX);
 
+        let units =
+            crate::state::read_capacity_units(page_size, input.consistent_read.unwrap_or(false));
+        // The read is ADMITTED against the read capacity the table is provisioned for:
+        // the units it consumes are the ones this response bills — every item the page
+        // read, filtered or not — and a read past that capacity is refused rather than
+        // served.
+        if let Err(throttle) = store
+            .active_table_mut(&region, &name, now)
+            .map_err(lift)?
+            .admit_read(units, now)
+        {
+            return Err(QueryErrorModeled::ProvisionedThroughputExceededException(
+                crate::state::read_throughput_exceeded(
+                    &crate::state::table_arn(&region, &name),
+                    throttle,
+                ),
+            )
+            .into());
+        }
+
         Ok(QueryOutput {
             items: if count_only { None } else { Some(kept) },
             count,
@@ -560,10 +584,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             consumed_capacity: crate::state::consumed_capacity(
                 input.return_consumed_capacity.as_deref(),
                 &name,
-                crate::state::read_capacity_units(
-                    page_size,
-                    input.consistent_read.unwrap_or(false),
-                ),
+                units,
             ),
         })
     }

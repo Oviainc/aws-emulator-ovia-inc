@@ -221,6 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // WHO this request speaks for, resolved before this service's store is locked
+        // ([`crate::state::authorization`]).
+        let caller = crate::state::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
         store.apply_due_transitions(now);
 
@@ -228,15 +231,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut keyed: std::collections::BTreeSet<(String, crate::state::ItemKey)> =
             std::collections::BTreeSet::new();
         let mut ledger = crate::state::ReadLedger::default();
+        // What each table the transaction reads would consume, totalled: the read is
+        // admitted all-or-nothing BELOW, once every table's share is known, because a
+        // transaction that is refused consumed nothing anywhere.
+        let mut per_table: std::collections::BTreeMap<String, f64> =
+            std::collections::BTreeMap::new();
         for requested in &input.transact_items {
             let name = crate::state::resolve_table_name(&requested.get.table_name).map_err(lift)?;
             for (attribute, value) in &requested.get.key {
                 crate::state::check_attribute_value(attribute, value).map_err(lift)?;
             }
             let table = store.active_table(&region, &name, now).map_err(lift)?;
-            // A table whose resource-based policy denies the caller the read answers the
+            // A table the policies in force do not let this caller read answers the
             // denial, not its items: a transactional get performs `dynamodb:GetItem`.
-            if let Some(denial) = crate::state::policy_denial(table, "dynamodb:GetItem", now) {
+            if let Some(denial) =
+                crate::state::policy_denial(&caller, table, "dynamodb:GetItem", now)
+            {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
             let key = table.key_of_key_map(&requested.get.key).map_err(lift)?;
@@ -245,19 +255,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::DUPLICATE_TRANSACT_ITEM_MESSAGE,
                 ));
             }
-            let item = table.items.get(&key);
+            let item = table.items.get(&key).cloned();
             // A key that holds no item still consumed the read it asked for, which is why
             // the capacity is charged for every `Get` and only the ones that were there
             // report an `Item`.
-            let size = item.map_or(0, crate::state::item_size);
-            ledger.record(
-                &name,
-                crate::state::read_capacity_units(size, true)
-                    * crate::state::TRANSACTIONAL_CAPACITY_FACTOR,
-            );
-            responses.push(ItemResponse {
-                item: item.cloned(),
-            });
+            let size = item.as_ref().map_or(0, crate::state::item_size);
+            let units = crate::state::read_capacity_units(size, true)
+                * crate::state::TRANSACTIONAL_CAPACITY_FACTOR;
+            *per_table.entry(name.clone()).or_default() += units;
+            ledger.record(&name, units);
+            responses.push(ItemResponse { item });
+        }
+
+        // "The entire transaction is rejected" when any part of it cannot be served, so
+        // every table is asked whether it covers its whole share BEFORE any of them is
+        // debited: a refused transaction leaves every budget where it was, exactly as a
+        // refused transactional WRITE does.
+        for (name, units) in &per_table {
+            if let Err(throttle) = store
+                .active_table(&region, name, now)
+                .map_err(lift)?
+                .read_admits(*units, now)
+            {
+                return Err(
+                    TransactGetItemsErrorModeled::ProvisionedThroughputExceededException(
+                        crate::state::read_throughput_exceeded(
+                            &crate::state::table_arn(&region, name),
+                            throttle,
+                        ),
+                    )
+                    .into(),
+                );
+            }
+        }
+        for (name, units) in &per_table {
+            // Every table covered its share a moment ago, so this takes it.
+            let _ = store
+                .active_table_mut(&region, name, now)
+                .map_err(lift)?
+                .admit_read(*units, now);
         }
 
         Ok(TransactGetItemsOutput {

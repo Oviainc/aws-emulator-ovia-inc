@@ -423,11 +423,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let active_at = now + crate::state::STATUS_TRANSITION;
         // A table created on-demand has `PAY_PER_REQUEST` set as its capacity mode by
-        // this call, and the mode takes effect when the table does, so the instant
-        // `BillingModeSummary.LastUpdateToPayPerRequestDateTime` reports is the one the
-        // table becomes ACTIVE at — this response still reports the table CREATING and
-        // therefore carries no timestamp yet.
-        let pay_per_request_at = (billing_mode == "PAY_PER_REQUEST").then_some(active_at);
+        // this call, so the instant
+        // `BillingModeSummary.LastUpdateToPayPerRequestDateTime` records is the instant
+        // the table was created at — the mode was never anything else, and this
+        // response reports it already.
+        let pay_per_request_at = (billing_mode == "PAY_PER_REQUEST").then_some(now);
         // A stream the request enables is registered in the DYNAMODB STREAMS store
         // (`crate::state::register_table_stream`), because the stream, its shards and
         // its records are that service's resources; this table keeps only the latest
@@ -466,6 +466,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             local_secondary_indexes,
             vector_indexes,
             table_class: input.table_class.clone(),
+            // The create SET this table's class; no call has updated it since, so there
+            // is no update instant to report under `TableClassSummary`.
+            table_class_updated_at: None,
             deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
             // A new table's continuous backups are on and its point-in-time recovery is
             // off: `CreateTable` carries no `PointInTimeRecoverySpecification`, so
@@ -488,6 +491,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new table has consumed none of the capacity it is provisioned for, so
             // its first write has the whole documented burst behind it.
             write_budget: crate::state::CapacityBudget::new(now),
+            // The same for the capacity it is provisioned to READ with.
+            read_budget: crate::state::CapacityBudget::new(now),
             key_write_budgets: crate::state::KeyWriteBudgets::default(),
             // A new table has been metered once, at zero: `ItemCount`/`TableSizeBytes` are
             // refreshed "approximately every six hours", not by the writes that follow.

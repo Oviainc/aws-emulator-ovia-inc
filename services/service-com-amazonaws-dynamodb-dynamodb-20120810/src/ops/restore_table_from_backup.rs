@@ -364,6 +364,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // No `TableClass` is recorded by a backup and no override names one, so the
             // restored table reports none, exactly as a create that names none does.
             table_class: None,
+            // No call has updated this table's class, so there is no update instant to
+            // report under `TableClassSummary`.
+            table_class_updated_at: None,
             deletion_protection_enabled: false,
             point_in_time_recovery: crate::state::PointInTimeRecovery::default(),
             // "You must manually set up the following on the restored table: ... Tags
@@ -376,8 +379,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             active_at,
             updated_at: None,
             // A table restored on-demand has `PAY_PER_REQUEST` set as its capacity mode
-            // by this call, and the mode takes effect when the table does.
-            pay_per_request_at: (billing_mode == "PAY_PER_REQUEST").then_some(active_at),
+            // by this call, which is the instant the table was created at — the same
+            // rule a create follows.
+            pay_per_request_at: (billing_mode == "PAY_PER_REQUEST").then_some(now),
             removed_at: None,
             items,
             // Metered below, once the items are in place: this table holds the backup's
@@ -386,6 +390,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stored_bytes,
             // A new table has consumed none of the capacity it is provisioned for.
             write_budget: crate::state::CapacityBudget::new(now),
+            read_budget: crate::state::CapacityBudget::new(now),
             key_write_budgets: crate::state::KeyWriteBudgets::default(),
             contributor_insights: crate::state::ContributorInsights::default(),
             // TTL is one of the settings the doc above has a caller set up again on the
