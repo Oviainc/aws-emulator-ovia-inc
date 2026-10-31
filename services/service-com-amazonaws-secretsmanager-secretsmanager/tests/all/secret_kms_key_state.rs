@@ -1,0 +1,850 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The secret value's ENVELOPE: every read of a secret under a customer managed
+//! KMS key decrypts through that key, and every write encrypts through it, so the
+//! key's own state decides both.
+//!
+//! The rule these tables assert: a secret naming a customer managed key holds its
+//! versions sealed under data keys that key wrapped, so a key KMS will not perform
+//! a cryptographic operation with refuses the read with `DecryptionFailure` and the
+//! write with `EncryptionFailure` — each relaying the KMS refusal it met — and the
+//! write stores nothing; a secret left on the Amazon Web Services managed key names
+//! no key a caller can act on, so nothing stands between its reads and its value.
+//!
+//! The rows span what the rule generalises over rather than one recorded request:
+//! the FORM the secret names its key in (key ARN, bare key id, alias name, alias
+//! ARN), the member and size of the value (a short string, a large JSON document, a
+//! binary blob), the KEY STATE that refuses the call (disabled, pending deletion),
+//! and the OPERATION that reads or writes the value (`GetSecretValue` by label and
+//! by version id, `BatchGetSecretValue`, `PutSecretValue`, `UpdateSecret`,
+//! `CreateSecret`).
+//!
+//! KMS is mounted beside Secrets Manager on ONE engine, the shape
+//! `core/router/src/lib.rs` mounts them in, so every key below is a real key minted
+//! through KMS's own operations and every state change is made through them too.
+
+use std::sync::Arc;
+
+use serde_json::{json, Map, Value};
+use service_com_amazonaws_secretsmanager_secretsmanager::state::ComAmazonawsSecretsmanagerSecretsmanagerState;
+use service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+use crate::secret_lifecycle::ValueCase;
+
+/// The region every request in this suite signs for: a KMS key is regional, and
+/// Secrets Manager calls the key in the region the request was addressed to, so the
+/// keys and the secrets below live in the same one.
+const REGION: &str = "us-west-2";
+
+/// How a read refusal introduces the KMS refusal it relays: Secrets Manager states
+/// what it could not do and then relays the wrapped failure, which is how the
+/// refusal of a secret under an unusable key is worded on the wire.
+const DECRYPTION_SENTENCE: &str = "Secrets Manager can't decrypt the secret value:";
+
+/// The mirror of [`DECRYPTION_SENTENCE`] for a write refusal.
+const ENCRYPTION_SENTENCE: &str = "Secrets Manager can't encrypt the secret value:";
+
+/// What the relayed clause states about the wrapped KMS refusal beside its message:
+/// the service that answered and the status its class is answered with, before the
+/// code it was stated under.
+const RELAY_FIELDS: &str = "(Service: AWSKMS; Status Code: 400; Error Code: ";
+
+/// How the relayed clause ends: the identifier of the answer it relays, then the
+/// proxy field, which no in-process answer came through.
+const RELAY_TAIL: &str = "; Proxy: null)";
+
+/// Secrets Manager and KMS over one shared engine, behind the same
+/// `MultiServiceRouter` the production router builds.
+///
+/// `Clone` shares that one router and that one engine, so a concurrency case can
+/// hand a copy to each task and every request still reaches the same store.
+#[derive(Clone)]
+struct Emulator {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl Emulator {
+    fn new() -> Self {
+        Self::build(true)
+    }
+
+    /// An emulator assembled WITHOUT KMS, which is the one deployment where a value
+    /// under a customer managed key is held as sent: nothing answers the seal call,
+    /// so nothing is said about the key.
+    fn without_kms() -> Self {
+        Self::build(false)
+    }
+
+    fn build(with_kms: bool) -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        if with_kms {
+            router.register_service(
+                service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&engine)),
+            );
+        }
+        Self { router, engine }
+    }
+
+    /// POST one `awsJson1_1` operation of `service`, signed for [`REGION`], and
+    /// answer its status and parsed body.
+    async fn call(
+        &self,
+        service: &str,
+        target_prefix: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://{service}.{REGION}.amazonaws.com/"))
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("{target_prefix}.{operation}"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{service}/aws4_request, SignedHeaders=host;x-amz-target, Signature=deadbeef"
+                ),
+            )
+            .body(bytes::Bytes::from(
+                serde_json::to_vec(body).expect("the request body is serializable"),
+            ))
+            .expect("a valid request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        (status, parsed)
+    }
+
+    /// One Secrets Manager operation.
+    async fn sm(&self, operation: &str, body: &Value) -> (u16, Value) {
+        self.call("secretsmanager", "secretsmanager", operation, body)
+            .await
+    }
+
+    /// One Secrets Manager operation that must succeed.
+    async fn sm_ok(&self, operation: &str, body: &Value, case: &str) -> Value {
+        let (status, parsed) = self.sm(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from {operation}, got {status} with body {parsed}"
+        );
+        parsed
+    }
+
+    /// One Secrets Manager operation that must be refused, answered as
+    /// `(error code, message)`.
+    async fn sm_err(&self, operation: &str, body: &Value, case: &str) -> (String, String) {
+        let (status, parsed) = self.sm(operation, body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a 400 client error from {operation}, got {status} with \
+             body {parsed}"
+        );
+        let raw = parsed
+            .get("__type")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: no __type in error body {parsed}"));
+        let message = parsed
+            .get("Message")
+            .or_else(|| parsed.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: no Message in error body {parsed}"))
+            .to_string();
+        (
+            raw.split('#').next_back().unwrap_or(raw).to_string(),
+            message,
+        )
+    }
+
+    /// One KMS operation that must succeed.
+    async fn kms_ok(&self, operation: &str, body: &Value, case: &str) -> Value {
+        let (status, parsed) = self
+            .call("kms", "TrentService", operation, body)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from KMS {operation}, got {status} with body {parsed}"
+        );
+        parsed
+    }
+
+    /// Mint a symmetric KMS key in [`REGION`] and answer it as `(key ARN, key id)`.
+    async fn create_key(&self, case: &str) -> (String, String) {
+        let created = self.kms_ok("CreateKey", &json!({}), case).await;
+        let metadata = &created["KeyMetadata"];
+        let arn = metadata["Arn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: CreateKey reported no Arn in {created}"))
+            .to_string();
+        let key_id = metadata["KeyId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: CreateKey reported no KeyId in {created}"))
+            .to_string();
+        (arn, key_id)
+    }
+
+    /// Whether the version `AWSCURRENT` names of the secret `name` is held SEALED —
+    /// read straight out of the shared store, because the one thing a response
+    /// cannot show is that the stored value is not the plaintext.
+    fn current_version_is_sealed(&self, name: &str, case: &str) -> bool {
+        let state = self
+            .engine
+            .state::<ComAmazonawsSecretsmanagerSecretsmanagerState>();
+        let store = state.lock();
+        let secret = store
+            .get(name)
+            .unwrap_or_else(|| panic!("case {case:?}: the store holds no secret {name:?}"));
+        secret
+            .version_with_stage("AWSCURRENT")
+            .unwrap_or_else(|| panic!("case {case:?}: {name:?} has no AWSCURRENT version"))
+            .value
+            .is_sealed()
+    }
+}
+
+/// How many versions a secret holds, deprecated ones included — what a refused
+/// write must leave unchanged.
+async fn version_count(emulator: &Emulator, secret_id: &str, case: &str) -> usize {
+    let listed = emulator
+        .sm_ok(
+            "ListSecretVersionIds",
+            &json!({"SecretId": secret_id, "IncludeDeprecated": true}),
+            case,
+        )
+        .await;
+    listed["Versions"]
+        .as_array()
+        .map_or(0, |versions| versions.len())
+}
+
+/// A `CreateSecret` body naming `name`, the key `kms_key_id` and this value.
+fn create_body(name: &str, kms_key_id: Option<&str>, value: &ValueCase) -> Value {
+    let mut body = Map::new();
+    body.insert("Name".to_string(), json!(name));
+    if let Some(kms_key_id) = kms_key_id {
+        body.insert("KmsKeyId".to_string(), json!(kms_key_id));
+    }
+    if let Value::Object(members) = value.wire_members() {
+        body.extend(members);
+    }
+    Value::Object(body)
+}
+
+/// Assert a refusal is worded as this error class is: Secrets Manager's own clause
+/// for what it could not do, then the wrapped KMS refusal — the message KMS stated,
+/// the code it stated it under, and the fields that name the answer it came from.
+fn assert_relays_kms(message: &str, sentence: &str, kms_code: &str, kms_phrase: &str, case: &str) {
+    assert!(
+        message.starts_with(sentence),
+        "case {case:?}: expected the message to start {sentence:?}, got {message:?}"
+    );
+    let clause = format!("{RELAY_FIELDS}{kms_code}; Request ID: ");
+    assert!(
+        message.contains(&clause),
+        "case {case:?}: expected the relayed clause {clause:?} in the message, got {message:?}"
+    );
+    assert!(
+        message.contains(kms_phrase),
+        "case {case:?}: expected the wrapped KMS refusal {kms_phrase:?} in the message, got \
+         {message:?}"
+    );
+    // The clause ends with the identifier of the answer it relays, which is one
+    // answer's own value and so is checked by its FORM: a non-empty identifier, and
+    // nothing of the clause's own punctuation inside it.
+    let request_id = message
+        .split_once(&clause)
+        .and_then(|(_, tail)| tail.strip_suffix(RELAY_TAIL))
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected the message to end {RELAY_TAIL:?}, got {message:?}")
+        });
+    assert!(
+        !request_id.is_empty() && !request_id.contains(';') && !request_id.contains(' '),
+        "case {case:?}: expected the relayed answer's identifier, got {request_id:?} in \
+         {message:?}"
+    );
+}
+
+/// The value table: the member and the size of what a caller stores, which the
+/// envelope is the same for.
+fn value_cases() -> Vec<ValueCase> {
+    vec![
+        ValueCase::string("a short string", "s3cr3t"),
+        ValueCase::string(
+            "a JSON document",
+            json!({"username": "admin", "password": "p@ssw0rd", "host": "db.internal"}).to_string(),
+        ),
+        // Larger than one AES block and not a multiple of it, so the ciphertext is
+        // not a single block however the AEAD pads.
+        ValueCase::string("a long string", "x".repeat(1_000)),
+        ValueCase::binary("a binary blob", (0u8..=255).cycle().take(300).collect()),
+        ValueCase::binary("a one-byte blob", vec![0x00]),
+    ]
+}
+
+#[tokio::test]
+async fn a_secret_under_a_customer_managed_key_is_sealed_under_it_and_reads_back() {
+    let emulator = Emulator::new();
+    // Every form `KmsKeyId` accepts: "the ARN, key ID, or alias of the KMS key"
+    // (`CreateSecretRequest$KmsKeyId`, this service's Smithy model), and the alias
+    // in both its spellings.
+    for (form, by_arn, by_alias) in [
+        ("a key ARN", true, false),
+        ("a bare key id", false, false),
+        ("an alias name", false, true),
+        ("an alias ARN", false, true),
+    ] {
+        for (index, value) in value_cases().iter().enumerate() {
+            let case = format!("{form}, {}", value.label);
+            let (key_arn, key_id) = emulator.create_key(&case).await;
+            let alias = format!("alias/envelope-{form}-{index}").replace(' ', "-");
+            emulator
+                .kms_ok(
+                    "CreateAlias",
+                    &json!({"AliasName": alias, "TargetKeyId": key_arn}),
+                    &case,
+                )
+                .await;
+            let named = match (by_arn, by_alias, form) {
+                (true, _, _) => key_arn.clone(),
+                (_, true, "an alias ARN") => {
+                    format!("arn:aws:kms:{REGION}:{}:{alias}", engine::EMULATOR_ACCOUNT_ID)
+                }
+                (_, true, _) => alias.clone(),
+                _ => key_id.clone(),
+            };
+            let name = format!("envelope-{}-{index}", form.replace(' ', "-"));
+
+            emulator
+                .sm_ok(
+                    "CreateSecret",
+                    &create_body(&name, Some(&named), value),
+                    &case,
+                )
+                .await;
+
+            // The stored value is not the plaintext: a customer managed key sealed
+            // it, which is what makes a read depend on that key at all.
+            assert!(
+                emulator.current_version_is_sealed(&name, &case),
+                "case {case:?}: expected the stored version to be sealed under the \
+                 customer managed key, got a value held as sent"
+            );
+
+            let read = emulator
+                .sm_ok("GetSecretValue", &json!({"SecretId": name}), &case)
+                .await;
+            value.assert_round_trip(&read, &case);
+
+            // The batched read opens the same envelope, so it answers the same value.
+            let batch = emulator
+                .sm_ok(
+                    "BatchGetSecretValue",
+                    &json!({"SecretIdList": [name]}),
+                    &case,
+                )
+                .await;
+            let entries = batch["SecretValues"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: no SecretValues in {batch}"));
+            assert_eq!(
+                entries.len(),
+                1,
+                "case {case:?}: expected one batched entry, got {batch}"
+            );
+            value.assert_round_trip(&entries[0], &case);
+
+            // And a new version goes through the key as well, so it reads back too.
+            let put = ValueCase::string("a replacement", "rotated-value");
+            let mut put_body = Map::new();
+            put_body.insert("SecretId".to_string(), json!(name));
+            if let Value::Object(members) = put.wire_members() {
+                put_body.extend(members);
+            }
+            emulator
+                .sm_ok("PutSecretValue", &Value::Object(put_body), &case)
+                .await;
+            let reread = emulator
+                .sm_ok("GetSecretValue", &json!({"SecretId": name}), &case)
+                .await;
+            put.assert_round_trip(&reread, &case);
+        }
+    }
+}
+
+#[tokio::test]
+async fn reads_and_writes_are_refused_while_the_secret_key_cannot_be_used() {
+    // The key states a cryptographic operation is refused for, each made through
+    // KMS's own operation, with the refusal KMS answers under: a disabled key is
+    // `DisabledException`, and any other unusable state is
+    // `KMSInvalidStateException` naming the state the key is in.
+    let unusable = [
+        (
+            "the key is disabled",
+            "DisableKey",
+            json!({}),
+            "DisabledException",
+            "is disabled.",
+        ),
+        (
+            "the key is pending deletion",
+            "ScheduleKeyDeletion",
+            json!({"PendingWindowInDays": 7}),
+            "KMSInvalidStateException",
+            "is pending deletion.",
+        ),
+    ];
+
+    for (label, kms_operation, extra, kms_code, kms_phrase) in unusable {
+        for (index, value) in value_cases().iter().enumerate() {
+            let emulator = Emulator::new();
+            let case = format!("{label}, {}", value.label);
+            let (key_arn, _) = emulator.create_key(&case).await;
+            let name = format!("unusable-{index}");
+            let created = emulator
+                .sm_ok(
+                    "CreateSecret",
+                    &create_body(&name, Some(&key_arn), value),
+                    &case,
+                )
+                .await;
+            let version_id = created["VersionId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no VersionId in {created}"))
+                .to_string();
+            let before = version_count(&emulator, &name, &case).await;
+
+            // The secret is readable and writable while the key is usable, so the
+            // refusals below are the key's state and nothing else.
+            emulator
+                .sm_ok("GetSecretValue", &json!({"SecretId": name}), &case)
+                .await;
+
+            let mut request = Map::new();
+            request.insert("KeyId".to_string(), json!(key_arn));
+            if let Value::Object(members) = extra.clone() {
+                request.extend(members);
+            }
+            emulator
+                .kms_ok(kms_operation, &Value::Object(request), &case)
+                .await;
+
+            // Every way of addressing the stored value is refused, and every one of
+            // them is refused with Secrets Manager's OWN code for a value it could
+            // not decrypt.
+            for (addressed, body) in [
+                ("by AWSCURRENT", json!({"SecretId": name})),
+                (
+                    "by version id",
+                    json!({"SecretId": name, "VersionId": version_id}),
+                ),
+                (
+                    "by stage",
+                    json!({"SecretId": name, "VersionStage": "AWSCURRENT"}),
+                ),
+            ] {
+                let case = format!("{case}, read {addressed}");
+                let (code, message) = emulator.sm_err("GetSecretValue", &body, &case).await;
+                assert_eq!(
+                    code, "DecryptionFailure",
+                    "case {case:?}: expected DecryptionFailure, got {code} with {message:?}"
+                );
+                assert_relays_kms(&message, DECRYPTION_SENTENCE, kms_code, kms_phrase, &case);
+                // KMS names the key its state refused the call for, by ARN, and
+                // that is the wording the relay carries.
+                assert!(
+                    message.contains(&key_arn),
+                    "case {case:?}: expected the relayed refusal to name the key {key_arn}, \
+                     got {message:?}"
+                );
+            }
+
+            // The batched read fails that secret alone, inside a 200: "you can see
+            // the errors in Errors in the response".
+            let batched_case = format!("{case}, batched read");
+            let batch = emulator
+                .sm_ok(
+                    "BatchGetSecretValue",
+                    &json!({"SecretIdList": [name]}),
+                    &batched_case,
+                )
+                .await;
+            assert_eq!(
+                batch["SecretValues"].as_array().map(Vec::len),
+                Some(0),
+                "case {batched_case:?}: expected no batched value, got {batch}"
+            );
+            let errors = batch["Errors"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {batched_case:?}: no Errors in {batch}"));
+            assert_eq!(
+                errors.len(),
+                1,
+                "case {batched_case:?}: expected one batched error, got {batch}"
+            );
+            assert_eq!(
+                errors[0]["ErrorCode"].as_str(),
+                Some("DecryptionFailure"),
+                "case {batched_case:?}: expected a DecryptionFailure entry, got {batch}"
+            );
+            assert_relays_kms(
+                errors[0]["Message"].as_str().unwrap_or_default(),
+                DECRYPTION_SENTENCE,
+                kms_code,
+                kms_phrase,
+                &batched_case,
+            );
+
+            // Every write of a VALUE is refused with the mirror code, and stores
+            // nothing.
+            let replacement = ValueCase::string("a replacement", "written-under-a-dead-key");
+            for operation in ["PutSecretValue", "UpdateSecret"] {
+                let case = format!("{case}, {operation}");
+                let mut body = Map::new();
+                body.insert("SecretId".to_string(), json!(name));
+                if let Value::Object(members) = replacement.wire_members() {
+                    body.extend(members);
+                }
+                let (code, message) = emulator
+                    .sm_err(operation, &Value::Object(body), &case)
+                    .await;
+                assert_eq!(
+                    code, "EncryptionFailure",
+                    "case {case:?}: expected EncryptionFailure, got {code} with {message:?}"
+                );
+                assert_relays_kms(&message, ENCRYPTION_SENTENCE, kms_code, kms_phrase, &case);
+                assert_eq!(
+                    version_count(&emulator, &name, &case).await,
+                    before,
+                    "case {case:?}: a refused write stored a version"
+                );
+            }
+
+            // A metadata-only update encrypts nothing, so the key's state does not
+            // reach it: "If you include SecretString or SecretBinary, then Secrets
+            // Manager creates a new version".
+            let metadata_case = format!("{case}, metadata-only UpdateSecret");
+            emulator
+                .sm_ok(
+                    "UpdateSecret",
+                    &json!({"SecretId": name, "Description": "still describable"}),
+                    &metadata_case,
+                )
+                .await;
+
+            // And a create naming the same key stores no secret at all.
+            let create_case = format!("{case}, CreateSecret");
+            let fresh = format!("{name}-fresh");
+            let (code, message) = emulator
+                .sm_err(
+                    "CreateSecret",
+                    &create_body(&fresh, Some(&key_arn), value),
+                    &create_case,
+                )
+                .await;
+            assert_eq!(
+                code, "EncryptionFailure",
+                "case {create_case:?}: expected EncryptionFailure, got {code} with {message:?}"
+            );
+            assert_relays_kms(
+                &message,
+                ENCRYPTION_SENTENCE,
+                kms_code,
+                kms_phrase,
+                &create_case,
+            );
+            let (status, parsed) = emulator
+                .sm("DescribeSecret", &json!({"SecretId": fresh}))
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {create_case:?}: expected the refused create to store nothing, got \
+                 {status} with {parsed}"
+            );
+            assert_eq!(
+                parsed["__type"]
+                    .as_str()
+                    .and_then(|raw| raw.split('#').next_back()),
+                Some("ResourceNotFoundException"),
+                "case {create_case:?}: expected the refused create to store nothing, got \
+                 {parsed}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_identical_read_succeeds_again_once_the_key_is_enabled() {
+    for (index, value) in value_cases().iter().enumerate() {
+        let emulator = Emulator::new();
+        let case = format!("re-enabled key, {}", value.label);
+        let (key_arn, _) = emulator.create_key(&case).await;
+        let name = format!("re-enabled-{index}");
+        emulator
+            .sm_ok(
+                "CreateSecret",
+                &create_body(&name, Some(&key_arn), value),
+                &case,
+            )
+            .await;
+
+        emulator
+            .kms_ok("DisableKey", &json!({"KeyId": key_arn}), &case)
+            .await;
+        let (code, _) = emulator
+            .sm_err("GetSecretValue", &json!({"SecretId": name}), &case)
+            .await;
+        assert_eq!(
+            code, "DecryptionFailure",
+            "case {case:?}: expected the read to be refused while the key is disabled, got \
+             {code}"
+        );
+
+        emulator
+            .kms_ok("EnableKey", &json!({"KeyId": key_arn}), &case)
+            .await;
+        // The SAME read, answering the value that was stored before the key was
+        // disabled: the version was never lost, only unopenable.
+        let read = emulator
+            .sm_ok("GetSecretValue", &json!({"SecretId": name}), &case)
+            .await;
+        value.assert_round_trip(&read, &case);
+
+        // And the write path recovers with it.
+        let replacement = ValueCase::string("a replacement", "written-after-re-enabling");
+        let mut body = Map::new();
+        body.insert("SecretId".to_string(), json!(name));
+        if let Value::Object(members) = replacement.wire_members() {
+            body.extend(members);
+        }
+        emulator
+            .sm_ok("PutSecretValue", &Value::Object(body), &case)
+            .await;
+        let reread = emulator
+            .sm_ok("GetSecretValue", &json!({"SecretId": name}), &case)
+            .await;
+        replacement.assert_round_trip(&reread, &case);
+    }
+}
+
+#[tokio::test]
+async fn a_secret_on_the_service_managed_key_needs_no_customer_key() {
+    let emulator = Emulator::new();
+    // Every spelling of "the Amazon Web Services managed key": naming none, the
+    // empty string ("If you set this to an empty string, Secrets Manager uses the
+    // Amazon Web Services managed key aws/secretsmanager",
+    // `UpdateSecretRequest$KmsKeyId`), and that key's alias in both spellings.
+    for (form_index, (form, kms_key_id)) in [
+        ("no KmsKeyId", None),
+        ("an empty KmsKeyId", Some("")),
+        ("the managed key alias", Some("alias/aws/secretsmanager")),
+        ("the managed key alias, unprefixed", Some("aws/secretsmanager")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (index, value) in value_cases().iter().enumerate() {
+            let case = format!("{form}, {}", value.label);
+            let name = format!("managed-{form_index}-{index}");
+            emulator
+                .sm_ok("CreateSecret", &create_body(&name, kms_key_id, value), &case)
+                .await;
+            assert!(
+                !emulator.current_version_is_sealed(&name, &case),
+                "case {case:?}: expected a secret on the service-managed key to hold its \
+                 value as sent, got a sealed value"
+            );
+            let read = emulator
+                .sm_ok("GetSecretValue", &json!({"SecretId": name}), &case)
+                .await;
+            value.assert_round_trip(&read, &case);
+        }
+    }
+}
+
+#[tokio::test]
+async fn each_version_opens_under_the_key_it_was_sealed_with() {
+    let emulator = Emulator::new();
+    let case = "a secret pointed at a second key";
+    let (first_key, _) = emulator.create_key(case).await;
+    let (second_key, _) = emulator.create_key(case).await;
+    let name = "re-keyed";
+    let original = ValueCase::string("the first value", "under-the-first-key");
+    emulator
+        .sm_ok(
+            "CreateSecret",
+            &create_body(name, Some(&first_key), &original),
+            case,
+        )
+        .await;
+
+    // "If you change the KMS key, Secrets Manager does not re-encrypt existing
+    // secret versions with the new key" (`UpdateSecretRequest$KmsKeyId`, this
+    // service's Smithy model): the new version is sealed under the new key and the
+    // old one keeps the key it was sealed under.
+    let replacement = ValueCase::string("the second value", "under-the-second-key");
+    let mut body = Map::new();
+    body.insert("SecretId".to_string(), json!(name));
+    body.insert("KmsKeyId".to_string(), json!(second_key));
+    if let Value::Object(members) = replacement.wire_members() {
+        body.extend(members);
+    }
+    emulator
+        .sm_ok("UpdateSecret", &Value::Object(body), case)
+        .await;
+
+    let current = emulator
+        .sm_ok("GetSecretValue", &json!({"SecretId": name}), case)
+        .await;
+    replacement.assert_round_trip(&current, case);
+    let previous = emulator
+        .sm_ok(
+            "GetSecretValue",
+            &json!({"SecretId": name, "VersionStage": "AWSPREVIOUS"}),
+            case,
+        )
+        .await;
+    original.assert_round_trip(&previous, case);
+
+    // Disabling the FIRST key refuses the version that key sealed, and only that
+    // one: each version is opened under the key its own data key was wrapped by.
+    emulator
+        .kms_ok("DisableKey", &json!({"KeyId": first_key}), case)
+        .await;
+    let (code, message) = emulator
+        .sm_err(
+            "GetSecretValue",
+            &json!({"SecretId": name, "VersionStage": "AWSPREVIOUS"}),
+            case,
+        )
+        .await;
+    assert_eq!(
+        code, "DecryptionFailure",
+        "case {case:?}: expected the version sealed under the disabled key to be refused, got \
+         {code} with {message:?}"
+    );
+    assert_relays_kms(
+        &message,
+        DECRYPTION_SENTENCE,
+        "DisabledException",
+        "is disabled.",
+        case,
+    );
+    let still_current = emulator
+        .sm_ok("GetSecretValue", &json!({"SecretId": name}), case)
+        .await;
+    replacement.assert_round_trip(&still_current, case);
+}
+
+#[tokio::test]
+async fn an_emulator_without_kms_holds_the_value_as_sent() {
+    let emulator = Emulator::without_kms();
+    // A well-formed customer managed key ARN that no KMS in this emulator can
+    // answer for, because this emulator holds none: the seal call is refused by the
+    // transport itself, which says nothing about the key, so the value is stored
+    // and read back as sent rather than every write of a value being refused.
+    let key_arn = format!(
+        "arn:aws:kms:{REGION}:{}:key/9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+        engine::EMULATOR_ACCOUNT_ID
+    );
+    for (index, value) in value_cases().iter().enumerate() {
+        let case = format!("no KMS mounted, {}", value.label);
+        let name = format!("no-kms-{index}");
+        emulator
+            .sm_ok(
+                "CreateSecret",
+                &create_body(&name, Some(&key_arn), value),
+                &case,
+            )
+            .await;
+        assert!(
+            !emulator.current_version_is_sealed(&name, &case),
+            "case {case:?}: expected the value to be held as sent where no KMS answers, got a \
+             sealed value nothing could open"
+        );
+        let read = emulator
+            .sm_ok("GetSecretValue", &json!({"SecretId": name}), &case)
+            .await;
+        value.assert_round_trip(&read, &case);
+
+        let replacement = ValueCase::string("a replacement", "written-with-no-kms-mounted");
+        let mut body = Map::new();
+        body.insert("SecretId".to_string(), json!(name));
+        if let Value::Object(members) = replacement.wire_members() {
+            body.extend(members);
+        }
+        emulator
+            .sm_ok("PutSecretValue", &Value::Object(body), &case)
+            .await;
+        let reread = emulator
+            .sm_ok("GetSecretValue", &json!({"SecretId": name}), &case)
+            .await;
+        replacement.assert_round_trip(&reread, &case);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_creates_under_one_token_all_answer_the_same_version() {
+    // The envelope releases the store's guard to call KMS, so the refusals a write
+    // is subject to are decided again when it lands. "This value helps ensure
+    // idempotency" (`CreateSecretRequest$ClientRequestToken`): identical creates
+    // carrying one token are ONE request however they interleave, so each is
+    // answered from the version that token named rather than refused for a name a
+    // racing copy of itself took.
+    let emulator = Emulator::new();
+    let case = "concurrent identical creates under one token";
+    let (key_arn, _) = emulator.create_key(case).await;
+    // `ClientRequestTokenType` is modelled with a length bound of 32..64.
+    let token = "f0b3e2a1-7c4d-4e5f-8a9b-0c1d2e3f4a5b";
+    let value = ValueCase::string("one value", "the-one-value");
+    let name = "concurrent-token";
+
+    let mut body = create_body(name, Some(&key_arn), &value);
+    if let Value::Object(members) = &mut body {
+        members.insert("ClientRequestToken".to_string(), json!(token));
+    }
+
+    let mut running = Vec::new();
+    for _ in 0..6 {
+        let emulator = emulator.clone();
+        let body = body.clone();
+        running.push(tokio::spawn(async move {
+            emulator.sm("CreateSecret", &body).await
+        }));
+    }
+    for (attempt, task) in running.into_iter().enumerate() {
+        let case = format!("{case}, attempt {attempt}");
+        let (status, parsed) = task
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the request task failed: {error}"));
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected every identical create to succeed, got {status} with \
+             body {parsed}"
+        );
+        assert_eq!(
+            parsed["VersionId"].as_str(),
+            Some(token),
+            "case {case:?}: expected the token's own version back, got {parsed}"
+        );
+    }
+
+    // One secret, one version, and the value readable through the key it was
+    // sealed under.
+    assert_eq!(
+        version_count(&emulator, name, case).await,
+        1,
+        "case {case:?}: six identical creates must leave one version"
+    );
+    let read = emulator
+        .sm_ok("GetSecretValue", &json!({"SecretId": name}), case)
+        .await;
+    value.assert_round_trip(&read, case);
+}

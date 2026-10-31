@@ -7,6 +7,10 @@
 //! retrieval itself, the access `LastAccessedDate` reports ("This field is
 //! omitted if the secret has never been retrieved in the Region").
 //!
+//! The value is held under the secret's own KMS key, so answering with it means
+//! decrypting it under that key ([`crate::state::envelope`]): a key KMS will not
+//! decrypt with makes this read `DecryptionFailure`, relaying the KMS refusal.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -194,64 +198,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
-        let mut store = state.lock();
-        let now = ::std::time::SystemTime::now();
-        // Dropping secrets whose recovery window has already elapsed, which the
-        // clock made due whether or not anybody called.
-        store.expire_due(now);
+        // What the answer is built from, read under the store's guard and carried
+        // out of it: unwrapping the data key this version was sealed under is a
+        // call to KMS, which cannot be made while the guard is held.
+        let resolved = {
+            let mut store = state.lock();
+            let now = ::std::time::SystemTime::now();
+            // Dropping secrets whose recovery window has already elapsed, which the
+            // clock made due whether or not anybody called.
+            store.expire_due(now);
 
-        let Some(secret) = store.get(&input.secret_id) else {
-            return Err(no_such_secret());
-        };
-        // "If a secret is scheduled for deletion, then its details, including the
-        // encrypted secret value, is not accessible."
-        if secret.scheduled_for_deletion() {
-            return Err(GetSecretValueErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
+            let Some(secret) = store.get(&input.secret_id) else {
+                return Err(no_such_secret());
+            };
+            // "If a secret is scheduled for deletion, then its details, including the
+            // encrypted secret value, is not accessible."
+            if secret.scheduled_for_deletion() {
+                return Err(GetSecretValueErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
 
-        let stage = input.version_stage.as_deref();
-        let version = match input.version_id.as_deref() {
-            // A `VersionId` names the version outright; a `VersionStage` given
-            // alongside it has to agree with the labels that version carries.
-            Some(version_id) => secret
-                .version(version_id)
-                .filter(|version| stage.is_none_or(|stage| version.has_stage(stage))),
-            // "If you don't specify either a VersionStage or VersionId, Secrets
-            // Manager returns the AWSCURRENT version."
-            None => secret.version_with_stage(stage.unwrap_or(crate::state::STAGE_CURRENT)),
+            let stage = input.version_stage.as_deref();
+            let version = match input.version_id.as_deref() {
+                // A `VersionId` names the version outright; a `VersionStage` given
+                // alongside it has to agree with the labels that version carries.
+                Some(version_id) => secret
+                    .version(version_id)
+                    .filter(|version| stage.is_none_or(|stage| version.has_stage(stage))),
+                // "If you don't specify either a VersionStage or VersionId, Secrets
+                // Manager returns the AWSCURRENT version."
+                None => secret.version_with_stage(stage.unwrap_or(crate::state::STAGE_CURRENT)),
+            };
+            let Some(version) = version else {
+                return Err(GetSecretValueErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(match (input.version_id.as_deref(), stage) {
+                            (Some(version_id), _) => {
+                                crate::state::version_not_found_message(version_id)
+                            }
+                            (None, stage) => crate::state::stage_not_found_message(
+                                stage.unwrap_or(crate::state::STAGE_CURRENT),
+                            ),
+                        }),
+                    },
+                )
+                .into());
+            };
+            Resolved {
+                arn: secret.arn.clone(),
+                name: secret.name.clone(),
+                version_id: version.version_id.clone(),
+                stages: version.stages_out(),
+                created_date: version.created_date,
+                value: version.value.clone(),
+            }
         };
-        let Some(version) = version else {
-            return Err(GetSecretValueErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(match (input.version_id.as_deref(), stage) {
-                        (Some(version_id), _) => {
-                            crate::state::version_not_found_message(version_id)
-                        }
-                        (None, stage) => crate::state::stage_not_found_message(
-                            stage.unwrap_or(crate::state::STAGE_CURRENT),
-                        ),
-                    }),
-                },
-            )
-            .into());
-        };
+
+        // The value is held under the secret's own key, so answering with it means
+        // decrypting it under that key: a key KMS will not decrypt with is the
+        // `DecryptionFailure` this read answers, relaying the refusal KMS stated.
+        let context = crate::state::envelope::ValueContext::new(&resolved.arn, &resolved.version_id);
+        let region = crate::state::request_region(ctx.parts());
+        let opened =
+            crate::state::envelope::open(ctx, &region, &context, &resolved.value)
+                .await
+                .map_err(decryption_failure)?;
+        let (secret_string, secret_binary) = opened.into_members();
 
         let answer = GetSecretValueOutput {
-            arn: Some(secret.arn.clone()),
-            name: Some(secret.name.clone()),
-            version_id: Some(version.version_id.clone()),
-            secret_binary: version.secret_binary.clone(),
-            secret_string: version.secret_string.clone(),
-            version_stages: version.stages_out(),
-            created_date: Some(crate::state::timestamp(version.created_date)),
+            arn: Some(resolved.arn),
+            name: Some(resolved.name),
+            version_id: Some(resolved.version_id.clone()),
+            secret_binary,
+            secret_string,
+            version_stages: resolved.stages,
+            created_date: Some(crate::state::timestamp(resolved.created_date)),
         };
 
         // This call retrieved the version's value, which is what
@@ -259,13 +287,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // never been retrieved in the Region."
         // (`DescribeSecretResponse$LastAccessedDate`, this service's Smithy
         // model.) Nothing else about the secret moves — see
-        // `state::Secret::record_access`.
-        let read = version.version_id.clone();
+        // `state::Secret::record_access`. A read KMS refused retrieved nothing and
+        // never reaches here.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
         if let Some(secret) = store.get_mut(&input.secret_id) {
-            secret.record_access(&read, now);
+            secret.record_access(&resolved.version_id, now);
         }
         Ok(answer)
     }
+}
+
+/// The version this read resolved, carried out of the store's guard so the KMS call
+/// that opens its value is made with no lock held.
+struct Resolved {
+    arn: String,
+    name: String,
+    version_id: String,
+    stages: Option<Vec<String>>,
+    created_date: ::std::time::SystemTime,
+    value: crate::state::envelope::StoredValue,
+}
+
+/// `DecryptionFailure` — "Secrets Manager can't decrypt the protected secret text
+/// using the provided KMS key." — for a value the secret's KMS key would not
+/// decrypt, relaying the KMS refusal (see
+/// [`crate::state::envelope::KmsRefusal`]).
+fn decryption_failure(refusal: crate::state::envelope::KmsRefusal) -> GetSecretValueError {
+    GetSecretValueErrorModeled::DecryptionFailure(DecryptionFailure {
+        message: Some(refusal.decryption_failure_message()),
+    })
+    .into()
 }
 
 /// `ResourceNotFoundException` for a `SecretId` that names no stored secret: the

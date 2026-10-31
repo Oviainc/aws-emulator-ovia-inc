@@ -153,14 +153,17 @@ fn assert_version_id_shape(version_id: &str, case: &str) {
 }
 
 /// One row of the value table: what a caller stores in a secret.
-struct ValueCase {
-    label: &'static str,
+///
+/// `pub(crate)` so a sibling suite under `tests/all/` varies the value the same
+/// way instead of writing a second copy of the table row.
+pub(crate) struct ValueCase {
+    pub(crate) label: &'static str,
     secret_string: Option<String>,
     secret_binary: Option<Vec<u8>>,
 }
 
 impl ValueCase {
-    fn string(label: &'static str, value: impl Into<String>) -> Self {
+    pub(crate) fn string(label: &'static str, value: impl Into<String>) -> Self {
         Self {
             label,
             secret_string: Some(value.into()),
@@ -168,7 +171,7 @@ impl ValueCase {
         }
     }
 
-    fn binary(label: &'static str, value: Vec<u8>) -> Self {
+    pub(crate) fn binary(label: &'static str, value: Vec<u8>) -> Self {
         Self {
             label,
             secret_string: None,
@@ -178,7 +181,7 @@ impl ValueCase {
 
     /// The value members as they go on the wire: a blob is base64 on
     /// `awsJson1_1`.
-    fn wire_members(&self) -> Value {
+    pub(crate) fn wire_members(&self) -> Value {
         let mut members = serde_json::Map::new();
         if let Some(secret_string) = &self.secret_string {
             members.insert("SecretString".to_string(), json!(secret_string));
@@ -193,7 +196,7 @@ impl ValueCase {
     }
 
     /// Assert a response carries exactly this value back.
-    fn assert_round_trip(&self, parsed: &Value, case: &str) {
+    pub(crate) fn assert_round_trip(&self, parsed: &Value, case: &str) {
         match &self.secret_string {
             Some(expected) => assert_eq!(
                 parsed.get("SecretString").and_then(Value::as_str),

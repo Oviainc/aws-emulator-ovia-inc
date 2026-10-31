@@ -21,6 +21,13 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# A secret value is stored enveloped under the secret's KMS key: this is the KMS
+# client the seal and open calls go out over the in-process callback with.
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# AES-256-GCM (and the OS CSPRNG for its nonce) for the envelope a secret value is
+# sealed in under the data key KMS wrapped, and the SHA-256 an idempotent replay
+# compares a value by; already in this workspace's lock file.
+ring = "0.17"
 # Secret version ids are UUIDs (SecretVersionIdType, len 32..64), and the six
 # random characters that end a secret's ARN are drawn from a random UUID too.
 uuid = { version = "1", features = ["v4"] }
@@ -35,6 +42,10 @@ emulator-core-build-support = { workspace = true }
 sha2 = { workspace = true }
 # SecretBinary is a blob, which awsJson1_1 carries base64-encoded on the wire.
 base64 = "0.22"
+# The envelope suite mounts KMS beside this service on one engine, exactly as the
+# assembled router mounts them, so the keys a secret is sealed under are real keys
+# minted through KMS's own operations.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [lints]
 workspace = true

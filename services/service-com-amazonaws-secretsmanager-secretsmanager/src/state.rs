@@ -28,6 +28,11 @@ use crate::ops::types::{
     ExternalSecretRotationMetadataItem, Filter, ReplicationStatusType, RotationRulesType, Tag,
 };
 
+/// The envelope a version's value is stored under, and the KMS calls that seal
+/// and open it: the one place this service encrypts and decrypts a secret value,
+/// so every read and every write of one goes through the secret's own key.
+pub mod envelope;
+
 /// The staging label on the current value of a secret.
 pub const STAGE_CURRENT: &str = "AWSCURRENT";
 
@@ -1044,8 +1049,10 @@ pub fn replica_count_after_adding(existing: &[Replica], regions: &[&str]) -> usi
 #[derive(Debug, Clone)]
 pub struct SecretVersion {
     pub version_id: String,
-    pub secret_string: Option<String>,
-    pub secret_binary: Option<Vec<u8>>,
+    /// The version's value, under the key the secret names: sealed under a data
+    /// key a customer managed key wrapped, or held as sent for a secret on the
+    /// service-managed key. See [`envelope`].
+    pub value: envelope::StoredValue,
     pub version_stages: Vec<String>,
     pub created_date: SystemTime,
     /// The date this version's value was last retrieved, at the resolution the
@@ -1062,12 +1069,8 @@ impl SecretVersion {
 
     /// Whether this version already holds exactly the value in a request — the
     /// test an `@idempotencyToken` replay turns on.
-    pub fn holds_same_value(
-        &self,
-        secret_string: Option<&String>,
-        secret_binary: Option<&Vec<u8>>,
-    ) -> bool {
-        self.secret_string.as_ref() == secret_string && self.secret_binary.as_ref() == secret_binary
+    pub fn holds_same_value(&self, value: &envelope::SecretValue) -> bool {
+        self.value.holds(value)
     }
 
     /// The version's staging labels for the wire, omitted while it carries none

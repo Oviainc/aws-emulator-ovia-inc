@@ -15,6 +15,8 @@
 mod secret_batch_get;
 #[path = "all/secret_error_responses.rs"]
 mod secret_error_responses;
+#[path = "all/secret_kms_key_state.rs"]
+mod secret_kms_key_state;
 #[path = "all/secret_lifecycle.rs"]
 mod secret_lifecycle;
 #[path = "all/secret_policy_validation.rs"]

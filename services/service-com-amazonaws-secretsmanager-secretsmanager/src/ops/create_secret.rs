@@ -6,6 +6,10 @@
 //! stores an initial version labelled `AWSCURRENT`. The response is read back out
 //! of the stored secret.
 //!
+//! That initial value is stored under the KMS key the request names, so storing it
+//! means encrypting it under that key ([`crate::state::envelope`]): a key KMS will
+//! not encrypt with makes this create `EncryptionFailure`, and stores no secret.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -366,69 +370,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
-        let mut store = state.lock();
-        let now = ::std::time::SystemTime::now();
-        store.expire_due(now);
+        // "If you include SecretString or SecretBinary then Secrets Manager
+        // creates an initial secret version and automatically attaches the
+        // staging label AWSCURRENT to it" — so a secret created with no value
+        // has no version at all, and no `VersionId` to report.
+        let value = crate::state::envelope::SecretValue::from_request(
+            input.secret_string.as_ref(),
+            input.secret_binary.as_ref(),
+        );
 
-        if let Some(existing) = store.secrets.get(&input.name) {
-            if existing.scheduled_for_deletion() {
-                return Err(CreateSecretErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
+        // What this create is refused for, decided under the store's guard;
+        // sealing the initial value is a call to KMS, which cannot be made while
+        // the guard is held.
+        {
+            let mut store = state.lock();
+            let now = ::std::time::SystemTime::now();
+            store.expire_due(now);
+
+            if let Some(existing) = store.secrets.get(&input.name) {
+                return answer_existing(
+                    existing,
+                    input.client_request_token.as_deref(),
+                    value.as_ref(),
+                );
+            }
+
+            // Bound the store before it grows: "The request failed because it would
+            // exceed one of the Secrets Manager quotas." The bound is the
+            // emulator's own (see `state::SECRET_QUOTA`) and every record it holds
+            // is released by `DeleteSecret`.
+            if store.secrets.len() >= crate::state::SECRET_QUOTA {
+                return Err(CreateSecretErrorModeled::LimitExceededException(
+                    LimitExceededException {
                         message: Some(format!(
-                            "You can't create this secret because a secret with the name {} is \
-                             already scheduled for deletion.",
-                            input.name
+                            "The request failed because it would exceed the maximum of {} secrets \
+                             this emulator stores.",
+                            crate::state::SECRET_QUOTA
                         )),
                     },
                 )
                 .into());
             }
-            // `ClientRequestToken` becomes the version id, and it is an
-            // @idempotencyToken: a repeat naming a version that already holds
-            // exactly this value is the same request, so it is answered from
-            // what is stored rather than refused.
-            let replay = input
-                .client_request_token
-                .as_deref()
-                .and_then(|token| existing.version(token))
-                .filter(|version| {
-                    version
-                        .holds_same_value(input.secret_string.as_ref(), input.secret_binary.as_ref())
-                });
-            if let Some(version) = replay {
-                return Ok(CreateSecretOutput {
-                    arn: Some(existing.arn.clone()),
-                    name: Some(existing.name.clone()),
-                    version_id: Some(version.version_id.clone()),
-                    replication_status: existing.replication_status_out(),
-                });
-            }
-            return Err(CreateSecretErrorModeled::ResourceExistsException(
-                ResourceExistsException {
-                    message: Some(format!(
-                        "The operation failed because the secret {} already exists.",
-                        input.name
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // Bound the store before it grows: "The request failed because it would
-        // exceed one of the Secrets Manager quotas." The bound is the
-        // emulator's own (see `state::SECRET_QUOTA`) and every record it holds
-        // is released by `DeleteSecret`.
-        if store.secrets.len() >= crate::state::SECRET_QUOTA {
-            return Err(CreateSecretErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(format!(
-                        "The request failed because it would exceed the maximum of {} secrets \
-                         this emulator stores.",
-                        crate::state::SECRET_QUOTA
-                    )),
-                },
-            )
-            .into());
         }
 
         let region = crate::state::request_region(ctx.parts());
@@ -467,6 +449,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &format!("secret:{}-{}", input.name, crate::state::new_arn_suffix()),
         );
+        let version_id = input
+            .client_request_token
+            .clone()
+            .unwrap_or_else(crate::state::new_version_id);
+        // The initial value is stored under the key this secret names, so storing
+        // it means encrypting it under that key: a key KMS will not encrypt with is
+        // the `EncryptionFailure` this create answers, and no secret is stored.
+        let sealed = match &value {
+            Some(value) => Some(
+                crate::state::envelope::seal(
+                    ctx,
+                    &region,
+                    input.kms_key_id.as_deref(),
+                    &crate::state::envelope::ValueContext::new(&arn, &version_id),
+                    value,
+                )
+                .await
+                .map_err(encryption_failure)?,
+            ),
+            None => None,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A secret name belongs to one secret, and the guard was released while the
+        // initial value was sealed: the name is answered against what the store
+        // holds NOW, so a concurrent create of the same name under the same
+        // idempotency token is still the same request and is answered from what it
+        // stored rather than refused.
+        if let Some(existing) = store.secrets.get(&input.name) {
+            return answer_existing(
+                existing,
+                input.client_request_token.as_deref(),
+                value.as_ref(),
+            );
+        }
         let mut secret = crate::state::Secret::new(input.name.clone(), arn, region, now);
         secret.description = input.description.clone();
         secret.kms_key_id = input.kms_key_id.clone();
@@ -483,19 +501,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "If you include SecretString or SecretBinary then Secrets Manager
-        // creates an initial secret version and automatically attaches the
-        // staging label AWSCURRENT to it" — so a secret created with no value
-        // has no version at all, and no `VersionId` to report.
-        if input.secret_string.is_some() || input.secret_binary.is_some() {
+        if let Some(sealed) = sealed {
             secret.put_version(
                 crate::state::SecretVersion {
-                    version_id: input
-                        .client_request_token
-                        .clone()
-                        .unwrap_or_else(crate::state::new_version_id),
-                    secret_string: input.secret_string.clone(),
-                    secret_binary: input.secret_binary.clone(),
+                    version_id,
+                    value: sealed,
                     version_stages: vec![crate::state::STAGE_CURRENT.to_string()],
                     created_date: now,
                     // Never retrieved yet: `LastAccessedDate` "is omitted if
@@ -522,6 +532,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             replication_status: stored.replication_status_out(),
         })
     }
+}
+
+/// What a create addressed to a name this service ALREADY holds a secret under
+/// answers.
+///
+/// One decision for both times it is made — before the initial value is sealed and
+/// again when the secret is stored, since the store's guard is released in between —
+/// so a create that raced another one is answered the same way whichever side of
+/// the KMS call it sees the name taken on.
+fn answer_existing(
+    existing: &crate::state::Secret,
+    client_request_token: Option<&str>,
+    value: Option<&crate::state::envelope::SecretValue>,
+) -> Result<CreateSecretOutput, CreateSecretError> {
+    if existing.scheduled_for_deletion() {
+        return Err(CreateSecretErrorModeled::InvalidRequestException(
+            InvalidRequestException {
+                message: Some(format!(
+                    "You can't create this secret because a secret with the name {} is \
+                     already scheduled for deletion.",
+                    existing.name
+                )),
+            },
+        )
+        .into());
+    }
+    // `ClientRequestToken` becomes the version id, and it is an
+    // @idempotencyToken: a repeat naming a version that already holds
+    // exactly this value is the same request, so it is answered from
+    // what is stored rather than refused.
+    let replay = value.and_then(|value| {
+        client_request_token
+            .and_then(|token| existing.version(token))
+            .filter(|version| version.holds_same_value(value))
+    });
+    match replay {
+        Some(version) => Ok(CreateSecretOutput {
+            arn: Some(existing.arn.clone()),
+            name: Some(existing.name.clone()),
+            version_id: Some(version.version_id.clone()),
+            replication_status: existing.replication_status_out(),
+        }),
+        None => Err(already_exists(&existing.name)),
+    }
+}
+
+/// `ResourceExistsException` for a name this service already holds a secret
+/// under, naming the secret the caller asked to create.
+fn already_exists(name: &str) -> CreateSecretError {
+    CreateSecretErrorModeled::ResourceExistsException(ResourceExistsException {
+        message: Some(format!(
+            "The operation failed because the secret {name} already exists."
+        )),
+    })
+    .into()
+}
+
+/// `EncryptionFailure` — "Secrets Manager can't encrypt the protected secret text
+/// using the provided KMS key." — for an initial value the KMS key this request
+/// names would not encrypt, relaying the KMS refusal (see
+/// [`crate::state::envelope::KmsRefusal`]).
+fn encryption_failure(refusal: crate::state::envelope::KmsRefusal) -> CreateSecretError {
+    CreateSecretErrorModeled::EncryptionFailure(EncryptionFailure {
+        message: Some(refusal.encryption_failure_message()),
+    })
+    .into()
 }
 
 /// The modelled server error for a request that cannot reach this service's

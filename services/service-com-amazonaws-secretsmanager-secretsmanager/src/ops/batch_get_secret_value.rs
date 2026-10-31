@@ -6,6 +6,11 @@
 //! fails the whole call, and a problem with ONE secret is an entry in `Errors`
 //! inside a 200.
 //!
+//! Each value is held under its own secret's KMS key, so answering with it means
+//! decrypting it under that key ([`crate::state::envelope`]): a key KMS will not
+//! decrypt with fails THAT secret alone, as a `DecryptionFailure` entry in
+//! `Errors`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "To choose which secrets to retrieve, you can specify a list of
         // secrets by name or ARN, or you can use filters", and "You must include
@@ -223,98 +228,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
-        let mut store = state.lock();
-        // The only write this read performs: dropping secrets whose deletion the
-        // clock has already made due, which was owed at this instant whether or
-        // not anybody called.
-        let now = ::std::time::SystemTime::now();
-        store.expire_due(now);
+        // Each selection's answer, decided under the store's guard and carried out
+        // of it: opening a sealed value is a call to KMS, which cannot be made
+        // while the guard is held.
+        let (pending, mut errors, next_token) = {
+            let mut store = state.lock();
+            // The only write this read performs: dropping secrets whose deletion the
+            // clock has already made due, which was owed at this instant whether or
+            // not anybody called.
+            let now = ::std::time::SystemTime::now();
+            store.expire_due(now);
 
-        // What this call selects, in the order it answers: the ids the caller
-        // listed, or — for the filter form — the names of the secrets every
-        // filter holds for. A secret inside its recovery window is left out of
-        // the filter form, the same way the listing leaves it out unless the
-        // caller asks for it: the filter form selects secrets, it does not
-        // address them.
-        let selected: Vec<String> = match (ids, filters) {
-            (Some(ids), _) => ids.to_vec(),
-            (None, filters) => {
-                let filters = filters.unwrap_or_default();
-                store
-                    .secrets
-                    .values()
-                    .filter(|secret| !secret.scheduled_for_deletion())
-                    .filter(|secret| {
-                        filters
-                            .iter()
-                            .all(|filter| crate::state::matches_filter(secret, filter))
-                    })
-                    .map(|secret| secret.name.clone())
-                    .collect()
-            }
-        };
+            // What this call selects, in the order it answers: the ids the caller
+            // listed, or — for the filter form — the names of the secrets every
+            // filter holds for. A secret inside its recovery window is left out of
+            // the filter form, the same way the listing leaves it out unless the
+            // caller asks for it: the filter form selects secrets, it does not
+            // address them.
+            let selected: Vec<String> = match (ids, filters) {
+                (Some(ids), _) => ids.to_vec(),
+                (None, filters) => {
+                    let filters = filters.unwrap_or_default();
+                    store
+                        .secrets
+                        .values()
+                        .filter(|secret| !secret.scheduled_for_deletion())
+                        .filter(|secret| {
+                            filters
+                                .iter()
+                                .all(|filter| crate::state::matches_filter(secret, filter))
+                        })
+                        .map(|secret| secret.name.clone())
+                        .collect()
+                }
+            };
 
-        // The cursor names the first selection of the page to answer, so the
-        // next page resumes exactly where this one ends.
-        let start = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                let resume = crate::state::decode_next_token(token)
-                    .and_then(|cursor| selected.iter().position(|id| *id == cursor));
-                match resume {
-                    Some(index) => index,
-                    None => {
-                        return Err(
-                            BatchGetSecretValueErrorModeled::InvalidNextTokenException(
-                                InvalidNextTokenException {
-                                    message: Some(
-                                        crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
-                                    ),
-                                },
-                            )
-                            .into(),
-                        );
+            // The cursor names the first selection of the page to answer, so the
+            // next page resumes exactly where this one ends.
+            let start = match input.next_token.as_deref() {
+                None => 0,
+                Some(token) => {
+                    let resume = crate::state::decode_next_token(token)
+                        .and_then(|cursor| selected.iter().position(|id| *id == cursor));
+                    match resume {
+                        Some(index) => index,
+                        None => {
+                            return Err(
+                                BatchGetSecretValueErrorModeled::InvalidNextTokenException(
+                                    InvalidNextTokenException {
+                                        message: Some(
+                                            crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                                        ),
+                                    },
+                                )
+                                .into(),
+                            );
+                        }
                     }
                 }
-            }
-        };
-        // "The number of results to include in the response. If there are more
-        // results available, in the response, Secrets Manager includes
-        // NextToken." With no `MaxResults` the page is the whole batch this
-        // operation reads — "up to 20 secrets" (see `state::SECRETS_PER_BATCH`).
-        let page_size = input
-            .max_results
-            .and_then(|max| usize::try_from(max).ok())
-            .unwrap_or(crate::state::SECRETS_PER_BATCH)
-            .clamp(1, crate::state::SECRETS_PER_BATCH);
+            };
+            // "The number of results to include in the response. If there are more
+            // results available, in the response, Secrets Manager includes
+            // NextToken." With no `MaxResults` the page is the whole batch this
+            // operation reads — "up to 20 secrets" (see `state::SECRETS_PER_BATCH`).
+            let page_size = input
+                .max_results
+                .and_then(|max| usize::try_from(max).ok())
+                .unwrap_or(crate::state::SECRETS_PER_BATCH)
+                .clamp(1, crate::state::SECRETS_PER_BATCH);
 
+            let mut pending = Vec::new();
+            let mut errors = Vec::new();
+            for secret_id in selected.iter().skip(start).take(page_size) {
+                match entry_for(&store, secret_id) {
+                    Ok(entry) => pending.push(entry),
+                    Err(error) => errors.push(error),
+                }
+            }
+            let next_token = selected
+                .get(start + pending.len() + errors.len())
+                .map(|cursor| crate::state::encode_next_token(cursor));
+            (pending, errors, next_token)
+        };
+
+        // Each selected value is held under its own secret's key, so answering with
+        // it means decrypting it under that key. A key KMS will not decrypt with
+        // fails THAT secret alone: "If Secrets Manager encounters errors … while
+        // attempting to retrieve any of the secrets, you can see the errors in
+        // Errors in the response."
+        let region = crate::state::request_region(ctx.parts());
         let mut values = Vec::new();
-        let mut errors = Vec::new();
         let mut retrieved: Vec<(String, String)> = Vec::new();
-        for secret_id in selected.iter().skip(start).take(page_size) {
-            match entry_for(&store, secret_id) {
-                Ok(entry) => {
-                    if let Some(version_id) = entry.version_id.clone() {
-                        retrieved.push((secret_id.clone(), version_id));
-                    }
-                    values.push(entry);
+        for entry in pending {
+            let context =
+                crate::state::envelope::ValueContext::new(&entry.arn, &entry.version_id);
+            match crate::state::envelope::open(ctx, &region, &context, &entry.value).await {
+                Ok(opened) => {
+                    let (secret_string, secret_binary) = opened.into_members();
+                    retrieved.push((entry.secret_id.clone(), entry.version_id.clone()));
+                    values.push(SecretValueEntry {
+                        arn: Some(entry.arn),
+                        name: Some(entry.name),
+                        version_id: Some(entry.version_id),
+                        secret_binary,
+                        secret_string,
+                        version_stages: entry.stages,
+                        created_date: Some(crate::state::timestamp(entry.created_date)),
+                    });
                 }
-                Err(error) => errors.push(error),
+                Err(refusal) => errors.push(APIErrorType {
+                    secret_id: Some(entry.secret_id),
+                    error_code: Some("DecryptionFailure".to_string()),
+                    message: Some(refusal.decryption_failure_message()),
+                }),
             }
         }
+
         // Every entry this call answered retrieved that secret's current value,
         // which is what `LastAccessedDate` reports: "This field is omitted if
         // the secret has never been retrieved in the Region."
         // (`DescribeSecretResponse$LastAccessedDate`, this service's Smithy
-        // model.) See `state::Secret::record_access`.
+        // model.) See `state::Secret::record_access`. An entry KMS refused
+        // retrieved nothing, so it records nothing.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
         for (secret_id, version_id) in retrieved {
             if let Some(secret) = store.get_mut(&secret_id) {
                 secret.record_access(&version_id, now);
             }
         }
-        let next_token = selected
-            .get(start + values.len() + errors.len())
-            .map(|cursor| crate::state::encode_next_token(cursor));
 
         Ok(BatchGetSecretValueOutput {
             secret_values: Some(values),
@@ -324,7 +366,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// One selection's answer: the value of its current version, or the per-entry
+/// One selection this call resolved to a version, carried out of the store's guard
+/// so the KMS call that opens its value is made with no lock held.
+struct Pending {
+    /// The `SecretId` the selection named, which is what an entry and an error
+    /// report it as.
+    secret_id: String,
+    arn: String,
+    name: String,
+    version_id: String,
+    stages: Option<Vec<String>>,
+    created_date: ::std::time::SystemTime,
+    value: crate::state::envelope::StoredValue,
+}
+
+/// One selection's answer: the version holding its current value, or the per-entry
 /// error that secret alone failed with.
 ///
 /// "If Secrets Manager encounters errors such as `AccessDeniedException` while
@@ -336,7 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn entry_for(
     store: &crate::state::ComAmazonawsSecretsmanagerSecretsmanagerState,
     secret_id: &str,
-) -> Result<SecretValueEntry, APIErrorType> {
+) -> Result<Pending, APIErrorType> {
     let error = |code: &str, message: String| APIErrorType {
         secret_id: Some(secret_id.to_string()),
         error_code: Some(code.to_string()),
@@ -363,14 +419,14 @@ fn entry_for(
             crate::state::stage_not_found_message(crate::state::STAGE_CURRENT),
         ));
     };
-    Ok(SecretValueEntry {
-        arn: Some(secret.arn.clone()),
-        name: Some(secret.name.clone()),
-        version_id: Some(version.version_id.clone()),
-        secret_binary: version.secret_binary.clone(),
-        secret_string: version.secret_string.clone(),
-        version_stages: version.stages_out(),
-        created_date: Some(crate::state::timestamp(version.created_date)),
+    Ok(Pending {
+        secret_id: secret_id.to_string(),
+        arn: secret.arn.clone(),
+        name: secret.name.clone(),
+        version_id: version.version_id.clone(),
+        stages: version.stages_out(),
+        created_date: version.created_date,
+        value: version.value.clone(),
     })
 }
 

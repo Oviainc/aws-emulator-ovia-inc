@@ -5,6 +5,12 @@
 //! `Type` — and, when the call carries a value, stores that value as a new
 //! version the staging label `AWSCURRENT` moves to.
 //!
+//! That new version is stored under the key this call leaves the secret on, so
+//! storing it means encrypting it under that key ([`crate::state::envelope`]): a
+//! key KMS will not encrypt with makes this update `EncryptionFailure`, and changes
+//! nothing. A call carrying no value encrypts nothing and is not affected by the
+//! key's state.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -227,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "Either SecretBinary or SecretString must have a value, but not both."
         // (`UpdateSecretRequest$SecretString`, this service's Smithy model.) A
@@ -245,39 +251,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        let value = crate::state::envelope::SecretValue::from_request(
+            input.secret_string.as_ref(),
+            input.secret_binary.as_ref(),
+        );
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
-        let mut store = state.lock();
-        let now = ::std::time::SystemTime::now();
-        // The permanent removal the clock has already made due, materialised
-        // before this call resolves anything: a secret whose removal was owed at
-        // this instant is gone whether or not anybody called, so an update
-        // addressed to it finds nothing — which is what makes a mutation after a
-        // deletion that skipped the recovery window report the secret missing
-        // rather than succeed.
-        store.expire_due(now);
-
-        let Some(secret) = store.get_mut(&input.secret_id) else {
-            return Err(UpdateSecretErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        };
-        // A secret inside its recovery window still exists, so it is refused by
-        // its state: "The secret is scheduled for deletion."
-        // (`InvalidRequestException`, this service's Smithy model.)
-        if secret.scheduled_for_deletion() {
-            return Err(UpdateSecretErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
-
-        let stores_a_value = input.secret_string.is_some() || input.secret_binary.is_some();
         // "If you include SecretString or SecretBinary, then Secrets Manager
         // creates a new version for the secret, and this parameter specifies the
         // unique identifier for the new version."
@@ -291,33 +270,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .client_request_token
             .clone()
             .unwrap_or_else(crate::state::new_version_id);
-        let replay = stores_a_value
-            && secret.version(&version_id).is_some_and(|existing| {
-                existing.holds_same_value(input.secret_string.as_ref(), input.secret_binary.as_ref())
-            });
-        if stores_a_value && !replay {
-            if secret.version(&version_id).is_some() {
-                return Err(UpdateSecretErrorModeled::ResourceExistsException(
-                    ResourceExistsException {
-                        message: Some(crate::state::token_in_use_message(&version_id, &secret.arn)),
-                    },
+
+        // What this update is refused for, and the key the new value is to be
+        // stored under, decided under the store's guard; sealing that value is a
+        // call to KMS, which cannot be made while the guard is held.
+        let target = {
+            let mut store = state.lock();
+            let now = ::std::time::SystemTime::now();
+            // The permanent removal the clock has already made due, materialised
+            // before this call resolves anything: a secret whose removal was owed at
+            // this instant is gone whether or not anybody called, so an update
+            // addressed to it finds nothing — which is what makes a mutation after a
+            // deletion that skipped the recovery window report the secret missing
+            // rather than succeed.
+            store.expire_due(now);
+
+            admit(
+                store.get(&input.secret_id),
+                &version_id,
+                value.as_ref(),
+                input.kms_key_id.as_deref(),
+            )?
+        };
+
+        // The new value is stored under that key, so storing it means encrypting it
+        // under that key: a key KMS will not encrypt with is the
+        // `EncryptionFailure` this update answers, and nothing about the secret
+        // changes.
+        let region = crate::state::request_region(ctx.parts());
+        let sealed = match value.as_ref().filter(|_| !target.replay) {
+            Some(value) => Some(
+                crate::state::envelope::seal(
+                    ctx,
+                    &region,
+                    target.kms_key_id.as_deref(),
+                    &crate::state::envelope::ValueContext::new(&target.arn, &version_id),
+                    value,
                 )
-                .into());
-            }
-            // Bound the secret before it grows, the same way `PutSecretValue`
-            // does: an update that leaves no deprecated version to evict would
-            // grow the store without end, so it is refused with the modelled
-            // quota error. See `state::VERSIONS_PER_SECRET`.
-            let claimed = vec![crate::state::STAGE_CURRENT.to_string()];
-            if !secret.has_room_for_version(&claimed) {
-                return Err(UpdateSecretErrorModeled::LimitExceededException(
-                    LimitExceededException {
-                        message: Some(crate::state::version_quota_message()),
-                    },
-                )
-                .into());
-            }
-        }
+                .await
+                .map_err(encryption_failure)?,
+            ),
+            None => None,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The guard was released while the value was sealed, so every refusal is
+        // decided again against what the store holds NOW: a concurrent delete, a
+        // concurrent write of this same token, or one that has since taken the last
+        // version slot refuses this update rather than being overwritten by it.
+        let target = admit(
+            store.get(&input.secret_id),
+            &version_id,
+            value.as_ref(),
+            input.kms_key_id.as_deref(),
+        )?;
+        // A token that now names a version already holding exactly this value is
+        // the same request again: the version it stored stands, and this call only
+        // applies the metadata it names.
+        let sealed = sealed.filter(|_| !target.replay);
+        let Some(secret) = store.get_mut(&input.secret_id) else {
+            return Err(UpdateSecretErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
 
         // The metadata this call names is applied; a member it does not name
         // keeps the value already stored, since this operation "modifies the
@@ -325,15 +344,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.description.is_some() {
             secret.description = input.description.clone();
         }
-        if let Some(kms_key_id) = input.kms_key_id.clone() {
-            // "If you set this to an empty string, Secrets Manager uses the
-            // Amazon Web Services managed key aws/secretsmanager."
-            // (`UpdateSecretRequest$KmsKeyId`, this service's Smithy model.)
-            secret.kms_key_id = Some(if kms_key_id.is_empty() {
-                crate::state::DEFAULT_KMS_KEY_ALIAS.to_string()
-            } else {
-                kms_key_id
-            });
+        if input.kms_key_id.is_some() {
+            secret.kms_key_id = target.kms_key_id.clone();
         }
         if input.r#type.is_some() {
             secret.secret_type = input.r#type.clone();
@@ -345,12 +357,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // AWSCURRENT to the new version. Then it attaches the label AWSPREVIOUS
         // to the version that AWSCURRENT was removed from." — which is what
         // `put_version` does for every write of a value.
-        if stores_a_value && !replay {
+        if let Some(sealed) = sealed {
             secret.put_version(
                 crate::state::SecretVersion {
                     version_id: version_id.clone(),
-                    secret_string: input.secret_string.clone(),
-                    secret_binary: input.secret_binary.clone(),
+                    value: sealed,
                     version_stages: vec![crate::state::STAGE_CURRENT.to_string()],
                     created_date: now,
                     // Never retrieved yet: `LastAccessedDate` "is omitted if
@@ -367,9 +378,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "If Secrets Manager created a new version of the secret during
             // this operation, then VersionId contains the unique identifier of
             // the new version." — so a metadata-only update reports none.
-            version_id: stores_a_value.then(|| version_id.clone()),
+            version_id: value.is_some().then(|| version_id.clone()),
         })
     }
+}
+
+/// What this update resolved against the stored secret: the secret it is addressed
+/// to, the KMS key the call leaves it on, and whether the token names a version
+/// already holding exactly this value.
+struct Target {
+    arn: String,
+    kms_key_id: Option<String>,
+    replay: bool,
+}
+
+/// Every refusal this update is subject to, decided against the secret the store
+/// holds, with the key a new version would be stored under.
+///
+/// One decision for both times it is made — before the value is sealed and again
+/// when it is stored, since the store's guard is released in between — so an update
+/// that raced another one is refused by the state it actually lands in.
+fn admit(
+    secret: Option<&crate::state::Secret>,
+    version_id: &str,
+    value: Option<&crate::state::envelope::SecretValue>,
+    requested_kms_key_id: Option<&str>,
+) -> Result<Target, UpdateSecretError> {
+    let Some(secret) = secret else {
+        return Err(UpdateSecretErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    };
+    // A secret inside its recovery window still exists, so it is refused by
+    // its state: "The secret is scheduled for deletion."
+    // (`InvalidRequestException`, this service's Smithy model.)
+    if secret.scheduled_for_deletion() {
+        return Err(UpdateSecretErrorModeled::InvalidRequestException(
+            InvalidRequestException {
+                message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    }
+
+    let replay = value.is_some_and(|value| {
+        secret
+            .version(version_id)
+            .is_some_and(|existing| existing.holds_same_value(value))
+    });
+    if value.is_some() && !replay {
+        if secret.version(version_id).is_some() {
+            return Err(UpdateSecretErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(crate::state::token_in_use_message(version_id, &secret.arn)),
+                },
+            )
+            .into());
+        }
+        // Bound the secret before it grows, the same way `PutSecretValue`
+        // does: an update that leaves no deprecated version to evict would
+        // grow the store without end, so it is refused with the modelled
+        // quota error. See `state::VERSIONS_PER_SECRET`.
+        let claimed = vec![crate::state::STAGE_CURRENT.to_string()];
+        if !secret.has_room_for_version(&claimed) {
+            return Err(UpdateSecretErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::version_quota_message()),
+                },
+            )
+            .into());
+        }
+    }
+    // "If you set this to an empty string, Secrets Manager uses the Amazon Web
+    // Services managed key aws/secretsmanager." (`UpdateSecretRequest$KmsKeyId`,
+    // this service's Smithy model.) A new version is stored under the key this call
+    // leaves the secret on, so the key it names is the one the value is encrypted
+    // under.
+    let kms_key_id = match requested_kms_key_id {
+        Some("") => Some(crate::state::DEFAULT_KMS_KEY_ALIAS.to_string()),
+        Some(named) => Some(named.to_string()),
+        None => secret.kms_key_id.clone(),
+    };
+    Ok(Target {
+        arn: secret.arn.clone(),
+        kms_key_id,
+        replay,
+    })
+}
+
+/// `EncryptionFailure` — "Secrets Manager can't encrypt the protected secret text
+/// using the provided KMS key." — for a value the secret's KMS key would not
+/// encrypt, relaying the KMS refusal (see
+/// [`crate::state::envelope::KmsRefusal`]).
+fn encryption_failure(refusal: crate::state::envelope::KmsRefusal) -> UpdateSecretError {
+    UpdateSecretErrorModeled::EncryptionFailure(EncryptionFailure {
+        message: Some(refusal.encryption_failure_message()),
+    })
+    .into()
 }
 
 /// The modelled server error for a request that cannot reach this service's

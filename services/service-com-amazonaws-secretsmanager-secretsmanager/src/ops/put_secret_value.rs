@@ -9,6 +9,11 @@
 //! IAM; it does not take part in choosing or storing the value, and this emulator
 //! does not evaluate IAM, so it is accepted and has no effect on what is stored.
 //!
+//! The new value is stored under the secret's own KMS key, so storing it means
+//! encrypting it under that key ([`crate::state::envelope`]): a key KMS will not
+//! encrypt with makes this write `EncryptionFailure`, relaying the KMS refusal, and
+//! no version is stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -232,31 +237,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "Either SecretString or SecretBinary must have a value, but not both."
-        let refusal = match (input.secret_string.is_some(), input.secret_binary.is_some()) {
-            (true, true) => Some(
+        if input.secret_string.is_some() && input.secret_binary.is_some() {
+            return Err(invalid_parameter(
                 "You can't specify both SecretString and SecretBinary in the same request.",
-            ),
-            (false, false) => {
-                Some("You must provide either SecretString or SecretBinary in the request.")
-            }
-            _ => None,
-        };
-        if let Some(refusal) = refusal {
-            return Err(PutSecretValueErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(refusal.to_string()),
-                },
-            )
-            .into());
+            ));
         }
+        let Some(value) = crate::state::envelope::SecretValue::from_request(
+            input.secret_string.as_ref(),
+            input.secret_binary.as_ref(),
+        ) else {
+            return Err(invalid_parameter(
+                "You must provide either SecretString or SecretBinary in the request.",
+            ));
+        };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
-        let mut store = state.lock();
-        let now = ::std::time::SystemTime::now();
-        store.expire_due(now);
 
         // "If you don't include VersionStages, then Secrets Manager automatically
         // moves the staging label AWSCURRENT to this version."
@@ -270,68 +268,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(crate::state::new_version_id);
 
-        let Some(secret) = store.get_mut(&input.secret_id) else {
-            return Err(PutSecretValueErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        };
-        if secret.scheduled_for_deletion() {
-            return Err(PutSecretValueErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
+        // Everything this write is refused for before a value is encrypted at all,
+        // decided under the store's guard; sealing the value is a call to KMS, which
+        // cannot be made while the guard is held.
+        let (arn, kms_key_id) = {
+            let mut store = state.lock();
+            let now = ::std::time::SystemTime::now();
+            store.expire_due(now);
 
-        // `ClientRequestToken` is the new version's id and an @idempotencyToken:
-        // a repeat carrying the same value is the same request and changes
-        // nothing, while the same id with a different value would modify an
-        // existing version, which this operation never does.
-        if let Some(existing) = secret.version(&version_id) {
-            if existing
-                .holds_same_value(input.secret_string.as_ref(), input.secret_binary.as_ref())
-            {
-                return Ok(PutSecretValueOutput {
-                    arn: Some(secret.arn.clone()),
-                    name: Some(secret.name.clone()),
-                    version_id: Some(existing.version_id.clone()),
-                    version_stages: existing.stages_out(),
-                });
+            match admit(store.get(&input.secret_id), &version_id, &stages, &value)? {
+                Admission::Replay(answer) => return Ok(answer),
+                Admission::Store { arn, kms_key_id } => (arn, kms_key_id),
             }
-            // The conflict is reported so the caller can attribute it: the
-            // message is built from the request's own token and the secret's
-            // ARN, which is what identifies which of a batch of idempotent
-            // writes collided.
-            return Err(PutSecretValueErrorModeled::ResourceExistsException(
-                ResourceExistsException {
-                    message: Some(crate::state::token_in_use_message(&version_id, &secret.arn)),
-                },
-            )
-            .into());
-        }
+        };
 
-        // Bound the secret before it grows: a put that leaves no deprecated
-        // version to evict would grow the store without end, so it is refused
-        // with "The request failed because it would exceed one of the Secrets
-        // Manager quotas." See `state::VERSIONS_PER_SECRET`.
-        if !secret.has_room_for_version(&stages) {
-            return Err(PutSecretValueErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(crate::state::version_quota_message()),
-                },
-            )
-            .into());
-        }
+        // The new value is stored under the secret's own key, so storing it means
+        // encrypting it under that key: a key KMS will not encrypt with is the
+        // `EncryptionFailure` this write answers, and no version is stored.
+        let context = crate::state::envelope::ValueContext::new(&arn, &version_id);
+        let region = crate::state::request_region(ctx.parts());
+        let sealed = crate::state::envelope::seal(
+            ctx,
+            &region,
+            kms_key_id.as_deref(),
+            &context,
+            &value,
+        )
+        .await
+        .map_err(encryption_failure)?;
 
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The guard was released while the value was sealed, so every refusal is
+        // decided again against what the store holds NOW: a concurrent delete, a
+        // concurrent write of this same token, or one that has since taken the last
+        // version slot refuses this write rather than being overwritten by it.
+        match admit(store.get(&input.secret_id), &version_id, &stages, &value)? {
+            Admission::Replay(answer) => return Ok(answer),
+            Admission::Store { .. } => {}
+        }
+        let secret = store
+            .get_mut(&input.secret_id)
+            .ok_or_else(no_such_secret)?;
         secret.put_version(
             crate::state::SecretVersion {
                 version_id: version_id.clone(),
-                secret_string: input.secret_string.clone(),
-                secret_binary: input.secret_binary.clone(),
+                value: sealed,
                 version_stages: stages,
                 created_date: now,
                 // Never retrieved yet: `LastAccessedDate` "is omitted if the
@@ -350,6 +332,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version_stages: stored.stages_out(),
         })
     }
+}
+
+/// What this write is admitted to do against the stored secret.
+enum Admission {
+    /// The token names a version that already holds exactly this value, so this is
+    /// the same request again and is answered from what is stored.
+    Replay(PutSecretValueOutput),
+    /// The version may be stored, under this secret's ARN and `KmsKeyId`.
+    Store {
+        arn: String,
+        kms_key_id: Option<String>,
+    },
+}
+
+/// Every refusal this write is subject to, decided against the secret the store
+/// holds.
+///
+/// One decision for both times it is made — before the value is sealed and again
+/// when it is stored, since the store's guard is released in between — so a write
+/// that raced another one is refused by the state it actually lands in.
+fn admit(
+    secret: Option<&crate::state::Secret>,
+    version_id: &str,
+    stages: &[String],
+    value: &crate::state::envelope::SecretValue,
+) -> Result<Admission, PutSecretValueError> {
+    let Some(secret) = secret else {
+        return Err(no_such_secret());
+    };
+    if secret.scheduled_for_deletion() {
+        return Err(PutSecretValueErrorModeled::InvalidRequestException(
+            InvalidRequestException {
+                message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    }
+
+    // `ClientRequestToken` is the new version's id and an @idempotencyToken:
+    // a repeat carrying the same value is the same request and changes
+    // nothing, while the same id with a different value would modify an
+    // existing version, which this operation never does.
+    if let Some(existing) = secret.version(version_id) {
+        if existing.holds_same_value(value) {
+            return Ok(Admission::Replay(PutSecretValueOutput {
+                arn: Some(secret.arn.clone()),
+                name: Some(secret.name.clone()),
+                version_id: Some(existing.version_id.clone()),
+                version_stages: existing.stages_out(),
+            }));
+        }
+        // The conflict is reported so the caller can attribute it: the
+        // message is built from the request's own token and the secret's
+        // ARN, which is what identifies which of a batch of idempotent
+        // writes collided.
+        return Err(PutSecretValueErrorModeled::ResourceExistsException(
+            ResourceExistsException {
+                message: Some(crate::state::token_in_use_message(version_id, &secret.arn)),
+            },
+        )
+        .into());
+    }
+
+    // Bound the secret before it grows: a put that leaves no deprecated
+    // version to evict would grow the store without end, so it is refused
+    // with "The request failed because it would exceed one of the Secrets
+    // Manager quotas." See `state::VERSIONS_PER_SECRET`.
+    if !secret.has_room_for_version(stages) {
+        return Err(PutSecretValueErrorModeled::LimitExceededException(
+            LimitExceededException {
+                message: Some(crate::state::version_quota_message()),
+            },
+        )
+        .into());
+    }
+    Ok(Admission::Store {
+        arn: secret.arn.clone(),
+        kms_key_id: secret.kms_key_id.clone(),
+    })
+}
+
+/// `ResourceNotFoundException` for a `SecretId` that names no stored secret: the
+/// constant sentence Secrets Manager answers with, which carries no part of the
+/// request (see [`crate::state::SECRET_NOT_FOUND_MESSAGE`]).
+fn no_such_secret() -> PutSecretValueError {
+    PutSecretValueErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// `EncryptionFailure` — "Secrets Manager can't encrypt the protected secret text
+/// using the provided KMS key." — for a value the secret's KMS key would not
+/// encrypt, relaying the KMS refusal (see
+/// [`crate::state::envelope::KmsRefusal`]).
+fn encryption_failure(refusal: crate::state::envelope::KmsRefusal) -> PutSecretValueError {
+    PutSecretValueErrorModeled::EncryptionFailure(EncryptionFailure {
+        message: Some(refusal.encryption_failure_message()),
+    })
+    .into()
+}
+
+/// `InvalidParameterException` — "the parameter name or value is invalid" — for a
+/// request that does not state one value to store.
+fn invalid_parameter(message: &str) -> PutSecretValueError {
+    PutSecretValueErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
 
 /// The modelled server error for a request that cannot reach this service's
