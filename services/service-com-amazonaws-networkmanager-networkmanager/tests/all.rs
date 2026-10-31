@@ -245,6 +245,8 @@ mod update_empty_optional_reference;
 mod update_link;
 #[path = "all/update_no_op.rs"]
 mod update_no_op;
+#[path = "all/update_no_op_while_creating.rs"]
+mod update_no_op_while_creating;
 #[path = "all/update_site.rs"]
 mod update_site;
 #[path = "all/vpc_attachment_lifecycle.rs"]
