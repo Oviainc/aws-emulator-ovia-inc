@@ -7,6 +7,17 @@
 //! `parameters` NAME must satisfy the map's key shape `CommandParameterName` (the one
 //! constraint of this request the framework's pre-handler walk does not report, since
 //! it treats a map's key as a path segment rather than as a constrained leaf), and
+//! `commandArn` must be readable as a command ARN.
+//!
+//! THEN the `clientToken` replay index, before any refusal that reads state a later
+//! call can have changed: `clientToken` makes the call idempotent, so the same token
+//! with the same parameters returns the same `executionId` and creates nothing, and
+//! the same token with different parameters is a 409 `ConflictException` (the token
+//! member's own documented rule). A retry of a request this service already completed
+//! completes the same way, whatever has happened to the command or to the device's
+//! quota since.
+//!
+//! Only a request that is NOT such a replay is judged against the state around it.
 //! `commandArn` must name a command that EXISTS in the shared command index the
 //! IoT control plane owns (`service_common::iot_commands`), or the call is refused
 //! 400 `ValidationException` naming the missing command rather than accepting an
@@ -22,10 +33,7 @@
 //! `ServiceQuotaExceededException` and nothing is stored. Then it mints and persists
 //! a job execution for the thing named by `targetArn`, with
 //! status `QUEUED` and a job document built from `commandArn` + `parameters`, and
-//! returns its id. `clientToken` makes the call idempotent: the same token with the
-//! same parameters returns the same `executionId` and creates nothing, the same
-//! token with different parameters is a 409 `ConflictException` (the token member's
-//! own documented rule).
+//! returns its id.
 //!
 //! ## Shape of an operation
 //!
@@ -473,43 +481,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_request(reason));
         }
 
-        // An execution can only be started for a command that EXISTS: "using the
-        // command created with the CreateCommand API, start a command execution on
-        // a specific device". Commands are owned by the IoT control plane, so the
-        // store that answers it is the shared command index — never this
-        // operation's own guess from the ARN's form, which says nothing about
-        // whether the command was ever created, what it admits, or whether it is
-        // still one new executions may be created from.
-        let Some(commands) = crate::state::command_registry(&*self.engine) else {
-            return Err(unavailable("command registry"));
-        };
-        let command = commands.lock().facts(&input.command_arn);
-        let Some(command) = command else {
-            return Err(invalid_request(command_not_found_message(command_name)));
-        };
-        // A DEPRECATED command still exists and is still readable, but it is not one an
-        // execution may be started from any more: the request is refused with this
-        // operation's modelled client error, and nothing is stored.
-        if command.deprecated {
-            return Err(invalid_request(command_deprecated_message(command_name)));
-        }
-        // `parameters` is "a list of parameters that are required by the
-        // StartCommandExecution API when performing the command on a device": it is
-        // meaningful only where the command's payload has placeholders for it — a
-        // command created with a `payloadTemplate` (or with `mandatoryParameters` a
-        // start fills in). A command created with a literal, STATIC payload has none,
-        // so parameters supplied against one are not a request the service can honor
-        // and are refused rather than silently baked into a document the device's
-        // payload does not use. An EMPTY map asks for no substitution at all, so it is
-        // not what is refused.
-        let supplies_parameters = input
-            .parameters
-            .as_ref()
-            .is_some_and(|parameters| !parameters.is_empty());
-        if command.static_payload && supplies_parameters {
-            return Err(invalid_request(STATIC_PAYLOAD_PARAMETERS_MESSAGE.to_string()));
-        }
-
         let parameters = parameters_json(input.parameters.as_ref());
         let document = job_document(&input.command_arn, &parameters);
         // Smithy `length` counts characters, so the modeled maximum does too.
@@ -526,11 +497,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let fingerprint = request_fingerprint(&input, &parameters);
 
+        // What the referenced COMMAND admits, read as ONE snapshot before anything is
+        // judged by it. An execution can only be started for a command that EXISTS:
+        // "using the command created with the CreateCommand API, start a command
+        // execution on a specific device". Commands are owned by the IoT control
+        // plane, so the store that answers it is the shared command index — never
+        // this operation's own guess from the ARN's form, which says nothing about
+        // whether the command was ever created, what it admits, or whether it is
+        // still one new executions may be created from. The index is locked for this
+        // read alone and released before this service's store is locked, the lock
+        // order `crate::state::command_registry` documents.
+        let Some(commands) = crate::state::command_registry(&*self.engine) else {
+            return Err(unavailable("command registry"));
+        };
+        let command = commands.lock().facts(&input.command_arn);
+
         let mut state = state.lock();
 
         // Idempotency, as `clientToken` documents it: the same token with the same
         // parameters completes with the execution the first call created; the same
         // token with different parameters is a conflict.
+        //
+        // The replay is answered BEFORE every refusal that reads state a call after
+        // the first one can have changed — what the referenced command admits (a
+        // store another service writes) and what the target device's quota allows —
+        // because a retry of a request the service already completed has to complete
+        // the same way, and the request's own values, which the replay matched on the
+        // fingerprint, are all that this operation judges before it. A refusal here
+        // would tell a caller whose execution exists that the request it already
+        // committed is invalid, and leave it no way to learn the execution's id.
         if let Some(token) = input.client_token.as_deref() {
             if let Some(started) = state.idempotency.get(token) {
                 if started.request_fingerprint == fingerprint {
@@ -552,6 +547,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // The command's own refusals, now that this request is known to be a NEW one:
+        // a command that does not exist is not one an execution can be started for,
+        // and a DEPRECATED command still exists and is still readable but is not one
+        // new executions may be created from any more. Either is refused with this
+        // operation's modelled client error, and nothing is stored.
+        let Some(command) = command else {
+            return Err(invalid_request(command_not_found_message(command_name)));
+        };
+        if command.deprecated {
+            return Err(invalid_request(command_deprecated_message(command_name)));
+        }
+        // `parameters` is "a list of parameters that are required by the
+        // StartCommandExecution API when performing the command on a device": it is
+        // meaningful only where the command's payload has placeholders for it — a
+        // command created with a `payloadTemplate` (or with `mandatoryParameters` a
+        // start fills in). A command created with a literal, STATIC payload has none,
+        // so parameters supplied against one are not a request the service can honor
+        // and are refused rather than silently baked into a document the device's
+        // payload does not use. An EMPTY map asks for no substitution at all, so it is
+        // not what is refused.
+        let supplies_parameters = input
+            .parameters
+            .as_ref()
+            .is_some_and(|parameters| !parameters.is_empty());
+        if command.static_payload && supplies_parameters {
+            return Err(invalid_request(STATIC_PAYLOAD_PARAMETERS_MESSAGE.to_string()));
         }
 
         let now = crate::state::now_epoch_seconds();
