@@ -3725,6 +3725,29 @@ pub fn validation_envelope(clauses: &[String]) -> String {
     }
 }
 
+/// The modelled `reason` a refused CONSTRAINT is classified by: the value of
+/// `ValidationExceptionReason` (`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`)
+/// that names a member whose value does not satisfy a rule stated about it, as opposed to
+/// an argument the operation does not accept (`ILLEGAL_ARGUMENT`) or a well-formed request
+/// the service's state leaves nothing to answer (`BAD_REQUEST`).
+const CONSTRAINT_VIOLATION: &str = "CONSTRAINT_VIOLATION";
+
+/// The modelled `ValidationException` for a request that broke one or more constraints on
+/// its input, over the clauses that say which.
+///
+/// The ONE builder a refused input constraint of this service is reported through, reached
+/// by both sides of the request boundary: by the walk in front of a handler, for a
+/// constraint the model declares (`crate::service::constraints`), and by a handler, for one
+/// the model cannot express. So a caller cannot tell which side caught the violation — the
+/// message is the one envelope over the one set of clause builders, and the classification
+/// is the same modelled `reason` either way.
+pub fn constraint_violation(clauses: &[String]) -> ValidationException {
+    ValidationException {
+        message: validation_envelope(clauses),
+        reason: Some(CONSTRAINT_VIOLATION.to_string()),
+    }
+}
+
 /// A `@pattern` expression without the anchors a model may spell it with: the
 /// requirement reported is the expression a value must satisfy, not the anchoring the
 /// model uses to make the match total.

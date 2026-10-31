@@ -156,10 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal of this service is reported in, so the same broken rule reads the same
         // whichever operation caught it.
         if let Err(clause) = crate::state::bound_tags(&input.tags) {
-            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message: crate::state::validation_envelope(&[clause]),
-                reason: Some("CONSTRAINT_VIOLATION".to_string()),
-            })
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::constraint_violation(&[clause]),
+            )
             .into());
         }
 
@@ -190,10 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|key| !tags.contains_key(*key))
             .count();
         if let Err(clause) = crate::state::bound_tag_count(tags.len() + added) {
-            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message: crate::state::validation_envelope(&[clause]),
-                reason: Some("CONSTRAINT_VIOLATION".to_string()),
-            })
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::constraint_violation(&[clause]),
+            )
             .into());
         }
 

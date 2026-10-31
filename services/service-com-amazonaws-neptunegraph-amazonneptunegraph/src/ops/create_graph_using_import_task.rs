@@ -324,10 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !violations.is_empty() {
             return Err(CreateGraphUsingImportTaskErrorModeled::ValidationException(
-                ValidationException {
-                    message: crate::state::validation_envelope(&violations),
-                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
-                },
+                crate::state::constraint_violation(&violations),
             )
             .into());
         }

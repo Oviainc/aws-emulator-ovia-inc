@@ -160,18 +160,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `maxResults` carries no range in the model, so the published minimum is
         // enforced here rather than at the boundary: a request asking for fewer than one
-        // result names no number of queries to fetch. The refusal is worded by the same
-        // builder the boundary refusal renderer uses (`crate::service`), so a caller
-        // cannot tell which side of the boundary caught the violation.
+        // result names no number of queries to fetch. The refusal is built by the one
+        // builder a refused input constraint of this service is reported through
+        // (`crate::state::constraint_violation`), which the walk in front of this handler
+        // reaches too, so a caller cannot tell which side of the boundary caught the
+        // violation.
         if input.max_results < MIN_MAX_RESULTS {
-            return Err(ListQueriesErrorModeled::ValidationException(ValidationException {
-                message: crate::state::validation_envelope(&[crate::state::constraint_clause(
+            return Err(ListQueriesErrorModeled::ValidationException(
+                crate::state::constraint_violation(&[crate::state::constraint_clause(
                     "maxResults",
                     Some(&input.max_results.to_string()),
                     &crate::state::min_value_requirement(MIN_MAX_RESULTS),
                 )]),
-                reason: Some("CONSTRAINT_VIOLATION".to_string()),
-            })
+            )
             .into());
         }
         // `maxResults` is the count of summaries the answer may carry. The operation is

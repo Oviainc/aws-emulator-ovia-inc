@@ -21,14 +21,17 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly, or serve a modeled one through a wrapper. Every request this service
-//!   claims resolves through the generated routing table except the three that ask it
-//!   to assume one of the caller's IAM roles, which are served through
-//!   [`pass_role::PassRoleGate`] so that authorization decision is reached ahead of the
-//!   boundary's model-constraint validation.
+//!   correctly, or serve a modeled one through a wrapper. Every operation this service
+//!   models is served through [`constraints::ConstraintGate`], so a violation of a
+//!   modelled input constraint is answered with the service's OWN `ValidationException`
+//!   — the shape that carries the `reason` the framework's refusal channel cannot — and
+//!   the three operations that ask this service to assume one of the caller's IAM roles
+//!   are served through [`pass_role::PassRoleGate`] as well, so that authorization
+//!   decision is reached ahead of the constraint walk.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. Still the wording of last resort: a refusal that reaches
+//!   the framework's own channel rather than the gate above is worded there from the
+//!   same builder. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -49,11 +52,17 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// How a violated MODEL constraint is answered with this service's own
+/// `ValidationException`. Public because the pass-role boundary beside it answers the
+/// same refusal, once its own decision is taken.
+pub mod constraints;
+
 /// The authorization boundary in front of every operation that asks this service to
 /// assume one of the caller's IAM roles. Public because each such operation implements
 /// [`pass_role::PassesRole`] beside its own handler.
 pub mod pass_role;
 
+use constraints::ConstraintGate;
 use pass_role::PassRoleGate;
 
 /// The error code this service answers an input-constraint violation with: the modelled
@@ -103,11 +112,11 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
     ))
 }
 
-/// The `ValidationException` message for a refusal: the count of violated constraints
-/// over one clause per violation.
+/// One clause per violation of a refusal, in this service's own wording.
 ///
-/// `None` declines the whole refusal — see [`constraint_clause`].
-fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+/// `None` declines the whole refusal — see [`constraint_clause`] — and `None` for a
+/// refusal with no violations in it, which is not a refusal at all.
+fn constraint_clauses(violations: &[Violation]) -> Option<Vec<String>> {
     let clauses: Vec<String> = violations
         .iter()
         .map(constraint_clause)
@@ -115,7 +124,17 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     if clauses.is_empty() {
         return None;
     }
-    Some(crate::state::validation_envelope(&clauses))
+    Some(clauses)
+}
+
+/// The `ValidationException` message for a refusal: the count of violated constraints
+/// over one clause per violation.
+///
+/// `None` declines the whole refusal — see [`constraint_clause`].
+fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    Some(crate::state::validation_envelope(&constraint_clauses(
+        violations,
+    )?))
 }
 
 /// The `com-amazonaws-neptunegraph-amazonneptunegraph` emulated service: the generated [`ServiceDefinition`] plus
@@ -125,13 +144,15 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The operations whose input carries a role this service has to assume, each the
-    /// SAME operation the generated table holds, wrapped in [`PassRoleGate`] so the
-    /// pass-role authorization decision is reached ahead of the model-constraint
-    /// validation. Keyed by the routing key the protocol resolves — the key the
-    /// generated table uses — and built from the SAME shared engine, so a wrapped
-    /// operation reads and writes the one store.
-    pass_role_gated: OperationRoutingTable,
+    /// Every operation this service models, each the SAME operation the generated table
+    /// holds, wrapped so a refusal found before its handler runs is answered with this
+    /// service's own modelled shapes: [`ConstraintGate`] for a violated model
+    /// constraint, and [`PassRoleGate`] over that for the operations whose input carries
+    /// a role this service has to assume, so the pass-role authorization decision is
+    /// reached ahead of the constraint walk. Keyed by the routing key the protocol
+    /// resolves — the key the generated table uses — and built from the SAME shared
+    /// engine, so a wrapped operation reads and writes the one store.
+    gated: OperationRoutingTable,
 }
 
 /// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
@@ -150,28 +171,86 @@ macro_rules! gate_pass_role_operations {
     };
 }
 
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`ConstraintGate`] and keyed by the same routing key [`gate_pass_role_operations`]
+/// keys by — the operation's shape name.
+macro_rules! gate_constraint_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                ::std::boxed::Box::new(ConstraintGate::over(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
+}
+
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// Build this service from the shared engine. The engine is threaded into the
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut gated = OperationRoutingTable::new();
         // EVERY operation whose input carries a `roleArn` this service must assume
         // (`smithy_query(query="operation",operation="StartImportTask,CreateGraphUsingImportTask,StartExportTask")`),
         // because each of them takes the same authorization decision about the caller
         // and that one member, and each takes it ahead of its own validation. An
         // operation that merely REPORTS the role a stored task was started with takes
-        // no such decision and is served through the generated table.
-        let mut pass_role_gated = OperationRoutingTable::new();
+        // no such decision. The gate answers the constraint refusal below itself, once
+        // that decision is taken, so these operations are listed HERE and not there.
         gate_pass_role_operations!(
-            pass_role_gated,
+            gated,
             engine,
             create_graph_using_import_task::CreateGraphUsingImportTask,
             start_export_task::StartExportTask,
             start_import_task::StartImportTask,
         );
+        // Every OTHER operation this service models: a refusal of a modelled input
+        // constraint is the service's own `ValidationException` whichever operation was
+        // called, so the list is the whole modelled surface rather than a family of it
+        // (the unit test below reads that surface off the model, so an operation missing
+        // from these two lists fails there rather than answering a constraint refusal in
+        // a shape that drops the modelled `reason`).
+        gate_constraint_operations!(
+            gated,
+            engine,
+            cancel_export_task::CancelExportTask,
+            cancel_import_task::CancelImportTask,
+            cancel_query::CancelQuery,
+            create_graph::CreateGraph,
+            create_graph_snapshot::CreateGraphSnapshot,
+            create_private_graph_endpoint::CreatePrivateGraphEndpoint,
+            delete_graph::DeleteGraph,
+            delete_graph_snapshot::DeleteGraphSnapshot,
+            delete_private_graph_endpoint::DeletePrivateGraphEndpoint,
+            execute_query::ExecuteQuery,
+            get_export_task::GetExportTask,
+            get_graph::GetGraph,
+            get_graph_snapshot::GetGraphSnapshot,
+            get_graph_summary::GetGraphSummary,
+            get_import_task::GetImportTask,
+            get_private_graph_endpoint::GetPrivateGraphEndpoint,
+            get_query::GetQuery,
+            list_export_tasks::ListExportTasks,
+            list_graph_snapshots::ListGraphSnapshots,
+            list_graphs::ListGraphs,
+            list_import_tasks::ListImportTasks,
+            list_private_graph_endpoints::ListPrivateGraphEndpoints,
+            list_queries::ListQueries,
+            list_tags_for_resource::ListTagsForResource,
+            reset_graph::ResetGraph,
+            restore_graph_from_snapshot::RestoreGraphFromSnapshot,
+            start_graph::StartGraph,
+            stop_graph::StopGraph,
+            tag_resource::TagResource,
+            untag_resource::UntagResource,
+            update_graph::UpdateGraph,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
-            pass_role_gated,
+            gated,
         }
     }
 }
@@ -200,13 +279,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<&dyn ErasedOperation> {
         // NOT a re-route: the key is the one the generated table's own protocol
         // resolves, and the operation it names is the one served — wrapped in
-        // `PassRoleGate` for the three operations that ask this service to assume one
-        // of the caller's roles, so that authorization decision is reached ahead of the
-        // model-constraint validation, which no other seam is handed the request to do.
-        // Every other key resolves to `None` here and is served by the generated table
-        // unchanged.
+        // `ConstraintGate`, so a violated model constraint is answered with this
+        // service's own `ValidationException` rather than with the code-and-message
+        // envelope the framework's refusal channel can carry, and wrapped in
+        // `PassRoleGate` on top of that for the three operations that ask this service
+        // to assume one of the caller's roles, so that authorization decision is reached
+        // ahead of the constraint walk. An operation the model names and these lists do
+        // not resolves to `None` here and is served by the generated table unchanged.
         let key = self.entry.protocol().routing_key(req).ok()?;
-        self.pass_role_gated.get(key)
+        self.gated.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -219,6 +300,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // reaches, so a refusal found at the boundary and one found in a handler read
         // identically. The only difference from the framework's own wording is that a
         // `@pattern` requirement is reported unanchored — see [`constraint_clause`].
+        //
+        // This is the wording of LAST RESORT, not the usual path: what travels on it is
+        // a code and a message and nothing else, so the modelled `reason` cannot, and
+        // every operation the model names is served through
+        // [`constraints::ConstraintGate`], which answers a violated model constraint
+        // with the whole modelled shape before this walk is reached. A refusal that does
+        // reach here — of an operation outside the lists in `new`, or of a violation
+        // class the gate declined to word — keeps the same message this builder states.
         //
         // The code stays the modelled `ValidationException` (HTTP 400), which is what
         // the framework would have answered; `override_refusal` replaces the code and
@@ -261,5 +350,68 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The one thing about the wiring above a wire test cannot see: that the two
+    //! hand-maintained lists in `new` cover the WHOLE modelled surface, read off the
+    //! model rather than off a third hand-written list.
+
+    use super::*;
+
+    /// This service's Smithy model, as it ships beside this crate. Read at test time
+    /// rather than embedded: it is JSON no non-test build needs.
+    const MODEL_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-neptunegraph-amazonneptunegraph.json"
+    );
+
+    /// Every operation this service's model declares, by shape name.
+    fn modelled_operations() -> Vec<String> {
+        let model = std::fs::read_to_string(MODEL_PATH)
+            .expect("the model that generated this crate ships beside it");
+        let model: serde_json::Value =
+            serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+        let mut names: Vec<String> = model["shapes"]
+            .as_object()
+            .expect("a Smithy model declares shapes")
+            .iter()
+            .filter(|(_, shape)| shape["type"] == "operation")
+            .filter_map(|(id, _)| id.rsplit('#').next().map(str::to_string))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// RULE, over the whole modelled surface: every operation is served through a gate
+    /// that answers a violated model constraint with this service's own
+    /// `ValidationException`. An operation left out of both lists in `new` fails here
+    /// instead of silently answering such a refusal in the framework's code-and-message
+    /// envelope, which carries no `reason`.
+    #[test]
+    fn every_modelled_operation_is_served_behind_the_constraint_gate() {
+        let operations = modelled_operations();
+        assert!(
+            operations.len() > 1,
+            "case the model's surface: expected this service to model operations, got \
+             {operations:?}"
+        );
+
+        let service = EmulatedService::new(Arc::new(engine::InMemoryEngine::new()));
+        for operation in &operations {
+            assert!(
+                service.entry.routing_table().get(operation).is_some(),
+                "case {operation}: the generated table keys an operation by its shape \
+                 name; this one resolved to nothing, so the gate's key spelling is wrong"
+            );
+            assert!(
+                service.gated.get(operation).is_some(),
+                "case {operation}: every modelled operation is served behind a gate that \
+                 answers a constraint refusal with the modelled ValidationException; this \
+                 one is missing from the lists in `new`"
+            );
+        }
     }
 }

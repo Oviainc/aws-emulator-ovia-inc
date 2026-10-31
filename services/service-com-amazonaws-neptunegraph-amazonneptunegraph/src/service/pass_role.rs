@@ -24,11 +24,13 @@
 //! diagnoses an authorization failure as a malformed request. [`PassRoleGate`] takes
 //! the decision on the way IN, before that walk, and answers it.
 //!
-//! Nothing else is re-implemented. A request it does not refuse is handed to the
-//! operation it wraps, whose [`ErasedOperation::run`] owns deserialize -> validate ->
-//! handle -> serialize, telemetry and every modelled error. The cost is that such a
-//! request is read twice, once here and once in the operation's own sequence, because
-//! the framework hands no already-built input to an operation.
+//! Nothing else is re-implemented. A request it does not refuse is handed on: first to
+//! the constraint refusal every other operation of this service is served behind
+//! ([`super::constraints`]), which is the step the decision above comes before, and then
+//! to the operation it wraps, whose [`ErasedOperation::run`] owns deserialize ->
+//! validate -> handle -> serialize, telemetry and every modelled error. The cost is that
+//! such a request is read twice, once here and once in the operation's own sequence,
+//! because the framework hands no already-built input to an operation.
 
 use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use smithy_server_runtime::{
@@ -85,6 +87,16 @@ impl<Inner: PassesRole + ErasedOperation> ErasedOperation for PassRoleGate<Inner
             // across the await below would make this future non-`Send`.
             if let Some(denied) = denial_response::<Inner>(svc, req, ctx) {
                 return denied;
+            }
+            // The refusal `super::constraints::ConstraintGate` answers for every other
+            // operation of this service, answered here for the same reason that gate
+            // exists — the modelled `ValidationException` carries a `reason` the
+            // framework's refusal channel cannot — and reached only AFTER the
+            // authorization decision above, which is the one thing that comes first.
+            let refused =
+                super::constraints::constraint_violations::<Inner>(svc.definition().protocol(), req);
+            if let Some(response) = super::constraints::constraint_refusal::<Inner>(svc, &refused) {
+                return response;
             }
             self.operation.run(svc, req, ctx).await
         })
