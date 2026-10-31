@@ -47,6 +47,8 @@ mod exclusion_window_reads;
 mod exclusion_window_start_time;
 #[path = "all/exclusion_windows.rs"]
 mod exclusion_windows;
+#[path = "all/expires_at_lifetime_window.rs"]
+mod expires_at_lifetime_window;
 #[path = "all/get_instrumentation_configuration.rs"]
 mod get_instrumentation_configuration;
 #[path = "all/get_service.rs"]
