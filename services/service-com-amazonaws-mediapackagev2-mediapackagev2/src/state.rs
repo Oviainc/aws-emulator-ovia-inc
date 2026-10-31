@@ -1179,10 +1179,36 @@ impl Channel {
             .flat_map(|endpoint| endpoint.harvest_jobs.values())
     }
 
+    /// The harvest job of this channel called `name`, whichever of its origin endpoints
+    /// persists it — the lookup every decision about a job's identity goes through,
+    /// because that identity is the channel's ([`Channel::harvest_jobs`]).
+    pub fn harvest_job(&self, name: &str) -> Option<&HarvestJobRecord> {
+        self.harvest_jobs().find(|job| job.name == name)
+    }
+
     /// Whether any origin endpoint of this channel already holds a harvest job called
     /// `name` — the question a create naming its job is refused by.
     pub fn holds_harvest_job(&self, name: &str) -> bool {
-        self.harvest_jobs().any(|job| job.name == name)
+        self.harvest_job(name).is_some()
+    }
+
+    /// Every harvest job of this channel as `match_client_token` takes it: the candidate
+    /// set a create's `ClientToken` is resolved in.
+    ///
+    /// The scope is the CHANNEL, the namespace a job's identity lives in, and NOT the
+    /// addressed endpoint's map: a token already spent on a job under a sibling endpoint
+    /// of the same channel must be found, or a second create under it would be read as a
+    /// first attempt and mint a second job holding one token.
+    pub fn harvest_job_token_candidates(
+        &self,
+    ) -> impl Iterator<Item = (&str, Option<&str>, &str)> {
+        self.harvest_jobs().map(|job| {
+            (
+                job.name.as_str(),
+                job.client_token.as_deref(),
+                job.fingerprint.as_str(),
+            )
+        })
     }
 
     /// A harvest job name no job of this channel holds, derived from `seed` and the

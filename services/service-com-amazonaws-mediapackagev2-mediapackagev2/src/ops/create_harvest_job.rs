@@ -7,7 +7,10 @@
 //! The operation is `@idempotent` and binds `ClientToken` with `@idempotencyToken`, so a
 //! repeat under the same token is the SAME request: an unchanged one replays the job that
 //! token already created and creates nothing, while one that changed any other member is
-//! the modelled `IDEMPOTENT_PARAMETER_MISMATCH` conflict.
+//! the modelled `IDEMPOTENT_PARAMETER_MISMATCH` conflict. The token is resolved over every
+//! job of the CHANNEL, the namespace a harvest job's identity lives in — the same
+//! collection the job's NAME is judged against — so a token spent under any endpoint of
+//! that channel is found whichever endpoint the repeat addresses.
 //!
 //! Refusals, in the order they are judged: a schedule whose end is before its start, or
 //! equal to it, is `ValidationException` (400) with `END_TIME_EARLIER_THAN_START_TIME` /
@@ -395,23 +398,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ]);
 
         // The same idempotency rule every create in this service follows, applied among
-        // the jobs of the endpoint the request addresses — the level this create's
-        // siblings live at. The replay answers from the stored record, so it reports
-        // exactly what the first attempt stored; it advances no clock of its own (a job's
-        // due transitions are materialised by the operations that report it).
+        // every job of the CHANNEL — the namespace a harvest job's identity lives in
+        // (`crate::state::Channel::harvest_jobs`), and the same collection the name half
+        // of this decision is judged against below. Scoped to the addressed endpoint's
+        // map instead, a token already spent on a job under a sibling endpoint would be
+        // read as fresh and mint a second job under one token. The replay answers from
+        // the stored record, so it reports exactly what the first attempt stored; it
+        // advances no clock of its own (a job's due transitions are materialised by the
+        // operations that report it).
         match crate::state::match_client_token(
             input.client_token.as_deref(),
             &fingerprint,
-            endpoint.harvest_jobs.values().map(|job| {
-                (
-                    job.name.as_str(),
-                    job.client_token.as_deref(),
-                    job.fingerprint.as_str(),
-                )
-            }),
+            channel.harvest_job_token_candidates(),
         ) {
             crate::state::TokenMatch::Replay(name) => {
-                return Ok(job_output(&endpoint.harvest_jobs[&name]));
+                let Some(job) = channel.harvest_job(&name) else {
+                    return Err(CreateHarvestJobErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: Some(
+                                "the MediaPackageV2 store lost this harvest job".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                return Ok(job_output(job));
             }
             crate::state::TokenMatch::Mismatch => {
                 return Err(CreateHarvestJobErrorModeled::ConflictException(

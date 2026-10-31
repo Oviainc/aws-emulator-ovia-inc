@@ -134,3 +134,5 @@ mod harvest_job_modification_instant;
 mod harvest_job_manifest_reference;
 #[path = "all/tagging_arn_account_scope.rs"]
 mod tagging_arn_account_scope;
+#[path = "all/harvest_job_token_namespace.rs"]
+mod harvest_job_token_namespace;
