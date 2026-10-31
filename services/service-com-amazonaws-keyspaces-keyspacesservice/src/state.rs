@@ -2473,9 +2473,12 @@ pub fn resolve_capacity(
 /// caller's, or the modelled default (`AWS_OWNED_KMS_KEY`) when a create omits
 /// it.
 ///
-/// `CUSTOMER_MANAGED_KMS_KEY` "requires the `kms_key_identifier` of the KMS key
-/// in Amazon Resource Name (ARN) format as input"
-/// (`EncryptionSpecification$type`), which the model cannot express.
+/// The key identifier belongs to `CUSTOMER_MANAGED_KMS_KEY` and to nothing else:
+/// that type "requires the `kms_key_identifier` of the KMS key in Amazon Resource
+/// Name (ARN) format as input" (`EncryptionSpecification$type`), and no other type
+/// takes one — the Amazon-owned key "is owned by Amazon Keyspaces", so there is no
+/// key of the caller's to name. The model expresses neither half of that, so both
+/// are refused here, naming the member the caller has to fix.
 pub fn resolve_encryption(
     supplied: Option<EncryptionSpecification>,
 ) -> Result<EncryptionSpecification, String> {
@@ -2485,11 +2488,16 @@ pub fn resolve_encryption(
             kms_key_identifier: None,
         });
     };
-    if encryption.r#type == CUSTOMER_MANAGED_ENCRYPTION_TYPE
-        && encryption.kms_key_identifier.is_none()
-    {
+    if encryption.r#type == CUSTOMER_MANAGED_ENCRYPTION_TYPE {
+        if encryption.kms_key_identifier.is_none() {
+            return Err(format!(
+                "encryptionSpecification with type '{CUSTOMER_MANAGED_ENCRYPTION_TYPE}' requires kmsKeyIdentifier"
+            ));
+        }
+    } else if encryption.kms_key_identifier.is_some() {
         return Err(format!(
-            "encryptionSpecification with type '{CUSTOMER_MANAGED_ENCRYPTION_TYPE}' requires kmsKeyIdentifier"
+            "encryptionSpecification with type '{}' does not take kmsKeyIdentifier; it is input for '{CUSTOMER_MANAGED_ENCRYPTION_TYPE}' only",
+            encryption.r#type
         ));
     }
     Ok(encryption)
