@@ -35,6 +35,12 @@
 //! `ValidationException` (HTTP 400) and nothing is persisted, exactly as the create and the
 //! amendment refuse it: see [`crate::state::unconstrained_members_refusal`].
 //!
+//! An attachment the application already carries keeps the `CreatedBy`/`CreatedAt` the call
+//! that attached it recorded: those report WHO uploaded that file and WHEN, so a write that
+//! adds, removes, reorders or re-describes attachments leaves them alone and records the
+//! calling principal and the current instant only for a file not already attached — see
+//! [`crate::state::merged_file_details`].
+//!
 //! Idempotency: `ClientToken` identifies the REQUEST, so a retry carrying the token of an
 //! update that already applied changes nothing a second time and answers with the
 //! `Id`/`Arn`/`Revision` that update reported, while an update carrying that token with
@@ -446,11 +452,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // files the application already carries attaches nothing a second time and
             // leaves the `CreatedBy`/`CreatedAt` the first attachment recorded — see
             // [`crate::state::same_file_details`].
+            // A request that DID change the list stores the attachments it names, and
+            // each file the application already carries keeps the `CreatedBy`/`CreatedAt`
+            // the call that attached it recorded: those report who uploaded that file and
+            // when, so adding, removing or reordering attachments leaves them alone and
+            // only a file not already attached records this caller and this instant — see
+            // [`crate::state::merged_file_details`].
             if !crate::state::same_file_details(&application.file_details, &files) {
-                application.file_details = files
-                    .iter()
-                    .map(|file| crate::state::file_detail(file, &principal, now))
-                    .collect();
+                application.file_details = crate::state::merged_file_details(
+                    &application.file_details,
+                    &files,
+                    &principal,
+                    now,
+                );
                 applied_members.push(MEMBER_FILE_DETAILS.to_string());
             }
         }

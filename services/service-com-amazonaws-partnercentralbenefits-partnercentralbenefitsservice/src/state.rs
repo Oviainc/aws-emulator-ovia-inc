@@ -21,7 +21,7 @@
 //! *observably* later than the write before it even when both land inside one clock
 //! tick.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::aws_smithy_types::{Document, Number};
@@ -2648,9 +2648,13 @@ pub fn element_member_path(list: &str, index: usize, member: &str) -> String {
 /// The members checked are the ones the model constrains not at all
 /// ([`CONTACT_PHONE_MEMBER`], [`FILE_BUSINESS_USE_CASE_MEMBER`]); every other string of
 /// either shape carries a modelled `@length` or `@pattern` the centralized walk has
-/// already enforced. The refusal is built by the one construction every member refusal of
-/// this crate goes through ([`member_validation_exception`]), naming the element and the
-/// member a caller must fix ([`element_member_path`]) and echoing nothing of the value.
+/// already enforced, as do the two lists themselves (`PartnerContacts` `@length(max: 1)`,
+/// `FileDetails` `@length(max: 30)` —
+/// `smithy_query(query="operation",operation="UpdateBenefitApplication")`), so how many
+/// elements one request may name is refused before this runs. The refusal is built by the
+/// one construction every member refusal of this crate goes through
+/// ([`member_validation_exception`]), naming the element and the member a caller must fix
+/// ([`element_member_path`]) and echoing nothing of the value.
 ///
 /// Applied by every operation that supplies these lists — the create and the update to the
 /// lists they were handed, `AmendBenefitApplication` to the single value an amendment
@@ -2729,6 +2733,59 @@ pub fn same_file_details(stored: &[FileDetail], supplied: &[FileInput]) -> bool 
                 stored.file_uri == supplied.file_uri
                     && stored.business_use_case == supplied.business_use_case
             })
+}
+
+/// The `FileDetail` list an application holds once a write supplies `supplied`.
+///
+/// `CreatedBy` and `CreatedAt` record WHO uploaded a file and WHEN ("The identifier of the
+/// user who uploaded the file", "The timestamp when the file was uploaded" —
+/// `smithy_query(query="shape",shape="FileDetail")`), so they belong to the FILE rather
+/// than to the request that last wrote the list or to the position the file holds in it: a
+/// supplied attachment naming a `FileURI` the application already carries keeps the
+/// principal and instant the call that attached it recorded, and only a file the
+/// application does not already carry records `created_by` and `now_millis`. A write that
+/// adds, removes or reorders attachments therefore leaves the upload facts of every file
+/// already attached exactly as they were, while the members the caller supplies — and the
+/// `FileName`/`FileType` the URI governs — come from `supplied` through the one derivation
+/// every stored attachment goes through ([`file_detail`]).
+///
+/// Each stored file is carried forward at most once, so two supplied entries naming one
+/// stored file take that file's record for the first of them and record this call for the
+/// second. The stored files are indexed by `FileURI` ONCE, so the merge costs one pass
+/// over each list rather than a scan of the stored list per supplied entry — and both
+/// lists are at most the modelled `FileDetails` `@length(max: 30)` the centralized walk
+/// enforces before any write path reaches here
+/// (`smithy_query(query="operation",operation="UpdateBenefitApplication")`).
+pub fn merged_file_details(
+    stored: &[FileDetail],
+    supplied: &[FileInput],
+    created_by: &str,
+    now_millis: i64,
+) -> Vec<FileDetail> {
+    let mut already_attached: HashMap<&str, VecDeque<&FileDetail>> = HashMap::new();
+    for file in stored {
+        already_attached
+            .entry(file.file_uri.as_str())
+            .or_default()
+            .push_back(file);
+    }
+    supplied
+        .iter()
+        .map(|input| {
+            let attached = already_attached
+                .get_mut(input.file_uri.as_str())
+                .and_then(VecDeque::pop_front);
+            let detail = file_detail(input, created_by, now_millis);
+            match attached {
+                Some(attached) => FileDetail {
+                    created_by: attached.created_by.clone(),
+                    created_at: attached.created_at,
+                    ..detail
+                },
+                None => detail,
+            }
+        })
+        .collect()
 }
 
 /// The last path segment of `uri`, which is the file's name, with any query or fragment

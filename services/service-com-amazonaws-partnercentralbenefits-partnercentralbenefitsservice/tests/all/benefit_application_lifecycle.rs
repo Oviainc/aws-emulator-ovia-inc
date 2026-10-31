@@ -48,6 +48,11 @@ const TARGET_PREFIX: &str = "PartnerCentralBenefitsService";
 /// The production catalog, one of the two the service serves.
 pub(crate) const CATALOG: &str = "AWS";
 
+/// The access key id every request below is signed with unless the test names another
+/// ([`Harness::call_as`]). The service reports the caller it names as the principal of a
+/// write that records one.
+pub(crate) const ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+
 /// One emulator holding this service on one shared engine.
 ///
 /// Reused by `tests/all/service_error_rules.rs` and
@@ -122,6 +127,21 @@ impl Harness {
 
     /// Call one operation and return `(http status, parsed body)`.
     pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+        self.call_as(ACCESS_KEY_ID, operation, body).await
+    }
+
+    /// Call one operation signed with `access_key_id`, and return `(http status, parsed
+    /// body)`.
+    ///
+    /// The id is what the service derives the calling principal from, so a test about
+    /// which caller a stored record names — `tests/all/file_upload_facts.rs` on
+    /// `FileDetail$CreatedBy` — drives two different callers through this one request path.
+    pub(crate) async fn call_as(
+        &self,
+        access_key_id: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -130,7 +150,7 @@ impl Harness {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261021/{REGION}/{SIGNING_NAME}/aws4_request, \
+                    "AWS4-HMAC-SHA256 Credential={access_key_id}/20261021/{REGION}/{SIGNING_NAME}/aws4_request, \
                      SignedHeaders=host;x-amz-target, Signature=0000"
                 ),
             )
