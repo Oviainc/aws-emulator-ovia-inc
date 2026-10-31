@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the mutable configuration of a stored data source with what the request
+//! carries: the data source is addressed by `(AwsAccountId, DataSourceId)`, the members
+//! the request omits are cleared (the operation is a `PUT` of the whole configuration),
+//! and its identity — ARN, id, `Type`, `CreatedTime`, permissions and tags — is left
+//! alone. `Credentials` are dropped when the request is served, never stored and never
+//! reported.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +172,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataSource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateDataSourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+        let updated_time = crate::state::now_timestamp(std::time::SystemTime::now());
+
+        let key = (input.aws_account_id, input.data_source_id);
+        let mut store = state.lock();
+        let Some(record) = store.data_sources.get_mut(&key) else {
+            return Err(UpdateDataSourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Data source with ID {} not found.", key.1)),
+                    resource_type: Some("DATA_SOURCE".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // The whole mutable configuration comes from this request, so a member it omits
+        // is cleared rather than carried over: `Name` is required, and each optional
+        // member states how this data source connects from now on. `Type` is not an
+        // input here — the kind of a data source is fixed when it is created — and
+        // neither are the permissions or tags, which have their own operations.
+        record.name = input.name;
+        record.data_source_parameters = input.data_source_parameters;
+        record.vpc_connection_properties = input.vpc_connection_properties;
+        record.ssl_properties = input.ssl_properties;
+        record.last_updated_time = updated_time;
+        // The update is applied by the time this call answers, so the data source is in
+        // the terminal update status from this instant — there is no later transition for
+        // the clock to owe — and no error describes it any more.
+        record.status = crate::state::RESOURCE_STATUS_UPDATE_SUCCESSFUL.to_string();
+        record.error_info = None;
+        // `input.credentials` is deliberately not stored, exactly as on create: the
+        // member is `@sensitive`, no read returns it, and keeping a secret nothing can
+        // reach only risks disclosing it.
+
+        Ok(UpdateDataSourceOutput {
+            arn: Some(record.arn.clone()),
+            data_source_id: Some(record.data_source_id.clone()),
+            update_status: Some(crate::state::RESOURCE_STATUS_UPDATE_SUCCESSFUL.to_string()),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

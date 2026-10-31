@@ -380,7 +380,11 @@ impl DataSourceRecord {
             created_time: Some(self.created_time),
             last_updated_time: Some(self.last_updated_time),
             data_source_parameters: self.data_source_parameters.clone(),
-            // Set only by UpdateDataSource, which is still a stub.
+            // The allow list of alternate parameter sets a shared credential may be
+            // used with. It reaches the service only inside the `@sensitive`
+            // `Credentials` structure, which neither the create nor the update keeps,
+            // so no stored data source carries one — and the model documents a null
+            // list as allowing the parameters the credentials were used with.
             alternate_data_source_parameters: None,
             vpc_connection_properties: self.vpc_connection_properties.clone(),
             ssl_properties: self.ssl_properties.clone(),
@@ -570,6 +574,11 @@ pub const RESOURCE_STATUS_CREATION_SUCCESSFUL: &str = "CREATION_SUCCESSFUL";
 /// enum). A theme version is created in this non-terminal status and leaves it once
 /// [`THEME_CREATION_SPAN`] has elapsed.
 pub const RESOURCE_STATUS_CREATION_IN_PROGRESS: &str = "CREATION_IN_PROGRESS";
+
+/// `ResourceStatus` of a resource whose last update succeeded (same model enum).
+/// `UpdateDataSource` applies the update while serving the call, so the data source
+/// carries this terminal status from the instant the update is stored.
+pub const RESOURCE_STATUS_UPDATE_SUCCESSFUL: &str = "UPDATE_SUCCESSFUL";
 
 /// `ThemeType` of a theme a caller created, as opposed to one of the starting themes
 /// the service itself defines (`QUICKSIGHT`). Model enum
