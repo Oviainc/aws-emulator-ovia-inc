@@ -311,7 +311,9 @@ async fn detector_with_listings(router: &Router, region: &str, detector_id: &str
     );
 
     // Names created out of sorted order, so a page is a window of the LIST's order and
-    // not of the creation order.
+    // not of the creation order. Only the first list asks for activation: the
+    // account's allowance for the lists GuardDuty is USING is
+    // `ACTIVATED_IP_SETS_PER_ACCOUNT` in a Region.
     for name in ["zeta", "alpha", "mid"] {
         let (status, body) = call_in(
             router,
@@ -322,7 +324,7 @@ async fn detector_with_listings(router: &Router, region: &str, detector_id: &str
                 "name": format!("ipset-{name}"),
                 "format": "TXT",
                 "location": format!("s3://my-bucket/lists/{name}.txt"),
-                "activate": true
+                "activate": name == "zeta"
             })),
         )
         .await;

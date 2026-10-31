@@ -63,8 +63,13 @@ const ACTIVATING: &str = "ACTIVATING";
 const ACTIVE: &str = "ACTIVE";
 
 /// The published bounds of `Location` (`smithy_query(shape="Location")`: len 1..300).
-const LOCATION_MIN: usize = 1;
 const LOCATION_MAX: usize = 300;
+
+/// The length of the SHORTEST value that is both within `Location`'s published
+/// bounds and the Amazon S3 URL an uploaded list's location has to be
+/// (`s3://b/k`): a bucket of one character and an object key of one. Below it no
+/// value can be both, so it is the floor these rows use.
+const LOCATION_SHORTEST_S3: usize = "s3://b/k".len();
 
 /// A margin on top of the activation span, for the wall clock the handler reads.
 const SETTLE_MARGIN_MILLIS: u64 = 150;
@@ -120,10 +125,17 @@ async fn created_set_id(router: &Router, detector_id: &str, body: &Value) -> Str
 
 /// A `Location` of exactly `len` characters, built on an S3 URI prefix so the value
 /// stays a plausible object URI at every size.
+///
+/// Below [`LOCATION_SHORTEST_S3`] no value of that length is an S3 URL at all, so
+/// the shortest one is returned instead of a shorter string the service could never
+/// fetch.
 fn location_of(len: usize) -> String {
     let prefix = "s3://threat-lists/";
+    if len < LOCATION_SHORTEST_S3 {
+        return "s3://b/k".to_string();
+    }
     if len <= prefix.len() {
-        return "s".repeat(len);
+        return format!("s3://b/{}", "a".repeat(len - "s3://b/".len()));
     }
     format!("{prefix}{}", "a".repeat(len - prefix.len()))
 }
@@ -164,11 +176,11 @@ fn round_trip_requests() -> Vec<(String, Value)> {
         }),
     ));
     rows.push((
-        format!("a location at the published minimum of {LOCATION_MIN}"),
+        format!("a location at the shortest S3 URL of {LOCATION_SHORTEST_S3}"),
         json!({
             "name": "n",
             "format": "STIX",
-            "location": location_of(LOCATION_MIN),
+            "location": location_of(LOCATION_SHORTEST_S3),
             "activate": false,
         }),
     ));

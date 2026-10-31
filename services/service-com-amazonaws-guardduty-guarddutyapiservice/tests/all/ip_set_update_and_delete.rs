@@ -212,10 +212,11 @@ fn base_create(case_tag: &str, with_owner: bool) -> Value {
 ///
 /// The rows differ along what the rule generalises over: WHICH optional members the
 /// request carries (each alone, several together, none at all), the SIZE of the value
-/// (both ends of `Name`/`Location`'s modelled `len 1..300`), its ALPHABET (the
-/// documented name punctuation, a non-ASCII location) and whether the member already
-/// had a stored value. The alphabet `Name` itself is held to is the
-/// `ip_set_name_alphabet` suite's rule.
+/// (both ends of what `Name`/`Location` admit), its ALPHABET (the documented name
+/// punctuation, a non-ASCII object key), the FORM of the location (the S3 URL
+/// spellings) and whether the member already had a stored value. The alphabet `Name`
+/// itself is held to is the `ip_set_name_alphabet` suite's rule, and the S3 URL
+/// syntax `Location` is held to the `ip_set_location_syntax` suite's.
 struct UpdateRow {
     case: &'static str,
     with_owner: bool,
@@ -261,14 +262,17 @@ fn partial_update_rows() -> Vec<UpdateRow> {
             update: json!({"name": longest_name, "location": longest_location}),
         },
         UpdateRow {
-            case: "the shortest name and location the model accepts",
+            case: "the shortest name and location the members admit",
             with_owner: true,
-            update: json!({"name": "a", "location": "s"}),
+            update: json!({"name": "a", "location": "s3://b/k"}),
         },
         UpdateRow {
-            case: "a non-ASCII location round-trips byte for byte",
+            case: "a non-ASCII object key round-trips byte for byte",
             with_owner: false,
-            update: json!({"name": "renamed list 2", "location": "https://example.com/更新.xml"}),
+            update: json!({
+                "name": "renamed list 2",
+                "location": "https://my-bucket.s3.us-west-2.amazonaws.com/\u{66f4}\u{65b0}.xml"
+            }),
         },
         UpdateRow {
             case: "an update that carries no updatable member at all",
@@ -457,11 +461,15 @@ fn activation_rows() -> Vec<ActivationRow> {
 
 #[tokio::test]
 async fn an_update_moves_the_activation_status_only_through_the_clock() {
-    let router = new_router();
-    let detector = enabled_detector(&router).await;
-
     for (index, row) in activation_rows().into_iter().enumerate() {
         let case = row.case;
+        // Each row gets its OWN account state: a row that leaves a list in use has
+        // consumed the account's activated-list allowance
+        // (`state::ACTIVATED_IP_SETS_PER_ACCOUNT`, the
+        // `ip_set_activation_allowance` suite's rule), which must not decide what
+        // the next row's create is answered.
+        let router = new_router();
+        let detector = enabled_detector(&router).await;
         let id = created(
             &router,
             &detector,

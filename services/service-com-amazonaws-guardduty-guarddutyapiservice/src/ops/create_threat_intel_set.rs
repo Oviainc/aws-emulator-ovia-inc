@@ -165,6 +165,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `Location` is "the URI of the file that contains the ThreatIntelSet"
+        // (`smithy_query(query="doc",shape="CreateThreatIntelSetRequest",member="Location")`)
+        // — the file GuardDuty fetches from Amazon S3 — and the modelled constraint
+        // on it is a `len 1..300` with no pattern, so the syntax is enforced here,
+        // the way it is for every other uploaded list on this service
+        // ([`crate::state::is_s3_location`]). Checked before anything is written and
+        // whatever `Activate` says.
+        if !crate::state::is_s3_location(&input.location) {
+            return Err(invalid_input(crate::state::invalid_parameter_message(
+                crate::state::THREAT_INTEL_SET_LOCATION_MEMBER,
+            )));
+        }
+
         // `ExpectedBucketOwner` is "the Amazon Web Services account ID that owns the
         // Amazon S3 bucket specified in the location parameter"
         // (`smithy_query(query="doc",shape="CreateThreatIntelSetRequest",member="ExpectedBucketOwner")`),

@@ -928,7 +928,7 @@ async fn update_ip_set_with_an_id_the_detector_does_not_hold_is_refused_and_list
     let bodies = [
         json!({"name": "x"}),
         json!({"activate": true}),
-        json!({"location": "https://example.com/list.txt"}),
+        json!({"location": "s3://my-bucket/list.txt"}),
         json!({}),
     ];
 

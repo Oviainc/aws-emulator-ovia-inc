@@ -1611,6 +1611,11 @@ pub const LIST_EXPECTED_BUCKET_OWNER_MEMBER: &str = "expectedBucketOwner";
 /// ([`SET_ID_NOT_FOUND_MESSAGE`]).
 pub const THREAT_INTEL_SET_ID_MEMBER: &str = "threatIntelSetId";
 
+/// The name GuardDuty gives the threat-list `Location` member in a rejection of
+/// it: the threat-list counterpart of [`IP_SET_LOCATION_MEMBER`], qualified by
+/// its own resource the way [`THREAT_INTEL_SET_ID_MEMBER`] is.
+pub const THREAT_INTEL_SET_LOCATION_MEMBER: &str = "threatIntelSetLocation";
+
 /// The wire name of the `ScanResourceCriteria` member of
 /// `UpdateMalwareScanSettings` (`jsonName` `scanResourceCriteria`), for the same
 /// reason.
@@ -1670,6 +1675,17 @@ pub fn invalid_parameter_message(member: &str) -> String {
 /// refusal names the member the request carried and stops there.
 pub fn invalid_parameter_value_message(member: &str) -> String {
     format!("The request was rejected because the parameter {member} has an invalid value.")
+}
+
+/// The message GuardDuty refuses a criteria structure whose CONDITION VALUES it
+/// will not take with: the member the request carried named, the fault located in a
+/// condition, and nothing from inside the structure echoed.
+///
+/// It is a different sentence from [`invalid_parameter_value_message`] because it
+/// is a different answer: the member's own shape is one the service takes, and what
+/// it will not take is a value a condition inside it carries.
+pub fn invalid_condition_values_message(member: &str) -> String {
+    format!("The request was rejected because the parameter {member} has invalid values in a condition.")
 }
 
 /// The message GuardDuty refuses an unusable input value with where it does NOT
@@ -3692,9 +3708,23 @@ impl Detector {
     /// been accepted is only reported, never used, so it no longer occupies one of
     /// the detector's slots.
     pub fn live_ip_set_count(&self) -> usize {
+        self.live_ip_set_count_excluding(None)
+    }
+
+    /// How many of this detector's IPSets are LIVE — held and not being deleted —
+    /// other than the one `except` names.
+    ///
+    /// This is the count [`ACTIVATED_IP_SETS_PER_ACCOUNT`] bounds when a request
+    /// asks GuardDuty to start USING a list: the allowance is for the lists the
+    /// account keeps, so a list whose delete has been accepted releases the one it
+    /// held, and `except` is how a request about one list asks the question about
+    /// the OTHERS.
+    pub fn live_ip_set_count_excluding(&self, except: Option<&str>) -> usize {
         self.ip_sets
             .values()
-            .filter(|ip_set| !ip_set.is_deleting())
+            .filter(|ip_set| {
+                !ip_set.is_deleting() && except.is_none_or(|id| ip_set.id != id)
+            })
             .count()
     }
 
@@ -3824,6 +3854,51 @@ pub fn ip_set_limit_message() -> String {
     )
 }
 
+/// How many trusted IP lists an account may have GuardDuty USE in one Region.
+///
+/// AWS publishes an allowance of one trusted IP list per account per Region. The
+/// number of lists a detector may HOLD is the larger [`IP_SETS_PER_DETECTOR`]:
+/// uploading a further list unused is accepted, and what the allowance governs is
+/// putting a list INTO USE — so a request that asks GuardDuty to start using a
+/// list is refused once the account's lists have taken the allowance up, while the
+/// same request that does not ask for it is served
+/// ([`Detector::live_ip_set_count_excluding`]).
+///
+/// A detector is the account's one resource in a Region ("you can have only one
+/// detector per account per Region" —
+/// `smithy_query(query="doc",shape="CreateDetector")`), so the account's allowance
+/// in a Region is the detector's.
+///
+/// The threat-list family needs no allowance of its own: AWS publishes six threat
+/// lists per account per Region and that is already the ceiling on the lists a
+/// detector HOLDS ([`THREAT_INTEL_SETS_PER_DETECTOR`]), so no sequence of creates
+/// or updates can put more than the allowance into use.
+pub const ACTIVATED_IP_SETS_PER_ACCOUNT: usize = 1;
+
+/// The message GuardDuty refuses a request that would take the account past one
+/// of its resource allowances with.
+///
+/// A server-side allowance rather than a malformed request: the class is the
+/// modelled `InternalServerErrorException` (`httpError` 500,
+/// `smithy_query(shape="InternalServerErrorException")`), so a client reading the
+/// class alone still tells it apart from the 400 a bad parameter gets. The
+/// sentence names neither the resource nor the caller's values.
+pub const ACCOUNT_LIMIT_MESSAGE: &str =
+    "The request is rejected because it\u{2019}s an attempt to create resources beyond the current AWS account limits.";
+
+/// The modelled server-side failure a request past an account allowance is
+/// refused with, carrying [`ACCOUNT_LIMIT_MESSAGE`].
+///
+/// `Type` is "The error type" (`smithy_query(shape="InternalServerErrorException")`)
+/// — the error class, the same value the body's `__type` discriminator carries,
+/// which is how [`state_unavailable`] fills it too.
+pub fn account_limit_exceeded() -> crate::ops::types::shared_types::InternalServerErrorException {
+    crate::ops::types::shared_types::InternalServerErrorException {
+        message: Some(ACCOUNT_LIMIT_MESSAGE.to_string()),
+        r#type: Some("InternalServerErrorException".to_string()),
+    }
+}
+
 /// The wire name of the `IpSetId` member, as the request carries it
 /// (`smithy_query(operation="GetIPSet")` binds it as the URI label `IpSetId`,
 /// rendered `ipSetId` in the JSON body of the sibling operations). The family's own
@@ -3844,6 +3919,16 @@ pub const SET_ID_NOT_FOUND_MESSAGE: &str = NO_SUCH_RESOURCE_MESSAGE;
 /// (`smithy_query(operation="CreateIPSet")`). It is what a rejection names,
 /// AS THE REQUEST CARRIES IT.
 pub const IP_SET_NAME_MEMBER: &str = "name";
+
+/// The name GuardDuty gives the IPSet `Location` member in a rejection of it.
+///
+/// It is the ONE member name where the service does not use the request's own
+/// spelling: the create and the update bind the member in the JSON body under
+/// `jsonName` `location` (`smithy_query(operation="CreateIPSet")`), while the
+/// service names the parameter it refuses by its resource-qualified name — the
+/// same convention its other IPSet-qualified member names follow
+/// ([`IP_SET_ID_MEMBER`]).
+pub const IP_SET_LOCATION_MEMBER: &str = "ipSetLocation";
 
 /// Does `name` hold only the characters an IPSet `Name` may contain?
 ///
@@ -4434,12 +4519,22 @@ pub fn is_entity_set_name(name: &str) -> bool {
     is_list_name(name, false)
 }
 
-/// Is `location` a valid Amazon S3 URL for an uploaded entity-set list?
+/// Is `location` a valid Amazon S3 URL for an UPLOADED LIST?
 ///
 /// "The format of the Location URL must be a valid Amazon S3 URL format. Invalid
 /// URL formats will result in an error, regardless of whether you activate the
 /// entity set or not"
 /// (`smithy_query(query="doc",shape="CreateTrustedEntitySetRequest",member="Location")`).
+///
+/// The rule is the list FAMILY's, not the entity set's: every uploaded list's
+/// `Location` is "the URI of the file that contains the …"
+/// (`smithy_query(query="doc",shape="CreateIPSetRequest",member="Location")` and
+/// its threat-list sibling) — the file GuardDuty fetches from Amazon S3 — so the
+/// IPSet, the threat list and the entity sets are all held to this one syntax,
+/// and a `Location` the service could never fetch is refused instead of stored.
+/// The modelled constraint on each of those members is a `len 1..300` with no
+/// pattern, so the handler is the enforcement point.
+///
 /// The accepted forms are the S3 URL forms: the `s3://bucket/key` scheme, the
 /// path-style HTTPS endpoint (`https://s3[.-]<region>.amazonaws.com/bucket/key`)
 /// and the virtual-hosted-style one
@@ -5602,6 +5697,64 @@ const NUMERIC_FINDING_ATTRIBUTES: [&str; 7] = [
     "updatedAt",
 ];
 
+/// The `jsonName` of the `Finding` member carrying the finding's severity
+/// (`smithy_query(shape="Finding")`), which is the one numeric finding field whose
+/// value domain is a published SCALE rather than an open-ended number.
+const SEVERITY_ATTRIBUTE: &str = "severity";
+
+/// The lowest value on GuardDuty's finding severity scale.
+///
+/// The scale runs from 1 to 10 and is divided into the bands this service already
+/// assigns a generated sample finding by its finding type — Low 1.0–3.9, Medium
+/// 4.0–6.9, High 7.0–8.9, Critical 9.0–10.0. The model types the member as a plain
+/// double and states no range at all
+/// (`smithy_query(query="doc",shape="Finding",member="Severity")`), so the scale is
+/// the service's own and is enforced here.
+pub const FINDING_SEVERITY_MIN: f64 = 1.0;
+
+/// The highest value on GuardDuty's finding severity scale. See
+/// [`FINDING_SEVERITY_MIN`].
+pub const FINDING_SEVERITY_MAX: f64 = 10.0;
+
+/// The [`NUMERIC_FINDING_ATTRIBUTES`] that carry an INSTANT, and so the ones whose
+/// values have two admissible forms: the epoch milliseconds a criterion's ordering
+/// compares ("Type: Timestamp in Unix Epoch millisecond format",
+/// `smithy_query(query="doc",shape="CreateFilterRequest",member="FindingCriteria")`)
+/// and the ISO-8601 text a finding reports. Either is a value the field can hold,
+/// so an equality value on one of them is not held to the numeric form.
+const TIMESTAMP_FINDING_ATTRIBUTES: [&str; 4] = [
+    "createdAt",
+    "service.eventFirstSeen",
+    "service.eventLastSeen",
+    "updatedAt",
+];
+
+/// Can the finding field at `path` HOLD `value` — is it a value of that field?
+///
+/// A criterion carries every value as text, so the field's own form is what decides:
+/// a field this service resolves as a number cannot hold a value that is not one,
+/// and the one field whose numbers run over a published scale cannot hold a number
+/// off that scale ([`FINDING_SEVERITY_MIN`]). A field resolved as text, an instant
+/// (which has two admissible forms, see [`TIMESTAMP_FINDING_ATTRIBUTES`]) and a
+/// field a stored record does not populate have no form here to contradict, so any
+/// value is one they could hold — the same reasoning
+/// [`attribute_is_orderable`] applies to an ordering condition.
+fn is_finding_field_value(path: &str, value: &str) -> bool {
+    if !NUMERIC_FINDING_ATTRIBUTES.contains(&path) || TIMESTAMP_FINDING_ATTRIBUTES.contains(&path) {
+        return true;
+    }
+    let Ok(number) = value.parse::<f64>() else {
+        return false;
+    };
+    if !number.is_finite() {
+        return false;
+    }
+    if path != SEVERITY_ATTRIBUTE {
+        return true;
+    }
+    (FINDING_SEVERITY_MIN..=FINDING_SEVERITY_MAX).contains(&number)
+}
+
 /// The `Finding` members that carry a SCALAR, by `jsonName`
 /// (`smithy_query(shape="Finding")`): a criterion key or a sort attribute names one
 /// of these on its own, with nothing beneath it.
@@ -5749,6 +5902,10 @@ pub enum CriterionRejection {
     /// (see [`filter_only_condition`]). Carries that member's `jsonName`, which is a
     /// name from the MODEL and not a value from the request.
     ConditionNotAvailable(&'static str),
+    /// A condition on the field asserts it equals a value that field cannot hold
+    /// ([`is_finding_field_value`]). Carries the field path, which is a name from
+    /// the request, so nothing of it reaches the message.
+    ValueNotInDomain(String),
 }
 
 impl CriterionRejection {
@@ -5766,6 +5923,11 @@ impl CriterionRejection {
             Self::UnknownField(_) | Self::NotOrderable(_) | Self::ConditionNotAvailable(_) => {
                 invalid_parameter_value_message(member)
             }
+            // A criteria structure whose SHAPE the service takes but whose
+            // condition values it does not gets the sentence that says so: the
+            // fault is located in a condition rather than in the member as a
+            // whole, and the value is still not echoed.
+            Self::ValueNotInDomain(_) => invalid_condition_values_message(member),
         }
     }
 }
@@ -6013,6 +6175,25 @@ fn filter_only_condition(condition: &crate::ops::types::Condition) -> Option<&'s
     .find_map(|(member, present)| present.then_some(member))
 }
 
+/// Does a `Condition` on the finding field at `path` assert that field equals a
+/// value it cannot hold?
+///
+/// `Equals` and the deprecated `Eq` are the members that CLAIM the field takes one
+/// of the values they carry, so they are the ones held to the field's domain
+/// ([`is_finding_field_value`]): a claim no value of the field can satisfy selects
+/// nothing, whatever findings exist. The other members make no such claim and are
+/// therefore not checked against it — `NotEquals`/`Neq` name values to EXCLUDE,
+/// which is well defined for a value the field never takes (it excludes nothing),
+/// and an ordering member carries a THRESHOLD rather than a value, so a bound past
+/// the field's domain selects everything or nothing instead of being unsatisfiable.
+fn condition_value_not_in_domain(path: &str, condition: &crate::ops::types::Condition) -> bool {
+    [condition.equals.as_ref(), condition.eq.as_ref()]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|value| !is_finding_field_value(path, value))
+}
+
 /// Refuse a `FindingCriteria` this service cannot answer on `surface`, naming the field
 /// path or the unavailable condition.
 ///
@@ -6049,6 +6230,14 @@ pub fn validate_finding_criteria(
             || condition.lte.is_some();
         if orders_numerically && !attribute_is_orderable(path) {
             return Err(CriterionRejection::NotOrderable(path.clone()));
+        }
+        // A criterion is a claim about the VALUE of a finding field, so a value the
+        // field cannot hold is refused here rather than saved in a filter that can
+        // never select anything or evaluated against findings it cannot describe.
+        // Checked on every surface, for the same reason the field check is: the two
+        // answers must not depend on which operation was handed the criteria.
+        if condition_value_not_in_domain(path, condition) {
+            return Err(CriterionRejection::ValueNotInDomain(path.clone()));
         }
     }
     Ok(())

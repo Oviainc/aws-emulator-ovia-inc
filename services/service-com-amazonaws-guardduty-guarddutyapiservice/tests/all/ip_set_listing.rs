@@ -93,6 +93,11 @@ async fn created(
 /// A create body differing from its neighbours in name, format, location and whether it
 /// asks for activation, so the rows the listing tests build span those classes rather
 /// than repeating one recorded request.
+///
+/// Only the FIRST row asks for activation: the account's allowance for the lists
+/// GuardDuty is USING is `state::ACTIVATED_IP_SETS_PER_ACCOUNT` in a Region (the
+/// `ip_set_activation_allowance` suite owns that rule), so every further row is
+/// uploaded unused.
 fn create_body(index: usize) -> Value {
     // Every member of `IpSetFormat` (`smithy_query(shape="IpSetFormat")`).
     const FORMATS: [&str; 6] = [
@@ -107,7 +112,7 @@ fn create_body(index: usize) -> Value {
         "name": format!("listed-{index:03}"),
         "format": FORMATS[index % FORMATS.len()],
         "location": format!("s3://my-bucket/lists/listed-{index:03}.txt"),
-        "activate": index.is_multiple_of(2)
+        "activate": index == 0
     })
 }
 

@@ -173,6 +173,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // `Location` is "the URI of the file that contains the IPSet"
+        // (`smithy_query(query="doc",shape="CreateIPSetRequest",member="Location")`)
+        // — the file GuardDuty fetches from Amazon S3 — and the modelled constraint
+        // on it is a `len 1..300` with no pattern, so the syntax is enforced here,
+        // the way it is for every other uploaded list on this service
+        // ([`crate::state::is_s3_location`]). Checked before anything is written and
+        // whatever `Activate` says, so a list the service could never fetch is
+        // refused instead of provisioned.
+        if !crate::state::is_s3_location(&input.location) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::IP_SET_LOCATION_MEMBER),
+            ));
+        }
+
         // `ExpectedBucketOwner` is "the Amazon Web Services account ID that owns the
         // Amazon S3 bucket specified in the location parameter"
         // (`smithy_query(query="doc",shape="CreateIPSetRequest",member="ExpectedBucketOwner")`),
@@ -236,6 +250,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::ip_set_limit_message(),
             ));
+        }
+        // `Activate` is "a Boolean value that indicates whether GuardDuty is to
+        // start using the uploaded IPSet" (`smithy_query(operation="CreateIPSet")`),
+        // and the account's allowance for the trusted IP lists GuardDuty USES in a
+        // Region is `ACTIVATED_IP_SETS_PER_ACCOUNT` — taken up by the lists this
+        // account already holds. A create that asks for its list to be used past
+        // that allowance is refused as a server-side allowance failure, not as a bad
+        // parameter, and the refusal is decided from the account's own stored lists —
+        // so the identical create that does not ask for the list to be used is
+        // accepted and the list is uploaded unused. Decided before the `Location` is
+        // ever dereferenced and before anything is minted, so a refused create leaves
+        // no IPSet behind.
+        if input.activate
+            && detector.live_ip_set_count_excluding(None)
+                >= crate::state::ACTIVATED_IP_SETS_PER_ACCOUNT
+        {
+            return Err(CreateIPSetErrorModeled::InternalServerErrorException(
+                crate::state::account_limit_exceeded(),
+            )
+            .into());
         }
 
         // Past every refusal: this call is going to write, so now it may read the

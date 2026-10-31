@@ -257,14 +257,17 @@ fn partial_update_rows() -> Vec<UpdateRow> {
             update: json!({"name": longest_name, "location": longest_location}),
         },
         UpdateRow {
-            case: "the shortest name and location the model accepts",
+            case: "the shortest name and location the members admit",
             with_owner: true,
-            update: json!({"name": "a", "location": "s"}),
+            update: json!({"name": "a", "location": "s3://b/k"}),
         },
         UpdateRow {
             case: "a non-ASCII name round-trips byte for byte",
             with_owner: false,
-            update: json!({"name": "リスト – 更新", "location": "https://example.com/更新.xml"}),
+            update: json!({
+                "name": "\u{30ea}\u{30b9}\u{30c8} \u{2013} \u{66f4}\u{65b0}",
+                "location": "https://my-bucket.s3.us-west-2.amazonaws.com/\u{66f4}\u{65b0}.xml"
+            }),
         },
         UpdateRow {
             case: "an update that carries no updatable member at all",

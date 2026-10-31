@@ -25,6 +25,8 @@ mod client_token_store;
 mod coverage_listing;
 #[path = "all/coverage_statistics.rs"]
 mod coverage_statistics;
+#[path = "all/criterion_value_domain.rs"]
+mod criterion_value_domain;
 #[path = "all/custom_detection_rule_association_delete.rs"]
 mod custom_detection_rule_association_delete;
 #[path = "all/custom_detection_rule_association_listing.rs"]
@@ -105,10 +107,14 @@ mod invitation_listing;
 mod invitation_pending_agreement;
 #[path = "all/invite_members_no_send_clock.rs"]
 mod invite_members_no_send_clock;
+#[path = "all/ip_set_activation_allowance.rs"]
+mod ip_set_activation_allowance;
 #[path = "all/ip_set_lifecycle.rs"]
 mod ip_set_lifecycle;
 #[path = "all/ip_set_listing.rs"]
 mod ip_set_listing;
+#[path = "all/ip_set_location_syntax.rs"]
+mod ip_set_location_syntax;
 #[path = "all/ip_set_name_alphabet.rs"]
 mod ip_set_name_alphabet;
 #[path = "all/ip_set_update_and_delete.rs"]

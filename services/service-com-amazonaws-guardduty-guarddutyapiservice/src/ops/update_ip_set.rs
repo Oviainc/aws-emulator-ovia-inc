@@ -164,6 +164,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The `Location` an update carries is the same fact the create's member is —
+        // "the updated URI of the file that contains the IPSet"
+        // (`smithy_query(operation="UpdateIPSet")`) — so it is held to the same S3
+        // URL syntax the create holds it to ([`crate::state::is_s3_location`]), and
+        // a value the service could never fetch is refused before the stored
+        // location is overwritten with it.
+        if input
+            .location
+            .as_deref()
+            .is_some_and(|location| !crate::state::is_s3_location(location))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::IP_SET_LOCATION_MEMBER),
+            ));
+        }
+
         // `ExpectedBucketOwner` is the same fact the create's member carries — "the
         // Amazon Web Services account ID that owns the Amazon S3 bucket specified in
         // the location parameter"
@@ -234,6 +250,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the detector keeps its own, and the clock keeps the instant the next
             // real change is entitled to.
             return Ok(UpdateIPSetOutput {});
+        }
+
+        // An update that asks GuardDuty to start USING this list is held to the
+        // account's allowance exactly as a create is
+        // ([`crate::state::ACTIVATED_IP_SETS_PER_ACCOUNT`]) — asked of the OTHER
+        // lists this account holds, since the list the request names is the one it
+        // is asking about, and only when the request's `Activate` moves this list
+        // into use. Decided before anything is written, so a refused update leaves
+        // the stored list and the clock where they were.
+        if input.activate == Some(true)
+            && detector.live_ip_set_count_excluding(Some(&input.ip_set_id))
+                >= crate::state::ACTIVATED_IP_SETS_PER_ACCOUNT
+        {
+            return Err(UpdateIPSetErrorModeled::InternalServerErrorException(
+                crate::state::account_limit_exceeded(),
+            )
+            .into());
         }
 
         // Past the refusals and past that no-op this is a MUTATION: the instant

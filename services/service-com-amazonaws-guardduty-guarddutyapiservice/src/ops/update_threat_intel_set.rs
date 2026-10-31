@@ -152,6 +152,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // The `Location` an update carries is the same fact the create's member is —
+        // "the updated URI of the file that contains the ThreatIntelSet"
+        // (`smithy_query(operation="UpdateThreatIntelSet")`) — so it is held to the
+        // same S3 URL syntax the create holds it to
+        // ([`crate::state::is_s3_location`]), and a value the service could never
+        // fetch is refused before the stored location is overwritten with it.
+        if input
+            .location
+            .as_deref()
+            .is_some_and(|location| !crate::state::is_s3_location(location))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(
+                    crate::state::THREAT_INTEL_SET_LOCATION_MEMBER,
+                ),
+            ));
+        }
+
         // `ExpectedBucketOwner` is the same fact the create's member carries — "the
         // Amazon Web Services account ID that owns the Amazon S3 bucket specified in
         // the location parameter"

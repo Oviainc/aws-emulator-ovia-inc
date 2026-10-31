@@ -13,7 +13,11 @@
 //! 1. `CreateIPSet` PERSISTS the IPSet under the request's detector, and `GetIPSet`
 //!    reports every member back as it was stored — the name verbatim, the format,
 //!    the location, the tags and `ExpectedBucketOwner`, which appears "only if it
-//!    was provided during IPSet creation or update".
+//!    was provided during IPSet creation or update". A `Location` the service could
+//!    never fetch is refused instead (the `ip_set_location_syntax` suite), and only
+//!    `state::ACTIVATED_IP_SETS_PER_ACCOUNT` of an account's lists may be in use at
+//!    a time (the `ip_set_activation_allowance` suite), so these rows upload at most
+//!    one activated list per detector.
 //! 2. `Activate` decides the status: a list the caller asked GuardDuty to start
 //!    using is transitional (`ACTIVATING`) until the CLOCK owes it `ACTIVE`
 //!    (`state::IP_SET_TRANSITION_MILLIS`), one it did not is stored unused
@@ -127,18 +131,24 @@ async fn status_of(router: &Router, detector_id: &str, ip_set_id: &str, case: &s
 /// One create request and the case it stands for. The rows span the classes the
 /// members admit — `Name` is `len 1..300` within the alphabet its documentation
 /// names (the `ip_set_name_alphabet` suite owns that rule), `Location` is
-/// `len 1..300` with no documented form at all, and `Tags`/`ExpectedBucketOwner`
+/// `len 1..300` in the Amazon S3 URL form the service requires (the
+/// `ip_set_location_syntax` suite owns that rule), and `Tags`/`ExpectedBucketOwner`
 /// are optional (`smithy_query(operation="CreateIPSet")`) — differing in SIZE
-/// (both ends of the modelled range), ALPHABET (the documented name punctuation,
-/// a non-ASCII location), PRESENCE (the optional members absent and present) and
-/// COUNT (one tag, several).
+/// (both ends of what the members admit), ALPHABET (the documented name
+/// punctuation, a non-ASCII object key), FORM (the S3 URL spellings), PRESENCE (the
+/// optional members absent and present) and COUNT (one tag, several).
+///
+/// Only the first row asks for activation: the account's allowance for the lists
+/// GuardDuty is USING is `state::ACTIVATED_IP_SETS_PER_ACCOUNT` in a Region (the
+/// `ip_set_activation_allowance` suite owns that rule), and these rows are created
+/// under ONE detector.
 fn round_trip_rows() -> Vec<(&'static str, Value)> {
     let longest_name = "n".repeat(300);
     let longest_location = format!("s3://bucket/{}", "p".repeat(287));
     vec![
         (
-            "the shortest name and location the model accepts",
-            json!({"name": "a", "format": "TXT", "location": "s", "activate": true}),
+            "the shortest name and location the members admit",
+            json!({"name": "a", "format": "TXT", "location": "s3://b/k", "activate": true}),
         ),
         (
             "the documented name alphabet: alphanumeric, whitespace, dash, underscore",
@@ -146,20 +156,20 @@ fn round_trip_rows() -> Vec<(&'static str, Value)> {
                 "name": "trusted ip-list_02",
                 "format": "TXT",
                 "location": "s3://my-bucket/lists/trusted.txt",
-                "activate": true
-            }),
-        ),
-        (
-            "a non-ASCII location round-trips byte for byte",
-            json!({
-                "name": "trusted list STIX",
-                "format": "STIX",
-                "location": "https://example.com/lists/トラスト.xml",
                 "activate": false
             }),
         ),
         (
-            "the longest name and location the model accepts",
+            "a non-ASCII object key round-trips byte for byte",
+            json!({
+                "name": "trusted list STIX",
+                "format": "STIX",
+                "location": "https://s3.eu-west-1.amazonaws.com/my-bucket/lists/\u{30c8}\u{30e9}\u{30b9}\u{30c8}.xml",
+                "activate": false
+            }),
+        ),
+        (
+            "the longest name and location the members admit",
             json!({
                 "name": longest_name,
                 "format": "ALIEN_VAULT",
@@ -173,7 +183,7 @@ fn round_trip_rows() -> Vec<(&'static str, Value)> {
                 "name": "tagged list",
                 "format": "PROOF_POINT",
                 "location": "s3://my-bucket/lists/proof.txt",
-                "activate": true,
+                "activate": false,
                 "expectedBucketOwner": "123456789012",
                 "tags": {"Env": "prod", "Team/Owner": "security", "cost-center": "4711"}
             }),
@@ -255,7 +265,7 @@ async fn every_modelled_format_round_trips() {
                 "name": format!("list-{format}"),
                 "format": format,
                 "location": format!("s3://my-bucket/{format}.list"),
-                "activate": true
+                "activate": false
             }),
         )
         .await;
@@ -370,7 +380,7 @@ async fn a_replayed_client_token_returns_the_first_ip_set() {
         "name": "token list",
         "format": "TXT",
         "location": "s3://my-bucket/token.txt",
-        "activate": true
+        "activate": false
     });
 
     // The tokens span the class `ClientToken` admits — `len 0..64`

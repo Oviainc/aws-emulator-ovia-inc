@@ -103,8 +103,13 @@ struct BoundaryRow {
 }
 
 /// A `FindingCriteria` keyed by `field`.
+///
+/// The value is one the severity scale admits, because the rows below key the
+/// criteria by `severity` as their BASELINE — a criterion asserting a field equals a
+/// value that field cannot take is itself refused, which is the
+/// `criterion_value_domain` suite's rule and not this suite's.
 fn criteria(field: &str) -> Value {
-    json!({"criterion": {field: {"equals": ["x"]}}})
+    json!({"criterion": {field: {"equals": ["5"]}}})
 }
 
 /// Assert the status, the error shape and the exact message of one refusal.
