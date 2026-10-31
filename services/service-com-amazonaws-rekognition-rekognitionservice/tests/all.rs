@@ -17,5 +17,7 @@ mod error_bodies;
 mod face_collections;
 #[path = "all/face_detection.rs"]
 mod face_detection;
+#[path = "all/image_content_refusal.rs"]
+mod image_content_refusal;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

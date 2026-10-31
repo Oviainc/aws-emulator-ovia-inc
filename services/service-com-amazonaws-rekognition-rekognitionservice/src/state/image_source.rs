@@ -38,10 +38,12 @@ pub const MAX_S3_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 pub const UNREADABLE_OBJECT_MESSAGE: &str =
     "Unable to get object metadata from S3. Check object key, region and/or access permissions.";
 
-/// The message an `Image` carrying neither form is refused with. The model marks both
-/// members optional, so such a request reaches the handler and is refused there.
+/// The message an `Image` carrying neither form is refused with, as AWS words it for that
+/// error class: fixed text that interpolates nothing — neither a request value nor a member
+/// name — so it is the same for every image operation. The model marks both members
+/// optional, so such a request reaches the handler and is refused there.
 pub const MISSING_IMAGE_CONTENT_MESSAGE: &str =
-    "Request has invalid parameters: Image must carry either Bytes or S3Object";
+    "Requested image should either contain bytes or s3 object.";
 
 /// The message `InvalidImageFormatException` is stated with — the error AWS answers for
 /// bytes that are not an image in a format it reads.
