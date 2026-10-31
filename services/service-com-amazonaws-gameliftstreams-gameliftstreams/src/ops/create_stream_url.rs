@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStreamUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStreamUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates and PERSISTS a stream URL under the stream group that runs the stream
+//! sessions it starts, in `ACTIVE` status.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStreamUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The resource, its ARN, its stored configuration, its `RemainingUses` and its
+//! expiry are real: the record is what `GetStreamUrl` reports and what
+//! `RevokeStreamUrl` moves to `REVOKED`. The shareable locator it hands out is
+//! built from that record (see `crate::state::shareable_stream_url`); the hosted
+//! web player the locator addresses is a browser client of the real service, so no
+//! call of this API spends a use.
 //!
 //! ## Shape of an operation
 //!
@@ -285,18 +285,277 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStreamUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStreamUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStreamUrl"))
+        // Both identifiers this request carries have to resolve to the ARN of the
+        // resource they name, which is checked BEFORE the store is read: a value
+        // that resolves to no such ARN is a bad value for the member, not a resource
+        // that is missing.
+        if let Some(refusal) = crate::state::invalid_resource_arn(
+            crate::state::IDENTIFIER_MEMBER,
+            &input.identifier,
+            crate::state::STREAM_GROUP_RESOURCE,
+        ) {
+            return Err(CreateStreamUrlErrorModeled::ValidationException(refusal).into());
+        }
+        if let Some(refusal) = crate::state::invalid_resource_arn(
+            crate::state::APPLICATION_IDENTIFIER_MEMBER,
+            &input.application_identifier,
+            crate::state::APPLICATION_RESOURCE,
+        ) {
+            return Err(CreateStreamUrlErrorModeled::ValidationException(refusal).into());
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateStreamUrlErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::region_of(ctx.parts());
+        let mut state = state.lock();
+        state.materialize(now);
+
+        let Some(group) = state.stream_group(&input.identifier) else {
+            // The stream group is the resource this create path addresses, so the
+            // message names the ARN the request's `Identifier` resolves to.
+            return Err(CreateStreamUrlErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&crate::state::resolved_arn(
+                    &region,
+                    &input.identifier,
+                    crate::state::STREAM_GROUP_RESOURCE,
+                )),
+            )
+            .into());
+        };
+        let group_id = group.id.clone();
+        let group_arn = group.arn.clone();
+
+        // The parameters this request's `ClientToken` stands for: "If you retry a
+        // request with the same ClientToken, Amazon GameLift Streams returns the
+        // original response without performing the operation again", and the same
+        // token sent with different parameters is refused instead.
+        let launch_args = input.additional_launch_args.clone().unwrap_or_default();
+        let environment = input
+            .additional_environment_variables
+            .clone()
+            .unwrap_or_default();
+        let mut fingerprint = crate::state::Fingerprint::new();
+        fingerprint.text("Identifier", &group_id);
+        fingerprint.text("ApplicationIdentifier", &input.application_identifier);
+        fingerprint.text("Protocol", &input.protocol);
+        fingerprint.number(
+            "UrlExpiresAfterMinutes",
+            Some(input.url_expires_after_minutes),
+        );
+        fingerprint.number("UsageLimit", input.usage_limit);
+        fingerprint.optional("Description", input.description.as_deref());
+        fingerprint.list("Locations", &input.locations);
+        fingerprint.number("SessionLengthSeconds", input.session_length_seconds);
+        fingerprint.list("AdditionalLaunchArgs", &launch_args);
+        fingerprint.map("AdditionalEnvironmentVariables", &environment);
+        fingerprint.optional("RoleArn", input.role_arn.as_deref());
+        fingerprint.optional(
+            "DisplayConfiguration.Resolution",
+            input
+                .display_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.resolution.as_ref())
+                .map(|resolution| format!("{}x{}", resolution.width, resolution.height))
+                .as_deref(),
+        );
+        let fingerprint = fingerprint.finish();
+
+        let replayed = match state.client_token_use(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+        ) {
+            crate::state::TokenUse::Fresh => None,
+            crate::state::TokenUse::Replay(url_id) => Some(url_id),
+            crate::state::TokenUse::Conflict => {
+                return Err(CreateStreamUrlErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::client_token_conflict(),
+                    },
+                )
+                .into());
+            }
+        };
+        let replayed = replayed.filter(|url_id| {
+            state.stream_groups[&group_id]
+                .stream_urls
+                .contains_key(url_id)
+        });
+
+        let url_id = match replayed {
+            Some(url_id) => url_id,
+            None => {
+                let Some(application) = state.application(&input.application_identifier) else {
+                    // Same rule for the identifier in the body: the message names the
+                    // ARN `ApplicationIdentifier` resolves to.
+                    return Err(CreateStreamUrlErrorModeled::ResourceNotFoundException(
+                        crate::state::resource_not_found(&crate::state::resolved_arn(
+                            &region,
+                            &input.application_identifier,
+                            crate::state::APPLICATION_RESOURCE,
+                        )),
+                    )
+                    .into());
+                };
+                let application_arn = application.arn.clone();
+
+                let group = &state.stream_groups[&group_id];
+                // "This application must be associated with the stream group"
+                // (`ApplicationIdentifier`): the stream sessions this URL starts run
+                // the application in that group, so one the group is not associated
+                // with can never serve them.
+                if !group.associated_applications.contains(&application_arn) {
+                    return Err(CreateStreamUrlErrorModeled::ValidationException(
+                        crate::state::application_not_associated(&application_arn, &group.arn),
+                    )
+                    .into());
+                }
+
+                // "A list of locations, in order of preference, where Amazon GameLift
+                // Streams can place the stream session" — in THIS stream group, which
+                // is the one that runs the session, so a location the group does not
+                // hold could never place one. The group's locations may still be
+                // activating: the placement happens when the URL is used, not now.
+                let unknown: Vec<String> = input
+                    .locations
+                    .iter()
+                    .filter(|location| !group.has_location(location))
+                    .cloned()
+                    .collect();
+                if !unknown.is_empty() {
+                    return Err(CreateStreamUrlErrorModeled::ValidationException(
+                        ValidationException {
+                            message: crate::state::with_internal_id(format!(
+                                "stream group {} does not hold the requested Locations: {}",
+                                group.id,
+                                unknown.join(", ")
+                            )),
+                        },
+                    )
+                    .into());
+                }
+
+                // The same two `Resolution` rules every operation that configures a
+                // virtual monitor refuses, from the one place they are worded.
+                if let Some(refusal) =
+                    crate::state::unsupported_resolution(input.display_configuration.as_ref())
+                {
+                    return Err(CreateStreamUrlErrorModeled::ValidationException(refusal).into());
+                }
+
+                // The emulator's own bound on the per-group stream URL store. Stream
+                // URLs that can no longer start a stream session are released first
+                // (oldest first); only a group whose USABLE stream URLs fill the
+                // bound is refused.
+                let group = state
+                    .stream_groups
+                    .get_mut(&group_id)
+                    .expect("the stream group was resolved above");
+                if !group.make_room_for_a_stream_url() {
+                    return Err(CreateStreamUrlErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: crate::state::with_internal_id(format!(
+                                "stream group {} already holds the maximum of {} stream URLs \
+                                 that can start a stream session; revoke one before creating \
+                                 another",
+                                group_id,
+                                crate::state::STREAM_URLS_PER_STREAM_GROUP
+                            )),
+                        },
+                    )
+                    .into());
+                }
+
+                let url_id = state.mint_id("su-");
+                let token = state.mint_token(crate::state::STREAM_URL_TOKEN_LENGTH);
+                // "The maximum number of times the stream URL can start a stream
+                // session. Each successful use reduces the remaining uses by one. The
+                // minimum is 1, and the default is 1."
+                let usage_limit = input.usage_limit.unwrap_or(crate::state::DEFAULT_USAGE_LIMIT);
+                let url = crate::state::StreamUrl {
+                    id: url_id.clone(),
+                    arn: crate::state::stream_url_arn(&region, &group_id, &url_id),
+                    stream_group_id: group_id.clone(),
+                    stream_group_arn: group_arn.clone(),
+                    application_arn,
+                    description: input.description.clone(),
+                    stream_url: crate::state::shareable_stream_url(
+                        &region, &group_id, &url_id, &token,
+                    ),
+                    protocol: input.protocol.clone(),
+                    locations: input.locations.clone(),
+                    session_length_seconds: input
+                        .session_length_seconds
+                        .unwrap_or(crate::state::DEFAULT_SESSION_LENGTH_SECONDS),
+                    additional_launch_args: launch_args.clone(),
+                    additional_environment_variables: environment.clone(),
+                    display_configuration: input.display_configuration.clone(),
+                    role_arn: input.role_arn.clone(),
+                    usage_limit,
+                    // Nothing has used the URL yet, so every use it was created with
+                    // is still available.
+                    remaining_uses: usage_limit,
+                    // A stream URL is usable as soon as it is created: it starts a
+                    // stream session "up to the number of times set by UsageLimit,
+                    // until it expires after UrlExpiresAfterMinutes".
+                    status: crate::state::STREAM_URL_ACTIVE.to_string(),
+                    status_reason: None,
+                    created_at: now,
+                    expires_at: now
+                        + ::std::time::Duration::from_secs(
+                            // The model refuses a value below 1 before the handler
+                            // runs, so the saturating floor is unreachable; it is
+                            // there so no arithmetic here can turn a value the
+                            // handler never accepts into a longer window.
+                            u64::try_from(input.url_expires_after_minutes)
+                                .unwrap_or_default()
+                                * 60,
+                        ),
+                };
+                let group = state
+                    .stream_groups
+                    .get_mut(&group_id)
+                    .expect("the stream group was resolved above");
+                group.stream_urls.insert(url_id.clone(), url);
+                state.remember(
+                    Self::NAME,
+                    input.client_token.as_deref(),
+                    &url_id,
+                    &fingerprint,
+                );
+                url_id
+            }
+        };
+
+        let url = &state.stream_groups[&group_id].stream_urls[&url_id];
+        Ok(CreateStreamUrlOutput {
+            arn: url.arn.clone(),
+            stream_url_id: Some(url.id.clone()),
+            stream_url: Some(url.stream_url.clone()),
+            status: Some(url.status.clone()),
+            status_reason: url.status_reason.clone(),
+            expires_at: Some(crate::state::timestamp(url.expires_at)),
+            created_at: Some(crate::state::timestamp(url.created_at)),
+            usage_limit: Some(url.usage_limit),
+            remaining_uses: Some(url.remaining_uses),
+            stream_group_arn: Some(url.stream_group_arn.clone()),
+            application_arn: Some(url.application_arn.clone()),
+            protocol: Some(url.protocol.clone()),
+            locations: Some(url.locations.clone()),
+            session_length_seconds: Some(url.session_length_seconds),
+            description: url.description.clone(),
+            additional_launch_args: Some(url.additional_launch_args.clone()),
+            additional_environment_variables: Some(url.additional_environment_variables.clone()),
+            role_arn: url.role_arn.clone(),
+            display_configuration: url.display_configuration.clone(),
+        })
     }
 }

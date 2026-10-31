@@ -492,6 +492,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status_reason: None,
                     associated_applications,
                     sessions: ::std::collections::HashMap::new(),
+                    stream_urls: ::std::collections::HashMap::new(),
                     tags: input.tags.unwrap_or_default(),
                     created_at: now,
                     last_updated_at: now,

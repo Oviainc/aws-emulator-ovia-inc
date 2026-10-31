@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeStreamUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeStreamUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Moves the stored stream URL to `REVOKED`, permanently.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeStreamUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The status reason reports what the revocation did to the stream sessions the
+//! URL had started: a use of a stream URL starts its session in the hosted web
+//! player rather than through this API, so a stream URL this emulator holds has
+//! none running and `REVOKE_AND_TERMINATE_SESSIONS` has nothing left to end.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +185,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeStreamUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeStreamUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeStreamUrl"))
+        // Both path labels have to resolve to the ARN of the resource they name,
+        // which is checked BEFORE the store is read: a value that resolves to no
+        // such ARN is a bad value for the label, not a resource that is missing.
+        if let Some(refusal) = crate::state::invalid_resource_arn(
+            crate::state::IDENTIFIER_MEMBER,
+            &input.identifier,
+            crate::state::STREAM_GROUP_RESOURCE,
+        ) {
+            return Err(RevokeStreamUrlErrorModeled::ValidationException(refusal).into());
+        }
+        if let Some(refusal) = crate::state::invalid_resource_arn(
+            crate::state::STREAM_URL_IDENTIFIER_MEMBER,
+            &input.stream_url_identifier,
+            crate::state::STREAM_URL_RESOURCE,
+        ) {
+            return Err(RevokeStreamUrlErrorModeled::ValidationException(refusal).into());
+        }
+        let region = crate::state::region_of(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RevokeStreamUrlErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize(now);
+
+        // The resource this call addresses is the stream URL its two labels name, so
+        // an absent stream group and an absent stream URL are the SAME miss, reported
+        // against the composite stream URL ARN.
+        if state
+            .stream_url(&input.identifier, &input.stream_url_identifier)
+            .is_none()
+        {
+            return Err(RevokeStreamUrlErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&crate::state::resolved_stream_url_arn(
+                    &region,
+                    &input.identifier,
+                    &input.stream_url_identifier,
+                )),
+            )
+            .into());
+        }
+
+        // "Controls what happens to running stream sessions when you revoke the
+        // stream URL. If you do not specify a value, the default is REVOKE_URL":
+        // `REVOKE_URL` leaves running sessions alone (`userRevoked`), while
+        // `REVOKE_AND_TERMINATE_SESSIONS` ends them — `revokedAndTerminatingSessions`
+        // while any is still ending, `revokedAndSessionsTerminated` once none is.
+        let mode = input
+            .revocation_mode
+            .as_deref()
+            .unwrap_or(crate::state::REVOKE_URL);
+        let reason = if mode == crate::state::REVOKE_AND_TERMINATE_SESSIONS {
+            crate::state::STREAM_URL_REASON_SESSIONS_TERMINATED
+        } else {
+            crate::state::STREAM_URL_REASON_USER_REVOKED
+        };
+        let url = state
+            .stream_url_mut(&input.identifier, &input.stream_url_identifier)
+            .expect("the stream URL was resolved immediately above");
+        // @idempotent: "Revoking a stream URL is permanent", so a repeat of the call
+        // that already revoked it leaves the record exactly as it is.
+        url.revoke_for(reason);
+        Ok(RevokeStreamUrlOutput)
     }
 }

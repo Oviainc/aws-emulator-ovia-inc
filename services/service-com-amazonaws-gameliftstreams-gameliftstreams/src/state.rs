@@ -26,7 +26,7 @@
 //!   every message this service's HANDLERS answer with carries, so no handler words
 //!   that suffix itself.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -122,6 +122,34 @@ pub const LOCATIONS_PER_STREAM_GROUP: usize = 100;
 /// defer is not a bound.
 pub const TERMINAL_SESSION_RETENTION: Duration = Duration::from_secs(60);
 
+/// How many stream URLs ONE stream group holds at a time.
+///
+/// Amazon GameLift Streams publishes an adjustable quota on stream URLs rather
+/// than a fixed one, and this emulator models no Service Quotas, so this is the
+/// emulator's OWN bound on the per-group store — the same role
+/// [`SESSIONS_PER_STREAM_GROUP`] plays for stream sessions. Stream URLs that can
+/// no longer start a stream session (expired, revoked) are released first to admit
+/// a new one (see [`StreamGroup::make_room_for_a_stream_url`]), and a group whose
+/// usable stream URLs fill the bound is refused with the modelled
+/// `ServiceQuotaExceededException`, which `CreateStreamUrl` declares.
+pub const STREAM_URLS_PER_STREAM_GROUP: usize = 100;
+
+/// How many stream sessions a stream URL can start when the request names no
+/// `UsageLimit`: "The minimum is 1, and the default is 1" (`UsageLimit`
+/// documentation).
+pub const DEFAULT_USAGE_LIMIT: i32 = 1;
+
+/// How long a stream session started from a stream URL may run when the request
+/// names no `SessionLengthSeconds`: "Valid values are 1-86400 seconds (1 second to
+/// 24 hours). The default is 43200 seconds (12 hours)" (`SessionLengthSeconds`
+/// documentation on `CreateStreamUrl`).
+pub const DEFAULT_SESSION_LENGTH_SECONDS: i32 = 43_200;
+
+/// The pixel budget of a stream's virtual monitor: `Resolution`'s documentation —
+/// "The total number of pixels (width x height) must not exceed 2,073,600
+/// (equivalent to 1920 x 1080)."
+pub const MAX_RESOLUTION_PIXELS: i64 = 2_073_600;
+
 // The enum values this slice stores, from the model's `ApplicationStatus`,
 // `StreamGroupStatus`, `StreamGroupLocationStatus`, `StreamSessionStatus`,
 // `StreamSessionStatusReason` and `ReplicationStatusType` (see
@@ -154,11 +182,25 @@ pub const SESSION_REASON_INTERNAL_ERROR: &str = "internalError";
 pub const SESSION_REASON_API_TERMINATED: &str = "apiTerminated";
 pub const REPLICATION_REPLICATING: &str = "REPLICATING";
 pub const REPLICATION_COMPLETED: &str = "COMPLETED";
+pub const STREAM_URL_ACTIVE: &str = "ACTIVE";
+pub const STREAM_URL_EXPIRED: &str = "EXPIRED";
+pub const STREAM_URL_REVOKED: &str = "REVOKED";
+pub const STREAM_URL_REASON_USER_REVOKED: &str = "userRevoked";
+pub const STREAM_URL_REASON_SESSIONS_TERMINATED: &str = "revokedAndSessionsTerminated";
+pub const STREAM_URL_REASON_TERMINATING_SESSIONS: &str = "revokedAndTerminatingSessions";
+pub const STREAM_URL_REASON_STREAM_GROUP_DELETED: &str = "streamGroupDeleted";
+pub const STREAM_URL_REASON_APPLICATION_DELETED: &str = "applicationDeleted";
+
+/// The `RevocationMode` values `RevokeStreamUrl` accepts, from the model's
+/// `RevocationMode` enum.
+pub const REVOKE_URL: &str = "REVOKE_URL";
+pub const REVOKE_AND_TERMINATE_SESSIONS: &str = "REVOKE_AND_TERMINATE_SESSIONS";
 
 /// The ARN resource-type segment of each resource this service names.
 pub const APPLICATION_RESOURCE: &str = "application";
 pub const STREAM_GROUP_RESOURCE: &str = "streamgroup";
 pub const STREAM_SESSION_RESOURCE: &str = "streamsession";
+pub const STREAM_URL_RESOURCE: &str = "streamurl";
 
 /// The `StreamClass` values Amazon GameLift Streams ACCEPTS, in the order the
 /// service's own refusal enumerates them.
@@ -332,6 +374,7 @@ fn same_values(stated: &[String], expected: &[&str]) -> bool {
 const RESOURCE_ID_PREFIXES: &[(&str, &str)] = &[
     (APPLICATION_RESOURCE, "a-"),
     (STREAM_GROUP_RESOURCE, "sg-"),
+    (STREAM_URL_RESOURCE, "su-"),
 ];
 
 /// The id prefix `resource_type`'s own ids carry, if the model publishes one.
@@ -398,6 +441,8 @@ pub const APPLICATION_IDENTIFIER_MEMBER: &str = "ApplicationIdentifier";
 pub const APPLICATION_IDENTIFIERS_MEMBER: &str = "ApplicationIdentifiers";
 pub const DEFAULT_APPLICATION_IDENTIFIER_MEMBER: &str = "DefaultApplicationIdentifier";
 pub const STREAM_SESSION_IDENTIFIER_MEMBER: &str = "StreamSessionIdentifier";
+pub const STREAM_URL_IDENTIFIER_MEMBER: &str = "StreamUrlIdentifier";
+pub const STREAM_GROUP_IDENTIFIER_MEMBER: &str = "StreamGroupIdentifier";
 
 /// Every error message this service's HANDLERS produce ends with a per-request
 /// internal id, which is how Amazon GameLift Streams words its errors: the body a
@@ -453,6 +498,63 @@ fn internal_id() -> String {
 /// The refusal text for a `ClientToken` replayed with different request parameters.
 pub fn client_token_conflict() -> String {
     with_internal_id("'ClientToken' value has already been used with different request parameters")
+}
+
+/// The refusal an application that is not associated with the stream group a
+/// request addresses carries.
+///
+/// "You must have at least one application associated to the stream group"
+/// (`StartStreamSession`'s prerequisites), and a stream URL starts its sessions in
+/// the stream group too ("This application must be associated with the stream
+/// group" — `CreateStreamUrl`'s `ApplicationIdentifier`), so both paths refuse an
+/// unassociated application with the same modelled client-input error, worded here
+/// once. The text names both resources by the full ARN each one resolves to, in
+/// single quotes, which is how the service words this refusal — an `Identifier`
+/// member accepts either form, so the ARN is the one spelling of it a caller can
+/// always read back.
+pub fn application_not_associated(
+    application_arn: &str,
+    stream_group_arn: &str,
+) -> ValidationException {
+    ValidationException {
+        message: with_internal_id(format!(
+            "Application '{application_arn}' is not associated with stream group \
+             '{stream_group_arn}'"
+        )),
+    }
+}
+
+/// The refusal a `DisplayConfiguration` whose `Resolution` breaks one of the two
+/// rules the model states in prose carries, or `None` when the operation may go on.
+///
+/// `Resolution` documents both: "The value must be an even number" (`Width`,
+/// `Height`) and the [`MAX_RESOLUTION_PIXELS`] budget. Neither is expressible as a
+/// constraint trait, so every operation that accepts a `DisplayConfiguration` —
+/// `StartStreamSession` and `CreateStreamUrl`, which configure the same virtual
+/// monitor — refuses it here, in this one place, with the modelled
+/// `ValidationException`.
+pub fn unsupported_resolution(
+    configuration: Option<&DisplayConfiguration>,
+) -> Option<ValidationException> {
+    let resolution = configuration.and_then(|configuration| configuration.resolution.as_ref())?;
+    let (width, height) = (resolution.width, resolution.height);
+    if width % 2 != 0 || height % 2 != 0 {
+        return Some(ValidationException {
+            message: with_internal_id(format!(
+                "DisplayConfiguration.Resolution must have an even Width and Height, got \
+                 {width}x{height}"
+            )),
+        });
+    }
+    if i64::from(width) * i64::from(height) > MAX_RESOLUTION_PIXELS {
+        return Some(ValidationException {
+            message: with_internal_id(format!(
+                "DisplayConfiguration.Resolution must not exceed {MAX_RESOLUTION_PIXELS} \
+                 pixels, got {width}x{height}"
+            )),
+        });
+    }
+    None
 }
 
 /// The refusal text for a member documented as an Amazon S3 location whose value is
@@ -696,6 +798,11 @@ pub struct StreamGroup {
     /// ARNs of the applications associated with this stream group.
     pub associated_applications: Vec<String>,
     pub sessions: HashMap<String, StreamSession>,
+    /// The stream URLs this group hands out, by stream URL id. A stream URL is
+    /// scoped to the stream group that runs the sessions it starts — its ARN
+    /// carries both ids, and every operation that addresses one names the group
+    /// too — so the group owns the record, exactly as it owns its sessions.
+    pub stream_urls: HashMap<String, StreamUrl>,
     pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
     pub last_updated_at: SystemTime,
@@ -757,6 +864,34 @@ impl StreamGroup {
         for (_, id) in terminal {
             self.sessions.remove(&id);
             if self.sessions.len() < SESSIONS_PER_STREAM_GROUP {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Make room for one more stream URL, releasing the stream URLs that can no
+    /// longer start a stream session (oldest first) when the store is at
+    /// [`STREAM_URLS_PER_STREAM_GROUP`].
+    ///
+    /// Answers `false` when every stream URL the bound allows can still start a
+    /// stream, which is the one case the caller must refuse; otherwise the group is
+    /// below the bound on return. The same rule
+    /// [`StreamGroup::make_room_for_a_session`] applies to sessions.
+    pub fn make_room_for_a_stream_url(&mut self) -> bool {
+        if self.stream_urls.len() < STREAM_URLS_PER_STREAM_GROUP {
+            return true;
+        }
+        let mut spent: Vec<(SystemTime, String)> = self
+            .stream_urls
+            .values()
+            .filter(|url| url.is_spent())
+            .map(|url| (url.created_at, url.id.clone()))
+            .collect();
+        spent.sort();
+        for (_, id) in spent {
+            self.stream_urls.remove(&id);
+            if self.stream_urls.len() < STREAM_URLS_PER_STREAM_GROUP {
                 return true;
             }
         }
@@ -851,6 +986,18 @@ impl StreamGroup {
             .retain(|_, session| !session.retention_elapsed(now));
         for slot in &mut self.locations {
             slot.advance(now);
+        }
+        // "streamGroupDeleted: The stream group was deleted, which revoked the
+        // stream URL" (`StreamUrlStatusReason`). The deletion is already under way,
+        // so the revocation it causes is owed at the same instant — whether or not
+        // anybody reads the stream URL.
+        if self.status == STREAM_GROUP_DELETING {
+            for url in self.stream_urls.values_mut() {
+                url.revoke_for(STREAM_URL_REASON_STREAM_GROUP_DELETED);
+            }
+        }
+        for url in self.stream_urls.values_mut() {
+            url.advance(now);
         }
         if let Some(due) = self.status_due_at {
             if now >= due {
@@ -972,6 +1119,109 @@ impl StreamSession {
         }
     }
 }
+
+/// A persisted stream URL, stored under the stream group that runs the stream
+/// sessions it starts.
+///
+/// The record is what every stream-URL operation reads: `CreateStreamUrl` mints it,
+/// `GetStreamUrl` reports it, and `RevokeStreamUrl` moves it to `REVOKED`.
+#[derive(Debug, Clone)]
+pub struct StreamUrl {
+    pub id: String,
+    pub arn: String,
+    pub stream_group_id: String,
+    pub stream_group_arn: String,
+    pub application_arn: String,
+    pub description: Option<String>,
+    /// The shareable locator this stream URL hands out, built once with the record
+    /// (see [`shareable_stream_url`]) so two reads of the same stream URL agree.
+    pub stream_url: String,
+    /// A `Protocol` value.
+    pub protocol: String,
+    pub locations: Vec<String>,
+    pub session_length_seconds: i32,
+    pub additional_launch_args: Vec<String>,
+    pub additional_environment_variables: HashMap<String, String>,
+    /// The virtual monitor a stream session started from this URL gets, as the
+    /// request configured it.
+    pub display_configuration: Option<DisplayConfiguration>,
+    /// The IAM role such a session assumes, as the request named it.
+    pub role_arn: Option<String>,
+    pub usage_limit: i32,
+    pub remaining_uses: i32,
+    /// A `StreamUrlStatus` value.
+    pub status: String,
+    /// A `StreamUrlStatusReason` value. "Amazon GameLift Streams populates this
+    /// value when the status is REVOKED" (`StatusReason` documentation).
+    pub status_reason: Option<String>,
+    pub created_at: SystemTime,
+    pub expires_at: SystemTime,
+}
+
+impl StreamUrl {
+    /// Can this stream URL still start a stream session? Only an `ACTIVE` one can:
+    /// "EXPIRED: The stream URL has passed its expiration time and can no longer
+    /// start stream sessions. REVOKED: The stream URL was revoked and can no longer
+    /// start stream sessions" (`StreamUrlStatus` documentation).
+    pub fn is_usable(&self) -> bool {
+        self.status == STREAM_URL_ACTIVE
+    }
+
+    /// Has this stream URL reached a status it can never leave? The complement of
+    /// [`Self::is_usable`], and what makes a record releasable when the per-group
+    /// bound needs room.
+    pub fn is_spent(&self) -> bool {
+        !self.is_usable()
+    }
+
+    /// Revoke this stream URL for `reason`, one of the model's
+    /// `StreamUrlStatusReason` values.
+    ///
+    /// "Revoking a stream URL is permanent. The status of the stream URL changes to
+    /// REVOKED" (`RevokeStreamUrl` documentation) — so a URL already `REVOKED` keeps
+    /// the reason it was first revoked for, which is what makes the operation
+    /// `@idempotent`.
+    pub fn revoke_for(&mut self, reason: &str) {
+        if self.status == STREAM_URL_REVOKED {
+            return;
+        }
+        self.status = STREAM_URL_REVOKED.to_string();
+        self.status_reason = Some(reason.to_string());
+    }
+
+    /// Advance this stream URL to the status the clock already owed it at `now`.
+    ///
+    /// The one transition the clock owes is expiry: "The number of minutes after
+    /// creation that the stream URL remains valid. After this period, the status of
+    /// the stream URL changes to EXPIRED and it can no longer start stream sessions"
+    /// (`UrlExpiresAfterMinutes` documentation). `LIMIT_REACHED` is reached by USING
+    /// the URL, and a use starts a stream session in the hosted web player rather
+    /// than through this API, so no call here spends one: `RemainingUses` reports
+    /// the uses the record still holds.
+    fn advance(&mut self, now: SystemTime) {
+        if self.is_usable() && now >= self.expires_at {
+            self.status = STREAM_URL_EXPIRED.to_string();
+        }
+    }
+}
+
+/// The shareable locator a stream URL hands out: what an end user opens to play a
+/// stream session in the hosted web player.
+///
+/// Amazon GameLift Streams publishes no format for the value, so it is built from
+/// the record itself — the Region the stream URL was created in, the stream group
+/// and stream URL ids its ARN carries, and the opaque token minted with it. No two
+/// stream URLs can therefore share a locator, and the locator cannot be derived
+/// from the ids alone: "Treat the stream URL as a secret. Anyone who has it can
+/// start a stream session until the stream URL expires, is revoked, or reaches its
+/// usage limit" (`StreamUrl` documentation). The hosted web player the locator
+/// addresses is a browser client of the real service, not part of this emulator.
+pub fn shareable_stream_url(region: &str, group_id: &str, url_id: &str, token: &str) -> String {
+    format!("https://streams.{SIGNING_NAME}.{region}.amazonaws.com/{group_id}/{url_id}?token={token}")
+}
+
+/// How many characters the opaque token a shareable stream URL carries holds.
+pub const STREAM_URL_TOKEN_LENGTH: usize = 32;
 
 /// Per-service state for com-amazonaws-gameliftstreams-gameliftstreams. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -1100,22 +1350,9 @@ impl ComAmazonawsGameliftstreamsGameliftstreamsState {
     /// this store's mint counter in base62, so the result is unique within the
     /// store and matches the model's `Id` shape.
     pub fn mint_id(&mut self, prefix: &str) -> String {
-        self.mint_counter += 1;
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |since| since.as_nanos() as u64);
-        let mut hash = nanos ^ self.mint_counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mut id = String::with_capacity(prefix.len() + 11);
         id.push_str(prefix);
-        for _ in 0..5 {
-            hash = hash
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .wrapping_add(0xBF58_476D_1CE4_E5B9);
-            let mixed = (hash >> 29) ^ hash;
-            id.push(char::from(
-                ID_ALPHABET[(mixed % ID_ALPHABET.len() as u64) as usize],
-            ));
-        }
+        id.push_str(&self.random_chars(5));
         let base = ID_ALPHABET.len() as u64;
         let mut counter = self.mint_counter;
         let mut digits = Vec::new();
@@ -1133,6 +1370,35 @@ impl ComAmazonawsGameliftstreamsGameliftstreamsState {
         id
     }
 
+    /// A fresh opaque token of `length` characters over [`ID_ALPHABET`], for a value
+    /// a caller must not be able to guess (the token a shareable stream URL
+    /// carries). Minted from the same stream as [`Self::mint_id`], so two tokens of
+    /// the same nanosecond differ by construction rather than by luck.
+    pub fn mint_token(&mut self, length: usize) -> String {
+        self.random_chars(length)
+    }
+
+    /// `count` characters of this store's pseudo-random stream, mixed from the wall
+    /// clock and the mint counter.
+    fn random_chars(&mut self, count: usize) -> String {
+        self.mint_counter += 1;
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos() as u64);
+        let mut hash = nanos ^ self.mint_counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut characters = String::with_capacity(count);
+        for _ in 0..count {
+            hash = hash
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(0xBF58_476D_1CE4_E5B9);
+            let mixed = (hash >> 29) ^ hash;
+            characters.push(char::from(
+                ID_ALPHABET[(mixed % ID_ALPHABET.len() as u64) as usize],
+            ));
+        }
+        characters
+    }
+
     /// Apply every transition the clock had already made due at `now`, and drop
     /// the resources whose deletion completed.
     ///
@@ -1143,7 +1409,33 @@ impl ComAmazonawsGameliftstreamsGameliftstreamsState {
         self.applications
             .retain(|_, application| !application.advance(now));
         self.stream_groups.retain(|_, group| !group.advance(now));
+        self.revoke_stream_urls_of_deleted_applications();
         self.forget_dead_idempotency_keys();
+    }
+
+    /// Revoke every stream URL whose application this store no longer holds.
+    ///
+    /// "applicationDeleted: The application was deleted, which revoked the stream
+    /// URL" (`StreamUrlStatusReason`), and "if you delete the stream group or
+    /// application that backs the stream URL, this operation updates the status of
+    /// the stream URL to REVOKED" (`GetStreamUrl` documentation). The delete already
+    /// happened, so the revocation it causes is owed at the same instant whether or
+    /// not anybody reads the stream URL. The stream-group half of that sentence is
+    /// applied by [`StreamGroup::advance`], which can see its own status; this half
+    /// needs both stores, so it lives here.
+    fn revoke_stream_urls_of_deleted_applications(&mut self) {
+        let live: HashSet<&String> = self
+            .applications
+            .values()
+            .map(|application| &application.arn)
+            .collect();
+        for group in self.stream_groups.values_mut() {
+            for url in group.stream_urls.values_mut() {
+                if url.is_usable() && !live.contains(&url.application_arn) {
+                    url.revoke_for(STREAM_URL_REASON_APPLICATION_DELETED);
+                }
+            }
+        }
     }
 
     /// Drop the idempotency entries whose resource is gone.
@@ -1163,6 +1455,9 @@ impl ComAmazonawsGameliftstreamsGameliftstreamsState {
                 Some("StartStreamSession") => stream_groups
                     .values()
                     .any(|group| group.sessions.contains_key(&record.resource_id)),
+                Some("CreateStreamUrl") => stream_groups
+                    .values()
+                    .any(|group| group.stream_urls.contains_key(&record.resource_id)),
                 // An operation this slice records nothing for: there is nothing to
                 // judge the entry by, so leave it rather than drop it blindly.
                 _ => true,
@@ -1191,6 +1486,26 @@ impl ComAmazonawsGameliftstreamsGameliftstreamsState {
     pub fn stream_group_mut(&mut self, identifier: &str) -> Option<&mut StreamGroup> {
         let id = identifier_id(identifier, STREAM_GROUP_RESOURCE)?;
         self.stream_groups.get_mut(&id)
+    }
+
+    /// The stored stream URL the two identifiers of a stream-URL operation name: the
+    /// stream group that owns it, and the stream URL itself (either of them by bare
+    /// id or by ARN).
+    pub fn stream_url(&self, group_identifier: &str, url_identifier: &str) -> Option<&StreamUrl> {
+        let id = identifier_id(url_identifier, STREAM_URL_RESOURCE)?;
+        self.stream_group(group_identifier)?.stream_urls.get(&id)
+    }
+
+    /// The stored stream URL those two identifiers name, for mutation.
+    pub fn stream_url_mut(
+        &mut self,
+        group_identifier: &str,
+        url_identifier: &str,
+    ) -> Option<&mut StreamUrl> {
+        let id = identifier_id(url_identifier, STREAM_URL_RESOURCE)?;
+        self.stream_group_mut(group_identifier)?
+            .stream_urls
+            .get_mut(&id)
     }
 
     /// What this call's `ClientToken` means: a token no previous call of
@@ -1355,11 +1670,21 @@ pub fn stream_group_arn(region: &str, id: &str) -> String {
 /// The ARN of a stream session, which carries the hosting stream group:
 /// `arn:aws:gameliftstreams:<region>:<account>:streamsession/<group id>/<session id>`.
 pub fn stream_session_arn(region: &str, group_id: &str, session_id: &str) -> String {
-    resource_arn(
-        region,
-        STREAM_SESSION_RESOURCE,
-        &format!("{group_id}/{session_id}"),
-    )
+    child_arn(region, STREAM_SESSION_RESOURCE, group_id, session_id)
+}
+
+/// The ARN of a stream URL, which carries the stream group that runs its sessions:
+/// "Format is arn:aws:gameliftstreams:[AWS Region]:[AWS account]:streamurl/[stream
+/// group resource ID]/[stream URL resource ID]" (`Arn` documentation on
+/// `CreateStreamUrl`).
+pub fn stream_url_arn(region: &str, group_id: &str, url_id: &str) -> String {
+    child_arn(region, STREAM_URL_RESOURCE, group_id, url_id)
+}
+
+/// One stream-group-scoped resource's ARN: `<type>/<stream group id>/<resource id>`,
+/// the composite form both the stream sessions and the stream URLs of a group take.
+fn child_arn(region: &str, resource_type: &str, group_id: &str, id: &str) -> String {
+    resource_arn(region, resource_type, &format!("{group_id}/{id}"))
 }
 
 /// The ARN the `Identifier` a request passed resolves to, for the resource type
@@ -1398,8 +1723,34 @@ pub fn resolved_stream_session_arn(
     group_identifier: &str,
     session_identifier: &str,
 ) -> String {
-    if session_identifier.starts_with("arn:") {
-        return session_identifier.to_string();
+    resolved_child_arn(
+        region,
+        STREAM_SESSION_RESOURCE,
+        group_identifier,
+        session_identifier,
+    )
+}
+
+/// The composite stream URL ARN the two path labels of a stream-URL operation
+/// resolve to: `…:streamurl/<stream group id>/<stream URL id>`, by the same rule
+/// [`resolved_stream_session_arn`] resolves a session's.
+pub fn resolved_stream_url_arn(
+    region: &str,
+    group_identifier: &str,
+    url_identifier: &str,
+) -> String {
+    resolved_child_arn(region, STREAM_URL_RESOURCE, group_identifier, url_identifier)
+}
+
+/// The composite ARN a stream-group-scoped resource's two identifiers resolve to.
+fn resolved_child_arn(
+    region: &str,
+    resource_type: &str,
+    group_identifier: &str,
+    identifier: &str,
+) -> String {
+    if identifier.starts_with("arn:") {
+        return identifier.to_string();
     }
     let group_id = identifier_id(group_identifier, STREAM_GROUP_RESOURCE).unwrap_or_else(|| {
         group_identifier
@@ -1408,7 +1759,7 @@ pub fn resolved_stream_session_arn(
             .unwrap_or(group_identifier)
             .to_string()
     });
-    stream_session_arn(region, &group_id, session_identifier)
+    child_arn(region, resource_type, &group_id, identifier)
 }
 
 /// The service's `ResourceNotFoundException` for a resource-scoped operation: it

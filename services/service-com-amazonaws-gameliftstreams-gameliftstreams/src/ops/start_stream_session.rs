@@ -269,11 +269,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The pixel budget of a stream session's virtual monitor: `Resolution`'s
-/// documentation — "The total number of pixels (width x height) must not exceed
-/// 2,073,600 (equivalent to 1920 x 1080)."
-const MAX_RESOLUTION_PIXELS: i64 = 2_073_600;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -498,12 +493,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // group."
                 if !group.associated_applications.contains(&application_arn) {
                     return Err(StartStreamSessionErrorModeled::ValidationException(
-                        ValidationException {
-                            message: crate::state::with_internal_id(format!(
-                                "application {} is not associated with stream group {}",
-                                input.application_identifier, group.id
-                            )),
-                        },
+                        crate::state::application_not_associated(&application_arn, &group.arn),
                     )
                     .into());
                 }
@@ -554,35 +544,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `Resolution` — "The value must be an even number" (Width, Height)
                 // and "The total number of pixels (width x height) must not exceed
                 // 2,073,600". Neither rule is expressible in the model, so both are
-                // refused here with the modelled client-input error.
-                if let Some(resolution) = input
-                    .display_configuration
-                    .as_ref()
-                    .and_then(|configuration| configuration.resolution.as_ref())
+                // refused through the one helper every operation that accepts a
+                // `DisplayConfiguration` shares.
+                if let Some(refusal) =
+                    crate::state::unsupported_resolution(input.display_configuration.as_ref())
                 {
-                    let (width, height) = (resolution.width, resolution.height);
-                    if width % 2 != 0 || height % 2 != 0 {
-                        return Err(StartStreamSessionErrorModeled::ValidationException(
-                            ValidationException {
-                                message: crate::state::with_internal_id(format!(
-                                    "DisplayConfiguration.Resolution must have an even Width \
-                                     and Height, got {width}x{height}"
-                                )),
-                            },
-                        )
-                        .into());
-                    }
-                    if i64::from(width) * i64::from(height) > MAX_RESOLUTION_PIXELS {
-                        return Err(StartStreamSessionErrorModeled::ValidationException(
-                            ValidationException {
-                                message: crate::state::with_internal_id(format!(
-                                    "DisplayConfiguration.Resolution must not exceed \
-                                     {MAX_RESOLUTION_PIXELS} pixels, got {width}x{height}"
-                                )),
-                            },
-                        )
-                        .into());
-                    }
+                    return Err(
+                        StartStreamSessionErrorModeled::ValidationException(refusal).into()
+                    );
                 }
 
                 // The emulator's own bound on the per-group session store. Sessions

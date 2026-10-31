@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStreamUrls
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStreamUrls`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the stored stream URLs of this account, filtered as the request asks
+//! ("Filters the list to stream URLs that belong to the specified stream group",
+//! "Filters the list to stream URLs with the specified status"), one page at a
+//! time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStreamUrls::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only: the records are read, and the only writes are the transitions
+//! the clock already owed (`crate::state::StreamUrl::advance`).
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +168,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStreamUrls` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStreamUrlsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStreamUrls"))
+        let _ = ctx;
+        // A `StreamGroupIdentifier` that resolves to no stream group ARN is a bad
+        // value for the member, which this operation models no not-found error for:
+        // it is refused from the request alone, before the store is read.
+        if let Some(group_identifier) = input.stream_group_identifier.as_deref() {
+            if let Some(refusal) = crate::state::invalid_resource_arn(
+                crate::state::STREAM_GROUP_IDENTIFIER_MEMBER,
+                group_identifier,
+                crate::state::STREAM_GROUP_RESOURCE,
+            ) {
+                return Err(ListStreamUrlsErrorModeled::ValidationException(refusal).into());
+            }
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListStreamUrlsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Reporting only: materialise the transitions the clock had already made due
+        // at `now`, so a stream URL past its expiry is listed in the status it holds
+        // and `Status` filters on that same status.
+        state.materialize(now);
+
+        // "Filters the list to stream URLs that belong to the specified stream
+        // group": a group the store does not hold owns no stream URL, and this
+        // operation models no not-found error, so it reports an empty page.
+        let group_id = input
+            .stream_group_identifier
+            .as_deref()
+            .and_then(|identifier| {
+                crate::state::identifier_id(identifier, crate::state::STREAM_GROUP_RESOURCE)
+            });
+        let urls: ::std::collections::HashMap<&str, &crate::state::StreamUrl> = state
+            .stream_groups
+            .values()
+            .flat_map(|group| group.stream_urls.values())
+            .filter(|url| {
+                group_id.as_ref().is_none_or(|id| &url.stream_group_id == id)
+                    && input
+                        .status
+                        .as_ref()
+                        .is_none_or(|status| &url.status == status)
+            })
+            .map(|url| (url.id.as_str(), url))
+            .collect();
+
+        // `MaxResults` is modelled `range 1..100`; a request that names no page size
+        // gets a full page. The page boundary is the same shared pager every `List*`
+        // of this service uses, over the stream URL ids.
+        let page_size = usize::try_from(input.max_results.unwrap_or(100)).unwrap_or(100);
+        let after = input.next_token.unwrap_or_default();
+        let ids: Vec<String> = urls.keys().map(|id| (*id).to_string()).collect();
+        let (page, next_token) = crate::state::page_of_ids(ids, &after, page_size);
+        let items: Vec<StreamUrlSummary> = page
+            .iter()
+            .filter_map(|id| urls.get(id.as_str()))
+            .map(|url| StreamUrlSummary {
+                arn: url.arn.clone(),
+                stream_url_id: Some(url.id.clone()),
+                stream_url: Some(url.stream_url.clone()),
+                status: Some(url.status.clone()),
+                status_reason: url.status_reason.clone(),
+                expires_at: Some(crate::state::timestamp(url.expires_at)),
+                created_at: Some(crate::state::timestamp(url.created_at)),
+                usage_limit: Some(url.usage_limit),
+                remaining_uses: Some(url.remaining_uses),
+                stream_group_arn: Some(url.stream_group_arn.clone()),
+                application_arn: Some(url.application_arn.clone()),
+                session_length_seconds: Some(url.session_length_seconds),
+                description: url.description.clone(),
+            })
+            .collect();
+        Ok(ListStreamUrlsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }
