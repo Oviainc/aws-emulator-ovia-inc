@@ -221,6 +221,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A slot type is defined inside one of those locales, so it cannot outlive the
         // bot either.
         store.remove_slot_types_of_bot(&input.bot_id);
+        // Nor can an intent, which is defined inside one of those locales too.
+        store.remove_intents_of_bot(&input.bot_id);
         // The record is gone, so a later `DescribeBot` cannot find it and `ListBots`
         // cannot list it; the status reported is the one the delete call itself puts the
         // bot into.

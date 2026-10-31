@@ -73,9 +73,10 @@
 //! front door, the same `1.1` framing over an `awsJson1_0` model; the last of them is the
 //! two-announcer case, so it states which responses that front door produced rather than
 //! re-announcing all of them — and by
-//! `service-com-amazonaws-connectcampaigns-amazonconnectcampaignservice`, whose model
-//! declares `restJson1` and whose recorded wire announces the awsJson `1.1` media type
-//! on every reply, so it states its own pair (`application/json` → `1.1`) and takes the
+//! `service-com-amazonaws-connectcampaigns-amazonconnectcampaignservice` and
+//! `service-com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2`, whose models declare
+//! `restJson1` and whose recorded wires announce the awsJson `1.1` media type on every
+//! reply, so each states its own pair (`application/json` → `1.1`) and takes the
 //! mechanism, including [`ResponseMediaTypeOperation`], from here. Each of them states
 //! only its own pair (`RESPONSE_MEDIA_TYPE`).
 //!

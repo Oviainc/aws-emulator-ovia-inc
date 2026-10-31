@@ -56,7 +56,11 @@
 //! One rendering here is not a sentence but an ORDER: [`in_sorted_enum_order`] states an
 //! enumerated type's value set lexicographically, which is how AWS lists it where a model
 //! declares its members in an order of its own. A service hands its violations through it
-//! before the envelope is rendered, so the clause itself stays the framework's.
+//! before the envelope is rendered, so the clause itself stays the framework's. The other
+//! order is over the CLAUSES rather than inside one: [`in_pattern_first_order`] states a
+//! member's `@pattern` requirement before that member's other requirements, for a front
+//! door whose recordings show that order, with the members themselves left where the walk
+//! found them.
 //!
 //! The same seam carries one more rendering of the VALUE half: a floating-point value is
 //! quoted back the way a service formats one ([`float_value_text`], applied to a violation
@@ -83,7 +87,7 @@
 //! recordings show it; the set is read off the MODEL (the schemas the caller hands over),
 //! because the refusal carries only the constraints that failed.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
 use aws_smithy_schema_server::constraints::{
@@ -343,6 +347,48 @@ pub fn in_sorted_enum_order(violation: &Violation) -> Violation {
         kind: ViolationKind::EnumValue(sorted),
         value: violation.value.clone(),
     }
+}
+
+/// The violations of ONE refusal in the order a front door states them that reports a
+/// member's `@pattern` requirement before that member's other requirements: the members
+/// in the order the validating walk found them, and within one member the EXPRESSION it
+/// must match first, because the expression is the shape of the value and every other
+/// requirement is a bound on it.
+///
+/// Only the ORDER changes: each clause, its member path and its requirement stay the
+/// framework's, so a service that takes this cannot word a constraint differently from one
+/// that does not. A service hands its violations through this before the envelope is
+/// rendered.
+///
+/// Each violation's key is computed ONCE, in a single pass that remembers where each member
+/// was first reported, rather than inside the comparator: a comparator that rescanned the
+/// slice would read each path once per pair it is asked about. The sort is STABLE, so two
+/// violations this key cannot separate keep the order the walk collected them in, and the
+/// walk hands over at most its own ceiling of violations
+/// ([`crate::validation::MAX_VIOLATIONS`]), so the work is bounded by this crate rather
+/// than by one request.
+///
+/// THE HOME for this order: `services/service-com-amazonaws-acmpca-acmprivateca`'s
+/// `stated_order` carries the same single-pass loop, written before this module had one,
+/// and is to be migrated onto this function rather than copied again.
+#[must_use]
+pub fn in_pattern_first_order(violations: &[Violation]) -> Vec<&Violation> {
+    let mut first_reported_at: HashMap<&str, usize> = HashMap::with_capacity(violations.len());
+    let mut keyed: Vec<((usize, bool), &Violation)> = violations
+        .iter()
+        .enumerate()
+        .map(|(position, violation)| {
+            let member = *first_reported_at
+                .entry(violation.path.as_str())
+                .or_insert(position);
+            (
+                (member, !matches!(violation.kind, ViolationKind::Pattern(_))),
+                violation,
+            )
+        })
+        .collect();
+    keyed.sort_by_key(|(key, _)| *key);
+    keyed.into_iter().map(|(_, violation)| violation).collect()
 }
 
 /// The magnitudes a floating-point value is quoted back in PLAIN decimal form: at least
@@ -1027,9 +1073,9 @@ mod tests {
         aws_validation_refusal, aws_validation_refusal_over_elements, aws_validation_refusal_with,
         aws_validation_refusal_withholding, aws_validation_refusal_withholding_with,
         enum_value_not_found, envelope_over, float_value_text, in_float_value_rendering,
-        map_key_refusal, map_key_refusal_quoting, pattern_mismatch, property_count_refusal,
-        quoting_the_submitted_collection, quoting_the_whole_submitted_value, string_too_long,
-        string_too_short,
+        in_pattern_first_order, map_key_refusal, map_key_refusal_quoting, pattern_mismatch,
+        property_count_refusal, quoting_the_submitted_collection,
+        quoting_the_whole_submitted_value, string_too_long, string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -1046,6 +1092,84 @@ mod tests {
             path: path.to_owned(),
             kind,
             value: Some(value.to_owned()),
+        }
+    }
+
+    /// RULE: the clauses come out with the members in the order the walk found them, and
+    /// within one member its `@pattern` requirement before that member's others.
+    ///
+    /// The rows span what the order generalises over: a member whose pattern was reported
+    /// after another of its requirements and one where it came first, a member with no
+    /// pattern at all, several members interleaved, and the empty refusal.
+    #[test]
+    fn a_members_pattern_requirement_is_stated_before_its_others() {
+        /// The `(path, is a pattern)` pairs one ordering produced, as a reader sees them.
+        fn stated(violations: &[Violation]) -> Vec<(&str, bool)> {
+            in_pattern_first_order(violations)
+                .into_iter()
+                .map(|violation| {
+                    (
+                        violation.path.as_str(),
+                        matches!(violation.kind, ViolationKind::Pattern(_)),
+                    )
+                })
+                .collect()
+        }
+
+        let pattern = |path: &str| {
+            violation(
+                path,
+                ViolationKind::Pattern("^[a-z]+$".to_owned()),
+                "NOPE",
+            )
+        };
+        let length = |path: &str| violation(path, ViolationKind::MinLength(1), "");
+        let range = |path: &str| violation(path, ViolationKind::MaxValue("1".to_owned()), "2.5");
+
+        /// One row: the case, the violations the walk collected, and the order they come
+        /// out in.
+        type Row = (&'static str, Vec<Violation>, Vec<(&'static str, bool)>);
+
+        let cases: [Row; 5] = [
+            (
+                "a member whose length was reported before its pattern",
+                vec![length("name"), pattern("name")],
+                vec![("name", true), ("name", false)],
+            ),
+            (
+                "a member whose pattern was reported first already",
+                vec![pattern("name"), length("name")],
+                vec![("name", true), ("name", false)],
+            ),
+            (
+                "a member with no pattern at all",
+                vec![range("threshold")],
+                vec![("threshold", false)],
+            ),
+            (
+                "two members, each with two requirements",
+                vec![
+                    length("first"),
+                    range("second"),
+                    pattern("second"),
+                    pattern("first"),
+                ],
+                vec![
+                    ("first", true),
+                    ("first", false),
+                    ("second", true),
+                    ("second", false),
+                ],
+            ),
+            ("no violation at all", Vec::new(), Vec::new()),
+        ];
+
+        for (case, violations, expected) in cases {
+            let actual = stated(&violations);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the order {expected:?}, got {actual:?}"
+            );
         }
     }
 

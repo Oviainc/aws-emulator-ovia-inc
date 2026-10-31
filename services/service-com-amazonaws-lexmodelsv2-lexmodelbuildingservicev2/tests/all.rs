@@ -15,8 +15,14 @@
 mod bot_lifecycle;
 #[path = "all/bot_locale.rs"]
 mod bot_locale;
+#[path = "all/intents_and_builds.rs"]
+mod intents_and_builds;
 #[path = "all/name_already_exists.rs"]
 mod name_already_exists;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
+#[path = "all/response_media_type.rs"]
+mod response_media_type;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/slot_type.rs"]

@@ -283,7 +283,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             audio_filler_settings: input.audio_filler_settings,
             speech_recognition_settings: input.speech_recognition_settings,
             generative_ai_settings: input.generative_ai_settings,
-            speech_detection_sensitivity: input.speech_detection_sensitivity,
+            // A create that names no sensitivity level detects speech at the documented
+            // standard one, and that is the level a read reports.
+            speech_detection_sensitivity: Some(
+                input
+                    .speech_detection_sensitivity
+                    .unwrap_or_else(|| {
+                        crate::state::DEFAULT_SPEECH_DETECTION_SENSITIVITY.to_string()
+                    }),
+            ),
             speaker_diarization_settings: input.speaker_diarization_settings,
             bot_locale_status: crate::state::BOT_LOCALE_STATUS_CREATING.to_string(),
             creation_date_time: now,
@@ -302,7 +310,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call reports is what a later read reports.
         let key =
             crate::state::bot_locale_key(&input.bot_id, &input.bot_version, &input.locale_id);
-        let stored = store.bot_locales.entry(key).or_insert(locale);
+        let stored = store.bot_locales.entry(key).or_insert(locale).clone();
+        // Amazon Lex adds the fallback intent to a locale as it creates it — it is what
+        // the bot falls back on "when it can't determine another intent to invoke" — so
+        // the locale holds that one intent from the start and `DescribeBotLocale` counts
+        // it.
+        store.add_fallback_intent(&input.bot_id, &input.bot_version, &input.locale_id, now);
         Ok(CreateBotLocaleOutput {
             bot_id: Some(stored.bot_id.clone()),
             bot_version: Some(stored.bot_version.clone()),

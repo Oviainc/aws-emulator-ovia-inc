@@ -192,10 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(DescribeSlotTypeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Slot type {} does not exist in locale {} of bot {} version {}; check the slotTypeId, botId, botVersion and localeId and try again",
-                        input.slot_type_id, input.locale_id, input.bot_id, input.bot_version
-                    )),
+                    // The sentence this service states for a read of a resource it does
+                    // not hold, whatever the resource and whatever identified it.
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

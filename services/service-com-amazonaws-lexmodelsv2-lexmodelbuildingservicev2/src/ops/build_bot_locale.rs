@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BuildBotLocale
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BuildBotLocale`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BuildBotLocale::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a build of one locale of one bot version on the stored locale in
+//! [`crate::state`]: the locale is `Building` from the submission, which is the instant
+//! `lastBuildSubmittedDateTime` reports, and the `Built` transition the clock owes is due
+//! [`crate::state::BUILD_SETTLES_AFTER`] later and is materialised by the next read, so a
+//! caller reading straight back still observes `Building`.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +166,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BuildBotLocale` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BuildBotLocaleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BuildBotLocale"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BuildBotLocaleErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // A build is submitted for a locale that is there; nothing is built for a triple
+        // the store holds no locale under.
+        let Some(locale) =
+            store.settled_bot_locale_mut(&input.bot_id, &input.bot_version, &input.locale_id)
+        else {
+            return Err(BuildBotLocaleErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    message: Some(format!(
+                        "Locale {} does not exist for bot {} version {}; create the locale before building it",
+                        input.locale_id, input.bot_id, input.bot_version
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The build is recorded on the stored locale, so the status and the build
+        // timestamp this call reports are the ones `DescribeBotLocale` reports: building
+        // from now, and `Built` once the span the clock owes has elapsed. A locale the
+        // service is still settling takes the submission too — AWS documents no state a
+        // build is refused from, and the one conflict this error class documents is a
+        // DELETE of a resource that is still being created.
+        locale.submit_build(::std::time::SystemTime::now());
+        Ok(BuildBotLocaleOutput {
+            bot_id: Some(locale.bot_id.clone()),
+            bot_version: Some(locale.bot_version.clone()),
+            locale_id: Some(locale.locale_id.clone()),
+            bot_locale_status: Some(locale.bot_locale_status.clone()),
+            last_build_submitted_date_time: locale
+                .last_build_submitted_date_time
+                .map(crate::state::to_date_time),
+        })
     }
 }

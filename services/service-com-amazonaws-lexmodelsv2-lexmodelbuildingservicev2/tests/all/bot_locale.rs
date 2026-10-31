@@ -34,8 +34,10 @@ use crate::bot_lifecycle::{
 
 /// The members `CreateBotLocale` accepts that `DescribeBotLocale` reports back
 /// unchanged. `nluIntentConfidenceThreshold` is compared numerically instead, so that a
-/// double rendered as `1` and one rendered as `1.0` still compare equal.
-const ECHOED_BY_DESCRIBE: [&str; 9] = [
+/// double rendered as `1` and one rendered as `1.0` still compare equal, and
+/// `speechDetectionSensitivity` through [`expected_sensitivity`], because a create that
+/// names no level is answered with the documented standard one.
+const ECHOED_BY_DESCRIBE: [&str; 8] = [
     "localeId",
     "description",
     "voiceSettings",
@@ -43,9 +45,17 @@ const ECHOED_BY_DESCRIBE: [&str; 9] = [
     "audioFillerSettings",
     "speechRecognitionSettings",
     "generativeAISettings",
-    "speechDetectionSensitivity",
     "speakerDiarizationSettings",
 ];
+
+/// The sensitivity level a response must report: the one the request named, or the
+/// documented standard level when the request named none.
+fn expected_sensitivity(request: &Value) -> Value {
+    match member(request, "speechDetectionSensitivity") {
+        Value::Null => Value::String(state::DEFAULT_SPEECH_DETECTION_SENSITIVITY.to_string()),
+        named => named,
+    }
+}
 
 /// A foundation-model ARN satisfying the modelled `BedrockModelArn` pattern
 /// (`smithy_query(query="shape",shape="SpeechFoundationModel")`).
@@ -234,6 +244,17 @@ async fn a_created_bot_locale_is_stored_and_read_back_through_its_own_triple() {
                 member(&described, name),
                 member(&request, name),
                 "case {case:?}: DescribeBotLocale must report the stored {name}, got {described:?}"
+            );
+        }
+        // A create that named no sensitivity level stored the documented standard one,
+        // and both the create and the read report that stored level.
+        for (reporter, reported) in [("CreateBotLocale", &created), ("DescribeBotLocale", &described)]
+        {
+            assert_eq!(
+                member(reported, "speechDetectionSensitivity"),
+                expected_sensitivity(&request),
+                "case {case:?}: {reporter} must report the stored sensitivity level, got \
+                 {reported:?}"
             );
         }
         let threshold = number(&request, "nluIntentConfidenceThreshold");

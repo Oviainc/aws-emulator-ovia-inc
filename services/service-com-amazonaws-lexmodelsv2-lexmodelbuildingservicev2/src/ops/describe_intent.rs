@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeIntent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeIntent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeIntent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one intent of one locale of one bot version out of [`crate::state`], scoped by
+//! the bot, bot version and locale the URI names, and reports
+//! `ResourceNotFoundException` (HTTP 404) for an intent the store holds none of under
+//! that triple.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +190,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeIntent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeIntentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeIntent"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeIntentErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        let store = state.lock();
+        // An intent is reachable only under the locale of the bot version it was created
+        // in, so a read scoped to any other triple finds nothing.
+        let Some(intent) = store.intent(
+            &input.bot_id,
+            &input.bot_version,
+            &input.locale_id,
+            &input.intent_id,
+        ) else {
+            return Err(DescribeIntentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // The sentence this service states for a read of a resource it does
+                    // not hold, whatever the resource and whatever identified it.
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeIntentOutput {
+            intent_id: Some(intent.intent_id.clone()),
+            intent_name: Some(intent.intent_name.clone()),
+            intent_display_name: intent.intent_display_name.clone(),
+            description: intent.description.clone(),
+            parent_intent_signature: intent.parent_intent_signature.clone(),
+            // A describe reports the record in full: the lists the intent holds, each
+            // empty when it holds none of that kind.
+            sample_utterances: Some(intent.sample_utterances.clone()),
+            dialog_code_hook: intent.dialog_code_hook.clone(),
+            fulfillment_code_hook: intent.fulfillment_code_hook.clone(),
+            // Slot priorities are ordered over the slots of an intent, and no operation
+            // in this slice stores a slot, so a stored intent has none to prioritise.
+            slot_priorities: None,
+            intent_confirmation_setting: intent.intent_confirmation_setting.clone(),
+            intent_closing_setting: intent.intent_closing_setting.clone(),
+            input_contexts: Some(intent.input_contexts.clone()),
+            output_contexts: Some(intent.output_contexts.clone()),
+            kendra_configuration: intent.kendra_configuration.clone(),
+            bot_id: Some(intent.bot_id.clone()),
+            bot_version: Some(intent.bot_version.clone()),
+            locale_id: Some(intent.locale_id.clone()),
+            creation_date_time: Some(crate::state::to_date_time(intent.creation_date_time)),
+            last_updated_date_time: Some(crate::state::to_date_time(
+                intent.last_updated_date_time,
+            )),
+            initial_response_setting: intent.initial_response_setting.clone(),
+            qn_a_intent_configuration: intent.qn_a_intent_configuration.clone(),
+            q_in_connect_intent_configuration: intent
+                .q_in_connect_intent_configuration
+                .clone(),
+        })
     }
 }

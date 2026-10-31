@@ -178,10 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(bot) = store.settled_bot(&input.bot_id) else {
             return Err(DescribeBotErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Bot {} does not exist; check the botId and try again",
-                        input.bot_id
-                    )),
+                    // The sentence this service states for a read of a resource it does
+                    // not hold, whatever the resource and whatever identified it.
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

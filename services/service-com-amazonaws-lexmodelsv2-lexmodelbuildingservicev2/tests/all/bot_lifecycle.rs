@@ -69,6 +69,18 @@ pub(crate) async fn call(
     uri: &str,
     body: Option<Value>,
 ) -> (u16, Value) {
+    let (status, _, parsed) = call_announcing(router, method, uri, body).await;
+    (status, parsed)
+}
+
+/// Dispatch one request and return its status, the media type it announces and its
+/// parsed JSON body — the three things a client reads off a response.
+pub(crate) async fn call_announcing(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, Option<String>, Value) {
     let payload = body.map_or_else(Bytes::new, |body| {
         Bytes::from(serde_json::to_vec(&body).expect("serialize the request body"))
     });
@@ -82,13 +94,18 @@ pub(crate) async fn call(
         .expect("build the request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let announced = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let bytes = response.body();
     let parsed = if bytes.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(bytes).unwrap_or(Value::Null)
     };
-    (status, parsed)
+    (status, announced, parsed)
 }
 
 /// The wire error code restJson1 puts in the error envelope's `__type`.

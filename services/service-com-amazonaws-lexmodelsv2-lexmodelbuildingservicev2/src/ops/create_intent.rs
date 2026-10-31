@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIntent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIntent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIntent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one intent of one locale of one bot version in [`crate::state`] and answers
+//! from the stored record, so `DescribeIntent` reports back what was stored and
+//! `DescribeBotLocale` counts it.
 //!
 //! ## Shape of an operation
 //!
@@ -269,18 +264,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIntent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIntentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIntent"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateIntentErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // "You must add a locale to a bot before you can add intents and slot types to
+        // the bot": the locale the intent is defined in has to be there, which also
+        // settles whether the bot is.
+        if !store.bot_locale_exists(&input.bot_id, &input.bot_version, &input.locale_id) {
+            return Err(CreateIntentErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    message: Some(format!(
+                        "Locale {} does not exist for bot {} version {}; create the locale before adding intents to it",
+                        input.locale_id, input.bot_id, input.bot_version
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The per-bot-locale intent quota bounds the store: past it the service answers
+        // its modelled quota error rather than growing forever.
+        if store
+            .intents_in_locale(&input.bot_id, &input.bot_version, &input.locale_id)
+            .count()
+            >= crate::state::INTENTS_PER_LOCALE_QUOTA
+        {
+            return Err(CreateIntentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "You have reached the quota of {} intents for locale {} of bot {} version {}; delete an intent or request a quota increase",
+                        crate::state::INTENTS_PER_LOCALE_QUOTA,
+                        input.locale_id,
+                        input.bot_id,
+                        input.bot_version
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Intent names must be unique in the locale that contains the intent and cannot
+        // match the name of any built-in intent", so a create under a name the locale
+        // already carries — the fallback intent it was created with included — is refused
+        // rather than stored beside it. The refusal is the modelled `ValidationException`
+        // (the name in the request is the parameter that isn't valid), worded by the one
+        // template this service states for a name that is already in use.
+        if store.intent_name_taken(
+            &input.bot_id,
+            &input.bot_version,
+            &input.locale_id,
+            &input.intent_name,
+        ) {
+            return Err(CreateIntentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::name_already_exists(
+                        crate::state::INTENT_RESOURCE_LABEL,
+                        &input.intent_name,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let intent_id = store.mint_intent_id();
+        let intent = crate::state::Intent {
+            intent_id: intent_id.clone(),
+            intent_name: input.intent_name,
+            bot_id: input.bot_id,
+            bot_version: input.bot_version,
+            locale_id: input.locale_id,
+            intent_display_name: input.intent_display_name,
+            description: input.description,
+            parent_intent_signature: input.parent_intent_signature,
+            sample_utterances: input.sample_utterances.unwrap_or_default(),
+            dialog_code_hook: input.dialog_code_hook,
+            fulfillment_code_hook: input.fulfillment_code_hook,
+            intent_confirmation_setting: input.intent_confirmation_setting,
+            intent_closing_setting: input.intent_closing_setting,
+            input_contexts: input.input_contexts.unwrap_or_default(),
+            output_contexts: input.output_contexts.unwrap_or_default(),
+            kendra_configuration: input.kendra_configuration,
+            initial_response_setting: input.initial_response_setting,
+            qn_a_intent_configuration: input.qn_a_intent_configuration,
+            q_in_connect_intent_configuration: input.q_in_connect_intent_configuration,
+            creation_date_time: now,
+            last_updated_date_time: now,
+        };
+
+        // The response is read back off the record that was just stored, so an `intentId`
+        // this operation hands out always has a backing intent.
+        let stored = store.intents.entry(intent_id).or_insert(intent);
+        Ok(CreateIntentOutput {
+            intent_id: Some(stored.intent_id.clone()),
+            intent_name: Some(stored.intent_name.clone()),
+            intent_display_name: stored.intent_display_name.clone(),
+            description: stored.description.clone(),
+            parent_intent_signature: stored.parent_intent_signature.clone(),
+            // An intent has a list of sample utterances, of input contexts and of output
+            // contexts, each empty until it is given some, so each list is reported
+            // whether or not the create named one.
+            sample_utterances: Some(stored.sample_utterances.clone()),
+            dialog_code_hook: stored.dialog_code_hook.clone(),
+            fulfillment_code_hook: stored.fulfillment_code_hook.clone(),
+            intent_confirmation_setting: stored.intent_confirmation_setting.clone(),
+            intent_closing_setting: stored.intent_closing_setting.clone(),
+            input_contexts: Some(stored.input_contexts.clone()),
+            output_contexts: Some(stored.output_contexts.clone()),
+            kendra_configuration: stored.kendra_configuration.clone(),
+            bot_id: Some(stored.bot_id.clone()),
+            bot_version: Some(stored.bot_version.clone()),
+            locale_id: Some(stored.locale_id.clone()),
+            creation_date_time: Some(crate::state::to_date_time(stored.creation_date_time)),
+            initial_response_setting: stored.initial_response_setting.clone(),
+            qn_a_intent_configuration: stored.qn_a_intent_configuration.clone(),
+            q_in_connect_intent_configuration: stored
+                .q_in_connect_intent_configuration
+                .clone(),
+        })
     }
 }

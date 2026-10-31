@@ -196,8 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        // The slot types of this locale are records the store holds, so the count is read
-        // off them rather than reported as unknown.
+        // The intents and slot types of this locale are records the store holds, so both
+        // counts are read off them rather than reported as unknown.
+        let intents_count = store
+            .intents_in_locale(&input.bot_id, &input.bot_version, &input.locale_id)
+            .count();
         let slot_types_count = store
             .slot_types_in_locale(&input.bot_id, &input.bot_version, &input.locale_id)
             .count();
@@ -208,10 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DescribeBotLocaleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Locale {} does not exist for bot {} version {}; check the botId, botVersion and localeId and try again",
-                        input.locale_id, input.bot_id, input.bot_version
-                    )),
+                    // The sentence this service states for a read of a resource it does
+                    // not hold, whatever the resource and whatever identified it.
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -228,10 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             unified_speech_settings: locale.unified_speech_settings.clone(),
             audio_filler_settings: locale.audio_filler_settings.clone(),
             speech_recognition_settings: locale.speech_recognition_settings.clone(),
-            // `CreateIntent` is still a scaffold, so no intent is stored for a locale and
-            // reporting a number would assert a collection nothing holds; the slot types
-            // `CreateSlotType` stores are counted.
-            intents_count: None,
+            intents_count: Some(i32::try_from(intents_count).unwrap_or(i32::MAX)),
             slot_types_count: Some(i32::try_from(slot_types_count).unwrap_or(i32::MAX)),
             bot_locale_status: Some(locale.bot_locale_status.clone()),
             // Only a locale in `Failed` carries failure reasons and the recommended

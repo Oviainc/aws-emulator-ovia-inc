@@ -13,13 +13,21 @@
 //! The slot type slice (`CreateSlotType`, `DescribeSlotType`, `ListSlotTypes`) is served
 //! out of `slot_types`: a custom slot type is defined inside one locale of one bot
 //! version, so every record carries that triple and every read is scoped by it.
+//!
+//! The intent slice (`CreateIntent`, `DescribeIntent`) is served out of `intents` the
+//! same way, and is what `DescribeBotLocale` counts: a locale is created with the
+//! fallback intent Amazon Lex adds to it, so a locale nothing else was added to holds
+//! one intent.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     AudioFillerSettings, BotMember, BotSummary, CompositeSlotTypeSetting, DataPrivacy,
-    ErrorLogSettings, ExternalSourceSetting, GenerativeAISettings, SlotTypeSummary, SlotTypeValue,
+    DialogCodeHookSettings, ErrorLogSettings, ExternalSourceSetting, FulfillmentCodeHookSettings,
+    GenerativeAISettings, InitialResponseSetting, InputContext, IntentClosingSetting,
+    IntentConfirmationSetting, KendraConfiguration, OutputContext, QInConnectIntentConfiguration,
+    QnAIntentConfiguration, SampleUtterance, SlotTypeSummary, SlotTypeValue,
     SlotValueSelectionSetting, SpeakerDiarizationSettings, SpeechRecognitionSettings,
     UnifiedSpeechSettings, VoiceSettings,
 };
@@ -41,6 +49,12 @@ pub const BOT_LOCALE_STATUS_CREATING: &str = "Creating";
 /// See [`BOT_LOCALE_STATUS_CREATING`]. AWS documents this as the status of a locale
 /// that "was saved but not built", which is where a freshly created locale lands.
 pub const BOT_LOCALE_STATUS_NOT_BUILT: &str = "NotBuilt";
+/// See [`BOT_LOCALE_STATUS_CREATING`]. AWS documents this as the status while "Amazon
+/// Lex is building the bot for testing and use", which is where a submitted build starts.
+pub const BOT_LOCALE_STATUS_BUILDING: &str = "Building";
+/// See [`BOT_LOCALE_STATUS_CREATING`]. AWS documents this as the status once "the bot is
+/// ready for use and can be tested using any utterance", which is where a build settles.
+pub const BOT_LOCALE_STATUS_BUILT: &str = "Built";
 
 /// Every language and locale Amazon Lex V2 accepts, each with the locale name the API
 /// reports for it.
@@ -158,6 +172,42 @@ pub const EXTERNAL_SOURCE_TYPE_GRAMMAR: &str = "GrammarSlotTypeSetting";
 /// materialised by the next read, which is what the clock already owed.
 pub const CREATION_SETTLES_AFTER: Duration = Duration::from_millis(500);
 
+/// How long after a build is submitted the `Building` -> `Built` transition falls due.
+///
+/// AWS documents the transition but not its duration (`BuildBotLocale` answers while
+/// "Amazon Lex is building the bot" and the locale is `Built` once it "is ready for use"),
+/// so the span is CHOSEN, the same way and for the same reasons as
+/// [`CREATION_SETTLES_AFTER`]: non-zero, so a caller reading the locale straight after
+/// submitting the build still observes `Building`, and materialised by the next read
+/// rather than slept for.
+///
+/// It is this service's OWN span rather than a longer one because the two transitions a
+/// locale has are the same kind of wait to a client — a create settles and a build
+/// settles — so a locale that is read a few calls after either one answers the same way;
+/// stretching only the build would make a recorded client that builds and then reads the
+/// locale see a status its own run never saw.
+pub const BUILD_SETTLES_AFTER: Duration = Duration::from_millis(500);
+
+/// How many intents one bot locale may hold: the AWS Lex V2 model-building quota on the
+/// intents of a bot locale, which is adjustable on request, at the default this emulator
+/// enforces.
+///
+/// `CreateIntent` answers the modelled `ServiceQuotaExceededException` ("You have reached
+/// a quota for your bot", HTTP 402) once the locale holds this many, which is what bounds
+/// the stored intents: at most [`BOTS_PER_ACCOUNT_QUOTA`] bots times the locale ids of
+/// [`SUPPORTED_LOCALES`] times this many records, so a caller cannot grow that map past
+/// it.
+pub const INTENTS_PER_LOCALE_QUOTA: usize = 1_000;
+
+/// The intent Amazon Lex V2 adds to every locale it creates, and the built-in intent that
+/// intent is based on: a locale is created with its fallback intent already in it, which
+/// is why a locale nothing else was added to reports one intent.
+pub const FALLBACK_INTENT_NAME: &str = "FallbackIntent";
+/// The built-in intent [`FALLBACK_INTENT_NAME`] is based on, as `parentIntentSignature`
+/// names it — the signature AWS documents for the intent Amazon Lex uses "when it can't
+/// determine another intent to invoke".
+pub const FALLBACK_INTENT_SIGNATURE: &str = "AMAZON.FallbackIntent";
+
 /// How many bots one account may hold: the published AWS Lex V2 service quota "Bots
 /// per account per Region" (default 100, adjustable on request).
 ///
@@ -185,6 +235,10 @@ pub const BOT_RESOURCE_LABEL: &str = "Bot";
 /// How Amazon Lex V2 names a slot type in a message about a name that is already in
 /// use. See [`name_already_exists`].
 pub const SLOT_TYPE_RESOURCE_LABEL: &str = "Slot Type";
+
+/// How Amazon Lex V2 names an intent in a message about a name that is already in use.
+/// See [`name_already_exists`].
+pub const INTENT_RESOURCE_LABEL: &str = "Intent";
 
 /// The message this service answers when the name a request asks for is already in use
 /// where that name has to be unique.
@@ -302,6 +356,24 @@ fn settle_status(status: &mut String, pending: &mut Option<(String, Instant)>) {
 /// OriginalValue | TopResolution | Concatenation) that names that strategy.
 pub const DEFAULT_RESOLUTION_STRATEGY: &str = "OriginalValue";
 
+/// What this control plane says when a read names a resource it does not hold.
+///
+/// The modelled `ResourceNotFoundException`
+/// (`smithy_query(query="doc",shape="ResourceNotFoundException")`) documents the
+/// condition — "You asked to describe a resource that doesn't exist" — and the service
+/// states it with this one sentence, which has no variable part: it names neither the
+/// kind of resource nor the identifier the request carried, so every read of this
+/// service answers a resource it cannot find with exactly this text.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Failed to retrieve resource since it does not exist";
+
+/// The voice-activity-detection sensitivity a bot locale runs at when a create names
+/// none: the member of the modelled `SpeechDetectionSensitivity` enum
+/// (`smithy_query(query="shape",shape="SpeechDetectionSensitivity")`) its own
+/// documentation calls the standard level — "`Default` - Standard sensitivity level
+/// suitable for most environments" — against the two that raise the tolerance for
+/// background noise.
+pub const DEFAULT_SPEECH_DETECTION_SENSITIVITY: &str = "Default";
+
 /// The only built-in slot type a custom slot type may extend. The modelled
 /// `parentSlotTypeSignature` member documents the restriction: "The built-in slot type
 /// used as a parent of this slot type. [...] Only AMAZON.AlphaNumeric is supported."
@@ -344,6 +416,58 @@ impl BotLocale {
     /// Schedule `status` to become this locale's status once `after` has elapsed.
     pub fn schedule_status(&mut self, status: &str, after: Duration) {
         self.pending_status = Some((status.to_string(), Instant::now() + after));
+    }
+
+    /// Record a build submitted at `now`: the locale is building from that instant, the
+    /// build timestamp is the one a read reports, and the `Built` the clock then owes is
+    /// due [`BUILD_SETTLES_AFTER`] later.
+    pub fn submit_build(&mut self, now: SystemTime) {
+        self.last_build_submitted_date_time = Some(now);
+        self.bot_locale_status = BOT_LOCALE_STATUS_BUILDING.to_string();
+        self.schedule_status(BOT_LOCALE_STATUS_BUILT, BUILD_SETTLES_AFTER);
+    }
+}
+
+/// An intent of one locale of one bot version, as `CreateIntent` stored it and
+/// `DescribeIntent` reads it back.
+///
+/// An intent HAS a list of sample utterances, of input contexts and of output contexts,
+/// each empty until the intent is given some, so the three are held as the lists they are
+/// rather than as "set or not": what a read reports is the list the record holds.
+///
+/// `slotPriorities` is not held: it is ordered by `CreateSlot` / `UpdateIntent`, neither
+/// of which this slice implements, so a stored intent has no slot to prioritise.
+#[derive(Debug, Clone)]
+pub struct Intent {
+    pub intent_id: String,
+    pub intent_name: String,
+    pub bot_id: String,
+    pub bot_version: String,
+    pub locale_id: String,
+    pub intent_display_name: Option<String>,
+    pub description: Option<String>,
+    pub parent_intent_signature: Option<String>,
+    pub sample_utterances: Vec<SampleUtterance>,
+    pub dialog_code_hook: Option<DialogCodeHookSettings>,
+    pub fulfillment_code_hook: Option<FulfillmentCodeHookSettings>,
+    pub intent_confirmation_setting: Option<IntentConfirmationSetting>,
+    pub intent_closing_setting: Option<IntentClosingSetting>,
+    pub input_contexts: Vec<InputContext>,
+    pub output_contexts: Vec<OutputContext>,
+    pub kendra_configuration: Option<KendraConfiguration>,
+    pub initial_response_setting: Option<InitialResponseSetting>,
+    pub qn_a_intent_configuration: Option<QnAIntentConfiguration>,
+    pub q_in_connect_intent_configuration: Option<QInConnectIntentConfiguration>,
+    pub creation_date_time: SystemTime,
+    pub last_updated_date_time: SystemTime,
+}
+
+impl Intent {
+    /// Is this intent the one that triple names? An intent is defined inside one locale
+    /// of one bot version, so every read is scoped by the same triple the operation's URI
+    /// carries.
+    pub fn is_in_locale(&self, bot_id: &str, bot_version: &str, locale_id: &str) -> bool {
+        self.bot_id == bot_id && self.bot_version == bot_version && self.locale_id == locale_id
     }
 }
 
@@ -450,6 +574,13 @@ pub struct ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
     /// ([`SUPPORTED_LOCALES`]) times [`SLOT_TYPES_PER_LOCALE_QUOTA`]: a caller cannot
     /// grow it past that.
     pub slot_types: HashMap<String, SlotType>,
+    /// Every intent this emulator holds, keyed by the `intentId` it minted. The record
+    /// carries the bot, bot version and locale it was created in, which is what scopes
+    /// every read of it. An intent belongs to one locale of one bot version, so this map
+    /// is bounded by the bots the store may hold ([`BOTS_PER_ACCOUNT_QUOTA`]) times the
+    /// locale ids a bot version can carry ([`SUPPORTED_LOCALES`]) times
+    /// [`INTENTS_PER_LOCALE_QUOTA`]: a caller cannot grow it past that.
+    pub intents: HashMap<String, Intent>,
     /// The monotonic source the minted ids are derived from.
     id_seq: u64,
 }
@@ -478,6 +609,19 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
             self.id_seq += 1;
             let candidate = render_id(self.id_seq);
             if !self.slot_types.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Mint an unused `intentId`, from the same counter and in the same
+    /// `[0-9a-zA-Z]{10}` space [`mint_bot_id`] draws from, and checked against the
+    /// stored intents before it is handed out.
+    pub fn mint_intent_id(&mut self) -> String {
+        loop {
+            self.id_seq += 1;
+            let candidate = render_id(self.id_seq);
+            if !self.intents.contains_key(&candidate) {
                 return candidate;
             }
         }
@@ -531,6 +675,105 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
             .get_mut(&bot_locale_key(bot_id, bot_version, locale_id))?;
         locale.settle();
         Some(locale)
+    }
+
+    /// The stored locale the triple names, mutably, with any due status transition
+    /// applied first — what a build submission moves on.
+    pub fn settled_bot_locale_mut(
+        &mut self,
+        bot_id: &str,
+        bot_version: &str,
+        locale_id: &str,
+    ) -> Option<&mut BotLocale> {
+        let locale = self
+            .bot_locales
+            .get_mut(&bot_locale_key(bot_id, bot_version, locale_id))?;
+        locale.settle();
+        Some(locale)
+    }
+
+    /// Every intent defined in one locale of one bot version.
+    pub fn intents_in_locale<'a>(
+        &'a self,
+        bot_id: &'a str,
+        bot_version: &'a str,
+        locale_id: &'a str,
+    ) -> impl Iterator<Item = &'a Intent> + 'a {
+        self.intents
+            .values()
+            .filter(move |intent| intent.is_in_locale(bot_id, bot_version, locale_id))
+    }
+
+    /// Is `name` already the name of an intent in that locale? `CreateIntent` refuses a
+    /// duplicate: "Intent names must be unique in the locale that contains the intent".
+    pub fn intent_name_taken(
+        &self,
+        bot_id: &str,
+        bot_version: &str,
+        locale_id: &str,
+        name: &str,
+    ) -> bool {
+        self.intents_in_locale(bot_id, bot_version, locale_id)
+            .any(|intent| intent.intent_name == name)
+    }
+
+    /// The stored intent the id names, but only when it is defined in the locale the read
+    /// scopes it to; `None` otherwise, which is what a read reports as not found.
+    pub fn intent(
+        &self,
+        bot_id: &str,
+        bot_version: &str,
+        locale_id: &str,
+        intent_id: &str,
+    ) -> Option<&Intent> {
+        self.intents
+            .get(intent_id)
+            .filter(|intent| intent.is_in_locale(bot_id, bot_version, locale_id))
+    }
+
+    /// Store the intent Amazon Lex adds to a locale as it creates it
+    /// ([`FALLBACK_INTENT_NAME`]), and answer the id it was minted under.
+    pub fn add_fallback_intent(
+        &mut self,
+        bot_id: &str,
+        bot_version: &str,
+        locale_id: &str,
+        now: SystemTime,
+    ) -> String {
+        let intent_id = self.mint_intent_id();
+        let intent = Intent {
+            intent_id: intent_id.clone(),
+            intent_name: FALLBACK_INTENT_NAME.to_string(),
+            bot_id: bot_id.to_string(),
+            bot_version: bot_version.to_string(),
+            locale_id: locale_id.to_string(),
+            intent_display_name: None,
+            description: None,
+            parent_intent_signature: Some(FALLBACK_INTENT_SIGNATURE.to_string()),
+            sample_utterances: Vec::new(),
+            dialog_code_hook: None,
+            fulfillment_code_hook: None,
+            intent_confirmation_setting: None,
+            intent_closing_setting: None,
+            input_contexts: Vec::new(),
+            output_contexts: Vec::new(),
+            kendra_configuration: None,
+            initial_response_setting: None,
+            qn_a_intent_configuration: None,
+            q_in_connect_intent_configuration: None,
+            creation_date_time: now,
+            last_updated_date_time: now,
+        };
+        self.intents.insert(intent_id.clone(), intent);
+        intent_id
+    }
+
+    /// Drop every intent of `bot_id`, whatever version or locale holds it, and answer how
+    /// many went: an intent cannot outlive the bot it is defined in.
+    pub fn remove_intents_of_bot(&mut self, bot_id: &str) -> usize {
+        let before = self.intents.len();
+        self.intents.retain(|_, intent| intent.bot_id != bot_id);
+        before - self.intents.len()
     }
 
     /// Drop every locale of `bot_id`, whatever version holds it, and answer how many
