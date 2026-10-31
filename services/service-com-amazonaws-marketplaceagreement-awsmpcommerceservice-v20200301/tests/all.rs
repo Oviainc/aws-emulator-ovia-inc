@@ -119,6 +119,8 @@ mod time_windows;
 mod unknown_ids;
 #[path = "all/unmatched_selector_pages.rs"]
 mod unmatched_selector_pages;
+#[path = "all/unsettled_store_adjustment_writes.rs"]
+mod unsettled_store_adjustment_writes;
 #[path = "all/unsettled_store_invoice_reports.rs"]
 mod unsettled_store_invoice_reports;
 #[path = "all/unsettled_store_listings.rs"]
