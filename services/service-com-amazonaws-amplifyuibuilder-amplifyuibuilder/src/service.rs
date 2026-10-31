@@ -36,8 +36,10 @@
 //!   that named no operation declares the same media type and validator as one that
 //!   did.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. THIS SERVICE words one here: a request that fails the
+//!   model's own input rules is answered with the exception this service's model
+//!   declares for an invalid input value, so a refusal caught at the boundary and one
+//!   caught in a handler name the same shape. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -59,6 +61,20 @@ use std::sync::Arc;
 
 pub mod front_door;
 pub mod untyped_errors;
+
+/// The exception this service's model declares for an input value its own rules refuse:
+/// the one shape documented as "an invalid or out-of-range value was supplied for the
+/// input parameter", and a common error of every operation
+/// (`smithy_query(query="shape",shape="InvalidParameterException",model_path="services/service-com-amazonaws-amplifyuibuilder-amplifyuibuilder/smithy-model/com-amazonaws-amplifyuibuilder-amplifyuibuilder.json")`
+/// — `errorKind` client, `httpError` 400, which is the status the framework already
+/// answers a refusal with).
+///
+/// It is what [`EmulatedService::override_refusal`] names for a refusal the framework
+/// found while reading or walking the request, so an out-of-bound value and a value a
+/// handler checks itself are reported as one class. Removing the discriminator from the
+/// rendered response is [`untyped_errors`]'s job, as for every other exception of this
+/// service.
+const INVALID_PARAMETER_EXCEPTION: &str = "InvalidParameterException";
 
 /// The `com-amazonaws-amplifyuibuilder-amplifyuibuilder` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -118,15 +134,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // A request that fails the model's own input rules is refused for the reason
+        // [`INVALID_PARAMETER_EXCEPTION`] is declared for, so it is answered with that
+        // shape rather than with the framework's `ValidationException` — a shape this
+        // service's model does not declare, and the one error this service would
+        // otherwise name on the wire (`untyped_errors` strips the discriminator of a
+        // modelled exception, so this is also what makes a boundary refusal leave in
+        // this service's own untyped form). It covers both classes the framework
+        // reports structurally — a required member that was absent, and a value
+        // outside a declared `@length` / `@range` / `@pattern` / enum / uniqueness
+        // bound — because to a caller both are an input parameter this service would
+        // not accept, and this service declares no other 400 for one.
+        //
+        // The MESSAGE is the one the framework renders for the same violations, so
+        // only the code moves: `override_refusal` replaces the code and the message
+        // together, so the message is restated rather than changed. `None` when there
+        // is nothing to state, which keeps the framework's default wording.
+        //
+        // An authentication refusal is left alone: it is not an input-value failure,
+        // and it is answered before this service's response path runs.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: INVALID_PARAMETER_EXCEPTION.to_string(),
+                message: aws_smithy_schema_server::envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

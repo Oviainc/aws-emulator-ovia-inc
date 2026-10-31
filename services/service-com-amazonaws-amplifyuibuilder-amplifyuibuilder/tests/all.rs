@@ -47,6 +47,9 @@ mod form_lifecycle;
 #[path = "all/form_update.rs"]
 mod form_update;
 
+#[path = "all/invalid_parameter_refusals.rs"]
+mod invalid_parameter_refusals;
+
 #[path = "all/metadata_flags.rs"]
 mod metadata_flags;
 

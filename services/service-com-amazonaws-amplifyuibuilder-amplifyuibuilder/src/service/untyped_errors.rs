@@ -26,11 +26,16 @@
 //! header, and the whole success path.
 //!
 //! What it deliberately leaves typed is a code that is NOT one of this service's modelled
-//! exceptions (see [`MODELLED_EXCEPTIONS`]): the scaffold's `NotImplemented` (501) and the
-//! framework's `ValidationException` (400) are the emulator's own signals for "nobody has
-//! written this operation yet" and "this request was refused before any handler ran" —
-//! AmplifyUIBuilder has no such errors, so dressing them as one of its refusals would hide
-//! what they report.
+//! exceptions (see [`MODELLED_EXCEPTIONS`]): the scaffold's `NotImplemented` (501) is the
+//! emulator's own signal for "nobody has written this operation yet" — AmplifyUIBuilder has
+//! no such error, so dressing it as one of its refusals would hide what it reports.
+//!
+//! A request the framework refused before any handler ran reaches here already naming one
+//! of this service's own exceptions, because this service's refusal seam
+//! ([`crate::service::EmulatedService`]'s `override_refusal`) answers that refusal with the
+//! shape the model declares for an invalid input value; so it loses its discriminator here
+//! like every other refusal of this service, and no response names the framework's own
+//! `ValidationException`, which this service's model does not declare.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_types::body::SdkBody;
@@ -297,14 +302,15 @@ mod tests {
     }
 
     /// Nothing to strip: a code this service does not model — the scaffold's 501 and the
-    /// framework's refusal — a body carrying no code at all, and a body that is not a JSON
-    /// object are all left alone.
+    /// framework's own `ValidationException`, which no response of this service names any
+    /// more — a body carrying no code at all, and a body that is not a JSON object are all
+    /// left alone.
     #[test]
     fn a_body_this_service_does_not_own_is_left_alone() {
         for (label, body) in [
             ("the scaffold's 501", r#"{"__type":"NotImplemented","Message":"no"}"#),
             (
-                "a framework refusal",
+                "a shape this service's model does not declare",
                 r#"{"__type":"ValidationException","Message":"no"}"#,
             ),
             ("no code at all", r#"{"Message":"no"}"#),
