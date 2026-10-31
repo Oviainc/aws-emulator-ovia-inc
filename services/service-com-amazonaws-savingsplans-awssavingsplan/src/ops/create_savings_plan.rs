@@ -171,7 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The amount is parsed here, before the fingerprint below needs it, and
         // kept alongside the parsed units AS THE CALLER SPELLED IT, so a clause
         // that reports it back reports the request's own value rather than the
-        // magnitude this service read it at.
+        // magnitude this service read it at. The parse settles the value's FORM
+        // only: its MAGNITUDE — a sign included, since the member is documented
+        // with a window — is refused by that window below, which is where the
+        // bound a value missed is reported.
         let supplied_upfront = match input.upfront_payment_amount.as_deref() {
             Some(amount) => Some((
                 amount,

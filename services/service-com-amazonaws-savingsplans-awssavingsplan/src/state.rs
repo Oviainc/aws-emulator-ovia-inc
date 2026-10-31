@@ -214,43 +214,49 @@ pub const MIN_COMMITMENT_UNITS: i128 = AMOUNT_SCALE / 1000;
 /// The largest hourly commitment, from the same sentence.
 pub const MAX_COMMITMENT_UNITS: i128 = 1_000_000 * AMOUNT_SCALE;
 
-/// Parse an `Amount` into [`AMOUNT_SCALE`] units, refusing anything that is not
-/// a plain non-negative decimal number with at most [`MAX_AMOUNT_DIGITS`]
-/// decimal places.
+/// Parse a REQUEST's `Amount` into [`AMOUNT_SCALE`] units, refusing only a value
+/// that is not a plain decimal number, or one spelled at more than
+/// [`MAX_AMOUNT_DIGITS`] decimal places.
 ///
 /// `Amount` is an unconstrained string in the model, so the shape of the value
-/// is the handler's to enforce. A number too large to hold exactly is still such
-/// a number, so it comes back as [`AMOUNT_OVERFLOW_UNITS`] for the caller's own
-/// rule to refuse on its magnitude.
+/// is the handler's to enforce. Every `Amount` a request carries is a member the
+/// documentation gives a RANGE — an hourly commitment between 0.001 and 1
+/// million, an up-front payment between 50 and 99 percent of the plan's total
+/// value — so the sign is read as part of the number ([`Negative::Read`]) and a
+/// value below the member's floor is reported with that bound rather than called
+/// malformed. For the same reason a number too large to hold exactly comes back
+/// as [`AMOUNT_OVERFLOW_UNITS`]: both ends of the number line are left to the
+/// member's own rule to refuse on its magnitude.
 pub fn parse_amount(member: &str, value: &str) -> Result<i128, String> {
-    parse_amount_with_digits(member, value, MAX_AMOUNT_DIGITS)
+    parse_decimal_amount(member, value, MAX_AMOUNT_DIGITS, Negative::Read)
 }
 
 /// Read an amount the way a FILTER value is read: at the full wire scale, since
 /// the value a client filters with is the one this service rendered for it
 /// ([`AMOUNT_WIRE_DIGITS`] fractional digits), which is wider than the
 /// [`MAX_AMOUNT_DIGITS`] a request may SPECIFY.
+///
+/// A filter value is COMPARED with an amount this service rendered, never
+/// refused by a bound, and no amount it renders carries a sign — so a signed
+/// spelling cannot be one of those renderings and is simply not a value to
+/// compare ([`Negative::Refused`]).
 pub fn parse_amount_at_wire_scale(value: &str) -> Option<i128> {
-    parse_amount_with_digits("amount", value, AMOUNT_WIRE_DIGITS).ok()
+    parse_decimal_amount("amount", value, AMOUNT_WIRE_DIGITS, Negative::Refused).ok()
 }
 
 /// How a leading `-` is read by [`parse_decimal_amount`].
 ///
-/// A member whose documented rule has a RANGE reads a negative amount as the
-/// number it is, so the clause a caller gets names the bound the value missed;
-/// a member whose rule is simply "an amount" refuses the sign as a malformed
-/// value, which is all there is to say about it.
+/// A value a documented RANGE governs reads a negative amount as the number it
+/// is, so the clause a caller gets names the bound the value missed; a value
+/// that is only ever COMPARED with an amount this service rendered takes no sign
+/// at all, because no rendering of a stored amount carries one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Negative {
-    /// Refused as a malformed amount.
+    /// Not an amount to compare with (the comparison's caller discards the
+    /// reason, there being no bound to report).
     Refused,
     /// Read as the negative number it is.
     Read,
-}
-
-/// [`parse_amount`], with the number of fractional digits the caller admits.
-fn parse_amount_with_digits(member: &str, value: &str, max_digits: usize) -> Result<i128, String> {
-    parse_decimal_amount(member, value, max_digits, Negative::Refused)
 }
 
 /// Parse a plain decimal amount into [`AMOUNT_SCALE`] units, admitting at most
@@ -262,11 +268,7 @@ fn parse_decimal_amount(
     negative: Negative,
 ) -> Result<i128, String> {
     let trimmed = value.trim();
-    let form = match negative {
-        Negative::Refused => "non-negative decimal amount",
-        Negative::Read => "decimal amount",
-    };
-    let invalid = || format!("{member} must be a {form}, got '{value}'");
+    let invalid = || format!("{member} must be a decimal amount, got '{value}'");
     // The sign is taken off the front before the digit rules are applied, so a
     // negative amount is read by exactly the rules a positive one is.
     let (sign, magnitude) = match trimmed.strip_prefix('-') {
@@ -318,7 +320,7 @@ fn parse_decimal_amount(
 /// for anything above. Only a value that is not a decimal number at all, or one
 /// spelled at more digits than a request may carry, is refused on its form.
 pub fn parse_commitment(value: &str) -> Result<i128, String> {
-    let units = parse_decimal_amount("commitment", value, MAX_AMOUNT_DIGITS, Negative::Read)?;
+    let units = parse_amount("commitment", value)?;
     if units < MIN_COMMITMENT_UNITS {
         return Err(format!(
             "'commitment' cannot be less than {}",

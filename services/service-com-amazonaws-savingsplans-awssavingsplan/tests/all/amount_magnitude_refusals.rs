@@ -33,15 +33,18 @@ use crate::savings_plans_lifecycle::{text, Emulator, ONE_YEAR};
 const MAX_COMMITMENT: &str = "1000000";
 
 /// The documented minimum hourly commitment ("0.001"), as the service quotes it.
-const MIN_COMMITMENT: &str = "0.001";
+///
+/// `pub(crate)` so the sibling suites of this test target share the one spelling of
+/// each documented bound rather than each writing it down again.
+pub(crate) const MIN_COMMITMENT: &str = "0.001";
 
 /// `lead` followed by `zeros` zeros — a plain decimal integer of a chosen width.
-fn wide(lead: &str, zeros: usize) -> String {
+pub(crate) fn wide(lead: &str, zeros: usize) -> String {
     format!("{lead}{}", "0".repeat(zeros))
 }
 
 /// How many Savings Plans the account holds, so a refusal can be shown to buy nothing.
-async fn plan_count(emulator: &Emulator) -> usize {
+pub(crate) async fn plan_count(emulator: &Emulator) -> usize {
     let answer = emulator.call("DescribeSavingsPlans", json!({})).await;
     assert_eq!(
         answer.status, 200,
@@ -342,9 +345,10 @@ async fn a_wide_upfront_payment_amount_names_the_window_it_missed() {
 }
 
 /// `upfrontPaymentAmount`'s own FORM half, at width: a wide value that is not a plain
-/// non-negative decimal number is refused on its form, and a wide one carrying a
-/// fraction the window cannot take is refused for not being a whole number — each
-/// reporting the value as the caller spelled it.
+/// decimal number is refused on its form, and a wide one carrying a fraction the
+/// window cannot take is refused for not being a whole number — each reporting the
+/// value as the caller spelled it. A SIGNED decimal number is in neither half: it is
+/// a number, and [`crate::negative_amount_sign_rule`] pins the bound it misses.
 #[tokio::test]
 async fn a_wide_upfront_payment_amount_that_is_not_an_amount_is_refused_on_its_form() {
     let emulator = Emulator::new();
@@ -360,22 +364,22 @@ async fn a_wide_upfront_payment_amount_that_is_not_an_amount_is_refused_on_its_f
         (
             "letters",
             "abc".to_string(),
-            "upfrontPaymentAmount must be a non-negative decimal amount, got 'abc'".to_string(),
+            "upfrontPaymentAmount must be a decimal amount, got 'abc'".to_string(),
         ),
         (
             "a wide value with a trailing letter",
             format!("{}x", "9".repeat(40)),
             format!(
-                "upfrontPaymentAmount must be a non-negative decimal amount, got '{}x'",
+                "upfrontPaymentAmount must be a decimal amount, got '{}x'",
                 "9".repeat(40)
             ),
         ),
         (
-            "a wide negative amount",
-            format!("-{}", wide("1", 39)),
+            "a wide value with two decimal points",
+            format!("{}.1.2", "9".repeat(40)),
             format!(
-                "upfrontPaymentAmount must be a non-negative decimal amount, got '-{}'",
-                wide("1", 39)
+                "upfrontPaymentAmount must be a decimal amount, got '{}.1.2'",
+                "9".repeat(40)
             ),
         ),
         (
