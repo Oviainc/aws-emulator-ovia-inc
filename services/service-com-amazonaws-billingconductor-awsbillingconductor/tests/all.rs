@@ -51,6 +51,8 @@ mod billing_transfer_identity;
 mod billing_transfer_preference;
 #[path = "all/cost_report_charges_of_the_generation_in_effect.rs"]
 mod cost_report_charges_of_the_generation_in_effect;
+#[path = "all/cost_report_mutual_percentage_associations.rs"]
+mod cost_report_mutual_percentage_associations;
 #[path = "all/cost_report_token_breakdown_scope.rs"]
 mod cost_report_token_breakdown_scope;
 #[path = "all/create_custom_line_item_billing_period_window.rs"]
