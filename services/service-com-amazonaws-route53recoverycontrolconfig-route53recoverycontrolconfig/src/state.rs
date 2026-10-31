@@ -263,6 +263,9 @@ pub struct RoutingControlRecord {
     pub cluster_arn: String,
     pub name: String,
     pub owner: String,
+    /// The tags the tagging operations hold on this routing control. `CreateRoutingControl`
+    /// models no `Tags` member, so a created one starts untagged.
+    pub tags: BTreeMap<String, String>,
     pub deploy_due: Instant,
 }
 
@@ -708,6 +711,41 @@ impl ComAmazonawsRoute53recoverycontrolconfigRoute53recoverycontrolconfigState {
     pub fn idempotency_len(&self) -> usize {
         self.idempotency.len()
     }
+
+    /// The tags stored on the resource `arn` names, whatever kind of resource it is, or
+    /// `None` when this store holds no resource under that ARN.
+    ///
+    /// The tagging operations address a resource by ARN alone, so the ARN is resolved
+    /// against every kind of resource stored here: each record keeps its own tag set,
+    /// which is what a create's `Tags` filled and what the tag operations read and write.
+    pub fn tags_of(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        if let Some(record) = self.clusters.get(arn) {
+            return Some(&record.tags);
+        }
+        if let Some(record) = self.control_panels.get(arn) {
+            return Some(&record.tags);
+        }
+        if let Some(record) = self.routing_controls.get(arn) {
+            return Some(&record.tags);
+        }
+        self.safety_rules.get(arn).map(|record| &record.tags)
+    }
+
+    /// The same tag set, for a caller that writes it ([`tags_of`] is the read).
+    ///
+    /// [`tags_of`]: Store::tags_of
+    pub fn tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(record) = self.clusters.get_mut(arn) {
+            return Some(&mut record.tags);
+        }
+        if let Some(record) = self.control_panels.get_mut(arn) {
+            return Some(&mut record.tags);
+        }
+        if let Some(record) = self.routing_controls.get_mut(arn) {
+            return Some(&mut record.tags);
+        }
+        self.safety_rules.get_mut(arn).map(|record| &mut record.tags)
+    }
 }
 
 /// A `ClientToken` is scoped to the operation that honoured it, so the same token on
@@ -777,6 +815,11 @@ pub const ROUTING_CONTROL_NOUN: &str = "routing control";
 
 /// The noun a safety rule is named by in a not-found diagnosis.
 pub const SAFETY_RULE_NOUN: &str = "safety rule";
+
+/// The noun a resource whose kind the request does not say is named by in a not-found
+/// diagnosis: what the tagging operations' `ResourceArn` is documented as, "the resource
+/// that's tagged", when the ARN names no kind this service stores.
+pub const RESOURCE_NOUN: &str = "resource";
 
 /// The `ResourceNotFoundException$Message` for a request whose ARN resolves to no
 /// resource of this service.
@@ -931,6 +974,71 @@ pub fn tags_map(tags: Option<std::collections::HashMap<String, String>>) -> BTre
     tags.unwrap_or_default().into_iter().collect()
 }
 
+/// The most tags one resource carries at once.
+///
+/// AWS's tag restrictions state a maximum of 50 user-created tags per resource, so a
+/// request that would leave a resource holding more is out of range
+/// ([`too_many_tags_message`]). It also bounds caller-driven growth of the store, the
+/// same reason the resource ceilings above exist.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The longest tag KEY a resource holds.
+///
+/// AWS's tag restrictions state a maximum key length of 128 characters. The model puts no
+/// `@length` on the map's key, which targets the service's unconstrained `__string`
+/// (`smithy_query(query="shape",shape="__mapOf__stringMin0Max256PatternS")`), so this is
+/// where that bound is applied; a tag VALUE is already bounded to 256 characters by the
+/// type the same map targets.
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// The `ValidationException$Message` for a tag key longer than [`MAX_TAG_KEY_LENGTH`].
+///
+/// States the limit and how long the key the request sent is; the key itself is not echoed,
+/// so a refusal of an enormous key is not answered with it.
+pub fn tag_key_too_long_message(length: usize) -> String {
+    format!(
+        "A tag key may be at most {MAX_TAG_KEY_LENGTH} characters; this request carries one of \
+         {length}."
+    )
+}
+
+/// The `ValidationException$Message` for a tag request that would push a resource past
+/// [`MAX_TAGS_PER_RESOURCE`].
+///
+/// Names the limit and the number the resource would be left holding, both as the
+/// request and the stored resource decide them.
+pub fn too_many_tags_message(resulting: usize) -> String {
+    format!(
+        "A resource may carry at most {MAX_TAGS_PER_RESOURCE} tags; this request would leave \
+         it with {resulting}."
+    )
+}
+
+/// The noun a request that resolved `arn` to no resource names the kind it looked for
+/// by, read from the ARN itself.
+///
+/// The operations that address ONE kind of resource know the noun from the member they
+/// took; the tagging operations take any of this service's resource ARNs, so the kind
+/// comes from the ARN's own resource field — `cluster/<id>`, `controlpanel/<id>`,
+/// `controlpanel/<id>/routingcontrol/<id>`, `controlpanel/<id>/safetyrule/<id>`, as the
+/// create handlers mint them. A value that is not an ARN of one of those kinds is named
+/// by the kind-agnostic [`RESOURCE_NOUN`].
+pub fn noun_for_arn(arn: &str) -> &'static str {
+    let Some(parsed) = ::service_common::arn::parse(arn) else {
+        return RESOURCE_NOUN;
+    };
+    // A nested resource is appended to its parent's resource field, so the segments
+    // alternate `<type>/<id>` and the kind is the LAST type segment.
+    let kind = parsed.resource.split('/').step_by(2).last().unwrap_or_default();
+    match kind {
+        "cluster" => CLUSTER_NOUN,
+        "controlpanel" => CONTROL_PANEL_NOUN,
+        "routingcontrol" => ROUTING_CONTROL_NOUN,
+        "safetyrule" => SAFETY_RULE_NOUN,
+        _ => RESOURCE_NOUN,
+    }
+}
+
 /// Wall-clock nanoseconds since the epoch, used only to seed the id counter.
 fn now_nanos() -> u64 {
     SystemTime::now()
@@ -1011,6 +1119,7 @@ mod tests {
             cluster_arn: "cluster".to_string(),
             name: arn.to_string(),
             owner: "000000000000".to_string(),
+            tags: BTreeMap::new(),
             deploy_due: Instant::now(),
         }
     }

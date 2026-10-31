@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: MERGES the request's `Tags` into the tag set of the stored resource
+//! `ResourceArn` names — a key the resource already carries takes the request's value,
+//! and a key the request omits is left alone — so the tags a later
+//! [`crate::ops::list_tags_for_resource`] reports are what this call left behind.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The ARN is resolved against every kind of resource this service stores
+//! ([`crate::state::Store::tags_mut`]); one no resource is stored under is
+//! `ResourceNotFoundException` (404), one naming another account's resource is
+//! `AccessDeniedException` (403) decided before that lookup
+//! ([`crate::state::authorize_resource_arn`]), and a request that would leave the
+//! resource holding more than [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, or that
+//! carries a key longer than [`crate::state::MAX_TAG_KEY_LENGTH`], is
+//! `ValidationException` (400) — refused before anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -67,6 +71,8 @@
 //! * `ValidationException` (HTTP 400) — 400 response - Multiple causes. For example, you
 //!   might have a malformed query string and input parameter might be out of range, or you
 //!   might have used parameters together incorrectly.
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below):
+//!   403 response - You do not have sufficient access to perform this action.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -82,9 +88,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-route53recoverycontrolc
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.route53recoverycontrolconfig#TagResource")]
+//
+// `AccessDeniedException` — a shape this SERVICE models, and one every operation that
+// resolves a caller-supplied ARN declares, though this operation's own `errors` list omits
+// it — is widened in through `extra_errors`, so an ARN of another account is refused with
+// the same 403 the rest of this service answers it with rather than with another status.
+#[smithy_macros::operation_error(
+    "com.amazonaws.route53recoverycontrolconfig#TagResource",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
@@ -141,18 +156,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        // Whether the caller may act on the resource an ARN names is decided from the
+        // request alone, so it is decided BEFORE the ARN is looked up: an ARN of another
+        // account is refused without the answer saying whether a resource is stored there.
+        crate::state::authorize_resource_arn(Self::NAME, &input.resource_arn)
+            .map_err(TagResourceErrorModeled::AccessDeniedException)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the route53-recovery-control-config store is unavailable on this \
+                              engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A tag key is bounded here rather than by the model, which constrains the map's
+        // values and not its keys — and before the store is reached, so an oversized key
+        // is refused on its INPUT without a lookup.
+        if let Some(length) = input
+            .tags
+            .keys()
+            .map(|key| key.chars().count())
+            .filter(|length| *length > crate::state::MAX_TAG_KEY_LENGTH)
+            .max()
+        {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: crate::state::tag_key_too_long_message(length),
+            })
+            .into());
+        }
+
+        let mut guard = state.lock();
+        let Some(stored) = guard.tags_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::not_found_message(
+                        crate::state::noun_for_arn(&input.resource_arn),
+                        &input.resource_arn,
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Adding tags MERGES: the request's value wins for a key it carries, and every
+        // other key the resource already holds survives. Built beside the stored set, so
+        // the refusal below leaves the resource exactly as it was.
+        let mut merged = stored.clone();
+        merged.extend(input.tags);
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: crate::state::too_many_tags_message(merged.len()),
+            })
+            .into());
+        }
+        *stored = merged;
+
+        Ok(TagResourceOutput {})
     }
 }

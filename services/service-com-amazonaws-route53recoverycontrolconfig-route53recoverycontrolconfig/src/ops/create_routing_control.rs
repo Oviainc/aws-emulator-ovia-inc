@@ -316,6 +316,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 cluster_arn: input.cluster_arn,
                 name: input.routing_control_name,
                 owner: ::engine::emulator_account_id().to_string(),
+                // `CreateRoutingControl` models no `Tags` member, so a routing control
+                // starts untagged; `TagResource` is what fills this set.
+                tags: std::collections::BTreeMap::new(),
                 deploy_due: crate::state::deploy_due(),
             },
         );
