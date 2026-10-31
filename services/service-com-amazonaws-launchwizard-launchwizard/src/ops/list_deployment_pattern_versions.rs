@@ -239,15 +239,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect()
         };
 
+        // The result set is narrowed by the two required members, and the catalogue names
+        // a version only within the pattern that publishes it — several patterns publish
+        // the same version names — so the cursor a page resumes after names the workload
+        // and the pattern the version belongs to as well, off the reported summary
+        // itself. A token one pattern's page issued then names nothing here and is
+        // refused rather than resuming in the middle of another pattern's versions.
         let (page, next_token) = crate::state::paginate(
             summaries,
             input.max_results,
             input.next_token.as_deref(),
             |summary| {
-                summary
-                    .deployment_pattern_version_name
-                    .clone()
-                    .unwrap_or_default()
+                crate::state::scoped_cursor([
+                    summary.workload_name.as_deref().unwrap_or_default(),
+                    summary.deployment_pattern_name.as_deref().unwrap_or_default(),
+                    summary
+                        .deployment_pattern_version_name
+                        .as_deref()
+                        .unwrap_or_default(),
+                ])
             },
         )
         .map_err(|message| {

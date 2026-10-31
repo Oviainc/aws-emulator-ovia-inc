@@ -51,6 +51,8 @@ mod list_deployments_filter_pairs;
 mod not_found_contract;
 #[path = "all/not_found_resource_kind.rs"]
 mod not_found_resource_kind;
+#[path = "all/pagination_token_scope.rs"]
+mod pagination_token_scope;
 #[path = "all/pattern_specification_schemas.rs"]
 mod pattern_specification_schemas;
 #[path = "all/resource_tagging.rs"]

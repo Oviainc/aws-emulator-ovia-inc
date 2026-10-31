@@ -182,11 +182,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect()
         };
 
+        // The result set is narrowed by the workload the request names, and a pattern is
+        // named only within its workload, so the cursor names the workload ahead of the
+        // pattern — off the reported summary itself. A token one workload's page issued
+        // then names nothing in another workload's page and is refused rather than
+        // resuming in the middle of it.
         let (page, next_token) = crate::state::paginate(
             summaries,
             input.max_results,
             input.next_token.as_deref(),
-            |pattern| pattern.deployment_pattern_name.clone().unwrap_or_default(),
+            |pattern| {
+                crate::state::scoped_cursor([
+                    pattern.workload_name.as_deref().unwrap_or_default(),
+                    pattern.deployment_pattern_name.as_deref().unwrap_or_default(),
+                ])
+            },
         )
         .map_err(|message| {
             ListWorkloadDeploymentPatternsErrorModeled::ValidationException(ValidationException {

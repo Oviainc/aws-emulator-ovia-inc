@@ -795,7 +795,8 @@ impl Deployment {
     /// [`Deployment::events_appended`]), not its position in the kept slice: trimming
     /// drops events from the front, so a position is reassigned to a different, newer
     /// event while an ordinal belongs to one event for good. The deployment id is folded
-    /// in, so a token one deployment's event list issued is not accepted on another's.
+    /// in through [`scoped_cursor`] — an ordinal is only an identity within one log —
+    /// so a token one deployment's event list issued is not accepted on another's.
     pub fn events_with_cursors(&self) -> Vec<(String, &DeploymentEvent)> {
         // The ordinal of the oldest event still held: every append so far, less the ones
         // that survived the trimming. Saturating, so the arithmetic cannot panic even if
@@ -808,10 +809,8 @@ impl Deployment {
             .iter()
             .enumerate()
             .map(|(offset, event)| {
-                (
-                    format!("{}:{}", self.id, oldest_kept + offset as u64),
-                    event,
-                )
+                let ordinal = (oldest_kept + offset as u64).to_string();
+                (scoped_cursor([self.id.as_str(), ordinal.as_str()]), event)
             })
             .collect()
     }
@@ -2532,6 +2531,36 @@ pub fn non_empty_member<T>(items: Vec<T>) -> Option<Vec<T>> {
     (!items.is_empty()).then_some(items)
 }
 
+/// What separates the parts of a [`scoped_cursor`].
+///
+/// None of the parts this service builds a cursor from can carry it — a `WorkloadName`
+/// is `^[A-Za-z][a-zA-Z0-9-_]*$`, a `DeploymentPatternName` `^[A-Za-z0-9][a-zA-Z0-9-]*$`,
+/// a `DeploymentPatternVersionName` `^(([A-Za-z0-9][a-zA-Z0-9-]*)|(\d+\.\d+\.\d+))$`, a
+/// `deploymentId` a hyphenated UUID ([`is_deployment_id`]) and an event's part its append
+/// ordinal — so no two different part lists spell the same cursor.
+const CURSOR_PART_SEPARATOR: &str = ":";
+
+/// The cursor of one item of a result set the REQUEST NARROWS: the names of the
+/// resources that narrow it, then the item's own name.
+///
+/// [`paginate`] requires a cursor that names the item it was issued for and no other
+/// item this service pages. An item's own name meets that only when the name is unique
+/// across the service: the versions a deployment pattern publishes, and the patterns a
+/// workload holds, are named only WITHIN the resource that holds them, so two scopes can
+/// publish one name for two different items. Naming the holding resources ahead of the
+/// item is what makes the cursor an identity again, so a token one scope issued names
+/// nothing in another scope's result set and is refused there
+/// ([`INVALID_NEXT_TOKEN_MESSAGE`]) instead of resuming in the middle of a set it was
+/// never issued for, silently skipping everything before it.
+///
+/// Every scoped pager goes through here, so the parts are joined one way only.
+pub fn scoped_cursor<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    parts
+        .into_iter()
+        .collect::<Vec<&str>>()
+        .join(CURSOR_PART_SEPARATOR)
+}
+
 /// Encode an opaque pagination token over the cursor it resumes after.
 ///
 /// The cursor is hex-encoded so a caller cannot read a position out of it or
@@ -2556,10 +2585,13 @@ fn decode_token(token: &str) -> Option<String> {
 /// `cursor_of` names an item's stable cursor, so a page resumes exactly where the
 /// previous one ended rather than at a remembered offset. "Stable" is a REQUIREMENT on
 /// the caller: the cursor has to be an identity of the item itself that this service
-/// never reassigns to another item (a `deploymentId`, a `workloadName`, a
-/// `deploymentPatternName`, an event's append ordinal) and never a position in a
-/// sequence the store can renumber, so a token either names the item it was issued for
-/// or names none. The error is the message for the operation's own `ValidationException`
+/// never reassigns to another item (a `deploymentId`, a `workloadName`, an event's
+/// append ordinal) and never a position in a sequence the store can renumber, so a token
+/// either names the item it was issued for or names none. A name that is unique only
+/// within the resource the request narrowed the set by is not such an identity on its
+/// own: that cursor is built through [`scoped_cursor`], which names the narrowing
+/// resources ahead of the item. The error is the message for the operation's own
+/// `ValidationException`
 /// ([`INVALID_NEXT_TOKEN_MESSAGE`]); a token this service did not issue, or one naming an
 /// item the result set no longer holds, is a client error rather than a silent restart
 /// from the top — or, worse, a silent jump past the items in between.
