@@ -26,7 +26,8 @@
 //! the policy `ListPolicies` reports: the `Arn` is minted from the version this service
 //! RESOLVED (a `$DEFAULT` request therefore answers with that version's id, not with the
 //! alias), `IsDefault` holds exactly for the policy's `DefaultVersion`, and the `Document`
-//! is the one [`crate::state::policy_version_document`] holds for this version — the same
+//! is the one the catalog holds for this version ([`crate::state::CatalogPolicyVersion::document`])
+//! — the same
 //! value the resource-policy reads report for it, so no two readers of one version
 //! disagree about its contents.
 //!
@@ -205,9 +206,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The `PolicyVersion` for one version of a catalog policy. The members a version shares
 /// with its policy are read off the policy, so a reported version can never disagree with
-/// the policy that owns it — the document included: it is the one
-/// [`crate::state::policy_version_document`] builds for this version, which is what the
-/// resource-policy reads report for the same version.
+/// the policy that owns it; the `Document` is the version's own, read off the stored
+/// version, which is what the resource-policy reads report for the same version.
 fn detail(
     policy: &crate::state::CatalogPolicy,
     version: &crate::state::CatalogPolicyVersion,
@@ -222,6 +222,6 @@ fn detail(
         status: version.status.as_wire().to_string(),
         creation_time: ::aws_smithy_types::DateTime::from(version.creation_time),
         last_updated_time: ::aws_smithy_types::DateTime::from(version.last_updated_time),
-        document: crate::state::policy_version_document(policy, version.version_id),
+        document: version.document.clone(),
     }
 }

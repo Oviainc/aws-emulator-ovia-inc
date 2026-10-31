@@ -37,7 +37,9 @@ use serde_json::Value;
 use service_com_amazonaws_mpa_awsfluffycoreservice::state;
 
 use crate::approval_sessions::message;
-use crate::approval_team_lifecycle::{encode_label, error_code, text, Harness};
+use crate::approval_team_lifecycle::{
+    encode_label, error_code, recorded_policy_document, text, Harness,
+};
 
 /// `MaxResults` is modelled `range(min: 1, max: 20)` with `default: 20` on both catalog
 /// listings — the minimum width a request may ask for.
@@ -194,7 +196,7 @@ fn catalog_policy(n: usize, versions: usize) -> state::CatalogPolicy {
     };
     let mut policy = state::CatalogPolicy {
         arn: state::policy_arn("IdentityCenter", &name),
-        name,
+        name: name.clone(),
         policy_type,
         default_version: ids.first().copied().unwrap_or(state::FIRST_POLICY_VERSION),
         versions: BTreeMap::new(),
@@ -206,6 +208,7 @@ fn catalog_policy(n: usize, versions: usize) -> state::CatalogPolicy {
             status: state::PolicyStatus::Attachable,
             creation_time: created,
             last_updated_time: created + Duration::from_secs(30),
+            document: recorded_policy_document(&name, version_id),
         });
     }
     policy

@@ -35,7 +35,9 @@ use serde_json::Value;
 use service_com_amazonaws_mpa_awsfluffycoreservice::ops::types::shared_types as model;
 use service_com_amazonaws_mpa_awsfluffycoreservice::state;
 
-use crate::approval_team_lifecycle::{encode_label, error_code, text, Harness};
+use crate::approval_team_lifecycle::{
+    encode_label, error_code, recorded_policy_document, text, Harness,
+};
 use crate::policy_versions::{
     assert_instant, base_instant, is_qualified_policy_arn, status_for, stored_policy,
     MAX_POLICY_NAME,
@@ -169,6 +171,7 @@ fn record_policy(harness: &Harness, case: &DetailCase) -> String {
             status,
             creation_time: created,
             last_updated_time: created + Duration::from_secs(30),
+            document: recorded_policy_document(&case.name, version_id),
         });
     }
     let arn = policy.arn.clone();
@@ -229,11 +232,12 @@ fn assert_detail(
         policy.default_version,
         reported.get("IsDefault")
     );
-    // The document this service reports for this version of this policy — the very value
-    // the resource-policy reads report for it, so the two readers cannot disagree.
+    // The document this service reports for this version of this policy — the one the
+    // catalog holds for it, which is the very value the resource-policy reads report, so
+    // the two readers cannot disagree.
     assert_eq!(
         text(reported, "Document"),
-        state::policy_version_document(policy, version.version_id),
+        version.document,
         "case {case:?}: Document is not the document this service holds for this version: \
          {reported:?}"
     );
@@ -328,7 +332,7 @@ async fn every_stored_version_is_reported_by_its_qualified_arn() {
         let documents: Vec<String> = policy
             .versions
             .values()
-            .map(|version| state::policy_version_document(&policy, version.version_id))
+            .map(|version| version.document.clone())
             .collect();
         assert_eq!(
             documents.iter().collect::<std::collections::BTreeSet<_>>().len(),

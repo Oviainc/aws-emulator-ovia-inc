@@ -168,11 +168,13 @@ impl Harness {
         let mut guard = store.lock();
         let created = SystemTime::now();
         for n in 1..=ATTACHABLE_POLICIES {
+            let arn_name = format!("MPAApprovalTeamPolicy{n}");
             let mut policy = state::CatalogPolicy::with_first_version(
                 "IdentityCenter",
-                &format!("MPAApprovalTeamPolicy{n}"),
+                &arn_name,
                 state::PolicyType::AwsManaged,
                 created,
+                &recorded_policy_document(&arn_name, 1),
             );
             for version_id in 2..=i32::try_from(n).expect("a small version id") {
                 policy.insert_version(state::CatalogPolicyVersion {
@@ -180,6 +182,7 @@ impl Harness {
                     status: state::PolicyStatus::Attachable,
                     creation_time: created,
                     last_updated_time: created,
+                    document: recorded_policy_document(&arn_name, version_id),
                 });
             }
             guard.insert_policy(policy);
@@ -318,6 +321,27 @@ impl Harness {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
     }
+}
+
+/// The document a catalog version RECORDED BY A TEST carries, one per `(policy, version)`
+/// so no two recorded versions share a document and a reader cannot pass by reporting
+/// another version's.
+///
+/// A published policy's document is the catalog's own (`state::SEEDED_POLICY_CATALOG`
+/// holds it); this is a test's stand-in for one, in the same IAM policy grammar.
+pub(crate) fn recorded_policy_document(policy_name: &str, version_id: i32) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": ["mpa:StartSession"],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": { "mpa:RequestedOperation": format!("{policy_name}:v{version_id}") }
+            }
+        }],
+    })
+    .to_string()
 }
 
 /// Percent-encode an ARN for a non-greedy `@httpLabel`, which binds ONE path segment.

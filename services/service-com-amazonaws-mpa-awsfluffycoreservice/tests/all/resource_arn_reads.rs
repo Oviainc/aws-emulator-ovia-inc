@@ -31,7 +31,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_mpa_awsfluffycoreservice::ops::types::shared_types as model;
 use service_com_amazonaws_mpa_awsfluffycoreservice::state;
 
-use crate::approval_team_lifecycle::{encode_label, error_code, text, Harness, REGION};
+use crate::approval_team_lifecycle::{
+    encode_label, error_code, recorded_policy_document, text, Harness, REGION,
+};
 use crate::resource_policies::{create_body, get_resource_policy};
 
 /// `MaxResults` is modelled `range(min: 1, max: 20)` with `default: 20`.
@@ -98,6 +100,7 @@ fn record_policy(harness: &Harness, name: &str, policy_type: state::PolicyType) 
         name,
         policy_type,
         base_instant(),
+        &recorded_policy_document(name, 1),
     );
     let arn = policy.arn.clone();
     let store = state::service_state(&*harness.engine).expect("the service store");

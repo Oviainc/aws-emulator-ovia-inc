@@ -38,7 +38,9 @@ use std::time::SystemTime;
 use serde_json::{json, Value};
 use service_com_amazonaws_mpa_awsfluffycoreservice::state;
 
-use crate::approval_team_lifecycle::{encode_label, error_code, expected_arn, text, Harness, REGION};
+use crate::approval_team_lifecycle::{
+    encode_label, error_code, expected_arn, recorded_policy_document, text, Harness, REGION,
+};
 
 /// The policy a fresh store seeds (`state::seeded_policy_catalog`): category and name.
 const SEEDED_POLICY: (&str, &str) = ("IdentityCenter", "MPAApprovalTeamPolicy");
@@ -59,12 +61,14 @@ fn record_two_version_policy(harness: &Harness) -> String {
         TWO_VERSION_POLICY.1,
         state::PolicyType::AwsRam,
         created,
+        &recorded_policy_document(TWO_VERSION_POLICY.1, 1),
     );
     policy.insert_version(state::CatalogPolicyVersion {
         version_id: 2,
         status: state::PolicyStatus::Attachable,
         creation_time: created,
         last_updated_time: created,
+        document: recorded_policy_document(TWO_VERSION_POLICY.1, 2),
     });
     let arn = policy.arn.clone();
     let store = state::service_state(&*harness.engine).expect("the service store");
@@ -340,7 +344,23 @@ async fn a_create_naming_an_unattachable_policy_is_refused_and_stores_nothing() 
 struct AttachableCase {
     case: &'static str,
     policies: Vec<String>,
-    resolved: Vec<(&'static str, &'static str)>,
+    resolved: Vec<(String, &'static str)>,
+}
+
+/// The DISPLAY name the catalog holds for the policy `(category, arn_name)` names.
+///
+/// Read out of the store rather than assumed to be the ARN's name segment: `PolicyName`
+/// carries no pattern, so a policy's own name is a different string from that segment
+/// whenever it holds a character the segment cannot (a space, for one), and the
+/// resource-policy reads report and match on the policy's own name.
+fn catalog_display_name(harness: &Harness, category: &str, arn_name: &str) -> String {
+    let store = state::service_state(&*harness.engine).expect("the service store");
+    let guard = store.lock();
+    guard
+        .policy(&state::policy_arn(category, arn_name))
+        .expect("a policy the catalog holds")
+        .name
+        .clone()
 }
 
 /// Every reference a create ACCEPTS resolves for every reader: the attachments
@@ -351,22 +371,24 @@ async fn the_attachments_a_create_accepts_resolve_for_every_reader() {
     let harness = Harness::new();
     let two_version_policy = record_two_version_policy(&harness);
     let seeded = state::policy_arn(SEEDED_POLICY.0, SEEDED_POLICY.1);
+    let seeded_name = catalog_display_name(&harness, SEEDED_POLICY.0, SEEDED_POLICY.1);
+    let recorded_name = catalog_display_name(&harness, TWO_VERSION_POLICY.0, TWO_VERSION_POLICY.1);
 
     let rows = vec![
         AttachableCase {
             case: "the seeded policy, attached as $DEFAULT",
             policies: vec![seeded_default()],
-            resolved: vec![(SEEDED_POLICY.1, "AWS_MANAGED")],
+            resolved: vec![(seeded_name.clone(), "AWS_MANAGED")],
         },
         AttachableCase {
             case: "the seeded policy, attached by version id",
             policies: vec![format!("{seeded}/1")],
-            resolved: vec![(SEEDED_POLICY.1, "AWS_MANAGED")],
+            resolved: vec![(seeded_name.clone(), "AWS_MANAGED")],
         },
         AttachableCase {
             case: "a recorded policy, attached by a version that is not its default",
             policies: vec![format!("{two_version_policy}/2")],
-            resolved: vec![(TWO_VERSION_POLICY.1, "AWS_RAM")],
+            resolved: vec![(recorded_name.clone(), "AWS_RAM")],
         },
         AttachableCase {
             case: "every resolvable form at once",
@@ -376,9 +398,9 @@ async fn the_attachments_a_create_accepts_resolve_for_every_reader() {
                 format!("{two_version_policy}/2"),
             ],
             resolved: vec![
-                (SEEDED_POLICY.1, "AWS_MANAGED"),
-                (TWO_VERSION_POLICY.1, "AWS_RAM"),
-                (TWO_VERSION_POLICY.1, "AWS_RAM"),
+                (seeded_name.clone(), "AWS_MANAGED"),
+                (recorded_name.clone(), "AWS_RAM"),
+                (recorded_name.clone(), "AWS_RAM"),
             ],
         },
     ];
@@ -438,7 +460,7 @@ async fn the_attachments_a_create_accepts_resolve_for_every_reader() {
             .collect();
         let expected_names: Vec<String> = resolved
             .iter()
-            .map(|(policy_name, _)| (*policy_name).to_string())
+            .map(|(policy_name, _)| policy_name.clone())
             .collect();
         assert_eq!(
             names, expected_names,

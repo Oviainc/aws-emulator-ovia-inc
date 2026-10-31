@@ -60,8 +60,23 @@ fn message(body: &Value) -> String {
     modelled
 }
 
-/// The policy a fresh store seeds (`state::seeded_policy_catalog`): category and name.
+/// The policy a fresh store seeds (`state::seeded_policy_catalog`): the category and
+/// name SEGMENTS of its ARN. Its display name is a different string (`PolicyName` has no
+/// pattern tying it to the ARN) and is read out of the store by
+/// [`seeded_policy_display_name`].
 const SEEDED_POLICY: (&str, &str) = ("IdentityCenter", "MPAApprovalTeamPolicy");
+
+/// The DISPLAY name the catalog holds for the seeded policy — the `PolicyName` a
+/// resource-policy read reports and matches on.
+fn seeded_policy_display_name(harness: &Harness) -> String {
+    let store = state::service_state(&*harness.engine).expect("the service store");
+    let guard = store.lock();
+    guard
+        .policy(&state::policy_arn(SEEDED_POLICY.0, SEEDED_POLICY.1))
+        .expect("the seeded policy")
+        .name
+        .clone()
+}
 
 /// Every value `PolicyType` accepts, from
 /// `smithy_query(query="shape",shape="PolicyType")` (`values: [AWS_MANAGED, AWS_RAM]`).
@@ -377,7 +392,7 @@ async fn get_resource_policy_resolves_the_resource_before_the_policy_name() {
     let names: Vec<String> = vec![
         "nonexistent-policy-name".to_string(),
         String::new(),
-        SEEDED_POLICY.1.to_string(),
+        seeded_policy_display_name(&harness),
         "p".repeat(1000),
         "a name with spaces and /slashes/".to_string(),
     ];
@@ -412,14 +427,15 @@ async fn get_resource_policy_resolves_the_resource_before_the_policy_name() {
 
     // The control: the same (PolicyName, PolicyType) IS resolved for a resource the store
     // records, so the refusal above is the resource lookup failing and not the matching.
-    let (status, body) = get_resource_policy(&harness, &live, SEEDED_POLICY.1, "AWS_MANAGED").await;
+    let attached_name = seeded_policy_display_name(&harness);
+    let (status, body) = get_resource_policy(&harness, &live, &attached_name, "AWS_MANAGED").await;
     assert_eq!(
         status, 200,
         "the attached policy must be readable for a recorded resource: {body:?}"
     );
     assert_eq!(
         text(&body, "PolicyName"),
-        SEEDED_POLICY.1,
+        attached_name,
         "the attached policy reported the wrong name: {body:?}"
     );
 }

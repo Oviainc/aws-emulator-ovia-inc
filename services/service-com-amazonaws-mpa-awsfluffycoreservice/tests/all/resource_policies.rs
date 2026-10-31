@@ -34,7 +34,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_mpa_awsfluffycoreservice::ops::types::shared_types as model;
 use service_com_amazonaws_mpa_awsfluffycoreservice::state;
 
-use crate::approval_team_lifecycle::{error_code, expected_arn, text, Harness, REGION};
+use crate::approval_team_lifecycle::{
+    error_code, expected_arn, recorded_policy_document, text, Harness, REGION,
+};
 use crate::authorization_gate::expected_denial;
 
 /// The policy a fresh store seeds, from `state::seeded_policy_catalog` — the entry
@@ -154,6 +156,7 @@ fn record_policy(harness: &Harness, case: &PolicyCase) -> String {
                 status: state::PolicyStatus::Attachable,
                 creation_time: created,
                 last_updated_time: created,
+                document: recorded_policy_document(case.name, version_id),
             },
         );
     }

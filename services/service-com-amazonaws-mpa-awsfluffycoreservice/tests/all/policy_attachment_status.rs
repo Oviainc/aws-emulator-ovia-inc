@@ -34,7 +34,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_mpa_awsfluffycoreservice::ops::types::shared_types as model;
 use service_com_amazonaws_mpa_awsfluffycoreservice::state;
 
-use crate::approval_team_lifecycle::{encode_label, error_code, expected_arn, text, Harness, REGION};
+use crate::approval_team_lifecycle::{
+    encode_label, error_code, expected_arn, recorded_policy_document, text, Harness, REGION,
+};
 
 /// Category the policies this suite records sit in — one segment of
 /// `UnqualifiedPolicyArn`'s pattern, so any `[a-zA-Z0-9_\.-]` value does.
@@ -90,6 +92,7 @@ fn record_policy(
             status,
             creation_time: created,
             last_updated_time: created + Duration::from_secs(30),
+            document: recorded_policy_document(name, version_id),
         });
     }
     let arn = policy.arn.clone();
@@ -725,6 +728,7 @@ fn the_gate_names_the_first_unattachable_reference() {
             status,
             creation_time: base_instant(),
             last_updated_time: base_instant(),
+            document: recorded_policy_document("mpa.ram_gate-policy", 1),
         });
         let arn = policy.arn.clone();
         let mut store = state::ComAmazonawsMpaAwsfluffycoreserviceState::default();

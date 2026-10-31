@@ -138,6 +138,13 @@
 //! ([`Default`]) and `ListPolicies` reports whatever it then holds. See
 //! [`seeded_policy_catalog`].
 //!
+//! A published entry's identity and dates are the CATALOG's own, not this store's: the
+//! display name `Name` reports is the policy's ([`CatalogPolicy::name`], a `PolicyName`
+//! the ARN's name segment cannot be read back out of), each version carries the document
+//! the catalog publishes for it ([`CatalogPolicyVersion::document`]), and the instants it
+//! reports are the ones recorded for that version rather than the instant this store came
+//! into being — so two stores answer a catalog read alike.
+//!
 //! Each catalog entry carries its VERSIONS ([`CatalogPolicy::versions`]), one of which is
 //! the entry's default; `ListPolicyVersions` reports them for the policy its `PolicyArn`
 //! names and `GetPolicyVersion` reports the one its `PolicyVersionArn` names, resolved
@@ -2595,39 +2602,6 @@ pub struct ResourcePolicy {
     pub document: String,
 }
 
-/// The document this service reports for version `version_id` of `policy`.
-///
-/// Its identity is read from the catalog: the statement id is built from the policy's
-/// name and the version id, so every version of every policy has a document of its own
-/// and the same version always reports the same one.
-///
-/// The document's CONTENTS are this emulator's and are NOT a claim about the text AWS
-/// serves: AWS does not publish its MPA managed policy documents in this service's
-/// model, and `PolicyDocument` carries no modelled structure beyond
-/// `@length(max: 400000)`. What is reported is a syntactically valid document in the IAM
-/// policy grammar that `PolicyVersion$Status`' own documentation points at, over this
-/// service's own action namespace.
-#[must_use]
-pub fn policy_version_document(policy: &CatalogPolicy, version_id: i32) -> String {
-    // An IAM `Sid` is alphanumeric, so the policy's name contributes only its
-    // alphanumeric characters rather than the `_`, `.` and `-` its own pattern allows.
-    let name: String = policy
-        .name
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect();
-    let document = ::serde_json::json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Sid": format!("{name}v{version_id}"),
-            "Effect": "Allow",
-            "Action": format!("{SERVICE_ACTION_PREFIX}:*"),
-            "Resource": "*",
-        }],
-    });
-    document.to_string()
-}
-
 /// One version of a catalog policy: everything `ListPolicyVersions` reports for it that
 /// is the VERSION's rather than the policy's.
 ///
@@ -2644,6 +2618,11 @@ pub struct CatalogPolicyVersion {
     pub status: PolicyStatus,
     pub creation_time: SystemTime,
     pub last_updated_time: SystemTime,
+    /// This version's document, as `PolicyVersion$Document` reports it — the text the
+    /// catalog holds for it, which is what every reader of this version answers with.
+    /// A version's document belongs to the VERSION, so each one carries its own and no
+    /// reader synthesizes one.
+    pub document: String,
 }
 
 /// One policy in the catalog: everything `ListPolicies` reports for it, plus the
@@ -2652,6 +2631,11 @@ pub struct CatalogPolicyVersion {
 pub struct CatalogPolicy {
     /// The policy's unqualified ARN, in the form [`policy_arn`] mints.
     pub arn: String,
+    /// The policy's own DISPLAY name, as `Name` reports it on every catalog read.
+    /// `PolicyName` is `length(max: 64)` and carries no pattern, so a display name is
+    /// independent of the `[a-zA-Z0-9_\.-]` name segment of the ARN — it may hold a
+    /// space, which that segment pattern forbids — and is therefore recorded here
+    /// rather than read back out of the ARN.
     pub name: String,
     pub policy_type: PolicyType,
     /// Version id that is this policy's default, as `Policy$DefaultVersion` reports it.
@@ -2663,13 +2647,19 @@ pub struct CatalogPolicy {
 
 impl CatalogPolicy {
     /// A catalog policy holding one version, [`FIRST_POLICY_VERSION`], which is
-    /// therefore also its default: the shape every seeded entry starts in.
+    /// therefore also its default, carrying `document` as that version's document.
+    ///
+    /// `name` is both the ARN's name segment and the policy's display name, which is
+    /// what a policy whose display name carries no character `UnqualifiedPolicyArn`'s
+    /// segment pattern forbids looks like. An entry whose display name differs from its
+    /// ARN segment is built from the two values it holds ([`SeededPolicy`]).
     #[must_use]
     pub fn with_first_version(
         category: &str,
         name: &str,
         policy_type: PolicyType,
         created: SystemTime,
+        document: &str,
     ) -> Self {
         let mut policy = Self {
             arn: policy_arn(category, name),
@@ -2683,6 +2673,7 @@ impl CatalogPolicy {
             status: PolicyStatus::Attachable,
             creation_time: created,
             last_updated_time: created,
+            document: document.to_string(),
         });
         policy
     }
@@ -2734,30 +2725,118 @@ pub fn policy_version_arn(policy_arn: &str, version_id: i32) -> String {
     format!("{policy_arn}/{version_id}")
 }
 
-/// The policies this store holds when it is first touched, as
-/// `(category, name, type)`.
+/// One policy of the catalog this service publishes, with everything a read of it
+/// reports that the entry itself owns.
+///
+/// A published policy is not the caller's and not this store's: no operation of this
+/// model mints, updates or deletes one, and nothing about it is derived from the request
+/// that reads it or from the instant this store came into being. So each entry carries
+/// its own identity (the two segments its ARN is built from, plus the display name), its
+/// `PolicyType`, and the one version it publishes — that version's status, its document
+/// and the instant the catalog records for it.
+#[derive(Debug, Clone, Copy)]
+struct SeededPolicy {
+    /// The CATEGORY segment of the ARN, from `UnqualifiedPolicyArn`'s pattern
+    /// (`.../aws:policy/<category>/<name>`).
+    category: &'static str,
+    /// The NAME segment of the ARN, restricted to `[a-zA-Z0-9_\.-]` by that same
+    /// pattern.
+    arn_name: &'static str,
+    /// The policy's DISPLAY name, as `Name` reports it: a `PolicyName`
+    /// (`length(max: 64)`, no pattern), which is a different string from the ARN's name
+    /// segment whenever it carries a character — a space, here — the ARN cannot.
+    name: &'static str,
+    policy_type: PolicyType,
+    /// Status of the published version, from `PolicyStatus`' own tokens.
+    status: PolicyStatus,
+    /// The published version's document, as `PolicyVersion$Document` reports it.
+    document: &'static str,
+    /// Epoch seconds of the instant the catalog records as the published version's
+    /// creation — and, since nothing updates a published version, as its last update
+    /// too. It belongs to the ENTRY, so every read of it in every run reports the one
+    /// instant, which is what makes a catalog read repeatable.
+    published_at_epoch_secs: u64,
+}
+
+impl SeededPolicy {
+    /// This entry as the catalog holds it: the policy, holding the one version
+    /// [`FIRST_POLICY_VERSION`] names, which is therefore also its default.
+    fn catalog_policy(self) -> CatalogPolicy {
+        let published = SystemTime::UNIX_EPOCH + Duration::from_secs(self.published_at_epoch_secs);
+        let mut policy = CatalogPolicy {
+            arn: policy_arn(self.category, self.arn_name),
+            name: self.name.to_string(),
+            policy_type: self.policy_type,
+            default_version: FIRST_POLICY_VERSION,
+            versions: BTreeMap::new(),
+        };
+        policy.insert_version(CatalogPolicyVersion {
+            version_id: FIRST_POLICY_VERSION,
+            status: self.status,
+            creation_time: published,
+            last_updated_time: published,
+            document: self.document.to_string(),
+        });
+        policy
+    }
+}
+
+/// The document the published vault-protection policy's one version carries: approval
+/// sessions for the protected operation alone.
+///
+/// A managed policy's document is the CATALOG's, not a value this service derives per
+/// read, so it is held here as the entry's own data: it grants the two session actions a
+/// team's approvers exercise — and no other action, never a service-wide wildcard —
+/// scoped by the condition keys this service's own model defines for them
+/// (`mpa:RequestedOperation`, the operation that needs the team's approval, and
+/// `mpa:ProtectedResourceAccount`, the account owning the resource it targets) and only
+/// for a request the protected service makes on the caller's behalf
+/// (`aws:ViaAWSService`, a boolean key, hence IAM's `Bool` operator).
+const VAULT_PROTECTION_POLICY_DOCUMENT: &str = concat!(
+    r#"{"Version":"2012-10-17","Statement":[{"Sid":"AWSBackupLAGVaultProtection","#,
+    r#""Effect":"Allow","Action":["mpa:StartSession","mpa:CancelSession"],"#,
+    r#""Resource":"*","Condition":{"StringEquals":{"#,
+    r#""mpa:RequestedOperation":"backup:DisassociateRecoveryPoint","#,
+    r#""mpa:ProtectedResourceAccount":"${aws:PrincipalAccount}"},"#,
+    r#""Bool":{"aws:ViaAWSService":"true"}}}]}"#,
+);
+
+/// The policies this store holds when it is first touched: the catalog this service
+/// publishes.
 ///
 /// The model fixes the SHAPE of an entry, and that is what this emulator computes its
 /// answers from: the ARN form comes from `UnqualifiedPolicyArn`'s pattern (whose two
-/// `[a-zA-Z0-9_\.-]` segments are the category and the name), the token from
-/// `PolicyType`'s enum, and the version from `PolicyVersionId`'s `range(min: 1)`. The
-/// entries themselves are AWS's own catalog, which no request can change and no model
-/// member enumerates: this seeds the AWS-managed approval-team policy and invents no
-/// others, each with the one version `FIRST_POLICY_VERSION` names. Nothing is keyed to a
-/// particular entry — `ListPolicies` pages over whatever the store holds and
-/// `ListPolicyVersions` over whatever versions an entry holds, so an entry or a version
-/// recorded later is reported exactly like a seeded one.
-const SEEDED_POLICY_CATALOG: &[(&str, &str, PolicyType)] =
-    &[("IdentityCenter", "MPAApprovalTeamPolicy", PolicyType::AwsManaged)];
+/// `[a-zA-Z0-9_\.-]` segments are the category and the name), the display name from
+/// `PolicyName`, the token from `PolicyType`'s enum, the status from `PolicyStatus`' and
+/// the version from `PolicyVersionId`'s `range(min: 1)`. The entries themselves are the
+/// published catalog, which no request can change and no model member enumerates.
+/// Nothing is keyed to a particular entry — `ListPolicies` pages over whatever the store
+/// holds, `ListPolicyVersions` over whatever versions an entry holds and
+/// `GetPolicyVersion` reads one of them — so an entry or a version recorded later is
+/// reported exactly like a seeded one, and one more published policy is one more row
+/// here.
+const SEEDED_POLICY_CATALOG: &[SeededPolicy] = &[SeededPolicy {
+    category: "IdentityCenter",
+    arn_name: "MPAApprovalTeamPolicy",
+    name: "AWS Backup LAG Vault Protection Policy",
+    policy_type: PolicyType::AwsManaged,
+    status: PolicyStatus::Attachable,
+    document: VAULT_PROTECTION_POLICY_DOCUMENT,
+    // 2025-06-17T00:00:00Z, the instant the catalog records for this version.
+    published_at_epoch_secs: 1_750_118_400,
+}];
 
-/// The catalog a fresh store starts with, keyed by ARN. `created` is the instant the
-/// store came into being, which is when its seeded policies and their versions did.
+/// The catalog a fresh store starts with, keyed by ARN.
+///
+/// Takes no instant: a published policy was created when the catalog says it was, not
+/// when this store came into being, so each entry's version carries its own recorded
+/// instant ([`SeededPolicy::published_at_epoch_secs`]) and two stores answer alike.
 #[must_use]
-pub fn seeded_policy_catalog(created: SystemTime) -> BTreeMap<String, CatalogPolicy> {
+pub fn seeded_policy_catalog() -> BTreeMap<String, CatalogPolicy> {
     SEEDED_POLICY_CATALOG
         .iter()
-        .map(|&(category, name, policy_type)| {
-            let policy = CatalogPolicy::with_first_version(category, name, policy_type, created);
+        .map(|seed| {
+            let policy = seed.catalog_policy();
             (policy.arn.clone(), policy)
         })
         .collect()
@@ -2824,7 +2903,7 @@ impl Default for ComAmazonawsMpaAwsfluffycoreserviceState {
             name_index: BTreeMap::new(),
             idempotency_tokens: BTreeMap::new(),
             organization_management_account_id: None,
-            policies: seeded_policy_catalog(SystemTime::now()),
+            policies: seeded_policy_catalog(),
             identity_sources: BTreeMap::new(),
             sessions: BTreeMap::new(),
             next_team_seq: 0,
@@ -3394,7 +3473,7 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
             policy_version_id: version.version_id,
             policy_name: policy.name.clone(),
             policy_type: policy.policy_type,
-            document: policy_version_document(policy, version.version_id),
+            document: version.document.clone(),
         })
     }
 

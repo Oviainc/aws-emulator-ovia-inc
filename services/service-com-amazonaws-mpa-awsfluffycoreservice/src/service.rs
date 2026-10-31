@@ -35,6 +35,11 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! A sixth seam, `override_protocol`, is one this service DOES take: it serves the
+//! model's own `restJson1` codec with every timestamp of a modelled response written in
+//! the `date-time` form this model's one timestamp shape declares (see
+//! [`iso_timestamps`]).
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
@@ -74,6 +79,8 @@ use smithy_server_runtime::{
     ServerHttpProtocol, Service,
 };
 
+pub mod iso_timestamps;
+
 /// The wire error code (`__type` / `x-amzn-errortype`) a management-account refusal
 /// carries: the `AccessDeniedException` shape the model lists as a common error of every
 /// operation of this service, and the same name a handler-returned one carries.
@@ -97,6 +104,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// `Arc` the generated entry holds, so this is a table of names rather than a
     /// second set of operations or a second store.
     gates: HashMap<&'static str, Box<dyn ErasedOperation>>,
+    /// This service's wire protocol, built ONCE here because
+    /// [`Service::override_protocol`] hands back a borrow of it.
+    protocol: iso_timestamps::IsoTimestampRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -107,6 +117,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             gates: management_account_gates::<Eng>(&engine),
             entry: crate::ServiceDefinition::new(engine),
+            protocol: iso_timestamps::IsoTimestampRestJson::new(),
         }
     }
 }
@@ -254,6 +265,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn ServerHttpProtocol> {
+        // The model's own restJson1 codec, with the ONE difference the generic renderer
+        // cannot express: a timestamp is written in the date-time form this model's only
+        // timestamp shape declares, rather than in the protocol's default epoch-seconds
+        // form (see `iso_timestamps`). Borrowed from the field built in `new`, never
+        // constructed per request.
+        Some(&self.protocol)
     }
 }
 

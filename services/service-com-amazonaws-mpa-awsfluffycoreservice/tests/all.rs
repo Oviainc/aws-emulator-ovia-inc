@@ -73,6 +73,8 @@ mod policy_catalog;
 mod policy_version_detail;
 #[path = "all/policy_versions.rs"]
 mod policy_versions;
+#[path = "all/published_catalog_and_iso_timestamps.rs"]
+mod published_catalog_and_iso_timestamps;
 #[path = "all/refusal_message_bound.rs"]
 mod refusal_message_bound;
 #[path = "all/refused_write_mints_nothing.rs"]
