@@ -39,6 +39,8 @@ mod discoverer_state;
 mod draft4_openapi_vocabulary;
 #[path = "all/duplicate_create_refusals.rs"]
 mod duplicate_create_refusals;
+#[path = "all/empty_client_token.rs"]
+mod empty_client_token;
 #[path = "all/empty_next_token.rs"]
 mod empty_next_token;
 #[path = "all/empty_response_framing.rs"]

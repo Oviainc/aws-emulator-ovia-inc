@@ -1396,6 +1396,28 @@ impl CodeBinding {
     }
 }
 
+/// The call a request's idempotency-token member NAMES, if it names one at all.
+///
+/// A member the request left out and one it sent with nothing in it are the same
+/// thing: the token is the identity of the call carrying it, and a value with no
+/// characters in it is no identity, so such a request is served exactly as the one
+/// that omits the member — it resolves to no earlier call, and the call it makes is
+/// recorded under no token. Were the empty value read as an identity, two unrelated
+/// calls that both left the member empty would be retries of each other and the
+/// second one's writes would be dropped with a success status.
+///
+/// This is the same reading the rest of this service already gives a value that
+/// specifies nothing: an empty `NextToken` names no position ([`page_by_key`]), an
+/// empty `Keywords` limits nothing, an empty `Tags` map is no tags
+/// ([`tags_from_input`]) and an empty version label names no version
+/// ([`Schema::version_number`]). The models of these members admit the empty string
+/// (`@length(min: 0)`, or no length constraint at all), so a request may legitimately
+/// carry one and the reading has to be decided here rather than refused at the
+/// boundary.
+pub fn idempotency_token(sent: Option<&str>) -> Option<&str> {
+    sent.filter(|token| !token.is_empty())
+}
+
 impl Schema {
     /// The version a request asked for: `SchemaVersion` when given, else the latest.
     ///
@@ -1517,6 +1539,35 @@ impl Schema {
     /// read never calls this, so reading a schema cannot move the member.
     fn modified_at(&mut self, now: SystemTime) {
         self.last_modified = now;
+    }
+
+    /// The version the call named by `token` already minted for this schema, if it
+    /// names one the schema still HOLDS.
+    ///
+    /// The ONE reader of [`Schema::minted_by_token`], paired with
+    /// [`Schema::record_minted_token`], so the token a retry presents is resolved
+    /// exactly as the token a mint recorded was read: through
+    /// [`idempotency_token`], which is where "this value names no call" is decided. A
+    /// token whose version has since been deleted names nothing a retry could be
+    /// answered with.
+    pub fn minted_for_token(&self, token: Option<&str>) -> Option<u64> {
+        let token = idempotency_token(token)?;
+        self.minted_by_token
+            .get(token)
+            .copied()
+            .filter(|version| self.versions.contains_key(version))
+    }
+
+    /// Record that the call named by `token` minted `version`, so a retry of that call
+    /// is answered with it instead of writing the same definition twice.
+    ///
+    /// The ONE writer of [`Schema::minted_by_token`]: a request whose token names no
+    /// call ([`idempotency_token`]) records nothing, so no later request can resolve
+    /// to this one by leaving the member as empty as this one left it.
+    pub fn record_minted_token(&mut self, token: Option<&str>, version: u64) {
+        if let Some(token) = idempotency_token(token) {
+            self.minted_by_token.insert(token.to_string(), version);
+        }
     }
 
     /// Store `content` as this schema's NEXT version and answer the version stored.

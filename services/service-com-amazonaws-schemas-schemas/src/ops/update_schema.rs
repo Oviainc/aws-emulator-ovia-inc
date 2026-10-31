@@ -257,16 +257,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Unless this is a RETRY of a call that already wrote one: the token
                 // the first attempt carried names the version it minted, and a retry
                 // must answer that rather than write the same definition twice. A
-                // token whose version has since been deleted names nothing. A retry
-                // that resolves to an already-minted version writes NOTHING at all —
-                // not even a `Description` it carries: the first attempt's call is
-                // the one that happened.
-                let already_minted = input
-                    .client_token_id
-                    .as_deref()
-                    .and_then(|token| schema.minted_by_token.get(token))
-                    .copied()
-                    .filter(|version| schema.versions.contains_key(version));
+                // token whose version has since been deleted names nothing, and so
+                // does a `ClientTokenId` sent with nothing in it — the member's model
+                // admits the empty value, which identifies no call, so such a request
+                // is the one that sent no token (`crate::state::idempotency_token`). A
+                // retry that resolves to an already-minted version writes NOTHING at
+                // all — not even a `Description` it carries: the first attempt's call
+                // is the one that happened.
+                let already_minted = schema.minted_for_token(input.client_token_id.as_deref());
                 match already_minted {
                     Some(version) => Some(version),
                     None => {
@@ -298,9 +296,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             schema.set_description(description, now);
                         }
                         let minted = schema.add_version(content, r#type, now).version;
-                        if let Some(token) = input.client_token_id.clone() {
-                            schema.minted_by_token.insert(token, minted);
-                        }
+                        // Recorded under the token that NAMES this call, so a later
+                        // request resolves to it only by presenting that same identity;
+                        // a call whose token names none records nothing.
+                        schema.record_minted_token(input.client_token_id.as_deref(), minted);
                         Some(minted)
                     }
                 }
