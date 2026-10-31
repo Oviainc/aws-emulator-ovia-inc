@@ -11,7 +11,8 @@
 //! states `Value at 'storageTier' … Member must not be null`). An enum's value set is
 //! listed in ascending order of its values, and a `@pattern` is stated as AWS publishes the
 //! expression for that shape — the model's expression, except for a shape whose published
-//! form drops its `^`…`$` anchors ([`DELIVERY_SOURCE_NAME_PATTERN`]). The CODE such a
+//! form drops its `^`…`$` anchors ([`DELIVERY_SOURCE_NAME_PATTERN`],
+//! [`LOG_GROUP_NAME_PATTERN`]). The CODE such a
 //! refusal carries is the one the
 //! served operation declares, which `tests/all/refusal_error_codes.rs` is about: the
 //! delivery and S3-table-source operations below declare `ValidationException`, while
@@ -70,6 +71,15 @@ const DELIVERY_ID_PATTERN: &str =
 /// `CreateDelivery.deliverySourceName`.
 const DELIVERY_SOURCE_NAME_PATTERN: &str =
     "Member must satisfy regular expression pattern: [\\w-]*";
+
+/// The clause `LogGroupName`'s `@pattern` states. The model's `LogGroupName` shape carries
+/// `@length` 1..512 and `@pattern ^[\.\-_/#A-Za-z0-9]+$`, and the expression AWS publishes
+/// for that shape is the same one UNANCHORED — the form the model's own documentation of a
+/// log group name states ("Pattern: [\.\-_/#A-Za-z0-9]+", in the `logGroupIdentifier` docs
+/// of `PutLogGroupDeletionProtection`). Reached by the `logGroupName` member of every
+/// operation that names a log group by name.
+const LOG_GROUP_NAME_PATTERN: &str =
+    "Member must satisfy regular expression pattern: [\\.\\-_/#A-Za-z0-9]+";
 
 /// The envelope one refused clause is wrapped in.
 fn one(clause: &str) -> String {
@@ -226,17 +236,25 @@ fn cases() -> Vec<Case> {
             code: INVALID_PARAMETER,
             message: at("limit", "Member must have value less than or equal to 50"),
         },
-        // A `@pattern` on an operation no report cites. Source: `LogGroupName` 1..512,
-        // `^[\.\-_/#A-Za-z0-9]+$`.
+        // A `@pattern` whose published form drops the model's anchors, on two operations
+        // reaching the same `LogGroupName` shape, with two forms of a value outside it.
         Case {
             name: "CreateLogGroup logGroupName with a space and a bang",
             operation: "CreateLogGroup",
             body: json!({"logGroupName": "bad name!"}),
             code: INVALID_PARAMETER,
-            message: at(
-                "logGroupName",
-                "Member must satisfy regular expression pattern: ^[\\.\\-_/#A-Za-z0-9]+$",
-            ),
+            message: at("logGroupName", LOG_GROUP_NAME_PATTERN),
+        },
+        Case {
+            name: "PutLogEvents logGroupName with a space and a star",
+            operation: "PutLogEvents",
+            body: json!({
+                "logGroupName": "bad name!*",
+                "logStreamName": "stream",
+                "logEvents": [{"timestamp": 1_700_000_000_000_i64, "message": "hello"}],
+            }),
+            code: INVALID_PARAMETER,
+            message: at("logGroupName", LOG_GROUP_NAME_PATTERN),
         },
         // An enum value set. Source: the model's `LogGroupClass` enum — declared STANDARD,
         // INFREQUENT_ACCESS, DELIVERY — listed in ascending order of its values.

@@ -12,7 +12,10 @@
 //! envelope, whose members are the owner account, the log group, the log stream, the
 //! filter name that selected the events and the events themselves ([`envelope`]).
 //!
-//! The envelope carries each event's message exactly as it was INGESTED. A log group's
+//! The envelope carries each event's message as the filter is configured to see it: as it
+//! was INGESTED by default, and — for a filter put with `applyOnTransformedLogs` on a log
+//! group that has an active transformer — the version that transformer produced
+//! ([`super::transformer`]). A log group's
 //! `kmsKeyId` names the key the group's own stored log data is encrypted with
 //! (`AssociateKmsKey`: "Associates the specified KMS key with either one log group in the
 //! account, or with all stored CloudWatch Logs query insights results in the account"); it
@@ -172,6 +175,32 @@ pub fn deliveries(
         return Vec::new();
     };
     let owner = ::engine::emulator_account_id();
+    // The TRANSFORMED version of this batch, materialised once and only where some filter
+    // asks for it: a filter put with `applyOnTransformedLogs` "will be applied on the
+    // transformed version of the log events instead of the original ingested log events", and
+    // a group with no active transformer has no transformed version at all.
+    let transformed: Option<Vec<StoredEvent>> = group
+        .transformer
+        .as_ref()
+        .filter(|_| {
+            group
+                .subscription_filters
+                .values()
+                .any(|filter| filter.apply_on_transformed_logs)
+        })
+        .map(|transformer| {
+            let pipeline = super::transformer::Pipeline::of(&transformer.processors);
+            events
+                .iter()
+                .map(|event| match pipeline.transform(&event.message) {
+                    Some(message) => StoredEvent {
+                        message,
+                        ..event.clone()
+                    },
+                    None => event.clone(),
+                })
+                .collect()
+        });
     let mut deliveries = Vec::new();
     for filter in group.subscription_filters.values() {
         // A stored filter's pattern was parsed when the put configured it, so one that
@@ -179,7 +208,11 @@ pub fn deliveries(
         let Ok(pattern) = FilterPattern::parse(&filter.filter_pattern) else {
             continue;
         };
-        let matched: Vec<&StoredEvent> = events
+        let offered: &[StoredEvent] = match (filter.apply_on_transformed_logs, &transformed) {
+            (true, Some(transformed)) => transformed,
+            _ => events,
+        };
+        let matched: Vec<&StoredEvent> = offered
             .iter()
             .filter(|event| pattern.match_message(&event.message).is_some())
             .collect();

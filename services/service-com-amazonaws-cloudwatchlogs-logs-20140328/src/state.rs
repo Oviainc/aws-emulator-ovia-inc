@@ -165,6 +165,9 @@ pub mod metric_filters;
 /// filters.
 pub mod subscription_delivery;
 
+/// The transformation a log group's transformer applies to an ingested log event.
+pub mod transformer;
+
 /// The scheduled query CloudWatch manages on a log alarm's behalf.
 pub mod log_alarm_queries;
 
@@ -4751,7 +4754,9 @@ pub fn check_index_policy_quotas(fields: &[IndexedField]) -> Result<(), IndexPol
 /// block with the array of processors and their configurations." Which processors exist,
 /// and how each is configured, is the catalogue `PutTransformer` owns, so what is judged
 /// here is that the document carries a non-empty array of processor blocks — written
-/// either as that array itself or as an object holding it.
+/// either as that array itself or as an object holding it — whose FIRST block names a
+/// parse-type processor, which is the one rule a transformer's pipeline has to satisfy
+/// wherever it is configured ([`PARSE_TYPE_PROCESSORS`]).
 fn check_transformer_policy_document(document: &str) -> Result<(), String> {
     let expected =
         "policyDocument for a transformer policy must include an array of processors".to_string();
@@ -4766,6 +4771,14 @@ fn check_transformer_policy_document(document: &str) -> Result<(), String> {
     };
     if processors.is_empty() || !processors.iter().all(serde_json::Value::is_object) {
         return Err(expected);
+    }
+    let leading = processors
+        .first()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|block| block.keys().next())
+        .ok_or_else(|| expected.clone())?;
+    if !is_parse_type_processor(leading) {
+        return Err(transformer_leading_parser_message(leading));
     }
     Ok(())
 }
@@ -5967,6 +5980,68 @@ pub fn processor_transformations(processor: &crate::ops::types::Processor) -> Ve
     .into_iter()
     .filter_map(|(member, populated)| populated.then_some(member))
     .collect()
+}
+
+/// The processor kinds that PARSE a log event — the ones that turn the raw message into
+/// the structured event the other processors work on — as the model spells the `Processor`
+/// members that carry them.
+///
+/// A transformer "must have at least one parse-type processor" (`ParseJSON`), and a
+/// configuration whose FIRST processor is a mutation step structures nothing for the rest of
+/// the pipeline to read, which is what [`transformer_leading_parser_message`] refuses. The
+/// set is the configurable parsers (`csv`, `grok`, `parseJSON`, `parseKeyValue`) and the
+/// parsers for AWS-vended log formats, each of which the model documents as parsing a log
+/// event into fields; it is keyed on the member name, so it holds for every operation that
+/// takes a `Processors` list.
+pub const PARSE_TYPE_PROCESSORS: &[&str] = &[
+    "csv",
+    "grok",
+    "parseCloudfront",
+    "parseJSON",
+    "parseKeyValue",
+    "parsePostgres",
+    "parseRoute53",
+    "parseToOCSF",
+    "parseVPC",
+    "parseWAF",
+];
+
+/// The processor kinds that may appear ONLY as the first processor of a transformer, as the
+/// model states on each of them: "If you use this processor, it must be the first processor
+/// in your transformer" (`ParseCloudfront`, `ParseRoute53`, `ParsePostgres`, `ParseVPC`,
+/// `ParseWAF`). Each "always processes the entire log event message", so there is nothing
+/// for it to do after another processor has already restructured the event.
+pub const LEADING_ONLY_PROCESSORS: &[&str] = &[
+    "parseCloudfront",
+    "parsePostgres",
+    "parseRoute53",
+    "parseVPC",
+    "parseWAF",
+];
+
+/// Whether the processor member `member` names a parse-type processor
+/// ([`PARSE_TYPE_PROCESSORS`]).
+pub fn is_parse_type_processor(member: &str) -> bool {
+    PARSE_TYPE_PROCESSORS.contains(&member)
+}
+
+/// The refusal for a transformer whose first processor is not a parse-type one: it states
+/// the rule and which kinds satisfy it, and names the kind the request put first.
+pub fn transformer_leading_parser_message(named: &str) -> String {
+    format!(
+        "The first processor in a transformer must be a parse-type processor, one of {}; \
+         this transformer begins with {named}.",
+        PARSE_TYPE_PROCESSORS.join(", ")
+    )
+}
+
+/// The refusal for a processor the model admits only as the first one of a transformer
+/// ([`LEADING_ONLY_PROCESSORS`]), used at any later position.
+pub fn transformer_leading_only_message(named: &str, at: usize) -> String {
+    format!(
+        "{named} must be the first processor in a transformer, and this transformer has it \
+         at transformerConfig[{at}]."
+    )
 }
 
 /// One saved CloudWatch Logs Insights query definition — "details about a saved

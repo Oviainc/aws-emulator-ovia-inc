@@ -83,22 +83,22 @@ fn dimension_set(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 /// One published datapoint, as the CloudWatch metric store holds it.
 #[derive(Debug, Clone, PartialEq)]
-struct Published {
+pub(crate) struct Published {
     /// The dimension set the value was published under.
-    dimensions: BTreeMap<String, String>,
+    pub(crate) dimensions: BTreeMap<String, String>,
     /// The value itself.
-    value: f64,
+    pub(crate) value: f64,
     /// The unit it was published with, or [`UNIT_NONE`] where none was declared.
-    unit: String,
+    pub(crate) unit: String,
     /// The instant it was published at, in epoch seconds.
-    timestamp_secs: f64,
+    pub(crate) timestamp_secs: f64,
 }
 
 /// Every datapoint the CloudWatch metric store holds for one metric, in dimension-set order.
 ///
 /// This reads the SAME store `PutMetricData` writes and `GetMetricStatistics` reads, through
 /// the shared engine both services are mounted on.
-fn published(logs: &Logs, namespace: &str, metric_name: &str) -> Vec<Published> {
+pub(crate) fn published(logs: &Logs, namespace: &str, metric_name: &str) -> Vec<Published> {
     let state = cloudwatch::state::service_state(&**logs.engine())
         .expect("the CloudWatch metric store is mounted on the shared engine");
     let store = state.lock();

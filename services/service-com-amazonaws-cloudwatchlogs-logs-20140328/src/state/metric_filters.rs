@@ -18,6 +18,13 @@
 //! The datapoints go to the SAME CloudWatch metric store the Embedded Metric Format path
 //! writes and `GetMetricStatistics` / `GetMetricData` read, through the one publisher in
 //! [`super::emf`], so a metric has one home whichever ingest path produced it.
+//!
+//! WHICH VERSION OF THE EVENT a filter sees is the filter's own configuration: a filter put
+//! with `applyOnTransformedLogs` is run against the version the log group's transformer
+//! produced — "if the log group uses either a log-group level or account-level transformer,
+//! and you specify true, the metric filter will be applied on the transformed version of the
+//! log events instead of the original ingested log events" — and every other filter against
+//! the message as it was ingested ([`super::transformer`]).
 
 use std::collections::BTreeMap;
 
@@ -35,6 +42,12 @@ pub struct CompiledFilters {
     /// One entry per filter whose pattern this module could parse, in the group's own filter
     /// order, so the datapoints one event publishes are in the same order on every run.
     filters: Vec<CompiledFilter>,
+    /// The log group's own transformer, prepared for this batch, which is what the
+    /// TRANSFORMED version of an event is produced by ([`super::transformer`]). Empty for a
+    /// group that carries no transformer, and then no filter has a transformed version to run
+    /// against: `applyOnTransformedLogs` "is valid only for log groups that have an active log
+    /// transformer".
+    pipeline: super::transformer::Pipeline,
 }
 
 /// One metric filter, ready to run.
@@ -44,10 +57,14 @@ struct CompiledFilter {
     pattern: FilterPattern,
     /// The transformations it emits metric data through.
     transformations: Vec<MetricTransformationRecord>,
+    /// Whether this filter is "applied on the transformed version of the log events instead
+    /// of the original ingested log events" (`PutMetricFilter$applyOnTransformedLogs`).
+    apply_on_transformed_logs: bool,
 }
 
 impl CompiledFilters {
-    /// Every metric filter `group` holds, compiled.
+    /// Every metric filter `group` holds, compiled, beside the transformer that group
+    /// transforms its ingested events with.
     ///
     /// A pattern that does not parse is left out rather than failing the ingest: the batch
     /// was accepted, and a filter the emulator cannot run extracts nothing. Every pattern a
@@ -62,10 +79,18 @@ impl CompiledFilters {
                     .map(|pattern| CompiledFilter {
                         pattern,
                         transformations: filter.transformations.clone(),
+                        apply_on_transformed_logs: filter.apply_on_transformed_logs,
                     })
             })
             .collect();
-        Self { filters }
+        let pipeline = super::transformer::Pipeline::of(
+            group
+                .transformer
+                .as_ref()
+                .map(|transformer| transformer.processors.as_slice())
+                .unwrap_or_default(),
+        );
+        Self { filters, pipeline }
     }
 
     /// The datapoints ONE ingested log event publishes through these filters.
@@ -77,6 +102,11 @@ impl CompiledFilters {
     /// `budget` is how many datapoints this event may still publish, so the per-event ceiling
     /// ([`super::emf::MAX_DATAPOINTS_PER_EVENT`]) bounds what ONE event publishes across every
     /// extraction path rather than once per path: the caller passes what the other paths left.
+    ///
+    /// A filter that declares `applyOnTransformedLogs` is run against the TRANSFORMED version
+    /// of the event — both its pattern and the selectors its transformation resolves — and
+    /// every other filter against the message as ingested. The transformation is performed at
+    /// most once per event, and only where some filter asks for it.
     pub fn datapoints(
         &self,
         message: &str,
@@ -90,11 +120,24 @@ impl CompiledFilters {
         // the whole event however many filters and selectors ask for it — and not at all when
         // none does.
         let event = Event::of(message);
+        let transformed_message = self
+            .filters
+            .iter()
+            .any(|filter| filter.apply_on_transformed_logs)
+            .then(|| self.pipeline.transform(message))
+            .flatten();
+        let transformed = transformed_message.as_deref().map(Event::of);
         let mut datapoints: Vec<ExtractedDatapoint> = Vec::new();
         for filter in &self.filters {
             if datapoints.len() >= budget {
                 return datapoints;
             }
+            // A group with no active transformer has no transformed version, so such a
+            // filter still reads the event as ingested.
+            let (message, event) = match (filter.apply_on_transformed_logs, &transformed) {
+                (true, Some(transformed)) => (transformed.message, transformed),
+                _ => (message, &event),
+            };
             let matched = filter.pattern.match_message(message);
             for transformation in &filter.transformations {
                 if datapoints.len() >= budget {
@@ -102,7 +145,7 @@ impl CompiledFilters {
                 }
                 let datapoint = match &matched {
                     Some(extracted) => {
-                        matched_datapoint(transformation, extracted, &event, event_timestamp_ms)
+                        matched_datapoint(transformation, extracted, event, event_timestamp_ms)
                     }
                     None => default_datapoint(transformation, event_timestamp_ms),
                 };

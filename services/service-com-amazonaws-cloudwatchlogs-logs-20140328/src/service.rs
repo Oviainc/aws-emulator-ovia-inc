@@ -265,9 +265,10 @@ const SUBJECT: &str = "Value at";
 /// a property of the SHAPE rather than of a member or an operation, and the recorded
 /// refusals of this service differ on it — the three recorded `DeliveryId` refusals print
 /// the model's `^[0-9A-Za-z]+$` anchored, while the recorded `DeliverySourceName` one prints
-/// the model's `^[\w-]*$` as `[\w-]*` — so the shapes whose published form differs from the
-/// model's are named in that table and every other shape's expression is rendered as the
-/// model spells it.
+/// the model's `^[\w-]*$` as `[\w-]*` and the recorded `logGroupName` ones print the model's
+/// `^[\.\-_/#A-Za-z0-9]+$` as `[\.\-_/#A-Za-z0-9]+` — so the shapes whose published form
+/// differs from the model's are named in that table and every other shape's expression is
+/// rendered as the model spells it.
 ///
 /// THE ENUM ORDERING RULE: an enum's admissible set is listed in the order AWS publishes
 /// for that enum where there is one ([`PUBLISHED_ENUM_ORDERS`]), and otherwise in ascending
@@ -331,6 +332,12 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
 const PUBLISHED_PATTERNS: &[(&str, &str)] = &[
     // `DeliverySourceName` (`@length` 1..60, `@pattern ^[\w-]*$`).
     (r"^[\w-]*$", r"[\w-]*"),
+    // `LogGroupName` (`@length` 1..512, `@pattern ^[\.\-_/#A-Za-z0-9]+$`), reached by the
+    // `logGroupName` member of every operation that names a log group by name. AWS publishes
+    // this shape's expression UNANCHORED, which the model's own documentation of a log group
+    // name states ("Pattern: [\.\-_/#A-Za-z0-9]+", in the `logGroupIdentifier` docs of
+    // `PutLogGroupDeletionProtection` and `PutBearerTokenAuthentication`).
+    (r"^[\.\-_/#A-Za-z0-9]+$", r"[\.\-_/#A-Za-z0-9]+"),
 ];
 
 /// The expression this service states for the `@pattern` the model spells `pattern`: the

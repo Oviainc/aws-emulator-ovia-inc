@@ -767,6 +767,14 @@ async fn a_document_its_type_does_not_admit_is_refused() {
             json!([]).to_string(),
         ),
         (
+            // An account-level transformer is a transformer: its pipeline must begin with a
+            // parse-type processor, the same rule `PutTransformer` holds a log-group level
+            // one to (the subject of `tests/all/transformers.rs`).
+            "transformer-whose-first-processor-is-a-mutation",
+            "TRANSFORMER_POLICY",
+            json!([{"trimString": {"withKeys": ["message"]}}, {"parseJSON": {}}]).to_string(),
+        ),
+        (
             "data-protection-without-the-deidentify-block",
             "DATA_PROTECTION_POLICY",
             json!({

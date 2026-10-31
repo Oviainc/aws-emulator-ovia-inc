@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutTransformer
-//! Implemented: stores the log-group level transformer `transformerConfig` describes on
-//! the log group `logGroupIdentifier` names, so `GetTransformer` reports it back. This is
-//! the ONLY file to touch for this operation.
+//! Implemented: validates `transformerConfig` as a transformer pipeline — each element names
+//! exactly one processor, the first is a parse-type processor and a parser for an AWS-vended
+//! log format appears nowhere else — then stores the log-group level transformer it
+//! describes on the log group `logGroupIdentifier` names, so `GetTransformer` reports it back
+//! and the group's ingest applies it. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -223,6 +225,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(format!(
                             "transformerConfig[{at}] must name exactly one processor, named {listed}"
                         )),
+                    },
+                )
+                .into());
+            }
+            // A parser for an AWS-vended log format "always processes the entire log event
+            // message", and the model states on each of them that "if you use this
+            // processor, it must be the first processor in your transformer", so one at any
+            // later position is refused.
+            let leading_only = named
+                .first()
+                .copied()
+                .filter(|named| crate::state::LEADING_ONLY_PROCESSORS.contains(named));
+            if let Some(named) = leading_only.filter(|_| at > 0) {
+                return Err(PutTransformerErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::transformer_leading_only_message(named, at)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A transformer "must have at least one parse-type processor" (`ParseJSON`), and the
+        // pipeline runs "one after another, in the order that you list them": a first
+        // processor that is a mutation step has no structured event to mutate, so a
+        // configuration that does not BEGIN with a parser is refused rather than installed.
+        // Checked over the same catalogue of parse-type kinds wherever a `Processors` list
+        // is accepted (`crate::state::PARSE_TYPE_PROCESSORS`).
+        if let Some(leading) = input
+            .transformer_config
+            .first()
+            .map(crate::state::processor_transformations)
+            .and_then(|named| named.first().copied())
+        {
+            if !crate::state::is_parse_type_processor(leading) {
+                return Err(PutTransformerErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::transformer_leading_parser_message(leading)),
                     },
                 )
                 .into());

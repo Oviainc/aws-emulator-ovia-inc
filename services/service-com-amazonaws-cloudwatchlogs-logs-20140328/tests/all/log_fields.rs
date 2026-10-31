@@ -27,6 +27,27 @@ use service_com_amazonaws_cloudwatchlogs_logs_20140328::ops::types::TYPE_VALUES;
 
 use crate::harness::{batch, group_with_stream, now_ms, Logs};
 use crate::index_policies::seed_data_sources;
+use crate::transformers::PARSE_TYPE_KINDS;
+
+/// A `transformerConfig` for the processors `pipeline` names, led by a parse-type processor
+/// where the pipeline does not already begin with one: `PutTransformer` accepts a transformer
+/// only when its first processor parses. `parseJSON` over the whole message is the leader
+/// used, because its output fields depend on the content of each event rather than on its
+/// configuration, so it adds no field here and what each row asserts is still the effect of
+/// the processors that row names.
+fn led_pipeline(pipeline: &[Value]) -> Vec<Value> {
+    let leads_with_a_parser = pipeline
+        .first()
+        .and_then(Value::as_object)
+        .and_then(|members| members.keys().next())
+        .is_some_and(|member| PARSE_TYPE_KINDS.contains(&member.as_str()));
+    if leads_with_a_parser {
+        return pipeline.to_vec();
+    }
+    std::iter::once(json!({"parseJSON": {"source": "@message"}}))
+        .chain(pipeline.iter().cloned())
+        .collect()
+}
 
 /// The operation every case calls.
 const OP: &str = "GetLogFields";
@@ -624,7 +645,12 @@ async fn the_pipeline_a_group_carries_modifies_the_reported_fields() {
         .await;
         logs.ok(
             "PutTransformer",
-            &json!({"logGroupIdentifier": "piped", "transformerConfig": transformer_config}),
+            &json!({
+                "logGroupIdentifier": "piped",
+                "transformerConfig": led_pipeline(
+                    transformer_config.as_array().map(Vec::as_slice).unwrap_or_default(),
+                ),
+            }),
         )
         .await;
 
@@ -681,7 +707,10 @@ async fn a_pipeline_cannot_grow_one_response_past_the_discovery_ceiling() {
     .await;
     logs.ok(
         "PutTransformer",
-        &json!({"logGroupIdentifier": "amplified", "transformerConfig": processors}),
+        &json!({
+            "logGroupIdentifier": "amplified",
+            "transformerConfig": led_pipeline(&processors),
+        }),
     )
     .await;
 
@@ -732,7 +761,9 @@ async fn a_pipeline_on_a_group_with_no_event_still_names_its_declared_fields() {
         "PutTransformer",
         &json!({
             "logGroupIdentifier": "declared",
-            "transformerConfig": [{"addKeys": {"entries": [{"key": "env", "value": "prod"}]}}],
+            "transformerConfig": led_pipeline(&[
+                json!({"addKeys": {"entries": [{"key": "env", "value": "prod"}]}}),
+            ]),
         }),
     )
     .await;
@@ -768,7 +799,9 @@ async fn reporting_the_fields_changes_nothing_a_later_caller_sees() {
         "PutTransformer",
         &json!({
             "logGroupIdentifier": "read-only",
-            "transformerConfig": [{"addKeys": {"entries": [{"key": "env", "value": "prod"}]}}],
+            "transformerConfig": led_pipeline(&[
+                json!({"addKeys": {"entries": [{"key": "env", "value": "prod"}]}}),
+            ]),
         }),
     )
     .await;
@@ -818,7 +851,10 @@ async fn reporting_the_fields_changes_nothing_a_later_caller_sees() {
         .await;
     assert_eq!(
         transformer["transformerConfig"],
-        json!([{"addKeys": {"entries": [{"key": "env", "value": "prod", "overwriteIfExists": false}]}}]),
+        json!([
+            {"parseJSON": {"source": "@message"}},
+            {"addKeys": {"entries": [{"key": "env", "value": "prod", "overwriteIfExists": false}]}},
+        ]),
         "case the transformer after the report: the pipeline is unchanged by a read, got {transformer}"
     );
 }

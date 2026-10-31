@@ -203,6 +203,8 @@ mod subscription_filter_delivery;
 mod subscription_filters;
 #[path = "all/syslog_configurations.rs"]
 mod syslog_configurations;
+#[path = "all/transformed_log_filters.rs"]
+mod transformed_log_filters;
 #[path = "all/transformers.rs"]
 mod transformers;
 #[path = "all/validation_message_rendering.rs"]

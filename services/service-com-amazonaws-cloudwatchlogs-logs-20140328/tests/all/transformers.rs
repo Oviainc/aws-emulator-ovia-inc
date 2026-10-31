@@ -12,7 +12,10 @@
 //! as the last `PutTransformer` configured it, in that order, with the times that put and
 //! the one that created it stamped — reports an EMPTY pipeline for a group of this account
 //! that carries no transformer (including one whose transformer was deleted), and refuses,
-//! as a missing resource, an identifier that names no log group.
+//! as a missing resource, an identifier that names no log group. A pipeline `PutTransformer`
+//! will not accept as a transformer at all is refused as a bad parameter: one whose element
+//! names other than exactly one processor, and one that does not BEGIN with a parse-type
+//! processor or that carries an AWS-vended parser anywhere but first.
 //!
 //! The tables below span the classes the rule generalises over (the processor KINDS the
 //! model's `Processor` structure names, the pipeline LENGTH at both published bounds and
@@ -167,6 +170,35 @@ fn processor_catalog() -> Vec<(&'static str, Value)> {
     ]
 }
 
+/// The processor kinds a transformer's pipeline may BEGIN with. Source: the catalogue
+/// `PutTransformer` holds a pipeline to — a transformer "must have at least one parse-type
+/// processor" (the model's `ParseJSON` doc), and the parse-type kinds are the configurable
+/// parsers and the parsers for AWS-vended log formats.
+pub(crate) const PARSE_TYPE_KINDS: [&str; 10] = [
+    "csv",
+    "grok",
+    "parseCloudfront",
+    "parseJSON",
+    "parseKeyValue",
+    "parsePostgres",
+    "parseRoute53",
+    "parseToOCSF",
+    "parseVPC",
+    "parseWAF",
+];
+
+/// The processor kinds that may appear only as the FIRST processor of a transformer.
+/// Source: the model's own note on each of them — "If you use this processor, it must be the
+/// first processor in your transformer" (`ParseCloudfront`, `ParseRoute53`, `ParsePostgres`,
+/// `ParseVPC`, `ParseWAF`).
+pub(crate) const LEADING_ONLY_KINDS: [&str; 5] = [
+    "parseCloudfront",
+    "parsePostgres",
+    "parseRoute53",
+    "parseVPC",
+    "parseWAF",
+];
+
 /// One processor of the kind `member` names, as a `transformerConfig` element.
 fn processor(member: &str) -> Value {
     let (member, configuration) = processor_catalog()
@@ -184,6 +216,29 @@ fn every_kind() -> Vec<Value> {
         .collect()
 }
 
+/// The catalogue's kinds that may follow another processor: everything but the AWS-vended
+/// parsers, which must lead.
+fn followable_kinds() -> Vec<Value> {
+    processor_catalog()
+        .into_iter()
+        .filter(|(member, _)| !LEADING_ONLY_KINDS.contains(member))
+        .map(|(member, configuration)| json!({member: configuration}))
+        .collect()
+}
+
+/// A pipeline of `length` processors led by a parser: the parse-type kind `leading`, then as
+/// many followable kinds as the length needs, repeating the catalogue where it runs out.
+fn pipeline_of_length(leading: &str, length: usize) -> Vec<Value> {
+    let followable = followable_kinds();
+    let mut pipeline = vec![processor(leading)];
+    while pipeline.len() < length {
+        let at = (pipeline.len() - 1) % followable.len();
+        pipeline.push(followable[at].clone());
+    }
+    pipeline.truncate(length.max(1));
+    pipeline
+}
+
 /// One row of the round-trip table: the group to put on and the pipeline to put.
 #[derive(Debug, Clone)]
 struct Row {
@@ -194,17 +249,22 @@ struct Row {
 }
 
 /// The pipelines the round trip spans: the list's minimum and maximum length, an order
-/// and its reverse, a kind repeated with different parameters, and — across the last two
-/// rows — every processor kind the model names.
+/// and its reverse, a kind repeated with different parameters, and — across the rows — every
+/// processor kind the model names. Every pipeline begins with a parse-type processor, which
+/// is what `PutTransformer` accepts a transformer at all for, and the AWS-vended parsers
+/// lead the one-processor rows because they may appear nowhere else.
 fn round_trip_rows() -> Vec<Row> {
-    let kinds = every_kind();
-    let pipeline: Vec<Value> = ["parseJSON", "addKeys", "lowerCaseString", "deleteKeys"]
+    let mutators: Vec<Value> = ["addKeys", "lowerCaseString", "deleteKeys"]
         .iter()
         .map(|member| processor(member))
         .collect();
-    let mut reversed = pipeline.clone();
-    reversed.reverse();
-    vec![
+    let pipeline: Vec<Value> = std::iter::once(processor("parseJSON"))
+        .chain(mutators.iter().cloned())
+        .collect();
+    let reversed: Vec<Value> = std::iter::once(processor("parseJSON"))
+        .chain(mutators.iter().rev().cloned())
+        .collect();
+    let mut rows = vec![
         Row {
             case: "one processor — the list's minimum length",
             group: "/transformers/minimum",
@@ -216,7 +276,7 @@ fn round_trip_rows() -> Vec<Row> {
             config: pipeline,
         },
         Row {
-            case: "the same four kinds in the opposite order",
+            case: "the same mutate kinds in the opposite order behind the parser",
             group: "/transformers/pipeline-reversed",
             config: reversed,
         },
@@ -232,14 +292,25 @@ fn round_trip_rows() -> Vec<Row> {
         Row {
             case: "twenty processors — the list's maximum length",
             group: "/transformers/maximum",
-            config: kinds[..PROCESSORS_MAX].to_vec(),
+            config: pipeline_of_length("parseJSON", PROCESSORS_MAX),
         },
-        Row {
-            case: "the catalogue kinds the maximum-length row leaves out",
-            group: "/transformers/remaining-kinds",
-            config: kinds[PROCESSORS_MAX..].to_vec(),
-        },
-    ]
+    ];
+    // Every kind the rows above cannot carry: each AWS-vended parser leads a pipeline of
+    // its own, so the catalogue is covered between the rows.
+    for member in LEADING_ONLY_KINDS {
+        rows.push(Row {
+            case: "a parser that must lead, leading a pipeline of its own",
+            group: match member {
+                "parseCloudfront" => "/transformers/leading-cloudfront",
+                "parsePostgres" => "/transformers/leading-postgres",
+                "parseRoute53" => "/transformers/leading-route53",
+                "parseVPC" => "/transformers/leading-vpc",
+                _ => "/transformers/leading-waf",
+            },
+            config: vec![processor(member), processor("trimString")],
+        });
+    }
+    rows
 }
 
 /// Create one log group, in the class given when one is given.
@@ -302,6 +373,31 @@ fn reported_time(response: &Value, member: &str) -> i64 {
 #[tokio::test]
 async fn put_is_readable_back_through_get_transformer() {
     let logs = Logs::new();
+
+    // Every kind the catalogue names is carried by some row, so the round trip covers the
+    // whole of `Processor` rather than the kinds one pipeline happens to fit.
+    let mut covered: Vec<String> = Vec::new();
+    for row in round_trip_rows() {
+        for element in &row.config {
+            covered.extend(
+                element
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|members| members.keys().cloned()),
+            );
+        }
+    }
+    for element in every_kind() {
+        let member = element
+            .as_object()
+            .and_then(|members| members.keys().next().cloned())
+            .unwrap_or_default();
+        assert!(
+            covered.contains(&member),
+            "case {member}: every processor kind the catalogue names is round-tripped by some \
+             row, and this one is not among {covered:?}"
+        );
+    }
 
     for row in round_trip_rows() {
         assert!(
@@ -577,6 +673,92 @@ async fn put_transformer_refuses_a_log_group_outside_the_standard_class() {
     );
 }
 
+/// A transformer's pipeline must BEGIN with a parse-type processor — a transformer "must
+/// have at least one parse-type processor", and the processors "work one after another, in
+/// the order that you list them", so a first processor that is a mutation step structures
+/// nothing for the rest to read — and a parser for an AWS-vended log format may appear
+/// nowhere but first ("If you use this processor, it must be the first processor in your
+/// transformer"). Each row drives the whole catalogue: every parse-type kind leads a pipeline
+/// that is accepted, every other kind leading one that is refused, and every must-lead kind
+/// at a later position refused too. A refused put leaves the stored transformer as it was.
+#[tokio::test]
+async fn put_transformer_requires_a_pipeline_that_begins_with_a_parser() {
+    let logs = Logs::new();
+    let group = "/transformers/leading-parser";
+    create_group(&logs, group, None).await;
+
+    let stored = vec![processor("parseJSON")];
+    logs.ok("PutTransformer", &put_body(group, &stored)).await;
+
+    for (member, _) in processor_catalog() {
+        let parses = PARSE_TYPE_KINDS.contains(&member);
+        // A pipeline led by this kind, with a mutate processor behind it so the row is a
+        // pipeline rather than a single processor.
+        let led = vec![processor(member), processor("trimString")];
+
+        if parses {
+            logs.ok("PutTransformer", &put_body(group, &led)).await;
+            let found = logs
+                .ok("GetTransformer", &json!({"logGroupIdentifier": group}))
+                .await;
+            assert_eq!(
+                reported_config(&found),
+                led,
+                "case {member} leading: a parse-type processor may lead a transformer, got {found}"
+            );
+            logs.ok("PutTransformer", &put_body(group, &stored)).await;
+            continue;
+        }
+
+        let (code, message) = logs.refusal("PutTransformer", &put_body(group, &led)).await;
+        assert_eq!(
+            code, INVALID_PARAMETER,
+            "case {member} leading: expected {INVALID_PARAMETER}, got {code}"
+        );
+        assert!(
+            message.contains(member) && message.contains("parse-type"),
+            "case {member} leading: the refusal states the rule and the kind the pipeline \
+             begins with, got {message:?}"
+        );
+        let found = logs
+            .ok("GetTransformer", &json!({"logGroupIdentifier": group}))
+            .await;
+        assert_eq!(
+            reported_config(&found),
+            stored,
+            "case {member} leading: a refused put changes nothing, got {found}"
+        );
+    }
+
+    // A must-lead parser anywhere but first, behind each of two different leading parsers,
+    // so what is refused is the position rather than one pairing.
+    for member in LEADING_ONLY_KINDS {
+        for leading in ["parseJSON", "csv"] {
+            let config = vec![processor(leading), processor(member)];
+            let (code, message) = logs
+                .refusal("PutTransformer", &put_body(group, &config))
+                .await;
+            assert_eq!(
+                code, INVALID_PARAMETER,
+                "case {member} behind {leading}: expected {INVALID_PARAMETER}, got {code}"
+            );
+            assert!(
+                message.contains(member),
+                "case {member} behind {leading}: the refusal names the processor that must \
+                 lead, got {message:?}"
+            );
+            let found = logs
+                .ok("GetTransformer", &json!({"logGroupIdentifier": group}))
+                .await;
+            assert_eq!(
+                reported_config(&found),
+                stored,
+                "case {member} behind {leading}: a refused put changes nothing, got {found}"
+            );
+        }
+    }
+}
+
 /// Each element of a `transformerConfig` names exactly ONE transformation — `Processor`
 /// is "the information about one processor in a log transformer" — so an element naming
 /// none, and one naming several, are refused, wherever in the pipeline they sit, and the
@@ -642,7 +824,6 @@ async fn transformer_config_length_is_held_to_its_published_bounds() {
     let group = "/transformers/bounds";
     create_group(&logs, group, None).await;
 
-    let kinds = every_kind();
     let over_the_maximum: Vec<Value> = (0..=PROCESSORS_MAX)
         .map(|at| {
             json!({"grok": {"source": format!("field_{at}"), "match": "%{GREEDYDATA:rest}"}})
@@ -669,8 +850,8 @@ async fn transformer_config_length_is_held_to_its_published_bounds() {
     }
 
     for (case, config) in [
-        ("the minimum", kinds[..PROCESSORS_MIN].to_vec()),
-        ("the maximum", kinds[..PROCESSORS_MAX].to_vec()),
+        ("the minimum", pipeline_of_length("parseJSON", PROCESSORS_MIN)),
+        ("the maximum", pipeline_of_length("grok", PROCESSORS_MAX)),
     ] {
         logs.ok("PutTransformer", &put_body(group, &config)).await;
         let found = logs
