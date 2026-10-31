@@ -1093,3 +1093,9 @@ mod managed_resource_visibility;
 // the move the clock then owes the new policy, and what it refuses.
 #[path = "all/create_transit_gateway_metering_policy.rs"]
 mod create_transit_gateway_metering_policy;
+// Appended at the END of this file, for the reason the header gives. What
+// `AssociateTransitGatewayRouteTable` stores for the (route table, attachment) pair it names,
+// the move the clock then owes the new association, what it refuses, and how both reports of
+// an association — the route table's own and the attachment's — answer with that one record.
+#[path = "all/transit_gateway_route_table_associations.rs"]
+mod transit_gateway_route_table_associations;

@@ -10,8 +10,8 @@
 //! narrowed by the attachment ids and the documented filters the request names and paged in
 //! `TransitGatewayAttachmentId` order. Each report is projected from the stored attachment
 //! and from the records it points at (the transit gateway's own record names the account
-//! that owns it; the policy table store names the association), so no member is invented
-//! here and a member nothing recorded is reported absent.
+//! that owns it; the route table and policy table association stores name the association),
+//! so no member is invented here and a member nothing recorded is reported absent.
 //!
 //! It WRITES nothing of its own — the only state it touches is the clock-owed move of an
 //! attachment or an association whose due instant has passed, which was owed whether or not
@@ -444,26 +444,44 @@ fn attachment_report(
 /// `TransitGatewayAttachment$Association`), or `None` for an attachment the store holds no
 /// association for.
 ///
-/// An attachment is associated with at most one transit gateway policy table, and that
-/// association carries its own state, so both are read out of the policy table store rather
-/// than kept as a second copy on the attachment. Nothing in this emulator associates an
-/// attachment with a ROUTE table yet (`AssociateTransitGatewayRouteTable` is still a
-/// scaffold), so `TransitGatewayRouteTableId` is reported absent until something records
-/// one.
+/// An attachment is associated with at most one transit gateway ROUTE table and at most one
+/// POLICY table, and each association carries its own state, so all three members are read
+/// out of those two stores rather than kept as a second copy on the attachment. The state
+/// reported is the route table association's where there is one — that being the association
+/// `TransitGatewayAssociationState` describes — and the policy table association's otherwise,
+/// so the member is never left empty while an association exists.
 fn association(
     store: &state::ComAmazonawsEc2Amazonec2State,
     attachment_id: &str,
 ) -> Option<TransitGatewayAttachmentAssociation> {
-    let policy_table_id = store.policy_table_of_attachment(attachment_id)?;
-    let association = store
-        .transit_gateway_policy_tables
-        .get(policy_table_id)?
-        .associations
-        .get(attachment_id)?;
+    let route_table_association =
+        store.transit_gateway_route_table_association_of_attachment(attachment_id);
+    let policy_table_association = store
+        .policy_table_of_attachment(attachment_id)
+        .and_then(|policy_table_id| {
+            let association = store
+                .transit_gateway_policy_tables
+                .get(policy_table_id)?
+                .associations
+                .get(attachment_id)?;
+            Some((policy_table_id, association))
+        });
+    // An attachment nothing has associated carries no association at all, rather than one
+    // whose every member is absent.
+    if route_table_association.is_none() && policy_table_association.is_none() {
+        return None;
+    }
     Some(TransitGatewayAttachmentAssociation {
-        transit_gateway_route_table_id: None,
-        transit_gateway_policy_table_id: Some(policy_table_id.to_string()),
-        state: association.view.state.clone(),
+        transit_gateway_route_table_id: route_table_association
+            .map(|association| association.transit_gateway_route_table_id.clone()),
+        transit_gateway_policy_table_id: policy_table_association
+            .map(|(policy_table_id, _)| policy_table_id.to_string()),
+        state: route_table_association
+            .map(|association| association.state.clone())
+            .or_else(|| {
+                policy_table_association
+                    .and_then(|(_, association)| association.view.state.clone())
+            }),
     })
 }
 

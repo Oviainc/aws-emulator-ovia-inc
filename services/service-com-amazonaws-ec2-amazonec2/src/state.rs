@@ -1048,6 +1048,22 @@
 //! ([`ComAmazonawsEc2Amazonec2State::policy_table_of_attachment`]), so a second association
 //! of the same attachment is refused rather than stored beside the first.
 //!
+//! Which attachment is ASSOCIATED with which of those route tables is a resource of its own
+//! — "Associates the specified attachment with the specified transit gateway route table"
+//! (`AssociateTransitGatewayRouteTable`) — so
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateway_associations`] holds one
+//! [`TransitGatewayRouteTableAssociationRecord`] per (route table, attachment) pair, keyed
+//! and ordered exactly like the propagations below, which is the order
+//! `GetTransitGatewayRouteTableAssociations` reports and pages over. An association is
+//! answered in the non-terminal `associating` state, so the clock owes it `associated` one
+//! [`TRANSITION_DELAY`] later and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies that move. "You can
+//! associate only one route table with an attachment" (`AssociateTransitGatewayRouteTable`),
+//! so a second association of an attachment that already has one
+//! ([`ComAmazonawsEc2Amazonec2State::transit_gateway_route_table_association_of_attachment`])
+//! is refused rather than stored beside the first — and that one record is also what a report
+//! of the ATTACHMENT names as its association.
+//!
 //! Which attachment propagates its routes into which of those route tables is a resource of
 //! its own too — "Enables the specified attachment to propagate routes to the specified
 //! propagation route table" (`EnableTransitGatewayRouteTablePropagation`) — so
@@ -1630,10 +1646,12 @@ use crate::ops::types::{
     TransitGatewayMeteringPolicy,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
     TransitGatewayPeeringAttachment, TransitGatewayPolicyTable,
+    TransitGatewayAssociation,
     TransitGatewayPolicyTableAssociation, TransitGatewayPrefixListAttachment,
     TransitGatewayPrefixListReference, TransitGatewayPropagation,
     TransitGatewayRequestOptions,
     TransitGatewayRouteTable, TransitGatewayRouteTableAnnouncement,
+    TransitGatewayRouteTableAssociation,
     TransitGatewayRouteTablePropagation,
     TransitGatewayVpcAttachment,
     UserIdGroupPair, Vpc, VpcBlockPublicAccessExclusion, VpcCidrBlockAssociation,
@@ -3675,6 +3693,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// a pair either propagates or does not; ordered by route table and then by attachment,
     /// which is the order `GetTransitGatewayRouteTablePropagations` reports and pages over.
     pub transit_gateway_propagations: BTreeMap<(String, String), TransitGatewayPropagationRecord>,
+    /// Which attachment is associated with which transit gateway route table, by
+    /// (`TransitGatewayRouteTableId`, `TransitGatewayAttachmentId`) — see
+    /// [`TransitGatewayRouteTableAssociationRecord`] and the module docs. One entry per pair,
+    /// because a pair is either associated or not; ordered by route table and then by
+    /// attachment, which is the order `GetTransitGatewayRouteTableAssociations` reports and
+    /// pages over.
+    pub transit_gateway_associations:
+        BTreeMap<(String, String), TransitGatewayRouteTableAssociationRecord>,
     /// Every virtual private gateway the account holds, by `VpnGatewayId`, as
     /// [`VpnGatewayRecord`]s — the modelled [`VpnGateway`] shape plus the state move the
     /// clock owes it (see the module docs). Ordered by id, which is the order
@@ -4483,6 +4509,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_route_tables: BTreeMap::new(),
             transit_gateway_route_table_available_at: BTreeMap::new(),
             transit_gateway_propagations: BTreeMap::new(),
+            transit_gateway_associations: BTreeMap::new(),
             vpn_gateways: BTreeMap::new(),
             transit_gateway_prefix_list_references: BTreeMap::new(),
             dedicated_hosts: BTreeMap::new(),
@@ -8460,6 +8487,20 @@ impl ComAmazonawsEc2Amazonec2State {
                     association.view.state = Some(state);
                     association.pending = None;
                 }
+            }
+        }
+        // One attachment's association with a ROUTE table, which
+        // `AssociateTransitGatewayRouteTable` leaves in the transient `associating` state
+        // with `associated` owed: the same contract as the policy table associations above.
+        for association in self.transit_gateway_associations.values_mut() {
+            if let Some(state) = association
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            {
+                association.state = state;
+                association.pending = None;
             }
         }
         // A metering policy `CreateTransitGatewayMeteringPolicy` left `pending`: it reaches
@@ -28318,6 +28359,212 @@ impl ComAmazonawsEc2Amazonec2State {
             .take_while(move |((table, _), _)| table == route_table_id)
             .map(|(_, record)| record)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The attachments associated with a transit gateway route table
+// ---------------------------------------------------------------------------
+
+/// One attachment's association with one transit gateway route table.
+///
+/// Flattened rather than holding a modelled shape, because the shapes that report an
+/// association carry different member sets — `TransitGatewayAssociation` names the route
+/// table, `TransitGatewayRouteTableAssociation` does not, being reported under the table it
+/// was asked about — so [`Self::view`] and [`Self::route_table_view`] build each from the one
+/// stored record and the reports cannot disagree about one association. The same arrangement
+/// as [`TransitGatewayPropagationRecord`] above, whose two reports differ the same way.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayRouteTableAssociationRecord {
+    /// The route table the attachment is associated with.
+    pub transit_gateway_route_table_id: String,
+    /// The associated attachment.
+    pub transit_gateway_attachment_id: String,
+    /// The resource that attachment attaches, which a report of the association names as its
+    /// `ResourceId`; absent for an attachment that carries no resource id.
+    pub resource_id: Option<String>,
+    /// That resource's `TransitGatewayAttachmentResourceType`.
+    pub resource_type: String,
+    /// The association's state, a member of `TransitGatewayAssociationState`.
+    pub state: String,
+    /// The move the clock owes this association, while one is owed.
+    pub pending: Option<PendingStateMove>,
+}
+
+impl TransitGatewayRouteTableAssociationRecord {
+    /// The association as `AssociateTransitGatewayRouteTable` answers with it, naming the
+    /// route table it is an association with.
+    pub fn view(&self) -> TransitGatewayAssociation {
+        TransitGatewayAssociation {
+            transit_gateway_route_table_id: Some(self.transit_gateway_route_table_id.clone()),
+            transit_gateway_attachment_id: Some(self.transit_gateway_attachment_id.clone()),
+            resource_id: self.resource_id.clone(),
+            resource_type: Some(self.resource_type.clone()),
+            state: Some(self.state.clone()),
+        }
+    }
+
+    /// The association as `GetTransitGatewayRouteTableAssociations` reports it, under the
+    /// route table the request asked about — which is why that shape names no route table.
+    pub fn route_table_view(&self) -> TransitGatewayRouteTableAssociation {
+        TransitGatewayRouteTableAssociation {
+            transit_gateway_attachment_id: Some(self.transit_gateway_attachment_id.clone()),
+            resource_id: self.resource_id.clone(),
+            resource_type: Some(self.resource_type.clone()),
+            state: Some(self.state.clone()),
+        }
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another route table association fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_propagation_capacity`].
+    pub fn has_transit_gateway_association_capacity(&self) -> bool {
+        self.transit_gateway_associations.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// The associations of one transit gateway route table, in attachment-id order — the
+    /// stable order `GetTransitGatewayRouteTableAssociations` reports and pages over.
+    ///
+    /// A RANGE over the keys of one route table rather than a scan of every association
+    /// stored, exactly as [`Self::transit_gateway_route_table_propagations`] is: the cost is
+    /// proportional to the associations of the table asked about.
+    ///
+    /// A read, so it writes nothing: the caller applies the clock-owed moves
+    /// ([`Self::materialize_due_transitions`]) before asking, as every report of this module
+    /// does.
+    pub fn transit_gateway_route_table_associations<'a>(
+        &'a self,
+        route_table_id: &'a str,
+    ) -> impl Iterator<Item = &'a TransitGatewayRouteTableAssociationRecord> {
+        self.transit_gateway_associations
+            .range((route_table_id.to_string(), String::new())..)
+            .take_while(move |((table, _), _)| table == route_table_id)
+            .map(|(_, record)| record)
+    }
+
+    /// The route table association `transit_gateway_attachment_id` already has, if any.
+    ///
+    /// "You can associate only one route table with an attachment"
+    /// (`AssociateTransitGatewayRouteTable`), so this answers at most one record; it is a
+    /// scan of the associations the account holds, which is bounded by
+    /// [`MAX_STORED_RECORDS_PER_STORE`] like every other store here — the same shape as
+    /// [`Self::policy_table_of_attachment`], the policy table's own answer to this question.
+    pub fn transit_gateway_route_table_association_of_attachment(
+        &self,
+        transit_gateway_attachment_id: &str,
+    ) -> Option<&TransitGatewayRouteTableAssociationRecord> {
+        self.transit_gateway_associations
+            .values()
+            .find(|record| record.transit_gateway_attachment_id == transit_gateway_attachment_id)
+    }
+}
+
+/// Associate the transit gateway attachment `transit_gateway_attachment_id` with the transit
+/// gateway route table `transit_gateway_route_table_id`, and answer the association as it now
+/// stands.
+///
+/// The rule `AssociateTransitGatewayRouteTable` follows, in [`crate::state`] so the reports of
+/// what it wrote cannot disagree with it:
+///
+/// * the route table must be one the account holds, or there is nothing to associate with
+///   ([`invalid_transit_gateway_route_table_id_not_found`]);
+/// * the attachment must be one the account holds
+///   ([`invalid_transit_gateway_attachment_id_not_found`]);
+/// * "you can associate only one route table with an attachment", so an attachment that
+///   already has an association is refused with EC2's own `Resource.AlreadyAssociated` and
+///   NOTHING is written, whether the table it already belongs to is this one or another;
+/// * the new association starts in the TRANSIENT `associating` state with the clock owing it
+///   `associated` — the span is never zero, so a caller acting straight after this call still
+///   sees `associating`.
+///
+/// The association's `ResourceId` and `ResourceType` are read off the STORED attachment ("the
+/// ID of the resource" / "the resource type", `TransitGatewayAssociation$ResourceId` /
+/// `$ResourceType`), never off the request, which names neither. The CALLER refuses a
+/// malformed id of either kind first, so nothing here depends on the request's form.
+pub fn associate_transit_gateway_route_table<E>(
+    store: &mut ComAmazonawsEc2Amazonec2State,
+    transit_gateway_route_table_id: &str,
+    transit_gateway_attachment_id: &str,
+) -> Result<TransitGatewayAssociation, Scaffolded<E>> {
+    // The clock first: an association whose move has fallen due is already `associated`, so
+    // what this call is asked against is the state the store is ACTUALLY in.
+    store.materialize_due_transitions();
+
+    // The route table the request names, before the attachment: the operation's members name
+    // the table first, and a request naming two unknown resources is told about the first one.
+    if !store
+        .transit_gateway_route_tables
+        .contains_key(transit_gateway_route_table_id)
+    {
+        return Err(invalid_transit_gateway_route_table_id_not_found(
+            transit_gateway_route_table_id,
+        ));
+    }
+
+    // "The ID of the attachment" (`AssociateTransitGatewayRouteTableRequest$
+    // TransitGatewayAttachmentId`): an id naming no attachment of the account is refused with
+    // the attachment's own NotFound code rather than silently associating nothing.
+    let attachment = store
+        .transit_gateway_attachments
+        .get(transit_gateway_attachment_id)
+        .ok_or_else(|| {
+            invalid_transit_gateway_attachment_id_not_found(transit_gateway_attachment_id)
+        })?;
+    let resource_id = attachment.view.resource_id().map(str::to_string);
+    let resource_type = attachment.view.resource_type().to_string();
+
+    // One attachment, at most one route table — so a second association is refused and
+    // nothing is written, which is how the first association stays observable to a later
+    // caller.
+    if let Some(held) = store.transit_gateway_route_table_association_of_attachment(
+        transit_gateway_attachment_id,
+    ) {
+        return Err(resource_already_associated(format!(
+            "The transit gateway attachment '{transit_gateway_attachment_id}' is already \
+             associated with the transit gateway route table '{holder}'",
+            holder = held.transit_gateway_route_table_id,
+        )));
+    }
+
+    if !store.has_transit_gateway_association_capacity() {
+        return Err(resource_limit_exceeded(format!(
+            "This emulator holds {} transit gateway route table associations, which is as \
+             many as it stores",
+            store.transit_gateway_associations.len()
+        )));
+    }
+    // An association retains no caller-chosen text at all — every string on it is either a
+    // word this module chose or an id read back out of another store — so the only charge is
+    // the fixed per-record overhead every stored record costs.
+    if store.would_exceed_stored_bytes(STORED_RECORD_OVERHEAD_BYTES) {
+        return Err(resource_limit_exceeded(format!(
+            "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of caller-supplied \
+             data, so it cannot store another transit gateway route table association",
+            store.stored_bytes()
+        )));
+    }
+
+    let record = TransitGatewayRouteTableAssociationRecord {
+        transit_gateway_route_table_id: transit_gateway_route_table_id.to_string(),
+        transit_gateway_attachment_id: transit_gateway_attachment_id.to_string(),
+        resource_id,
+        resource_type,
+        state: TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATING.to_string(),
+        pending: Some(PendingStateMove::starting_now(
+            TRANSIT_GATEWAY_ASSOCIATION_STATE_ASSOCIATED,
+        )),
+    };
+    let view = record.view();
+    store.add_stored_bytes(STORED_RECORD_OVERHEAD_BYTES);
+    store.transit_gateway_associations.insert(
+        (
+            transit_gateway_route_table_id.to_string(),
+            transit_gateway_attachment_id.to_string(),
+        ),
+        record,
+    );
+    Ok(view)
 }
 
 // ---------------------------------------------------------------------------
