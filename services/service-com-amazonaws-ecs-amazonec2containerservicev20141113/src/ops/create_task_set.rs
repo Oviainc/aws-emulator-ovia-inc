@@ -330,14 +330,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // "The specified service isn't active. You can't update a service that's
-        // inactive."
+        // inactive": one fixed sentence for the condition, naming neither the service nor
+        // the status it holds.
         if !service.is_active() {
             return Err(CreateTaskSetErrorModeled::ServiceNotActiveException(
                 ServiceNotActiveException {
-                    message: Some(format!(
-                        "service {service_name:?} is {} and cannot be updated",
-                        service.status
-                    )),
+                    message: Some(crate::state::SERVICE_NOT_ACTIVE_MESSAGE.to_string()),
                 },
             )
             .into());

@@ -224,12 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The specified service isn't active. You can't update a service that's
         // inactive": a service the caller has deleted holds no task set to modify.
         if !service.is_active() {
-            let status = service.status.clone();
             return Err(UpdateTaskSetErrorModeled::ServiceNotActiveException(
                 ServiceNotActiveException {
-                    message: Some(format!(
-                        "service {service_name:?} is {status} and cannot be updated"
-                    )),
+                    message: Some(crate::state::SERVICE_NOT_ACTIVE_MESSAGE.to_string()),
                 },
             )
             .into());

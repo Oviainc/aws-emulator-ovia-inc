@@ -224,13 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The specified service isn't active": a service the caller has deleted holds no
         // task set to describe.
         if !service.is_active() {
-            let status = service.status.clone();
             return Err(DescribeTaskSetsErrorModeled::ServiceNotActiveException(
                 ServiceNotActiveException {
-                    message: Some(format!(
-                        "service {service_name:?} is {status} and its task sets cannot be \
-                         described"
-                    )),
+                    message: Some(crate::state::SERVICE_NOT_ACTIVE_MESSAGE.to_string()),
                 },
             )
             .into());

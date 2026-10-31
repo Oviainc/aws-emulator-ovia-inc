@@ -111,6 +111,8 @@ mod service_lifecycle;
 mod service_listing;
 #[path = "all/service_load_balancer_cross_field.rs"]
 mod service_load_balancer_cross_field;
+#[path = "all/service_not_active_refusals.rs"]
+mod service_not_active_refusals;
 #[path = "all/service_projection.rs"]
 mod service_projection;
 #[path = "all/service_revisions.rs"]

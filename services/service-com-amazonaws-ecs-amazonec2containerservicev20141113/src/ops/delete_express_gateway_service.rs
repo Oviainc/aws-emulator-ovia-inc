@@ -213,14 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A service that is already draining is on its way out: "This operation cannot be
         // reversed", and there is nothing left for a second delete to start.
         if !stored.is_active() {
-            let message = crate::state::express_gateway_not_active_message(
-                &stored.name,
-                &stored.status_code,
-            );
             return Err(
                 DeleteExpressGatewayServiceErrorModeled::ServiceNotActiveException(
                     ServiceNotActiveException {
-                        message: Some(message),
+                        message: Some(crate::state::SERVICE_NOT_ACTIVE_MESSAGE.to_string()),
                     },
                 )
                 .into(),

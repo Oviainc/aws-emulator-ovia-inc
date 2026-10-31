@@ -1778,6 +1778,16 @@ pub const CLUSTER_NOT_FOUND_MESSAGE: &str = "Cluster not found.";
 /// `ServiceNotFoundException$message` for a `service` that names no stored service.
 pub const SERVICE_NOT_FOUND_MESSAGE: &str = "Service not found.";
 
+/// `ServiceNotActiveException$message` for a `service` this store HOLDS in a status that
+/// is not [`SERVICE_ACTIVE`] — the error shape's own doc: "The specified service isn't
+/// active."
+///
+/// Like its neighbours above it is ONE fixed sentence for the condition: it names neither
+/// the service nor the cluster the request carried, and it does not report WHICH
+/// non-ACTIVE status ([`SERVICE_DRAINING`] or [`SERVICE_INACTIVE`]) the service holds, so
+/// every operation that resolves a service and finds it not active answers the same text.
+pub const SERVICE_NOT_ACTIVE_MESSAGE: &str = "Service was not ACTIVE.";
+
 /// `InvalidParameterException$message` for a `task` that names no stored task.
 pub const TASK_NOT_FOUND_MESSAGE: &str = "The referenced task was not found";
 
@@ -4248,13 +4258,6 @@ pub const EXPRESS_GATEWAY_SERVICE_NOT_FOUND_MESSAGE: &str = "Service not found";
 /// followed by the identifier the request named.
 pub fn express_resource_not_found_message(reference: &str) -> String {
     format!("Resource not found: {reference}")
-}
-
-/// The refusal for an operation on an Express service whose status is not
-/// [`EXPRESS_GATEWAY_ACTIVE`] — the `ServiceNotActiveException` doc: "The specified
-/// service isn't active."
-pub fn express_gateway_not_active_message(name: &str, status: &str) -> String {
-    format!("The Express service {name} is {status} and can not be changed")
 }
 
 /// The members `taskDefinitionArn` cannot be combined with, in the order the

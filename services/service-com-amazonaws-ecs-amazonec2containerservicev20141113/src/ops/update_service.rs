@@ -501,10 +501,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if stored.status != crate::state::SERVICE_ACTIVE {
             return Err(UpdateServiceErrorModeled::ServiceNotActiveException(
                 ServiceNotActiveException {
-                    message: Some(format!(
-                        "service {name:?} is {} and cannot be updated",
-                        stored.status
-                    )),
+                    message: Some(crate::state::SERVICE_NOT_ACTIVE_MESSAGE.to_string()),
                 },
             )
             .into());

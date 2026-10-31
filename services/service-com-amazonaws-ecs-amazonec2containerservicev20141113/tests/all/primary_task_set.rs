@@ -364,7 +364,7 @@ async fn a_task_set_the_service_does_not_hold_is_refused_and_promotes_nothing() 
             service: Some("deleted"),
             task_set: None,
             code: "ServiceNotActiveException",
-            message: "service \"deleted\" is DRAINING and cannot be updated".to_string(),
+            message: "Service was not ACTIVE.".to_string(),
         },
     ];
 

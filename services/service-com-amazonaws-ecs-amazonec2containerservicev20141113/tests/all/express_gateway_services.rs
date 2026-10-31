@@ -73,7 +73,7 @@ const DEFAULT_SCALING_TARGET_VALUE: i64 = 60;
 
 /// The infrastructure role every case passes: "This role is only used during Express
 /// service creation, updates, and deletion operations" — ECS stores the ARN it is given.
-fn infrastructure_role() -> String {
+pub(crate) fn infrastructure_role() -> String {
     format!("arn:aws:iam::{ACCOUNT}:role/ecsInfrastructureRole")
 }
 
@@ -84,7 +84,11 @@ fn express_arn(cluster: &str, name: &str) -> String {
 }
 
 /// Create one Express service and return the service it reports.
-async fn create_express(router: &MultiServiceRouter, request: Value, case: &str) -> Value {
+pub(crate) async fn create_express(
+    router: &MultiServiceRouter,
+    request: Value,
+    case: &str,
+) -> Value {
     let body = ok(router, "CreateExpressGatewayService", request, case).await;
     body["service"].clone()
 }
@@ -116,7 +120,7 @@ fn only_configuration(service: &Value, case: &str) -> Value {
 }
 
 /// The status code a service reports.
-fn status_code(service: &Value, case: &str) -> String {
+pub(crate) fn status_code(service: &Value, case: &str) -> String {
     string(&service["status"], "statusCode", case)
 }
 

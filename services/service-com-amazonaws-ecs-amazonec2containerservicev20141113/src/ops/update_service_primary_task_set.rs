@@ -213,13 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // inactive": a service the caller has deleted deploys nothing, so none of its task
         // sets can be made to serve its traffic.
         if !service.is_active() {
-            let status = service.status.clone();
             return Err(
                 UpdateServicePrimaryTaskSetErrorModeled::ServiceNotActiveException(
                     ServiceNotActiveException {
-                        message: Some(format!(
-                            "service {service_name:?} is {status} and cannot be updated"
-                        )),
+                        message: Some(crate::state::SERVICE_NOT_ACTIVE_MESSAGE.to_string()),
                     },
                 )
                 .into(),

@@ -217,12 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // inactive": a service the caller has deleted is being drained away with every
         // task set it holds, so no call of this one takes one away from it.
         if !service.is_active() {
-            let status = service.status.clone();
             return Err(DeleteTaskSetErrorModeled::ServiceNotActiveException(
                 ServiceNotActiveException {
-                    message: Some(format!(
-                        "service {service_name:?} is {status} and cannot be updated"
-                    )),
+                    message: Some(crate::state::SERVICE_NOT_ACTIVE_MESSAGE.to_string()),
                 },
             )
             .into());
