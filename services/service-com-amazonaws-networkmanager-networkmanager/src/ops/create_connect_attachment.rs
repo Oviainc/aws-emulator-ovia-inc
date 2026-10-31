@@ -382,6 +382,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // its transport attachment, so that is the resource its ARN names.
             resource_arn: transport_arn,
             routing_policy_label: input.routing_policy_label,
+            // The label this attachment carries is the one this create carried, which no
+            // `PutAttachmentRoutingPolicyLabel` token names.
+            routing_policy_label_client_token: None,
             created_at: now,
             // An attachment the policy asked acceptance for is not being created yet, so no
             // transition is owed on it: `AcceptAttachment` is what starts the settle span.

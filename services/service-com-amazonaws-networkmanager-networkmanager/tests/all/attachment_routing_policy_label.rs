@@ -34,7 +34,7 @@ use crate::resource_not_found_message::assert_not_found_answer;
 
 /// The `PutAttachmentRoutingPolicyLabel` route (`POST /routing-policy-label`,
 /// `smithy_query query="operation" operation="PutAttachmentRoutingPolicyLabel"`).
-const PUT_URI: &str = "/routing-policy-label";
+pub(crate) const PUT_URI: &str = "/routing-policy-label";
 
 /// The `ListAttachmentRoutingPolicyAssociations` route prefix
 /// (`GET /routing-policy-label/core-network/{CoreNetworkId}`), which is how a stored label
@@ -62,7 +62,12 @@ pub(crate) const REGIONS: [&str; 3] = ["us-west-2", "eu-central-1", "ap-southeas
 
 /// A `PutAttachmentRoutingPolicyLabel` request body, carrying `ClientToken` when `token`
 /// names one.
-fn put_body(core_network: &str, attachment: &str, label: &str, token: Option<&str>) -> Value {
+pub(crate) fn put_body(
+    core_network: &str,
+    attachment: &str,
+    label: &str,
+    token: Option<&str>,
+) -> Value {
     let mut body = json!({
         "CoreNetworkId": core_network,
         "AttachmentId": attachment,
@@ -75,7 +80,7 @@ fn put_body(core_network: &str, attachment: &str, label: &str, token: Option<&st
 }
 
 /// `PutAttachmentRoutingPolicyLabel`.
-async fn put(emulator: &Emulator, body: Value) -> (u16, Value) {
+pub(crate) async fn put(emulator: &Emulator, body: Value) -> (u16, Value) {
     emulator.post(PUT_URI, body).await
 }
 
@@ -479,9 +484,13 @@ async fn a_label_past_the_published_bound_is_refused_and_stores_nothing() {
         ),
     ] {
         let before = stored_label(&emulator, case, &core_network, &id).await;
+        // One token per row: the rows ask for DIFFERENT labels, and the same token asking
+        // for another label is this operation's conflict refusal, which
+        // `crate::attachment_routing_policy_label_idempotency` covers.
+        let token = format!("bound-{case}");
         let (status, answer) = put(
             &emulator,
-            put_body(&core_network, &id, &label, Some("bounds-token")),
+            put_body(&core_network, &id, &label, Some(&token)),
         )
         .await;
         if accepted {

@@ -31,6 +31,8 @@ mod attachment_rejection;
 mod attachment_routing_policy_associations;
 #[path = "all/attachment_routing_policy_label.rs"]
 mod attachment_routing_policy_label;
+#[path = "all/attachment_routing_policy_label_idempotency.rs"]
+mod attachment_routing_policy_label_idempotency;
 #[path = "all/attachment_routing_policy_label_removal.rs"]
 mod attachment_routing_policy_label_removal;
 #[path = "all/build_on_created_attachment.rs"]

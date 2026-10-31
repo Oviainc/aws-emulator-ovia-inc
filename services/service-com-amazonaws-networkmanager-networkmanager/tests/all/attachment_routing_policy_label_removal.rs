@@ -38,7 +38,7 @@ use crate::resource_not_found_message::assert_not_found_answer;
 /// The `RemoveAttachmentRoutingPolicyLabel` route
 /// (`DELETE /routing-policy-label/core-network/{CoreNetworkId}/attachment/{AttachmentId}`,
 /// `smithy_query query="operation" operation="RemoveAttachmentRoutingPolicyLabel"`).
-fn remove_uri(core_network: &str, attachment: &str) -> String {
+pub(crate) fn remove_uri(core_network: &str, attachment: &str) -> String {
     format!("/routing-policy-label/core-network/{core_network}/attachment/{attachment}")
 }
 

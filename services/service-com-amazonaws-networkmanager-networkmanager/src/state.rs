@@ -2807,6 +2807,13 @@ pub struct AttachmentRecord {
     /// — it is reported by `ListAttachmentRoutingPolicyAssociations`
     /// ([`Self::to_routing_policy_association`]) — so it is held here rather than dropped.
     pub routing_policy_label: Option<String>,
+    /// The normalised idempotency token of the `PutAttachmentRoutingPolicyLabel` call that
+    /// applied the label above, kept so a retry of that call answers it again instead of
+    /// writing a second time and so the same token asking for another label is refused
+    /// ([`replay_or_conflict_by`]). `None` for a label that came from the create, for one
+    /// applied by a call carrying no token, and for an attachment carrying no label — none
+    /// of which a token names.
+    pub routing_policy_label_client_token: Option<String>,
     pub created_at: SystemTime,
     /// The instant the `CREATING` -> `AVAILABLE` transition the clock owes becomes due, or
     /// `None` while the attachment is still waiting for the acceptance the core network
@@ -4466,13 +4473,36 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         core_network_id: &str,
         attachment_id: &str,
     ) -> Result<&mut AttachmentRecord, ResourceNotFoundException> {
+        self.require_attachment_of_core_network(core_network_id, attachment_id)?;
+        self.attachments
+            .get_mut(attachment_id)
+            .ok_or_else(|| resource_not_found(ATTACHMENT_KIND, attachment_id))
+    }
+
+    /// The same resolution as [`Self::attachment_of_core_network_mut`] without handing the
+    /// record back: `Err` names whichever of the two resources the request addresses the
+    /// store does not hold.
+    ///
+    /// For the point in such a call where the refusal is already owed but the record is not
+    /// needed yet: a tokened write resolves the resources it addresses before it resolves
+    /// its idempotency token, and that resolution walks the whole attachment map, across
+    /// which no borrow of one record can be held.
+    pub fn require_attachment_of_core_network(
+        &self,
+        core_network_id: &str,
+        attachment_id: &str,
+    ) -> Result<(), ResourceNotFoundException> {
         if !self.core_networks.contains_key(core_network_id) {
             return Err(resource_not_found(CORE_NETWORK_KIND, core_network_id));
         }
-        self.attachments
-            .get_mut(attachment_id)
-            .filter(|record| record.core_network_id == core_network_id)
-            .ok_or_else(|| resource_not_found(ATTACHMENT_KIND, attachment_id))
+        if !self
+            .attachments
+            .get(attachment_id)
+            .is_some_and(|record| record.core_network_id == core_network_id)
+        {
+            return Err(resource_not_found(ATTACHMENT_KIND, attachment_id));
+        }
+        Ok(())
     }
 
     /// How many peerings `core_network_id` holds, for the per-core-network quota and the
@@ -8862,7 +8892,8 @@ pub struct ClientTokenConflict {
     pub resource_type: String,
 }
 
-/// Resolve the idempotency token of a create against the records a store already holds.
+/// Resolve the idempotency token of a tokened write against the records a store already
+/// holds, where each record remembers that token in the field [`HasClientToken`] names.
 ///
 /// `Ok(Some(record))` is a retry of the request that produced `record`, which the caller
 /// answers from that record instead of producing a second one; `Ok(None)` is a request that
@@ -8879,12 +8910,36 @@ pub fn replay_or_conflict<'store, Record>(
 where
     Record: HasClientToken + 'store,
 {
+    replay_or_conflict_by(
+        token,
+        stored,
+        HasClientToken::client_token,
+        same_request,
+        conflict,
+    )
+}
+
+/// [`replay_or_conflict`] where the token a stored record was produced under is reached by
+/// `token_of` rather than by [`HasClientToken`].
+///
+/// The walk is the same one, and it is the only one: a record can remember the token of
+/// MORE than one tokened operation — an attachment remembers the token of the create that
+/// minted it and the token of the call that applied the label it currently carries — and
+/// each of those tokens is resolved against the records holding it rather than against the
+/// one field a record's [`HasClientToken`] names.
+pub fn replay_or_conflict_by<'store, Record>(
+    token: Option<&str>,
+    stored: impl IntoIterator<Item = &'store Record>,
+    token_of: impl Fn(&Record) -> Option<&str>,
+    same_request: impl Fn(&Record) -> bool,
+    conflict: impl FnOnce(&Record) -> ClientTokenConflict,
+) -> Result<Option<&'store Record>, ConflictException> {
     let Some(token) = normalized_client_token(token) else {
         return Ok(None);
     };
     let Some(existing) = stored
         .into_iter()
-        .find(|record| record.client_token() == Some(token))
+        .find(|record| token_of(record) == Some(token))
     else {
         return Ok(None);
     };

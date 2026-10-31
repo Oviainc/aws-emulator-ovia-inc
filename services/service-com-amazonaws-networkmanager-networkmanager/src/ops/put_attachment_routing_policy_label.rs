@@ -7,8 +7,13 @@
 //! an earlier call of this operation — and is what
 //! `ListAttachmentRoutingPolicyAssociations` then reports as the attachment's routing
 //! policy association. A mutating operation that addresses two resources which must
-//! already be stored, so it mints nothing. This is the ONLY file to touch for this
-//! operation.
+//! already be stored, so it mints nothing. Its modelled `ClientToken` is resolved the way
+//! every tokened operation of this service resolves one: a retry under the same token
+//! answers the label that token already stored, and the same token asking for anything else
+//! is refused `ConflictException` (409) and writes nothing. This is the only file holding
+//! this operation's own logic; what it stores — the label and the token it was applied
+//! under — lives on the shared attachment record in `crate::state`, which the attachment
+//! creates fill in too.
 //!
 //! ## Shape of an operation
 //!
@@ -177,8 +182,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // attachment that exists rather than minting one — so an id naming nothing stored is
         // the service's not-found refusal, naming whichever of the two the store does not
         // hold; the core network the request reaches the attachment through is resolved
-        // first (`State::attachment_of_core_network_mut`, shared with the removal of a
-        // label, which addresses the same pair of resources).
+        // first. That resolution is `State::require_attachment_of_core_network`, which
+        // `State::attachment_of_core_network_mut` performs for the write below and the
+        // removal of a label goes through too, since it addresses the same pair of
+        // resources. It is answered BEFORE the idempotency token, as every tokened
+        // operation of this service answers the resources its request addresses, so a
+        // request addressing nothing stored is refused whatever token it carries.
+        store
+            .require_attachment_of_core_network(&input.core_network_id, &input.attachment_id)
+            .map_err(PutAttachmentRoutingPolicyLabelErrorModeled::ResourceNotFoundException)?;
+
+        // `ClientToken` is this operation's modelled `@idempotencyToken`, so a retry of the
+        // same request answers the label the first call stored instead of writing again, and
+        // the same token asking for something else — another label, or the label of another
+        // attachment — is a conflict that writes nothing. The walk itself — the token
+        // normalisation, the store lookup and the replay-or-refuse branch — is
+        // [`crate::state::replay_or_conflict_by`], the one every tokened operation of this
+        // service goes through, reading the token each attachment remembers for the label it
+        // currently carries rather than the token of the create that minted it; what is left
+        // here is only what makes a stored label THIS request.
+        let client_token = crate::state::normalized_client_token(input.client_token);
+        if let Some(existing) = crate::state::replay_or_conflict_by(
+            client_token.as_deref(),
+            store.attachments.values(),
+            |record| record.routing_policy_label_client_token.as_deref(),
+            // The attachment the request addresses, carrying the label it asks for. Its core
+            // network is not compared: the resolution above already refused every request
+            // reaching this attachment id through another core network.
+            |existing| {
+                existing.id == input.attachment_id
+                    && existing.routing_policy_label.as_deref()
+                        == Some(input.routing_policy_label.as_str())
+            },
+            |existing| crate::state::ClientTokenConflict {
+                effect: format!(
+                    "applied routing policy label {:?} to attachment {}",
+                    existing.routing_policy_label.as_deref().unwrap_or_default(),
+                    existing.id
+                ),
+                resource_id: existing.id.clone(),
+                resource_type: crate::state::ATTACHMENT_KIND.to_string(),
+            },
+        )
+        .map_err(PutAttachmentRoutingPolicyLabelErrorModeled::ConflictException)?
+        {
+            // Answered from the record the first call wrote, so the replay reports exactly
+            // what that call reported.
+            return Ok(PutAttachmentRoutingPolicyLabelOutput {
+                core_network_id: Some(existing.core_network_id.clone()),
+                attachment_id: Some(existing.id.clone()),
+                routing_policy_label: existing.routing_policy_label.clone(),
+            });
+        }
+
         let record = store
             .attachment_of_core_network_mut(&input.core_network_id, &input.attachment_id)
             .map_err(PutAttachmentRoutingPolicyLabelErrorModeled::ResourceNotFoundException)?;
@@ -193,12 +249,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // attachment changes: the modelled `Attachment` carries no label member, so a read
         // of the attachment itself answers precisely what it answered before.
         //
-        // `ClientToken` is this operation's modelled `@idempotencyToken` and needs no record
-        // of its own: the whole effect of the call is the label it carries, so a retry under
-        // the same token writes the same label and answers the same payload as the call it
-        // repeats, while a later call carrying another label is how a caller CHANGES the
-        // label rather than a request to refuse.
+        // The token this write was made under is stored beside the label it wrote, which is
+        // what lets the walk above recognise a retry of this call; an untokened call stores
+        // none, so nothing is idempotent against it.
         record.routing_policy_label = Some(input.routing_policy_label);
+        record.routing_policy_label_client_token = client_token;
 
         // Answered from the stored record, so the payload cannot report a core network, an
         // attachment or a label the store does not hold.

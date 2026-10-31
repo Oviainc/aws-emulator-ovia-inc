@@ -4,7 +4,7 @@
 //! that models `ClientToken` follows, driven over HTTP through the real router (the harness
 //! lives in `crate::global_network_lifecycle`).
 //!
-//! The rule under test: a create whose request carries a non-empty idempotency token is
+//! The rule under test: a write whose request carries a non-empty idempotency token is
 //! resolved against the records the relevant store already holds — a record under that token
 //! whose request is the same one is ANSWERED instead of a second record being produced, the
 //! same token asking for anything else is refused `ConflictException` (HTTP 409) naming that
@@ -12,11 +12,13 @@
 //! one behaves exactly as a request carrying no `ClientToken` member.
 //!
 //! The table below spans that class: one row per operation that models the token — the nine
-//! creates and `PutCoreNetworkPolicy` — differing in the store the lookup walks, in which
-//! member the second call changes (a list, a tunnel protocol, a tag set, an address, a
-//! description, an alias), and in whether the record the refusal names has an id of its own
-//! or is keyed by the core network that holds it. Nothing reaches into `crate::state` for
-//! data: every record is produced and observed through an operation.
+//! creates, `PutCoreNetworkPolicy` and `PutAttachmentRoutingPolicyLabel` — differing in the
+//! store the lookup walks, in which member the second call changes (a list, a tunnel
+//! protocol, a tag set, an address, a description, an alias, a label), in whether the record
+//! the refusal names has an id of its own or is keyed by the core network that holds it, and
+//! in whether the call MINTS that record or writes a value onto a record that already exists.
+//! Nothing reaches into `crate::state` for data: every record is produced and observed
+//! through an operation.
 
 use serde_json::{json, Value};
 
@@ -76,6 +78,9 @@ struct Fixture {
     connect_attachment: String,
     /// A peering the transit gateway route table attachment row attaches over.
     peering: String,
+    /// A VPC attachment the `PutAttachmentRoutingPolicyLabel` row labels: that row writes
+    /// onto a record that already exists rather than minting one.
+    labelled: String,
 }
 
 /// One VPC attachment of the fixture, attaching the VPC `index` at the first edge.
@@ -109,6 +114,7 @@ async fn fixture(emulator: &Emulator, name: &str) -> Fixture {
         .await;
     let transport = fixture_transport(emulator, name, &core_network, 90).await;
     let peer_transport = fixture_transport(emulator, name, &core_network, 91).await;
+    let labelled = fixture_transport(emulator, name, &core_network, 92).await;
 
     let (status, created) = create_connect_attachment(
         emulator,
@@ -146,19 +152,20 @@ async fn fixture(emulator: &Emulator, name: &str) -> Fixture {
         transport,
         connect_attachment,
         peering,
+        labelled,
     }
 }
 
-/// One row: the create of one operation that models the token, and what makes a second call
-/// under the same token a DIFFERENT request.
+/// One row: the tokened write of one operation that models the token, and what makes a
+/// second call under the same token a DIFFERENT request.
 struct TokenRow {
     /// Names the case in every assertion message.
     name: &'static str,
-    /// The route the create is addressed to.
+    /// The route the write is addressed to.
     uri: String,
     /// The request, carrying no `ClientToken` member: the harness adds the row's token.
     request: Value,
-    /// The same create asking for something else, one compared member changed.
+    /// The same write asking for something else, one compared member changed.
     different: Value,
     /// Where the success answer carries the identity of the record the create produced.
     identity: &'static [&'static str],
@@ -343,6 +350,26 @@ fn rows(fixture: &Fixture) -> Vec<TokenRow> {
             key_scope: Some(core_network.clone()),
         },
         TokenRow {
+            name: "PutAttachmentRoutingPolicyLabel, another label",
+            uri: "/routing-policy-label".to_string(),
+            request: json!({
+                "CoreNetworkId": &core_network,
+                "AttachmentId": &fixture.labelled,
+                "RoutingPolicyLabel": "blue",
+            }),
+            different: json!({
+                "CoreNetworkId": &core_network,
+                "AttachmentId": &fixture.labelled,
+                "RoutingPolicyLabel": "red",
+            }),
+            identity: &["AttachmentId"],
+            resource_type: ATTACHMENT_KIND,
+            effect: Box::new(|id| {
+                format!("applied routing policy label {:?} to attachment {id}", "blue")
+            }),
+            key_scope: None,
+        },
+        TokenRow {
             name: "PutCoreNetworkPolicy, another description",
             uri: format!("/core-networks/{core_network}/core-network-policy"),
             request: json!({
@@ -410,7 +437,7 @@ fn message_of(body: &Value) -> String {
 }
 
 #[tokio::test]
-async fn every_tokened_create_replays_its_token_and_refuses_a_different_request() {
+async fn every_tokened_operation_replays_its_token_and_refuses_a_different_request() {
     let emulator = Emulator::new();
     let fixture = fixture(&emulator, "idempotency").await;
 
@@ -424,7 +451,7 @@ async fn every_tokened_create_replays_its_token_and_refuses_a_different_request(
         let (status, first) = emulator.post(&row.uri, request.clone()).await;
         assert_eq!(
             status, 200,
-            "case {case:?}: the first create expected 200, got {status} with {first}"
+            "case {case:?}: the first call expected 200, got {status} with {first}"
         );
         let produced = identity(row, &first);
 
@@ -492,7 +519,7 @@ async fn every_tokened_create_replays_its_token_and_refuses_a_different_request(
     }
 }
 
-/// Drive every row's create, a retry of it and the changed request under `token`, answering
+/// Drive every row's write, a retry of it and the changed request under `token`, answering
 /// the `(case, status, error code)` of each call — an empty error code for a success.
 async fn sequence(
     emulator: &Emulator,
@@ -502,7 +529,7 @@ async fn sequence(
     let mut answers = Vec::new();
     for row in rows {
         for (step, request) in [
-            ("the create", &row.request),
+            ("the write", &row.request),
             ("the identical retry", &row.request),
             ("the changed request", &row.different),
         ] {

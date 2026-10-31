@@ -193,7 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // label reports what it removed. The removal is therefore idempotent: repeating it
         // answers the same success with that member absent, and the attachment is left
         // label-free either way.
+        // The idempotency token the label was applied under goes with it: nothing is stored
+        // under that token any more, so a repeat of the call that applied the label is a
+        // fresh request rather than a retry of one this store still holds the effect of.
         let removed = record.routing_policy_label.take();
+        record.routing_policy_label_client_token = None;
 
         // Answered from the stored record, so the payload cannot report a core network or an
         // attachment the store does not hold.
