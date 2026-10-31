@@ -6273,6 +6273,33 @@ pub fn check_attributes_size(
     ))
 }
 
+/// Merge an `attributes` map a request carries over the one a stored identity already
+/// holds, and refuse the composition when it passes the documented
+/// [`MAX_ATTRIBUTES_BYTES`] total. `Ok` is the composed map, ready to persist; `Err` is
+/// the sentence to put on the `ValidationException`.
+///
+/// The documented bound belongs to the map this service STORES and REPORTS — every shape
+/// of this service carrying an `attributes` map documents it, including the ones a reader
+/// answers with — not only to the half a caller filled in. So a map this service composes
+/// from more than one source is measured AFTER it is composed, against the same measure
+/// [`check_attributes_size`] uses: no operation persists, and so no reader reports, an
+/// `attributes` map past the bound its own field documents. An overlapping key takes the
+/// overriding map's value, so a composition can total less than the sum of its halves.
+///
+/// Like [`check_attributes_size`], this neither opens nor writes anything: a caller runs
+/// it before it persists, so a refused request leaves the store exactly as it was.
+pub fn merge_attributes_within_bound(
+    operation: &str,
+    member: &str,
+    held: &HashMap<String, String>,
+    overriding: HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
+    let mut merged = held.clone();
+    merged.extend(overriding);
+    check_attributes_size(operation, member, &merged)?;
+    Ok(merged)
+}
+
 /// The resource type an IVS ARN names (`stage`, `encoder-configuration`, …), or `None`
 /// when the string carries no sixth `:`-field at all.
 ///

@@ -201,7 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Checked BEFORE any lookup, because the limit is a property of the request
         // alone: a request that is both oversized and names no stage is answered as
         // malformed, exactly as the modelled constraints the framework checks ahead of
-        // this handler are.
+        // this handler are. The map this operation STORES is a composition of this one
+        // and the replicated participant's own, so the bound is measured again on that
+        // composition once the participant is resolved, below.
         let requested_attributes = input.attributes.unwrap_or_default();
         crate::state::check_attributes_size(Self::NAME, "attributes", &requested_attributes)
             .map_err(|message| {
@@ -270,6 +272,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // What this operation stores on the replica participant is the composition the
+        // request member documents: "These attributes are merged with any attributes set
+        // for this participant when creating the token. If there is overlap in keys, the
+        // values in these attributes are replaced" — the participant's own attributes
+        // first, then the request's over them.
+        //
+        // The composition is what `GetParticipant` and `ListParticipants` report as
+        // `Participant$attributes`, a field documenting the very same 1 KB maximum, so the
+        // bound is measured on the composed map and not only on the request's half of it
+        // (`crate::state::merge_attributes_within_bound`). Measured here, before any
+        // session is opened or any record written, so a refused composition leaves the
+        // store exactly as it was.
+        let attributes = crate::state::merge_attributes_within_bound(
+            Self::NAME,
+            "attributes",
+            &participant.attributes,
+            requested_attributes,
+        )
+        .map_err(|message| {
+            crate::state::validation_failed(
+                StartParticipantReplicationErrorModeled::ValidationException,
+                message,
+            )
+        })?;
+
         // One participant is replicated into one destination stage once: a second
         // replication of the same participant into the same stage would be a second
         // replica of one publisher in one stage, which is the inconsistent state this
@@ -332,13 +359,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &input.destination_stage_arn,
                     )
                 })?;
-
-        // "These attributes are merged with any attributes set for this participant when
-        // creating the token. If there is overlap in keys, the values in these attributes
-        // are replaced" — so the source participant's own attributes first, then the
-        // request's over them.
-        let mut attributes = participant.attributes.clone();
-        attributes.extend(requested_attributes);
 
         let sequence = store.next_sequence();
         let record = crate::state::ParticipantReplicaRecord {
