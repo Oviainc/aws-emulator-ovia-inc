@@ -1,15 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetImages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetImages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Generates the images of one stream's archived media at the instants a timestamp
+//! window is sampled at. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetImages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## Behaviour
+//!
+//! * The request names exactly one stream, by `StreamName` or `StreamARN`; neither or
+//!   both is `InvalidArgumentException` (400) and a name or ARN no stream answers to is
+//!   `ResourceNotFoundException` (404). The stream is resolved in the Kinesis Video
+//!   Streams registry, so its current retention is read on every call, and a stream
+//!   that retains no data is `NoDataRetentionException` (400).
+//! * The window is refused as `InvalidArgumentException` (400) when `EndTimestamp` does
+//!   not come after `StartTimestamp` — a window that ends where it starts names no
+//!   range for `StartTimestamp`'s documented "inclusive range of timestamps for an
+//!   image to be returned" either — and when it spans more than the documented 300
+//!   seconds.
+//! * A window the stream's archive holds NO fragment in is refused WHOLESALE with
+//!   `ResourceNotFoundException` (404), not answered 200 with per-image markers: the
+//!   refusal is a pure function of the archive and the requested window, so repeating
+//!   the identical call — concurrently or not — answers identically.
+//!   "In" the window is the archive's one range rule, the same one `ListFragments`,
+//!   `GetClip` and the streaming sessions select with: a fragment is in a window when
+//!   its own selected timestamp — "the (starting) timestamp of the fragment" — falls
+//!   inside it. That is deliberately NOT the per-instant covering relation used below:
+//!   this refusal answers the error's documented condition, "a stream that has no
+//!   fragments within the requested time range", whereas an individual image is
+//!   generated from whichever fragment was being recorded at its instant, which may
+//!   have started before the window.
+//! * Otherwise one image is generated per sampled instant: the window's start, then one
+//!   every `SamplingInterval` milliseconds while the window lasts. Each image is either
+//!   the frame the covering fragment's archived bytes carry, re-encoded in the requested
+//!   `Format` at the requested size, or the modelled per-image `ImageError` —
+//!   `NO_MEDIA` when no fragment covers the instant, `MEDIA_ERROR` when the covering
+//!   fragment's bytes carry no frame that can be generated into the requested image.
+//! * The response carries at most the documented 25 images, and a `NextToken` while
+//!   sampled instants remain.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +158,127 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    date_time_millis, epoch_millis, service_state, FragmentCursor, StoredFragment,
+    StreamLookupError, TimestampOrigin, NO_DATA_RETENTION_MESSAGE, TIMESTAMP_RANGE_ORDER_MESSAGE,
+};
+use std::io::Cursor;
+
+/// The widest window one request may span, in milliseconds: `EndTimestamp` is
+/// documented as "If the time range between StartTimestamp and EndTimestamp is more
+/// than 300 seconds above StartTimestamp, you will receive an IllegalArgumentException."
+const MAX_WINDOW_MILLIS: i64 = 300_000;
+
+/// The smallest sampling interval a request may name, in milliseconds:
+/// `SamplingInterval` is documented as "The minimum value that can be provided is 200
+/// ms (5 images per second)."
+const MIN_SAMPLING_INTERVAL_MILLIS: i64 = 200;
+
+/// How many images one response carries at most: `MaxResults` is documented as "The
+/// default limit is 25 images per API response. Providing a MaxResults greater than
+/// this value will result in a page size of 25", so it is both the default page size
+/// and the ceiling on a requested one.
+const MAX_IMAGES_PER_PAGE: i64 = 25;
+
+/// The only key `FormatConfig` carries, as the `FormatConfigKey` enum names it (its
+/// single value, [`FORMAT_CONFIG_KEY_VALUES`]).
+const JPEG_QUALITY_KEY: &str = "JPEGQuality";
+
+/// The smallest JPEG quality the `FormatConfig` value accepts: it "accepts ints from 1
+/// to 100. If the value is 1, the image will be generated with less quality and the
+/// best compression."
+const MIN_JPEG_QUALITY: i64 = 1;
+/// The largest: "If the value is 100, the image will be generated with the best quality
+/// and less compression."
+const MAX_JPEG_QUALITY: i64 = 100;
+/// The quality used when the request names none: "If no value is provided, the default
+/// value of the JPEGQuality key will be set to 80."
+const DEFAULT_JPEG_QUALITY: u8 = 80;
+
+/// The longest `ImageContent` the model lets one image carry (`ImageContent`,
+/// len 1..6291456), counted on the base64 text the member holds.
+const MAX_IMAGE_CONTENT_CHARS: usize = 6_291_456;
+
+/// What an image no media was available for reports: "If there is no media available
+/// for the given timestamp, the NO_MEDIA error will be listed in the output."
+/// (`ImageError`, [`IMAGE_ERROR_VALUES`].)
+const NO_MEDIA: &str = "NO_MEDIA";
+/// What an image that could not be generated reports: "If an error occurs while the
+/// image is being generated, the MEDIA_ERROR will be listed in the output as the cause
+/// of the missing image."
+const MEDIA_ERROR: &str = "MEDIA_ERROR";
+
+/// The refusal a request over a window the archive holds no fragment in carries.
+/// `ResourceNotFoundException` (404) is what Kinesis Video Streams raises when it
+/// "can't find the stream that you specified" AND when the request names no archived
+/// media; this message is the second case, entirely fixed text naming neither the
+/// stream nor the window.
+const NO_FRAGMENTS_MESSAGE: &str = "No fragments found in the stream for the GetImages request.";
+
+/// The largest frame side one decode or one resize may produce. NOT an AWS limit: it
+/// bounds what the archived bytes of a single fragment may expand into, both while the
+/// frame is decoded and while it is scaled to the requested size.
+const MAX_FRAME_SIDE: u32 = 8192;
+/// The most one decode may allocate, for the same reason: a small archived blob must
+/// not make one request allocate without limit.
+const MAX_FRAME_ALLOC: u64 = 64 * 1024 * 1024;
+/// The most pixels one generated frame may hold: [`MAX_FRAME_ALLOC`] at the four bytes
+/// per pixel a decoded frame is held in, so the frame a request asks for is bounded by
+/// the same budget as the frame that was decoded.
+const MAX_FRAME_PIXELS: u64 = MAX_FRAME_ALLOC / 4;
+
+/// The smallest output side the model admits (`WidthPixels` range 1..3840,
+/// `HeightPixels` range 1..2160 — both floors are 1).
+const MIN_OUTPUT_SIDE: i32 = 1;
+/// The largest `WidthPixels` the model admits (range 1..3840).
+const MAX_WIDTH_PIXELS: i32 = 3840;
+/// The largest `HeightPixels` the model admits (range 1..2160).
+const MAX_HEIGHT_PIXELS: i32 = 2160;
+
+/// The image format the generated images are encoded in: the `Format` enum's value set
+/// ([`FORMAT_VALUES`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    /// `JPEG`, encoded at the request's `JPEGQuality`.
+    Jpeg,
+    /// `PNG`.
+    Png,
+}
+
+impl OutputFormat {
+    /// Parse a wire enum value, or `None` when it is outside the value set.
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "JPEG" => Some(Self::Jpeg),
+            "PNG" => Some(Self::Png),
+            _ => None,
+        }
+    }
+}
+
+/// How the generated images are encoded: everything the request says about their form,
+/// read off it once so every image on the page is generated the same way.
+#[derive(Debug, Clone, Copy)]
+struct ImageForm {
+    /// The format the image is encoded in.
+    format: OutputFormat,
+    /// The JPEG quality, read by [`OutputFormat::Jpeg`] alone.
+    quality: u8,
+    /// The requested output width, when the request named one.
+    width: Option<u32>,
+    /// The requested output height, when the request named one.
+    height: Option<u32>,
+}
+
+/// One sampled instant, with the archived media the image at it is generated from.
+#[derive(Debug)]
+struct SampledInstant {
+    /// The instant the image is generated for, in epoch milliseconds.
+    at_millis: i64,
+    /// The media of the fragment covering that instant, or `None` when the archive
+    /// holds no fragment covering it.
+    media: Option<Vec<u8>>,
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -205,18 +352,626 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetImages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetImagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetImages"))
+        let _ = ctx;
+
+        let invalid = |message: String| -> Self::Error {
+            GetImagesErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let Some(state) = service_state(&*self.engine) else {
+            // See the note in `list_fragments`: unreachable in the assembled emulator,
+            // and reported as a modelled failure rather than as an empty success, so a
+            // client never reads an empty image list as "this window holds no media".
+            return Err(GetImagesErrorModeled::ClientLimitExceededException(
+                ClientLimitExceededException {
+                    message: Some("the archived-media store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Everything this answer depends on is read under ONE lock, and the images
+        // themselves are generated after it is released: the answer is a function of the
+        // requested window and of the archive as of that single read, so two identical
+        // calls cannot interleave into two different answers.
+        let (sampled, next_token, form) = {
+            let state = state.lock();
+
+            let stream = match state.resolve_stream(
+                &*self.engine,
+                input.stream_name.as_deref(),
+                input.stream_arn.as_deref(),
+            ) {
+                Ok(stream) => stream,
+                Err(StreamLookupError::InvalidArgument(message)) => return Err(invalid(message)),
+                Err(StreamLookupError::NotFound(message)) => {
+                    return Err(GetImagesErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+            };
+
+            // "GetImages was requested for a stream that does not retain data (that is,
+            // has a DataRetentionInHours of 0)."
+            if !stream.retains_data() {
+                return Err(GetImagesErrorModeled::NoDataRetentionException(
+                    NoDataRetentionException {
+                        message: Some(NO_DATA_RETENTION_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+
+            let Some(origin) = TimestampOrigin::parse(&input.image_selector_type) else {
+                return Err(invalid(format!(
+                    "ImageSelectorType must be one of [{}]",
+                    IMAGE_SELECTOR_TYPE_VALUES.join(", ")
+                )));
+            };
+            let Some(format) = OutputFormat::parse(&input.format) else {
+                return Err(invalid(format!(
+                    "Format must be one of [{}]",
+                    FORMAT_VALUES.join(", ")
+                )));
+            };
+            let quality = jpeg_quality(input.format_config.as_ref()).map_err(invalid)?;
+            // The output sides are read — and bounded — here, because the frame budget
+            // the generation runs under is computed FROM them.
+            let width = bounded_side(input.width_pixels, "WidthPixels", MAX_WIDTH_PIXELS)
+                .map_err(invalid)?;
+            let height = bounded_side(input.height_pixels, "HeightPixels", MAX_HEIGHT_PIXELS)
+                .map_err(invalid)?;
+
+            let start_millis = date_time_millis(&input.start_timestamp);
+            let end_millis = date_time_millis(&input.end_timestamp);
+            // `StartTimestamp` "must be within an inclusive range of timestamps for an
+            // image to be returned", so a window that does not run forwards names no
+            // range for an image to fall in.
+            if end_millis <= start_millis {
+                return Err(invalid(TIMESTAMP_RANGE_ORDER_MESSAGE.to_string()));
+            }
+            if end_millis.saturating_sub(start_millis) > MAX_WINDOW_MILLIS {
+                return Err(invalid(format!(
+                    "The time range between StartTimestamp and EndTimestamp must not be more \
+                     than {} seconds.",
+                    MAX_WINDOW_MILLIS / 1000
+                )));
+            }
+
+            let interval = match input.sampling_interval {
+                None => None,
+                Some(value) => {
+                    let millis = i64::from(value);
+                    if millis < MIN_SAMPLING_INTERVAL_MILLIS {
+                        return Err(invalid(format!(
+                            "SamplingInterval must be at least {MIN_SAMPLING_INTERVAL_MILLIS} ms."
+                        )));
+                    }
+                    Some(millis)
+                }
+            };
+
+            // Where this page starts. A continuation re-states the window and the
+            // selector (the model makes all three required members), so the token
+            // carries only how far the previous pages got — and it must have been issued
+            // for this very query.
+            let offset = match input.next_token.as_deref() {
+                None => 0,
+                Some(token) => {
+                    let Some(cursor) = FragmentCursor::decode(token) else {
+                        return Err(invalid(
+                            "NextToken is not a valid pagination token".to_string(),
+                        ));
+                    };
+                    if cursor.stream_name != stream.name
+                        || cursor.origin != origin
+                        || cursor.start_millis != start_millis
+                        || cursor.end_millis != end_millis
+                    {
+                        return Err(invalid(
+                            "NextToken was issued for a different stream or timestamp range"
+                                .to_string(),
+                        ));
+                    }
+                    cursor.offset
+                }
+            };
+
+            // The archive holds nothing in the requested window: the WHOLE call is
+            // refused, rather than answered with a list of absence markers.
+            if stream
+                .fragments_in_range(origin, start_millis, end_millis)
+                .is_empty()
+            {
+                return Err(GetImagesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(NO_FRAGMENTS_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+
+            let instants = sampled_instants(start_millis, end_millis, interval);
+            // "Providing a MaxResults greater than this value will result in a page
+            // size of 25": a larger request is served at the ceiling rather than
+            // refused. The floor is the model's own (`GetImagesMaxResults` range
+            // 1..100, refused at the boundary), and the clamp keeps the page size a
+            // bounded number whatever reaches here — no count a caller sends sizes an
+            // allocation.
+            let page_size = usize::try_from(
+                input
+                    .max_results
+                    .unwrap_or(MAX_IMAGES_PER_PAGE)
+                    .clamp(1, MAX_IMAGES_PER_PAGE),
+            )
+            .unwrap_or(1);
+
+            let sampled: Vec<SampledInstant> = instants
+                .iter()
+                .skip(offset)
+                .take(page_size)
+                .map(|&at_millis| SampledInstant {
+                    at_millis,
+                    media: covering_media(stream.fragments, origin, at_millis),
+                })
+                .collect();
+
+            // "This value is null when there are no more results to return."
+            let next_offset = offset.saturating_add(sampled.len());
+            let next_token = (next_offset < instants.len()).then(|| {
+                FragmentCursor {
+                    stream_name: stream.name.clone(),
+                    origin,
+                    start_millis,
+                    end_millis,
+                    offset: next_offset,
+                }
+                .encode()
+            });
+
+            (
+                sampled,
+                next_token,
+                ImageForm {
+                    format,
+                    quality,
+                    width,
+                    height,
+                },
+            )
+        };
+
+        // Decoding and re-encoding a frame is CPU-bound, so the page is generated OFF
+        // the async worker: doing it inline would stall the runtime — and with it every
+        // other request's timeout, health check and shutdown — for as long as the page
+        // takes.
+        let images = match ::tokio::task::spawn_blocking(move || generated_page(sampled, form))
+            .await
+        {
+            Ok(images) => images,
+            Err(error) => {
+                ::tracing::error!(error = %error, "generating the images did not complete");
+                return Err(GetImagesErrorModeled::ClientLimitExceededException(
+                    ClientLimitExceededException {
+                        message: Some("generating the images did not complete".to_string()),
+                    },
+                )
+                .into());
+            }
+        };
+
+        Ok(GetImagesOutput {
+            images: Some(images),
+            next_token,
+        })
+    }
+}
+
+/// The JPEG quality a request's `FormatConfig` names, or the documented default when it
+/// names none. `Err` carries the refusal for a config outside the map's own enum key
+/// and value range.
+fn jpeg_quality(
+    format_config: Option<&std::collections::HashMap<String, String>>,
+) -> Result<u8, String> {
+    let Some(config) = format_config else {
+        return Ok(DEFAULT_JPEG_QUALITY);
+    };
+    let mut quality = DEFAULT_JPEG_QUALITY;
+    for (key, value) in config {
+        if key != JPEG_QUALITY_KEY {
+            return Err(format!(
+                "FormatConfig keys must be one of [{}]",
+                FORMAT_CONFIG_KEY_VALUES.join(", ")
+            ));
+        }
+        let parsed = value
+            .parse::<i64>()
+            .ok()
+            .filter(|parsed| (MIN_JPEG_QUALITY..=MAX_JPEG_QUALITY).contains(parsed));
+        let Some(parsed) = parsed else {
+            return Err(format!(
+                "The {JPEG_QUALITY_KEY} value must be an integer from {MIN_JPEG_QUALITY} to \
+                 {MAX_JPEG_QUALITY}."
+            ));
+        };
+        quality = u8::try_from(parsed).unwrap_or(DEFAULT_JPEG_QUALITY);
+    }
+    Ok(quality)
+}
+
+/// The output side `member` named, inside the range the model declares for it, or `Err`
+/// with the refusal for a value outside it.
+///
+/// The boundary validator refuses such a value before this handler runs, from the
+/// model's own `@range`; the bound is re-stated here because the frame budget the
+/// generation runs under is computed FROM this number, so the code that uses it also
+/// establishes it.
+fn bounded_side(value: Option<i32>, member: &str, max: i32) -> Result<Option<u32>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let refusal = || format!("{member} must be between {MIN_OUTPUT_SIDE} and {max}.");
+    if value < MIN_OUTPUT_SIDE || value > max {
+        return Err(refusal());
+    }
+    u32::try_from(value).map(Some).map_err(|_| refusal())
+}
+
+/// Every instant in `[start_millis, end_millis]` an image is generated for: the start,
+/// then one per sampling interval while the window lasts.
+///
+/// With no interval named there is no second sample point, so the window yields the one
+/// image `SamplingInterval`'s documentation describes for a window shorter than the
+/// interval — "the image from the startTimestamp will be returned if available".
+fn sampled_instants(start_millis: i64, end_millis: i64, interval: Option<i64>) -> Vec<i64> {
+    let Some(interval) = interval else {
+        return vec![start_millis];
+    };
+    let mut instants = Vec::new();
+    let mut at = start_millis;
+    while at <= end_millis {
+        instants.push(at);
+        // Checked rather than saturating: at the very end of the representable range a
+        // saturating step would stop advancing and this walk would never terminate.
+        match at.checked_add(interval) {
+            Some(next) => at = next,
+            None => break,
+        }
+    }
+    instants
+}
+
+/// The archived media of the fragment that was being recorded at `at_millis`, read on
+/// the selector's timestamp field: the fragment whose selected timestamp starts at or
+/// before that instant and whose playback duration still covers it.
+///
+/// `None` when the archive holds no such fragment — the `NO_MEDIA` case. The whole
+/// archive is searched, not only the requested window, because a fragment that started
+/// before the window may still be the one covering its first instants.
+fn covering_media(
+    fragments: &[StoredFragment],
+    origin: TimestampOrigin,
+    at_millis: i64,
+) -> Option<Vec<u8>> {
+    fragments
+        .iter()
+        .rev()
+        .find(|fragment| {
+            let from = epoch_millis(origin.of(fragment));
+            let duration = i64::try_from(fragment.duration_millis).unwrap_or(i64::MAX);
+            let until = from.saturating_add(duration);
+            from <= at_millis && (at_millis < until || at_millis == from)
+        })
+        .map(|fragment| fragment.media.clone())
+}
+
+/// The images of one page: one per sampled instant, generated from the archived bytes
+/// read for it.
+///
+/// CPU-bound — one decode and one re-encode per instant — so the request path reaches
+/// it on the blocking pool, never on the async worker.
+fn generated_page(sampled: Vec<SampledInstant>, form: ImageForm) -> Vec<Image> {
+    sampled
+        .into_iter()
+        .map(|instant| {
+            // `Image$TimeStamp` is the instant the image was extracted FOR, which is
+            // the sampled instant itself whenever the archive covers it.
+            let time_stamp = Some(::aws_smithy_types::DateTime::from_millis(instant.at_millis));
+            match instant
+                .media
+                .as_deref()
+                .map(|media| generated_image(media, form))
+            {
+                None => Image {
+                    time_stamp,
+                    error: Some(NO_MEDIA.to_string()),
+                    image_content: None,
+                },
+                Some(None) => Image {
+                    time_stamp,
+                    error: Some(MEDIA_ERROR.to_string()),
+                    image_content: None,
+                },
+                Some(Some(image_content)) => Image {
+                    time_stamp,
+                    error: None,
+                    image_content: Some(image_content),
+                },
+            }
+        })
+        .collect()
+}
+
+/// The image generated from one fragment's archived bytes, as the base64 text the
+/// `ImageContent` member carries, or `None` when no image can be generated from them —
+/// the `MEDIA_ERROR` case.
+///
+/// The frame is the archive's OWN bytes, decoded and re-encoded in the requested form:
+/// nothing is synthesised for a fragment whose bytes carry no frame this emulator can
+/// read, and nothing is returned that the modelled `ImageContent` ceiling cannot carry.
+fn generated_image(media: &[u8], form: ImageForm) -> Option<String> {
+    let frame = resized(decode_frame(media)?, form.width, form.height)?;
+    let encoded = encode_frame(&frame, form.format, form.quality)?;
+    let content = ::aws_smithy_types::base64::encode(&encoded);
+    (!content.is_empty() && content.len() <= MAX_IMAGE_CONTENT_CHARS).then_some(content)
+}
+
+/// The frame a fragment's archived bytes carry, decoded under this emulator's own
+/// bounds, or `None` when those bytes carry no frame it can read.
+///
+/// The format comes from the bytes' own magic numbers, never from the stream's declared
+/// `MediaType`: what the archive holds is what can be decoded.
+fn decode_frame(media: &[u8]) -> Option<::image::DynamicImage> {
+    let format = match ::image::guess_format(media) {
+        Ok(format @ (::image::ImageFormat::Png | ::image::ImageFormat::Jpeg)) => format,
+        _ => return None,
+    };
+    let mut reader = ::image::ImageReader::with_format(Cursor::new(media), format);
+    // `no_limits()` rather than `default()`: the bounds here are this emulator's, and
+    // starting from the crate's defaults would silently inherit them.
+    let mut limits = ::image::Limits::no_limits();
+    limits.max_image_width = Some(MAX_FRAME_SIDE);
+    limits.max_image_height = Some(MAX_FRAME_SIDE);
+    limits.max_alloc = Some(MAX_FRAME_ALLOC);
+    reader.limits(limits);
+    reader.decode().ok()
+}
+
+/// `frame` at the size the request asked for, or `None` when that size is past the
+/// frame budget — the `MEDIA_ERROR` case.
+///
+/// Both sides given stretches the frame to that aspect ratio ("the image will be
+/// stretched to fit the specified aspect ratio"); one side alone keeps the frame's own
+/// ratio, as `HeightPixels` documents ("its original aspect ratio will be used to
+/// calculate the WidthPixels ratio") and symmetrically for a width alone; neither
+/// returns "the original image size from the stream".
+///
+/// The size it generates is BOUNDED by the same budget the decode runs under
+/// ([`MAX_FRAME_SIDE`], [`MAX_FRAME_PIXELS`]), checked before anything is allocated. A
+/// request inside the modelled ranges is always inside that budget; what the check
+/// refuses is a side DERIVED from an extreme archived frame ratio, which no request
+/// bound of its own can cap.
+fn resized(
+    frame: ::image::DynamicImage,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Option<::image::DynamicImage> {
+    let (source_width, source_height) = (frame.width(), frame.height());
+    if source_width == 0 || source_height == 0 {
+        return Some(frame);
+    }
+    let (width, height) = match (width, height) {
+        (None, None) => return Some(frame),
+        (Some(width), Some(height)) => (width, height),
+        (Some(width), None) => (width, scaled(source_height, width, source_width)),
+        (None, Some(height)) => (scaled(source_width, height, source_height), height),
+    };
+    if width > MAX_FRAME_SIDE
+        || height > MAX_FRAME_SIDE
+        || u64::from(width) * u64::from(height) > MAX_FRAME_PIXELS
+    {
+        return None;
+    }
+    Some(frame.resize_exact(width, height, ::image::imageops::FilterType::Triangle))
+}
+
+/// `side` scaled by `to`/`from`, never smaller than one pixel.
+fn scaled(side: u32, to: u32, from: u32) -> u32 {
+    let scaled = u64::from(side) * u64::from(to) / u64::from(from.max(1));
+    u32::try_from(scaled).unwrap_or(u32::MAX).max(1)
+}
+
+/// `frame` encoded in the requested format, or `None` when the encoder refuses it.
+fn encode_frame(
+    frame: &::image::DynamicImage,
+    format: OutputFormat,
+    quality: u8,
+) -> Option<Vec<u8>> {
+    use ::image::ImageEncoder;
+
+    let mut encoded: Vec<u8> = Vec::new();
+    match format {
+        OutputFormat::Jpeg => {
+            // JPEG carries no alpha channel, so the frame is encoded from its RGB
+            // channels, at the quality the request's `JPEGQuality` named.
+            let rgb = frame.to_rgb8();
+            ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, quality)
+                .write_image(
+                    rgb.as_raw(),
+                    rgb.width(),
+                    rgb.height(),
+                    ::image::ExtendedColorType::Rgb8,
+                )
+                .ok()?;
+        }
+        OutputFormat::Png => {
+            let rgba = frame.to_rgba8();
+            ::image::codecs::png::PngEncoder::new(&mut encoded)
+                .write_image(
+                    rgba.as_raw(),
+                    rgba.width(),
+                    rgba.height(),
+                    ::image::ExtendedColorType::Rgba8,
+                )
+                .ok()?;
+        }
+    }
+    Some(encoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bounded_side, resized, MAX_FRAME_PIXELS, MAX_FRAME_SIDE, MAX_HEIGHT_PIXELS,
+        MAX_WIDTH_PIXELS,
+    };
+
+    /// A solid frame of `width` x `height`, the cheapest thing to scale.
+    fn frame(width: u32, height: u32) -> ::image::DynamicImage {
+        ::image::DynamicImage::ImageRgba8(::image::RgbaImage::new(width, height))
+    }
+
+    /// RULE: an output side is accepted exactly inside the range the model declares
+    /// for it — the rows are both floors, both ceilings, one past each, and the
+    /// absent member.
+    #[test]
+    fn an_output_side_is_accepted_only_inside_its_modelled_range() {
+        // (case, member, maximum, the value, whether it is accepted)
+        let rows: [(&str, &str, i32, Option<i32>, bool); 8] = [
+            ("no width named", "WidthPixels", MAX_WIDTH_PIXELS, None, true),
+            ("the width floor", "WidthPixels", MAX_WIDTH_PIXELS, Some(1), true),
+            (
+                "the width ceiling",
+                "WidthPixels",
+                MAX_WIDTH_PIXELS,
+                Some(MAX_WIDTH_PIXELS),
+                true,
+            ),
+            (
+                "one past the width ceiling",
+                "WidthPixels",
+                MAX_WIDTH_PIXELS,
+                Some(MAX_WIDTH_PIXELS + 1),
+                false,
+            ),
+            ("a zero width", "WidthPixels", MAX_WIDTH_PIXELS, Some(0), false),
+            (
+                "a negative width",
+                "WidthPixels",
+                MAX_WIDTH_PIXELS,
+                Some(-1),
+                false,
+            ),
+            (
+                "the height ceiling",
+                "HeightPixels",
+                MAX_HEIGHT_PIXELS,
+                Some(MAX_HEIGHT_PIXELS),
+                true,
+            ),
+            (
+                "one past the height ceiling",
+                "HeightPixels",
+                MAX_HEIGHT_PIXELS,
+                Some(MAX_HEIGHT_PIXELS + 1),
+                false,
+            ),
+        ];
+        for (case, member, max, value, accepted) in rows {
+            let actual = bounded_side(value, member, max);
+            assert_eq!(
+                actual.is_ok(),
+                accepted,
+                "case {case:?}: expected accepted? {accepted}, got {actual:?}"
+            );
+        }
+    }
+
+    /// One row of the frame-budget table: the archived frame's size, the size the
+    /// request asks for, and the size that may be generated from it.
+    struct BudgetCase {
+        /// What this row is about.
+        case: &'static str,
+        /// The size of the archived frame.
+        source: (u32, u32),
+        /// The `WidthPixels` the request names.
+        width: Option<u32>,
+        /// The `HeightPixels` the request names.
+        height: Option<u32>,
+        /// The size the generated frame has, or `None` when none may be generated.
+        expected: Option<(u32, u32)>,
+    }
+
+    /// RULE: the frame a request asks for is generated only inside the frame budget —
+    /// a side past the side ceiling or a target past the pixel budget is no image
+    /// rather than an allocation, however the side was arrived at.
+    #[test]
+    fn a_frame_past_the_budget_is_not_generated() {
+        let rows = [
+            BudgetCase {
+                case: "the frame's own size",
+                source: (8, 4),
+                width: None,
+                height: None,
+                expected: Some((8, 4)),
+            },
+            BudgetCase {
+                case: "both sides inside the budget",
+                source: (8, 4),
+                width: Some(16),
+                height: Some(32),
+                expected: Some((16, 32)),
+            },
+            BudgetCase {
+                case: "one side, with the frame's own ratio",
+                source: (8, 4),
+                width: Some(16),
+                height: None,
+                expected: Some((16, 8)),
+            },
+            BudgetCase {
+                case: "a side derived from an extreme ratio, past the side ceiling",
+                source: (1, 2048),
+                width: Some(MAX_WIDTH_PIXELS.unsigned_abs()),
+                height: None,
+                expected: None,
+            },
+            BudgetCase {
+                case: "a target past the pixel budget",
+                source: (4, 4),
+                width: Some(MAX_FRAME_SIDE),
+                height: Some(MAX_FRAME_SIDE),
+                expected: None,
+            },
+        ];
+        for row in rows {
+            let BudgetCase {
+                case,
+                source: (source_width, source_height),
+                width,
+                height,
+                expected,
+            } = row;
+            let generated =
+                resized(frame(source_width, source_height), width, height).map(|frame| {
+                    assert!(
+                        u64::from(frame.width()) * u64::from(frame.height()) <= MAX_FRAME_PIXELS,
+                        "case {case:?}: expected a frame inside the pixel budget, got {}x{}",
+                        frame.width(),
+                        frame.height()
+                    );
+                    (frame.width(), frame.height())
+                });
+            assert_eq!(
+                generated, expected,
+                "case {case:?}: expected {expected:?}, got {generated:?}"
+            );
+        }
     }
 }

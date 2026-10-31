@@ -499,7 +499,8 @@ pub struct FragmentCursor {
     pub start_millis: i64,
     /// The inclusive end of the selected range.
     pub end_millis: i64,
-    /// How many matching fragments earlier pages already returned.
+    /// How many results earlier pages already returned: matching fragments for a
+    /// fragment listing, sampled instants for an image page.
     pub offset: usize,
 }
 

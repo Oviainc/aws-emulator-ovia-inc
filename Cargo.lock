@@ -10981,6 +10981,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "image",
  "serde_json",
  "service-com-amazonaws-kinesisvideo-kinesisvideo-20170930",
  "service-common",

@@ -1407,27 +1407,15 @@ async fn get_hls_streaming_session_url_refuses_a_stream_with_no_retention() {
     );
 }
 
-/// The two operations this slice leaves unimplemented still answer 501, so a
+/// The operation this slice leaves unimplemented still answers 501, so a
 /// caller can tell "nobody has written it yet" from a real, empty answer.
 #[tokio::test]
 async fn the_operations_outside_this_slice_still_answer_not_implemented() {
     let harness = seeded();
-    let cases: Vec<(&str, serde_json::Value)> = vec![
-        (
-            "/getDASHStreamingSessionURL",
-            serde_json::json!({ "StreamName": STREAM, "PlaybackMode": "ON_DEMAND" }),
-        ),
-        (
-            "/getImages",
-            serde_json::json!({
-                "StreamName": STREAM,
-                "ImageSelectorType": "PRODUCER_TIMESTAMP",
-                "StartTimestamp": T0_SECS,
-                "EndTimestamp": T0_SECS + 1000,
-                "Format": "JPEG",
-            }),
-        ),
-    ];
+    let cases: Vec<(&str, serde_json::Value)> = vec![(
+        "/getDASHStreamingSessionURL",
+        serde_json::json!({ "StreamName": STREAM, "PlaybackMode": "ON_DEMAND" }),
+    )];
 
     for (path, body) in cases {
         let response = harness.post(path, &body).await;
