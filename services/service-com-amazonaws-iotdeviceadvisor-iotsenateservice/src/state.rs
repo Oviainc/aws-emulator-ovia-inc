@@ -657,7 +657,15 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
     }
 
     /// Add `tags` to `arn`'s row, overwriting the value of every key it already carries
-    /// and leaving the rest in place.
+    /// and leaving the rest in place, and report how many keys the call actually WROTE.
+    ///
+    /// `Ok` counts the named keys the row did not carry with that value already — the ones
+    /// this call created or whose value it replaced — so `Ok(0)` is a merge that left the
+    /// stored tags exactly as they were, whether because it named no key at all (`TagMap`
+    /// is `len 0..50`, so an empty map is a legal request) or because every key it named
+    /// already carried the value it asked for. The counterpart of
+    /// [`remove_tags`](Self::remove_tags), which reports the same way, and what lets a
+    /// caller's audit record state the no-op rather than claim a change.
     ///
     /// `Err` is how many tags the merge would have left, when that is past `limit`: the
     /// caller refuses with its own modelled error and the row is left untouched, so a
@@ -668,7 +676,7 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
         arn: &str,
         tags: BTreeMap<String, String>,
         limit: usize,
-    ) -> Result<(), usize> {
+    ) -> Result<usize, usize> {
         let existing = self.tags.get(arn);
         let would_hold = existing.map_or(tags.len(), |existing| {
             existing.len() + tags.keys().filter(|key| !existing.contains_key(*key)).count()
@@ -676,12 +684,20 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
         if would_hold > limit {
             return Err(would_hold);
         }
-        if tags.is_empty() {
-            return Ok(());
+        let written = tags
+            .iter()
+            .filter(|(key, value)| {
+                existing.is_none_or(|existing| existing.get(key.as_str()) != Some(*value))
+            })
+            .count();
+        if written == 0 {
+            // Nothing to write: the row — including the absence of one — is left as it is,
+            // so an empty merge onto an untagged resource creates no row for it.
+            return Ok(0);
         }
         let row = self.tags.entry(arn.to_string()).or_default();
         row.extend(tags);
-        Ok(())
+        Ok(written)
     }
 
     /// Retain at most `keep` runs of `suite_definition_id`, dropping the OLDEST ones that

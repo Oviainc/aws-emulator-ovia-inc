@@ -14,6 +14,10 @@
 //! each one every way its call can end — completed, a no-op, and each refusal it answers
 //! (a prose-rule violation, a reused idempotency token, a resource the store does not hold,
 //! a value that is not one of this service's ARNs, a per-resource limit, a conflicting run).
+//!
+//! The merges that write nothing — the no-op end of `TagResource` — are a table of their own
+//! in `tests/all/tag_merge_outcome.rs`, which reads the same capture under the same serial
+//! lock ([`audit_serial`]).
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iotdeviceadvisor_iotsenateservice as iotdeviceadvisor;
@@ -22,12 +26,12 @@ use super::endpoint::percent_encode;
 use super::suite_lifecycle::{thing_arn, Answer, Emulator, ROLE_ARN};
 
 /// The region every call below signs for, so the ARN a record names is predictable.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The access key id these calls present: this suite's own, so the records it reads back
 /// are its own and a sibling suite driving the same routes in parallel cannot add to the
 /// count a row demands.
-const AUDIT_AKID: &str = "AKIDAUDITTRAIL";
+pub(crate) const AUDIT_AKID: &str = "AKIDAUDITTRAIL";
 
 /// An id of the modelled `UUID` form (`len 12..36`) that no call below creates.
 const UNKNOWN_ID: &str = "11111111-2222-3333-4444-555555555555";
@@ -89,7 +93,7 @@ fn run_arn(definition_id: &str, run_id: &str) -> String {
 }
 
 /// The `/tags/{resourceArn}` URI for `arn`.
-fn tags_uri(arn: &str) -> String {
+pub(crate) fn tags_uri(arn: &str) -> String {
     format!("/tags/{}", percent_encode(arn))
 }
 
@@ -108,7 +112,7 @@ fn tags_uri(arn: &str) -> String {
 /// it stays per-crate because an integration test target cannot import another crate's test
 /// module.
 #[derive(Clone, Default)]
-struct CapturedRecords(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+pub(crate) struct CapturedRecords(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
 impl CapturedRecords {
     /// Every record captured since the last drain, clearing the buffer.
@@ -166,7 +170,21 @@ impl tracing::Subscriber for CapturedRecords {
 /// reads are picked out by the access key id only it presents.
 static AUDIT_CAPTURE: std::sync::OnceLock<CapturedRecords> = std::sync::OnceLock::new();
 
-fn audit_capture() -> &'static CapturedRecords {
+/// Serializes the suites that read their own records back out of the capture.
+///
+/// The capture is one process-wide buffer and a read DRAINS it, so a second suite reading
+/// records at the same time would take this one's. Every such suite awaits this for as long
+/// as it is reading; suites that only make calls need it not, because a record is picked out
+/// by the access key id that wrote it. An async-aware lock, because a suite holds it across
+/// the awaits of the calls it is reading the records of.
+static AUDIT_SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+/// Take [`AUDIT_SERIAL`], waiting for whichever suite holds it.
+pub(crate) async fn audit_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    AUDIT_SERIAL.get_or_init(Default::default).lock().await
+}
+
+pub(crate) fn audit_capture() -> &'static CapturedRecords {
     AUDIT_CAPTURE.get_or_init(|| {
         let captured = CapturedRecords::default();
         tracing::subscriber::set_global_default(captured.clone())
@@ -191,7 +209,7 @@ fn audit_records(captured: &[String]) -> Vec<String> {
 ///
 /// Asserting the count here is half the rule: a call that wrote none is the gap under test,
 /// and a call that wrote two would mean a path audited twice.
-async fn audited_call(
+pub(crate) async fn audited_call(
     emulator: &Emulator,
     captured: &CapturedRecords,
     case: &str,
@@ -219,7 +237,13 @@ async fn audited_call(
 
 /// What the record of a call must carry: who called, where, which resource, and how the
 /// call ended.
-fn assert_record(case: &str, record: &str, operation: &str, resource: &str, outcome: &str) {
+pub(crate) fn assert_record(
+    case: &str,
+    record: &str,
+    operation: &str,
+    resource: &str,
+    outcome: &str,
+) {
     for field in [
         format!("operation={operation}"),
         format!("access_key_id={AUDIT_AKID:?}"),
@@ -280,6 +304,7 @@ fn seed_in_progress_run(emulator: &Emulator, definition_id: &str) -> (String, St
 /// sibling test draining it in parallel would take another's records.
 #[tokio::test]
 async fn every_mutating_call_leaves_one_audit_record() {
+    let _serial = audit_serial().await;
     let captured = audit_capture();
 
     // Harness self-test, so a missing record below can never be mistaken for a capture that
@@ -434,7 +459,9 @@ async fn every_mutating_call_leaves_one_audit_record() {
             None,
             "TagResource",
             definition.clone(),
-            "tagged".to_string(),
+            // The record states what the merge WROTE: the one key it named was not on the
+            // resource, so the one key it named was written.
+            "tagged 1 of 1 key(s)".to_string(),
         ),
         (
             "a removal naming one key the resource carries and one it does not",
@@ -580,7 +607,7 @@ async fn every_mutating_call_leaves_one_audit_record() {
         &record,
         "TagResource",
         &definition,
-        "tagged",
+        &format!("tagged {MAX_TAGS} of {MAX_TAGS} key(s)"),
     );
     let (answer, record) = audited_call(
         &emulator,

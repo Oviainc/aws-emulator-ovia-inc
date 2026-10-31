@@ -61,3 +61,6 @@ mod suite_run_report;
 
 #[path = "all/suite_runs_listing_and_update.rs"]
 mod suite_runs_listing_and_update;
+
+#[path = "all/tag_merge_outcome.rs"]
+mod tag_merge_outcome;

@@ -30,6 +30,9 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
+# The suites that read the audit capture back share one process-wide buffer, so they
+# serialize on an async-aware lock held across awaits (`tests/all/audit_trail.rs`).
+tokio = { workspace = true, features = ["sync"] }
 
 [lints]
 workspace = true

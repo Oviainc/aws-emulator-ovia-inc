@@ -7,6 +7,10 @@
 //! the `resourceArn` names, overwriting the value of a key already there and leaving every
 //! other key in place.
 //!
+//! The audit record states how many of the named keys the merge actually wrote, so a call
+//! that left the stored tags as they were — one naming no key, or only keys already
+//! carrying the values asked for — is recorded as the no-op it was rather than as a change.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -167,6 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let tags: ::std::collections::BTreeMap<String, String> =
             input.tags.into_iter().collect();
+        // The keys the caller named, counted before the merge consumes them: a map carries
+        // each key once, so this is how many the call asked to set.
+        let named = tags.len();
         let mut store = state.lock();
 
         // An ARN the store holds no resource for is a lookup of the resource the request
@@ -187,26 +194,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The per-resource tag limit: a merge that would leave the resource holding more
         // tags than `TagMap` can carry is refused whole, so a refused call changes nothing.
-        if let Err(would_hold) = store.merge_tags(
+        let written = match store.merge_tags(
             &input.resource_arn,
             tags,
             crate::state::MAX_TAGS_PER_RESOURCE,
         ) {
-            return Err(trail.refused(
-                TagResourceErrorModeled::ValidationException(ValidationException {
-                    // The ARN is request-supplied and as long as a whole message may be, so
-                    // the refusal states it through the crate's one bounded-message rule.
-                    message: Some(crate::state::bounded_message(format!(
-                        "Cannot attach {would_hold} tags to {}: a resource holds at most {} tags",
-                        crate::state::echoed_value(&input.resource_arn),
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    ))),
-                })
-                .into(),
-            ));
-        }
+            Ok(written) => written,
+            Err(would_hold) => {
+                return Err(trail.refused(
+                    TagResourceErrorModeled::ValidationException(ValidationException {
+                        // The ARN is request-supplied and as long as a whole message may be,
+                        // so the refusal states it through the crate's one bounded-message
+                        // rule.
+                        message: Some(crate::state::bounded_message(format!(
+                            "Cannot attach {would_hold} tags to {}: a resource holds at most {} tags",
+                            crate::state::echoed_value(&input.resource_arn),
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        ))),
+                    })
+                    .into(),
+                ));
+            }
+        };
 
-        trail.ended("tagged");
+        // What the call CHANGED, which is what the record is for: an empty `tags` map is a
+        // legal request (`TagMap` is `len 0..50`) and so is one naming only keys the
+        // resource already carries with those values, and neither touches the store — so
+        // the outcome counts the keys actually written out of the keys named, the way the
+        // counterpart removal records how many of its keys it removed.
+        trail.ended(format!("tagged {written} of {named} key(s)"));
         Ok(TagResourceOutput {})
     }
 }
