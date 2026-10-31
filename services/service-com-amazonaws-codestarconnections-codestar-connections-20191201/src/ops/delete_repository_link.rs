@@ -171,11 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // REFERENCE that is not the link id itself.
         //
         // The modelled `SyncConfigurationStillExistsException` (409) guards a link a
-        // sync configuration still references. This service persists no sync
-        // configurations yet — `CreateSyncConfiguration` is still a scaffold stub, so
-        // the store holds nothing that could reference a link — and the guard belongs
-        // with the operation that creates those references, which will resolve them
-        // against the same store this handler reads.
+        // sync configuration still references. Nothing in this crate registers one yet —
+        // `CreateSyncConfiguration` is still a scaffold stub, so the configuration store
+        // (`crate::state::ComAmazonawsCodestarconnectionsCodestarConnections20191201State::sync_configurations`)
+        // is only ever written by that operation — and the guard belongs with the
+        // operation that creates those references, which will resolve them against the
+        // same store this handler reads.
         let mut store = state.lock();
         let removed = store.repository_links.remove(&input.repository_link_id);
         if let Some(link) = removed.as_ref() {

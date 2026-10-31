@@ -16,8 +16,9 @@ use std::hash::BuildHasher;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Connection, Host, RepositoryLinkInfo, RepositorySyncAttempt, ResourceSyncAttempt, Revision,
-    SyncBlocker, SyncBlockerContext, SyncBlockerSummary, Tag, VpcConfiguration,
+    Connection, Host, RepositoryLinkInfo, RepositorySyncAttempt, RepositorySyncDefinition,
+    ResourceSyncAttempt, Revision, SyncBlocker, SyncBlockerContext, SyncBlockerSummary, Tag,
+    VpcConfiguration,
 };
 
 /// This service's ARN namespace (`awsService.arnNamespace` in the Smithy model), used
@@ -389,12 +390,80 @@ pub struct StoredResourceSyncState {
     pub latest_successful_sync: Option<ResourceSyncAttempt>,
 }
 
-/// The key the sync state of a resource is stored under: the `(SyncType, ResourceName)`
-/// pair every sync operation of this service addresses one by.
+/// The key the sync state of a resource — and the sync configuration registered for it —
+/// is stored under: the `(SyncType, ResourceName)` pair every sync operation of this
+/// service addresses one by.
 ///
 /// One function, so a writer and a reader can never disagree about the field order.
 pub fn resource_sync_key(sync_type: &str, resource_name: &str) -> (String, String) {
     (sync_type.to_string(), resource_name.to_string())
+}
+
+/// A sync configuration this service holds: what one `(SyncType, ResourceName)` pair is
+/// configured to sync, and the record a repository sync DEFINITION is derived from.
+///
+/// A definition is a projection of a configuration rather than a record of its own, so
+/// there is one copy of the resource whichever operation reads it:
+/// `RepositorySyncDefinition$Directory` is modeled "The configuration file for a
+/// repository sync definition. This value comes from creating or updating the
+/// `config-file` field of a `sync-configuration`"
+/// (`smithy_query(query="shape", shape="RepositorySyncDefinition")`), which states the
+/// derivation.
+///
+/// A configuration is registered by `CreateSyncConfiguration`, which is still a scaffold
+/// stub, so nothing in `src/` puts a row here yet and a link with no configuration has no
+/// sync definition to report — an empty list, not an absence, because
+/// `ListRepositorySyncDefinitions`' one `@required` output member is a list.
+#[derive(Debug, Clone)]
+pub struct StoredSyncConfiguration {
+    /// The branch the configured resource is synced from.
+    pub branch: String,
+    /// The path of the deployment file in that branch — `CreateSyncConfiguration` models
+    /// `ConfigFile` `@required`, so a stored configuration always carries one.
+    pub config_file: String,
+    /// The repository owner at the provider, as the link's own record reports it.
+    pub owner_id: String,
+    /// The provider type of the connection the link reaches the repository through.
+    pub provider_type: String,
+    /// The link whose repository this configuration syncs from — the id
+    /// `ListRepositorySyncDefinitions` and `ListSyncConfigurations` address a link by.
+    pub repository_link_id: String,
+    /// The name of that repository.
+    pub repository_name: String,
+    /// The resource synced from the branch (for `CFN_STACK_SYNC`, the stack name), and
+    /// the second half of this record's key.
+    pub resource_name: String,
+    /// The IAM role the sync is performed under.
+    pub role_arn: String,
+    /// The `SyncConfigurationType` this configuration was registered under.
+    pub sync_type: String,
+    /// Whether deployment status is published to the source provider, when the caller
+    /// said.
+    pub publish_deployment_status: Option<String>,
+    /// When a sync is triggered, when the caller said.
+    pub trigger_resource_update_on: Option<String>,
+    /// Creation order, taken from the store's own monotonic sequence, so the definitions
+    /// of a link are reported in a stable order.
+    pub sequence: u64,
+}
+
+impl StoredSyncConfiguration {
+    /// This configuration as the modeled `RepositorySyncDefinition` the list reports.
+    ///
+    /// `Directory` is the configuration's `ConfigFile` (the member doc states exactly
+    /// that), and `Parent` and `Target` are both its `ResourceName`: `Target` is modeled
+    /// "The target resource specified for a repository sync definition. In some cases,
+    /// such as CFN_STACK_SYNC, the parent and target resource are the same", and
+    /// `CFN_STACK_SYNC` is the only value `SyncConfigurationType` admits
+    /// (`smithy_query(query="shape", shape="SyncConfigurationType")`).
+    pub fn to_repository_sync_definition(&self) -> RepositorySyncDefinition {
+        RepositorySyncDefinition {
+            branch: self.branch.clone(),
+            directory: self.config_file.clone(),
+            parent: self.resource_name.clone(),
+            target: self.resource_name.clone(),
+        }
+    }
 }
 
 /// The key a REPOSITORY's sync attempt is stored under: the
@@ -456,6 +525,14 @@ pub struct ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
     /// service has put there and nothing is synthesised for work nothing ran: a triple
     /// holding no attempt has no sync history, which is an ABSENT resource.
     pub repository_sync_attempts: BTreeMap<(String, String, String), RepositorySyncAttempt>,
+    /// Every sync configuration in this emulator, keyed by [`resource_sync_key`] — the
+    /// `(SyncType, ResourceName)` pair `GetSyncConfiguration` and
+    /// `DeleteSyncConfiguration` address one by, so a resource is configured for a sync
+    /// type at most once.
+    ///
+    /// The repository sync definitions `ListRepositorySyncDefinitions` reports for a link
+    /// are these rows projected onto the wire shape; see [`StoredSyncConfiguration`].
+    pub sync_configurations: BTreeMap<(String, String), StoredSyncConfiguration>,
     /// Tags by resource ARN, shared by `TagResource` / `UntagResource` /
     /// `ListTagsForResource` and populated from `CreateConnection.Tags` /
     /// `CreateHost.Tags`.
@@ -503,6 +580,32 @@ impl ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
         let mut links: Vec<&StoredRepositoryLink> = self.repository_links.values().collect();
         links.sort_unstable_by_key(|link| link.sequence);
         links
+    }
+
+    /// Every sync configuration registered against one `(sync_type, repository_link_id)`
+    /// pair, in creation order — the rows `ListRepositorySyncDefinitions` reports for that
+    /// link, and the ones `ListSyncConfigurations` pages over.
+    ///
+    /// A configuration carries the link and the sync type it belongs to (see
+    /// [`StoredSyncConfiguration`]), so the configurations of a link are the rows matching
+    /// BOTH: one registered against another link, or under another sync type, belongs to
+    /// that pair and not to this one. Borrowed, not cloned, for the same reason as
+    /// [`Self::connections_in_creation_order`].
+    pub fn sync_configurations_for_link(
+        &self,
+        sync_type: &str,
+        repository_link_id: &str,
+    ) -> Vec<&StoredSyncConfiguration> {
+        let mut configurations: Vec<&StoredSyncConfiguration> = self
+            .sync_configurations
+            .values()
+            .filter(|configuration| {
+                configuration.sync_type == sync_type
+                    && configuration.repository_link_id == repository_link_id
+            })
+            .collect();
+        configurations.sort_unstable_by_key(|configuration| configuration.sequence);
+        configurations
     }
 
     /// Every sync blocker recorded for one `(sync_type, resource_name)` pair, MOST
@@ -1014,6 +1117,21 @@ pub fn repository_link_not_found_message(repository_link_id: &str) -> String {
         ),
         TAIL_RESOURCE_NOT_FOUND,
     )
+}
+
+/// What the repository-sync surface answers for a `RepositoryLinkId` that resolves to no
+/// link: the fixed sentence naming the id that resolved to nothing.
+///
+/// This is a different refusal from the link readers' own
+/// ([`repository_link_not_found_message`]): the operations that list what a link SYNCS
+/// report an unresolvable id as invalid input, with this sentence and no Git-sync tail. The
+/// template is the one the live service answers with (corpus
+/// `simparity-behavioral-aws-v1`, unit
+/// `codestar-connections.list-repository-sync-definitions-empty-without-stack`, which
+/// asserts the whole message): the FIXED text below with the requested `RepositoryLinkId`
+/// in it.
+pub fn repository_link_was_not_found_message(repository_link_id: &str) -> String {
+    format!("Repository Link with id {repository_link_id} was not found")
 }
 
 /// What the repository-sync surface answers for a `(RepositoryLinkId, Branch, SyncType)`

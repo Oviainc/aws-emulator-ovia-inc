@@ -142,7 +142,10 @@ async fn get_status(
 /// Register one repository link through the API and return its `RepositoryLinkId`: the id
 /// a sync status is addressed by has to be a link this service actually holds, so it is
 /// created the way a client creates one.
-async fn create_link(emulator: &Emulator, case: &str, repository_name: &str) -> String {
+///
+/// Shared with the sibling suites that address a link by its id (`repository_sync_definitions`),
+/// so there is ONE statement of how a link under test is registered.
+pub(crate) async fn create_link(emulator: &Emulator, case: &str, repository_name: &str) -> String {
     let connection_arn = emulator
         .create(
             case,
