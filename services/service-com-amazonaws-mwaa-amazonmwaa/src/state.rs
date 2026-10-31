@@ -607,6 +607,10 @@ impl LoggingConfigurationRecord {
 }
 
 /// The VPC networking components an environment was placed in.
+///
+/// Each list is kept in the order its caller wrote, because that is the order every reader
+/// reports it in; neither order MEANS anything, so a comparison of two configurations
+/// disregards it ([`EnvironmentSpec::describes_same`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetworkConfigurationRecord {
     pub subnet_ids: Vec<String>,
@@ -620,6 +624,21 @@ impl NetworkConfigurationRecord {
             subnet_ids: Some(self.subnet_ids.clone()),
             security_group_ids: Some(self.security_group_ids.clone()),
         }
+    }
+
+    /// Put each id list in a fixed order, so two records naming the same components
+    /// compare equal whatever order each was listed in.
+    ///
+    /// Both members are sets of ids: `SubnetList` and `SecurityGroupList` carry no ordering
+    /// trait, so WHICH position an id was listed at says nothing about where the
+    /// environment is placed.
+    ///
+    /// Only the comparable form of a configuration is put in this order (see
+    /// [`EnvironmentSpec::describes_same`]); the STORED record keeps the order its caller
+    /// wrote, which is the order every reader reports it back in.
+    fn canonicalise(&mut self) {
+        self.subnet_ids.sort();
+        self.security_group_ids.sort();
     }
 }
 
@@ -699,6 +718,35 @@ impl EnvironmentSpec {
                 *version = None;
             }
         }
+    }
+
+    /// Whether `other` describes the SAME environment as this configuration does.
+    ///
+    /// Member by member, except that a member whose value is a COLLECTION the model gives
+    /// no order — a map of key/value pairs, a list of ids carrying no ordering trait — is
+    /// compared disregarding the order the request listed its entries in: the order says
+    /// nothing about the environment asked for, so two configurations describing one and
+    /// the same environment are the same configuration however each request happened to
+    /// order such a member. The key/value members get this from being stored in a
+    /// `BTreeMap`; the id lists keep the order their caller wrote (it is the order every
+    /// reader reports them in), so they are put in a fixed order HERE, for the comparison
+    /// alone.
+    ///
+    /// Asked (through [`EnvironmentRecord::matches_create`]) by `CreateEnvironment`, which
+    /// is `@idempotent`: whether a second create of a stored name is a replay of the create
+    /// that stored it cannot depend on how either request ordered a member whose value is a
+    /// set.
+    pub fn describes_same(&self, other: &Self) -> bool {
+        self.comparable() == other.comparable()
+    }
+
+    /// This configuration with every unordered collection in a fixed order — the form
+    /// [`Self::describes_same`] compares. Never stored: it exists only for the duration of
+    /// a comparison, so no response order changes.
+    fn comparable(&self) -> Self {
+        let mut comparable = self.clone();
+        comparable.network_configuration.canonicalise();
+        comparable
     }
 
     /// Every rule the RESOLVED environment configuration must satisfy that the Smithy
@@ -1119,9 +1167,12 @@ impl EnvironmentRecord {
     /// member thrown away.
     ///
     /// Asked by `CreateEnvironment` alone, so the set of members a replay has to match is
-    /// decided in one place beside the record whose members they are.
+    /// decided in one place beside the record whose members they are. Each member is
+    /// compared by what it MEANS and not by how the request spelled it: see
+    /// [`EnvironmentSpec::describes_same`] for the configuration, and the tag pairs are a
+    /// `BTreeMap` for the same reason.
     pub fn matches_create(&self, spec: &EnvironmentSpec, tags: &BTreeMap<String, String>) -> bool {
-        self.spec == *spec && self.tags == *tags
+        self.spec.describes_same(spec) && self.tags == *tags
     }
 
     /// Whether this environment is in a status an `UpdateEnvironment` can be applied to:

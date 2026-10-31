@@ -19,6 +19,8 @@ mod airflow_rest_api;
 mod airflow_rest_api_entity_keys;
 #[path = "all/create_replay_member_comparison.rs"]
 mod create_replay_member_comparison;
+#[path = "all/create_replay_unordered_members.rs"]
+mod create_replay_unordered_members;
 #[path = "all/endpoint_host_prefix_census.rs"]
 mod endpoint_host_prefix_census;
 #[path = "all/env_endpoint_front_door.rs"]
