@@ -27,13 +27,14 @@
 
 use std::sync::Arc;
 
-use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use service_common::audited_operation::{AuditedService, AuditedTable, CallKind};
 use service_common::management_events::{ManagementEventLog, ServedApiCall};
-use smithy_server_runtime::{
-    ErasedServiceDefinition, OperationContext, OperationRoutingTable, PreDispatchProtocol,
-    ServerHttpProtocol, ServiceIdentity,
-};
+use smithy_server_runtime::{OperationContext, OperationRoutingTable, PreDispatchProtocol};
+
+/// This service's model-derived half, routing through the AUDITED operations — the shared
+/// wrapper every recording service uses, re-exported under the name this service's
+/// `EmulatedService` holds it by.
+pub use service_common::audited_operation::AuditedDefinition;
 
 /// The `eventSource` every record of this service carries: this service's endpoint prefix
 /// (`smithy_query(query="service_info")` -> `endpointPrefix: iam`) in the
@@ -106,7 +107,7 @@ impl<Eng: Send + Sync + 'static> IamAudit<Eng> {
 }
 
 impl<Eng: Send + Sync + 'static> AuditedService for IamAudit<Eng> {
-    fn record(&self, call: ServedApiCall) {
+    fn record(&self, call: ServedApiCall, answered_as: &str) {
         let Some(log) = self.log() else {
             // Not silent: an unrecorded call leaves no trace in the log by definition, so
             // it leaves one here instead.
@@ -116,7 +117,11 @@ impl<Eng: Send + Sync + 'static> AuditedService for IamAudit<Eng> {
             );
             return;
         };
-        log.lock().record(call, ::std::time::SystemTime::now());
+        log.lock().record_answered(
+            call,
+            ::std::time::SystemTime::now(),
+            answered_as.to_string(),
+        );
     }
 
     fn event_source(&self) -> &'static str {
@@ -162,61 +167,6 @@ pub fn management_event_log<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ManagementEventLog>)
-}
-
-/// This service's model-derived half, routing through the AUDITED operations.
-///
-/// Identity, the protocol and every framework-level error renderer come from the generated
-/// definition untouched — nothing model-derived is restated here. The ONE thing this
-/// wrapper answers differently is the routing table: it hands back [`audited_table`], whose
-/// keys are the same modelled operation names the generated table's are and whose
-/// operations are the generated ones wrapped in the recorder. So every layer that resolves
-/// an operation for a request — the router itself, and the envelope wrapper this service
-/// serves its requests through — reaches the audited operation, and no request can be
-/// served by a path that records nothing.
-pub struct AuditedDefinition<D> {
-    inner: D,
-    audited: OperationRoutingTable,
-}
-
-impl<D: ErasedServiceDefinition> AuditedDefinition<D> {
-    /// Wrap `inner`, routing through `audited` instead of `inner`'s own table.
-    pub fn new(inner: D, audited: OperationRoutingTable) -> Self {
-        Self { inner, audited }
-    }
-}
-
-impl<D: ErasedServiceDefinition> ErasedServiceDefinition for AuditedDefinition<D> {
-    fn identity(&self) -> &ServiceIdentity {
-        self.inner.identity()
-    }
-
-    fn protocol(&self) -> &dyn ServerHttpProtocol {
-        self.inner.protocol()
-    }
-
-    fn routing_table(&self) -> &OperationRoutingTable {
-        &self.audited
-    }
-
-    fn routing_error_response(&self, req: &RtRequest) -> RtResponse {
-        self.inner.routing_error_response(req)
-    }
-
-    fn framework_error_response(
-        &self,
-        error: ::aws_smithy_schema_server::ProtocolError,
-    ) -> RtResponse {
-        self.inner.framework_error_response(error)
-    }
-
-    fn refusal_response(
-        &self,
-        error: ::aws_smithy_schema_server::ProtocolError,
-        chosen: Option<::smithy_server_runtime::Refused>,
-    ) -> RtResponse {
-        self.inner.refusal_response(error, chosen)
-    }
 }
 
 /// The envelope a pre-dispatch failure of one of this service's operations renders in:

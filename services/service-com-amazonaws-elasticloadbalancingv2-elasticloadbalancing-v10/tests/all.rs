@@ -35,6 +35,8 @@ mod load_balancer_attributes;
 mod load_balancer_input_rules;
 #[path = "all/load_balancer_network_capacity_and_policy.rs"]
 mod load_balancer_network_capacity_and_policy;
+#[path = "all/management_event_recording.rs"]
+mod management_event_recording;
 #[path = "all/provisioning_loop.rs"]
 mod provisioning_loop;
 #[path = "all/query_error_envelope.rs"]

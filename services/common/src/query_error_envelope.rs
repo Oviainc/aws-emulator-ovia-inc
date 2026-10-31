@@ -159,9 +159,7 @@ fn envelope_children(body: &str) -> Option<(usize, &str)> {
 /// response's id.
 fn envelope_request_id(body: &str) -> Option<&str> {
     let (_, siblings) = envelope_children(body)?;
-    let value = siblings.find(REQUEST_ID_OPEN)? + REQUEST_ID_OPEN.len();
-    let end = siblings[value..].find("</RequestId>")?;
-    let stated = &siblings[value..value + end];
+    let stated = first_element_text(siblings, "RequestId")?;
     is_request_id(stated).then_some(stated)
 }
 
@@ -254,6 +252,75 @@ pub fn with_request_id_header(mut resp: RtResponse) -> RtResponse {
         .headers_mut()
         .try_insert(REQUEST_ID_HEADER, new_request_id());
     resp
+}
+
+/// The text of the FIRST `<name>` element of `text`, or `None` when it holds none.
+fn first_element_text<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&format!("</{name}>"))? + start;
+    Some(&text[start..end])
+}
+
+/// The request id a SUCCESSFUL query response states: `awsQuery` reports it in the
+/// `<ResponseMetadata>` block that closes the document, and the `ec2Query` dialect in a
+/// lower-case `<requestId>` in place of that block (both written by
+/// `aws_smithy_schema_server::query`).
+///
+/// `None` for a document that states none, and for a stated value that does not have the
+/// FORM of a request id — the same guard [`envelope_request_id`] applies, for the same
+/// reason.
+fn success_request_id(body: &str) -> Option<&str> {
+    const RESPONSE_METADATA_OPEN: &str = "<ResponseMetadata>";
+    let stated = match body.find(RESPONSE_METADATA_OPEN) {
+        Some(at) => first_element_text(&body[at..], "RequestId"),
+        None => first_element_text(body, "requestId"),
+    }?;
+    is_request_id(stated).then_some(stated)
+}
+
+/// The id a rendered response ALREADY names the request by, as the caller reads it: the
+/// header, the `awsQuery` error envelope's own element, or a successful query document's
+/// `ResponseMetadata`.
+///
+/// Read-only — it mints nothing and changes nothing — so a layer that needs to know which
+/// request a response names (an audit record of the call, which carries that id so a client
+/// holding the response can find the record of that very call) can ask without affecting
+/// what the caller receives. `None` means the renderer named no request, which is what
+/// [`named_request`] then reports one for.
+pub fn reported_request_id(resp: &RtResponse) -> Option<String> {
+    if let Some(stated) = resp.headers().get(REQUEST_ID_HEADER) {
+        if is_request_id(stated) {
+            return Some(stated.to_string());
+        }
+    }
+    // Built in memory by its renderer, so the bytes are readable here; a streamed body
+    // states no request id.
+    let text = std::str::from_utf8(resp.body().bytes()?).ok()?;
+    match envelope_children(text) {
+        Some(_) => envelope_request_id(text).map(str::to_string),
+        None => success_request_id(text).map(str::to_string),
+    }
+}
+
+/// One response and the ONE id it names its request by, reported where the renderer named
+/// none.
+///
+/// A response that already names its request ([`reported_request_id`]) is returned
+/// untouched under that id — so every success keeps the id its `ResponseMetadata` already
+/// carries, and nothing here can make a caller see two ids for one call. One that names
+/// none is reported through the two writers above ([`with_request_id`], then
+/// [`with_request_id_header`]), which is why this is idempotent and why a layer outside it
+/// that reports the id again finds the same one.
+pub fn named_request(resp: RtResponse) -> (RtResponse, String) {
+    if let Some(stated) = reported_request_id(&resp) {
+        return (resp, stated);
+    }
+    let resp = with_request_id_header(with_request_id(resp));
+    // Every path above reports an id; a response whose header the HTTP layer refused is
+    // named by the id it would have carried rather than by nothing.
+    let stated = reported_request_id(&resp).unwrap_or_else(new_request_id);
+    (resp, stated)
 }
 
 /// The modelled operation the service's routing table names for this request, or `None`
@@ -655,5 +722,84 @@ mod tests {
             Some(stated),
             "a response that already names its request keeps that id"
         );
+    }
+
+    /// One response names ONE request: the id a rendered document already states is the id
+    /// read back off it, and a document that states none is reported one — so a layer
+    /// reading the id and the caller can never see two values for one call.
+    ///
+    /// The rows span the forms a response states it in: an `awsQuery` success's
+    /// `ResponseMetadata`, the `ec2Query` dialect's lower-case element, an error envelope
+    /// that already carries one, an error envelope that carries none (reported here), and a
+    /// document of a protocol with no element for it at all.
+    #[test]
+    fn a_response_names_one_request_whichever_layer_reports_it() {
+        let stated = "11112222-3333-4444-5555-666677778888";
+        for (case, body, expected) in [
+            (
+                "an awsQuery success",
+                format!(
+                    "<CreateTargetGroupResponse><CreateTargetGroupResult/><ResponseMetadata>\
+                     <RequestId>{stated}</RequestId></ResponseMetadata>\
+                     </CreateTargetGroupResponse>"
+                ),
+                Some(stated),
+            ),
+            (
+                "an ec2Query success",
+                format!("<DescribeTagsResponse><requestId>{stated}</requestId></DescribeTagsResponse>"),
+                Some(stated),
+            ),
+            (
+                "an error envelope that states its own id",
+                format!(
+                    "<ErrorResponse><Error><Code>TargetGroupNotFound</Code></Error>\
+                     <RequestId>{stated}</RequestId></ErrorResponse>"
+                ),
+                Some(stated),
+            ),
+            (
+                "an error envelope that states none",
+                "<ErrorResponse><Error><Code>TargetGroupNotFound</Code></Error></ErrorResponse>"
+                    .to_string(),
+                None,
+            ),
+            ("a document of another protocol", "{\"tags\":{}}".to_string(), None),
+        ] {
+            let built = || {
+                RtResponse::new(
+                    aws_smithy_runtime_api::http::StatusCode::try_from(200u16).expect("200"),
+                    SdkBody::from(body.clone()),
+                )
+            };
+            assert_eq!(
+                reported_request_id(&built()).as_deref(),
+                expected,
+                "case {case:?}: expected the stated id {expected:?}"
+            );
+            let (named, id) = named_request(built());
+            assert!(
+                is_request_id(&id),
+                "case {case:?}: expected a well-formed id, got {id:?}"
+            );
+            if let Some(expected) = expected {
+                assert_eq!(
+                    id, expected,
+                    "case {case:?}: a response that states an id keeps it, got {id:?}"
+                );
+            }
+            assert_eq!(
+                reported_request_id(&named).as_deref(),
+                Some(id.as_str()),
+                "case {case:?}: the reported response must name the id {id:?} back"
+            );
+            // Idempotent: reporting again finds the same id and changes nothing.
+            let (again, second) = named_request(named);
+            assert_eq!(
+                second, id,
+                "case {case:?}: expected the same id on a second report, got {second:?}"
+            );
+            let _ = again;
+        }
     }
 }

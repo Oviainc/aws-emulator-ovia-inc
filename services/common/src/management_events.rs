@@ -951,7 +951,33 @@ impl ManagementEventLog {
     /// The parameters and the response a record carries are held to
     /// [`MAX_RECORDED_DOCUMENT_BYTES`] here, where every recorder passes, so one record's
     /// footprint is bounded whatever built the documents.
-    pub fn record(&mut self, mut call: ServedApiCall, at: SystemTime) -> String {
+    pub fn record(&mut self, call: ServedApiCall, at: SystemTime) -> String {
+        // No id the caller was answered under is known here, so the record is named by one
+        // of its own: see [`record_answered`](Self::record_answered) for the recorder that
+        // knows it.
+        self.record_answered(call, at, mint_uuid())
+    }
+
+    /// Record `call`, served at `at` and answered under `request_id`, as a management
+    /// event; answer the event's id.
+    ///
+    /// `request_id` is the id the CALLER was answered by — the one an SDK reports as the
+    /// call's `ResponseMetadata.RequestId` — which is what a record's `requestID` carries:
+    /// a client holding a response can then find the record of that very call in event
+    /// history, and two records of two calls to one operation are told apart by the call
+    /// each of them answered. A recorder that cannot resolve it uses
+    /// [`record`](Self::record) instead, which names the record by an id of its own rather
+    /// than by one belonging to another response.
+    ///
+    /// Everything else is [`record`](Self::record)'s: the retention and count bounds are
+    /// pruned first, and one record's documents are held to
+    /// [`MAX_RECORDED_DOCUMENT_BYTES`].
+    pub fn record_answered(
+        &mut self,
+        mut call: ServedApiCall,
+        at: SystemTime,
+        request_id: String,
+    ) -> String {
         self.prune(at);
         call.request_parameters = within_record_limit(call.request_parameters);
         call.response_elements = call.response_elements.map(within_record_limit);
@@ -959,7 +985,7 @@ impl ManagementEventLog {
         let event = ManagementEvent {
             seq: self.next_seq,
             event_id: mint_uuid(),
-            request_id: mint_uuid(),
+            request_id,
             event_time: at,
             event_category: EVENT_CATEGORY_MANAGEMENT.to_string(),
             call,

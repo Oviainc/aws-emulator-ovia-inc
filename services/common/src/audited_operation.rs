@@ -23,7 +23,12 @@
 //!   stored;
 //! * `errorCode` / `errorMessage` come from the error channel the caller was answered
 //!   through ([`crate::management_events::recorded_failure`]), so a failed call records
-//!   the fault SHAPE's name.
+//!   the fault SHAPE's name;
+//! * `requestID` is the id the CALLER was answered under
+//!   ([`crate::query_error_envelope::named_request`]), so a client holding a response can
+//!   find the record of that very call rather than guessing which of two records of one
+//!   operation is its own. That id exists only once the response has been rendered, which
+//!   is why the record built in the handler is HELD until the run that renders it finishes.
 //!
 //! Nothing else about the request changes: the wrapper runs the framework's own
 //! deserialize -> validate -> handle -> serialize sequence for the operation it wraps
@@ -49,17 +54,73 @@
 //! caller because the audit log is unreachable would be a worse answer than serving it
 //! unrecorded.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use smithy_server_runtime::{
-    BoxFuture, ErasedOperation, Operation, OperationContext, OperationError,
-    OperationRoutingTable, PreDispatchProtocol, Service,
+    BoxFuture, ErasedOperation, ErasedServiceDefinition, Operation, OperationContext,
+    OperationError, OperationRoutingTable, PreDispatchProtocol, ServerHttpProtocol, Service,
+    ServiceIdentity,
 };
 
 use crate::management_events::{
     recorded_failure, recorded_shape, ServedApiCall, WithheldFromRecord,
 };
+use crate::query_error_envelope::named_request;
+
+thread_local! {
+    /// The record of the call this thread is serving, built as the last thing the handler's
+    /// own run does and taken by [`RecordedCall`] once the response that answers it exists —
+    /// which is the only moment the id the caller was answered under is known.
+    ///
+    /// # The invariant this rests on
+    ///
+    /// The two sides of it are ONE poll apart, which is what makes a thread-local the right
+    /// home: the framework's sequence serializes the handler's result and returns with
+    /// nothing awaited after `Operation::handle`
+    /// ([`smithy_server_runtime::run_operation_http`]), and the layer that takes the record
+    /// is the one that awaited that sequence — so nothing else can run on this thread
+    /// between the record being put here and `taken_record` taking it. An operation served
+    /// behind one more wrapper ([`AuditedTable::serve_behind`]) is part of that invariant:
+    /// such a wrapper must not await anything AFTER the framework sequence it drives, or the
+    /// task may resume on another thread and leave the record behind.
+    ///
+    /// Nothing is left to be quietly wrong if that ever stops holding. The record is TAKEN
+    /// rather than read, the run about to serve a call clears the slot first
+    /// ([`forget_any_unanswered`]), and a record found where the slot should be empty is
+    /// DISCARDED rather than written: a record may never name a request no caller was
+    /// answered under, and may never be attributed to another call. Empty means nothing was
+    /// recorded for the call — an operation the scaffold refused, or a request the framework
+    /// answered before any handler ran.
+    static PENDING_RECORD: RefCell<Option<ServedApiCall>> = const { RefCell::new(None) };
+}
+
+/// The record this thread is holding, taken out of the slot so it is read once.
+fn taken_record() -> Option<ServedApiCall> {
+    PENDING_RECORD.with(|slot| slot.borrow_mut().take())
+}
+
+/// Drop whatever record this thread may still hold.
+///
+/// There is one only if the invariant in [`PENDING_RECORD`] stopped holding, which no
+/// composition in this tree does. It is DISCARDED rather than written, and that is the whole
+/// of the choice: the id the caller of that call was answered under is no longer reachable,
+/// and a record naming an id no response carried is the very defect a record's `requestID`
+/// exists to prevent — so the alternatives are a record that lies and no record, and no
+/// record is the honest one.
+fn forget_any_unanswered() {
+    drop(taken_record());
+}
+
+/// Hold `call` until the response that answers it exists.
+///
+/// The slot is empty by then — the run serving this call cleared it — so a record found in
+/// it is dropped by [`forget_any_unanswered`] rather than overwritten where it sits.
+fn hold_record(call: ServedApiCall) {
+    forget_any_unanswered();
+    PENDING_RECORD.with(|slot| *slot.borrow_mut() = Some(call));
+}
 
 /// The wire error code of the scaffold's "not implemented" signal, which every generated
 /// service's error channel renders a stub with (`crate::scaffolded` in each service
@@ -80,7 +141,10 @@ pub const NOT_IMPLEMENTED_STATUS: u16 = 501;
 pub trait AuditedService: Send + Sync + 'static {
     /// Record one served call in the account's management-event log, or drop it when this
     /// engine carries no log.
-    fn record(&self, call: ServedApiCall);
+    ///
+    /// `answered_as` is the request id the CALLER was answered under, which the record
+    /// carries as its `requestID`.
+    fn record(&self, call: ServedApiCall, answered_as: &str);
 
     /// The `eventSource` every record of this service carries: its endpoint prefix in
     /// CloudTrail's `<prefix>.amazonaws.com` form.
@@ -176,7 +240,13 @@ impl<O: Operation, S: AuditedService> Operation for AuditedOperation<O, S> {
         // the document is what the request carried, which is what a record reports.
         let request_parameters = recorded_shape(&input, O::INPUT_SCHEMA, self.withheld());
         let outcome = self.operation.handle(input, ctx).await;
-        self.record(&request_parameters, ctx, &outcome);
+        if let Some(call) = self.served_call(&request_parameters, ctx, &outcome) {
+            // Held, not written: the record names the request by the id the caller is
+            // answered under, and the response that states it does not exist yet. This is
+            // the LAST thing this handler does, with nothing awaited after it, which is
+            // what `PENDING_RECORD` relies on.
+            hold_record(call);
+        }
         outcome
     }
 }
@@ -191,19 +261,19 @@ impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
         }
     }
 
-    /// Record the call just served, unless it was refused as not implemented (so nothing
-    /// was served at all).
-    fn record(
+    /// The record of the call just served, or `None` when it was refused as not
+    /// implemented (so nothing was served at all).
+    fn served_call(
         &self,
         request_parameters: &serde_json::Value,
         ctx: &OperationContext<'_>,
         outcome: &Result<O::Output, O::Error>,
-    ) {
+    ) -> Option<ServedApiCall> {
         if outcome.as_ref().err().is_some_and(|error| {
             error.shape_name() == NOT_IMPLEMENTED_SHAPE_NAME
                 && error.http_status() == NOT_IMPLEMENTED_STATUS
         }) {
-            return;
+            return None;
         }
         let region = self.service.region(ctx);
         // "responseElements" is what the call ANSWERED with, which a reporting call has
@@ -216,7 +286,7 @@ impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
         };
         let (error_code, error_message) = recorded_failure(outcome);
         let caller = crate::management_events::recorded_caller(ctx.parts());
-        self.service.record(ServedApiCall {
+        Some(ServedApiCall {
             event_name: O::NAME.to_string(),
             event_source: self.service.event_source().to_string(),
             read_only: self.kind.read_only(),
@@ -238,7 +308,7 @@ impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
             response_elements,
             error_code,
             error_message,
-        });
+        })
     }
 }
 
@@ -256,7 +326,9 @@ where
         Box::pin(async move {
             // The framework's own per-request sequence, driven with THIS wrapper as the
             // operation: the handler it calls is the wrapped one, so nothing about the
-            // wire changes and the recording happens inside the typed call.
+            // wire changes and the record is built inside the typed call. The record the
+            // handler holds is written by [`RecordedCall`], which is what the table serves
+            // this operation behind.
             smithy_server_runtime::run_operation_http(self, svc, req, ctx, self.pre_dispatch)
                 .await
         })
@@ -269,9 +341,60 @@ where
     }
 }
 
+/// One call served and then RECORDED: whatever the table serves for an operation, with the
+/// record its handler held written once the response that answers the call exists.
+///
+/// It is the OUTERMOST layer of every row of an [`AuditedTable`], and the record is written
+/// here rather than inside [`AuditedOperation`] for one reason: an operation may be served
+/// behind one more wrapper ([`AuditedTable::serve_behind`]), and such a wrapper drives the
+/// framework's sequence itself — the audited operation's own `run` is then never called,
+/// while this one always is. So the record is written exactly once per served call, after
+/// the response has been rendered by every layer that renders it, which is the only moment
+/// the id the caller is answered under is known.
+pub struct RecordedCall<W, S> {
+    /// What serves the call: the audited operation, or a wrapper around it.
+    inner: W,
+    /// The service that records it.
+    service: Arc<S>,
+}
+
+impl<W: ErasedOperation, S: AuditedService> ErasedOperation for RecordedCall<W, S> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // Whatever this thread may still hold belongs to no call this run serves (see
+            // `PENDING_RECORD`): cleared before the slot is used, so a record cannot be
+            // named on another call's response.
+            forget_any_unanswered();
+            let resp = self.inner.run(svc, req, ctx).await;
+            let pending = taken_record();
+            // The record is written only now, because its `requestID` is the id the CALLER
+            // is answered under, and that id is the rendered response's. A response the
+            // renderer named no request in is named one here, which every layer outside
+            // this one then reports unchanged, so the record and the caller can never hold
+            // two ids for one call.
+            let (resp, answered_as) = named_request(resp);
+            if let Some(call) = pending {
+                self.service.record(call, &answered_as);
+            }
+            resp
+        })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // The served operation's modelled schemes: recording must not change which
+        // credentials sign a call.
+        self.inner.auth_schemes()
+    }
+}
+
 /// The routing table a service serves its operations audited through: every operation
-/// wrapped in [`AuditedOperation`], keyed by the routing key the protocol resolves (the
-/// operation's own modelled name).
+/// wrapped in [`AuditedOperation`] and served behind [`RecordedCall`], keyed by the routing
+/// key the protocol resolves (the operation's own modelled name).
 ///
 /// A service builds one in its `EmulatedService::new` and answers
 /// `Service::override_operation` from it; [`serve`](Self::serve) takes one
@@ -300,15 +423,8 @@ impl<S: AuditedService> AuditedTable<S> {
         operation: O,
         kind: CallKind,
     ) -> &mut Self {
-        self.table.add_operation(
-            O::NAME,
-            Box::new(AuditedOperation {
-                operation,
-                service: Arc::clone(&self.service),
-                kind,
-                pre_dispatch: self.pre_dispatch,
-            }),
-        );
+        let audited = self.audited(operation, kind);
+        self.file(O::NAME, audited);
         self
     }
 
@@ -320,6 +436,12 @@ impl<S: AuditedService> AuditedTable<S> {
     /// [`serve`](Self::serve) wrapped from the outside: a record reports the operation's
     /// OWN input and output, so a wrapper that changes how a response is rendered on the
     /// wire cannot change the document a lookup reports.
+    ///
+    /// `wrap`'s own `run` must not AWAIT anything after the framework sequence it drives:
+    /// the record of the call is handed to [`RecordedCall`] across that resumption (see
+    /// `PENDING_RECORD`), and a yield in between would leave it unwritten and reported.
+    /// Rendering the response that sequence answered, which is what such a wrapper is for,
+    /// awaits nothing.
     pub fn serve_behind<O, W>(
         &mut self,
         operation: O,
@@ -330,15 +452,37 @@ impl<S: AuditedService> AuditedTable<S> {
         O: Operation + ErasedOperation,
         W: ErasedOperation + 'static,
     {
-        let audited = AuditedOperation {
+        let audited = self.audited(operation, kind);
+        let wrapped = wrap(audited, self.pre_dispatch);
+        self.file(O::NAME, wrapped);
+        self
+    }
+
+    /// `operation` as a call of `kind`, recording into this table's service.
+    fn audited<O: Operation + ErasedOperation>(
+        &self,
+        operation: O,
+        kind: CallKind,
+    ) -> AuditedOperation<O, S> {
+        AuditedOperation {
             operation,
             service: Arc::clone(&self.service),
             kind,
             pre_dispatch: self.pre_dispatch,
-        };
-        self.table
-            .add_operation(O::NAME, Box::new(wrap(audited, self.pre_dispatch)));
-        self
+        }
+    }
+
+    /// File what serves one operation under `name`, behind the layer that WRITES the record
+    /// its handler held ([`RecordedCall`]) — so every row of this table records its call,
+    /// whether or not the operation is served behind a wrapper of its own.
+    fn file<W: ErasedOperation + 'static>(&mut self, name: &'static str, inner: W) {
+        self.table.add_operation(
+            name,
+            Box::new(RecordedCall {
+                inner,
+                service: Arc::clone(&self.service),
+            }),
+        );
     }
 
     /// Serve `operation` audited as a REPORTING call ([`CallKind::Reporting`]).
@@ -355,5 +499,65 @@ impl<S: AuditedService> AuditedTable<S> {
     #[must_use]
     pub fn finish(self) -> OperationRoutingTable {
         self.table
+    }
+}
+
+/// A service's model-derived half, routing through its AUDITED operations.
+///
+/// Identity, the protocol and every framework-level error renderer come from the wrapped
+/// definition untouched — nothing model-derived is restated here. The ONE thing this
+/// wrapper answers differently is the routing table: it hands back the audited one, whose
+/// keys are the same modelled operation names the generated table's are and whose
+/// operations are the generated ones wrapped in the recorder. So every layer that resolves
+/// an operation for a request — the router itself, and any envelope wrapper a service
+/// serves its requests through — reaches the audited operation, and no request can be
+/// served by a path that records nothing.
+///
+/// Generic over the definition rather than over an engine, so this crate names no service's
+/// generated type; a service whose definition is itself wrapped (an error-envelope wrapper,
+/// say) nests the two, with this one INSIDE, so the audited table is what the outer wrapper
+/// routes from.
+pub struct AuditedDefinition<D> {
+    inner: D,
+    audited: OperationRoutingTable,
+}
+
+impl<D: ErasedServiceDefinition> AuditedDefinition<D> {
+    /// Wrap `inner`, routing through `audited` instead of `inner`'s own table.
+    pub fn new(inner: D, audited: OperationRoutingTable) -> Self {
+        Self { inner, audited }
+    }
+}
+
+impl<D: ErasedServiceDefinition> ErasedServiceDefinition for AuditedDefinition<D> {
+    fn identity(&self) -> &ServiceIdentity {
+        self.inner.identity()
+    }
+
+    fn protocol(&self) -> &dyn ServerHttpProtocol {
+        self.inner.protocol()
+    }
+
+    fn routing_table(&self) -> &OperationRoutingTable {
+        &self.audited
+    }
+
+    fn routing_error_response(&self, req: &RtRequest) -> RtResponse {
+        self.inner.routing_error_response(req)
+    }
+
+    fn framework_error_response(
+        &self,
+        error: ::aws_smithy_schema_server::ProtocolError,
+    ) -> RtResponse {
+        self.inner.framework_error_response(error)
+    }
+
+    fn refusal_response(
+        &self,
+        error: ::aws_smithy_schema_server::ProtocolError,
+        chosen: Option<::smithy_server_runtime::Refused>,
+    ) -> RtResponse {
+        self.inner.refusal_response(error, chosen)
     }
 }

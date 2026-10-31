@@ -99,7 +99,7 @@ impl<Eng: Send + Sync + 'static> RdsAudit<Eng> {
 }
 
 impl<Eng: Send + Sync + 'static> AuditedService for RdsAudit<Eng> {
-    fn record(&self, call: ServedApiCall) {
+    fn record(&self, call: ServedApiCall, answered_as: &str) {
         let Some(log) = self.log() else {
             // Not silent: an unrecorded call leaves no trace in the log by definition, so
             // it leaves one here instead.
@@ -109,7 +109,11 @@ impl<Eng: Send + Sync + 'static> AuditedService for RdsAudit<Eng> {
             );
             return;
         };
-        log.lock().record(call, ::std::time::SystemTime::now());
+        log.lock().record_answered(
+            call,
+            ::std::time::SystemTime::now(),
+            answered_as.to_string(),
+        );
     }
 
     fn event_source(&self) -> &'static str {

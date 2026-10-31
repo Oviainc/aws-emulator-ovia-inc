@@ -64,6 +64,13 @@
 //! also claims a request addressed to a load balancer this service HOLDS, and
 //! [`override_routing_error`](Service::override_routing_error) answers it out of that load
 //! balancer's listener configuration; [`data_plane`] is what resolves and serves it.
+//!
+//! A fourth thing this file does is not a seam but a property of serving a call at all:
+//! every control-plane call of an account is a CloudTrail management event, so this
+//! service's definition routes through its operations wrapped in the shared
+//! management-event recorder ([`management_events`]) — one code path for all of them,
+//! reached whether the request arrives under this model's own routing key or is handed over
+//! by the shared front door, rather than a recording written into each handler.
 
 //! One fact about this service's wire identity is read from OUTSIDE this crate: the API
 //! version an awsQuery envelope must name to be served out of this model on the endpoint
@@ -75,6 +82,9 @@ pub mod shared_endpoint;
 
 pub mod data_plane;
 
+pub mod management_events;
+
+use service_common::audited_operation::AuditedDefinition;
 use service_common::query_error_envelope::{
     RequestIdEnvelopeDefinition, RequestIdEnvelopeOperation,
 };
@@ -117,10 +127,16 @@ const ROUTE_KEY: &str = "elasticloadbalancingv2";
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    /// The generated entry, behind the `awsQuery` error-envelope wrapper: every error this
-    /// service answers carries the `<RequestId>` that envelope has (see
-    /// `service_common::query_error_envelope`), whichever layer rendered it.
-    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    /// The generated entry, behind the AUDIT wrapper and the `awsQuery` error-envelope
+    /// wrapper: every call this service serves is recorded as a management event (see
+    /// [`management_events`]), and every error it answers carries the `<RequestId>` that
+    /// envelope has (see `service_common::query_error_envelope`), whichever layer rendered
+    /// it.
+    ///
+    /// The audit wrapper sits INSIDE, so the routing table every layer resolves an
+    /// operation from — the router itself and the envelope wrapper below — is the audited
+    /// one.
+    entry: RequestIdEnvelopeDefinition<AuditedDefinition<crate::ServiceDefinition<Eng>>>,
     /// The envelope wrapper every routable request is served through. Held in a field,
     /// built once, because `override_operation` hands back a reference borrowed from
     /// `&self`.
@@ -140,9 +156,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: RequestIdEnvelopeDefinition::new(crate::ServiceDefinition::new(Arc::clone(
-                &engine,
-            ))),
+            entry: RequestIdEnvelopeDefinition::new(AuditedDefinition::new(
+                crate::ServiceDefinition::new(Arc::clone(&engine)),
+                // Every modelled operation, each constructed from this same shared engine
+                // and served behind the audit recorder.
+                management_events::audited_table(&engine),
+            )),
             envelope: RequestIdEnvelopeOperation,
             engine,
         }

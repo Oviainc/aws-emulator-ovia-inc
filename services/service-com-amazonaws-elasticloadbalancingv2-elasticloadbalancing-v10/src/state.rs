@@ -3614,3 +3614,26 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State>)
 }
+
+/// The account's MANAGEMENT-EVENT (audit) log in the SAME shared engine — the one store
+/// CloudTrail's `LookupEvents` reads: call it with `&*engine`.
+///
+/// A SHARED type ([`::service_common::management_events::ManagementEventLog`]) and not a
+/// field of this service's own state, because the service that SERVES a call is the one
+/// that knows the call happened while the service that REPORTS it is CloudTrail; the engine
+/// keys state by TYPE, so a copy of its own here would be invisible to the reader.
+///
+/// Answer `None` by leaving the call unrecorded: the record is the account's audit trail,
+/// never part of this operation's own answer, so an engine carrying no log still serves the
+/// call.
+pub fn management_event_log<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::management_events::ManagementEventLog>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::management_events::ManagementEventLog,
+            >,
+        )
+}
