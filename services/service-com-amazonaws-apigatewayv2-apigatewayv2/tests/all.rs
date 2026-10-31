@@ -47,6 +47,8 @@ mod cors_configuration;
 mod constraint_refusal;
 #[path = "all/create_api_modelled_outcomes.rs"]
 mod create_api_modelled_outcomes;
+#[path = "all/custom_domain_hosted_zone.rs"]
+mod custom_domain_hosted_zone;
 #[path = "all/deployment_deletion.rs"]
 mod deployment_deletion;
 #[path = "all/deployment_lifecycle.rs"]
@@ -73,6 +75,8 @@ mod http_api_cors_data_plane;
 mod http_api_integration_fault_status;
 #[path = "all/http_api_jwt_data_plane.rs"]
 mod http_api_jwt_data_plane;
+#[path = "all/http_api_payload_quota.rs"]
+mod http_api_payload_quota;
 #[path = "all/http_api_request_authorizer.rs"]
 mod http_api_request_authorizer;
 #[path = "all/http_api_route_precedence.rs"]

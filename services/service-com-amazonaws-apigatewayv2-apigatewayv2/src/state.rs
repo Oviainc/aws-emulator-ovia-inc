@@ -4043,6 +4043,12 @@ pub struct DomainName {
     /// their own DNS record at, so changing a certificate or a routing mode cannot move
     /// it. See [`api_gateway_domain_host`].
     pub api_gateway_domain_name: String,
+    /// The Region the resource lives in, resolved from the request that CREATED it — the
+    /// same Region its ARN and its regional host carry. Held because the hosted zone a
+    /// regional endpoint of this domain name is aliased through is one per Region (see
+    /// [`endpoint_hosted_zone_id`]), and a later request signed for another Region must
+    /// not move the zone a caller already aliased their DNS record to.
+    pub region: String,
     /// This domain name's endpoint configurations, in the order the request gave them —
     /// `DomainNameConfigurations` is a modelled list, not a map, so order is the
     /// caller's and is preserved.
@@ -4255,7 +4261,9 @@ impl DomainName {
             domain_name_configurations: Some(
                 self.configurations
                     .iter()
-                    .map(|endpoint| endpoint.to_wire(&self.api_gateway_domain_name, status))
+                    .map(|endpoint| {
+                        endpoint.to_wire(&self.api_gateway_domain_name, status, &self.region)
+                    })
                     .collect(),
             ),
             mutual_tls_authentication: self.mutual_tls_authentication.as_ref().map(|input| {
@@ -4512,26 +4520,69 @@ pub fn portal_preview_url(endpoint: &wire::EndpointConfigurationResponse) -> Str
 /// fourteen-character ids AWS publishes for its endpoint hosted zones.
 const HOSTED_ZONE_ID_LEN: usize = 13;
 
-/// The hosted zone id of the portal domain
-/// (`EndpointConfigurationResponse$PortalDomainHostedZoneId`), the zone an alias record
-/// for the portal's domain points at.
+/// A hosted zone id DERIVED from the parts that decide WHICH endpoint it belongs to.
 ///
-/// The member is REQUIRED on the modelled response, so a portal always reports one. AWS
-/// assigns ONE opaque hosted zone id per service endpoint per Region and publishes no
-/// formula for it, so this DERIVES a stable id per region rather than carrying a table of
-/// real ones it could not keep true. The mixing is
+/// AWS assigns ONE opaque hosted zone id per service endpoint per Region and publishes no
+/// formula for it, so this derives a stable id from those parts rather than carrying a
+/// table of real ones it could not keep true. The mixing is
 /// [`::service_common::stable_hex_id`] — the tree's one derived-id mixer, reproducible
 /// across builds — uppercased and cut to the published LENGTH: a leading `Z` and
 /// [`HOSTED_ZONE_ID_LEN`] characters, which the mixer renders as uppercase hexadecimal
-/// (a subset of the uppercase alphanumerics AWS's own ids use, e.g. `Z1UJRXOUMOOFQ8`). A
-/// region therefore always answers the same id, and two regions answer different ones.
-pub fn portal_domain_hosted_zone_id(region: &str) -> String {
-    let mixed: String = ::service_common::stable_hex_id(&[region])
+/// (a subset of the uppercase alphanumerics AWS's own ids use, e.g. `Z1UJRXOUMOOFQ8`).
+/// The same parts therefore always answer the same id, and two different part lists
+/// answer different ones.
+fn derived_hosted_zone_id(parts: &[&str]) -> String {
+    let mixed: String = ::service_common::stable_hex_id(parts)
         .to_uppercase()
         .chars()
         .take(HOSTED_ZONE_ID_LEN)
         .collect();
     format!("Z{mixed}")
+}
+
+/// The hosted zone id of the portal domain
+/// (`EndpointConfigurationResponse$PortalDomainHostedZoneId`), the zone an alias record
+/// for the portal's domain points at.
+///
+/// The member is REQUIRED on the modelled response, so a portal always reports one; it is
+/// one id per Region, derived by [`derived_hosted_zone_id`].
+pub fn portal_domain_hosted_zone_id(region: &str) -> String {
+    derived_hosted_zone_id(&[region])
+}
+
+/// The `EndpointType` whose domain is fronted by a CloudFront distribution rather than by
+/// a regional endpoint: "an AWS-managed certificate that will be used by the
+/// edge-optimized endpoint for this domain name" (`DomainNameConfiguration$CertificateArn`
+/// and the rest of that shape's edge-optimized members).
+pub const EDGE_ENDPOINT_TYPE: &str = "EDGE";
+
+/// The one hosted zone every CloudFront distribution is aliased through, whatever Region
+/// the resource was created in. It is PUBLISHED rather than derived: Route 53's own
+/// `AliasTarget$HostedZoneId` states it ("CloudFront distribution: Specify
+/// `Z2FDTNDATAQYW2`"), and
+/// `services/service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice` reports the
+/// same value for its own CloudFront-fronted custom domains.
+pub const CLOUDFRONT_HOSTED_ZONE_ID: &str = "Z2FDTNDATAQYW2";
+
+/// "The Amazon Route 53 Hosted Zone ID of the endpoint"
+/// (`DomainNameConfiguration$HostedZoneId`) — the zone an ALIAS record for the custom
+/// domain names as its target, which is a fact about the endpoint rather than about the
+/// resource: one value per endpoint type, and for a regional endpoint one per Region.
+///
+/// * an `EDGE` endpoint is fronted by CloudFront, so every one of them is aliased through
+///   the single published [`CLOUDFRONT_HOSTED_ZONE_ID`], in every Region;
+/// * a `REGIONAL` endpoint lives in the Region the domain name was created in, so its zone
+///   is one per Region ([`derived_hosted_zone_id`] over the endpoint type and the Region),
+///   and never the CloudFront one.
+///
+/// Derived on every read from the stored endpoint type and the stored Region, so a domain
+/// name reports the same id for the life of the endpoint and reports a different one once
+/// an update moves it onto another endpoint type.
+pub fn endpoint_hosted_zone_id(endpoint_type: &str, region: &str) -> String {
+    if endpoint_type == EDGE_ENDPOINT_TYPE {
+        return CLOUDFRONT_HOSTED_ZONE_ID.to_string();
+    }
+    derived_hosted_zone_id(&[endpoint_type, region])
 }
 
 /// Resolve a portal's requested domain configuration into the one the readers report,
@@ -4657,6 +4708,7 @@ impl DomainNameEndpoint {
         &self,
         api_gateway_domain_name: &str,
         domain_name_status: &str,
+        region: &str,
     ) -> wire::DomainNameConfiguration {
         wire::DomainNameConfiguration {
             api_gateway_domain_name: Some(api_gateway_domain_name.to_string()),
@@ -4674,11 +4726,11 @@ impl DomainNameEndpoint {
             domain_name_status_message: None,
             endpoint_type: Some(self.endpoint_type.clone()),
             // "The Amazon Route 53 Hosted Zone ID of the endpoint"
-            // (`DomainNameConfiguration$HostedZoneId`) names a zone in Route 53 that
-            // this emulator neither owns nor can look up, and no rule derives it from the
-            // request. Left unset: a made-up zone id is one a caller could put in a real
-            // DNS alias record.
-            hosted_zone_id: None,
+            // (`DomainNameConfiguration$HostedZoneId`) is the alias target a caller's own
+            // Route 53 ALIAS record for this domain points at, and it is a fact about the
+            // ENDPOINT: one zone per endpoint type, and per Region for a regional one.
+            // See [`endpoint_hosted_zone_id`].
+            hosted_zone_id: Some(endpoint_hosted_zone_id(&self.endpoint_type, region)),
             ip_address_type: Some(self.ip_address_type.clone()),
             security_policy: Some(self.security_policy.clone()),
             ownership_verification_certificate_arn: self
@@ -4901,6 +4953,20 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
+
+/// The largest request payload an HTTP api's `execute-api` endpoint accepts for a route,
+/// in bytes: 10 MiB.
+///
+/// It is the payload quota AWS publishes for an HTTP api and it is not adjustable — no
+/// member of this model names it, because it is a quota of the data plane rather than of
+/// the api resource. A body of exactly this many bytes is delivered to the route's
+/// integration; one byte more is refused by the gateway itself, before the integration is
+/// invoked at all (see `crate::service::invoke`).
+///
+/// It is a FIDELITY bound and not an admission control: the front door buffers a request
+/// before any service sees it, so a body is already in memory by the time this is applied.
+/// Nothing here should be read as a cap on what one request can allocate.
+pub const MAX_HTTP_API_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 
 /// The first path segment that marks one of this service's data-plane endpoints carried IN
 /// THE PATH rather than in the host: `/_aws/{endpoint}/{resource-id}/{rest}`.

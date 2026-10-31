@@ -12,6 +12,33 @@ Issue-Commit: cc767c9c860d2029dd9667f4e637f1644e38e746
 
 > _Note: this issue was identified against the code base at commit `cc767c9c860d2029dd9667f4e637f1644e38e746`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Status
+
+Cause 1 and Cause 2 are implemented and pinned by tests in
+`services/service-com-amazonaws-apigatewayv2-apigatewayv2/tests/all/`:
+
+- Cause 1 — the HTTP-api payload quota is enforced ahead of integration dispatch:
+  a body of at most `state::MAX_HTTP_API_PAYLOAD_BYTES` reaches the route's
+  integration, one byte more is refused by the gateway with HTTP 413 and the
+  integration is not invoked (`service/invoke.rs::payload_refusal`,
+  `tests/all/http_api_payload_quota.rs`). The other leg of that check — the
+  at-limit body answered 2xx by the route's Lambda backend — needs a Lambda
+  deployment package to run and is owned by
+  `20261027T053233Z-apigatewayv2-an-http-api-aws-proxy-route-still.md` and
+  `20261025T030504Z-apigatewayv2-lambda-an-aws-proxy-route-cannot-answer-200-until-a.md`.
+- Cause 2 — every `DomainNameConfigurations` entry reports its endpoint's
+  `HostedZoneId` (`state::endpoint_hosted_zone_id`,
+  `tests/all/custom_domain_hosted_zone.rs`). The check that filed it now reads the
+  member and reaches a later step, the custom domain's own invoke URL, which
+  `20261026T023803Z-apigatewayv2-custom-domain-and-api-mapping-control-plane.md`
+  covers.
+- Cause 3 — a route gated by a `REQUEST` (Lambda) authorizer — is NOT fixed. It
+  needs two Lambda deployment packages to run (the authorizer's and the backend's)
+  and this emulator has no in-process runtime for one. It is carried as its own
+  open report,
+  `issues/things-that-do-not-work/20261029T070719Z-apigatewayv2-lambda-a-request-authorizer-gated-route-never-serves.md`,
+  which keeps that check's replay key, so nothing about it is claimed to work here.
+
 ## Operation
 GetDomainName
 

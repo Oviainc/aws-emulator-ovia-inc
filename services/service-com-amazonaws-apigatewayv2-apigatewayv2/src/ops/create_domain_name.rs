@@ -229,6 +229,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::DomainName {
             domain_name_arn: crate::state::domain_name_arn(&input.domain_name, &region),
             api_gateway_domain_name: crate::state::api_gateway_domain_host(&domain_id, &region),
+            // The Region the resource lives in, carried on the record so every later read
+            // reports the endpoints' hosted zones for the Region the domain name was
+            // created in, whatever Region a later request is signed for.
+            region: region.clone(),
             domain_name_id: domain_id,
             domain_name: input.domain_name.clone(),
             configurations,

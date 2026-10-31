@@ -246,6 +246,20 @@ pub(crate) async fn send(
     path: &str,
     headers: &[(&str, &str)],
 ) -> Answer {
+    send_with_body(emulator, host, method, path, headers, Vec::new()).await
+}
+
+/// [`send`] carrying a request BODY: what a client POSTing a payload to a route of a
+/// deployed HTTP api stage sends (`http_api_payload_quota`). [`send`] is this with no body
+/// at all, so both reach the emulator through one request builder.
+pub(crate) async fn send_with_body(
+    emulator: &MultiServiceRouter,
+    host: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> Answer {
     let mut builder = http::Request::builder()
         .method(method)
         .uri(format!("https://{host}{path}"))
@@ -254,7 +268,7 @@ pub(crate) async fn send(
         builder = builder.header(*name, *value);
     }
     let request = builder
-        .body(bytes::Bytes::new())
+        .body(bytes::Bytes::from(body))
         .expect("build the handshake request");
     let response = emulator.dispatch(request).await;
     let status = response.status().as_u16();

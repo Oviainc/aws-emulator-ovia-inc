@@ -54,7 +54,12 @@
 //!    ([`authorization_refusal`]) — which is what this module makes observable: a JWT
 //!    authorizer's gate ([`super::jwt`]), the identity-source precondition of a `REQUEST`
 //!    authorizer, and the credential an `AWS_IAM` route needs;
-//! 6. the route's integration decides the response.
+//! 6. the request's PAYLOAD is within the quota an HTTP api's endpoint accepts
+//!    ([`crate::state::MAX_HTTP_API_PAYLOAD_BYTES`], 10 MiB, which no member of this model
+//!    adjusts). A body past it is refused by the GATEWAY — `413`, before step 7 runs at
+//!    all, so the integration observes no invocation for it — and a body of exactly the
+//!    quota is passed on to step 7 like any other ([`payload_refusal`]);
+//! 7. the route's integration decides the response.
 //!
 //! On top of those, the api's own `CorsConfiguration` decorates whatever is answered for it
 //! ([`cors_decoration`]): `Cors` is a member of the API rather than of a backend
@@ -64,7 +69,7 @@
 //! allow-lists, and a request the configuration admits nothing of carries no CORS header at
 //! all.
 //!
-//! A preflight is DECORATED rather than answered in place of the route: it walks steps 1-6
+//! A preflight is DECORATED rather than answered in place of the route: it walks steps 1-7
 //! like any other request, and the decoration is put on what they answered. That is what the
 //! recorded behaviour of a configured api shows — a preflight carrying an allow-listed
 //! origin and method reaches the `$default` catch-all and is answered by the route's own
@@ -80,7 +85,7 @@
 //!
 //! # What it does not do, and what it answers instead
 //!
-//! Step 6 is the one step this emulator cannot perform as AWS does. Every integration type
+//! Step 7 is the one step this emulator cannot perform as AWS does. Every integration type
 //! an HTTP api admits names a backend outside this process: `AWS_PROXY` invokes a Lambda
 //! function, and Lambda's own `Invoke` answers `501` for `RequestResponse` and `Event`
 //! because there is no in-process runtime for a deployment package
@@ -186,6 +191,25 @@ const DEFAULT_JWT_IDENTITY_SOURCE: &str = "$request.header.Authorization";
 /// body for an HTTP api whose integration produced no response. Spelled as an HTTP api
 /// spells it, which is not the REST data plane's `Internal server error`.
 const INTERNAL_MESSAGE: &str = "Internal Server Error";
+
+/// The status a request whose payload is past [`crate::state::MAX_HTTP_API_PAYLOAD_BYTES`]
+/// is refused with: the gateway refuses the request itself rather than passing it to the
+/// route's integration.
+const PAYLOAD_TOO_LARGE_STATUS: u16 = 413;
+
+/// The sentence that status carries, which — like every other sentence this endpoint
+/// answers ([`INTERNAL_MESSAGE`], [`super::data_plane::FORBIDDEN_MESSAGE`],
+/// [`NOT_FOUND_MESSAGE`], [`UNAUTHORIZED_MESSAGE`]) — is the status's own reason phrase
+/// (RFC 7231 §6.5.11, the phrase for 413). The recorded answer for this refusal states
+/// its status and not its body, and an HTTP api has no `GatewayResponse` resource to word
+/// one with — that catalog, whose `REQUEST_TOO_LARGE` entry the REST plane words
+/// differently, is bound to REST apis alone — so the phrase convention this endpoint
+/// already follows decides it.
+const PAYLOAD_TOO_LARGE_MESSAGE: &str = "Request Entity Too Large";
+
+/// The request header that states how many bytes the payload has (RFC 9110 §8.6), read
+/// only when the body itself is not in memory to be measured.
+const CONTENT_LENGTH_HEADER: &str = "content-length";
 
 /// The status a caller is sent to an upstream with: the redirect that preserves the
 /// request's method and body (RFC 7231 §6.4.7), so the client repeats the request the
@@ -564,7 +588,57 @@ fn serve_resolved(
     if let Some(refusal) = authorization_refusal(api, stage, route, req) {
         return refusal;
     }
+    // And the payload quota, ahead of the dispatch below: a body past it is the gateway's
+    // own refusal, so the integration is never reached for it.
+    if let Some(refusal) = payload_refusal(api, stage, route, req) {
+        return refusal;
+    }
     serve_integration(api, stage, &deployment.configuration, route)
+}
+
+/// The refusal the request's PAYLOAD SIZE owes it, or `None` for a payload this endpoint
+/// delivers to the route's integration.
+///
+/// An HTTP api's endpoint accepts a request payload up to
+/// [`crate::state::MAX_HTTP_API_PAYLOAD_BYTES`], a quota of the data plane that no member
+/// of this model adjusts, so the bound is the same for every api, stage and route. A body
+/// of exactly the quota is within it and is passed on; one byte more is refused by the
+/// gateway with [`PAYLOAD_TOO_LARGE_STATUS`] AHEAD of the dispatch, which is what makes
+/// the boundary observable — the integration is invoked for the first and not for the
+/// second.
+///
+/// The size measured is the body as it arrived: the front door buffers every request, so
+/// the bytes are in memory and are counted. A body that is NOT in memory is measured by
+/// what the request states its length to be ([`CONTENT_LENGTH_HEADER`]); a request that
+/// states nothing either is not refused on a size nothing read.
+fn payload_refusal(
+    api: &Api,
+    stage: &Stage,
+    route: &Route,
+    req: &RtRequest,
+) -> Option<RtResponse> {
+    let payload_bytes = req.body().bytes().map(<[u8]>::len).or_else(|| {
+        req.headers()
+            .get(CONTENT_LENGTH_HEADER)
+            .and_then(|stated| stated.trim().parse::<usize>().ok())
+    })?;
+    if payload_bytes <= crate::state::MAX_HTTP_API_PAYLOAD_BYTES {
+        return None;
+    }
+    tracing::info!(
+        api_id = %api.api_id,
+        stage = %stage.stage_name,
+        route_key = %route.route_key,
+        payload_bytes,
+        quota = crate::state::MAX_HTTP_API_PAYLOAD_BYTES,
+        "refusing an invoke whose payload is past the quota this endpoint accepts, so the \
+         route's integration is not invoked"
+    );
+    Some(json_response(
+        PAYLOAD_TOO_LARGE_STATUS,
+        PAYLOAD_TOO_LARGE_MESSAGE,
+        None,
+    ))
 }
 
 /// The decoration an HTTP api's stored `CorsConfiguration` puts on the answer to this
