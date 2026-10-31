@@ -24,7 +24,12 @@
 //!   enrichment nor the target. The patterns are EventBridge event patterns, read and
 //!   matched by the one reading of that language in this tree
 //!   (`service_common::event_pattern`). A dropped record is still consumed: it entered
-//!   the pipe and the pipe decided about it.
+//!   the pipe and the pipe decided about it. A record's message body travels as the text
+//!   the producer sent, so the filter reads it in the format that text is in — a body
+//!   spelling a JSON document is matched as that document, one spelling none as its text
+//!   — and a pattern whose `body` clause is written for the other format admits nothing
+//!   ([`FilterView`]). What the later stages are handed is the record envelope itself,
+//!   with the body as sent.
 //! * ENRICHMENT. The records polled together are handed to the enrichment as ONE JSON
 //!   array of record envelopes, and what the enrichment RETURNS — not the source batch —
 //!   is what the target stage delivers. So an enrichment that collapses a batch into one
@@ -91,6 +96,7 @@
 //! thing that tells a pipe whose stage was refused from a pipe that never ran, because
 //! both leave the target holding nothing.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -1405,8 +1411,8 @@ async fn get_records(
 /// "The collection of event patterns used to filter events": a record that matches ANY of
 /// the patterns enters the pipe, and a pipe carrying no filter admits every record. The
 /// patterns are matched by the one reading of the event-pattern language in this tree,
-/// under one work budget for the whole batch, so a batch can never buy more matching work
-/// than the budget sold it.
+/// against the record as the filter READS it ([`FilterView`]), under one work budget for
+/// the whole batch, so a batch can never buy more matching work than the budget sold it.
 fn admitted(filters: &[Value], batch: Vec<Value>) -> Vec<Value> {
     if filters.is_empty() {
         return batch;
@@ -1416,11 +1422,114 @@ fn admitted(filters: &[Value], batch: Vec<Value>) -> Vec<Value> {
     batch
         .into_iter()
         .filter(|event| {
-            filters.iter().any(|pattern| {
-                ::service_common::event_pattern::matches_within(pattern, event, &mut budget)
-            })
+            // The record is matched as the FILTER reads it, which is not always as the
+            // envelope carries it; what the later stages are handed is the envelope
+            // itself, untouched.
+            let view = FilterView::of(event);
+            filters
+                .iter()
+                .any(|pattern| view.admits(pattern, &mut budget))
         })
         .collect()
+}
+
+/// The member of a source record envelope that carries the message AS SENT, whose format
+/// is the producer's and not the envelope's.
+const RECORD_BODY: &str = "body";
+
+/// The format the message a record carries is in.
+///
+/// A record envelope reports the message body as the text it was sent as, whatever that
+/// text spells; the filter stage is the one reader that cares which of the two formats a
+/// producer used, because a pattern is written for one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyFormat {
+    /// The body is in "a valid JSON format" — it spells a JSON document — so it is read
+    /// as the document it parses to.
+    Document,
+    /// The body spells no document, so it is read as the text it carries.
+    Text,
+}
+
+/// How the FILTER stage reads one polled record.
+///
+/// A record's message body travels as text, and a pattern's `body` clause is written
+/// either for the document a JSON body spells or for the text a plain body carries. So
+/// the filter decides the body's FORMAT once per record and reads the record accordingly:
+/// a body in "a valid JSON format" is matched as the document it parses to, a body that
+/// spells none as its text, and a pattern whose `body` clause is written for the other
+/// format admits the record no more than it would admit one whose values disagreed. A
+/// record envelope carrying no message body at all — a stream record, whose change is
+/// already a document — is read exactly as it was built.
+///
+/// This view lives only for the length of the match: the payload the enrichment and the
+/// target are handed is the record envelope with the body as sent.
+struct FilterView<'a> {
+    /// The format of the record's message body, or `None` for an envelope that has none.
+    format: Option<BodyFormat>,
+    /// The record as the patterns see it.
+    event: Cow<'a, Value>,
+}
+
+impl<'a> FilterView<'a> {
+    /// How the filter stage reads `event`.
+    ///
+    /// The body is parsed at most once per record, and what it may be is already bounded
+    /// by the largest message its source accepts, so the parse is bounded by the poll
+    /// that collected the record.
+    fn of(event: &'a Value) -> Self {
+        let Some(text) = event.get(RECORD_BODY).and_then(Value::as_str) else {
+            return Self {
+                format: None,
+                event: Cow::Borrowed(event),
+            };
+        };
+        // A body is in a JSON format when it spells a JSON DOCUMENT — an object or a
+        // list, which is what a clause names fields inside. A body spelling a bare scalar
+        // names nothing to descend into and is read as the text it is, the same reading
+        // the Amazon SQS event-source poller of a Lambda function takes.
+        let document = ::serde_json::from_str::<Value>(text)
+            .ok()
+            .filter(|body| body.is_object() || body.is_array());
+        let Some(document) = document else {
+            return Self {
+                format: Some(BodyFormat::Text),
+                event: Cow::Borrowed(event),
+            };
+        };
+        let mut view = event.clone();
+        if let Value::Object(members) = &mut view {
+            members.insert(RECORD_BODY.to_string(), document);
+        }
+        Self {
+            format: Some(BodyFormat::Document),
+            event: Cow::Owned(view),
+        }
+    }
+
+    /// Whether `pattern` admits this record, spending `budget`.
+    ///
+    /// The format of the body is decided BEFORE any value is compared, so a pattern whose
+    /// `body` clause is written for the other format drops the record whatever it holds.
+    fn admits(
+        &self,
+        pattern: &Value,
+        budget: &mut ::service_common::event_pattern::MatchBudget,
+    ) -> bool {
+        self.format_fits(pattern)
+            && ::service_common::event_pattern::matches_within(pattern, &self.event, budget)
+    }
+
+    /// Whether `pattern`'s `body` clause is written for the format this record's body
+    /// carries. A pattern with no `body` clause constrains neither format and fits both.
+    fn format_fits(&self, pattern: &Value) -> bool {
+        let form = match self.format {
+            None => return true,
+            Some(BodyFormat::Document) => ::service_common::event_pattern::ClauseForm::Document,
+            Some(BodyFormat::Text) => ::service_common::event_pattern::ClauseForm::Values,
+        };
+        ::service_common::event_pattern::reads_as(pattern, RECORD_BODY, form)
+    }
 }
 
 /// One polled Amazon SQS message as the record envelope a pipe hands to its enrichment

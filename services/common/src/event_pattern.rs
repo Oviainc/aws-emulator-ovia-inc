@@ -188,6 +188,63 @@ pub fn matches_within(pattern: &Value, event: &Value, budget: &mut MatchBudget) 
     })
 }
 
+/// The FORM a pattern writes a clause in, which is what decides the kind of
+/// value that clause can match at all.
+///
+/// A clause is either a nested object, which descends into a nested document, or
+/// an array of candidates, which compares a single value. The two never match
+/// the same thing: an object clause matches no scalar and a candidate list
+/// matches no document. A service whose event carries one field in more than one
+/// FORM — the same member read as a document or as text, depending on what the
+/// producer sent — needs to know which form a clause was written in before it
+/// renders the event for matching, which is what [`reads_as`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClauseForm {
+    /// A nested object, which matches only a nested document.
+    Document,
+    /// An array of candidate values, which matches only a single value.
+    Values,
+}
+
+/// Whether `pattern` can match an event whose top-level `field` is read in
+/// `form`.
+///
+/// A pattern that names `field` in the OTHER form cannot match such an event
+/// whatever the values compare to, and that is what this reports — before any
+/// matching, so a caller can decide the event is not this pattern's without
+/// rendering it. A pattern that does not name `field` at all is unconstrained by
+/// it and reports `true`, and `$or` is a disjunction: a pattern whose branches
+/// are alternatives can match when ANY branch can.
+///
+/// The walk is over the PATTERN alone, never the event, and [`parse`] bounds how
+/// large and how deep a stored pattern is, so this costs no match budget.
+pub fn reads_as(pattern: &Value, field: &str, form: ClauseForm) -> bool {
+    let Value::Object(fields) = pattern else {
+        return false;
+    };
+    fields.iter().all(|(named, spec)| {
+        if named == OR {
+            return spec
+                .as_array()
+                .is_some_and(|branches| branches.iter().any(|branch| reads_as(branch, field, form)));
+        }
+        if named != field {
+            return true;
+        }
+        clause_form(spec) == Some(form)
+    })
+}
+
+/// The form one clause is written in, or `None` for a clause in neither form —
+/// which `validate` refuses, so a stored pattern holds none.
+fn clause_form(spec: &Value) -> Option<ClauseForm> {
+    match spec {
+        Value::Object(_) => Some(ClauseForm::Document),
+        Value::Array(_) => Some(ClauseForm::Values),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Structural validation
 // ---------------------------------------------------------------------------

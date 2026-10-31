@@ -93,7 +93,11 @@ const SUPPRESS_DEFINITION: &str = r#"{
 
 /// Pipes, SQS and Step Functions on one engine: a pipe's source and target are queues
 /// and its enrichment is an Express workflow, so all three are reached in-process.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` with the helpers below, so a suite asking a different question of a pipe
+/// over the wire (`tests/all/pipe_filter_body_format.rs`) stands the same emulator up
+/// rather than copying it.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);

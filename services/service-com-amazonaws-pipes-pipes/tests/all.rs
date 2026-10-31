@@ -27,6 +27,8 @@ mod pipe_desired_state;
 mod pipe_dynamodb_stream_source;
 #[path = "all/pipe_execution_role.rs"]
 mod pipe_execution_role;
+#[path = "all/pipe_filter_body_format.rs"]
+mod pipe_filter_body_format;
 #[path = "all/pipe_lifecycle.rs"]
 mod pipe_lifecycle;
 #[path = "all/pipe_lifecycle_conflicts.rs"]
