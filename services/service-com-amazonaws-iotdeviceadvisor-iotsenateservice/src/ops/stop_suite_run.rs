@@ -3,8 +3,10 @@
 //! @op StopSuiteRun
 //!
 //! Moves the persisted run to `STOPPING`, from which the clock owes it `STOPPED` with an
-//! `endTime`, so the following `GetSuiteRun` observes the new status. A run that already
-//! reached a terminal status is left exactly as it is — stopping never resurrects it.
+//! `endTime`, so the following `GetSuiteRun` observes the new status. A run still queued
+//! when the stop arrives leaves `PENDING` here, so it carries a start stamp like every
+//! other run that left the queue. A run that already reached a terminal status is left
+//! exactly as it is — stopping never resurrects it.
 //!
 //! ## Shape of an operation
 //!
@@ -170,10 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // Only a run that has not been asked to stop and has not finished is moved: a
-        // second stop neither restarts the stop clock nor resurrects a finished run.
-        let outcome = if run.is_stoppable() {
-            run.status = "STOPPING".to_string();
-            run.next_transition_at = Some(now + crate::state::STATUS_TRANSITION);
+        // second stop neither restarts the stop clock nor resurrects a finished run. The
+        // record owns that decision, and with it the stamps a run that leaves the queue
+        // here carries.
+        let outcome = if run.begin_stop(now) {
             "stopping"
         } else {
             "unchanged-already-stopping-or-finished"

@@ -50,6 +50,9 @@ mod shared_paging_rule;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/stopped_run_timestamps.rs"]
+mod stopped_run_timestamps;
+
 #[path = "all/stored_configuration_and_tag_responses.rs"]
 mod stored_configuration_and_tag_responses;
 

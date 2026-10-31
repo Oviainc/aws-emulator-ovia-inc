@@ -385,7 +385,8 @@ pub struct SuiteRun {
     /// One of `SuiteRunStatus`.
     pub status: String,
     pub created_at: SystemTime,
-    /// Set when the run leaves `PENDING`; absent while it is still queued.
+    /// Set when the run leaves `PENDING`, by whichever path takes it out of the queue
+    /// (the clock-owed start, or a caller's stop); absent only while it is still queued.
     pub started_at: Option<SystemTime>,
     /// Set only once the status is terminal.
     pub end_at: Option<SystemTime>,
@@ -418,7 +419,7 @@ impl SuiteRun {
             match self.status.as_str() {
                 "PENDING" => {
                     self.status = "RUNNING".to_string();
-                    self.started_at = Some(due);
+                    self.leave_pending(due);
                     self.next_transition_at = Some(due + STATUS_TRANSITION);
                 }
                 "RUNNING" => {
@@ -463,6 +464,36 @@ impl SuiteRun {
     /// neither restarts the stop clock nor resurrects a finished run.
     pub fn is_stoppable(&self) -> bool {
         matches!(self.status.as_str(), "PENDING" | "RUNNING")
+    }
+
+    /// Stamp `at` as the instant this run stopped being queued, unless it is stamped.
+    ///
+    /// The ONE writer of [`SuiteRun::started_at`], so the stamp belongs to having left
+    /// `PENDING` rather than to one particular way of leaving it: every path out of the
+    /// queued status goes through here. A run that already carries a stamp keeps it — a
+    /// run starts once, and a later transition is not a second start.
+    fn leave_pending(&mut self, at: SystemTime) {
+        if self.started_at.is_none() {
+            self.started_at = Some(at);
+        }
+    }
+
+    /// Ask this run to stop, and report whether that moved it.
+    ///
+    /// A stoppable run goes to `STOPPING`, from which the clock owes it `STOPPED` with an
+    /// `endTime`; because it has left `PENDING` it also carries its start stamp from here
+    /// on, so the end instant it reaches is reported against a start instant rather than
+    /// against nothing. A run that is already stopping or has finished is left exactly as
+    /// it is (see [`SuiteRun::is_stoppable`]), keeping both the stamp and the status it
+    /// already reached.
+    pub fn begin_stop(&mut self, now: SystemTime) -> bool {
+        if !self.is_stoppable() {
+            return false;
+        }
+        self.leave_pending(now);
+        self.status = "STOPPING".to_string();
+        self.next_transition_at = Some(now + STATUS_TRANSITION);
+        true
     }
 }
 
