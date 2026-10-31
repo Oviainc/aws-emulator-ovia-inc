@@ -172,22 +172,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A `channelSubtype` outside the model's own `ChannelSubtype` catalog names no
-        // channel, so there is no channel subtype config for it to delete. A backstop
-        // rather than the first line of defence: `channelSubtype` targets a modelled
-        // enum, so the boundary validator refuses an off-catalog value before `handle`
-        // runs — but only this check keeps the handler's own contract if that walk ever
-        // widens. Answered before the campaign is looked up: a request this malformed is
-        // a bad request whether or not the campaign exists.
-        if !CHANNEL_SUBTYPE_VALUES.contains(&input.channel_subtype.as_str()) {
+        // channel, so there is no channel subtype config for it to delete. The catalog
+        // itself is weighed by `crate::state::enum_value_violation`, the one place this
+        // service holds a scalar enum member to its catalog, so this refusal and every
+        // sibling operation's read alike. Answered before the campaign is looked up: a
+        // request this malformed is a bad request whether or not the campaign exists.
+        if let Some(message) = crate::state::enum_value_violation(
+            "channelSubtype",
+            CHANNEL_SUBTYPE_VALUES,
+            Some(input.channel_subtype.as_str()),
+        ) {
             return Err(
                 DeleteCampaignChannelSubtypeConfigErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
-                            "channelSubtype: {} is not a supported channel subtype; \
-                             supported subtypes are {}",
-                            input.channel_subtype,
-                            CHANNEL_SUBTYPE_VALUES.join(", ")
-                        ),
+                        message,
                         x_amz_error_type: None,
                     },
                 )

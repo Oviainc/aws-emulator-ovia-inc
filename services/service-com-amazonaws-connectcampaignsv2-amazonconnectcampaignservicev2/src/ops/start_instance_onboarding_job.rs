@@ -144,18 +144,16 @@ fn check_encryption_config(
     };
 
     // `EncryptionType`'s catalog (`ENCRYPTION_TYPE_VALUES`) holds KMS alone, so any
-    // other type is refused whether or not encryption is enabled. A backstop rather
-    // than the first line of defence: `encryptionType` targets a modelled enum, so
-    // the boundary validator refuses an off-catalog value before `handle` runs — but
-    // only this check keeps the handler's own contract if that walk ever widens.
-    if let Some(encryption_type) = config.encryption_type.as_deref() {
-        if !ENCRYPTION_TYPE_VALUES.contains(&encryption_type) {
-            return refuse(format!(
-                "encryptionConfig.encryptionType: {encryption_type} is not a supported encryption \
-                 type; supported types are {}",
-                ENCRYPTION_TYPE_VALUES.join(", ")
-            ));
-        }
+    // other type is refused whether or not encryption is enabled. The catalog itself is
+    // weighed by `crate::state::enum_value_violation`, the one place this service holds
+    // a scalar enum member to its catalog — a config carrying no encryption type has
+    // nothing to weigh and passes.
+    if let Some(message) = crate::state::enum_value_violation(
+        "encryptionConfig.encryptionType",
+        ENCRYPTION_TYPE_VALUES,
+        config.encryption_type.as_deref(),
+    ) {
+        return refuse(message);
     }
 
     if config.enabled && key.is_empty() {

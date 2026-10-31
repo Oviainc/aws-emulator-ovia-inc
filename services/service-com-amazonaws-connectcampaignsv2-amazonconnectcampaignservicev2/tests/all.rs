@@ -85,6 +85,8 @@ mod connect_instance_registry_gate;
 mod cursor_paging_is_one_rule;
 #[path = "all/cursor_tokens_are_scoped_to_their_listing.rs"]
 mod cursor_tokens_are_scoped_to_their_listing;
+#[path = "all/enum_catalog_is_one_rule.rs"]
+mod enum_catalog_is_one_rule;
 #[path = "all/instance_communication_limits.rs"]
 mod instance_communication_limits;
 #[path = "all/instance_communication_limits_isolation.rs"]

@@ -421,6 +421,43 @@ pub fn enum_map_keys_violation<'k>(
     })
 }
 
+/// Why the SCALAR at `member` is a bad request, or `None` when the request leaves it
+/// out or it holds a value the member's own catalog (`allowed`) holds.
+///
+/// The scalar counterpart of [`enum_map_keys_violation`], and with it the one place
+/// this service weighs a value against an enum catalog itself: every operation that
+/// keeps its own contract for an enum member — the `channelSubtype` of the
+/// channel-subtype-config deletion, the `config` of the communication-limits and
+/// communication-time deletions, the `campaignDeletionPolicy` of the instance-config
+/// deletion and the encryption type of an onboarding job's encryption config — refuses
+/// an off-catalog value through here, so the one rule is worded one way however many
+/// operations hold to it, whether the member is required or optional: a member the
+/// request never sent is nothing to weigh.
+///
+/// A backstop rather than the first line of defence: each of those members targets a
+/// modelled enum, so the boundary walk refuses an off-catalog value before a handler
+/// runs. Because the sentence here is built from the framework's own
+/// [`::smithy_server_runtime::Violation`] and rendered by
+/// `aws_smithy_schema_server::constraints::envelope` — the one place that wording
+/// lives — the two layers refuse the same value with the same sentence, so which of
+/// them answered is not something a caller can tell.
+pub fn enum_value_violation(member: &str, allowed: &[&str], value: Option<&str>) -> Option<String> {
+    let value = value?;
+    if allowed.contains(&value) {
+        return None;
+    }
+    let violation = ::smithy_server_runtime::Violation {
+        path: member.to_string(),
+        kind: ::smithy_server_runtime::ViolationKind::EnumValue(
+            allowed.iter().map(|allowed| (*allowed).to_string()).collect(),
+        ),
+        // `Violation::value` must arrive ALREADY elided: the message interpolates it
+        // verbatim.
+        value: Some(elided(value)),
+    };
+    ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
+}
+
 /// Why a communication-time config is a bad request, or `None` when every day its
 /// windows open is one the model's `DayOfWeek` catalog holds (`DAY_OF_WEEK_VALUES`
 /// in [`crate::ops::types`]).

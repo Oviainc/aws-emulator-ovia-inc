@@ -176,21 +176,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A `config` outside the model's own `CommunicationTimeConfigType` catalog
         // names no channel, so there is no communication time config for it to
-        // delete. A backstop rather than the first line of defence: `config` targets
-        // a modelled enum, so the boundary validator refuses an off-catalog value
-        // before `handle` runs — but only this check keeps the handler's own contract
-        // if that walk ever widens. Answered before the campaign is looked up: a
+        // delete. The catalog itself is weighed by
+        // `crate::state::enum_value_violation`, the one place this service holds a
+        // scalar enum member to its catalog, so this refusal and every sibling
+        // operation's read alike. Answered before the campaign is looked up: a
         // request this malformed is a bad request whether or not the campaign exists.
-        if !COMMUNICATION_TIME_CONFIG_TYPE_VALUES.contains(&input.config.as_str()) {
+        if let Some(message) = crate::state::enum_value_violation(
+            "config",
+            COMMUNICATION_TIME_CONFIG_TYPE_VALUES,
+            Some(input.config.as_str()),
+        ) {
             return Err(
                 DeleteCampaignCommunicationTimeErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
-                            "config: {} is not a supported communication time config type; \
-                             supported types are {}",
-                            input.config,
-                            COMMUNICATION_TIME_CONFIG_TYPE_VALUES.join(", ")
-                        ),
+                        message,
                         x_amz_error_type: None,
                     },
                 )

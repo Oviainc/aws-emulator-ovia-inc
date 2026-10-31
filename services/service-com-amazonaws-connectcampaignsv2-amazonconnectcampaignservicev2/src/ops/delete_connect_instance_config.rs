@@ -180,16 +180,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A `campaignDeletionPolicy` outside the model's own `CampaignDeletionPolicy`
         // catalog names no policy to enact on the instance's campaigns, so there is no
-        // deletion it could ask for. A backstop rather than the first line of defence:
-        // the member targets a modelled enum, so the boundary validator refuses an
-        // off-catalog value before `handle` runs — but only this check keeps the
-        // handler's own contract if that walk ever widens. Answered before the instance
-        // is looked up: a request this malformed is a bad request whether or not the
-        // instance holds a configuration.
+        // deletion it could ask for. The catalog itself is weighed by
+        // `crate::state::enum_value_violation`, the one place this service holds a
+        // scalar enum member to its catalog — a request carrying no policy at all has
+        // nothing to weigh and passes. Answered before the instance is looked up: a
+        // request this malformed is a bad request whether or not the instance holds a
+        // configuration.
         let policy = input.campaign_deletion_policy.as_deref();
-        if let Some(unknown) =
-            policy.filter(|named| !CAMPAIGN_DELETION_POLICY_VALUES.contains(named))
-        {
+        if let Some(message) = crate::state::enum_value_violation(
+            "campaignDeletionPolicy",
+            CAMPAIGN_DELETION_POLICY_VALUES,
+            policy,
+        ) {
             // A refused attempt to change the instance is still an attempt to change
             // it, so it leaves the same record a successful one does, naming the
             // outcome it ended in.
@@ -201,11 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(
                 DeleteConnectInstanceConfigErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "campaignDeletionPolicy: {unknown} is not a supported campaign deletion \
-                         policy; supported policies are {}",
-                        CAMPAIGN_DELETION_POLICY_VALUES.join(", ")
-                    ),
+                    message,
                     x_amz_error_type: None,
                 })
                 .into(),

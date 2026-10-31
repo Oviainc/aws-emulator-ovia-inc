@@ -178,21 +178,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A `config` outside the model's own `CommunicationLimitsConfigType` catalog
         // names no communication-limits config, so there is nothing for it to delete.
-        // A backstop rather than the first line of defence: `config` targets a modelled
-        // enum, so the boundary validator refuses an off-catalog value before `handle`
-        // runs — but only this check keeps the handler's own contract if that walk ever
-        // widens. Answered before the campaign is looked up: a request this malformed is
-        // a bad request whether or not the campaign exists.
-        if !COMMUNICATION_LIMITS_CONFIG_TYPE_VALUES.contains(&input.config.as_str()) {
+        // The catalog itself is weighed by `crate::state::enum_value_violation`, the one
+        // place this service holds a scalar enum member to its catalog, so this refusal
+        // and every sibling operation's read alike. Answered before the campaign is
+        // looked up: a request this malformed is a bad request whether or not the
+        // campaign exists.
+        if let Some(message) = crate::state::enum_value_violation(
+            "config",
+            COMMUNICATION_LIMITS_CONFIG_TYPE_VALUES,
+            Some(input.config.as_str()),
+        ) {
             return Err(
                 DeleteCampaignCommunicationLimitsErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
-                            "config: {} is not a supported communication limits config type; \
-                             supported types are {}",
-                            input.config,
-                            COMMUNICATION_LIMITS_CONFIG_TYPE_VALUES.join(", ")
-                        ),
+                        message,
                         x_amz_error_type: None,
                     },
                 )
