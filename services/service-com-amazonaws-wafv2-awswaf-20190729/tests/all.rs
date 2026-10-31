@@ -25,6 +25,8 @@ mod available_managed_rule_groups;
 mod challenge_immunity;
 #[path = "all/check_capacity.rs"]
 mod check_capacity;
+#[path = "all/counted_rule_samples.rs"]
+mod counted_rule_samples;
 #[path = "all/exception_messages.rs"]
 mod exception_messages;
 #[path = "all/firewall_manager_rule_groups.rs"]

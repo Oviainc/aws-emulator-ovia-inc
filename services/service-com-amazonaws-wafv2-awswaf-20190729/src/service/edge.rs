@@ -23,8 +23,10 @@
 //! 2. A rule whose statement MATCHES adds its `RuleLabels` to the request, under the
 //!    web ACL's own label namespace, and then applies its `Action`. `Block`, `Allow`,
 //!    `Captcha` and `Challenge` are TERMINATING — they end the evaluation — while
-//!    `Count` records the match and lets the next rule run. A label a rule adds is
-//!    visible to every rule that runs after it, which is what a
+//!    `Count` records the match and lets the next rule run. EITHER WAY the request
+//!    enters the sample population of that rule's own dimension, under the
+//!    `ActionValue` the rule applied, because the match is what a sample is of. A
+//!    label a rule adds is visible to every rule that runs after it, which is what a
 //!    `LabelMatchStatement` matches against ("labels that have been added to the web
 //!    request by rules that have already run in the web ACL").
 //! 3. A rule whose statement runs a rule GROUP — a `ManagedRuleGroupStatement` or a
@@ -833,8 +835,15 @@ impl Evaluation<'_> {
             });
 
         for rule in web_acl.rules.iter().flatten() {
-            let outcome =
-                self.run_rule(rule, &mut cx, &mut inserted, &mut counted, counts, &namespace);
+            let outcome = self.run_rule(
+                rule,
+                &mut cx,
+                &mut inserted,
+                &mut counted,
+                counts,
+                &namespace,
+                &mut samples,
+            );
             if let RuleOutcome::Terminate {
                 action,
                 custom_response,
@@ -845,10 +854,14 @@ impl Evaluation<'_> {
                 self.record_sample(
                     &mut samples,
                     &rule.visibility_config,
-                    action,
+                    action.action_value(),
+                    None,
                     inner_rule.clone(),
                     &inserted,
                     &cx.labels,
+                );
+                report_response_code(
+                    &mut samples,
                     custom.as_ref().map(|response| response.status),
                 );
                 return (
@@ -887,10 +900,14 @@ impl Evaluation<'_> {
         self.record_sample(
             &mut samples,
             &web_acl.visibility_config,
-            action,
+            action.action_value(),
+            None,
             None,
             &inserted,
             &cx.labels,
+        );
+        report_response_code(
+            &mut samples,
             custom.as_ref().map(|response| response.status),
         );
         (
@@ -921,6 +938,7 @@ impl Evaluation<'_> {
         counted: &mut Vec<RateInstanceKey>,
         counts: &HashMap<RateInstanceKey, Vec<RateBucket>>,
         namespace: &str,
+        samples: &mut Vec<SampledRequestRecord>,
     ) -> RuleOutcome {
         // A rule that runs a rule GROUP has no `Action` of its own: each of the
         // group's rules carries one, and the web ACL rule's `OverrideAction` is what
@@ -938,6 +956,8 @@ impl Evaluation<'_> {
                 &managed_namespace(managed),
                 cx,
                 inserted,
+                samples,
+                &rule.visibility_config,
             );
         }
         if let Some(reference) = rule.statement.rule_group_reference_statement.as_ref() {
@@ -958,6 +978,8 @@ impl Evaluation<'_> {
                 inserted,
                 counted,
                 counts,
+                samples,
+                &rule.visibility_config,
             );
         }
 
@@ -970,7 +992,24 @@ impl Evaluation<'_> {
             return RuleOutcome::Continue;
         }
         add_labels(&mut cx.labels, namespace, rule.rule_labels.as_deref());
-        self.apply_action(rule.action.as_ref(), inserted, None)
+        let outcome = self.apply_action(rule.action.as_ref(), inserted, None);
+        if let RuleOutcome::Continue = outcome {
+            // The rule MATCHED and its action does not terminate the evaluation, so
+            // this request is one the rule COUNTED: it belongs to the rule's own
+            // dimension exactly as a terminating match does, and the next rule runs.
+            if let Some(counted_as) = counting_action_value(rule.action.as_ref()) {
+                self.record_sample(
+                    samples,
+                    &rule.visibility_config,
+                    counted_as,
+                    None,
+                    None,
+                    inserted,
+                    &cx.labels,
+                );
+            }
+        }
+        outcome
     }
 
     /// Run the rules of a MANAGED rule group the web ACL references.
@@ -986,6 +1025,8 @@ impl Evaluation<'_> {
         namespace: &str,
         cx: &mut MatchContext<'_>,
         inserted: &mut Vec<(String, String)>,
+        samples: &mut Vec<SampledRequestRecord>,
+        visibility: &VisibilityConfig,
     ) -> RuleOutcome {
         // "An optional nested statement that narrows the scope of the web requests
         // that are evaluated by the managed rule group. Requests are only evaluated by
@@ -1004,19 +1045,32 @@ impl Evaluation<'_> {
             if let Some(label) = group_rule.label.as_deref() {
                 add_label(&mut cx.labels, namespace, label);
             }
-            let action = effective_group_action(
+            let decided = effective_group_action(
                 &group_rule.name,
                 &group_rule.action,
                 excluded,
                 overrides,
                 counted_group,
             );
-            if let Some(outcome) = terminating(
-                action.as_ref(),
-                inserted,
-                Some(group_rule_name(group, &group_rule.name)),
-            ) {
+            let named = group_rule_name(group, &group_rule.name);
+            if let Some(outcome) =
+                terminating(decided.action.as_ref(), inserted, Some(named.clone()))
+            {
                 return outcome;
+            }
+            // The group's rule matched and did not terminate, so it COUNTED this
+            // request: it belongs to the dimension of the web ACL rule that runs the
+            // group, named by the group rule that counted it.
+            if let Some(counted_as) = decided.counted_as {
+                self.record_sample(
+                    samples,
+                    visibility,
+                    counted_as,
+                    decided.overridden_action,
+                    Some(named),
+                    inserted,
+                    &cx.labels,
+                );
             }
         }
         RuleOutcome::Continue
@@ -1036,6 +1090,8 @@ impl Evaluation<'_> {
         inserted: &mut Vec<(String, String)>,
         counted: &mut Vec<RateInstanceKey>,
         counts: &HashMap<RateInstanceKey, Vec<RateBucket>>,
+        samples: &mut Vec<SampledRequestRecord>,
+        visibility: &VisibilityConfig,
     ) -> RuleOutcome {
         let counted_group = override_action.is_some_and(|action| action.count.is_some());
         for group_rule in group_rules {
@@ -1061,20 +1117,33 @@ impl Evaluation<'_> {
                 &crate::state::label_namespace(crate::state::RULE_GROUP_ARN_KIND, group_name),
                 group_rule.rule_labels.as_deref(),
             );
-            let action = effective_group_action(
+            let decided = effective_group_action(
                 &group_rule.name,
                 &group_rule.action.clone().unwrap_or_default(),
                 excluded,
                 overrides,
                 counted_group,
             );
-            if let Some(outcome) = terminating(
-                action.as_ref(),
-                inserted,
-                // A customer-owned group is named by its own name alone.
-                Some(group_rule_name(&[group_name], &group_rule.name)),
-            ) {
+            // A customer-owned group is named by its own name alone.
+            let named = group_rule_name(&[group_name], &group_rule.name);
+            if let Some(outcome) =
+                terminating(decided.action.as_ref(), inserted, Some(named.clone()))
+            {
                 return outcome;
+            }
+            // As in [`Self::run_group`]: a group rule that matched without
+            // terminating counted the request, under the dimension of the web ACL
+            // rule that runs the group.
+            if let Some(counted_as) = decided.counted_as {
+                self.record_sample(
+                    samples,
+                    visibility,
+                    counted_as,
+                    decided.overridden_action,
+                    Some(named),
+                    inserted,
+                    &cx.labels,
+                );
             }
         }
         RuleOutcome::Continue
@@ -1273,16 +1342,23 @@ impl Evaluation<'_> {
 
     /// Record one sample of this request under a rule dimension, when that
     /// dimension's `VisibilityConfig` asks for samples.
+    ///
+    /// `action` is the `ActionValue` the dimension applied to the request — the
+    /// terminating action for the rule that ended the evaluation, and
+    /// [`COUNT_ACTION_VALUE`] or [`EXCLUDED_AS_COUNT_ACTION_VALUE`] for a rule that
+    /// only counted it. The response code the request was answered with is reported by
+    /// [`report_response_code`] once the evaluation has settled on one, because every
+    /// sample recorded here is of the SAME request.
     #[allow(clippy::too_many_arguments)]
     fn record_sample(
         &self,
         samples: &mut Vec<SampledRequestRecord>,
         visibility: &VisibilityConfig,
-        action: EdgeAction,
+        action: &str,
+        overridden_action: Option<String>,
         inner_rule: Option<String>,
         inserted: &[(String, String)],
         labels: &[String],
-        status: Option<u16>,
     ) {
         // `VisibilityConfig$SampledRequestsEnabled`: "indicates whether WAF should
         // store a sampling of the web requests that match the rules". Turned off,
@@ -1301,7 +1377,7 @@ impl Evaluation<'_> {
                 // sample stands for itself.
                 weight: 1,
                 timestamp: Some(::aws_smithy_types::DateTime::from_millis(self.now)),
-                action: Some(action.action_value().to_string()),
+                action: Some(action.to_string()),
                 rule_name_within_rule_group: inner_rule,
                 request_headers_inserted: (!inserted.is_empty()).then(|| {
                     inserted
@@ -1312,7 +1388,9 @@ impl Evaluation<'_> {
                         })
                         .collect()
                 }),
-                response_code_sent: status.map(i32::from),
+                // Filled in by [`report_response_code`], once the evaluation has
+                // settled on the response the request was answered with.
+                response_code_sent: None,
                 labels: Some(
                     labels
                         .iter()
@@ -1321,9 +1399,24 @@ impl Evaluation<'_> {
                 ),
                 captcha_response: None,
                 challenge_response: None,
-                overridden_action: None,
+                overridden_action,
             },
         });
+    }
+}
+
+/// Report, on every sample of the request just evaluated, the response code WAF
+/// answered it with.
+///
+/// `SampledHTTPRequest$ResponseCodeSent` is "the response code that was sent for the
+/// request", which is a property of the REQUEST rather than of the dimension a sample
+/// of it was drawn under: a rule that counted the request sent no response of its own,
+/// so what was sent is whatever the action that terminated the evaluation (or the
+/// `DefaultAction`) served. `None` where the protected resource's own origin answered,
+/// because WAF sent nothing then.
+fn report_response_code(samples: &mut [SampledRequestRecord], status: Option<u16>) {
+    for record in samples {
+        record.sample.response_code_sent = status.map(i32::from);
     }
 }
 
@@ -1351,8 +1444,64 @@ pub fn evaluation_window_millis(evaluation_window_sec: i64) -> i64 {
     seconds.saturating_mul(1_000)
 }
 
+/// What the web ACL's overrides made of one rule of a referenced rule group.
+struct GroupRuleDecision {
+    /// The action in force for the rule, or `None` when the web ACL took the rule's
+    /// own action out of force and left it counting the request.
+    action: Option<RuleAction>,
+    /// The `ActionValue` a sample of this rule reports when the rule did NOT terminate
+    /// the evaluation: `COUNT` for an action that counts the request,
+    /// `EXCLUDED_AS_COUNT` for a rule the web ACL excluded, and `None` for a rule that
+    /// names no action at all, which applies nothing to the request.
+    counted_as: Option<&'static str>,
+    /// `SampledHTTPRequest$OverriddenAction` — "used only for rule group rules that
+    /// have a rule action override in place in the web ACL. This is the action that
+    /// the rule group rule is configured for, and not the action that was applied to
+    /// the request" — so it is the CONFIGURED action, and only where the web ACL put
+    /// something else in its place.
+    overridden_action: Option<String>,
+}
+
+/// The `ActionValue` a sample reports for a rule that COUNTED the request rather than
+/// acting on it: `RuleAction$Count` "enables WAF to count requests that match the
+/// rule, without otherwise affecting what happens to the request" (`ActionValue`).
+const COUNT_ACTION_VALUE: &str = "COUNT";
+
+/// The `ActionValue` a sample reports for a rule of a referenced rule group that the
+/// web ACL EXCLUDED: such a rule is counted instead of acted on
+/// (`ExcludedRule`: "the rules in the referenced rule group whose actions are set to
+/// Count"), and the enum has a value of its own for that case.
+const EXCLUDED_AS_COUNT_ACTION_VALUE: &str = "EXCLUDED_AS_COUNT";
+
+/// The `ActionValue` `action` names, or `None` for a `RuleAction` naming no member at
+/// all.
+fn action_value(action: &RuleAction) -> Option<&'static str> {
+    if action.block.is_some() {
+        return Some(EdgeAction::Block.action_value());
+    }
+    if action.allow.is_some() {
+        return Some(EdgeAction::Allow.action_value());
+    }
+    if action.captcha.is_some() {
+        return Some(EdgeAction::Captcha.action_value());
+    }
+    if action.challenge.is_some() {
+        return Some(EdgeAction::Challenge.action_value());
+    }
+    action.count.as_ref().map(|_| COUNT_ACTION_VALUE)
+}
+
+/// The `ActionValue` a sample reports for a rule whose `action` left the evaluation to
+/// continue: `COUNT` for an action that counts the request, and `None` for one that
+/// names no member, which does nothing to the request and so samples it under nothing.
+fn counting_action_value(action: Option<&RuleAction>) -> Option<&'static str> {
+    action
+        .and_then(|action| action.count.as_ref())
+        .map(|_| COUNT_ACTION_VALUE)
+}
+
 /// The action a rule of a referenced group takes once the web ACL's overrides are
-/// applied, or `None` when the rule is to be counted rather than acted on.
+/// applied, beside what a sample of that rule reports when it only counts the request.
 ///
 /// Three overrides, innermost first: `ExcludedRules` ("the rules in the referenced
 /// rule group whose actions are set to `Count`"), `RuleActionOverrides` ("action
@@ -1365,25 +1514,51 @@ fn effective_group_action(
     excluded: Option<&[ExcludedRule]>,
     overrides: Option<&[RuleActionOverride]>,
     counted_group: bool,
-) -> Option<RuleAction> {
+) -> GroupRuleDecision {
+    // `OverriddenAction` reports what the rule is configured for in the place of what
+    // was applied, so a rule the web ACL put the SAME action in the place of has
+    // nothing to report there.
+    let configured_unless = |in_force: Option<&str>| {
+        action_value(configured)
+            .filter(|value| Some(*value) != in_force)
+            .map(str::to_string)
+    };
     if counted_group {
-        return None;
+        return GroupRuleDecision {
+            action: None,
+            counted_as: Some(COUNT_ACTION_VALUE),
+            overridden_action: configured_unless(Some(COUNT_ACTION_VALUE)),
+        };
     }
     if let Some(over) = overrides
         .unwrap_or_default()
         .iter()
         .find(|over| over.name == name)
     {
-        return Some(over.action_to_use.clone());
+        let in_force = over.action_to_use.clone();
+        return GroupRuleDecision {
+            counted_as: counting_action_value(Some(&in_force)),
+            overridden_action: configured_unless(action_value(&in_force)),
+            action: Some(in_force),
+        };
     }
     if excluded
         .unwrap_or_default()
         .iter()
         .any(|excluded| excluded.name == name)
     {
-        return None;
+        return GroupRuleDecision {
+            action: None,
+            counted_as: Some(EXCLUDED_AS_COUNT_ACTION_VALUE),
+            overridden_action: configured_unless(Some(EXCLUDED_AS_COUNT_ACTION_VALUE)),
+        };
     }
-    Some(configured.clone())
+    GroupRuleDecision {
+        counted_as: counting_action_value(Some(configured)),
+        // The rule's own action is in force, so nothing was put in its place.
+        overridden_action: None,
+        action: Some(configured.clone()),
+    }
 }
 
 /// The terminating outcome `action` names, collecting its `CustomRequestHandling`
