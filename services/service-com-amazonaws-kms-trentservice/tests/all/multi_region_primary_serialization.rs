@@ -136,9 +136,11 @@ async fn concurrent_promotions_of_one_set_are_refused_as_an_invalid_key_state() 
             );
         }
 
-        // ONE configuration, seen the same way from every endpoint of the set: the
-        // target Region holds the primary key and every other Region of the set holds
-        // a replica of it — no split brain, whichever endpoint is asked.
+        // ONE configuration, seen the same way from every endpoint of the set, once the
+        // clock has made the winner's move due — the designation arrives when the
+        // transient key state of the move is over: the target Region holds the primary
+        // key and every other Region of the set holds a replica of it — no split brain,
+        // whichever endpoint is asked.
         let mut expected_replicas: Vec<String> = set_regions
             .iter()
             .chain(std::iter::once(&REGION))
@@ -146,6 +148,7 @@ async fn concurrent_promotions_of_one_set_are_refused_as_an_invalid_key_state() 
             .map(|region| (*region).to_string())
             .collect();
         expected_replicas.sort();
+        settle_key_state(&router, race.target, case, &key_id, "Updating").await;
         for region in set_regions.iter().chain(std::iter::once(&REGION)) {
             let (key_type, primary_region, replicas) =
                 topology_at(&router, case, region, &key_id).await;
@@ -205,7 +208,8 @@ async fn a_set_moving_its_primary_key_refuses_management_and_serves_cryptography
     );
 
     // Both keys the designation moved between report the transient state, through
-    // their own endpoints, and `Enabled` follows it.
+    // their own endpoints, and `Enabled` follows it — and the move itself has not
+    // happened yet, so the set still reports the designation it has.
     for region in [REGION, target] {
         let metadata = describe_in(&router, region, &key_id).await;
         assert_eq!(
@@ -213,6 +217,12 @@ async fn a_set_moving_its_primary_key_refuses_management_and_serves_cryptography
             (json!("Updating"), json!(false)),
             "case the {region} endpoint while the move is in flight: the old and the new \
              primary key are Updating, got {metadata}"
+        );
+        assert_eq!(
+            metadata["MultiRegionConfiguration"]["PrimaryKey"]["Region"],
+            json!(REGION),
+            "case the {region} endpoint while the move is in flight: the designation has \
+             not arrived while the move is still in progress, got {metadata}"
         );
     }
 
@@ -373,6 +383,7 @@ async fn a_set_moving_its_primary_key_refuses_management_and_serves_cryptography
         promoted.is_null() || promoted.as_object().is_some_and(|members| members.is_empty()),
         "case once the move is complete: the set is promotable again, got {promoted}"
     );
+    settle_key_state(&router, REGION, "promoted back", &key_id, "Updating").await;
     let (key_type, primary_region, _) = topology_at(&router, "promoted back", REGION, &key_id).await;
     assert_eq!(
         (key_type.as_str(), primary_region.as_str()),

@@ -97,6 +97,8 @@ mod message_authentication_codes;
 mod multi_region_primary;
 #[path = "all/multi_region_primary_serialization.rs"]
 mod multi_region_primary_serialization;
+#[path = "all/multi_region_primary_settlement.rs"]
+mod multi_region_primary_settlement;
 #[path = "all/multi_region_rotation_sharing.rs"]
 mod multi_region_rotation_sharing;
 #[path = "all/no_allow_refusal_clause.rs"]

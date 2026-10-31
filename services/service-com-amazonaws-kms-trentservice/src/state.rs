@@ -129,9 +129,10 @@ pub const KEY_STATE_UPDATING: &str = "Updating";
 /// The documentation says only "a few more seconds", so the length of the span is this
 /// emulator's. It is NON-ZERO, so a caller racing or retrying the move still observes
 /// the set while the move is in flight and the key-state refusal that goes with it.
-/// The instant it ends is stored on the key records that are moving
-/// ([`Cmk::primary_region_update_until`]) and the state a reader reports is derived
-/// from the clock, so nothing has to be written when it passes.
+/// The instant it ends is stored on the move itself and both the designation and the
+/// designation and the key state a reader reports are derived from the clock, so
+/// nothing has to be written when it passes — and the designation arrives exactly when
+/// the transient state is over.
 pub const PRIMARY_REGION_UPDATE_SPAN: Duration = Duration::from_secs(3);
 
 /// The `KeyUsageType` a cryptographic encrypt/decrypt key carries, from
@@ -673,7 +674,7 @@ impl ComAmazonawsKmsTrentserviceState {
                 .get_mut(&arn)
                 .and_then(|key| key.multi_region_topology.as_mut())
             {
-                topology.replica_regions.insert(region.to_string());
+                topology.add_replica_region(region.to_string());
             }
         }
     }
@@ -722,13 +723,16 @@ impl ComAmazonawsKmsTrentserviceState {
     /// The move is not instantaneous: "even after this operation completes, the process
     /// of updating the primary Region might still be in progress for a few more
     /// seconds. ... The old and new primary keys have a transient key state of
-    /// Updating" (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`), so the two
-    /// keys the designation moves between — and only those two — are given the instant
-    /// that move is due ([`PRIMARY_REGION_UPDATE_SPAN`]), which is what makes a second
-    /// move of the same set while this one is in flight a key-state refusal
-    /// ([`Self::primary_region_update_in_flight`]).
+    /// Updating. The original key state is restored when the update is complete"
+    /// (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`), so the move is
+    /// recorded with the instant the clock makes it due
+    /// ([`PRIMARY_REGION_UPDATE_SPAN`]) rather than taking effect at once: until that
+    /// instant the set reports the designation it still has and a second move of it is
+    /// a key-state refusal ([`Self::primary_region_update_in_flight`]), and from it the
+    /// designation has moved and the transient state is over — ONE instant, so a reader
+    /// that can see the move complete is never refused for it being in flight.
     pub fn promote_primary_region(&mut self, key_id: &str, region: &str) -> bool {
-        let former_primary_region = self.primary_region_of(key_id);
+        let due = SystemTime::now() + PRIMARY_REGION_UPDATE_SPAN;
         let mut promoted = false;
         for arn in self.set_member_arns(key_id) {
             if let Some(topology) = self
@@ -736,37 +740,10 @@ impl ComAmazonawsKmsTrentserviceState {
                 .get_mut(&arn)
                 .and_then(|key| key.multi_region_topology.as_mut())
             {
-                promoted |= topology.promote(region);
+                promoted |= topology.promote(region, due);
             }
         }
-        if !promoted {
-            return false;
-        }
-        let due = SystemTime::now() + PRIMARY_REGION_UPDATE_SPAN;
-        for moving in former_primary_region
-            .as_deref()
-            .into_iter()
-            .chain(std::iter::once(region))
-        {
-            if let Some(key) = self.key_mut_in(moving, key_id) {
-                key.primary_region_update_until = Some(due);
-            }
-        }
-        true
-    }
-
-    /// The Region holding the primary key of the multi-Region key set `key_id`, or
-    /// `None` when no key of that id belongs to a multi-Region set. Which Region that
-    /// is, is a property every key of the set shares, so any member reports it.
-    fn primary_region_of(&self, key_id: &str) -> Option<String> {
-        self.keys
-            .values()
-            .filter(|key| key.key_id == key_id)
-            .find_map(|key| {
-                key.multi_region_topology
-                    .as_ref()
-                    .map(|topology| topology.primary_region.clone())
-            })
+        promoted
     }
 
     /// Whether the clock still owes the multi-Region key set `key_id` a primary-Region
@@ -777,9 +754,13 @@ impl ComAmazonawsKmsTrentserviceState {
     /// primary-key designation that is moving: whichever of its keys a request names, a
     /// promotion it asks for is serialized behind the one in flight.
     pub fn primary_region_update_in_flight(&self, key_id: &str) -> bool {
-        self.keys
-            .values()
-            .any(|key| key.key_id == key_id && key.is_updating_primary_region())
+        self.keys.values().any(|key| {
+            key.key_id == key_id
+                && key
+                    .multi_region_topology
+                    .as_ref()
+                    .is_some_and(MultiRegionTopology::promotion_in_flight)
+        })
     }
 
     /// Record that `operation` used the key `key_id` that `region`'s endpoint serves
@@ -1856,14 +1837,6 @@ pub struct Cmk {
     /// derives the transient state from this instant ([`Self::is_creating`]) rather
     /// than from anything a later call wrote.
     pub creating_until: Option<SystemTime>,
-    /// When this key stops being in the transient [`KEY_STATE_UPDATING`] state, or
-    /// `None` for a key whose multi-Region key set has no primary-Region move in
-    /// flight. Only the old and the new primary key of a set are given one, and only
-    /// until [`PRIMARY_REGION_UPDATE_SPAN`] after the call that moved the designation;
-    /// a reader derives the transient state from this instant
-    /// ([`Self::is_updating_primary_region`]) rather than from anything a later call
-    /// wrote.
-    pub primary_region_update_until: Option<SystemTime>,
     pub description: String,
     pub key_usage: String,
     pub key_spec: String,
@@ -2053,10 +2026,6 @@ impl std::fmt::Debug for Cmk {
             .field("enabled", &self.enabled)
             .field("key_state", &self.key_state)
             .field("creating_until", &self.creating_until)
-            .field(
-                "primary_region_update_until",
-                &self.primary_region_update_until,
-            )
             .field("description", &self.description)
             .field("key_usage", &self.key_usage)
             .field("key_spec", &self.key_spec)
@@ -2126,10 +2095,6 @@ impl Cmk {
             // A key `CreateKey` mints is never in the transient `Creating` state:
             // only a replica key is ([`Self::replica_in`]).
             creating_until: None,
-            // A key that has just been created has no primary-Region move in flight:
-            // only `UpdatePrimaryRegion` starts one
-            // ([`Store::promote_primary_region`]).
-            primary_region_update_until: None,
             description,
             key_usage,
             key_spec,
@@ -2209,7 +2174,7 @@ impl Cmk {
             .multi_region_topology
             .clone()
             .unwrap_or_else(|| MultiRegionTopology::primary_in(self.region.clone()));
-        topology.replica_regions.insert(region.clone());
+        topology.add_replica_region(region.clone());
         Self {
             key_id: self.key_id.clone(),
             arn,
@@ -2225,9 +2190,6 @@ impl Cmk {
                 KEY_STATE_ENABLED.to_string()
             },
             creating_until: Some(SystemTime::now() + REPLICA_CREATING_SPAN),
-            // A replica joins the set as a replica key: the designation moves only
-            // when `UpdatePrimaryRegion` moves it.
-            primary_region_update_until: None,
             description,
             key_usage: self.key_usage.clone(),
             key_spec: self.key_spec.clone(),
@@ -2915,7 +2877,7 @@ impl Cmk {
     pub fn is_multi_region_replica(&self) -> bool {
         self.multi_region_topology
             .as_ref()
-            .is_some_and(|topology| topology.primary_region != self.region)
+            .is_some_and(|topology| topology.primary_region() != self.region)
     }
 
     /// Whether this key's imported key material has reached the instant the caller set
@@ -2937,8 +2899,8 @@ impl Cmk {
     /// the clock still owes it a transient state change: a replica key is `Creating`
     /// until [`Self::creating_until`] passes, material past its `ValidTo` is deleted,
     /// leaving a key with no key material waiting in [`KEY_STATE_PENDING_IMPORT`], and
-    /// a key its set is still moving the primary-key designation through is `Updating`
-    /// until [`Self::primary_region_update_until`] passes.
+    /// and a key its set is still moving the primary-key designation through is
+    /// `Updating` until that move is due ([`Self::is_updating_primary_region`]).
     pub fn reported_key_state(&self) -> &str {
         if self.is_creating() {
             return KEY_STATE_CREATING;
@@ -2968,9 +2930,16 @@ impl Cmk {
     /// Whether the clock still owes this key's multi-Region key set the primary-Region
     /// move a call has started, which is the transient [`KEY_STATE_UPDATING`] state —
     /// see [`PRIMARY_REGION_UPDATE_SPAN`]. The clock ends it by itself.
+    ///
+    /// Only the two keys the designation moves BETWEEN are in it ("the old and new
+    /// primary keys have a transient key state of Updating"), so it is read off the
+    /// move the set has in flight and the Region this key lives in — the same record
+    /// the reported designation comes from, so the state and the designation can never
+    /// disagree about whether the move is over.
     pub fn is_updating_primary_region(&self) -> bool {
-        self.primary_region_update_until
-            .is_some_and(|until| SystemTime::now() < until)
+        self.multi_region_topology
+            .as_ref()
+            .is_some_and(|topology| topology.is_moving_through(&self.region))
     }
 
     /// Whether this key can be used in a cryptographic operation right now.
@@ -3203,12 +3172,19 @@ pub fn check_rotation_configurable(
 /// it, and which is which is what `MultiRegionConfiguration` reports.
 #[derive(Debug, Clone)]
 pub struct MultiRegionTopology {
-    /// The Region holding the set's primary key: the Region a `MultiRegion` create
-    /// minted it in, until `UpdatePrimaryRegion` moves the designation elsewhere.
-    pub primary_region: String,
-    /// The Regions holding a replica key of the set. Sorted, so a reader reports
-    /// the replicas in a stable order across calls.
-    pub replica_regions: BTreeSet<String>,
+    /// The Region holding the set's primary key once every move of the designation
+    /// the clock owes has taken effect: the Region a `MultiRegion` create minted it
+    /// in, until `UpdatePrimaryRegion` moves the designation elsewhere. A reader asks
+    /// [`Self::primary_region`] instead, which is the designation as it stands NOW.
+    settled_primary_region: String,
+    /// The Regions holding a replica key of the set once every move of the
+    /// designation the clock owes has taken effect. Sorted, so a reader reports the
+    /// replicas in a stable order across calls.
+    settled_replica_regions: BTreeSet<String>,
+    /// The move of the designation `UpdatePrimaryRegion` started and the clock has
+    /// not yet made due, or `None` when the set has no move outstanding — see
+    /// [`PendingPromotion`].
+    promotion: Option<PendingPromotion>,
 }
 
 impl MultiRegionTopology {
@@ -3217,14 +3193,19 @@ impl MultiRegionTopology {
     /// Region.
     pub fn primary_in(region: String) -> Self {
         Self {
-            primary_region: region,
-            replica_regions: BTreeSet::new(),
+            settled_primary_region: region,
+            settled_replica_regions: BTreeSet::new(),
+            promotion: None,
         }
     }
 
-    /// Make the replica key in `region` this set's primary key and the former
-    /// primary key a replica, answering whether that Region held a replica to
-    /// promote at all.
+    /// Record that `region` now holds a replica key of this set.
+    pub fn add_replica_region(&mut self, region: String) {
+        self.settled_replica_regions.insert(region);
+    }
+
+    /// Start moving the designation to the replica key in `region`, due at `due`,
+    /// answering whether that Region held a replica to promote at all.
     ///
     /// "This operation changes the replica key in the specified Region to a primary
     /// key and changes the former primary key to a replica key"
@@ -3232,13 +3213,94 @@ impl MultiRegionTopology {
     /// are one step: the set never has two primary keys, nor none. A Region holding
     /// no replica of the set — including the one that already holds the primary key
     /// — has nothing to promote and leaves the topology exactly as it was.
-    pub fn promote(&mut self, region: &str) -> bool {
-        if !self.replica_regions.remove(region) {
+    ///
+    /// The move takes effect at `due` rather than at once, because until then "the
+    /// process of updating the primary Region might still be in progress" (same
+    /// doc): the designation this call moves and the transient key state that move
+    /// puts the two keys in are the SAME record, so neither is ever observable
+    /// without the other.
+    pub fn promote(&mut self, region: &str, due: SystemTime) -> bool {
+        self.settle_due_promotion();
+        if !self.settled_replica_regions.contains(region) {
             return false;
         }
-        let former_primary = std::mem::replace(&mut self.primary_region, region.to_string());
-        self.replica_regions.insert(former_primary);
+        self.promotion = Some(PendingPromotion {
+            region: region.to_string(),
+            due,
+        });
         true
+    }
+
+    /// Whether the clock still owes this set the move of its designation a call has
+    /// started — the set is transiently busy, which is what refuses the management
+    /// operations of its keys.
+    pub fn promotion_in_flight(&self) -> bool {
+        self.promotion
+            .as_ref()
+            .is_some_and(|promotion| SystemTime::now() < promotion.due)
+    }
+
+    /// Whether the key `region` holds is one of the two the move in flight goes
+    /// between — the old primary key and the new one, which are the keys that carry
+    /// the transient [`KEY_STATE_UPDATING`] state while it is in flight.
+    pub fn is_moving_through(&self, region: &str) -> bool {
+        self.promotion.as_ref().is_some_and(|promotion| {
+            SystemTime::now() < promotion.due
+                && (promotion.region == region || self.settled_primary_region == region)
+        })
+    }
+
+    /// The Region holding this set's primary key NOW: the Region a move the clock has
+    /// already made due promoted, and otherwise the one the designation rests in. A
+    /// move still in flight has not happened yet, so it moves nothing a reader sees.
+    pub fn primary_region(&self) -> &str {
+        match self.due_promotion() {
+            Some(promoted) => promoted,
+            None => &self.settled_primary_region,
+        }
+    }
+
+    /// The Regions holding a replica key of this set NOW — every Region of the set
+    /// but the one [`Self::primary_region`] reports, in the sorted order the backing
+    /// set keeps them in.
+    fn replica_regions(&self) -> BTreeSet<&str> {
+        match self.due_promotion() {
+            Some(promoted) => self
+                .settled_replica_regions
+                .iter()
+                .map(String::as_str)
+                .filter(|region| *region != promoted)
+                .chain(std::iter::once(self.settled_primary_region.as_str()))
+                .collect(),
+            None => self
+                .settled_replica_regions
+                .iter()
+                .map(String::as_str)
+                .collect(),
+        }
+    }
+
+    /// The Region a move the clock has ALREADY made due promoted, which is the
+    /// designation this topology has not written down yet.
+    fn due_promotion(&self) -> Option<&str> {
+        self.promotion
+            .as_ref()
+            .filter(|promotion| SystemTime::now() >= promotion.due)
+            .map(|promotion| promotion.region.as_str())
+    }
+
+    /// Write a move the clock has already made due into the designation, so a move
+    /// started after it moves the set on from where that one left it. What a reader
+    /// sees is unchanged: this is the same designation [`Self::primary_region`]
+    /// already reports.
+    fn settle_due_promotion(&mut self) {
+        let Some(promoted) = self.due_promotion().map(str::to_string) else {
+            return;
+        };
+        self.settled_replica_regions.remove(&promoted);
+        let former_primary = std::mem::replace(&mut self.settled_primary_region, promoted);
+        self.settled_replica_regions.insert(former_primary);
+        self.promotion = None;
     }
 
     /// This set as the `MultiRegionConfiguration` of the key `region`'s endpoint
@@ -3246,22 +3308,44 @@ impl MultiRegionTopology {
     /// own, and `ReplicaKeys` names every Region holding a replica, each by the key
     /// ARN that Region's endpoint serves it under.
     pub fn configuration(&self, key_id: &str, region: &str) -> MultiRegionConfiguration {
-        let key_type = if self.primary_region == region {
+        let primary_region = self.primary_region();
+        let key_type = if primary_region == region {
             MULTI_REGION_KEY_TYPE_PRIMARY
         } else {
             MULTI_REGION_KEY_TYPE_REPLICA
         };
         MultiRegionConfiguration {
             multi_region_key_type: Some(key_type.to_string()),
-            primary_key: Some(multi_region_member(key_id, &self.primary_region)),
+            primary_key: Some(multi_region_member(key_id, primary_region)),
             replica_keys: Some(
-                self.replica_regions
-                    .iter()
+                self.replica_regions()
+                    .into_iter()
                     .map(|replica| multi_region_member(key_id, replica))
                     .collect(),
             ),
         }
     }
+}
+
+/// The move of one multi-Region key set's primary-key designation that an
+/// `UpdatePrimaryRegion` call started and the clock has not yet made due.
+///
+/// "Even after this operation completes, the process of updating the primary Region
+/// might still be in progress for a few more seconds. ... The old and new primary
+/// keys have a transient key state of Updating. The original key state is restored
+/// when the update is complete"
+/// (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`) — so ONE record carries
+/// both halves of the move: which Region the designation is going to, and the instant
+/// it arrives there, which is also the instant the transient state it put the two keys
+/// in is over.
+#[derive(Debug, Clone)]
+struct PendingPromotion {
+    /// The Region whose replica key the move makes this set's primary key.
+    region: String,
+    /// When the move is due — [`PRIMARY_REGION_UPDATE_SPAN`] after the call that
+    /// started it. Nothing has to be written when it passes: a reader derives the
+    /// designation and the key state from it.
+    due: SystemTime,
 }
 
 /// One key of a multi-Region set, as `MultiRegionConfiguration` names it: the

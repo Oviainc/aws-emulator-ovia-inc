@@ -15,12 +15,14 @@
 //! replica of the set — the last of which is a bad `PrimaryRegion` value rather
 //! than a missing resource, so it is a validation failure.
 //!
-//! The move itself takes a span the clock ends by itself: while it is in flight the
-//! two keys the designation moves between report the transient `Updating` key state
-//! and a second promotion of that set is refused as a key state the operation is not
-//! compatible with, whichever Region it asks for. The concurrent case — several
-//! promotions of one set issued at once — is asserted by
-//! `tests/all/multi_region_primary_serialization.rs`.
+//! The move itself takes a span the clock ends by itself, and the designation arrives
+//! when that span is over: while it is in flight the two keys the designation moves
+//! between report the transient `Updating` key state, the set still reports the
+//! designation it has, and a second promotion of that set is refused as a key state the
+//! operation is not compatible with, whichever Region it asks for. The concurrent case —
+//! several promotions of one set issued at once — is asserted by
+//! `tests/all/multi_region_primary_serialization.rs`, and what a set is once a promotion
+//! has been reported by `tests/all/multi_region_primary_settlement.rs`.
 //!
 //! Every assertion is about that rule over a TABLE, whose rows differ in the Region
 //! the designation moves to (two-, three- and four-segment Region ids), in the
@@ -101,58 +103,47 @@ async fn update_primary_region_moves_the_primary_key_of_the_set() {
         .await;
         assert_empty(&case, "UpdatePrimaryRegion", &answer);
 
-        let (key_type, reported_primary, replicas) = topology_of(&router, &case, &key_id).await;
-        assert_eq!(
-            reported_primary, primary_region,
-            "case {case}: expected the primary key in {primary_region}, got {reported_primary}"
-        );
-        // The endpoint serving this record is the creation Region, so the key it
-        // serves is the set's primary only while the designation rests there.
-        let expected_type = if primary_region == REGION {
-            "PRIMARY"
-        } else {
-            "REPLICA"
-        };
-        assert_eq!(
-            key_type, expected_type,
-            "case {case}: expected the key served in {REGION} to be the {expected_type} of the \
-             set, got {key_type}"
-        );
-        let expected_replicas: Vec<String> = members
+        // "Even after this operation completes, the process of updating the primary
+        // Region might still be in progress for a few more seconds. ... The old and
+        // new primary keys have a transient key state of Updating. The original key
+        // state is restored when the update is complete"
+        // (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`): while the clock
+        // still owes the set that move, the move has not happened, so the set goes on
+        // reporting the designation it has.
+        let in_flight_replicas: Vec<String> = members
             .iter()
-            .filter(|region| *region != primary_region)
+            .filter(|region| **region != former_primary)
             .cloned()
             .collect();
+        let (in_flight_type, in_flight_primary, in_flight_reported_replicas) =
+            topology_of(&router, &case, &key_id).await;
         assert_eq!(
-            replicas, expected_replicas,
-            "case {case}: expected replica keys in {expected_replicas:?}, got {replicas:?}"
+            (
+                in_flight_primary.as_str(),
+                &in_flight_reported_replicas,
+                in_flight_type.as_str()
+            ),
+            (
+                former_primary.as_str(),
+                &in_flight_replicas,
+                if former_primary == REGION {
+                    "PRIMARY"
+                } else {
+                    "REPLICA"
+                }
+            ),
+            "case {case}: while the move is in flight the set still reports the designation \
+             it has"
         );
 
-        // Nothing else about the key moved: a multi-Region set shares one key id,
-        // one key ARN per Region and one piece of key material.
-        let metadata = describe(&router, &key_id).await;
-        for member in ["KeyId", "Arn", "KeySpec", "KeyUsage", "CurrentKeyMaterialId"] {
-            assert_eq!(
-                metadata[member], created[member],
-                "case {case}: {member} must be untouched by a primary-Region move, got {metadata}"
-            );
-        }
-        assert_eq!(
-            metadata["MultiRegion"],
-            json!(true),
-            "case {case}: the key is still a multi-Region key, got {metadata}"
-        );
-
-        // "The old and new primary keys have a transient key state of Updating. The
-        // original key state is restored when the update is complete"
-        // (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`): this endpoint
-        // serves one key of the set, so it reports that transient state exactly while
-        // the key it serves is one of the two the designation moved between. "When
-        // KeyState is Enabled this value is true, otherwise it is false"
-        // (`smithy_query(query="doc",shape="KeyMetadata",member="Enabled")`), so the
-        // two members move together.
+        // This endpoint serves one key of the set, so it reports the transient state
+        // exactly while the key it serves is one of the two the designation moves
+        // between. "When KeyState is Enabled this value is true, otherwise it is
+        // false" (`smithy_query(query="doc",shape="KeyMetadata",member="Enabled")`),
+        // so the two members move together.
         let moves_this_key = former_primary == REGION || primary_region == REGION;
         let in_flight_state = if moves_this_key { "Updating" } else { "Enabled" };
+        let metadata = describe(&router, &key_id).await;
         assert_eq!(
             metadata["KeyState"],
             json!(in_flight_state),
@@ -196,16 +187,58 @@ async fn update_primary_region_moves_the_primary_key_of_the_set() {
             topology_of(&router, &case, &key_id).await;
         assert_eq!(
             (unchanged_primary, unchanged_replicas),
-            (primary_region.to_string(), expected_replicas.clone()),
+            (former_primary.clone(), in_flight_replicas),
             "case {case}: a refused call must leave the set exactly as it was"
         );
 
-        // Once the clock has ended the move, the original key state is restored and
-        // the set can be promoted again. The Region the designation moved TO is always
-        // one of the two keys the move went through, so its endpoint is where the move
-        // in flight is observable whichever Regions this row moved between.
+        // Once the clock has made the move due, the designation has arrived and the
+        // original key state is restored — one change, so the set reports the moved
+        // designation exactly from the instant the transient state is over. The Region
+        // the designation moved TO is always one of the two keys the move went through,
+        // so its endpoint is where the move in flight is observable whichever Regions
+        // this row moved between.
         settle_key_state(&router, primary_region, &case, &key_id, "Updating").await;
+        let (key_type, reported_primary, replicas) = topology_of(&router, &case, &key_id).await;
+        assert_eq!(
+            reported_primary, primary_region,
+            "case {case}: expected the primary key in {primary_region}, got {reported_primary}"
+        );
+        // The endpoint serving this record is the creation Region, so the key it
+        // serves is the set's primary only while the designation rests there.
+        let expected_type = if primary_region == REGION {
+            "PRIMARY"
+        } else {
+            "REPLICA"
+        };
+        assert_eq!(
+            key_type, expected_type,
+            "case {case}: expected the key served in {REGION} to be the {expected_type} of the \
+             set, got {key_type}"
+        );
+        let expected_replicas: Vec<String> = members
+            .iter()
+            .filter(|region| *region != primary_region)
+            .cloned()
+            .collect();
+        assert_eq!(
+            replicas, expected_replicas,
+            "case {case}: expected replica keys in {expected_replicas:?}, got {replicas:?}"
+        );
+
+        // Nothing else about the key moved: a multi-Region set shares one key id,
+        // one key ARN per Region and one piece of key material.
         let settled = describe(&router, &key_id).await;
+        for member in ["KeyId", "Arn", "KeySpec", "KeyUsage", "CurrentKeyMaterialId"] {
+            assert_eq!(
+                settled[member], created[member],
+                "case {case}: {member} must be untouched by a primary-Region move, got {settled}"
+            );
+        }
+        assert_eq!(
+            settled["MultiRegion"],
+            json!(true),
+            "case {case}: the key is still a multi-Region key, got {settled}"
+        );
         assert_eq!(
             (settled["KeyState"].clone(), settled["Enabled"].clone()),
             (created["KeyState"].clone(), created["Enabled"].clone()),

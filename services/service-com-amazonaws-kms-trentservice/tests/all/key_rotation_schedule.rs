@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 
 use super::harness::{
     assert_empty, call, create_alias, create_key, describe, error_code, error_message, ok,
-    replicate_into, router, text, REGION,
+    replicate_into, router, settle_key_state, text, REGION,
 };
 
 /// Seconds in a day: the unit `RotationPeriodInDays` counts in
@@ -672,6 +672,9 @@ async fn configuring_rotation_is_refused_outside_an_enabled_symmetric_kms_key() 
         &json!({"KeyId": replica, "PrimaryRegion": "eu-west-2"}),
     )
     .await;
+    // The designation arrives when the transient `Updating` key state of the move is
+    // over, so this endpoint serves a replica of the set from then on.
+    settle_key_state(&router, "eu-west-2", "setup", &replica, "Updating").await;
     for operation in ["EnableKeyRotation", "DisableKeyRotation"] {
         let case = format!("{operation} on a replica key of a multi-Region set");
         let (status, payload) = call(&router, REGION, operation, &json!({"KeyId": replica})).await;
