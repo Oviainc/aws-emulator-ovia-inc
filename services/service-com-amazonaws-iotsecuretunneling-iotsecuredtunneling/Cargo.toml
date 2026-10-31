@@ -26,7 +26,8 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # `service-common` carries the workspace's ONE caller-supplied-ARN parse, which the
 # ARN-addressed tagging operations read a `resourceArn` through
-# (`state::tunnel_id_from_arn`).
+# (`state::tunnel_id_from_arn`), and its ONE rendering of 16 opaque bytes as a version-4
+# UUID, which `state::mint_tunnel_id` lays a `tunnelId` out with.
 service-common = { path = "../common" }
 
 [build-dependencies]

@@ -846,18 +846,11 @@ fn minted_bytes() -> [u8; 32] {
 pub fn mint_tunnel_id() -> String {
     let mut id = [0u8; 16];
     id.copy_from_slice(&minted_bytes()[..16]);
-    // Version 4 and the RFC 4122 variant, so the id is well-formed as a UUID.
-    id[6] = (id[6] & 0x0f) | 0x40;
-    id[8] = (id[8] & 0x3f) | 0x80;
-    let hex = hex::encode(id);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
+    // The bytes are this crate's ([`minted_bytes`]); the UUID layout over them is the
+    // workspace's ONE rendering of 16 opaque bytes as a version-4 UUID, which computes
+    // it with the maintained `uuid` crate. So neither the version and variant bits nor
+    // the hyphenated text form is spelled out here to drift from that one.
+    ::service_common::uuid_from_random_bytes(id)
 }
 
 /// Mint a fresh client access token: 256 opaque bits, hex-encoded.

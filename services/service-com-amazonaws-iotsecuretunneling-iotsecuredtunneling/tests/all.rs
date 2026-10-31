@@ -29,6 +29,8 @@ mod list_tunnels_next_token_form;
 mod list_tunnels_page_token_scope;
 #[path = "all/member_update_stamp.rs"]
 mod member_update_stamp;
+#[path = "all/minted_tunnel_id_form.rs"]
+mod minted_tunnel_id_form;
 #[path = "all/owed_close_settled_by_every_entry_point.rs"]
 mod owed_close_settled_by_every_entry_point;
 #[path = "all/record_eviction_order.rs"]

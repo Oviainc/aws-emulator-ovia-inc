@@ -44,6 +44,9 @@
 //!   resource-based documents reach the same decision;
 //! * [`stable_hex_id`], the one deterministic mixing function a service derives a
 //!   wire-visible id with;
+//! * [`uuid_from_random_bytes`], the one rendering of 16 opaque bytes as a version-4
+//!   UUID, for every service that mints an identifier in that form — so the version
+//!   and variant bits and the hyphenated text form are written in one place;
 //! * [`network`], the contract the account's EC2 network — which subnets a Region has —
 //!   is modelled against, so no two services answer "does this subnet exist"
 //!   differently;
@@ -387,6 +390,30 @@ pub fn stable_hex_id(parts: &[&str]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// `bytes` as the text of a version-4 UUID: lowercase hexadecimal in the hyphenated
+/// `8-4-4-4-12` groups, carrying the version and variant bits a UUID built from random
+/// bytes has.
+///
+/// For an identifier a service MINTS in that form, out of 16 opaque bytes the service
+/// itself produced. The bytes stay the caller's: this RENDERS them rather than
+/// generating them, so a service keeps whatever unpredictability its own state module
+/// documents and takes only the layout from here.
+///
+/// Both halves of that layout belong to the maintained `uuid` crate — one call writes
+/// the version and variant bits, the other the text form — so no service has to spell
+/// out the bit masks or the group boundaries, which is exactly where a second copy
+/// drifts into producing something that is no longer a UUID.
+///
+/// Service crates still carrying their own copy of those masks and that `format!` are
+/// to be migrated onto this one, and nothing new should write another.
+#[must_use]
+pub fn uuid_from_random_bytes(bytes: [u8; 16]) -> String {
+    ::uuid::Builder::from_random_bytes(bytes)
+        .into_uuid()
+        .hyphenated()
+        .to_string()
 }
 
 /// The fixed first path segment of every `rpcv2Cbor` request
@@ -1907,6 +1934,86 @@ mod tests {
                 panic!("case {case:?}: mixes to the same id as case {other:?}: {id:?}");
             }
             seen.push((case, id));
+        }
+    }
+
+    /// Whatever 16 bytes a service hands [`uuid_from_random_bytes`], the text it gets
+    /// back is a version-4 UUID in the canonical hyphenated form: five lowercase-hex
+    /// groups of 8-4-4-4-12, the version nibble and the variant bits set, and the
+    /// remaining 122 bits exactly the ones that were handed in.
+    ///
+    /// The rows differ along the bytes, which is what the rendering generalises over:
+    /// all zero, all ones, the bytes whose version and variant nibbles are already
+    /// right, bytes whose nibbles are wrong in every position, and an ascending run.
+    #[test]
+    fn sixteen_bytes_render_as_a_canonical_version_4_uuid() {
+        // (case, bytes)
+        let rows: [(&str, [u8; 16]); 5] = [
+            ("all zero", [0x00; 16]),
+            ("all ones", [0xff; 16]),
+            (
+                "version and variant nibbles already set",
+                [
+                    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0x4c, 0xde, 0x8f, 0x01, 0x23, 0x45, 0x67,
+                    0x89, 0xab, 0xcd,
+                ],
+            ),
+            (
+                "version and variant nibbles set wrong",
+                [
+                    0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0xff, 0x33, 0xff, 0x55, 0x66, 0x77, 0x88,
+                    0x99, 0xaa, 0xbb,
+                ],
+            ),
+            (
+                "an ascending run",
+                [
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+                    0x0d, 0x0e, 0x0f,
+                ],
+            ),
+        ];
+
+        for (case, bytes) in rows {
+            let rendered = uuid_from_random_bytes(bytes);
+
+            let groups: Vec<&str> = rendered.split('-').collect();
+            assert_eq!(
+                groups.iter().map(|group| group.len()).collect::<Vec<_>>(),
+                vec![8, 4, 4, 4, 12],
+                "case {case:?}: a UUID is five groups of 8-4-4-4-12, got {rendered:?}"
+            );
+            assert!(
+                groups.iter().all(|group| group
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())),
+                "case {case:?}: a UUID is lowercase hexadecimal, got {rendered:?}"
+            );
+
+            let parsed = uuid::Uuid::parse_str(&rendered)
+                .unwrap_or_else(|error| panic!("case {case:?}: {rendered:?} is no UUID: {error}"));
+            assert_eq!(
+                parsed.get_version_num(),
+                4,
+                "case {case:?}: {rendered:?} must carry the version-4 nibble"
+            );
+            assert_eq!(
+                parsed.get_variant(),
+                uuid::Variant::RFC4122,
+                "case {case:?}: {rendered:?} must carry the variant bits, got {:?}",
+                parsed.get_variant()
+            );
+
+            // Only the version and variant bits are the layout's; every other bit is
+            // the one the caller supplied.
+            let mut expected = bytes;
+            expected[6] = (expected[6] & 0x0f) | 0x40;
+            expected[8] = (expected[8] & 0x3f) | 0x80;
+            assert_eq!(
+                parsed.as_bytes(),
+                &expected,
+                "case {case:?}: the rendered UUID must carry the supplied bytes, got {rendered:?}"
+            );
         }
     }
 }
