@@ -289,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let identifier = requested.to_lowercase();
                 if !store.replication_subnet_groups.contains_key(&identifier) {
                     return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                        format!("Replication Subnet Group '{requested}' does not exist."),
+                        crate::state::subnet_group_absent_message(requested),
                     ));
                 }
                 Some(identifier)

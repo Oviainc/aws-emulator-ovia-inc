@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteReplicationSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteReplicationSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: drops the replication subnet group the request names from
+//! [`crate::state`], and answers the modelled `ResourceNotFoundFault` for an identifier
+//! the account holds no group under. The notes below are the scaffold's, kept for the
+//! next reader.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteReplicationSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! NOT implemented here: the `InvalidResourceStateFault` DMS answers for a group a
+//! replication instance is still placed in. An instance resolves its group against the
+//! store every time it is reported, so deleting a group an instance names leaves that
+//! instance reporting no group rather than a stale one.
 //!
 //! ## Shape of an operation
 //!
@@ -135,20 +135,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteReplicationSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteReplicationSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteReplicationSubnetGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+
+        let requested = input.replication_subnet_group_identifier;
+        // A group "is stored as a lowercase string"
+        // (`CreateReplicationSubnetGroup$ReplicationSubnetGroupIdentifier`), so the
+        // lookup folds the request's value the same way the create folded it.
+        let identifier = requested.to_lowercase();
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        if store
+            .replication_subnet_groups
+            .remove(&identifier)
+            .is_none()
+        {
+            return Err(DeleteReplicationSubnetGroupErrorModeled::ResourceNotFoundFault(
+                ResourceNotFoundFault {
+                    // The identifier is reported as the CALLER sent it, not folded.
+                    message: Some(crate::state::subnet_group_absent_message(&requested)),
+                },
+            )
+            .into());
+        }
+
+        // A replication instance that was placed in the group resolves its subnet group
+        // against the store when it is reported, so an instance does not report a group
+        // that has left it; nothing else holds a copy of the record.
+        Ok(DeleteReplicationSubnetGroupOutput {})
     }
+}
+
+/// The DMS model declares no server-side fault, and this emulator always mounts the
+/// in-memory engine, so the unreachable "no store" branch is answered with the error the
+/// operation does model for a resource it cannot reach rather than a 501, which would
+/// claim the operation is unimplemented.
+fn store_unavailable() -> DeleteReplicationSubnetGroupError {
+    DeleteReplicationSubnetGroupErrorModeled::InvalidResourceStateFault(
+        InvalidResourceStateFault {
+            message: Some(
+                "the dms emulator is mounted on an engine that holds no state for it".to_string(),
+            ),
+        },
+    )
+    .into()
 }

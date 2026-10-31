@@ -294,6 +294,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
+        // The engine settings structures the request carried, with every password
+        // dropped: built here rather than inside the record below because the roles the
+        // endpoint asks DMS to assume are read off them, and that read happens before
+        // anything is persisted.
+        let settings = crate::state::EngineSettings {
+            dynamo_db: input.dynamo_db_settings,
+            s3: input.s3_settings,
+            dms_transfer: input.dms_transfer_settings,
+            mongo_db: input.mongo_db_settings,
+            kinesis: input.kinesis_settings,
+            kafka: input.kafka_settings,
+            elasticsearch: input.elasticsearch_settings,
+            neptune: input.neptune_settings,
+            redshift: input.redshift_settings,
+            postgre_sql: input.postgre_sql_settings,
+            my_sql: input.my_sql_settings,
+            oracle: input.oracle_settings,
+            sybase: input.sybase_settings,
+            microsoft_sql_server: input.microsoft_sql_server_settings,
+            ibm_db2: input.ibm_db2_settings,
+            doc_db: input.doc_db_settings,
+            redis: input.redis_settings,
+            gcp_my_sql: input.gcp_my_sql_settings,
+            timestream: input.timestream_settings,
+        }
+        .sanitized();
+
+        // An endpoint RUNS AS the service access role the request names, so the role is
+        // resolved against the account's IAM records at create time — DMS does not defer
+        // the check to `TestConnection`. A value that names no role this account holds, or
+        // one whose trust policy does not admit DMS, is refused with the modelled
+        // `AccessDeniedFault` and nothing is persisted. A value that names no role of THIS
+        // account at all, and an emulator with no IAM to ask, ground no refusal: the
+        // reading is silent unless IAM ANSWERED.
+        for role_arn in crate::state::service_access_role_arns(
+            input.service_access_role_arn.as_deref(),
+            &settings,
+        ) {
+            if ::service_common::iam_role::role_is_unassumable(
+                ctx,
+                &region,
+                &role_arn,
+                crate::state::DMS_SERVICE_PRINCIPAL,
+            )
+            .await
+            {
+                return Err(CreateEndpointErrorModeled::AccessDeniedFault(
+                    AccessDeniedFault {
+                        message: Some(crate::state::role_not_configured_message(&role_arn)),
+                    },
+                )
+                .into());
+            }
+        }
+
         let mut store = state.lock();
         store.settle(now);
 
@@ -374,28 +429,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             is_read_only: crate::state::DEFAULT_IS_READ_ONLY,
             // `sanitized` drops every password the request carried, so the store holds
             // no secret and no response can echo one.
-            settings: crate::state::EngineSettings {
-                dynamo_db: input.dynamo_db_settings,
-                s3: input.s3_settings,
-                dms_transfer: input.dms_transfer_settings,
-                mongo_db: input.mongo_db_settings,
-                kinesis: input.kinesis_settings,
-                kafka: input.kafka_settings,
-                elasticsearch: input.elasticsearch_settings,
-                neptune: input.neptune_settings,
-                redshift: input.redshift_settings,
-                postgre_sql: input.postgre_sql_settings,
-                my_sql: input.my_sql_settings,
-                oracle: input.oracle_settings,
-                sybase: input.sybase_settings,
-                microsoft_sql_server: input.microsoft_sql_server_settings,
-                ibm_db2: input.ibm_db2_settings,
-                doc_db: input.doc_db_settings,
-                redis: input.redis_settings,
-                gcp_my_sql: input.gcp_my_sql_settings,
-                timestream: input.timestream_settings,
-            }
-            .sanitized(),
+            settings,
             tags: crate::state::tags_for(&arn, input.tags),
             sequence,
         };

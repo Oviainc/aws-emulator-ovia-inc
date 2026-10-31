@@ -2,10 +2,13 @@
 
 //! Engine state for the com-amazonaws-databasemigrationservice-amazondmsv20160101 service.
 //!
-//! This module owns the replication-instance, endpoint and replication-task records
-//! the implemented operations read and write, the resource-id minting the DMS ARNs
-//! are built from, the identifier rules the member docs publish, and the single
-//! place where a clock-owed status transition is materialised ([`settle`]).
+//! This module owns the replication-instance, endpoint, replication-task and
+//! replication-subnet-group records the implemented operations read and write, the
+//! resource-id minting the DMS ARNs are built from, the identifier rules the member docs
+//! publish, the single place where a clock-owed status transition is materialised
+//! ([`settle`]), and the readings of the facts DMS resolves against ANOTHER service
+//! rather than holding itself: the account's subnets and Availability Zones, which are
+//! Amazon EC2's ([`placed_subnets`], [`region_availability_zones`]).
 //!
 //! [`settle`]: ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State::settle
 
@@ -200,6 +203,21 @@ pub const SUBNET_GROUP_COMPLETE: &str = "Complete";
 /// list, so this is the value this emulator reports for a usable subnet.
 pub const SUBNET_ACTIVE: &str = "Active";
 
+/// How many Availability Zones the subnets of a replication subnet group have to cover.
+///
+/// `CreateReplicationSubnetGroup`'s own doc: "The VPC needs to have at least one subnet
+/// in at least two availability zones in the Amazon Web Services Region, otherwise the
+/// service will throw a ReplicationSubnetGroupDoesNotCoverEnoughAZs exception."
+/// `SubnetIds` is a plain list in the model, so this is a rule the handler enforces
+/// rather than a modelled constraint.
+pub const MIN_SUBNET_GROUP_AVAILABILITY_ZONES: usize = 2;
+
+/// The principal DMS assumes a caller-supplied service access role as, which is what a
+/// role's trust policy has to admit for DMS to be able to use it
+/// (`CreateEndpoint$ServiceAccessRoleArn`: "the service access role that you want to use
+/// to create the endpoint. The role must allow the iam:PassRole action").
+pub const DMS_SERVICE_PRINCIPAL: &str = "dms.amazonaws.com";
+
 /// The replication instance classes DMS offers, as `(family, sizes)`.
 ///
 /// `ReplicationInstanceClass` is a plain string in the model (length 0..30, no
@@ -281,6 +299,14 @@ pub const INSTANCE_IDENTIFIER_MAX_LEN: usize = 63;
 /// alphanumeric characters or hyphens."
 pub const TASK_IDENTIFIER_MAX_LEN: usize = 255;
 
+/// The most characters a `ReplicationSubnetGroupIdentifier` may carry: "Must contain no
+/// more than 255 alphanumeric characters, periods, underscores, or hyphens."
+pub const SUBNET_GROUP_IDENTIFIER_MAX_LEN: usize = 255;
+
+/// The one `ReplicationSubnetGroupIdentifier` the member doc reserves: "Must not be
+/// \"default\"."
+pub const RESERVED_SUBNET_GROUP_IDENTIFIER: &str = "default";
+
 /// How many characters a minted resource id (the last ARN field) carries. Inside the
 /// 31 characters a caller-supplied `ResourceIdentifier` may have, so a minted id and
 /// a supplied one are interchangeable.
@@ -303,6 +329,18 @@ pub const MAX_ENDPOINTS: usize = 1000;
 /// The most replication tasks this emulator's store holds — the emulator's own
 /// ceiling.
 pub const MAX_REPLICATION_TASKS: usize = 1000;
+/// The most replication subnet groups this emulator's store holds — the emulator's own
+/// ceiling, for the same reason.
+pub const MAX_REPLICATION_SUBNET_GROUPS: usize = 100;
+
+/// The most subnets ONE `CreateReplicationSubnetGroup` may name.
+///
+/// CHOSEN as a process-safety backstop, not a published DMS quota (`SubnetIdentifierList`
+/// declares no `length`): the list comes from the request and every id in it is resolved
+/// against EC2, so without a ceiling one create would size that work. It is applied
+/// before any id is looked up, and sits well above the handful of Availability Zones a
+/// Region has.
+pub const MAX_SUBNETS_PER_GROUP: usize = 20;
 
 /// What the clock owes a record once [`Pending::due`] passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,24 +373,27 @@ impl Pending {
 
 /// One replication subnet group: the subnets a replication instance can be placed in.
 ///
-/// `CreateReplicationSubnetGroup` is the operation that persists one, and it is still
-/// a 501 stub; the record and the store live here so every operation that RESOLVES a
-/// `ReplicationSubnetGroupIdentifier` reads the one place groups are held.
-#[derive(Debug, Clone)]
+/// `CreateReplicationSubnetGroup` is the operation that persists one and
+/// `DeleteReplicationSubnetGroup` the one that drops it; the record and the store live
+/// here so every operation that RESOLVES a `ReplicationSubnetGroupIdentifier` reads the
+/// one place groups are held.
+#[derive(Debug, Clone, Default)]
 pub struct ReplicationSubnetGroupRecord {
     /// The caller's identifier, stored lowercased: "This value is stored as a
     /// lowercase string" (`CreateReplicationSubnetGroup$ReplicationSubnetGroupIdentifier`).
     pub identifier: String,
     /// The description the caller gave the group.
     pub description: String,
-    /// The VPC the group's subnets belong to.
+    /// The VPC the group's subnets belong to, as EC2 reports it for them.
     pub vpc_id: String,
     /// The group's subnets, each with the Availability Zone it sits in.
     pub subnets: Vec<SubnetRecord>,
+    /// The group's tags, as the create supplied them.
+    pub tags: Vec<Tag>,
 }
 
 /// One subnet of a [`ReplicationSubnetGroupRecord`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SubnetRecord {
     /// The subnet's own identifier.
     pub identifier: String,
@@ -380,8 +421,9 @@ impl ReplicationSubnetGroupRecord {
                     })
                     .collect(),
             ),
-            // The emulator models no EC2, so it reports no addressing protocol for a
-            // group's subnets.
+            // The IP addressing protocol a group supports follows from the address
+            // families its subnets carry, which this slice does not read off them: it
+            // reports none rather than inventing one.
             supported_network_types: None,
             // A group a caller created is its own, not one DMS manages for a zero-ETL
             // integration, so it is not read-only.
@@ -887,7 +929,8 @@ pub struct ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State {
     /// `ReplicationInstanceIdentifier` -> ARN, so a duplicate create is refused.
     pub instance_arn_by_identifier: BTreeMap<String, String>,
     /// Every replication subnet group this emulator holds, keyed by its (lowercased)
-    /// identifier, which is how `CreateReplicationInstance` resolves one.
+    /// identifier, which is how `CreateReplicationSubnetGroup` stores one and how
+    /// `CreateReplicationInstance` and `DeleteReplicationSubnetGroup` resolve one.
     pub replication_subnet_groups: BTreeMap<String, ReplicationSubnetGroupRecord>,
     /// Every endpoint this emulator holds, keyed by ARN.
     pub endpoints: BTreeMap<String, EndpointRecord>,
@@ -1173,4 +1216,303 @@ pub fn paginate<T>(
     let end = records.len().min(start.saturating_add(size));
     let next = (end < records.len()).then(|| encode_marker(key(&records[end])));
     Ok((start..end, next))
+}
+
+/// Why a `ReplicationSubnetGroupIdentifier` was refused, as a sentence naming the
+/// constraint it broke, or `None` when it is one DMS accepts.
+///
+/// The constraints are the ones the member doc publishes: "Must contain no more than 255
+/// alphanumeric characters, periods, underscores, or hyphens. Must not be \"default\"" —
+/// a different alphabet from the one [`identifier_refusal`] holds the other identifiers
+/// to, so the two readings stay apart. The comparison against the reserved name is made
+/// on the folded value, since the identifier "is stored as a lowercase string".
+pub fn subnet_group_identifier_refusal(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return Some("ReplicationSubnetGroupIdentifier must not be empty".to_string());
+    }
+    if value.chars().count() > SUBNET_GROUP_IDENTIFIER_MAX_LEN {
+        return Some(format!(
+            "ReplicationSubnetGroupIdentifier must contain at most \
+             {SUBNET_GROUP_IDENTIFIER_MAX_LEN} characters, and {value} has {}",
+            value.chars().count()
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.')
+    {
+        return Some(format!(
+            "ReplicationSubnetGroupIdentifier must contain only alphanumeric characters, \
+             periods, underscores and hyphens: {value}"
+        ));
+    }
+    if value.to_lowercase() == RESERVED_SUBNET_GROUP_IDENTIFIER {
+        return Some(format!(
+            "ReplicationSubnetGroupIdentifier must not be \"{RESERVED_SUBNET_GROUP_IDENTIFIER}\""
+        ));
+    }
+    None
+}
+
+/// DMS's sentence for a `ReplicationSubnetGroupIdentifier` that names no group the
+/// account holds, naming the value as the CALLER sent it.
+///
+/// One wording for the one fact, so the operations that resolve a group identifier —
+/// `CreateReplicationInstance`, which refuses the parameter, and
+/// `DeleteReplicationSubnetGroup`, which answers the modelled `ResourceNotFoundFault` —
+/// report it identically.
+pub fn subnet_group_absent_message(identifier: &str) -> String {
+    format!("Replication Subnet Group '{identifier}' does not exist.")
+}
+
+/// DMS's sentence for a service access role it cannot use, naming the role ARN the
+/// CALLER sent.
+///
+/// The fixed text is DMS's own for the `AccessDeniedFault` class ("DMS was denied access
+/// to the endpoint. Check that the role is correctly configured", as the modelled shape
+/// documents it); the ARN is the request's.
+pub fn role_not_configured_message(role_arn: &str) -> String {
+    format!("The IAM Role {role_arn} is not configured properly.AccessDenied")
+}
+
+/// Every service access role ARN an endpoint request carries: the endpoint's own
+/// `ServiceAccessRoleArn` and the per-engine settings structures' copies of it.
+///
+/// One list for the one question "which roles does this endpoint ask DMS to assume",
+/// because the member is modelled on the endpoint AND on each engine settings structure
+/// that needs a role of its own (`DynamoDbSettings`, `S3Settings`, `DmsTransferSettings`,
+/// `KinesisSettings`, `ElasticsearchSettings`, `NeptuneSettings`, `RedshiftSettings`,
+/// `PostgreSQLSettings`, `MySQLSettings`), and each copy is documented the same way:
+/// "The role must allow the iam:PassRole action".
+///
+/// Order follows the request: the endpoint's own member first, then the settings
+/// structures, so a refusal names the first role the request gave that DMS cannot use.
+pub fn service_access_role_arns(
+    endpoint_role_arn: Option<&str>,
+    settings: &EngineSettings,
+) -> Vec<String> {
+    let per_engine: [Option<&str>; 9] = [
+        settings
+            .dynamo_db
+            .as_ref()
+            .map(|it| it.service_access_role_arn.as_str()),
+        settings
+            .s3
+            .as_ref()
+            .and_then(|it| it.service_access_role_arn.as_deref()),
+        settings
+            .dms_transfer
+            .as_ref()
+            .and_then(|it| it.service_access_role_arn.as_deref()),
+        settings
+            .kinesis
+            .as_ref()
+            .and_then(|it| it.service_access_role_arn.as_deref()),
+        settings
+            .elasticsearch
+            .as_ref()
+            .map(|it| it.service_access_role_arn.as_str()),
+        settings
+            .neptune
+            .as_ref()
+            .and_then(|it| it.service_access_role_arn.as_deref()),
+        settings
+            .redshift
+            .as_ref()
+            .and_then(|it| it.service_access_role_arn.as_deref()),
+        settings
+            .postgre_sql
+            .as_ref()
+            .and_then(|it| it.service_access_role_arn.as_deref()),
+        settings
+            .my_sql
+            .as_ref()
+            .and_then(|it| it.service_access_role_arn.as_deref()),
+    ];
+    ::std::iter::once(endpoint_role_arn)
+        .chain(per_engine)
+        .flatten()
+        .filter(|arn| !arn.is_empty())
+        .map(::std::string::ToString::to_string)
+        .collect()
+}
+
+/// What EC2 answered about the subnets a request named.
+#[derive(Debug, Clone)]
+pub enum PlacedSubnets {
+    /// EC2 reported every id, and they all belong to one VPC: that VPC, and each subnet
+    /// with the Availability Zone it sits in, in the order the request named them.
+    InOneVpc {
+        /// The VPC every named subnet belongs to.
+        vpc_id: String,
+        /// The named subnets, request order.
+        subnets: Vec<SubnetRecord>,
+    },
+    /// EC2 answered that this value names no subnet of the account.
+    Absent(String),
+    /// EC2 reported the subnets, and they are spread over more than one VPC — so there is
+    /// no single `VpcId` a group of them could be reported under.
+    AcrossVpcs(Vec<String>),
+    /// Nothing was learned: there is no EC2 in this emulator to ask, or its answer could
+    /// not be read.
+    Unresolved,
+}
+
+/// The subnets `subnet_ids` names, resolved against the account's EC2 network.
+///
+/// A subnet is Amazon EC2's resource and not DMS's, so what a request names is resolved
+/// against EC2, reached the way any emulated service reaches another: the AWS SDK driven
+/// over the emulator's OWN in-process callback
+/// ([`smithy_server_runtime::OperationContext::callback`]), so this crate names no other
+/// service crate and nothing here opens a socket.
+///
+/// Each id is asked about on its own, so the answer says WHICH value named no subnet.
+/// The list is bounded by the caller before it gets here ([`MAX_SUBNETS_PER_GROUP`]).
+pub async fn placed_subnets(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    subnet_ids: &[String],
+) -> PlacedSubnets {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    let Some(ec2) = ec2_client(ctx, region) else {
+        return PlacedSubnets::Unresolved;
+    };
+    let mut subnets: Vec<SubnetRecord> = Vec::with_capacity(subnet_ids.len());
+    let mut vpc_ids: Vec<String> = Vec::new();
+    for subnet_id in subnet_ids {
+        let answer = ec2
+            .describe_subnets()
+            .subnet_ids(subnet_id.clone())
+            .send()
+            .await;
+        let reported = match answer {
+            Ok(output) => output
+                .subnets()
+                .iter()
+                .find(|subnet| subnet.subnet_id() == Some(subnet_id.as_str()))
+                .cloned(),
+            Err(error) => {
+                let code = error
+                    .as_service_error()
+                    .and_then(ProvideErrorMetadata::code)
+                    .unwrap_or_default()
+                    .to_string();
+                // `InvalidSubnetID.NotFound` for an id no subnet carries,
+                // `InvalidSubnetID.Malformed` for a value that is not a subnet id at
+                // all: both say the value names no subnet of the account.
+                if code.starts_with(SUBNET_ID_REFUSAL_PREFIX) {
+                    return PlacedSubnets::Absent(subnet_id.clone());
+                }
+                // Any other answer is this emulator failing to ASK rather than EC2
+                // reporting a subnet the account does not have, so nothing is concluded
+                // from it — and it is worth a warning, because an emulator with no EC2
+                // mounted cannot place a subnet group at all.
+                ::tracing::warn!(
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "the subnets a request named could not be resolved against EC2"
+                );
+                return PlacedSubnets::Unresolved;
+            }
+        };
+        // EC2 reports one subnet per id it resolved, so an id it reported nothing for
+        // names no subnet of the account.
+        let Some(reported) = reported else {
+            return PlacedSubnets::Absent(subnet_id.clone());
+        };
+        let (Some(vpc_id), Some(availability_zone)) =
+            (reported.vpc_id(), reported.availability_zone())
+        else {
+            // A subnet EC2 reported without a VPC or a zone is an answer this cannot
+            // read, not a subnet the account lacks.
+            ::tracing::warn!(
+                subnet = %subnet_id,
+                "EC2 reported a subnet with no VPC or no Availability Zone"
+            );
+            return PlacedSubnets::Unresolved;
+        };
+        if !vpc_ids.iter().any(|known| known == vpc_id) {
+            vpc_ids.push(vpc_id.to_string());
+        }
+        subnets.push(SubnetRecord {
+            identifier: subnet_id.clone(),
+            availability_zone: availability_zone.to_string(),
+        });
+    }
+    match vpc_ids.len() {
+        1 => PlacedSubnets::InOneVpc {
+            vpc_id: vpc_ids.into_iter().next().unwrap_or_default(),
+            subnets,
+        },
+        0 => PlacedSubnets::Unresolved,
+        _ => PlacedSubnets::AcrossVpcs(vpc_ids),
+    }
+}
+
+/// The Availability Zones of `region`, as EC2 reports them, or an empty list when there
+/// is no EC2 to ask.
+///
+/// The zones of a Region are a fact of the account's network rather than of DMS, so they
+/// are read from the service that owns them, over the same in-process callback
+/// [`placed_subnets`] uses.
+pub async fn region_availability_zones(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> Vec<String> {
+    let Some(ec2) = ec2_client(ctx, region) else {
+        return Vec::new();
+    };
+    match ec2.describe_availability_zones().send().await {
+        Ok(output) => output
+            .availability_zones()
+            .iter()
+            .filter_map(|zone| zone.zone_name().map(::std::string::ToString::to_string))
+            .collect(),
+        Err(error) => {
+            ::tracing::warn!(
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the Region's Availability Zones could not be read from EC2"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// The prefix of every EC2 error code that says a value names no subnet of the account:
+/// `InvalidSubnetID.NotFound` for an id no subnet carries, `InvalidSubnetID.Malformed`
+/// for a value that is not a subnet id at all.
+const SUBNET_ID_REFUSAL_PREFIX: &str = "InvalidSubnetID.";
+
+/// The EC2 client this service resolves a caller-named subnet through, addressed to
+/// `region`.
+///
+/// The transport is the emulator's own in-process callback, so there is nothing to retry,
+/// time out or watch for a stalled stream — and each of those would need a sleep
+/// implementation this client is not given. The same goes for caching the identity: the
+/// credentials the callback hands over are used directly.
+///
+/// `None` when the request carries no Region LABEL: the Region a request is signed for is
+/// caller-supplied text and here it would end up in an endpoint URL's authority, so it is
+/// read as a label (`service_common::arn::region_label`, this tree's one statement of
+/// that grammar) rather than interpolated as given.
+fn ec2_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> Option<::aws_sdk_ec2::Client> {
+    let Some(label) = ::service_common::arn::region_label(region) else {
+        ::tracing::warn!("the request names no Region label, so EC2 cannot be asked");
+        return None;
+    };
+    let config = ::aws_sdk_ec2::Config::builder()
+        .behavior_version(::aws_sdk_ec2::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_ec2::config::Region::new(label.to_string()))
+        .endpoint_url(format!("https://ec2.{label}.amazonaws.com"))
+        .retry_config(::aws_sdk_ec2::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_ec2::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_ec2::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_ec2::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    Some(::aws_sdk_ec2::Client::from_conf(config))
 }

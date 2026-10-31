@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReplicationSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReplicationSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReplicationSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the `SubnetIds` against the account's EC2 network, enforces the
+//! Availability-Zone coverage the operation documents, and persists the group in
+//! [`crate::state`] so `CreateReplicationInstance` and `DeleteReplicationSubnetGroup`
+//! read the same record. The notes below are the scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +162,215 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReplicationSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReplicationSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReplicationSubnetGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+
+        // "Must contain no more than 255 alphanumeric characters, periods, underscores,
+        // or hyphens. Must not be \"default\"" (`ReplicationSubnetGroupIdentifier`), none
+        // of which the model's plain `String` expresses.
+        if let Some(refusal) =
+            crate::state::subnet_group_identifier_refusal(&input.replication_subnet_group_identifier)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+        // "This value is stored as a lowercase string" (same member), so that is the key
+        // the group is held and resolved under.
+        let identifier = input.replication_subnet_group_identifier.to_lowercase();
+
+        // "This parameter Must not contain non-printable control characters"
+        // (`ReplicationSubnetGroupDescription`).
+        if input
+            .replication_subnet_group_description
+            .chars()
+            .any(char::is_control)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "ReplicationSubnetGroupDescription must not contain non-printable control \
+                 characters",
+            ));
+        }
+
+        // The caller-sized list is bounded HERE, before any id is resolved, so one
+        // request cannot size the resolution below.
+        if input.subnet_ids.len() > crate::state::MAX_SUBNETS_PER_GROUP {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SubnetIds must name at most {} subnets, and this request names {}",
+                crate::state::MAX_SUBNETS_PER_GROUP,
+                input.subnet_ids.len()
+            )));
+        }
+
+        let region = crate::state::request_region(ctx);
+
+        // A request that names no subnet covers no Availability Zone at all, which is the
+        // coverage refusal below rather than a resolution failure: there is nothing to
+        // resolve. No recording covers an empty list, so this follows the coverage rule
+        // the operation documents rather than inventing a second refusal for it.
+        if input.subnet_ids.is_empty() {
+            return Err(not_enough_zones(ctx, &region, 0).await);
+        }
+
+        // A subnet is EC2's resource, so the ids the request names are resolved against
+        // EC2 before anything is persisted — that read is also where the VPC and each
+        // subnet's Availability Zone come from, which the group reports.
+        let placed = crate::state::placed_subnets(ctx, &region, &input.subnet_ids).await;
+        let (vpc_id, subnets) = match placed {
+            crate::state::PlacedSubnets::InOneVpc { vpc_id, subnets } => (vpc_id, subnets),
+            // EC2's own wording for an id no subnet of the account carries, reported
+            // under the error DMS models for an unusable subnet.
+            crate::state::PlacedSubnets::Absent(subnet_id) => {
+                return Err(CreateReplicationSubnetGroupErrorModeled::InvalidSubnet(
+                    InvalidSubnet {
+                        message: Some(format!("The subnet ID '{subnet_id}' does not exist")),
+                    },
+                )
+                .into());
+            }
+            // A replication subnet group belongs to ONE VPC — it is what a replication
+            // instance placed in the group is attached to, and the group reports a single
+            // `VpcId` — so subnets spread over several is not a group DMS can hold.
+            crate::state::PlacedSubnets::AcrossVpcs(vpc_ids) => {
+                return Err(CreateReplicationSubnetGroupErrorModeled::InvalidSubnet(
+                    InvalidSubnet {
+                        message: Some(format!(
+                            "The subnets provided must all belong to one VPC, and these \
+                             belong to {}",
+                            vpc_ids.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+            crate::state::PlacedSubnets::Unresolved => {
+                return Err(CreateReplicationSubnetGroupErrorModeled::InvalidSubnet(
+                    InvalidSubnet {
+                        message: Some(
+                            "The subnets provided could not be resolved: this emulator holds \
+                             no Amazon EC2 network to place a replication subnet group in"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // "The VPC needs to have at least one subnet in at least two availability zones
+        // in the Amazon Web Services Region, otherwise the service will throw a
+        // ReplicationSubnetGroupDoesNotCoverEnoughAZs exception" (this operation's doc).
+        // The coverage is the number of DISTINCT zones the named subnets sit in, so two
+        // subnets of one zone do not cover two.
+        let mut covered: Vec<&str> = Vec::new();
+        for subnet in &subnets {
+            if !covered.contains(&subnet.availability_zone.as_str()) {
+                covered.push(&subnet.availability_zone);
+            }
+        }
+        if covered.len() < crate::state::MIN_SUBNET_GROUP_AVAILABILITY_ZONES {
+            return Err(not_enough_zones(ctx, &region, covered.len()).await);
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "If a replication subnet group exists in your Amazon Web Services account, the
+        // CreateReplicationSubnetGroup action returns the following error message: The
+        // Replication Subnet Group already exists" (this operation's doc), which is the
+        // sentence it carries.
+        if store.replication_subnet_groups.contains_key(&identifier) {
+            return Err(
+                CreateReplicationSubnetGroupErrorModeled::ResourceAlreadyExistsFault(
+                    ResourceAlreadyExistsFault {
+                        message: Some("The Replication Subnet Group already exists.".to_string()),
+                        // A replication subnet group is named by its identifier rather
+                        // than by an ARN in every operation that takes one, so there is
+                        // no resource ARN to report for it.
+                        resource_arn: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The emulator keeps every group in memory for the life of the process and this
+        // is the only operation that adds one, so the store keeps a ceiling on itself.
+        if store.replication_subnet_groups.len() >= crate::state::MAX_REPLICATION_SUBNET_GROUPS {
+            return Err(
+                CreateReplicationSubnetGroupErrorModeled::ResourceQuotaExceededFault(
+                    ResourceQuotaExceededFault {
+                        message: Some(format!(
+                            "this emulator already holds the maximum of {} replication subnet \
+                             groups",
+                            crate::state::MAX_REPLICATION_SUBNET_GROUPS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::ReplicationSubnetGroupRecord {
+            identifier: identifier.clone(),
+            description: input.replication_subnet_group_description,
+            vpc_id,
+            subnets,
+            // A group is reported by its identifier, not by an ARN, so its tags carry no
+            // `ResourceArn` for the group itself.
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        // DMS provisions nothing for a subnet group — it records the subnets the account
+        // already has — so it is created complete: there is no transient status the clock
+        // owes a transition out of.
+        let replication_subnet_group = record.to_shape();
+        store
+            .replication_subnet_groups
+            .insert(identifier, record);
+
+        Ok(CreateReplicationSubnetGroupOutput {
+            replication_subnet_group: Some(replication_subnet_group),
+        })
     }
+}
+
+/// The refusal a subnet list covering `covered` Availability Zones gets when DMS requires
+/// more.
+///
+/// The message's fixed text is DMS's for this error class; its variable parts are the
+/// minimum the operation documents, the coverage the REQUEST achieved, and the zones the
+/// Region has — the last read from the service that owns them, because those are the zones
+/// a caller can add a subnet in.
+async fn not_enough_zones(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    covered: usize,
+) -> CreateReplicationSubnetGroupError {
+    let zones = crate::state::region_availability_zones(ctx, region).await;
+    CreateReplicationSubnetGroupErrorModeled::ReplicationSubnetGroupDoesNotCoverEnoughAZs(
+        ReplicationSubnetGroupDoesNotCoverEnoughAZs {
+            message: Some(format!(
+                "Replication Subnet Group doesn't meet availability zone coverage requirement. \
+                 Please add subnets to cover at least {} availability zones. Current AZ \
+                 coverage: {covered}. Valid availability zones are: [{}]",
+                crate::state::MIN_SUBNET_GROUP_AVAILABILITY_ZONES,
+                zones.join(", ")
+            )),
+        },
+    )
+    .into()
+}
+
+/// The DMS model declares no server-side fault, and this emulator always mounts the
+/// in-memory engine, so the unreachable "no store" branch is answered with the error the
+/// operation does model for a resource it cannot reach rather than a 501, which would
+/// claim the operation is unimplemented.
+fn store_unavailable() -> CreateReplicationSubnetGroupError {
+    CreateReplicationSubnetGroupErrorModeled::ResourceNotFoundFault(ResourceNotFoundFault {
+        message: Some(
+            "the dms emulator is mounted on an engine that holds no state for it".to_string(),
+        ),
+    })
+    .into()
 }

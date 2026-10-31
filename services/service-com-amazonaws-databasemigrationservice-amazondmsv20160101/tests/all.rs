@@ -17,5 +17,9 @@ mod endpoint_projection;
 mod migration_task_slice;
 #[path = "all/rejection_paths.rs"]
 mod rejection_paths;
+#[path = "all/service_access_role_resolution.rs"]
+mod service_access_role_resolution;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/subnet_group_placement.rs"]
+mod subnet_group_placement;

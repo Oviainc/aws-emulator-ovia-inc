@@ -61,6 +61,8 @@ fn persist_subnet_group(emulator: &Emulator, identifier: &str) {
                     availability_zone: format!("{REGION}b"),
                 },
             ],
+            // This suite asserts nothing about a group's tags.
+            tags: Vec::new(),
         },
     );
 }

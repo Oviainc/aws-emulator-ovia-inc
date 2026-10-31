@@ -18,7 +18,7 @@ use service_com_amazonaws_databasemigrationservice_amazondmsv20160101::state::{
     MAX_RECORDS_MAX, MAX_RECORDS_MIN, RESOURCE_IDENTIFIER_MAX_LEN, TRANSITION_DELAY,
 };
 use service_com_amazonaws_databasemigrationservice_amazondmsv20160101::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 /// The region every case signs for.
 pub(crate) const REGION: &str = "us-east-1";
@@ -29,7 +29,8 @@ const TARGET_PREFIX: &str = "AmazonDMSv20160101";
 /// The account segment every ARN this emulator mints carries.
 pub(crate) const ACCOUNT: &str = "000000000000";
 
-/// A router carrying exactly this service, over one shared engine.
+/// A router carrying this service — and, through [`Emulator::with_network`], the owners of
+/// the resources it resolves — over one shared engine.
 ///
 /// Shared with the other suites in this target, so every case drives the same wire
 /// path.
@@ -45,6 +46,61 @@ impl Emulator {
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
         Self { router, engine }
+    }
+
+    /// This service mounted beside the OWNERS of the resources it resolves — Amazon EC2,
+    /// which holds the account's subnets and the Region's Availability Zones, and IAM,
+    /// which holds the roles an endpoint asks DMS to assume — on ONE shared engine, plus
+    /// an SDK client for each over the router's own in-process callback: the very seam
+    /// this service's own resolution reaches them through.
+    ///
+    /// Nothing in a suite using this reaches into either peer's store: a subnet exists
+    /// only because EC2 answered for it, and a role only because IAM did.
+    pub(crate) fn with_network() -> (Self, ::aws_sdk_ec2::Client, ::aws_sdk_iam::Client) {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
+        router.register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        let callback = EmbeddedEmulator::from_router(router.clone());
+        let ec2 = ::aws_sdk_ec2::Client::from_conf(
+            ::aws_sdk_ec2::Config::builder()
+                .behavior_version(::aws_sdk_ec2::config::BehaviorVersion::latest())
+                .region(::aws_sdk_ec2::config::Region::new(REGION.to_string()))
+                .endpoint_url(format!("https://ec2.{REGION}.amazonaws.com"))
+                .credentials_provider(callback.aws_credentials_provider())
+                .http_client(callback.http_client())
+                .retry_config(::aws_sdk_ec2::config::retry::RetryConfig::disabled())
+                .timeout_config(::aws_sdk_ec2::config::timeout::TimeoutConfig::disabled())
+                .identity_cache(::aws_sdk_ec2::config::IdentityCache::no_cache())
+                .stalled_stream_protection(
+                    ::aws_sdk_ec2::config::StalledStreamProtectionConfig::disabled(),
+                )
+                .build(),
+        );
+        let iam = ::aws_sdk_iam::Client::from_conf(
+            ::aws_sdk_iam::Config::builder()
+                .behavior_version(::aws_sdk_iam::config::BehaviorVersion::latest())
+                .region(::aws_sdk_iam::config::Region::new(REGION.to_string()))
+                .endpoint_url(format!("https://iam.{REGION}.amazonaws.com"))
+                .credentials_provider(callback.aws_credentials_provider())
+                .http_client(callback.http_client())
+                .retry_config(::aws_sdk_iam::config::retry::RetryConfig::disabled())
+                .timeout_config(::aws_sdk_iam::config::timeout::TimeoutConfig::disabled())
+                .identity_cache(::aws_sdk_iam::config::IdentityCache::no_cache())
+                .stalled_stream_protection(
+                    ::aws_sdk_iam::config::StalledStreamProtectionConfig::disabled(),
+                )
+                .build(),
+        );
+        (Self { router, engine }, ec2, iam)
     }
 
     /// The engine the service is mounted on, so a suite can seed a record for a
