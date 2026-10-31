@@ -340,6 +340,19 @@ pub const STOPPED: Lifecycle = Lifecycle {
     name: "stopped",
 };
 
+impl Lifecycle {
+    /// Whether an instance in this state is one of the two an operation
+    /// documented for "a running or stopped instance" acts on.
+    ///
+    /// The crate's ONE owner of that pair, asked by every operation whose own
+    /// documented scope is those two states, so a settled instance and one the
+    /// clock is still moving ([`PENDING`], [`STOPPING`]) are told apart in a
+    /// single place.
+    pub fn is_running_or_stopped(self) -> bool {
+        self == RUNNING || self == STOPPED
+    }
+}
+
 /// How long after the call that starts it the clock owes a resource its next
 /// settled state: an instance's (`pending` -> `running`, `stopping` ->
 /// `stopped`), a block storage disk's (`pending` -> `available`, and the
@@ -5749,6 +5762,11 @@ impl StoredInstance {
     /// documentation). An instance that is not running is processing no metadata
     /// traffic at all, so there is nothing to put in place: the options it will
     /// serve under are already the new ones.
+    ///
+    /// The only two states a selection is ever put in place from are `running`
+    /// and `stopped` — the operation that calls this refuses an instance in any
+    /// other state — so the instance is serving metadata traffic or it is down,
+    /// and never one the clock is still moving.
     pub fn apply_metadata_options(
         &mut self,
         selection: MetadataOptionsSelection,

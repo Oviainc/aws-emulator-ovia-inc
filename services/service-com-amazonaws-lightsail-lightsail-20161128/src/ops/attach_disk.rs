@@ -253,9 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // From this operation's own documentation: it "attaches a block
             // storage disk to a running or stopped Lightsail instance". An
             // instance still coming up or going down is neither, so there is
-            // nothing to expose the disk to yet.
-            if instance_state != crate::state::RUNNING && instance_state != crate::state::STOPPED
-            {
+            // nothing to expose the disk to yet. The pair is asked of the
+            // crate's one owner of it.
+            if !instance_state.is_running_or_stopped() {
                 return Err(operation_failure(format!(
                     "The instance {instance_name} is {}: a disk can be attached only to a \
                      running or stopped instance.",

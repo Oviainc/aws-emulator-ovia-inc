@@ -170,7 +170,10 @@ fn update_body(
 
 /// Every `UpdateInstanceMetadataOptions` entry the resource `name`'s operation
 /// log carries.
-async fn logged_updates(emulator: &Emulator, name: &str) -> usize {
+///
+/// `pub(crate)` so a sibling suite in this test target counts the entries of
+/// this same operation through the one walk rather than a second copy of it.
+pub(crate) async fn logged_updates(emulator: &Emulator, name: &str) -> usize {
     let body = emulator
         .ok("GetOperationsForResource", json!({"resourceName": name}))
         .await;

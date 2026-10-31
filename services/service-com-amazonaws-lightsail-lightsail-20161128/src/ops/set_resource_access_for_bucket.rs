@@ -225,8 +225,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let instance_state = instance.state;
             // From the member's own documentation: "The instance must be in a
             // running or stopped state." An instance still coming up or going
-            // down is neither.
-            if instance_state != crate::state::RUNNING && instance_state != crate::state::STOPPED {
+            // down is neither. The pair is asked of the crate's one owner of it.
+            if !instance_state.is_running_or_stopped() {
                 return Err(invalid(format!(
                     "The instance {} is {}: bucket access can be set only for an instance \
                      in a running or stopped state.",

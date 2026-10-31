@@ -186,11 +186,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `httpTokens`, `httpEndpoint` and `httpProtocolIpv6` each target a
         // modelled enum and `instanceName` carries the modelled `ResourceName`
         // pattern, so the centralized walk refused anything outside them before
-        // this body ran. What is left are the two rules the model cannot
+        // this body ran. What is left are the three rules the model cannot
         // express: `httpPutResponseHopLimit` targets a plain integer, and the
-        // metadata service takes a hop limit within the published range; and
+        // metadata service takes a hop limit within the published range;
         // `httpProtocolIpv6` configures an endpoint only the instances of one
-        // Region have, so it is served only for an instance there. Both are
+        // Region have, so it is served only for an instance there; and this
+        // operation "modifies the Amazon Lightsail instance metadata parameters
+        // on a running or stopped instance", so an instance in neither state has
+        // no metadata configuration for it to put in place. All three are
         // checked BEFORE the first write, so a refused request changes nothing.
         let instance_name = input.instance_name;
         if let Some(hop_limit) = input.http_put_response_hop_limit {
@@ -218,6 +221,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let instance = store
                 .instance_mut(&instance_name)
                 .ok_or_else(|| not_found(&instance_name))?;
+            // From this operation's own documentation: it "modifies the Amazon
+            // Lightsail instance metadata parameters on a running or stopped
+            // instance". An instance the clock is still moving — one coming up,
+            // or one on its way down — is neither, so it has no metadata
+            // service for this call to reconfigure, and a call its resource's
+            // state does not allow is this service's operation failure. The
+            // state is asked of the crate's one owner of that documented pair,
+            // and before anything is written.
+            if !instance.state.is_running_or_stopped() {
+                let state = instance.state.name;
+                return Err(operation_failure(format!(
+                    "The instance {instance_name} is {state}: instance metadata parameters can \
+                     be modified only on a running or stopped instance."
+                )));
+            }
             // The IPv6 endpoint of the metadata service belongs to the
             // instances of ONE Region, so what decides is where the addressed
             // instance lives — asked of the crate's one owner of that
@@ -262,6 +280,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// member that is wrong and the rule it broke.
 fn invalid(message: String) -> UpdateInstanceMetadataOptionsError {
     UpdateInstanceMetadataOptionsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The addressed instance is in a state this operation is not documented for:
+/// Lightsail's modelled counterpart for a call its resource's state does not
+/// allow — HTTP 400, wire error `OperationFailureException` — whose message
+/// names the instance and the state it is in.
+fn operation_failure(message: String) -> UpdateInstanceMetadataOptionsError {
+    UpdateInstanceMetadataOptionsErrorModeled::OperationFailureException(OperationFailureException {
+        // `code`, `docs` and `tip` are members this service fills from its own
+        // catalogue of failures, and no recorded response shows what it puts
+        // there for this one — so they are left absent rather than invented.
         message: Some(message),
         ..Default::default()
     })

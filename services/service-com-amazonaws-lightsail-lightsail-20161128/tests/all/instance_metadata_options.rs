@@ -19,8 +19,9 @@
 //! instance and `applied` once it has; and the change is appended to the
 //! operation log under the modelled `UpdateInstanceMetadataOptions` type, as an
 //! entry that settles with the options. A hop limit outside the range the
-//! metadata service accepts, and a name this account holds no instance under,
-//! are refused and record nothing.
+//! metadata service accepts, a name this account holds no instance under, and
+//! an instance that is neither running nor stopped (the two states the
+//! operation is documented for) are refused and record nothing.
 //!
 //! Each case is a TABLE whose rows differ along what the rule generalises over:
 //! which of the four settings the request names, and which value each is given —
@@ -34,7 +35,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::instance_lifecycle::{error_code, is_uuid_shaped, wait_for_state, Emulator};
-use crate::instance_metadata_ipv6_region::IPV6_METADATA_REGION;
+use crate::instance_metadata_ipv6_region::{logged_updates, IPV6_METADATA_REGION};
 
 /// The `operationType` the log entry of this call carries, the modelled
 /// `OperationType` enum's own `UpdateInstanceMetadataOptions` member.
@@ -189,12 +190,13 @@ fn update_body(
     body
 }
 
-/// Create the dual-stack instance `name` and wait until it is running — the
-/// state the documented `pending` → `applied` span belongs to.
+/// Create the dual-stack instance `name` WITHOUT waiting for it to settle, so a
+/// caller that calls straight away reaches it while the clock is still bringing
+/// it up.
 ///
 /// In the Region whose instances have the metadata service's IPv6 endpoint, so
 /// every one of the four settings is one this instance has.
-async fn running_instance(emulator: &Emulator, name: &str) {
+async fn create_instance(emulator: &Emulator, name: &str) {
     emulator
         .ok(
             "CreateInstances",
@@ -207,6 +209,12 @@ async fn running_instance(emulator: &Emulator, name: &str) {
             }),
         )
         .await;
+}
+
+/// Create the dual-stack instance `name` and wait until it is running — the
+/// state the documented `pending` → `applied` span belongs to.
+async fn running_instance(emulator: &Emulator, name: &str) {
+    create_instance(emulator, name).await;
     wait_for_state(emulator, name, "running").await;
 }
 
@@ -555,5 +563,219 @@ async fn an_instance_the_account_does_not_hold_is_refused() {
             Some("DoesNotExist"),
             "case {case}: expected the DoesNotExist code a client branches on, got {body:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The two states the operation is documented for
+// ---------------------------------------------------------------------------
+
+/// The metadata options a new dual-stack instance of the IPv6 Region is created
+/// with — no signed token required, the endpoint serving, the one hop that
+/// reaches the instance, and the IPv6 endpoint its dual-stack addressing reaches
+/// — which is what a setting a request below leaves out keeps.
+const NEW_TOKENS: &str = "optional";
+/// See [`NEW_TOKENS`].
+const NEW_ENDPOINT: &str = "enabled";
+/// See [`NEW_TOKENS`].
+const NEW_HOP_LIMIT: i64 = 1;
+/// See [`NEW_TOKENS`].
+const NEW_PROTOCOL_IPV6: &str = "enabled";
+
+/// One state the clock is still moving an instance through, with the request
+/// made while the instance is there.
+struct Transient {
+    /// Whether the instance is asked to stop before the call: a just-created
+    /// instance is still coming up, and one just asked to stop is on its way
+    /// down.
+    stop_first: bool,
+    /// The `InstanceState` name it reports when the call is made.
+    state: &'static str,
+    /// The state the clock settles it into, in which the identical call is
+    /// served.
+    settled: &'static str,
+    /// The request, and what the instance reports once that call is served.
+    request: Row,
+}
+
+/// The table. The rows differ along the state the instance is in when the call
+/// is made (the two the modelled `InstanceState` has besides `running` and
+/// `stopped`), which of the four settings the request names, and which value
+/// each is given — including the hop limit at both published bounds.
+const TRANSIENT: &[Transient] = &[
+    Transient {
+        stop_first: false,
+        state: "pending",
+        settled: "running",
+        request: Row {
+            case: "an instance still coming up, every setting named",
+            http_tokens: Some("required"),
+            http_endpoint: Some("disabled"),
+            http_put_response_hop_limit: Some(MAX_HOP_LIMIT),
+            http_protocol_ipv6: Some("disabled"),
+            expect_http_tokens: "required",
+            expect_http_endpoint: "disabled",
+            expect_http_put_response_hop_limit: MAX_HOP_LIMIT,
+            expect_http_protocol_ipv6: "disabled",
+        },
+    },
+    Transient {
+        stop_first: false,
+        state: "pending",
+        settled: "running",
+        request: Row {
+            case: "an instance still coming up, only the hop limit named",
+            http_tokens: None,
+            http_endpoint: None,
+            http_put_response_hop_limit: Some(MIN_HOP_LIMIT),
+            http_protocol_ipv6: None,
+            expect_http_tokens: NEW_TOKENS,
+            expect_http_endpoint: NEW_ENDPOINT,
+            expect_http_put_response_hop_limit: MIN_HOP_LIMIT,
+            expect_http_protocol_ipv6: NEW_PROTOCOL_IPV6,
+        },
+    },
+    Transient {
+        stop_first: true,
+        state: "stopping",
+        settled: "stopped",
+        request: Row {
+            case: "an instance on its way down, only httpTokens named",
+            http_tokens: Some("required"),
+            http_endpoint: None,
+            http_put_response_hop_limit: None,
+            http_protocol_ipv6: None,
+            expect_http_tokens: "required",
+            expect_http_endpoint: NEW_ENDPOINT,
+            expect_http_put_response_hop_limit: NEW_HOP_LIMIT,
+            expect_http_protocol_ipv6: NEW_PROTOCOL_IPV6,
+        },
+    },
+    Transient {
+        stop_first: true,
+        state: "stopping",
+        settled: "stopped",
+        request: Row {
+            case: "an instance on its way down, the endpoint settings named",
+            http_tokens: None,
+            http_endpoint: Some("disabled"),
+            http_put_response_hop_limit: Some(32),
+            http_protocol_ipv6: Some("disabled"),
+            expect_http_tokens: NEW_TOKENS,
+            expect_http_endpoint: "disabled",
+            expect_http_put_response_hop_limit: 32,
+            expect_http_protocol_ipv6: "disabled",
+        },
+    },
+];
+
+/// The `message` of a failure body.
+fn refusal_message(body: &Value) -> String {
+    body["message"]
+        .as_str()
+        .or_else(|| body["Message"].as_str())
+        .unwrap_or("<no message>")
+        .to_string()
+}
+
+/// RULE: the call modifies "the Amazon Lightsail instance metadata parameters on
+/// a running or stopped instance", so an instance the clock is still moving —
+/// one coming up, or one on its way down — is refused as an operation failure
+/// before anything is written: the options it already reports stand, nothing is
+/// appended to its operation log, and the identical request is served once that
+/// instance has settled.
+#[tokio::test]
+async fn an_instance_that_is_neither_running_nor_stopped_is_refused() {
+    let emulator = Emulator::new();
+
+    for (position, transient) in TRANSIENT.iter().enumerate() {
+        let row = &transient.request;
+        let case = row.case;
+        let name = format!("metadata-transient-{position}");
+        create_instance(&emulator, &name).await;
+        if transient.stop_first {
+            wait_for_state(&emulator, &name, "running").await;
+            emulator
+                .ok("StopInstance", json!({"instanceName": &name}))
+                .await;
+        }
+
+        // The instance really is in the state this row is about, and these are
+        // the options a refused call has to leave exactly as they are.
+        let before = instance(&emulator, &name).await;
+        assert_eq!(
+            before["state"]["name"].as_str(),
+            Some(transient.state),
+            "case {case}: expected {name} to be {}, got {before:?}",
+            transient.state
+        );
+        let options_before = before["metadataOptions"].clone();
+
+        let (status, body) = emulator
+            .call(
+                "UpdateInstanceMetadataOptions",
+                update_body(
+                    &name,
+                    row.http_tokens,
+                    row.http_endpoint,
+                    row.http_put_response_hop_limit,
+                    row.http_protocol_ipv6,
+                ),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "OperationFailureException"),
+            "case {case}: expected the operation-failure rejection, got {body:?}"
+        );
+        let answered = refusal_message(&body);
+        assert!(
+            answered.contains(&format!("The instance {name} is {}", transient.state)),
+            "case {case}: expected a message naming the instance and its state '{}', got \
+             {answered:?}",
+            transient.state
+        );
+        assert!(
+            answered.contains("running or stopped"),
+            "case {case}: expected a message naming the two states the call is served for, got \
+             {answered:?}"
+        );
+
+        // Nothing was written: the options the instance already reported stand,
+        // and no entry was appended for the refused call.
+        let after = metadata_options(&emulator, &name).await;
+        assert_eq!(
+            after, options_before,
+            "case {case}: a refused request must leave the options alone, expected \
+             {options_before:?}, got {after:?}"
+        );
+        let logged = logged_updates(&emulator, &name).await;
+        assert_eq!(
+            logged, 0,
+            "case {case}: a refused request records nothing, expected 0 {OPERATION_TYPE} \
+             entries, got {logged}"
+        );
+
+        // And once the instance has settled, the identical request is served:
+        // the refusal was about the state, not about the request. A stopped
+        // instance processes no metadata traffic, so its selection — and the
+        // entry for it — is in place when the call returns; a running one is
+        // still putting it in place.
+        wait_for_state(&emulator, &name, transient.settled).await;
+        let answered = emulator
+            .ok(
+                "UpdateInstanceMetadataOptions",
+                update_body(
+                    &name,
+                    row.http_tokens,
+                    row.http_endpoint,
+                    row.http_put_response_hop_limit,
+                    row.http_protocol_ipv6,
+                ),
+            )
+            .await;
+        assert_logged(case, &answered, &name, transient.settled == "stopped");
+        let applied = wait_for_applied(&emulator, &name).await;
+        assert_settings(case, &applied, row);
     }
 }
