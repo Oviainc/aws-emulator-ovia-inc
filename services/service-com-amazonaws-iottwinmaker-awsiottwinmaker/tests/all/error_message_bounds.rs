@@ -17,6 +17,13 @@
 //! bounded at 2048 — which a 2048-character `componentPath` overruns as soon as
 //! any fixed text joins it.
 //!
+//! [`ERROR_MESSAGE_MAX`] and [`assert_within_bound`] are this crate's ONE
+//! statement of that bound and of what the rule asserts about a reported
+//! reason, so a suite about a refusal built some other way — one grown by the
+//! caller rather than interpolating a single identifier
+//! ([`crate::component_type_delete_in_use_message_bound`]) — asserts the rule
+//! through them rather than restating it.
+//!
 //! The rows differ along what the rule generalises over: WHICH identifier the
 //! reason interpolates (a `propertyName`, a `componentPath`), its SIZE (one
 //! character, a value whose reason lands exactly on the member's maximum, one
@@ -38,7 +45,7 @@ const ENTRY_ERROR_MESSAGE_MAX: usize = 256;
 /// The greatest number of characters the modelled `ErrorMessage` admits — the
 /// member every exception of this service states its reason on:
 /// `@length(0..2048)`, from `smithy_query(query="shape",shape="ErrorMessage")`.
-const ERROR_MESSAGE_MAX: usize = 2048;
+pub(crate) const ERROR_MESSAGE_MAX: usize = 2048;
 
 /// The greatest number of characters `EntityPropertyReference$componentPath`
 /// admits (its target `ComponentPath` is `@length(1..2048)`), and
@@ -187,7 +194,7 @@ async fn seed(emulator: &Emulator) {
 }
 
 /// The last `count` characters of `text`.
-fn tail(text: &str, count: usize) -> String {
+pub(crate) fn tail(text: &str, count: usize) -> String {
     let characters: Vec<char> = text.chars().collect();
     characters[characters.len() - count.min(characters.len())..]
         .iter()
@@ -195,14 +202,14 @@ fn tail(text: &str, count: usize) -> String {
 }
 
 /// The first `count` characters of `text`.
-fn head(text: &str, count: usize) -> String {
+pub(crate) fn head(text: &str, count: usize) -> String {
     text.chars().take(count).collect()
 }
 
 /// Assert the rule over ONE reported message: `reported` is what the service
 /// states on a member bounded at `max_chars` characters, where `whole` is the
 /// reason the service words for this case.
-fn assert_within_bound(case: &str, reported: &str, whole: &str, max_chars: usize) {
+pub(crate) fn assert_within_bound(case: &str, reported: &str, whole: &str, max_chars: usize) {
     let length = reported.chars().count();
     assert!(
         length <= max_chars && length >= 1,

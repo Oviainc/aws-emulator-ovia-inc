@@ -47,6 +47,9 @@ mod component_type_delete;
 #[path = "all/component_type_delete_composite_references.rs"]
 mod component_type_delete_composite_references;
 
+#[path = "all/component_type_delete_in_use_message_bound.rs"]
+mod component_type_delete_in_use_message_bound;
+
 #[path = "all/component_type_inherited_schema.rs"]
 mod component_type_inherited_schema;
 
