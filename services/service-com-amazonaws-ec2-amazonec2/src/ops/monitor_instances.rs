@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op MonitorInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `MonitorInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`MonitorInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: turns detailed monitoring ON for the instances the request names.
+//!
+//! Each instance reports `pending` at once and reaches `enabled` at the instant the clock
+//! owes it, so a caller that reads straight after the call still sees the transient state
+//! — both written through the store's one monitoring seam
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::set_instance_monitoring`]), which
+//! `UnmonitorInstances` writes the other direction through.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +134,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `MonitorInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(MonitorInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("MonitorInstances"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            deduplicate_ids, require_instance_record, require_service_state, InstanceStateName,
+            MAX_RESOURCE_IDS, MONITORING_STATE_ENABLED, MONITORING_STATE_PENDING,
+        };
+
+        let _ = ctx;
+
+        // `InstanceIds` is `@required` but `clientOptional`: the boundary validator refuses
+        // a request that OMITS the list, and this is this operation's own answer for one
+        // that arrives EMPTY, which the model cannot express — the operation monitors the
+        // instances it names, and one that names none has nothing to monitor. The parameter
+        // is named the way the request spells it on the wire (`InstanceId.N`, the member's
+        // `xmlName`), as `RebootInstances` beside it names it.
+        if input.instance_ids.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter InstanceId",
+            ));
+        }
+        // The model declares no `@length` on `InstanceIds`, so this is the only place the
+        // batch size can be bounded — the same ceiling every other instance list in this
+        // crate is held to.
+        if input.instance_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceId carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                input.instance_ids.len()
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // Which state an instance is in is a fact of where the clock stands, so every move
+        // it already owed is materialised before one is read — including the monitoring move
+        // an earlier call to this operation left owed.
+        store.materialize_due_transitions();
+
+        // One instance is turned on once however many times the batch names it.
+        let instance_ids = deduplicate_ids(&input.instance_ids);
+
+        // The whole batch is resolved and checked before the first write, so a request
+        // naming one instance it cannot act on acts on none of them.
+        for instance_id in &instance_ids {
+            // Malformed before unknown, the order this service resolves an instance id in.
+            let instance = require_instance_record(&store, instance_id)?;
+            // "Enables detailed monitoring for a RUNNING instance": an instance in
+            // `pending` is one the clock is about to make `running` and nothing else, so a
+            // caller monitoring the instance it has just launched is monitoring a running
+            // one and this service's own launch delay cannot be what refuses it. Every
+            // other state is on its way down or already stopped, with nothing running to
+            // monitor.
+            if !matches!(
+                instance.state,
+                InstanceStateName::Running | InstanceStateName::Pending
+            ) {
+                return Err(Scaffolded::incorrect_instance_state(
+                    instance_id,
+                    instance.state.as_str(),
+                    "monitored",
+                ));
+            }
+        }
+
+        // DryRun sits AFTER everything that could refuse the request and BEFORE the first
+        // write: the flag asks whether the request WOULD have succeeded, so one that would
+        // have been refused is refused with that reason instead, and one that would have
+        // succeeded changes nothing.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        for instance_id in &instance_ids {
+            store.set_instance_monitoring(
+                instance_id,
+                MONITORING_STATE_PENDING,
+                MONITORING_STATE_ENABLED,
+            );
+        }
+
+        // "The monitoring information" (`MonitorInstancesResult$InstanceMonitorings`): one
+        // entry per instance the call acted on, each carrying the monitoring state that
+        // instance now reports — read back off the record just written, so this answer and
+        // `DescribeInstances` cannot disagree.
+        let instance_monitorings = instance_ids
+            .iter()
+            .filter_map(|instance_id| {
+                let instance = store.instances.get(instance_id)?;
+                Some(InstanceMonitoring {
+                    instance_id: Some(instance.instance_id.clone()),
+                    monitoring: Some(Monitoring {
+                        state: Some(instance.monitoring_state.clone()),
+                    }),
+                })
+            })
+            .collect();
+        Ok(MonitorInstancesOutput {
+            instance_monitorings: Some(instance_monitorings),
+        })
     }
 }

@@ -596,6 +596,9 @@ mod import_snapshot_tasks;
 mod import_task_cancellation;
 #[path = "all/instance_connect_endpoints.rs"]
 mod instance_connect_endpoints;
+// The fixed detail every instance reports, and the monitoring state a caller moves.
+#[path = "all/instance_detail.rs"]
+mod instance_detail;
 #[path = "all/instance_event_notification_attributes.rs"]
 mod instance_event_notification_attributes;
 #[path = "all/instance_event_window_associations.rs"]

@@ -528,25 +528,90 @@ async fn launch_parameters_round_trip_through_describe_instances() {
             case.key_name,
             described.key_name
         );
-        assert_eq!(
-            described.subnet_id.as_deref(),
-            case.subnet_id,
-            "case {}: expected subnet {:?}, got {:?}",
-            case.name,
-            case.subnet_id,
-            described.subnet_id
-        );
-        assert_eq!(
-            described.group_ids,
-            case.group_ids
-                .iter()
-                .map(|group| (*group).to_string())
-                .collect::<Vec<_>>(),
-            "case {}: expected groups {:?}, got {:?}",
-            case.name,
-            case.group_ids,
-            described.group_ids
-        );
+        match case.subnet_id {
+            Some(subnet_id) => assert_eq!(
+                described.subnet_id.as_deref(),
+                Some(subnet_id),
+                "case {}: expected subnet {:?}, got {:?}",
+                case.name,
+                subnet_id,
+                described.subnet_id
+            ),
+            // "If you don't specify a subnet ID, we choose a default subnet from your
+            // default VPC for you" (`RunInstances`), so a bare launch is placed in one and
+            // reports it — asserted against the subnet store, so the row cannot pass for
+            // any subnet that happens to be reported.
+            None => {
+                let reported = described.subnet_id.clone().unwrap_or_else(|| {
+                    panic!(
+                        "case {}: a launch that named no subnet is placed in the default one \
+                         and reports it, got {:?}",
+                        case.name, described.subnet_id
+                    )
+                });
+                let subnets = ec2
+                    .call("DescribeSubnets", vec![p("SubnetId.1", &reported)])
+                    .await;
+                let document = subnets.document();
+                let subnet = document
+                    .descendants()
+                    .find(|node| node.is_element() && has_child(*node, "subnetId"))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {}: DescribeSubnets must report {reported}, got {}",
+                            case.name, subnets.body
+                        )
+                    });
+                assert_eq!(
+                    child_text(subnet, "defaultForAz").as_deref(),
+                    Some("true"),
+                    "case {}: the subnet a bare launch is placed in is its zone's DEFAULT \
+                     subnet, got {}",
+                    case.name,
+                    subnets.body
+                );
+            }
+        }
+        if case.group_ids.is_empty() {
+            // "Default: Amazon EC2 uses the default security group"
+            // (`RunInstancesRequest$SecurityGroupIds`): a launch that named no group is
+            // given its VPC's `default` group, which is what the instance reports —
+            // asserted against the security group store by NAME, so the row cannot pass
+            // for any other single group.
+            assert_eq!(
+                described.group_ids.len(),
+                1,
+                "case {}: a launch that named no group reports the default group it was \
+                 given, got {:?}",
+                case.name,
+                described.group_ids
+            );
+            let groups = ec2
+                .call(
+                    "DescribeSecurityGroups",
+                    vec![p("GroupId.1", &described.group_ids[0])],
+                )
+                .await;
+            assert_eq!(
+                ec2_query::element(&groups.body, "groupName").as_deref(),
+                Some("default"),
+                "case {}: that one group is the VPC's default group, got {}",
+                case.name,
+                groups.body
+            );
+        } else {
+            assert_eq!(
+                described.group_ids,
+                case.group_ids
+                    .iter()
+                    .map(|group| (*group).to_string())
+                    .collect::<Vec<_>>(),
+                "case {}: expected groups {:?}, got {:?}",
+                case.name,
+                case.group_ids,
+                described.group_ids
+            );
+        }
         assert_eq!(
             described.monitoring.as_deref(),
             Some(if case.monitoring == Some(true) {

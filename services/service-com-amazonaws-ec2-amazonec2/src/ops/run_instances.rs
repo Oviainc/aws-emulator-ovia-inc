@@ -328,7 +328,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             issued_image_id_is_well_formed, private_dns_name, request_region,
             require_service_state, resolve_iam_instance_profile, validate_kernel_or_ramdisk_id,
             validate_tag_size,
-            IamInstanceProfileAssociationSpec, InstanceRecord, InstanceStateName,
+            IamInstanceProfileAssociationSpec, InstanceDetail, InstanceDetailSpec, InstanceRecord,
+            InstanceStateName,
             MONITORING_STATE_DISABLED, MONITORING_STATE_ENABLED,
             PendingTransition, ReservationRecord, DEFAULT_INSTANCE_TYPE,
             DEFAULT_SOURCE_DEST_CHECK, MAX_IAM_INSTANCE_PROFILE_ASSOCIATIONS,
@@ -520,6 +521,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
         store.materialize_due_transitions();
+        // "If you don't specify a subnet ID, we choose a default subnet from your default
+        // VPC for you" (`RunInstances`) — so the Region's default network has to be there
+        // to choose from. It has been owed to the account since the account existed rather
+        // than since this call, which is what makes materialising it here the same write
+        // every describe of VPCs, subnets or security groups already makes
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::ensure_default_network`]).
+        store.ensure_default_network(&region);
 
         // "The ID of the subnet to launch the instance into" (`RunInstancesRequest$SubnetId`)
         // — and a subnet belongs to ONE Availability Zone, so a launch that named a subnet
@@ -564,6 +572,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             MONITORING_STATE_DISABLED
         };
+        // "The name of the placement group that the instance is in"
+        // (`Placement$GroupName`): a launch that names one puts every instance it mints in
+        // THAT group, so the name is resolved against the placement group store here — a
+        // group the account does not hold is refused with EC2's own
+        // `InvalidPlacementGroup.Unknown` rather than accepted and dropped, which would
+        // leave the instance reporting a group nothing holds.
+        let placement_group_name = match input
+            .placement
+            .as_ref()
+            .and_then(|placement| placement.group_name.as_deref())
+            .filter(|group_name| !group_name.is_empty())
+        {
+            Some(group_name) => {
+                if store.placement_group_id_for_name(group_name).is_none() {
+                    return Err(crate::state::invalid_placement_group_unknown(group_name));
+                }
+                Some(group_name.to_string())
+            }
+            None => None,
+        };
+        // The option sets this launch chose for every instance it mints — its metadata
+        // options, enclave, Capacity Reservation preference, maintenance and network
+        // performance options, instance hostname options and tenancy — resolved ONCE for the
+        // batch against the account's own IMDS defaults and the AMI's `ImdsSupport`, so
+        // every instance of one launch reports the same detail. A word outside its modelled
+        // catalog refuses the launch HERE, before the first write.
+        let detail: InstanceDetail = InstanceDetail::launched(InstanceDetailSpec {
+            metadata_options: input.metadata_options.as_ref(),
+            enclave_options: input.enclave_options.as_ref(),
+            capacity_reservation_preference: input
+                .capacity_reservation_specification
+                .as_ref()
+                .and_then(|specification| specification.capacity_reservation_preference.as_deref()),
+            maintenance_options: input.maintenance_options.as_ref(),
+            network_performance_options: input.network_performance_options.as_ref(),
+            private_dns_name_options: input.private_dns_name_options.as_ref(),
+            tenancy: input
+                .placement
+                .as_ref()
+                .and_then(|placement| placement.tenancy.as_deref()),
+            placement_group_name: placement_group_name.as_deref(),
+            account_metadata_defaults: store.instance_metadata_defaults(),
+            image_imds_support: store
+                .images
+                .get(&image_id)
+                .and_then(|image| image.imds_support.as_deref()),
+        })?;
         let security_groups: Vec<(Option<String>, Option<String>)> = input
             .security_group_ids
             .iter()
@@ -610,6 +665,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             + input.kernel_id.as_ref().map_or(0, String::len)
             + input.ramdisk_id.as_ref().map_or(0, String::len)
             + availability_zone.len()
+            // The placement group name the launch resolved is copied onto every instance it
+            // mints, exactly as the zone is.
+            + placement_group_name.as_ref().map_or(0, String::len)
             // The association each instance of the launch is given retains the profile
             // reference the request named, charged by the one definition of that charge
             // beside the per-record overhead the store's writer seam adds to it — so the
@@ -778,6 +836,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 user_data: input.user_data.clone(),
                 placement_az: availability_zone.clone(),
                 monitoring_state: monitoring_state.to_string(),
+                // The launch says whether detailed monitoring is on from the start, so there
+                // is no move for the clock to make; `MonitorInstances` is what records one.
+                monitoring_transition: None,
+                detail: detail.clone(),
                 architecture: architecture_for(&instance_type),
                 // "The ID of the kernel" (`RunInstancesRequest$KernelId`) the launch
                 // named, or the one its image carries when it named none — the value

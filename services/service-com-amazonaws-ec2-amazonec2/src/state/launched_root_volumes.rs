@@ -27,7 +27,7 @@ use super::{
     ComAmazonawsEc2Amazonec2State, DEFAULT_GP3_IOPS, DEFAULT_GP3_THROUGHPUT, DEFAULT_VOLUME_TYPE,
     IMAGE_ROOT_DEVICE_TYPE_EBS, ImageSpec, MAX_STORED_VOLUMES, THROUGHPUT_VOLUME_TYPE,
     TRANSITION_DELAY, VOLUME_ATTACHMENT_STATE_ATTACHED, VOLUME_ID_PREFIX, VolumeRecord, VolumeView,
-    system_time_to_date_time, unmanaged_operator, zone_id_for_zone_name,
+    region_of_zone_name, system_time_to_date_time, unmanaged_operator, zone_id_for_zone_name,
 };
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -106,12 +106,9 @@ impl ComAmazonawsEc2Amazonec2State {
 
         let volume_id = self.next_id(VOLUME_ID_PREFIX);
         // The Region the volume's ARN names is the one its Availability Zone belongs to —
-        // read off the zone name the way [`zone_id_for_zone_name`] reads the zone's id, so
-        // the volume and the instance that holds it can never be placed in two Regions.
-        let region = zone_name
-            .strip_suffix(|letter: char| letter.is_ascii_lowercase())
-            .unwrap_or(zone_name.as_str())
-            .to_string();
+        // read off the zone name through the ONE reading of that ([`region_of_zone_name`]),
+        // so the volume and the instance that holds it can never be placed in two Regions.
+        let region = region_of_zone_name(&zone_name).to_string();
         let volume_type = ebs
             .volume_type
             .clone()

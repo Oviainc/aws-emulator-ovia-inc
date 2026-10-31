@@ -685,7 +685,10 @@ async fn discovers_what_the_owning_services_hold() {
                 ec2_arn(&format!("network-interface/{interface}")),
                 interface.clone(),
             )],
-            exhaustive: true,
+            // Every instance launched above came with its own PRIMARY network
+            // interface, which EC2 holds and the inventory therefore reports
+            // beside this one — the same reason the VPC row is not exhaustive.
+            exhaustive: false,
         },
         Row {
             resource_type: state::RESOURCE_TYPE_EC2_INSTANCE,

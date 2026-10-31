@@ -537,6 +537,13 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
         user_data: None,
         placement_az: availability_zone,
         monitoring_state: ec2::MONITORING_STATE_DISABLED.to_string(),
+        // Detailed monitoring is off from the start, so there is no move for EC2's clock
+        // to make; only `MonitorInstances` records one.
+        monitoring_transition: None,
+        // Amazon EVS configures none of the option sets an EC2 instance reports (its
+        // metadata options, enclave, tenancy and the rest), so every one of them is at its
+        // documented default.
+        detail: ec2::InstanceDetail::default(),
         architecture: ec2::architecture_for(launch.instance_type),
         // An ESX host boots the image Amazon EVS publishes, not a kernel or RAM disk
         // image a launch names, so it carries neither; source/destination checking

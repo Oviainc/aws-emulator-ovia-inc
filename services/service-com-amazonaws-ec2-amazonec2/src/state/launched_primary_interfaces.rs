@@ -25,8 +25,8 @@ use crate::ops::types::{GroupIdentifier, NetworkInterfaceAttachment};
 use super::{
     ATTACHMENT_STATUS_ATTACHED, ComAmazonawsEc2Amazonec2State, DEFAULT_SECURITY_GROUP_NAME,
     InstanceStateName, NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX, NETWORK_INTERFACE_TYPE_INTERFACE,
-    NetworkInterfaceSpec, PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX, Subnet, system_time_to_date_time,
-    zone_id_for_zone_name,
+    NetworkInterfaceSpec, PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX, Subnet, region_of_zone_name,
+    system_time_to_date_time, zone_id_for_zone_name,
 };
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -71,14 +71,7 @@ impl ComAmazonawsEc2Amazonec2State {
             return;
         };
         let private_ip = instance.private_ip.clone();
-        let launch_groups: Vec<GroupIdentifier> = instance
-            .security_groups
-            .iter()
-            .map(|(group_id, group_name)| GroupIdentifier {
-                group_id: group_id.clone(),
-                group_name: group_name.clone(),
-            })
-            .collect();
+        let named_groups: Vec<(Option<String>, Option<String>)> = instance.security_groups.clone();
         let Some(subnet) = self.launch_subnet(
             instance.subnet_id.as_deref(),
             instance.placement_az.as_str(),
@@ -94,16 +87,18 @@ impl ComAmazonawsEc2Amazonec2State {
             .or_else(|| zone_id_for_zone_name(&availability_zone))
             .unwrap_or_default();
         // The Region the interface's private DNS names are built for is the one its zone
-        // belongs to, read off the zone name the way the launched root volume reads it, so
-        // an instance and its interface can never be placed in two Regions.
-        let region = availability_zone
-            .strip_suffix(|letter: char| letter.is_ascii_lowercase())
-            .unwrap_or(availability_zone.as_str())
-            .to_string();
+        // belongs to, read through the ONE reading of that ([`region_of_zone_name`]), as the
+        // launched root volume beside it reads it — so an instance and its interface can
+        // never be placed in two Regions.
+        let region = region_of_zone_name(&availability_zone).to_string();
         if !self.has_network_interface_capacity() {
             return;
         }
-        let groups = if launch_groups.is_empty() {
+        // Each group the launch named, completed to the id AND the name a report carries
+        // ([`Self::group_identifier_of`]) — or, for a launch that named none, the VPC's own
+        // default group, which is what "Default: Amazon Web Services uses the default
+        // security group" gives it.
+        let groups: Vec<GroupIdentifier> = if named_groups.is_empty() {
             self.security_groups
                 .values()
                 .find(|group| {
@@ -118,7 +113,16 @@ impl ComAmazonawsEc2Amazonec2State {
                 })
                 .unwrap_or_default()
         } else {
-            launch_groups
+            named_groups
+                .iter()
+                .map(|(group_id, group_name)| {
+                    self.group_identifier_of(
+                        Some(vpc_id.as_str()),
+                        group_id.as_deref(),
+                        group_name.as_deref(),
+                    )
+                })
+                .collect()
         };
         let attachment_id = self.next_id(NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX);
         let attachment = NetworkInterfaceAttachment {

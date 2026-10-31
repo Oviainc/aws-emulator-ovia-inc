@@ -209,6 +209,13 @@ pub fn launch<Eng: Send + Sync + 'static>(
             user_data: parameters.user_data.clone(),
             placement_az: placement.availability_zone.clone(),
             monitoring_state: monitoring_state.to_string(),
+            // The launch template says whether detailed monitoring is on from the start, so
+            // there is no move for Amazon EC2's clock to make.
+            monitoring_transition: None,
+            // A launch template here configures none of the option sets an instance
+            // reports (its metadata options, enclave, tenancy and the rest), so every one
+            // of them is at its documented default.
+            detail: ec2::InstanceDetail::default(),
             architecture: ec2::architecture_for(&instance_type),
             kernel_id,
             ramdisk_id,

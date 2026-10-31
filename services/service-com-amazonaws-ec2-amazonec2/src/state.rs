@@ -1588,7 +1588,7 @@ use crate::ops::types::{
     NetworkInsightsAccessScopeAnalysis, NetworkInsightsAnalysis, NetworkInsightsPath,
     NetworkInterface, NetworkInterfacePermission,
     NetworkInterfacePermissionState, NetworkInterfacePrivateIpAddress,
-    OperatorResponse, PathFilter, PeeringAttachmentStatus, Placement,
+    OperatorResponse, PathFilter, PeeringAttachmentStatus,
     PlacementGroup, PrefixListId, PtrUpdateStatus,
     PrivateDnsDetails, PrivateDnsNameOptionsOnLaunch, ReferencedSecurityGroup,
     SecurityGroupRule, SecurityGroupVpcAssociation,
@@ -1704,6 +1704,13 @@ mod launched_root_volumes;
 /// the launch places it in — one method on the state, in a module of its own, beside the
 /// root volume the same launch creates.
 mod launched_primary_interfaces;
+
+/// The FIXED detail every instance reports — the machine facts of its AMI, the CPU layout of
+/// its instance type, the volumes it holds, where it runs and the option sets its launch
+/// chose — in a module of its own, re-exported so a handler reaches its words as
+/// `crate::state::<item>` like every other primitive here.
+pub mod instance_detail;
+pub use instance_detail::*;
 
 /// The associations between the account's instances and the IAM instance profiles they run
 /// as — the store, the form of an association id, its ceiling, its refusals and the two
@@ -2173,6 +2180,17 @@ pub struct InstanceRecord {
     pub user_data: Option<String>,
     pub placement_az: String,
     pub monitoring_state: String,
+    /// The move the clock owes this instance's `MonitoringState`, if any: detailed
+    /// monitoring is turned on and off through a transient state — `pending` on its way to
+    /// `enabled` and `disabling` on its way to `disabled` — so a caller that reads straight
+    /// after `MonitorInstances` or `UnmonitorInstances` still sees it. Carried as the one
+    /// [`ClockTransition`] every clock-owed move of this crate uses.
+    pub monitoring_transition: Option<ClockTransition<&'static str>>,
+    /// The settings this instance's LAUNCH chose for the option sets `DescribeInstances`
+    /// reports (its metadata options, enclave, tenancy and the rest): the only part of the
+    /// fixed instance detail that cannot be re-derived from the AMI, the instance type, the
+    /// subnet and the volume store ([`InstanceDetail`]).
+    pub detail: InstanceDetail,
     pub architecture: String,
     /// "The kernel associated with this instance, if applicable" (`Instance$KernelId`):
     /// the kernel the launch named, or the one its AMI carries when it named none. This
@@ -5884,6 +5902,41 @@ impl ComAmazonawsEc2Amazonec2State {
             .and_then(|group| group.group_id.clone())
     }
 
+    /// The security group this account holds in `vpc_id` under `group_name`, as the
+    /// `GroupIdentifier` a report carries — the id AND the name, however the caller named
+    /// it.
+    ///
+    /// The ONE completion of a half-named group, so every resource that reports the groups
+    /// a request named reports BOTH members of each one, the way AWS does: a launch that
+    /// named `sg-…` reports that group's name beside it, and one that named a name reports
+    /// its id. A group this account does not hold is reported exactly as the request named
+    /// it, there being nothing to read the other member off.
+    pub fn group_identifier_of(
+        &self,
+        vpc_id: Option<&str>,
+        group_id: Option<&str>,
+        group_name: Option<&str>,
+    ) -> GroupIdentifier {
+        if let Some(group_id) = group_id {
+            return GroupIdentifier {
+                group_id: Some(group_id.to_string()),
+                group_name: self
+                    .security_groups
+                    .get(group_id)
+                    .and_then(|group| group.group_name.clone())
+                    .or_else(|| group_name.map(str::to_string)),
+            };
+        }
+        GroupIdentifier {
+            group_id: group_name
+                .zip(vpc_id)
+                .and_then(|(group_name, vpc_id)| {
+                    self.security_group_id_for_name(vpc_id, group_name)
+                }),
+            group_name: group_name.map(str::to_string),
+        }
+    }
+
     /// The rules the group `group_id` holds in one direction, each beside the
     /// `SecurityGroupRuleId` the store minted for it — the inbound rules when `is_egress` is
     /// `false` and the outbound ones when it is `true`.
@@ -7324,6 +7377,39 @@ impl ComAmazonawsEc2Amazonec2State {
         Some(previous)
     }
 
+    /// Set the detailed monitoring of the instance `instance_id` names on its way to
+    /// `settled`, through the transient state `transient`.
+    ///
+    /// The ONE writer of a monitoring change, so `MonitorInstances` and
+    /// `UnmonitorInstances` leave the same shape of record behind: the instance reports
+    /// `transient` at once ("pending" on the way up, "disabling" on the way down) and the
+    /// clock owes it `settled` [`TRANSITION_DELAY`] later, whether or not anybody calls
+    /// again ([`Self::materialize_due_transitions`]). Nothing else about the instance
+    /// moves — turning monitoring on or off leaves the instance in the state it was in —
+    /// and an instance already at `settled` with nothing owed is left exactly as it is, so
+    /// a repeat of the same call reports the settled state rather than re-entering the
+    /// transient one. The words are `&'static str` members of the modelled
+    /// `MonitoringState` catalog, so no request text can reach the record.
+    pub fn set_instance_monitoring(
+        &mut self,
+        instance_id: &str,
+        transient: &'static str,
+        settled: &'static str,
+    ) {
+        debug_assert!(
+            self.instances.contains_key(instance_id),
+            "monitoring is set only for an instance the caller's id resolved to"
+        );
+        let Some(instance) = self.instances.get_mut(instance_id) else {
+            return;
+        };
+        if instance.monitoring_state == settled && instance.monitoring_transition.is_none() {
+            return;
+        }
+        instance.monitoring_state = transient.to_string();
+        instance.monitoring_transition = Some(ClockTransition::starting_now(settled));
+    }
+
     /// Queue one reboot for the instance `instance_id` names, as of `at`.
     ///
     /// The ONE writer of a queued reboot, so one `RebootInstances` call records one reboot
@@ -7462,6 +7548,19 @@ impl ComAmazonawsEc2Amazonec2State {
             if let Some(state) = due {
                 instance.state = state;
                 instance.pending_transition = None;
+            }
+            // The monitoring move the clock owes the same instance: `pending` -> `enabled`
+            // for a `MonitorInstances`, `disabling` -> `disabled` for an
+            // `UnmonitorInstances`. Owed at the same instant whether or not anybody called,
+            // exactly like the state move above.
+            let monitoring_due = instance
+                .monitoring_transition
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .map(|pending| pending.to);
+            if let Some(monitoring_state) = monitoring_due {
+                instance.monitoring_state = monitoring_state.to_string();
+                instance.monitoring_transition = None;
             }
         }
         // An instance that has reached `terminated` no longer holds the network interfaces
@@ -8788,9 +8887,52 @@ impl ComAmazonawsEc2Amazonec2State {
             .collect()
     }
 
+    /// The security groups the instance `instance` reports
+    /// (`Instance$SecurityGroups`): the groups of its PRIMARY network interface, or — for
+    /// an instance this store holds no interface for — the groups its launch named.
+    ///
+    /// The ONE reading of an instance's groups, so the instance report, the
+    /// `instance.group-id` / `instance.group-name` filters and
+    /// `DescribeNetworkInterfaces` all answer from the interface that actually carries
+    /// them. A launch that named no group is given its VPC's default group on that
+    /// interface ([`Self::mint_launched_primary_interface`]), which is what AWS reports for
+    /// such an instance.
+    pub fn instance_security_groups(&self, instance: &InstanceRecord) -> Vec<GroupIdentifier> {
+        let primary = self
+            .instance_network_interfaces(&instance.instance_id)
+            .into_iter()
+            .find(|interface| {
+                interface
+                    .attachment
+                    .as_ref()
+                    .and_then(|attachment| attachment.device_index)
+                    == Some(PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX)
+            })
+            .and_then(|interface| interface.groups)
+            .filter(|groups| !groups.is_empty());
+        primary.unwrap_or_else(|| {
+            instance
+                .security_groups
+                .iter()
+                .map(|(group_id, group_name)| GroupIdentifier {
+                    group_id: group_id.clone(),
+                    group_name: group_name.clone(),
+                })
+                .collect()
+        })
+    }
+
     /// The modelled `Instance` for one stored instance.
+    ///
+    /// The ONE projection of a stored instance, so `RunInstances`, `DescribeInstances` and
+    /// every other operation that answers with an `Instance` answers with the same members.
+    /// The FIXED detail every instance reports — the machine facts of its AMI, the CPU
+    /// layout of its instance type, the volumes it holds, where it runs and the option sets
+    /// its launch chose — is filled in by
+    /// [`Self::report_instance_detail`](crate::state::ComAmazonawsEc2Amazonec2State::report_instance_detail)
+    /// below, out of the one module that derives it (`super::instance_detail`).
     pub fn instance_view(&self, instance: &InstanceRecord) -> Instance {
-        Instance {
+        let mut view = Instance {
             instance_id: Some(instance.instance_id.clone()),
             image_id: instance.image_id.clone(),
             instance_type: Some(instance.instance_type.clone()),
@@ -8839,20 +8981,18 @@ impl ComAmazonawsEc2Amazonec2State {
             monitoring: Some(Monitoring {
                 state: Some(instance.monitoring_state.clone()),
             }),
-            placement: Some(Placement {
-                availability_zone: Some(instance.placement_az.clone()),
-                ..Default::default()
-            }),
-            security_groups: Some(
-                instance
-                    .security_groups
-                    .iter()
-                    .map(|(group_id, group_name)| GroupIdentifier {
-                        group_id: group_id.clone(),
-                        group_name: group_name.clone(),
-                    })
-                    .collect(),
-            ),
+            // `placement` is filled by `report_instance_detail` below, which reads the
+            // zone, its id and the tenancy off one record.
+            //
+            // "The security groups for the instance" (`Instance$SecurityGroups`): the
+            // groups of its PRIMARY network interface, which is where a VPC instance's
+            // groups live — "when you launch an instance … the security groups are
+            // associated with its primary network interface" — so a launch that named none
+            // reports the default group that interface was given rather than nothing at
+            // all, and the instance report and `DescribeNetworkInterfaces` cannot disagree.
+            // The launch's own list stands in for an instance this store holds no interface
+            // for.
+            security_groups: Some(self.instance_security_groups(instance)),
             client_token: instance.client_token.clone(),
             // "The product codes attached to this instance, IF APPLICABLE"
             // (`Instance$ProductCodes`): the codes of the AMI it was launched from, so an
@@ -8877,7 +9017,9 @@ impl ComAmazonawsEc2Amazonec2State {
             // report cannot disagree about one instance's profile.
             iam_instance_profile: self.iam_instance_profile_of_instance(&instance.instance_id),
             ..Default::default()
-        }
+        };
+        self.report_instance_detail(instance, &mut view);
+        view
     }
 
     /// The modelled `Reservation` for `reservation_id`, carrying exactly
@@ -8892,8 +9034,11 @@ impl ComAmazonawsEc2Amazonec2State {
             reservation_id: Some(reservation.reservation_id.clone()),
             owner_id: Some(reservation.owner_id.clone()),
             requester_id: reservation.requester_id.clone(),
-            // `Reservation$groups` is documented "Not supported", so it stays absent.
-            groups: None,
+            // `Reservation$Groups` is documented "Not supported", so it names no group —
+            // but AWS reports the member as an EMPTY set rather than leaving it out, so a
+            // client that reads it finds the empty list the documentation promises instead
+            // of nothing at all.
+            groups: Some(Vec::new()),
             instances: Some(
                 instance_ids
                     .iter()
@@ -8942,18 +9087,21 @@ impl ComAmazonawsEc2Amazonec2State {
             "instance-state-code" => single(Some(instance.state.code().to_string())),
             "instance-state-name" => single(Some(instance.state.as_str().to_string())),
             "instance-type" => single(Some(instance.instance_type.clone())),
+            // "instance.group-id - The ID of the security group for the instance" and
+            // "instance.group-name - The name of the security group for the instance"
+            // (`DescribeInstancesRequest$Filters`): read off the SAME projection the
+            // instance report carries ([`Self::instance_security_groups`]), so a filter and
+            // a report cannot disagree about which groups an instance is in.
             "instance.group-id" => Some(
-                instance
-                    .security_groups
-                    .iter()
-                    .filter_map(|(group_id, _)| group_id.clone())
+                self.instance_security_groups(instance)
+                    .into_iter()
+                    .filter_map(|group| group.group_id)
                     .collect(),
             ),
             "instance.group-name" => Some(
-                instance
-                    .security_groups
-                    .iter()
-                    .filter_map(|(_, group_name)| group_name.clone())
+                self.instance_security_groups(instance)
+                    .into_iter()
+                    .filter_map(|group| group.group_name)
                     .collect(),
             ),
             // "instance-lifecycle - Indicates whether this is a Spot Instance" and
@@ -9187,6 +9335,13 @@ pub fn instance_payload_bytes(record: &InstanceRecord) -> usize {
         + record.kernel_id.as_ref().map_or(0, String::len)
         + record.ramdisk_id.as_ref().map_or(0, String::len)
         + record.placement_az.len()
+        // The one caller-chosen string of the instance's own detail: every other member of
+        // it is a `&'static str` out of a modelled catalog or a number.
+        + record
+            .detail
+            .placement_group_name
+            .as_ref()
+            .map_or(0, String::len)
         + tag_bytes(&record.tags)
         + record
             .security_groups
@@ -9732,6 +9887,28 @@ pub fn private_dns_domain(region: &str) -> String {
 pub fn private_dns_name(private_ip: &str, region: &str) -> String {
     let host = private_ip.replace('.', "-");
     format!("ip-{host}.{domain}", domain = private_dns_domain(region))
+}
+
+/// The public DNS domain of a Region: the suffix of every Amazon-provided PUBLIC hostname
+/// in it, the public counterpart of [`private_dns_domain`].
+///
+/// AWS uses `compute-1.amazonaws.com` in `us-east-1` and `<region>.compute.amazonaws.com`
+/// in every other Region (Amazon EC2 User Guide, "Amazon EC2 instance hostname types").
+pub fn public_dns_domain(region: &str) -> String {
+    if region == EC2_INTERNAL_REGION {
+        "compute-1.amazonaws.com".to_string()
+    } else {
+        format!("{region}.compute.amazonaws.com")
+    }
+}
+
+/// The public IPv4 DNS hostname EC2 gives an instance for a public address it holds.
+///
+/// The public counterpart of [`private_dns_name`]: AWS builds it as `ec2-<dash-separated
+/// address>` followed by the Region's public DNS domain ([`public_dns_domain`]).
+pub fn public_dns_name(public_ip: &str, region: &str) -> String {
+    let host = public_ip.replace('.', "-");
+    format!("ec2-{host}.{domain}", domain = public_dns_domain(region))
 }
 
 /// The processor architecture an instance type runs on.
@@ -14287,6 +14464,36 @@ impl VolumeRecord {
             .collect()
     }
 
+    /// The attachments this volume holds TO ONE INSTANCE at `now`: the same reading
+    /// [`Self::attachments_at`] gives, narrowed to the attachments whose `InstanceId` is
+    /// `instance_id`.
+    ///
+    /// What an instance's block device mappings are read through
+    /// ([`ComAmazonawsEc2Amazonec2State::instance_block_device_mappings`]), so the device,
+    /// the volume and the attachment state an instance reports and the ones
+    /// `DescribeVolumes` reports are the same record. The filter runs before the clone, so a
+    /// volume attached elsewhere costs one comparison.
+    pub fn attachments_to_instance_at(
+        &self,
+        instance_id: &str,
+        now: Instant,
+    ) -> Vec<AttachVolumeOutput> {
+        self.view
+            .attachments
+            .iter()
+            .flatten()
+            .filter(|attachment| attachment.instance_id.as_deref() == Some(instance_id))
+            .filter(|attachment| !self.detach_is_due(attachment, now))
+            .map(|attachment| {
+                let mut attachment = attachment.clone();
+                if self.attach_is_due(&attachment, now) {
+                    attachment.state = Some(VOLUME_ATTACHMENT_STATE_ATTACHED.to_string());
+                }
+                attachment
+            })
+            .collect()
+    }
+
     /// Whether the detach of `attachment` was owed by `now`.
     fn detach_is_due(&self, attachment: &AttachVolumeOutput, now: Instant) -> bool {
         self.detaching_at
@@ -18275,13 +18482,33 @@ pub fn aggregated_application_status(
     (APPLICATION_STATUS_NOT_APPLICABLE, None)
 }
 
+/// The Region the Availability Zone named `zone_name` belongs to: the name without its
+/// trailing zone letter.
+///
+/// A zone's name is the Region's name with a letter appended
+/// ([`availability_zones_in_region`]), so this is the ONE reading of "which Region is this
+/// zone in" — used by [`zone_id_for_zone_name`] beside it and by every record whose Region
+/// is its zone's (a launched instance's root volume, its primary interface and the public
+/// DNS name it reports), so a resource and the instance that holds it can never be placed
+/// in two Regions. A name carrying no zone letter is already a Region name and is answered
+/// unchanged.
+pub fn region_of_zone_name(zone_name: &str) -> &str {
+    zone_name
+        .strip_suffix(|letter: char| letter.is_ascii_lowercase())
+        .unwrap_or(zone_name)
+}
+
 /// The `ZoneId` of the Availability Zone named `zone_name`.
 ///
 /// A zone's name and its id are the SAME derived pair ([`availability_zones_in_region`]),
 /// so the id is read back out of the Region the name belongs to rather than stored a
 /// second time beside it. `None` for a name no Region of that form has a zone for.
 pub fn zone_id_for_zone_name(zone_name: &str) -> Option<String> {
-    let region = zone_name.strip_suffix(|letter: char| letter.is_ascii_lowercase())?;
+    let region = region_of_zone_name(zone_name);
+    // A name carrying no zone letter is a Region name, which names no zone.
+    if region == zone_name {
+        return None;
+    }
     availability_zones_in_region(region)
         .into_iter()
         .find(|zone| zone.zone_name == zone_name)
@@ -36640,6 +36867,15 @@ pub const MONITORING_STATE_ENABLED: &str = "enabled";
 /// `RequestSpotLaunchSpecification$Monitoring`).
 pub const MONITORING_STATE_DISABLED: &str = "disabled";
 
+/// The `MonitoringState` enum's `pending` member: the transient state detailed monitoring
+/// is in between `MonitorInstances` and the `enabled` the clock then owes it
+/// ([`ComAmazonawsEc2Amazonec2State::set_instance_monitoring`]).
+pub const MONITORING_STATE_PENDING: &str = "pending";
+
+/// The `MonitoringState` enum's `disabling` member: the transient state on the way down,
+/// between `UnmonitorInstances` and the `disabled` the clock then owes it.
+pub const MONITORING_STATE_DISABLING: &str = "disabling";
+
 /// The product description of a Spot request for a Linux AMI: "`product-description` - The
 /// product description associated with the instance (`Linux/UNIX` | `Windows`)"
 /// (`DescribeSpotInstanceRequestsRequest$Filters`), and a member of the modelled
@@ -37160,6 +37396,12 @@ impl ComAmazonawsEc2Amazonec2State {
             } else {
                 MONITORING_STATE_DISABLED.to_string()
             },
+            // The launch specification says whether monitoring is on from the start, so
+            // there is no move for the clock to make.
+            monitoring_transition: None,
+            // A Spot launch specification configures none of the option sets an instance
+            // reports, so every one of them is at its documented default.
+            detail: InstanceDetail::default(),
             architecture: architecture_for(&instance_type),
             // The launch specification's kernel and RAM disk, falling back to the ones the
             // AMI carries — the same resolution `RunInstances` makes.
