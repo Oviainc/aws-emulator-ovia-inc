@@ -11682,12 +11682,18 @@ pub mod messages {
 
     /// A data quality ruleset lookup for a name this account holds no ruleset under — the
     /// miss of every operation that addresses one by `Name` (`GetDataQualityRuleset`, and
-    /// the update and delete that address a ruleset the same way). NOT recorded: the
-    /// sentence follows the per-resource template of its data quality sibling
-    /// [`data_quality_rule_recommendation_run_not_found`], built from the name the request
-    /// sent, which is the whole address of a ruleset.
+    /// the update and delete that address a ruleset the same way).
+    ///
+    /// Recorded template: the sentence names the account whose namespace was searched and
+    /// then the ruleset the request addressed, because a ruleset's name is "a unique name
+    /// for the data quality ruleset" per account and so the account is part of the address
+    /// that resolved to nothing. The name is read off the request, exactly as sent; the
+    /// account is the one this emulator serves, not a value the request carries.
     pub fn data_quality_ruleset_not_found(name: &str) -> String {
-        format!("Data quality ruleset with name {name} does not exist")
+        format!(
+            "Cannot find Data Quality Ruleset in account {} with name {name}",
+            ::engine::emulator_account_id()
+        )
     }
 
     /// `CreateDataQualityRuleset` for a name this account already holds a ruleset under.
