@@ -1041,15 +1041,22 @@ impl MultiplexRecord {
     /// Materialise the transition the clock has already made due: a multiplex
     /// AWS answers `CREATING` becomes `IDLE` once the span has passed, a
     /// `STARTING` one becomes `RUNNING`, a `STOPPING` one becomes `IDLE` again,
-    /// and a `DELETING` one becomes the terminal `DELETED`.
-    fn settle(&mut self, now: SystemTime) {
+    /// and a `DELETING` one becomes the terminal `DELETED` — answering whether
+    /// THIS call is the one that settled the deletion, which is what
+    /// [`ComAmazonawsMedialiveMedialiveState::settle_multiplexes`] collects to
+    /// end the idempotency window of the token that minted the multiplex (the
+    /// cluster slice's own record answers its settle the same way, for the same
+    /// reason).
+    fn settle(&mut self, now: SystemTime) -> bool {
         let Some(transition) = self.transition else {
-            return;
+            return false;
         };
         if now >= transition.due {
             self.state = transition.to.to_string();
             self.transition = None;
+            return self.state == multiplex_state::DELETED;
         }
+        false
     }
 }
 
@@ -1080,7 +1087,9 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// of them:
     ///
     /// * one walk of the multiplexes to settle their transitions, at most
-    ///   [`MAX_MULTIPLEXES`];
+    ///   [`MAX_MULTIPLEXES`], plus — only for the multiplexes whose deletion
+    ///   settles on THIS call — one pass over the token map, at most
+    ///   [`MAX_MULTIPLEX_TOKENS`] entries;
     /// * nothing more at all unless some multiplex is transmitting or carries an
     ///   alert that is still set — a store nothing runs in pays only the walk
     ///   above;
@@ -1095,8 +1104,22 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// the channel scan OUT of the per-program loop, where it would otherwise
     /// have multiplied the two bounds together.
     pub(super) fn settle_multiplexes(&mut self, now: SystemTime) {
-        for multiplex in self.multiplexes.values_mut() {
-            multiplex.settle(now);
+        // Only a multiplex that settles into the terminal `DELETED` on THIS call
+        // is collected, so the work here does not grow with the number of
+        // multiplexes that have already reached that state.
+        let mut just_deleted: Vec<String> = Vec::new();
+        for (id, multiplex) in &mut self.multiplexes {
+            if multiplex.settle(now) {
+                just_deleted.push(id.clone());
+            }
+        }
+        // A token never outlives the multiplex it minted: once that multiplex
+        // has reached the terminal `DELETED` state its idempotency window is
+        // over, so a retried create mints a new multiplex rather than answering
+        // with a deleted one — the rule the channel, input, network, cluster and
+        // channel placement group tokens follow too.
+        for id in just_deleted {
+            self.multiplex_tokens.forget(&id);
         }
 
         // Every condition is observed BEFORE anything is written, because a
@@ -1272,6 +1295,12 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// The multiplex a stored `RequestId` created, if that multiplex still
     /// exists.
+    ///
+    /// A multiplex whose deletion has come due is no longer one this answers
+    /// for: its token is dropped the moment the record settles into the terminal
+    /// `DELETED` state it keeps ([`Self::settle_multiplexes`]), so the entry
+    /// cannot outlive the multiplex it minted and a retried create mints a new
+    /// multiplex instead of being answered with a tombstone.
     pub fn multiplex_for_token(&self, request_id: &str) -> Option<&str> {
         let id = self.multiplex_tokens.created(request_id)?;
         self.multiplexes

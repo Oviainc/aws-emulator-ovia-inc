@@ -263,6 +263,9 @@ mod multiplex_alerts;
 #[path = "all/multiplex_deletion.rs"]
 mod multiplex_deletion;
 
+#[path = "all/multiplex_idempotency_after_delete.rs"]
+mod multiplex_idempotency_after_delete;
+
 #[path = "all/multiplex_lifecycle.rs"]
 mod multiplex_lifecycle;
 
