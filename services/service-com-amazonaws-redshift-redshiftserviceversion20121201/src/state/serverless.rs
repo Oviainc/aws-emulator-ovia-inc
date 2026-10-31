@@ -22,6 +22,13 @@
 //! mounted knows of no workgroup either way — leaves it UNDECIDED
 //! ([`ServerlessTarget::Unresolvable`]), and the change is admitted rather than
 //! refused on the strength of a peer that never answered.
+//!
+//! The same two-control-plane question is asked of a zero-ETL integration's
+//! `TargetArn` ([`resolve_zero_etl_target`]): that member names "the Amazon
+//! Redshift data warehouse to use as the target for replication", and its
+//! modelled pattern admits a namespace ARN of EITHER control plane, so an ARN
+//! naming a `redshift-serverless` namespace is resolved here while one naming a
+//! provisioned cluster's namespace is resolved against this service's own store.
 
 use super::NamespaceRefusal;
 use crate::ops::types::{NamespaceIdentifierUnion, ServerlessIdentifier};
@@ -215,6 +222,203 @@ where
     }
     ServerlessTarget::Unresolvable(reason)
 }
+
+/// The service field a namespace ARN of Amazon Redshift Serverless carries.
+///
+/// Source: `smithy_query(query="operation", operation="CreateIntegration")` —
+/// `TargetArn` @pattern
+/// `^arn:aws[a-z\-]*:redshift(-serverless)?:[a-z0-9\-]+:[0-9]{12}:(namespace\/|namespace:)[a-z0-9\-]+$`,
+/// which admits this service beside the provisioned control plane's `redshift`.
+const SERVERLESS_ARN_SERVICE: &str = "redshift-serverless";
+
+/// The two resource prefixes that same pattern admits before the namespace a
+/// `TargetArn` names.
+const NAMESPACE_RESOURCE_PREFIXES: [&str; 2] = ["namespace/", "namespace:"];
+
+/// The page bound each lookup listing asks for: the largest the owning service's
+/// `maxResults` admits (`smithy_query(query="operation",
+/// operation="ListNamespaces")` — @range 1..100), so one page answers unless
+/// that account holds more than a hundred of them.
+const LOOKUP_PAGE_SIZE: i32 = 100;
+
+/// How many pages of one lookup listing are read before the question is left
+/// undecided — a bound, so a peer that keeps handing out a page token cannot
+/// spin this resolution without end.
+const MAX_LOOKUP_PAGES: usize = 16;
+
+/// What resolving a zero-ETL integration's `TargetArn` against Amazon Redshift
+/// Serverless found.
+///
+/// The three answers are the three a target can give: it is there and ready, it
+/// is there and not ready yet, or it is not there — which a caller has to be
+/// able to tell apart, because the first two are transient and the third is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WarehouseTarget {
+    /// The namespace the ARN names exists and the data warehouse on it is
+    /// active, so it can take the data an integration replicates into it.
+    Active,
+    /// The namespace the ARN names exists, and no data warehouse on it is active
+    /// yet.
+    NotActive,
+    /// That control plane was asked and holds no namespace the ARN names.
+    Absent,
+    /// That control plane could not be asked, so the target's state is UNKNOWN;
+    /// see [`ServerlessTarget::Unresolvable`]. The reason travels for the
+    /// operator-visible log.
+    Unresolvable(String),
+}
+
+/// The namespace a `TargetArn` names, when the ARN names one of Amazon Redshift
+/// Serverless — `None` for a namespace ARN of the provisioned control plane,
+/// which this service resolves against its own store.
+///
+/// The token is the namespace's own unique identifier: the `namespaceId` the ARN
+/// that service mints carries, or the name it is addressed by, which is why
+/// [`resolve_zero_etl_target`] matches it against either.
+pub fn serverless_namespace_token(target_arn: &str) -> Option<&str> {
+    let mut fields = target_arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let _partition = fields.next()?;
+    if fields.next()? != SERVERLESS_ARN_SERVICE {
+        return None;
+    }
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let resource = fields.next()?;
+    NAMESPACE_RESOURCE_PREFIXES
+        .iter()
+        .find_map(|prefix| resource.strip_prefix(prefix))
+        .filter(|token| !token.is_empty())
+}
+
+/// Resolve a zero-ETL integration's `TargetArn` against Amazon Redshift
+/// Serverless, or answer `None` when the ARN names no namespace of that service.
+///
+/// A serverless data warehouse is the COMPUTE attached to a namespace — a
+/// workgroup — so a namespace is a target that can take data only while it is
+/// itself available and at least one workgroup on it is available; a namespace
+/// with none, or with one still coming up, exists but is not ready. Asked over
+/// the same in-process callback as [`resolve_registration_target`], before any
+/// store lock is taken.
+pub async fn resolve_zero_etl_target(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    target_arn: &str,
+) -> Option<WarehouseTarget> {
+    let token = serverless_namespace_token(target_arn)?;
+    Some(resolve_warehouse(ctx, target_arn, token).await)
+}
+
+/// [`resolve_zero_etl_target`] once the ARN is known to name a serverless
+/// namespace.
+async fn resolve_warehouse(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    target_arn: &str,
+    token: &str,
+) -> WarehouseTarget {
+    let region = super::request_region(ctx);
+    let client = serverless_client(ctx, &region);
+
+    let namespaces = match namespaces(&client).await {
+        Ok(namespaces) => namespaces,
+        Err(reason) => return WarehouseTarget::Unresolvable(reason),
+    };
+    // The ARN the request carried is matched against the ARN that service
+    // minted first, so a target names exactly what a `CreateNamespace` answered
+    // with; the token is then matched against either unique identifier of a
+    // namespace, since an ARN may be written with either.
+    let Some(namespace) = namespaces.iter().find(|namespace| {
+        namespace.namespace_arn() == Some(target_arn)
+            || namespace.namespace_id() == Some(token)
+            || namespace.namespace_name() == Some(token)
+    }) else {
+        return WarehouseTarget::Absent;
+    };
+
+    if namespace.status() != Some(&::aws_sdk_redshiftserverless::types::NamespaceStatus::Available) {
+        return WarehouseTarget::NotActive;
+    }
+    let Some(namespace_name) = namespace.namespace_name() else {
+        // A workgroup names the namespace it belongs to by that namespace's
+        // name, so a namespace reported without one settles nothing about the
+        // compute attached to it.
+        return WarehouseTarget::Unresolvable(
+            "the namespace was reported without the name its workgroups carry".to_string(),
+        );
+    };
+
+    let workgroups = match workgroups(&client).await {
+        Ok(workgroups) => workgroups,
+        Err(reason) => return WarehouseTarget::Unresolvable(reason),
+    };
+    let active = workgroups.iter().any(|workgroup| {
+        workgroup.namespace_name() == Some(namespace_name)
+            && workgroup.status()
+                == Some(&::aws_sdk_redshiftserverless::types::WorkgroupStatus::Available)
+    });
+    if active {
+        WarehouseTarget::Active
+    } else {
+        WarehouseTarget::NotActive
+    }
+}
+
+/// Every namespace Amazon Redshift Serverless holds for this account, or why the
+/// listing could not be read.
+async fn namespaces(
+    client: &::aws_sdk_redshiftserverless::Client,
+) -> Result<Vec<::aws_sdk_redshiftserverless::types::Namespace>, String> {
+    let mut found = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..MAX_LOOKUP_PAGES {
+        let page = client
+            .list_namespaces()
+            .max_results(LOOKUP_PAGE_SIZE)
+            .set_next_token(token)
+            .send()
+            .await
+            .map_err(|error| {
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
+            })?;
+        found.extend(page.namespaces().iter().cloned());
+        token = page.next_token().map(str::to_string);
+        if token.is_none() {
+            return Ok(found);
+        }
+    }
+    Err(TOO_MANY_LOOKUP_PAGES.to_string())
+}
+
+/// Every workgroup Amazon Redshift Serverless holds for this account, or why the
+/// listing could not be read.
+async fn workgroups(
+    client: &::aws_sdk_redshiftserverless::Client,
+) -> Result<Vec<::aws_sdk_redshiftserverless::types::Workgroup>, String> {
+    let mut found = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..MAX_LOOKUP_PAGES {
+        let page = client
+            .list_workgroups()
+            .max_results(LOOKUP_PAGE_SIZE)
+            .set_next_token(token)
+            .send()
+            .await
+            .map_err(|error| {
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
+            })?;
+        found.extend(page.workgroups().iter().cloned());
+        token = page.next_token().map(str::to_string);
+        if token.is_none() {
+            return Ok(found);
+        }
+    }
+    Err(TOO_MANY_LOOKUP_PAGES.to_string())
+}
+
+/// Why a lookup that kept being handed another page token is left undecided.
+const TOO_MANY_LOOKUP_PAGES: &str =
+    "the listing handed out more pages than this lookup reads";
 
 /// An Amazon Redshift Serverless client over the in-process callback into this
 /// same emulator.

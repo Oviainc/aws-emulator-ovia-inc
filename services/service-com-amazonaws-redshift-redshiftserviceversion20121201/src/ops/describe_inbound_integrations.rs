@@ -8,7 +8,10 @@
 //! `crate::state::StoredIntegration::inbound`) — paged through the service's
 //! `MaxRecords` window and `Marker` cursor. An `IntegrationArn` that names no
 //! integration answers `IntegrationNotFoundFault`, and a `TargetArn` that names
-//! no namespace this account holds answers `InvalidNamespaceFault`.
+//! no namespace of EITHER Redshift control plane — this service's own clusters,
+//! or the namespaces Amazon Redshift Serverless holds
+//! (`crate::state::serverless::resolve_zero_etl_target`) — answers
+//! `InvalidNamespaceFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
@@ -174,6 +177,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        };
+
+        // A `TargetArn` naming a SERVERLESS namespace is a question for the
+        // control plane that owns it, so it is asked before the lock is taken.
+        // Only an answer that the namespace is ABSENT refuses the read: whether
+        // its data warehouse is active is not what a filter on it turns on.
+        let serverless_target = match input.target_arn.as_deref() {
+            Some(target) => st::serverless::resolve_zero_etl_target(ctx, target).await,
+            None => None,
         };
 
         let mut store = state.lock();
@@ -206,15 +218,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "The Amazon Resource Name (ARN) of the target of an inbound
-        // integration": a namespace this account does not hold is no namespace
-        // at all, so it is refused rather than reported as an empty page.
+        // integration": a namespace neither Redshift control plane holds is no
+        // namespace at all, so it is refused rather than reported as an empty
+        // page.
         let matched: Vec<InboundIntegration> = match input.target_arn.as_deref() {
             Some(target) => {
-                if store.cluster_with_namespace_arn(target).is_none() {
+                let holds_namespace = match &serverless_target {
+                    Some(resolved) => {
+                        *resolved != st::serverless::WarehouseTarget::Absent
+                    }
+                    None => store.cluster_with_namespace_arn(target).is_some(),
+                };
+                if !holds_namespace {
                     return Err(
                         DescribeInboundIntegrationsErrorModeled::InvalidNamespaceFault(
                             InvalidNamespaceFault {
-                                message: Some(format!("Namespace not found: {target}")),
+                                message: Some(st::integration_namespace_not_found_message(target)),
                             },
                         )
                         .into(),

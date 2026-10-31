@@ -131,5 +131,7 @@ mod static_catalog;
 mod storage_summary;
 #[path = "all/usage_limits.rs"]
 mod usage_limits;
+#[path = "all/zero_etl_integration_targets.rs"]
+mod zero_etl_integration_targets;
 #[path = "all/zero_etl_integrations.rs"]
 mod zero_etl_integrations;

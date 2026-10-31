@@ -4645,6 +4645,24 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         })
     }
 
+    /// The stored integration that already replicates `source_arn` into
+    /// `target_arn`, if any.
+    ///
+    /// An integration is the replication of ONE source into ONE data warehouse,
+    /// so the (source, target) PAIR is its identity beside its name: a second
+    /// integration over the same pair would be the same replication twice, and
+    /// is refused however it is named.
+    pub fn integration_for_pair(
+        &self,
+        source_arn: &str,
+        target_arn: &str,
+    ) -> Option<&StoredIntegration> {
+        self.integrations.iter().find(|stored| {
+            stored.integration.source_arn.as_deref() == Some(source_arn)
+                && stored.integration.target_arn.as_deref() == Some(target_arn)
+        })
+    }
+
     /// The cluster whose namespace this ARN names, if this account holds one —
     /// how a zero-ETL integration's `TargetArn` resolves to a target that
     /// exists.
@@ -7919,6 +7937,42 @@ pub fn integration_arn(integration_name: &str, region: &str) -> String {
 /// names none.
 pub fn integration_not_found_message(integration_arn: &str) -> String {
     format!("Integration not found: {integration_arn}")
+}
+
+/// How Amazon Redshift states that the (source, target) pair a create names is
+/// already replicating.
+///
+/// An integration replicates ONE source into ONE data warehouse, so the pair is
+/// what an integration is unique on and what the sentence names. Fixed text bar
+/// the two ARNs, which are the request's own `SourceArn` and `TargetArn`.
+pub fn integration_pair_exists_message(source_arn: &str, target_arn: &str) -> String {
+    format!(
+        "An integration from source {source_arn} to target {target_arn} already exists. \
+         Only one integration is allowed."
+    )
+}
+
+/// What `CreateIntegration` answers when the data warehouse its `TargetArn`
+/// names exists but is not active yet.
+///
+/// Entirely fixed text: the condition is about the target the request already
+/// named, and the sentence tells the client what to do about it — wait, because
+/// the condition is transient, which is what distinguishes this refusal from the
+/// permanent "that target can't be found".
+pub const INTEGRATION_TARGET_NOT_ACTIVE: &str = "Unable to perform create operation on the \
+     specified zero-ETL integration because its target Redshift data warehouse is not active. \
+     Wait until the data warehouse is active and try again.";
+
+/// What `CreateIntegration` answers when its `TargetArn` names no data warehouse
+/// at all — a permanent condition, naming the ARN the request carried.
+pub fn integration_target_not_found_message(target_arn: &str) -> String {
+    format!("Integration target not found: {target_arn}")
+}
+
+/// Why a `TargetArn` that names no namespace of either control plane is refused
+/// by an operation that FILTERS on it rather than creating against it.
+pub fn integration_namespace_not_found_message(target_arn: &str) -> String {
+    format!("Namespace not found: {target_arn}")
 }
 
 /// A zero-ETL integration as this service stores it: the modelled projection

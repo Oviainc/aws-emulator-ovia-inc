@@ -4,14 +4,20 @@
 //!
 //! Records the zero-ETL integration the request asks for and reports it back in
 //! the `creating` status, under the ARN this service mints for it
-//! (`crate::state::integration_arn`). The TARGET is resolved against this
-//! service's store before anything is recorded — a `TargetArn` naming no
-//! cluster namespace this account holds answers `IntegrationTargetNotFoundFault`,
-//! and a target cluster that is not available answers `InvalidClusterStateFault`
-//! — so a refused create leaves no integration behind. The SOURCE is a resource
+//! (`crate::state::integration_arn`). The TARGET is resolved before anything is
+//! recorded, against the control plane that owns the namespace the `TargetArn`
+//! names — this service's own store for a provisioned cluster's namespace, and
+//! Amazon Redshift Serverless for one of its namespaces
+//! (`crate::state::serverless::resolve_zero_etl_target`) — and classified three
+//! ways: a namespace that exists nowhere answers `IntegrationTargetNotFoundFault`
+//! (404), a serverless namespace whose data warehouse is not active yet answers
+//! `IntegrationConflictOperationFault` (400) and a provisioned cluster that is
+//! not available answers this operation's own `InvalidClusterStateFault` (400),
+//! so a refused create leaves no integration behind. The SOURCE is a resource
 //! of another service (the model's own pattern admits an Amazon S3 or DynamoDB
-//! ARN), so it is stored exactly as the request carried it. A second create
-//! under one `IntegrationName` is refused with `IntegrationAlreadyExistsFault`.
+//! ARN), so it is stored exactly as the request carried it. A second create over
+//! one (`SourceArn`, `TargetArn`) pair, or under one `IntegrationName`, is
+//! refused with `IntegrationAlreadyExistsFault`.
 //! The integration becomes `active` a `crate::state::PROVISIONING_SPAN` after
 //! this call.
 //!
@@ -221,8 +227,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = st::request_region(ctx);
-        let started = ::std::time::Instant::now();
-        let created_at = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
 
         // The request's own tag list is capped BEFORE the store is locked and
         // before any per-element work, so a request carrying more entries than
@@ -245,11 +249,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The TARGET is a data warehouse namespace of EITHER Redshift control
+        // plane — the modelled `TargetArn` pattern admits a `redshift` and a
+        // `redshift-serverless` namespace ARN alike — so the ARN is resolved
+        // against the control plane that owns the namespace it names, and the
+        // outcome is classified three ways: a namespace that does not exist is
+        // no target at all (404, permanent), one that exists while its data
+        // warehouse is not active cannot take the data yet (400, transient), and
+        // one whose warehouse is active takes the integration.
+        //
+        // The SERVERLESS arm is a question for the control plane that owns those
+        // namespaces, so it is asked FIRST, with no lock held.
+        let serverless_target = st::serverless::resolve_zero_etl_target(ctx, &input.target_arn)
+            .await;
+        match &serverless_target {
+            Some(st::serverless::WarehouseTarget::Absent) => {
+                return Err(
+                    CreateIntegrationErrorModeled::IntegrationTargetNotFoundFault(
+                        IntegrationTargetNotFoundFault {
+                            message: Some(st::integration_target_not_found_message(
+                                &input.target_arn,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Some(st::serverless::WarehouseTarget::NotActive) => {
+                return Err(
+                    CreateIntegrationErrorModeled::IntegrationConflictOperationFault(
+                        IntegrationConflictOperationFault {
+                            message: Some(st::INTEGRATION_TARGET_NOT_ACTIVE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Some(st::serverless::WarehouseTarget::Unresolvable(reason)) => {
+                // Visible at default verbosity: a create admitted because the
+                // control plane that owns the target could not be asked reads
+                // exactly like one admitted against a warehouse known to be
+                // active, so the degraded path says so rather than passing
+                // quietly — and nothing is assumed from silence.
+                ::tracing::warn!(
+                    reason = %reason,
+                    "the zero-ETL integration target could not be resolved"
+                );
+            }
+            Some(st::serverless::WarehouseTarget::Active) | None => {}
+        }
+
+        // The clock is read once the target has been resolved, so the span the
+        // integration's own transition is owed starts from the call that records
+        // it rather than from before the resolution.
+        let started = ::std::time::Instant::now();
+        let created_at = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
         let mut store = state.lock();
         store.settle(started);
 
         // Identity before capacity: a request that would create nothing keeps
-        // the more specific fault even when the store is at its bound.
+        // the more specific fault even when the store is at its bound. An
+        // integration is identified by the (source, target) PAIR it replicates
+        // as well as by its name, so a second integration over one pair is
+        // refused however it is named.
+        if store
+            .integration_for_pair(&input.source_arn, &input.target_arn)
+            .is_some()
+        {
+            return Err(
+                CreateIntegrationErrorModeled::IntegrationAlreadyExistsFault(
+                    IntegrationAlreadyExistsFault {
+                        message: Some(st::integration_pair_exists_message(
+                            &input.source_arn,
+                            &input.target_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
         if store.integration_named(&input.integration_name).is_some() {
             return Err(
                 CreateIntegrationErrorModeled::IntegrationAlreadyExistsFault(
@@ -277,37 +356,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The TARGET is a namespace of this account's own control plane, so the
-        // ARN is resolved against the store: a target that names no namespace
-        // this account holds is no target at all, and a cluster that is not
-        // available cannot take the data an integration would replicate into it.
-        let Some(target) = store.cluster_with_namespace_arn(&input.target_arn) else {
-            return Err(
-                CreateIntegrationErrorModeled::IntegrationTargetNotFoundFault(
-                    IntegrationTargetNotFoundFault {
+        // ... and the PROVISIONED arm of the same target rule is this store's
+        // own: the namespace holding a cluster's data. A cluster that is not
+        // available cannot take the data an integration would replicate into
+        // it, and the model gives this operation its own cluster-state fault
+        // for exactly that condition.
+        if serverless_target.is_none() {
+            let Some(target) = store.cluster_with_namespace_arn(&input.target_arn) else {
+                return Err(
+                    CreateIntegrationErrorModeled::IntegrationTargetNotFoundFault(
+                        IntegrationTargetNotFoundFault {
+                            message: Some(st::integration_target_not_found_message(
+                                &input.target_arn,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            if target.cluster.cluster_status.as_deref() != Some(st::STATUS_AVAILABLE) {
+                return Err(CreateIntegrationErrorModeled::InvalidClusterStateFault(
+                    InvalidClusterStateFault {
                         message: Some(format!(
-                            "Integration target not found: {}",
-                            input.target_arn
+                            "Cluster {} is not in the available state.",
+                            target
+                                .cluster
+                                .cluster_identifier
+                                .clone()
+                                .unwrap_or_default()
                         )),
                     },
                 )
-                .into(),
-            );
-        };
-        if target.cluster.cluster_status.as_deref() != Some(st::STATUS_AVAILABLE) {
-            return Err(CreateIntegrationErrorModeled::InvalidClusterStateFault(
-                InvalidClusterStateFault {
-                    message: Some(format!(
-                        "Cluster {} is not in the available state.",
-                        target
-                            .cluster
-                            .cluster_identifier
-                            .clone()
-                            .unwrap_or_default()
-                    )),
-                },
-            )
-            .into());
+                .into());
+            }
         }
 
         // The record every later `DescribeIntegrations` reports verbatim: the
