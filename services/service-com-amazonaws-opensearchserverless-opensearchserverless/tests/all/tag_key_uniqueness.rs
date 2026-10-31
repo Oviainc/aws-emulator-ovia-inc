@@ -29,7 +29,7 @@ use crate::collection_lifecycle::{at, call, emulator, text, CLIENT_ERROR};
 
 /// The error code every refusal below carries
 /// (`smithy_query(query="shape", shape="ValidationException")`).
-const VALIDATION: &str = "ValidationException";
+pub(crate) const VALIDATION: &str = "ValidationException";
 
 /// `TagKey`'s modelled maximum length (`smithy_query(query="shape", shape="TagKeys")` ->
 /// the member's `length.max`), so the longest key the boundary admits is exercised too.
@@ -38,7 +38,7 @@ const MAX_TAG_KEY_LENGTH: usize = 128;
 /// The refusal this service words for a tagging member that names `key` twice: the clause
 /// its boundary validator renders for a repeated element of a list, at the member that
 /// carried it.
-fn repeated_key_message(member: &str, key: &str) -> String {
+pub(crate) fn repeated_key_message(member: &str, key: &str) -> String {
     format!(
         "1 validation error detected: Value '{key}' at '{member}' failed to satisfy \
          constraint: Member must have unique values"
@@ -67,7 +67,10 @@ struct RepeatCase {
 
 /// Create a collection encrypted with the AWS-owned key and answer its
 /// `createCollectionDetail`.
-async fn create_collection(router: &smithy_server_runtime::MultiServiceRouter, body: Value) -> Value {
+pub(crate) async fn create_collection(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    body: Value,
+) -> Value {
     let case = body.to_string();
     let (status, code, answer) = call(router, "CreateCollection", body).await;
     assert_eq!(
@@ -78,7 +81,7 @@ async fn create_collection(router: &smithy_server_runtime::MultiServiceRouter, b
 }
 
 /// The tags `ListTagsForResource` reports for `arn`, sorted by key.
-async fn listed_tags(
+pub(crate) async fn listed_tags(
     router: &smithy_server_runtime::MultiServiceRouter,
     arn: &str,
 ) -> Vec<(String, String)> {

@@ -79,6 +79,8 @@ mod security_policy_listing;
 mod state_roundtrip;
 #[path = "all/tag_key_uniqueness.rs"]
 mod tag_key_uniqueness;
+#[path = "all/tag_key_uniqueness_precedence.rs"]
+mod tag_key_uniqueness_precedence;
 #[path = "all/tag_write_timestamps.rs"]
 mod tag_write_timestamps;
 #[path = "all/tagging_plane_resource_kinds.rs"]
