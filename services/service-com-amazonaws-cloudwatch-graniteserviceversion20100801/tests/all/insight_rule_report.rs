@@ -795,9 +795,9 @@ async fn each_filter_operation_admits_exactly_the_events_it_names() {
 #[tokio::test]
 async fn the_series_holds_one_ascending_datapoint_per_period_of_the_window() {
     // Rows differ along the period the datapoints are aggregated over and how many periods the
-    // observations span, including the one-second period the model's lower bound allows. The
-    // last column names the periods that hold an observation — every OTHER period of the window
-    // is reported too, at zero.
+    // observations span, including the narrowest period a report may be asked at and the widest
+    // the window can carry. The last column names the periods that hold an observation — every
+    // OTHER period of the window is reported too, at zero.
     const WINDOW_SECS: i64 = 3_600;
     let cases: Vec<(&str, i64, Vec<i64>, Vec<i64>)> = vec![
         (
@@ -813,10 +813,10 @@ async fn the_series_holds_one_ascending_datapoint_per_period_of_the_window() {
             vec![0],
         ),
         (
-            "a one-second period, the narrowest the model allows",
-            1,
+            "an hour-long period, the widest this window spans",
+            3_600,
             vec![0, 1, 1, 4],
-            vec![0, 1, 4],
+            vec![0],
         ),
         (
             "periods with no observation between the ones that hold them",
@@ -1191,8 +1191,8 @@ async fn a_window_shorter_than_one_period_is_refused() {
     given_rule(&router, "window-rule", &definition(json!({})), None).await;
 
     // Rows differ along how the window relates to the period: shorter than one period, exactly
-    // one period, longer, zero-length and reversed — on the narrowest period the model allows
-    // as well as on wider ones.
+    // one period, longer, zero-length and reversed — on the narrowest period a report may be
+    // asked at as well as on wider ones.
     let cases: Vec<(&str, i64, i64, bool)> = vec![
         ("exactly one period", 60, 60, true),
         ("two periods", 60, 120, true),
@@ -1200,14 +1200,14 @@ async fn a_window_shorter_than_one_period_is_refused() {
         ("one second of a one-minute period", 60, 1, false),
         ("a zero-length window", 60, 0, false),
         ("a reversed window", 60, -60, false),
-        ("exactly the narrowest period", 1, 1, true),
-        ("shorter than the narrowest period", 1, 0, false),
+        ("exactly the widest period a report may be asked at", 86_400, 86_400, true),
+        ("a second short of that widest period", 86_400, 86_399, false),
         ("exactly one ten-minute period", 600, 600, true),
         ("nine minutes of a ten-minute period", 600, 540, false),
         // The other end of the same ratio: a window spanning more periods than one report
         // carries is refused, and the same window at a period that fits is served.
-        ("a window spanning more periods than one report carries", 1, 200_000, false),
-        ("the same window at a period that fits it", 60, 200_000, true),
+        ("a window spanning more periods than one report carries", 60, 6_100_000, false),
+        ("the same window at a period that fits it", 3_600, 6_100_000, true),
     ];
     for (case, period, window_secs, expected_ok) in cases {
         let (status, body) = call(
@@ -1480,7 +1480,7 @@ async fn a_report_never_changes_what_a_later_caller_sees() {
     for (period, window, order_by) in [
         (60, 60, "Sum"),
         (60, 3_600, "Maximum"),
-        (1, 1, "Sum"),
+        (86_400, 86_400, "Sum"),
         (600, 1_200, "Maximum"),
     ] {
         let mut request = report_request("read-only-rule", period, window, &["SampleCount"]);

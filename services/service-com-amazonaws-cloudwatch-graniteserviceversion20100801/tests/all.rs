@@ -93,6 +93,8 @@ mod harness;
 mod insight_rule_batch_failures;
 #[path = "all/insight_rule_report.rs"]
 mod insight_rule_report;
+#[path = "all/insight_rule_report_period_and_aggregate.rs"]
+mod insight_rule_report_period_and_aggregate;
 #[path = "all/insight_rule_state.rs"]
 mod insight_rule_state;
 #[path = "all/insight_rule_wire_shapes.rs"]

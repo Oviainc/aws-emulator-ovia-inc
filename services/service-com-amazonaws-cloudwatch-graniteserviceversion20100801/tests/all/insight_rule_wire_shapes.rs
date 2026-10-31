@@ -310,8 +310,8 @@ async fn a_report_names_its_aggregation_by_the_statistic_that_aggregation_comput
 async fn the_series_spans_every_period_of_the_window_asked_about() {
     // Rows differ along the period the datapoints are aggregated over, how many periods the
     // window spans, and which statistics the request asks for — one period, the twelve a
-    // five-minute period spans an hour in, an hour of one-minute periods, and the one-second
-    // period the model's lower bound allows.
+    // five-minute period spans an hour in, an hour of one-minute periods, and the widest period
+    // a report may be asked at.
     let cases: Vec<(&str, i64, i64, Vec<&str>)> = vec![
         ("one period, one statistic", 60, 60, vec!["UniqueContributors"]),
         ("twelve five-minute periods of an hour", 300, 3_600, vec!["UniqueContributors"]),
@@ -330,7 +330,7 @@ async fn the_series_spans_every_period_of_the_window_asked_about() {
                 "Average",
             ],
         ),
-        ("the narrowest period the model allows", 1, 10, vec!["SampleCount"]),
+        ("the widest period a report may be asked at", 86_400, 172_800, vec!["SampleCount"]),
     ];
     for (index, (case, period, window_secs, metrics)) in cases.into_iter().enumerate() {
         // The idle rule: a window of periods none of which holds an observation.
@@ -427,7 +427,7 @@ async fn a_window_that_is_not_period_aligned_opens_on_the_period_it_starts_in() 
         ("a window starting half a period in", 30, 60, 120),
         ("a window starting one second before the next period", 59, 60, 60),
         ("a window starting one second into a five-minute period", 1, 300, 600),
-        ("a window starting inside the narrowest period", 7, 1, 10),
+        ("a window starting inside the narrowest period a report allows", 7, 60, 120),
     ] {
         let start_secs = ANCHOR_SECS + offset_secs;
         let end_secs = start_secs + window_secs;

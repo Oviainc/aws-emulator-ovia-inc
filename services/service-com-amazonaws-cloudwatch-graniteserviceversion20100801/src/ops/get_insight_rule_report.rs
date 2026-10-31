@@ -211,6 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every value below is prose the model carries no constraint for, so the request
         // reaches this handler having satisfied the modelled ones already: `RuleName`'s
         // 1..128 length and pattern, `Period`'s 1.. range, and `OrderBy`'s 1..32 length.
+        //
+        // Judged BEFORE the rule is resolved: a value no report could be computed for is a
+        // fault in the request itself, whichever rule it names, so a request carrying one is
+        // refused for that value rather than for the rule the name does or does not address.
         let request = report_request(&input)?;
 
         let store = state.lock();
@@ -259,6 +263,10 @@ fn invalid_parameter_value(message: String) -> GetInsightRuleReportError {
 /// What this request asks the rule's observations for, or the refusal of a value no report can
 /// be computed for.
 ///
+/// The `Period` has to be a granularity the rule's contributor data is folded at
+/// ([`crate::state::insight_rule_period_error`]), which is judged first: every value below is
+/// measured in periods of it.
+///
 /// The window is `[StartTime, EndTime)` and has to span at least one whole `Period`: a report
 /// is a series of `Period`-wide datapoints, so a shorter window holds none. It must also not
 /// span more periods than one report carries
@@ -266,6 +274,15 @@ fn invalid_parameter_value(message: String) -> GetInsightRuleReportError {
 fn report_request(
     input: &GetInsightRuleReportInput,
 ) -> Result<insight_rules::ReportRequest, GetInsightRuleReportError> {
+    // "The period, in seconds, to use for the statistics in the InsightRuleMetricDatapoint
+    // results." (`GetInsightRuleReportInput$Period`) — the granularities the rule's contributor
+    // data is folded at, which the model states only as `range 1..`
+    // ([`crate::state::insight_rule_period_error`]). Held FIRST, so the period the window is
+    // measured in periods of is one the report could be aggregated at at all.
+    if let Some(refusal) = crate::state::insight_rule_period_error(input.period) {
+        return Err(invalid_parameter_value(refusal));
+    }
+
     let start_secs = crate::state::from_timestamp(&input.start_time);
     let end_secs = crate::state::from_timestamp(&input.end_time);
     // Held at one second here rather than relying on the model's `range 1..`, so nothing below

@@ -2453,6 +2453,43 @@ fn unknown_insight_rule_failure(rule_name: &str) -> PartialFailure {
 /// for `RuleNames` rather than as a change it applied to nothing.
 pub const EMPTY_RULE_NAMES: &str = "EMPTY_RULE_NAMES: RuleNames cannot be an empty array.";
 
+/// The granularity a Contributor Insights rule's contributor data is aggregated at, and so the
+/// step every `Period` a report may be asked at is a multiple of: one minute.
+///
+/// A rule folds the log events its groups receive into per-minute contributor data, so the
+/// `Period` a report's datapoints are aggregated over ("The period, in seconds, to use for the
+/// statistics in the InsightRuleMetricDatapoint results.",
+/// `GetInsightRuleReportInput$Period`) is a whole number of minutes: there is no finer fold to
+/// report from.
+pub const INSIGHT_RULE_PERIOD_STEP_SECS: i32 = 60;
+
+/// The widest `Period` a Contributor Insights report may be asked at: one day, the span
+/// Contributor Insights keeps a rule's contributor data over. See
+/// [`INSIGHT_RULE_PERIOD_STEP_SECS`].
+pub const MAX_INSIGHT_RULE_PERIOD_SECS: i32 = 86_400;
+
+/// Why `period` is not a granularity a Contributor Insights report can be aggregated at, or
+/// `None` when it is.
+///
+/// The `Period` member is modelled only as `range 1..`, so the granularities Contributor
+/// Insights actually folds its contributor data at are held here: a multiple of
+/// [`INSIGHT_RULE_PERIOD_STEP_SECS`], from that step up to
+/// [`MAX_INSIGHT_RULE_PERIOD_SECS`]. The refusal names the condition by its CODE and states
+/// the whole accepted set, the way this service's other Contributor Insights refusals do
+/// ([`EMPTY_RULE_NAMES`]), and carries nothing of the value that was asked for.
+#[must_use]
+pub fn insight_rule_period_error(period: i32) -> Option<String> {
+    let aggregatable = (INSIGHT_RULE_PERIOD_STEP_SECS..=MAX_INSIGHT_RULE_PERIOD_SECS)
+        .contains(&period)
+        && period % INSIGHT_RULE_PERIOD_STEP_SECS == 0;
+    (!aggregatable).then(|| {
+        format!(
+            "INVALID_PERIOD: A Period must be a multiple of {INSIGHT_RULE_PERIOD_STEP_SECS} \
+             seconds, from {INSIGHT_RULE_PERIOD_STEP_SECS} to {MAX_INSIGHT_RULE_PERIOD_SECS}."
+        )
+    })
+}
+
 /// How CloudWatch states the same thing for the operations that MOVE a rule's state
 /// (`EnableInsightRules`, `DisableInsightRules`).
 ///

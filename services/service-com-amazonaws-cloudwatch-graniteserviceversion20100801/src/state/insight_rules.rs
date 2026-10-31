@@ -23,7 +23,8 @@
 //! Reporting is then pure ([`report`]): the observations inside the requested window are
 //! bucketed into `Period`-wide datapoints anchored at multiples of the period, which is what
 //! makes the series a report answers with strictly ascending in `Timestamp` with no instant
-//! repeated, and grouped by contributor for the ranking the request asks for. The series spans
+//! repeated, and grouped by contributor and aggregated by the statistic the request ranks them
+//! by — their total over the window, or the largest value any one period of it holds for them. The series spans
 //! every period of the window, so a period that holds no observation is reported with each
 //! statistic asked for at zero rather than left out. A report reads; it never changes what a
 //! later caller sees.
@@ -606,8 +607,9 @@ pub struct ReportRequest {
     pub period_secs: i64,
     /// How many contributors the report carries at most.
     pub max_contributors: usize,
-    /// Rank the contributors by the largest value any one period of the window holds for
-    /// them, rather than by their aggregate over the whole window ([`ORDER_BY`]).
+    /// Aggregate and rank each contributor by the largest value any one period of the window
+    /// holds for it, rather than by its total over the whole window ([`ORDER_BY`],
+    /// [`contributor_aggregate`]).
     pub order_by_maximum: bool,
     /// The statistics each datapoint reports ([`INSIGHT_RULE_METRICS`]); a report asked for
     /// none carries no series, since there would be nothing in it to read.
@@ -631,7 +633,8 @@ pub struct InsightReport {
     /// period." (`GetInsightRuleReportOutput$ApproximateUniqueCount`) — every contributor the
     /// window holds, not only the ones the report carries.
     pub approximate_unique_count: i64,
-    /// The top contributors, ranked as the request asked and cut to the number it asked for.
+    /// The top contributors, each carrying the aggregate the request's ranking statistic comes
+    /// to for it, ranked by it and cut to the number the request asked for.
     pub contributors: Vec<InsightRuleContributor>,
     /// The time series of per-period aggregates, ascending by timestamp.
     pub metric_datapoints: Vec<InsightRuleMetricDatapoint>,
@@ -714,8 +717,9 @@ pub fn report(rule: &StoredInsightRule, request: &ReportRequest) -> InsightRepor
     }
 }
 
-/// The contributors the report carries: ranked by the statistic the request names, and cut to
-/// the number it asked for.
+/// The contributors the report carries: each with the aggregate the request's ranking statistic
+/// comes to for it ([`contributor_aggregate`]), ranked by that aggregate and cut to the number
+/// the request asked for.
 ///
 /// Contributors that rank equally are ordered by their keys, so two reports of the same window
 /// list them in the same order rather than in whichever order the walk happened to take.
@@ -725,15 +729,7 @@ fn ranked_contributors(
 ) -> Vec<InsightRuleContributor> {
     let mut ranked: Vec<(f64, &Vec<String>, &BTreeMap<i64, f64>)> = contributors
         .iter()
-        .map(|(keys, datapoints)| {
-            let total: f64 = datapoints.values().sum();
-            let rank = if request.order_by_maximum {
-                datapoints.values().copied().fold(f64::MIN, f64::max)
-            } else {
-                total
-            };
-            (rank, keys, datapoints)
-        })
+        .map(|(keys, datapoints)| (contributor_aggregate(datapoints, request), keys, datapoints))
         .collect();
     // Descending by rank — the top contributor first — and by keys within one rank, which the
     // source map already holds them in.
@@ -741,9 +737,9 @@ fn ranked_contributors(
     ranked.truncate(request.max_contributors);
     ranked
         .into_iter()
-        .map(|(_, keys, datapoints)| InsightRuleContributor {
+        .map(|(aggregate, keys, datapoints)| InsightRuleContributor {
             keys: keys.clone(),
-            approximate_aggregate_value: datapoints.values().sum(),
+            approximate_aggregate_value: aggregate,
             datapoints: datapoints
                 .iter()
                 .map(|(bucket, value)| InsightRuleContributorDatapoint {
@@ -754,6 +750,27 @@ fn ranked_contributors(
                 .collect(),
         })
         .collect()
+}
+
+/// What the request's ranking statistic aggregates one contributor's per-period values to: the
+/// total over the whole window under `Sum`, and the largest value the contributor reached in
+/// any ONE period under `Maximum` ([`ORDER_BY`]).
+///
+/// This is both the value the contributor is RANKED by and the one the report states for it —
+/// "an approximation of the aggregate value that comes from this contributor"
+/// (`InsightRuleContributor$ApproximateAggregateValue`): the aggregate a report reports is the
+/// one the statistic it was asked to rank by computes, which is what lets the two rankings
+/// disagree — a contributor with the larger window total may hold the smaller single-period
+/// peak, so it ranks below a spikier one under `Maximum` and above it under `Sum`.
+fn contributor_aggregate(datapoints: &BTreeMap<i64, f64>, request: &ReportRequest) -> f64 {
+    if request.order_by_maximum {
+        // A contributor's value may be negative, so this is the largest of the periods it
+        // appears in rather than the largest of those and zero; a contributor the report
+        // carries appears in at least one.
+        datapoints.values().copied().reduce(f64::max).unwrap_or(0.0)
+    } else {
+        datapoints.values().sum()
+    }
 }
 
 /// The series the report carries: one datapoint per `Period` of the window, ascending by
