@@ -23,6 +23,8 @@ mod channel_deletion;
 mod channel_lifecycle;
 #[path = "all/client_vpc_connection_listing.rs"]
 mod client_vpc_connection_listing;
+#[path = "all/cluster_arn_refusal.rs"]
+mod cluster_arn_refusal;
 #[path = "all/cluster_authorization.rs"]
 mod cluster_authorization;
 #[path = "all/cluster_configuration_update.rs"]

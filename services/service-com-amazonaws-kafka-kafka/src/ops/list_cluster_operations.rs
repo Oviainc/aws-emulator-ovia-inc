@@ -237,16 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
-            return Err(
-                ListClusterOperationsErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK cluster ARN.",
-                        input.cluster_arn
-                    )),
-                })
-                .into(),
-            );
+            return Err(ListClusterOperationsErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
         }
 
         // A token names the history key the previous page stopped at; the next

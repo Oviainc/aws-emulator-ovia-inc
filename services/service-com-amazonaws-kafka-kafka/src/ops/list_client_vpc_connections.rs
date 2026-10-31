@@ -217,16 +217,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The shape check depends on the request alone, so it runs before the
         // state lock is taken: a value that is not a cluster ARN is a request
-        // this reader cannot act on, which every cluster reader refuses the same
-        // way.
+        // this reader cannot act on. This surface answers the
+        // cluster-ARN-specific wording for it rather than the generic parameter
+        // sentence.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
-            return Err(bad_request(
-                "ClusterArn",
-                format!(
-                    "{} is not a valid Amazon MSK cluster ARN.",
-                    input.cluster_arn
-                ),
-            ));
+            return Err(ListClientVpcConnectionsErrorModeled::BadRequestException(
+                crate::state::invalid_cluster_arn(),
+            )
+            .into());
         }
 
         // Absent `MaxResults` pages at the largest size the model allows, and no

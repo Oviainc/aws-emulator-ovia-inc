@@ -29,7 +29,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kafka_kafka::state::{
-    OPERATION_STATE_COMPLETE, OPERATION_STATE_IN_PROGRESS,
+    BAD_REQUEST_MESSAGE, CLUSTER_ARN_MEMBER, OPERATION_STATE_COMPLETE, OPERATION_STATE_IN_PROGRESS,
     OPERATION_TYPE_UPDATE_CLUSTER_CONFIGURATION, PROVISIONED_ONLY_MESSAGE,
     RESOURCE_NOT_FOUND_MESSAGE,
 };
@@ -547,10 +547,19 @@ async fn the_cluster_is_resolved_before_the_body() {
                 reply.status,
                 reply.body
             );
+            // A malformed ARN names the member by its WIRE name, with the
+            // service's one fixed parameter sentence; the not-found refusal of a
+            // well-formed ARN is a different condition, so it keeps its own
+            // wording and token.
+            let member = if expected == 404 {
+                "ClusterArn"
+            } else {
+                CLUSTER_ARN_MEMBER
+            };
             assert_eq!(
                 reply.at("/invalidParameter").as_str(),
-                Some("ClusterArn"),
-                "case {case}: the refusal must name ClusterArn, got {}",
+                Some(member),
+                "case {case}: the refusal must name {member}, got {}",
                 reply.body
             );
             if expected == 404 {
@@ -558,6 +567,13 @@ async fn the_cluster_is_resolved_before_the_body() {
                     reply.error_message(),
                     RESOURCE_NOT_FOUND_MESSAGE,
                     "case {case}: expected the service's not-found wording, got {:?}",
+                    reply.error_message()
+                );
+            } else {
+                assert_eq!(
+                    reply.error_message(),
+                    BAD_REQUEST_MESSAGE,
+                    "case {case}: expected the fixed parameter sentence, got {:?}",
                     reply.error_message()
                 );
             }

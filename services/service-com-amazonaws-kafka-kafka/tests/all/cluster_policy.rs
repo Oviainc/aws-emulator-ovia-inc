@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 // The service's own refusal wordings, so the suite and the handlers cannot drift
 // apart on what the service says.
 use service_com_amazonaws_kafka_kafka::state::{
-    BAD_REQUEST_MESSAGE, MAX_CLUSTER_POLICY_BYTES, RESOURCE_NOT_FOUND_MESSAGE,
+    BAD_REQUEST_MESSAGE, CLUSTER_ARN_MEMBER, MAX_CLUSTER_POLICY_BYTES, RESOURCE_NOT_FOUND_MESSAGE,
 };
 
 // The router harness, the signing region, the account id and the URI encoder
@@ -105,7 +105,8 @@ fn assert_policy_not_found(reply: &Reply, case: &str) {
 }
 
 /// Assert `reply` is the refusal the service answers a value that is not a
-/// cluster ARN at all: HTTP 400 `BadRequestException` naming `ClusterArn`.
+/// cluster ARN at all: HTTP 400 `BadRequestException` carrying the service's one
+/// fixed parameter sentence and naming the cluster-ARN member by its wire name.
 fn assert_not_a_cluster_arn(reply: &Reply, case: &str) {
     assert_eq!(
         (reply.status, reply.error_code()),
@@ -116,8 +117,14 @@ fn assert_not_a_cluster_arn(reply: &Reply, case: &str) {
     );
     assert_eq!(
         reply.at("/invalidParameter").as_str(),
-        Some("ClusterArn"),
-        "case {case}: the refusal must name ClusterArn as the parameter at fault, got {}",
+        Some(CLUSTER_ARN_MEMBER),
+        "case {case}: the refusal must name {CLUSTER_ARN_MEMBER} as the parameter at fault, got {}",
+        reply.body
+    );
+    assert_eq!(
+        reply.error_message(),
+        BAD_REQUEST_MESSAGE,
+        "case {case}: expected the fixed parameter sentence, got {}",
         reply.body
     );
 }

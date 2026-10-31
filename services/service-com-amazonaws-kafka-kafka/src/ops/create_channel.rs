@@ -204,16 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Request-only checks first: they depend on nothing in the registry, so
         // the state lock below is held only for the state-dependent work.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
-            return Err(
-                CreateChannelErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK cluster ARN.",
-                        input.cluster_arn
-                    )),
-                })
-                .into(),
-            );
+            return Err(CreateChannelErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
         }
         // "Currently exactly one topic must be specified" — the model's own
         // documentation of this member.

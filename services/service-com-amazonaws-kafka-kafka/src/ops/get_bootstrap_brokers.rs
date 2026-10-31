@@ -206,13 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it runs before the state lock is taken.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
             return Err(GetBootstrapBrokersErrorModeled::BadRequestException(
-                BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK cluster ARN.",
-                        input.cluster_arn
-                    )),
-                },
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
             )
             .into());
         }

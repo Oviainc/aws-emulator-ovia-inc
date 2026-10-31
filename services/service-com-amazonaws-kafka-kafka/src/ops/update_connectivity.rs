@@ -194,16 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reader in this crate draws between `BadRequestException` and
         // `NotFoundException`.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
-            return Err(
-                UpdateConnectivityErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK cluster ARN.",
-                        input.cluster_arn
-                    )),
-                })
-                .into(),
-            );
+            return Err(UpdateConnectivityErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
         }
 
         // Both members the operation can change are optional in the model, so a

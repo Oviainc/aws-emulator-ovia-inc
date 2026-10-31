@@ -165,16 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `serde_json`, which bounds its own nesting depth, rather than by a
         // hand-rolled walk over caller text.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
-            return Err(
-                PutClusterPolicyErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK cluster ARN.",
-                        input.cluster_arn
-                    )),
-                })
-                .into(),
-            );
+            return Err(PutClusterPolicyErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
         }
         // `Policy` is stored verbatim as the cluster's policy, so the document
         // this emulator will keep for one cluster is bounded here. Checked

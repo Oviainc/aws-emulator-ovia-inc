@@ -194,13 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Request-only checks run first, before the registry lock is taken: none of
         // them depends on stored state.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
-            return Err(bad_request(
-                "ClusterArn",
-                format!(
-                    "{} is not a valid Amazon MSK cluster ARN.",
-                    input.cluster_arn
-                ),
-            ));
+            return Err(UpdateBrokerStorageErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
         }
 
         // ALL means every broker, so one entry describes the whole update and a

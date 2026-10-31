@@ -157,16 +157,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // all is a request the service cannot act on, and `NotFoundException` is
         // reserved for a well-formed ARN whose policy it cannot find.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
-            return Err(
-                DeleteClusterPolicyErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK cluster ARN.",
-                        input.cluster_arn
-                    )),
-                })
-                .into(),
-            );
+            return Err(DeleteClusterPolicyErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
         }
         let mut state = state.lock();
         // Resolved through the settling lookup, as every operation that reaches

@@ -232,16 +232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Request-only checks first, so the registry mutex below is held for the
         // state-dependent work alone.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
-            return Err(
-                CreateTopicErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK cluster ARN.",
-                        input.cluster_arn
-                    )),
-                })
-                .into(),
-            );
+            return Err(CreateTopicErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
         }
         if let Some(reason) = crate::state::topic_name_error(&input.topic_name) {
             return Err(

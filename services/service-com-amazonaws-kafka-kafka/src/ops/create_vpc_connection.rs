@@ -183,13 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `NotFoundException`, so every unusable request member — including a
         // target cluster that does not exist — is refused as a bad request.
         if !crate::state::is_cluster_arn(&input.target_cluster_arn) {
-            return Err(bad_request(
-                "TargetClusterArn",
-                format!(
-                    "{} is not a valid Amazon MSK cluster ARN.",
-                    input.target_cluster_arn
-                ),
-            ));
+            return Err(CreateVpcConnectionErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::TARGET_CLUSTER_ARN_MEMBER),
+            )
+            .into());
         }
         let authentication_types = crate::state::VPC_CONNECTION_AUTHENTICATION_TYPES;
         if !authentication_types.contains(&input.authentication.as_str()) {

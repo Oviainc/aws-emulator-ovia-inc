@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 
 use serde_json::json;
 use service_com_amazonaws_kafka_kafka::state::{
-    MAX_RESULTS_LIMIT, VPC_CONNECTION_AUTHENTICATION_TYPES,
+    CLUSTER_ARN_MEMBER, MAX_RESULTS_LIMIT, VPC_CONNECTION_AUTHENTICATION_TYPES,
 };
 
 use crate::kafka_harness::{
@@ -568,8 +568,8 @@ async fn a_deleted_connection_leaves_the_listing() {
 
 /// RULE: a `ClusterArn` that is not a cluster ARN of this service, and a
 /// well-formed one this Region holds no cluster for, are refused as a bad
-/// request naming `ClusterArn` — this operation models no not-found error — and
-/// so is a `NextToken` it did not mint for this cluster.
+/// request naming the cluster-ARN member — this operation models no not-found
+/// error — and so is a `NextToken` it did not mint for this cluster.
 #[tokio::test]
 async fn an_unresolvable_request_is_refused() {
     let emulator = Emulator::new();
@@ -604,13 +604,13 @@ async fn an_unresolvable_request_is_refused() {
             "not an ARN at all",
             "client-refusals".to_string(),
             String::new(),
-            "ClusterArn",
+            CLUSTER_ARN_MEMBER,
         ),
         (
             "an ARN of another service",
             format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0a1b2c3d"),
             String::new(),
-            "ClusterArn",
+            CLUSTER_ARN_MEMBER,
         ),
         (
             "a VPC-connection ARN of this service",
@@ -619,7 +619,7 @@ async fn an_unresolvable_request_is_refused() {
                  11111111-2222-3333-4444-555555555555-1"
             ),
             String::new(),
-            "ClusterArn",
+            CLUSTER_ARN_MEMBER,
         ),
         (
             "a well-formed cluster ARN no cluster holds",

@@ -185,12 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::authorization::authorize_operation(Self::NAME, cluster_arn)?;
                 if !crate::state::is_cluster_arn(cluster_arn) {
                     return Err(GetCompatibleKafkaVersionsErrorModeled::BadRequestException(
-                        BadRequestException {
-                            invalid_parameter: Some("ClusterArn".to_string()),
-                            message: Some(format!(
-                                "{cluster_arn} is not a valid Amazon MSK cluster ARN."
-                            )),
-                        },
+                        crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
                     )
                     .into());
                 }

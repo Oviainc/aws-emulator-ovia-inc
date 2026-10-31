@@ -210,16 +210,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot act on; `NotFoundException` is reserved for a well-formed ARN
         // this endpoint holds no cluster for.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
-            return Err(
-                ListScramSecretsErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK cluster ARN.",
-                        input.cluster_arn
-                    )),
-                })
-                .into(),
-            );
+            return Err(ListScramSecretsErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
         }
 
         // A token names the secret the previous page stopped at; the next page

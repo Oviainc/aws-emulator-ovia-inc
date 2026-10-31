@@ -169,13 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         if !crate::state::is_cluster_operation_arn(&input.cluster_operation_arn) {
             return Err(DescribeClusterOperationErrorModeled::BadRequestException(
-                BadRequestException {
-                    invalid_parameter: Some("ClusterOperationArn".to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK cluster operation ARN.",
-                        input.cluster_operation_arn
-                    )),
-                },
+                crate::state::malformed_arn(crate::state::CLUSTER_OPERATION_ARN_MEMBER),
             )
             .into());
         }

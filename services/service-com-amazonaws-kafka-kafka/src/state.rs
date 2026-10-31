@@ -639,7 +639,9 @@ const PORT_ZOOKEEPER_TLS: u16 = 2182;
 
 /// The message Amazon MSK answers a parameter it cannot parse with: its
 /// `BadRequestException` carries one fixed, request-independent sentence rather
-/// than a description of the offending value.
+/// than a description of the offending value. The generic one of the service's
+/// fixed sentences; a few surfaces answer a more specific one for a cluster ARN
+/// ([`CLUSTER_ARN_NOT_VALID_MESSAGE`]).
 pub const BAD_REQUEST_MESSAGE: &str = "One or more of the parameters are not valid.";
 
 /// The default for `EncryptionInTransit$ClientBroker`, per that member's model
@@ -6737,6 +6739,71 @@ fn resource_type_of_arn(value: &str) -> Result<&str, TagTargetRejected> {
 /// service draws between a request it cannot parse and a resource it cannot find.
 pub fn is_cluster_arn(value: &str) -> bool {
     is_kafka_arn_for(value, "cluster")
+}
+
+/// The input member the cluster-scoped operations carry their cluster's ARN in,
+/// named as the API documents it on the wire — the camelCase spelling the
+/// request itself uses, not the Smithy structure member's identifier. What those
+/// operations' refusals report as the parameter at fault, beside
+/// [`REPLICATOR_ARN_MEMBER`].
+pub const CLUSTER_ARN_MEMBER: &str = "clusterArn";
+
+/// The member `CreateVpcConnection` carries the cluster's ARN in, under the same
+/// rule: that operation names the cluster it connects to `TargetClusterArn`, so
+/// its refusal reports that member's wire name rather than the one every
+/// cluster-scoped operation binds.
+pub const TARGET_CLUSTER_ARN_MEMBER: &str = "targetClusterArn";
+
+/// The member the readers of one cluster OPERATION carry their target's ARN in,
+/// named the same way.
+pub const CLUSTER_OPERATION_ARN_MEMBER: &str = "clusterOperationArn";
+
+/// The cluster-ARN-SPECIFIC refusal wording, which the SCRAM-secret surface and
+/// the client-VPC-connection listing answer a cluster ARN they cannot parse with
+/// instead of the generic [`BAD_REQUEST_MESSAGE`] (the apostrophe is U+2019, as
+/// the service writes it).
+///
+/// Fixed text end to end, like the generic one: the offending value is not part
+/// of it. Which of the two an operation answers is the operation's, so the two
+/// are named separately here rather than evened out — a caller of one surface is
+/// told what that surface tells callers.
+pub const CLUSTER_ARN_NOT_VALID_MESSAGE: &str =
+    "The specified cluster ARN isn\u{2019}t valid. Specify a valid cluster ARN, and try again.";
+
+/// The refusal an operation answers a value that is not shaped like the kind of
+/// ARN the member naming it carries ([`is_cluster_arn`],
+/// [`is_cluster_operation_arn`]): a `BadRequestException` (HTTP 400) whose
+/// message is the service's generic parameter sentence
+/// ([`BAD_REQUEST_MESSAGE`]) — the WHOLE text, with no part taken from the
+/// request, so two calls carrying different unusable values are told the same
+/// thing and the offending value is never echoed back — and which names the
+/// member at fault in `invalidParameter`, by its wire name
+/// ([`CLUSTER_ARN_MEMBER`], [`TARGET_CLUSTER_ARN_MEMBER`],
+/// [`CLUSTER_OPERATION_ARN_MEMBER`]).
+///
+/// Built HERE rather than beside each shape check, so no handler composes a
+/// sentence of its own around the ARN it was handed: one condition, one
+/// envelope, whichever operation met it.
+pub fn malformed_arn(member: &str) -> BadRequestException {
+    parameter_refusal(member, BAD_REQUEST_MESSAGE)
+}
+
+/// The same refusal for the surfaces that answer the cluster-ARN-specific
+/// wording ([`CLUSTER_ARN_NOT_VALID_MESSAGE`]): the member at fault is the
+/// cluster's own ARN, which is what that sentence is about.
+pub fn invalid_cluster_arn() -> BadRequestException {
+    parameter_refusal(CLUSTER_ARN_MEMBER, CLUSTER_ARN_NOT_VALID_MESSAGE)
+}
+
+/// One `BadRequestException` naming a request member and carrying one of the
+/// service's fixed sentences, so the two refusals above cannot drift apart on
+/// how a parameter is named or on the fact that the message carries nothing of
+/// the request.
+fn parameter_refusal(member: &str, message: &str) -> BadRequestException {
+    BadRequestException {
+        invalid_parameter: Some(member.to_string()),
+        message: Some(message.to_string()),
+    }
 }
 
 /// Whether `value` is shaped like an MSK replicator ARN —

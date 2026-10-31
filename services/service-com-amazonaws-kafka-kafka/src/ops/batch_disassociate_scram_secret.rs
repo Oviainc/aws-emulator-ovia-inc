@@ -184,20 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The same line between the two client errors the association draws: a
         // value that is not a cluster ARN at all is a request the service cannot
         // act on, and `NotFoundException` is reserved for a well-formed ARN this
-        // endpoint holds no cluster for.
+        // endpoint holds no cluster for. The SCRAM surface answers the
+        // cluster-ARN-specific wording for it rather than the generic parameter
+        // sentence.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
-            return Err(
-                BatchDisassociateScramSecretErrorModeled::BadRequestException(
-                    BadRequestException {
-                        invalid_parameter: Some("ClusterArn".to_string()),
-                        message: Some(format!(
-                            "{} is not a valid Amazon MSK cluster ARN.",
-                            input.cluster_arn
-                        )),
-                    },
-                )
-                .into(),
-            );
+            return Err(BatchDisassociateScramSecretErrorModeled::BadRequestException(
+                crate::state::invalid_cluster_arn(),
+            )
+            .into());
         }
 
         // Every entry must name a Secrets Manager secret, as it must to be

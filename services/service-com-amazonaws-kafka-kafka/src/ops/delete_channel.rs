@@ -190,16 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // order: a value that is not an ARN of the kind the member names is a
         // request the service cannot act on, whatever the registry holds.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
-            return Err(
-                DeleteChannelErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK cluster ARN.",
-                        input.cluster_arn
-                    )),
-                })
-                .into(),
-            );
+            return Err(DeleteChannelErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
         }
         if !crate::state::is_channel_arn(&input.channel_arn) {
             return Err(
