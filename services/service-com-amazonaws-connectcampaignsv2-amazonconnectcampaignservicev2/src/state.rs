@@ -488,6 +488,20 @@ pub fn communication_time_violation(
 // member, and the walk's `ValidatingSerializer` over the one union member that is a
 // bare string. Same rules and same wording as the boundary, so no record can come to
 // hold — and no read project — an ARN the model's own shape forbids.
+//
+// `ChannelSubtypeConfig` is the union-borne case that rule settles with NO check here,
+// which is why no helper for it stands beside the ones above: every member of the four
+// `outboundMode` unions, and of the `PacingStrategy` union one level deeper, is a
+// STRUCTURE carrying no constraint trait on the union member itself, so the centralized
+// walk descends to every leaf behind them — the bandwidth-allocation, target-rate and
+// timeout ranges, the pacing-strategy list's `@length`, the agent-action and
+// connection-start-point catalogs, the evaluation window's `@pattern` and the
+// `@required` members at each depth — and the operations that accept such a config
+// (`CreateCampaign`, `UpdateCampaignChannelSubtypeConfig`) are handed one already
+// checked. `tests/all/channel_subtype_config_is_one_rule.rs` pins that end to end
+// through both of them, so a codegen change that stopped descending past a union
+// member fails there rather than letting a campaign come to hold a config the model's
+// own shape forbids.
 
 /// The modelled `Arn` rules, from `smithy_query(query="shape", shape="Arn")`:
 /// `@length(min: 20, max: 500)` with the ARN `@pattern`.

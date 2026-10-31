@@ -24,6 +24,14 @@
 //! this operation models no `InvalidCampaignStateException`, so the update turns on the
 //! campaign existing in this region and on nothing else.
 //!
+//! The config itself arrives already judged: every leaf of it — including the ones
+//! behind the per-channel `outboundMode` unions and the `PacingStrategy` union one
+//! level deeper — is reached by the centralized constraint walk, so a value outside
+//! the shape it targets is refused before this handler runs and no check of those
+//! constraints belongs here (see the union section of [`crate::state`], and
+//! `tests/all/channel_subtype_config_is_one_rule.rs`, which pins that through this
+//! operation and `CreateCampaign` alike).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

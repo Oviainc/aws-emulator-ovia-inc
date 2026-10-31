@@ -59,6 +59,8 @@ mod campaign_source_update;
 mod campaign_state_batch;
 #[path = "all/campaign_stop.rs"]
 mod campaign_stop;
+#[path = "all/channel_subtype_config_is_one_rule.rs"]
+mod channel_subtype_config_is_one_rule;
 #[path = "all/common.rs"]
 mod common;
 #[path = "all/communication_limit_range.rs"]
