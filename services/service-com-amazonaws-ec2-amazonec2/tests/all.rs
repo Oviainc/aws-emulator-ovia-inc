@@ -1068,3 +1068,8 @@ mod trunk_interface_associations;
 // the word `GetManagedResourceVisibility` reports out of the account's own setting.
 #[path = "all/managed_resource_visibility.rs"]
 mod managed_resource_visibility;
+// Appended at the END of this file, for the reason the header gives. What
+// `CreateTransitGatewayMeteringPolicy` mints and persists for the transit gateway it names,
+// the move the clock then owes the new policy, and what it refuses.
+#[path = "all/create_transit_gateway_metering_policy.rs"]
+mod create_transit_gateway_metering_policy;

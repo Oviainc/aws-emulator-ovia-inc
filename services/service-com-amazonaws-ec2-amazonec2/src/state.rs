@@ -1085,7 +1085,13 @@
 //! name the id the next page starts at.
 //! [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway_metering_policy`] is the one way
 //! one is stored, so the id mint and the bytes a stored policy is charged
-//! ([`transit_gateway_metering_policy_payload_bytes`]) cannot differ between writers.
+//! ([`transit_gateway_metering_policy_payload_bytes`]) cannot differ between writers, and
+//! [`ComAmazonawsEc2Amazonec2State::insert_pending_transit_gateway_metering_policy`] is what
+//! a CREATE goes through: it records the policy in the transient
+//! [`TRANSIT_GATEWAY_METERING_POLICY_STATE_PENDING`] state with
+//! [`TRANSIT_GATEWAY_METERING_POLICY_STATE_AVAILABLE`] owed one [`TRANSITION_DELAY`] later,
+//! held in [`ComAmazonawsEc2Amazonec2State::transit_gateway_metering_policy_moves`] on the
+//! same monotonic clock as every other move this store owes.
 //!
 //! ## Transit gateway Connect peers
 //!
@@ -3828,12 +3834,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// them reports and pages over.
     ///
     /// `CreateTransitGatewayMeteringPolicy` is the operation that adds one and
-    /// `DeleteTransitGatewayMeteringPolicy` the one that removes it; both are still
-    /// scaffolds, so a fresh account holds none — which is why
-    /// `DescribeTransitGatewayMeteringPolicies` answers
-    /// `InvalidTransitGatewayMeteringPolicyId.NotFound` for every well-formed id until one of
-    /// them is written, exactly as the real service does for a policy that does not exist.
+    /// `DeleteTransitGatewayMeteringPolicy` the one that removes it; the delete is still a
+    /// scaffold, so nothing takes a policy out of this store yet.
     pub transit_gateway_metering_policies: BTreeMap<String, TransitGatewayMeteringPolicy>,
+    /// The state move the clock owes one transit gateway metering policy, by
+    /// `TransitGatewayMeteringPolicyId` — see [`PendingStateMove`].
+    ///
+    /// Beside [`Self::transit_gateway_metering_policies`] rather than on the record, because
+    /// that store holds the MODELLED shape and `TransitGatewayMeteringPolicy` carries no
+    /// member for a move the clock has not applied yet; the same arrangement as
+    /// [`Self::asn_association_moves`]. Only a policy a write left in a transient state has
+    /// an entry here, so a policy stored in a terminal one is never moved out of it.
+    pub transit_gateway_metering_policy_moves: BTreeMap<String, PendingStateMove>,
     /// Every IPAM pool the account holds, by `IpamPoolId`, as the modelled [`IpamPool`]
     /// shape itself.
     pub ipam_pools: BTreeMap<String, IpamPool>,
@@ -4395,6 +4407,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_connect_peers: BTreeMap::new(),
             transit_gateway_policy_tables: BTreeMap::new(),
             transit_gateway_metering_policies: BTreeMap::new(),
+            transit_gateway_metering_policy_moves: BTreeMap::new(),
             ipam_pools: BTreeMap::new(),
             // A fresh account has brought no ASN of its own to IPAM, so nothing is
             // associated with any of its address ranges either.
@@ -8235,6 +8248,23 @@ impl ComAmazonawsEc2Amazonec2State {
                 }
             }
         }
+        // A metering policy `CreateTransitGatewayMeteringPolicy` left `pending`: it reaches
+        // the state that write recorded for it at the instant it was owed, whether or not
+        // anybody called again — the same contract as the records above. The move is held
+        // beside the store because the modelled shape carries no member for it, so the
+        // policy itself is reached through the id the move is keyed by.
+        let metering_policies = &mut self.transit_gateway_metering_policies;
+        self.transit_gateway_metering_policy_moves
+            .retain(|metering_policy_id, owed| {
+                let Some(state) = owed.due_by(now).map(str::to_string) else {
+                    return true;
+                };
+                if let Some(policy) = metering_policies.get_mut(metering_policy_id) {
+                    policy.state = Some(state);
+                }
+                // The transition is applied once; nothing is owed on this policy any more.
+                false
+            });
         // One routing policy registration a delete (or another write) left transient, and
         // the delta that write minted: the registration reaches the terminal state the
         // write recorded for it and the delta reaches `published`, both at the instant they
@@ -31132,6 +31162,23 @@ impl ComAmazonawsEc2Amazonec2State {
 /// is checked against cannot drift apart.
 pub const TRANSIT_GATEWAY_METERING_POLICY_ID_PREFIX: &str = "tgw-mp";
 
+/// A metering policy whose creation is still being carried out: the
+/// `TransitGatewayMeteringPolicyState` enum's `pending` member
+/// ([`crate::ops::types::TRANSIT_GATEWAY_METERING_POLICY_STATE_VALUES`]), which is what
+/// `CreateTransitGatewayMeteringPolicy` answers with until [`TRANSITION_DELAY`] has passed.
+pub const TRANSIT_GATEWAY_METERING_POLICY_STATE_PENDING: &str = "pending";
+
+/// A metering policy that is in force: that enum's `available` member, the terminal state the
+/// clock owes a freshly created policy.
+pub const TRANSIT_GATEWAY_METERING_POLICY_STATE_AVAILABLE: &str = "available";
+
+/// The `ResourceType` a `CreateTransitGatewayMeteringPolicy` tag specification may name: the
+/// metering policy it creates ("The tags to assign to the metering policy",
+/// `CreateTransitGatewayMeteringPolicyRequest$TagSpecifications`), which is the `ResourceType`
+/// enum's `transit-gateway-metering-policy` member
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+pub const RESOURCE_TYPE_TRANSIT_GATEWAY_METERING_POLICY: &str = "transit-gateway-metering-policy";
+
 /// `InvalidTransitGatewayMeteringPolicyId.NotFound` (HTTP 400): the request named a transit
 /// gateway metering policy id this account holds no policy for.
 pub const INVALID_TRANSIT_GATEWAY_METERING_POLICY_ID_NOT_FOUND: &str =
@@ -31178,6 +31225,15 @@ pub fn transit_gateway_metering_policy_payload_bytes(policy: &TransitGatewayMete
 }
 
 impl ComAmazonawsEc2Amazonec2State {
+    /// Whether the store can hold another transit gateway metering policy.
+    ///
+    /// The same contract as [`Self::has_transit_gateway_route_table_capacity`]: a create asks
+    /// first and refuses with [`resource_limit_exceeded`], and the writer below asks the same
+    /// predicate, so the two cannot drift apart.
+    pub fn has_transit_gateway_metering_policy_capacity(&self) -> bool {
+        self.transit_gateway_metering_policies.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
     /// Store a transit gateway metering policy and answer the
     /// `TransitGatewayMeteringPolicyId` it was given — or `None` when the store is at
     /// [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
@@ -31187,11 +31243,15 @@ impl ComAmazonawsEc2Amazonec2State {
     /// caller-chosen bytes the policy holds are charged on top of the fixed
     /// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, so no path can store one
     /// uncharged.
+    ///
+    /// The state in `view` is stored as it stands and nothing is owed on the policy: a
+    /// transient one comes from [`Self::insert_pending_transit_gateway_metering_policy`],
+    /// which is what a CREATE goes through.
     pub fn insert_transit_gateway_metering_policy(
         &mut self,
         mut view: TransitGatewayMeteringPolicy,
     ) -> Option<String> {
-        if self.transit_gateway_metering_policies.len() >= MAX_STORED_RECORDS_PER_STORE {
+        if !self.has_transit_gateway_metering_policy_capacity() {
             return None;
         }
         let metering_policy_id = self.next_id(TRANSIT_GATEWAY_METERING_POLICY_ID_PREFIX);
@@ -31202,6 +31262,37 @@ impl ComAmazonawsEc2Amazonec2State {
         self.transit_gateway_metering_policies
             .insert(metering_policy_id.clone(), view);
         Some(metering_policy_id)
+    }
+
+    /// Store the metering policy a create minted and answer it as it was stored, or `None`
+    /// when the store is at [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
+    ///
+    /// Everything the request does not decide is decided HERE rather than by the handler, so
+    /// a later writer of the kind cannot record a fresh policy differently: the id comes from
+    /// [`Self::insert_transit_gateway_metering_policy`], the state is the TRANSIENT
+    /// [`TRANSIT_GATEWAY_METERING_POLICY_STATE_PENDING`] with
+    /// [`TRANSIT_GATEWAY_METERING_POLICY_STATE_AVAILABLE`] owed one [`TRANSITION_DELAY`]
+    /// later — the span is never zero, so a caller acting straight after the create still
+    /// sees the policy pending — and "the date and time when the metering policy update
+    /// becomes effective" (`TransitGatewayMeteringPolicy$UpdateEffectiveAt`) is that same
+    /// instant, read off the wall clock, so the member and the owed move cannot disagree
+    /// about when this policy starts metering.
+    pub fn insert_pending_transit_gateway_metering_policy(
+        &mut self,
+        mut view: TransitGatewayMeteringPolicy,
+    ) -> Option<TransitGatewayMeteringPolicy> {
+        view.state = Some(TRANSIT_GATEWAY_METERING_POLICY_STATE_PENDING.to_string());
+        view.update_effective_at = Some(system_time_to_date_time(
+            SystemTime::now() + TRANSITION_DELAY,
+        ));
+        let metering_policy_id = self.insert_transit_gateway_metering_policy(view)?;
+        self.transit_gateway_metering_policy_moves.insert(
+            metering_policy_id.clone(),
+            PendingStateMove::starting_now(TRANSIT_GATEWAY_METERING_POLICY_STATE_AVAILABLE),
+        );
+        self.transit_gateway_metering_policies
+            .get(&metering_policy_id)
+            .cloned()
     }
 }
 

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGatewayMeteringPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGatewayMeteringPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates a metering policy for the transit gateway the request names, with
+//! the middlebox attachments and the tags it carries, in the transient `pending` state with
+//! `available` owed one transition span later.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGatewayMeteringPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -70,6 +66,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::collections::BTreeSet;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -138,18 +136,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayMeteringPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayMeteringPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayMeteringPolicy"))
+        // `ctx` carries request metadata only; this operation reads none of it — the policy
+        // is a resource of the gateway the request names and carries no Region of its own.
+        // The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The IDs of the middlebox attachments to include in the metering policy"
+        // (`MiddleboxAttachmentIds`): the model publishes no bound on the list
+        // (`TransitGatewayAttachmentIdStringList` carries no `@length`), so the number of ids
+        // one request may name is capped here, before any per-id work and before the store is
+        // locked — the same ceiling the rest of this crate puts on a caller-chosen id list.
+        let named_attachments: &[String] = input.middlebox_attachment_ids.as_deref().unwrap_or_default();
+        if named_attachments.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "MiddleboxAttachmentIds carries {supplied} ids, above the maximum of {maximum}",
+                supplied = named_attachments.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
+        }
+        // A value that is not a transit gateway attachment id at all is refused as malformed
+        // BEFORE anything is looked up, so "not an id of this kind" never reads as "no such
+        // attachment", and never as a policy that quietly dropped it.
+        for attachment_id in named_attachments {
+            state::require_well_formed_transit_gateway_attachment_id(attachment_id)?;
+        }
+        // Including one attachment twice includes it once: the policy records the SET of
+        // attachments the request named, in the order it first named them, so what is stored
+        // is what a later reader reports rather than a list a repeat could grow. The ids
+        // already seen are held as an ordered SET, so deduplicating a capped list costs a
+        // lookup per id rather than a walk of everything kept so far.
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut middlebox_attachment_ids: Vec<String> = Vec::with_capacity(named_attachments.len());
+        for attachment_id in named_attachments {
+            if seen.insert(attachment_id.as_str()) {
+                middlebox_attachment_ids.push(attachment_id.clone());
+            }
+        }
+
+        // "The tags to assign to the metering policy" (`TagSpecifications`) — "you must
+        // specify the resource type to tag, otherwise the request will fail"
+        // (`TagSpecification`), and the only type this action tags is the metering policy it
+        // creates. The tag payload's own bounds (the count per resource, each key and value's
+        // length, no key twice, nothing in the reserved namespace) are applied by the one
+        // shared reader every create holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_TRANSIT_GATEWAY_METERING_POLICY,
+            Self::NAME,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // resources the request names, so it is answered once the request's own form has been
+        // checked and before anything is resolved or written; every caller of this emulator is
+        // permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether this policy can be created is asked of the state its
+        // gateway and the attachments it names are ACTUALLY in rather than the one they were
+        // left in.
+        store.materialize_due_transitions();
+
+        // "The ID of the transit gateway for which to create the metering policy"
+        // (`TransitGatewayId`): a metering policy is a resource OF a transit gateway, so an id
+        // this account holds no gateway for has nothing to meter. The id is resolved against
+        // the store alone — the one refusal `DescribeTransitGateways` answers for a
+        // `TransitGatewayId` it cannot resolve, so one resource family reads one way.
+        if !store.transit_gateways.contains_key(&input.transit_gateway_id) {
+            return Err(state::invalid_transit_gateway_id_not_found(
+                &input.transit_gateway_id,
+            ));
+        }
+        // Every middlebox attachment the policy is to meter has to exist too: an id that names
+        // no attachment of the account is a dangling reference, and storing it would leave a
+        // policy metering nothing — the refusal this crate answers wherever an attachment id
+        // is a PARAMETER of some other action.
+        if let Some(unknown) = middlebox_attachment_ids
+            .iter()
+            .find(|attachment_id| !store.transit_gateway_attachments.contains_key(attachment_id.as_str()))
+        {
+            return Err(state::invalid_transit_gateway_attachment_id_not_found(
+                unknown,
+            ));
+        }
+
+        // The policy as the request asks for it, with everything the request does NOT decide
+        // left to the store's own writer: the id, the transient state, the instant the policy
+        // takes effect and the move the clock owes it.
+        let requested = TransitGatewayMeteringPolicy {
+            transit_gateway_metering_policy_id: None,
+            transit_gateway_id: Some(input.transit_gateway_id.clone()),
+            // A member nothing was recorded for is stored absent rather than as an empty
+            // list, so a reader reports it absent instead of inventing an empty set for it.
+            middlebox_attachment_ids: (!middlebox_attachment_ids.is_empty())
+                .then_some(middlebox_attachment_ids),
+            state: None,
+            update_effective_at: None,
+            tags: (!tags.is_empty()).then_some(tags),
+        };
+
+        // A count ceiling first, then the byte budget: a record count on its own admits tags
+        // of any length, and a byte budget on its own admits records without end. The insert
+        // below asks the same predicate and answers `None` for it, so this is the refusal the
+        // caller sees rather than a second rule.
+        if !store.has_transit_gateway_metering_policy_capacity() {
+            return Err(store_is_full(store.transit_gateway_metering_policies.len()));
+        }
+        // The bytes this policy would add to the store, charged against the crate's one byte
+        // budget BEFORE the write, and counted by the ONE definition of a stored policy's
+        // caller-chosen bytes, so the pre-check and the charge cannot drift apart.
+        let payload_bytes = state::transit_gateway_metering_policy_payload_bytes(&requested);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store another transit gateway metering policy",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        let Some(metering_policy) = store.insert_pending_transit_gateway_metering_policy(requested)
+        else {
+            // Unreachable: the ceiling was asked above, and the store is locked throughout.
+            // Kept as the backstop that keeps a full store from reading as a 501 or a 200,
+            // worded by the ONE definition of that refusal so the two cannot drift apart.
+            return Err(store_is_full(store.transit_gateway_metering_policies.len()));
+        };
+
+        // The answer is the policy as it was STORED, so this create and every later reader of
+        // it cannot drift apart.
+        Ok(CreateTransitGatewayMeteringPolicyOutput {
+            transit_gateway_metering_policy: Some(metering_policy),
+        })
     }
+}
+
+/// The refusal a store that holds as many metering policies as it can answers: HTTP 400
+/// `ResourceLimitExceeded`, naming how many it holds.
+///
+/// The ONE definition of that wording, so the pre-check and the writer's backstop below it
+/// cannot drift apart.
+fn store_is_full(held: usize) -> CreateTransitGatewayMeteringPolicyError {
+    crate::state::resource_limit_exceeded(format!(
+        "This emulator holds {held} transit gateway metering policies, which is as many as it \
+         stores"
+    ))
 }
