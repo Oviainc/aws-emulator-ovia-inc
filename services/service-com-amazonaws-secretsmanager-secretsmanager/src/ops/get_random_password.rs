@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRandomPassword
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRandomPassword`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRandomPassword::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Generates a password from the character types the request leaves included, draws every
+//! character from the OS CSPRNG, and persists nothing: the password is never stored, so a
+//! second call with the same request answers a different password. A request that leaves no
+//! character to draw from, or that cannot satisfy the types it requires, is refused.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -101,6 +99,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::ring::rand::{SecureRandom, SystemRandom};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -169,20 +169,249 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRandomPassword` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRandomPasswordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRandomPassword"))
+        // This operation generates a password and persists nothing: it resolves no
+        // resource, so it reads no secret, and storing the password it hands back would
+        // make it readable by a later caller, which Secrets Manager never does. The
+        // store is therefore neither read nor written here — every value in the response
+        // is computed from this request and from the OS CSPRNG — so the shared engine
+        // this operation holds is not reached.
+        let _ = &self.engine;
+
+        let length = requested_length(&input);
+        let excluded = input.exclude_characters.as_deref().unwrap_or_default();
+
+        // The characters each INCLUDED type still contributes once the ones the request
+        // named are removed, one entry per included type.
+        let pools: Vec<Vec<char>> = included_types(&input)
+            .into_iter()
+            .map(|characters| available_characters(characters, excluded))
+            .collect();
+        let available: Vec<char> = pools.iter().flatten().copied().collect();
+
+        let require_each_type = requires_each_included_type(&input);
+
+        // A type the request includes but leaves without a single character cannot be
+        // represented in the password, so a request that needs one character of every
+        // type it includes cannot be served. This is a property of the parameters
+        // themselves, so it is refused before the alphabet is looked at as a whole.
+        if require_each_type && pools.iter().any(Vec::is_empty) {
+            return Err(invalid_parameter(EXCLUDED_DESIRED_TYPE_MESSAGE));
+        }
+
+        // Nothing at all is left to select a password from — every character type
+        // switched off, or every character of the types left on excluded by name.
+        if available.is_empty() {
+            return Err(GetRandomPasswordErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(NO_CHARACTERS_LEFT_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // One position per required type is the shortest password that can carry one
+        // character of each.
+        if require_each_type && length < pools.len() {
+            return Err(invalid_parameter(TOO_SHORT_FOR_REQUIRED_TYPES_MESSAGE));
+        }
+
+        let random = SystemRandom::new();
+        // `length` is the clamped value [`requested_length`] returns, never the raw
+        // number the request carried, so the capacity here is bounded by the range the
+        // model declares for it.
+        let mut password: Vec<char> = Vec::with_capacity(length);
+
+        // Each required type contributes one character first, so the requirement holds
+        // however the rest of the password falls out.
+        if require_each_type {
+            for pool in &pools {
+                let index = random_index(&random, pool.len()).ok_or_else(no_randomness)?;
+                password.push(*pool.get(index).ok_or_else(no_randomness)?);
+            }
+        }
+
+        // Every remaining position is drawn, independently and uniformly, from every
+        // character the request leaves available.
+        while password.len() < length {
+            let index = random_index(&random, available.len()).ok_or_else(no_randomness)?;
+            password.push(*available.get(index).ok_or_else(no_randomness)?);
+        }
+
+        // The required characters were placed in type order, so without this the leading
+        // positions of the password would report which types the request included.
+        shuffle(&random, &mut password).ok_or_else(no_randomness)?;
+
+        Ok(GetRandomPasswordOutput {
+            random_password: Some(password.into_iter().collect()),
+        })
     }
+}
+
+/// The uppercase letters a password is drawn from: "Secrets Manager uses uppercase
+/// and lowercase letters, numbers, and the following characters in passwords"
+/// (`GetRandomPassword`, this service's Smithy model).
+const UPPERCASE_CHARACTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// The lowercase letters of that same sentence.
+const LOWERCASE_CHARACTERS: &str = "abcdefghijklmnopqrstuvwxyz";
+
+/// The numbers of that same sentence.
+const NUMBER_CHARACTERS: &str = "0123456789";
+
+/// The punctuation of that same sentence, which
+/// `GetRandomPasswordRequest$ExcludePunctuation` lists character by character:
+/// "! \" # $ % & ' ( ) * + , - . / : ; < = > ? @ [ \\ ] ^ _ ` { | } ~".
+const PUNCTUATION_CHARACTERS: &str = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+
+/// The one character the space type contributes
+/// (`GetRandomPasswordRequest$IncludeSpace`).
+const SPACE_CHARACTERS: &str = " ";
+
+/// The length of a password the request names none for: "If you don't include this
+/// parameter, the default length is 32 characters."
+/// (`GetRandomPasswordRequest$PasswordLength`, this service's Smithy model.)
+pub const DEFAULT_PASSWORD_LENGTH: usize = 32;
+
+/// The lower bound `PasswordLengthType` declares (range 1..4096). The boundary
+/// validator already refuses a request below it; the clamp in [`requested_length`]
+/// keeps the conversion total whatever a caller passes.
+const MIN_PASSWORD_LENGTH: i64 = 1;
+
+/// The upper bound of that same modelled range.
+const MAX_PASSWORD_LENGTH: i64 = 4096;
+
+/// What `InvalidRequestException` says about a request left with no character at all
+/// to select from: every character type switched off, or every character of the types
+/// left on named in `ExcludeCharacters`. The request asks for a password out of the
+/// empty set, so it is refused for what it asks for as a whole rather than for the
+/// value of one parameter.
+pub const NO_CHARACTERS_LEFT_MESSAGE: &str = "All characters have been excluded from selection.";
+
+/// What `InvalidParameterException` says about a request that needs one character of
+/// every type it includes while `ExcludeCharacters` leaves one of those types without
+/// a single character.
+pub const EXCLUDED_DESIRED_TYPE_MESSAGE: &str =
+    "All characters of the desired type have been excluded.";
+
+/// What `InvalidParameterException` says about a password too short to carry one
+/// character of every type it requires.
+pub const TOO_SHORT_FOR_REQUIRED_TYPES_MESSAGE: &str =
+    "Password length is too short based on the required types.";
+
+/// The length this request asks for: the one it names, or the documented default.
+///
+/// TOTAL for any value a request can carry. `PasswordLengthType`'s modelled range is
+/// refused by the boundary validator before this handler runs, so the clamp is
+/// defence in depth that keeps the conversion out of reach of any caller.
+fn requested_length(input: &GetRandomPasswordInput) -> usize {
+    match input.password_length {
+        Some(requested) => {
+            usize::try_from(requested.clamp(MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH))
+                .unwrap_or(DEFAULT_PASSWORD_LENGTH)
+        }
+        None => DEFAULT_PASSWORD_LENGTH,
+    }
+}
+
+/// Whether the password has to carry at least one character of every type it includes:
+/// "Specifies whether to include at least one upper and lowercase letter, one number,
+/// and one punctuation. If you don't include this switch, the password contains at
+/// least one of every character type."
+/// (`GetRandomPasswordRequest$RequireEachIncludedType`, this service's Smithy model) —
+/// so a request that names the switch gets what it names, and one that names none is
+/// served as though it had asked for each type.
+fn requires_each_included_type(input: &GetRandomPasswordInput) -> bool {
+    input.require_each_included_type.unwrap_or(true)
+}
+
+/// The characters of every type this request INCLUDES, one entry per type.
+///
+/// Each `Exclude…` switch turns its type off and defaults to leaving it on ("If you
+/// don't include this switch, the password can contain …"), while `IncludeSpace` turns
+/// the space type on and defaults to leaving it off ("If you include this switch, the
+/// password can contain space characters.").
+fn included_types(input: &GetRandomPasswordInput) -> Vec<&'static str> {
+    let excluded = |switch: Option<bool>| switch.unwrap_or(false);
+    let mut types = Vec::new();
+    if !excluded(input.exclude_uppercase) {
+        types.push(UPPERCASE_CHARACTERS);
+    }
+    if !excluded(input.exclude_lowercase) {
+        types.push(LOWERCASE_CHARACTERS);
+    }
+    if !excluded(input.exclude_numbers) {
+        types.push(NUMBER_CHARACTERS);
+    }
+    if !excluded(input.exclude_punctuation) {
+        types.push(PUNCTUATION_CHARACTERS);
+    }
+    if input.include_space.unwrap_or(false) {
+        types.push(SPACE_CHARACTERS);
+    }
+    types
+}
+
+/// The characters of `characters` that `excluded` — "a string of the characters that
+/// you don't want in the password" (`GetRandomPasswordRequest$ExcludeCharacters`) —
+/// does not name.
+fn available_characters(characters: &str, excluded: &str) -> Vec<char> {
+    characters
+        .chars()
+        .filter(|candidate| !excluded.contains(*candidate))
+        .collect()
+}
+
+/// An index below `bound`, drawn uniformly from the OS CSPRNG; `None` when `bound` is
+/// zero or the CSPRNG could not be read.
+///
+/// Rejection sampling: a draw at or above the largest multiple of `bound` a `u32`
+/// holds is discarded rather than reduced, so no residue makes a low index likelier
+/// than a high one. At most `bound` of the 2^32 draws are discarded, so all but a
+/// vanishing fraction of calls return on their first draw.
+fn random_index(random: &SystemRandom, bound: usize) -> Option<usize> {
+    let bound = u32::try_from(bound).ok()?;
+    if bound == 0 {
+        return None;
+    }
+    let unbiased_below = (u32::MAX / bound) * bound;
+    loop {
+        let mut bytes = [0_u8; 4];
+        random.fill(&mut bytes).ok()?;
+        let draw = u32::from_be_bytes(bytes);
+        if draw < unbiased_below {
+            return usize::try_from(draw % bound).ok();
+        }
+    }
+}
+
+/// Shuffle `characters` into a uniformly random order (Fisher-Yates over
+/// [`random_index`]); `None` when the CSPRNG could not be read.
+fn shuffle(random: &SystemRandom, characters: &mut [char]) -> Option<()> {
+    for position in (1..characters.len()).rev() {
+        let swap_with = random_index(random, position + 1)?;
+        characters.swap(position, swap_with);
+    }
+    Some(())
+}
+
+/// `InvalidParameterException` — "the parameter name or value is invalid" — for a
+/// combination of parameters this operation cannot serve.
+fn invalid_parameter(message: &str) -> GetRandomPasswordError {
+    GetRandomPasswordErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for a password that could not be drawn because the OS
+/// CSPRNG could not be read: a server-side fault, never a bad request.
+fn no_randomness() -> GetRandomPasswordError {
+    GetRandomPasswordErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some(
+            "the Secrets Manager emulator could not read the system random source".to_string(),
+        ),
+    })
+    .into()
 }
