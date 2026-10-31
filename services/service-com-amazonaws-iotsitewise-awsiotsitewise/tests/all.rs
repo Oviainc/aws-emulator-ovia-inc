@@ -31,6 +31,13 @@ mod task_delete;
 #[path = "all/refusal_resource_arn.rs"]
 mod refusal_resource_arn;
 
+// `client_token_conflict_names_a_held_record` is declared HERE, beside the suite
+// above, for the reason its note gives: the sorted list and the END of this file
+// are both where every concurrent iotsitewise change puts a declaration of its own.
+// Fold it into the list once the churn settles.
+#[path = "all/client_token_conflict_names_a_held_record.rs"]
+mod client_token_conflict_names_a_held_record;
+
 #[path = "all/query_results.rs"]
 mod query_results;
 

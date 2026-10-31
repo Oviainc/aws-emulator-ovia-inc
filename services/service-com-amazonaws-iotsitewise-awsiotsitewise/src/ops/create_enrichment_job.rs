@@ -251,13 +251,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TokenVerdict::Spent(spent_on) => {
                 // The conflict names the job the token's own call started — the job
                 // the caller has to look at — as the error's required members state
-                // it.
-                let (_, job_id) = crate::state::workspace_scoped_token_key(&spent_on);
-                let region = crate::state::request_region(ctx.parts());
-                return Err(token_spent(
-                    &job_id,
-                    crate::state::enrichment_job_arn(&region, &job_id),
-                ));
+                // it: "the resource that conflicts with this operation". So the
+                // refusal is conditioned on the SAME lookup the retry above makes:
+                // one gone since — its workspace deleted — is no resource to
+                // conflict with, and the request is served as the fresh create it
+                // now is.
+                let (workspace_name, job_id) = crate::state::workspace_scoped_token_key(&spent_on);
+                let key = crate::state::enrichment_job_key(&workspace_name, &job_id);
+                if store.enrichment_jobs.contains_key(&key) {
+                    let region = crate::state::request_region(ctx.parts());
+                    return Err(token_spent(
+                        &job_id,
+                        crate::state::enrichment_job_arn(&region, &job_id),
+                    ));
+                }
             }
             crate::state::TokenVerdict::Serve => {}
         }

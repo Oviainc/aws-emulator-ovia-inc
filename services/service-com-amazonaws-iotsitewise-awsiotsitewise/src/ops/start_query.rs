@@ -346,13 +346,22 @@ fn token_answer(
             }))
         }
         // The conflict names the query the token's own call started — the query the
-        // caller has to look at — as the error's required members state it.
+        // caller has to look at — as the error's required members state it: "the
+        // resource that conflicts with this operation". So the refusal is conditioned
+        // on the SAME lookup the replay above makes: one gone since — its workspace
+        // deleted — is no resource to conflict with, and the request is served as the
+        // fresh start it now is.
         crate::state::TokenVerdict::Spent(spent_on) => {
             let (workspace_name, query_id) = crate::state::workspace_scoped_token_key(&spent_on);
-            Err(token_spent(
-                &query_id,
-                crate::state::query_arn(region, &workspace_name, &query_id),
-            ))
+            let key = crate::state::query_key(&workspace_name, &query_id);
+            if store.queries.contains_key(&key) {
+                Err(token_spent(
+                    &query_id,
+                    crate::state::query_arn(region, &workspace_name, &query_id),
+                ))
+            } else {
+                Ok(None)
+            }
         }
         crate::state::TokenVerdict::Serve => Ok(None),
     }
