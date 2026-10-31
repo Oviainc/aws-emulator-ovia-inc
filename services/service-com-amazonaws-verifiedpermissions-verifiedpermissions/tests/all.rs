@@ -99,6 +99,8 @@ mod resource_names;
 mod response_fidelity;
 #[path = "all/schema.rs"]
 mod schema;
+#[path = "all/schema_deletion.rs"]
+mod schema_deletion;
 #[path = "all/schema_lifecycle.rs"]
 mod schema_lifecycle;
 #[path = "all/scope_entity_type_immutability.rs"]

@@ -32,14 +32,14 @@ use crate::schema::photo_app_schema;
 
 /// A static policy every part of which [`photo_app_schema`] declares, at the
 /// types it declares them at.
-const CONFORMANT_POLICY: &str = "permit(principal == PhotoApp::User::\"alice\", \
+pub(crate) const CONFORMANT_POLICY: &str = "permit(principal == PhotoApp::User::\"alice\", \
                                  action == PhotoApp::Action::\"viewPhoto\", \
                                  resource == PhotoApp::Photo::\"vacation.jpg\");";
 
 /// A replacement for [`CONFORMANT_POLICY`] that changes only its ACTION — the one
 /// scope member `UpdatePolicy` allows a replacement to change — to the other
 /// action [`photo_app_schema`] declares.
-const CONFORMANT_REPLACEMENT: &str = "permit(principal == PhotoApp::User::\"alice\", \
+pub(crate) const CONFORMANT_REPLACEMENT: &str = "permit(principal == PhotoApp::User::\"alice\", \
                                       action == PhotoApp::Action::\"sharePhoto\", \
                                       resource == PhotoApp::Photo::\"vacation.jpg\");";
 
@@ -52,13 +52,13 @@ const UNSANCTIONED_POLICY: &str = "permit(principal == PhotoApp::User::\"alice\"
 
 /// A policy TEMPLATE whose scope [`photo_app_schema`] sanctions, with the
 /// principal left as the `?principal` placeholder a template may carry.
-const CONFORMANT_TEMPLATE: &str = "permit(principal == ?principal, \
+pub(crate) const CONFORMANT_TEMPLATE: &str = "permit(principal == ?principal, \
                                    action == PhotoApp::Action::\"viewPhoto\", \
                                    resource is PhotoApp::Photo);";
 
 /// A replacement for [`CONFORMANT_TEMPLATE`] changing only its action, which is
 /// what `UpdatePolicyTemplate` allows a replacement to change.
-const CONFORMANT_TEMPLATE_REPLACEMENT: &str = "permit(principal == ?principal, \
+pub(crate) const CONFORMANT_TEMPLATE_REPLACEMENT: &str = "permit(principal == ?principal, \
                                                action == PhotoApp::Action::\"sharePhoto\", \
                                                resource is PhotoApp::Photo);";
 
@@ -71,7 +71,7 @@ const UNSANCTIONED_TEMPLATE: &str = "permit(principal == ?principal, \
 /// The reason a store that validates against a schema it does not have gives for
 /// refusing `content`. The refusal is the same sentence for every operation and
 /// every kind of content, down to the noun naming what was submitted.
-fn no_schema_reason(content: &str) -> String {
+pub(crate) fn no_schema_reason(content: &str) -> String {
     format!(
         "its validation mode is STRICT and it contains no schema, so there is nothing to \
          validate {content} against"
@@ -80,7 +80,7 @@ fn no_schema_reason(content: &str) -> String {
 
 /// Create a static policy carrying `statement` in `store_id`, requiring success,
 /// and return its `policyId`.
-async fn policy_in(
+pub(crate) async fn policy_in(
     router: &smithy_server_runtime::MultiServiceRouter,
     store_id: &str,
     statement: &str,
@@ -102,7 +102,7 @@ async fn policy_in(
 
 /// Create a policy template carrying `statement` in `store_id`, requiring
 /// success, and return its `policyTemplateId`.
-async fn template_in(
+pub(crate) async fn template_in(
     router: &smithy_server_runtime::MultiServiceRouter,
     store_id: &str,
     statement: &str,
@@ -121,7 +121,7 @@ async fn template_in(
 
 /// The Cedar text state holds for a static policy, read back through
 /// `GetPolicy`.
-async fn stored_policy_statement(
+pub(crate) async fn stored_policy_statement(
     router: &smithy_server_runtime::MultiServiceRouter,
     store_id: &str,
     policy_id: &str,
@@ -140,7 +140,7 @@ async fn stored_policy_statement(
 
 /// The Cedar text state holds for a policy template, read back through
 /// `GetPolicyTemplate`.
-async fn stored_template_statement(
+pub(crate) async fn stored_template_statement(
     router: &smithy_server_runtime::MultiServiceRouter,
     store_id: &str,
     template_id: &str,
@@ -172,9 +172,11 @@ fn field(body: &Value, index: usize) -> (String, String) {
 /// sentence for every one of them.
 ///
 /// The rows span the four write operations the rule covers, both kinds of content
-/// (a policy and a policy template), and both ways a store reaches the state (one
-/// created `STRICT`, and one switched to `STRICT` after it was given content —
-/// the only way such a store can hold a policy to update at all).
+/// (a policy and a policy template), and both ways a store reaches the state
+/// WITHOUT a schema ever being deleted (one created `STRICT`, and one switched to
+/// `STRICT` after it was given content — the only way such a store can hold a
+/// policy to update at all). The third way, a store whose schema was DELETED by
+/// putting the empty document, is pinned in [`crate::schema_deletion`].
 #[tokio::test]
 async fn a_strict_store_with_no_schema_refuses_every_cedar_write() {
     let router = router();

@@ -2,11 +2,13 @@
 
 //! @op PutSchema
 //!
-//! Creates or updates the ONE Cedar schema a policy store holds: the schema text
-//! is parsed by the real Cedar schema parser, persisted on the store, and the
-//! namespaces that parse found are reported back. A store's schema is what a
-//! later `CreatePolicy` validates against in `STRICT` mode and what types an
-//! `IsAuthorized` request's entities and context.
+//! Creates, updates or DELETES the ONE Cedar schema a policy store holds: the
+//! schema text is parsed by the real Cedar schema parser, persisted on the store,
+//! and the namespaces that parse found are reported back. The EMPTY document
+//! (`{}`) is how the model documents deleting the schema, so putting it leaves
+//! the store holding none. A store's schema is what a later `CreatePolicy`
+//! validates against in `STRICT` mode and what types an `IsAuthorized` request's
+//! entities and context.
 //!
 //! Creates or updates the policy schema in the specified policy store. The schema is used
 //! to validate any Cedar policies and policy templates submitted to the policy store. Any
@@ -180,9 +182,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The namespaces are a property of the schema text, so they come from the
         // real Cedar schema parser; text it refuses is refused here too, with its
         // own diagnostics. `{}` is a well-formed schema that declares nothing,
-        // which is how the model documents clearing a store's definitions ("To
-        // delete the schema, run PutSchema with `{}` for this parameter"): it is
-        // stored, and reports no namespaces.
+        // and is how the model documents DELETING a store's schema ("To delete
+        // the schema, run PutSchema with `{}` for this parameter"), so it parses
+        // like any other document and what putting it does to state is decided
+        // below.
         let parsed = crate::state::cedar::parse_schema(definition).map_err(|e| {
             // The schema text is one request member, so the refusal names it in
             // `fieldList` rather than only describing it in prose.
@@ -197,22 +200,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(not_found)?;
 
         let now = crate::state::now();
-        // "The date and time that the schema was originally created": putting a
-        // schema over an existing one UPDATES it, so the creation stamp stays the
-        // first put's and only `lastUpdatedDate` moves.
-        let created_date = store
-            .schema
-            .as_ref()
-            .map_or(now, |existing| existing.created_date);
-        store.schema = Some(crate::state::StoredSchema {
-            // The document, not the caller's spelling of it: what a read reports
-            // is the submitted JSON with its insignificant whitespace gone and
-            // nothing else about it changed.
-            cedar_json: crate::state::canonical_schema_json(definition),
-            namespaces: parsed.namespaces,
-            created_date,
-            last_updated_date: now,
-        });
+        // Create, update or DELETE the store's one schema, as the document the
+        // request carries says: the empty document returns the store to holding
+        // no schema, any other document becomes the schema it holds. The document
+        // persisted is not the caller's spelling of it: what a read reports is
+        // the submitted JSON with its insignificant whitespace gone and nothing
+        // else about it changed. Which of the three the put is — and so what the
+        // store afterwards holds — is decided in ONE place, on the store itself.
+        store.put_schema_document(
+            crate::state::canonical_schema_json(definition),
+            parsed.namespaces,
+            now,
+        );
         // The store itself changed, so its own `lastUpdatedDate` moves too. What
         // the store already holds is NOT re-validated: "Any changes to the schema
         // validate only policies and templates submitted after the schema change.
@@ -221,19 +220,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.last_updated_date = now;
 
         // Read the response back out of what was just persisted, so a value that
-        // did not reach state cannot appear on the wire.
-        let stored = state
+        // did not reach state cannot appear on the wire. It is the same document
+        // `GetSchema` reports, including after a delete: the store then holds the
+        // empty document again, dated at its own creation.
+        let store = state
             .policy_stores
             .get(&store_id)
-            .and_then(|store| store.schema.as_ref())
             .ok_or_else(unavailable)?;
+        let stored = store.schema_document();
+        // What the put DID, as state has it rather than as the request spelled
+        // it: a store that holds a schema was given one, and one that holds none
+        // had its schema deleted.
+        let outcome = if store.schema.is_some() {
+            "schema stored"
+        } else {
+            "schema deleted"
+        };
         let output = PutSchemaOutput {
             policy_store_id: store_id.clone(),
             namespaces: stored.namespaces.clone(),
             created_date: stored.created_date,
             last_updated_date: stored.last_updated_date,
         };
-        crate::ops::audit(ctx, "PutSchema", &output.policy_store_id, "schema stored");
+        crate::ops::audit(ctx, "PutSchema", &output.policy_store_id, outcome);
         Ok(output)
     }
 }

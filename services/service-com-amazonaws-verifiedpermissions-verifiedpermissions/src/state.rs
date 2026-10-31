@@ -422,6 +422,11 @@ pub struct PolicyStore {
     /// holds at most ONE schema — `PutSchema` "creates or updates" it — so this
     /// is an `Option`, not a map. `None` is the EMPTY schema document: see
     /// [`PolicyStore::schema_document`], which is what `GetSchema` reports.
+    ///
+    /// A store that was given a schema and then had it DELETED (a `PutSchema`
+    /// carrying the empty document) is back to `None`, so this is `Some` exactly
+    /// when the store contains a schema: see
+    /// [`PolicyStore::put_schema_document`].
     pub schema: Option<StoredSchema>,
 }
 
@@ -1196,6 +1201,45 @@ impl PolicyStore {
             created_date: self.created_date,
             last_updated_date: self.created_date,
         })
+    }
+
+    /// Persist `document` — the canonical form ([`canonical_schema_json`]) of a
+    /// schema the Cedar parser accepted — as this store's schema, with the
+    /// `namespaces` that parse found, and report the document the store then
+    /// holds ([`Self::schema_document`]).
+    ///
+    /// The EMPTY document DELETES the schema: `SchemaDefinition$cedarJson`
+    /// documents "To delete the schema, run PutSchema with `{}` for this
+    /// parameter", so putting it leaves the store holding no schema at all —
+    /// exactly the state a store that was never given one is in, which is what
+    /// makes every rule keyed on whether the store "contains a schema" (above
+    /// all [`Self::schema_to_validate_against`]) answer the same for both. Any
+    /// other document creates the schema, or updates the one already there:
+    /// "the date and time that the schema was originally created" then stays the
+    /// first put's and only `last_updated_date` moves.
+    ///
+    /// This is the ONE place that decides what a put of a document does, so
+    /// state can never hold the empty document as a schema the store contains.
+    pub fn put_schema_document(
+        &mut self,
+        document: String,
+        namespaces: Vec<String>,
+        now: DateTime,
+    ) {
+        if document == EMPTY_SCHEMA_JSON {
+            self.schema = None;
+            return;
+        }
+        let created_date = self
+            .schema
+            .as_ref()
+            .map_or(now, |existing| existing.created_date);
+        self.schema = Some(StoredSchema {
+            cedar_json: document,
+            namespaces,
+            created_date,
+            last_updated_date: now,
+        });
     }
 
     /// The Cedar schema this store validates submitted content against, for ONE

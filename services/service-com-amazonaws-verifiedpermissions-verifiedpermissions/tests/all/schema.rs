@@ -182,6 +182,10 @@ async fn schema_round_trips_and_reports_the_namespaces_it_declares() {
 
 /// Putting a schema over an existing one UPDATES it: the new definition replaces
 /// the old one and the creation stamp stays the first put's.
+///
+/// Every row here puts a schema the store then HOLDS. Putting the empty document
+/// is not an update but a delete, so it lives with the rule it belongs to, in
+/// [`crate::schema_deletion`].
 #[tokio::test]
 async fn putting_a_schema_again_updates_it_and_keeps_its_created_date() {
     let router = router();
@@ -197,7 +201,11 @@ async fn putting_a_schema_again_updates_it_and_keeps_its_created_date() {
             &["A", "B"],
         ),
         ("replaced by one again", json!({ "B": namespace_block() }), &["B"]),
-        ("emptied", json!({}), &[]),
+        (
+            "replaced by a qualified namespace",
+            json!({ "Org::B": namespace_block() }),
+            &["Org::B"],
+        ),
     ];
 
     let mut first_created: Option<Value> = None;
