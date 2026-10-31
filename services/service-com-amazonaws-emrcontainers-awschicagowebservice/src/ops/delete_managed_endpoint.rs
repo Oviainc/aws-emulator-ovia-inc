@@ -160,13 +160,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DeleteManagedEndpointErrorModeled::ValidationException(
                 ValidationException {
-                    // The one not-found wording of this service
-                    // ([`crate::state::ResourceKind`]), built from the requested id: the
-                    // refusal is carried by this operation's own modelled error, but what
-                    // it SAYS is that the endpoint does not exist.
+                    // This service's wording for a missing resource reported in THIS error
+                    // class ([`crate::state::ResourceKind`]): the refusal is carried by
+                    // this operation's own modelled error, but what it SAYS is that the
+                    // endpoint does not exist.
                     message: Some(
                         crate::state::ResourceKind::ManagedEndpoint
-                            .not_found_message(&input.id),
+                            .validation_not_found_message(&input.id),
                     ),
                 },
             )

@@ -377,6 +377,19 @@ pub fn endpoint_session_scope(virtual_cluster_id: &str, endpoint_id: &str) -> St
 /// so the operation alone scopes the token.
 pub const CREATE_JOB_TEMPLATE_SCOPE: &str = "CreateJobTemplate";
 
+/// The `message` an idempotency conflict carries, for every operation of this service
+/// whose input declares an `@idempotencyToken` `clientToken`.
+///
+/// A token already spent in its scope, replayed with a request that differs from the one
+/// it named, is refused with ONE fixed sentence. The sentence has no variable parts: it
+/// names neither the token, nor the resource that token already named, nor the member that
+/// differs — so a caller telling an idempotency conflict apart from the other
+/// `ValidationException`s of the same operation (the error code is shared by all of them)
+/// reads the same text whichever operation refused it, and the refusal discloses no
+/// resource identifier on a path that answers with none.
+pub const IDEMPOTENCY_CONFLICT_MESSAGE: &str =
+    "At least one input parameter differs from a previous call using the same client token";
+
 /// Wall-clock milliseconds since the epoch, the unit every stored timestamp uses.
 pub fn now_millis() -> i64 {
     SystemTime::now()
@@ -773,18 +786,23 @@ pub fn message_about(prefix: &str, value: &str, suffix: &str) -> String {
 /// A resource kind this service refuses a request for when the request names one that is
 /// not there.
 ///
-/// EMR on EKS words every not-found refusal from the identifier the request named the
-/// resource by, in ONE form: `<Resource type> <identifier> doesn't exist.` — the form the
-/// recorded refusals of this service show for a job template and for a security
-/// configuration, and the form it uses for every other resource it serves. The resource
-/// type is spelled the way the service spells it in a message, which is NOT derivable from
-/// the shape name, so each kind carries its own spelling here.
+/// The wording of such a refusal belongs to the ERROR CLASS that carries it, not to the
+/// resource:
 ///
-/// Every operation that reports a resource missing carries
-/// [`ResourceKind::not_found_message`] in its own modelled error — beside
-/// [`PageRefusal::message`], the other wording this service shares — so the message cannot
-/// differ between two operations reporting the same kind of resource missing, nor drift
-/// from the form above.
+/// * a `ResourceNotFoundException` — the class an operation that MODELS a not-found error
+///   reports a missing resource in — is worded from the identifier the request named the
+///   resource by, in ONE form: `<Resource type> <identifier> doesn't exist.`
+///   ([`ResourceKind::not_found_message`]). The resource type is spelled the way the
+///   service spells it in a message, which is NOT derivable from the shape name, so each
+///   kind carries its own spelling here.
+/// * a `ValidationException` — the only client error an operation that models no not-found
+///   error has to report it in — is worded as a SHORT FIXED sentence carrying no
+///   identifier at all ([`ResourceKind::validation_not_found_message`]).
+///
+/// Every operation that reports a resource missing takes its wording from this type —
+/// beside [`PageRefusal::message`], the other wording this service shares — so the message
+/// cannot differ between two operations reporting the same kind of resource missing in the
+/// same error class, nor drift from the forms above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceKind {
     VirtualCluster,
@@ -819,6 +837,31 @@ impl ResourceKind {
             identifier,
             " doesn't exist.",
         )
+    }
+
+    /// The `message` a refusal carries when the request names no such resource of this
+    /// region and the operation has to report it through its modelled `ValidationException`
+    /// because it models no not-found error at all (`DeleteJobTemplate`,
+    /// `DeleteSecurityConfiguration`, `DeleteVirtualCluster`, `DeleteManagedEndpoint`,
+    /// `CancelJobRun`, `ListJobRuns`, `ListManagedEndpoints` — smithy_query: digest).
+    ///
+    /// That class is worded as a short sentence of FIXED text, with no identifier
+    /// interpolated into it, which is a different sentence from the not-found wording a
+    /// read of the same resource answers with ([`not_found_message`](Self::not_found_message)).
+    /// The sentences are not one template either — a job template's says the template does
+    /// not exist, a security configuration's says the configuration was not found — so each
+    /// kind carries the sentence this service words for it. A kind for which only the
+    /// not-found wording of the class above is known keeps it, rather than a short sentence
+    /// invented here: a message this service never emits would be as wrong as the one it
+    /// replaces.
+    pub fn validation_not_found_message(self, identifier: &str) -> String {
+        match self {
+            Self::JobTemplate => "Template does not exist".to_string(),
+            Self::SecurityConfiguration => "Security configuration not found".to_string(),
+            Self::VirtualCluster | Self::JobRun | Self::ManagedEndpoint => {
+                self.not_found_message(identifier)
+            }
+        }
     }
 }
 

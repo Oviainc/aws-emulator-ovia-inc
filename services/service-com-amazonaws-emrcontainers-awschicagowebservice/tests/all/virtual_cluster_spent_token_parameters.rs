@@ -27,6 +27,7 @@
 
 use serde_json::{json, Value};
 
+use crate::refusal_wording_by_error_class::SPENT_TOKEN_CONFLICT;
 use crate::virtual_cluster_job_run_loop::{field, text, Emr};
 
 /// Create one security configuration and answer its id, so a request can carry a
@@ -243,13 +244,13 @@ async fn a_spent_token_never_rewrites_the_cluster_it_already_names() {
             .send("POST", "/virtualclusters", Some(conflicting))
             .await;
         refusal.refused(case, 400, "ValidationException");
-        // The refusal is the TOKEN rule's, not some other `ValidationException`: it names
-        // the token that was spent and the cluster that token already named.
-        let token = text(&base, "/clientToken", case);
+        // The refusal is the TOKEN rule's, not some other `ValidationException`: it is the
+        // one fixed sentence an idempotency conflict carries, whichever operation refuses
+        // ([`crate::refusal_wording_by_error_class`] holds every operation to it).
         let message = text(&refusal.body, "/message", case);
-        assert!(
-            message.contains(&token) && message.contains(&first_id),
-            "case {case:?}: expected a refusal naming token {token:?} and cluster {first_id:?}, got {message:?}"
+        assert_eq!(
+            message, SPENT_TOKEN_CONFLICT,
+            "case {case:?}: expected message {SPENT_TOKEN_CONFLICT:?}, got {message:?}"
         );
 
         // Nothing the refused call asked for reached the store: the cluster reads back

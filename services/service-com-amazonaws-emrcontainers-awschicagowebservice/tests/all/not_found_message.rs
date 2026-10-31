@@ -8,10 +8,12 @@
 //! so routing, deserialization, constraint validation, the handler and serialization all
 //! run exactly as they do for an AWS SDK client.
 //!
-//! The rule under test: EMR on EKS words every not-found refusal the same way, from the
-//! identifier the request named the resource by — `<Resource type> <identifier> doesn't
-//! exist.` — whichever operation issues it and whichever of its modelled client errors
-//! carries it.
+//! The rule under test: EMR on EKS words a not-found refusal of THIS class the same way,
+//! from the identifier the request named the resource by — `<Resource type> <identifier>
+//! doesn't exist.` — whichever operation issues it and whichever of its modelled client
+//! errors carries it. The two operations whose `ValidationException` reports a missing
+//! resource as a short fixed sentence instead are the other class, pinned by
+//! [`crate::refusal_wording_by_error_class`].
 //!
 //! The tables span what that rule generalises over: which resource is missing (a virtual
 //! cluster, a job run, a managed endpoint, a job template, a security configuration),
@@ -265,15 +267,6 @@ fn probes_for(absent: &str, label: &str, host: &str, index: usize) -> Vec<Probe>
             NOT_FOUND,
         ),
         probe(
-            format!("DeleteJobTemplate, {label}"),
-            JOB_TEMPLATE,
-            absent,
-            "DELETE",
-            format!("/jobtemplates/{absent}"),
-            None,
-            INVALID_REQUEST,
-        ),
-        probe(
             format!("StartJobRun naming an absent job template, {label}"),
             JOB_TEMPLATE,
             absent,
@@ -293,15 +286,6 @@ fn probes_for(absent: &str, label: &str, host: &str, index: usize) -> Vec<Probe>
             format!("/securityconfigurations/{absent}"),
             None,
             NOT_FOUND,
-        ),
-        probe(
-            format!("DeleteSecurityConfiguration, {label}"),
-            SECURITY_CONFIGURATION,
-            absent,
-            "DELETE",
-            format!("/securityconfigurations/{absent}"),
-            None,
-            INVALID_REQUEST,
         ),
         probe(
             format!("CreateVirtualCluster naming an absent security configuration, {label}"),
@@ -421,15 +405,6 @@ async fn a_deleted_resource_is_reported_as_one_that_does_not_exist() {
             NOT_FOUND,
         ),
         probe(
-            "DeleteJobTemplate of a deleted template".to_string(),
-            JOB_TEMPLATE,
-            &template,
-            "DELETE",
-            format!("/jobtemplates/{template}"),
-            None,
-            INVALID_REQUEST,
-        ),
-        probe(
             "DescribeSecurityConfiguration of a deleted configuration".to_string(),
             SECURITY_CONFIGURATION,
             &configuration,
@@ -437,15 +412,6 @@ async fn a_deleted_resource_is_reported_as_one_that_does_not_exist() {
             format!("/securityconfigurations/{configuration}"),
             None,
             NOT_FOUND,
-        ),
-        probe(
-            "DeleteSecurityConfiguration of a deleted configuration".to_string(),
-            SECURITY_CONFIGURATION,
-            &configuration,
-            "DELETE",
-            format!("/securityconfigurations/{configuration}"),
-            None,
-            INVALID_REQUEST,
         ),
     ];
     for current in &probes {

@@ -199,11 +199,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(ListManagedEndpointsErrorModeled::ValidationException(
                 ValidationException {
-                    // The one not-found wording of this service
-                    // ([`crate::state::ResourceKind`]), built from the requested id.
+                    // This service's wording for a missing resource reported in THIS error
+                    // class ([`crate::state::ResourceKind`]), about the requested cluster.
                     message: Some(
                         crate::state::ResourceKind::VirtualCluster
-                            .not_found_message(&input.virtual_cluster_id),
+                            .validation_not_found_message(&input.virtual_cluster_id),
                     ),
                 },
             )

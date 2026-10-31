@@ -433,10 +433,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             if existing.request_fingerprint != fingerprint {
                 return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
-                    message: Some(format!(
-                        "clientToken {} was already used to start job run {}, with different parameters",
-                        input.client_token, existing.id
-                    )),
+                    // The one wording an idempotency conflict carries in this service
+                    // ([`crate::state::IDEMPOTENCY_CONFLICT_MESSAGE`]): fixed text, naming
+                    // neither the token nor the run it already started.
+                    message: Some(crate::state::IDEMPOTENCY_CONFLICT_MESSAGE.to_string()),
                 })
                 .into());
             }

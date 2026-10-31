@@ -45,6 +45,8 @@ mod not_found_message;
 mod paginated_page_bounds;
 #[path = "all/refusal_message_bound.rs"]
 mod refusal_message_bound;
+#[path = "all/refusal_wording_by_error_class.rs"]
+mod refusal_wording_by_error_class;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/resource_tag_listing.rs"]

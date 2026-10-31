@@ -212,10 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if existing.request_fingerprint != fingerprint {
                 return Err(CreateJobTemplateErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(format!(
-                            "clientToken {} was already used to create job template {}, with different parameters",
-                            input.client_token, existing.id
-                        )),
+                        // The one wording an idempotency conflict carries in this service
+                        // ([`crate::state::IDEMPOTENCY_CONFLICT_MESSAGE`]): fixed text,
+                        // naming neither the token nor the template it already minted.
+                        message: Some(
+                            crate::state::IDEMPOTENCY_CONFLICT_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

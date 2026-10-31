@@ -248,10 +248,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state.endpoint_session(&region, &virtual_cluster_id, &endpoint_id, &id)
             }) {
                 if existing.request_fingerprint != fingerprint {
-                    return Err(invalid_request(format!(
-                        "clientToken {client_token} was already used to issue session credentials {}, with different parameters",
-                        existing.id
-                    )));
+                    // The one wording an idempotency conflict carries in this service
+                    // ([`crate::state::IDEMPOTENCY_CONFLICT_MESSAGE`]): fixed text, naming
+                    // neither the token nor the session it already issued.
+                    return Err(invalid_request(
+                        crate::state::IDEMPOTENCY_CONFLICT_MESSAGE.to_string(),
+                    ));
                 }
                 return Ok(existing.to_session_credentials());
             }
