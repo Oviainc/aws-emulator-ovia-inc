@@ -12,11 +12,15 @@
 //! the `ClientToken` the request that minted it carried, so a repeat of that request
 //! reports the same license instead of minting a second one.
 //!
-//! A license's **entitlement consumption** is held as one record per outstanding
-//! grant, keyed by the consumption token that grant was issued under, so the usage
-//! of an entitlement is the sum over those records: a report of the usage
-//! recomputes it from stored state instead of reading a counter, and releasing a
-//! grant drops exactly what it consumed.
+//! A license's **entitlement consumption** is held as one record per grant a
+//! checkout answered, keyed by the consumption token that grant was issued under,
+//! so the usage of an entitlement is the sum over the grants that still hold units:
+//! a report of the usage recomputes it from stored state instead of reading a
+//! counter, and releasing a grant drops exactly what it consumed. A released or
+//! expired grant is KEPT, holding nothing, so the token it was issued under can
+//! never be checked out, checked in or extended again — and a store at its cap
+//! reclaims the record released longest ago, which no caller can tell apart,
+//! because a released token is refused whether its record is still held or not.
 //!
 //! Tags live in their own ARN-keyed map rather than on the record: `TagResource`,
 //! `UntagResource` and `ListTagsForResource` are modelled against a generic
@@ -32,11 +36,13 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ConsumedLicenseSummary, ConsumptionConfiguration, DatetimeRange, Entitlement, Issuer,
-    IssuerDetails, License, LicenseConfiguration, ManagedResourceSummary, Metadata,
+    ConsumedLicenseSummary, ConsumptionConfiguration, DatetimeRange, Entitlement, EntitlementData,
+    Issuer, IssuerDetails, License, LicenseConfiguration, ManagedResourceSummary, Metadata,
     ProductInformation, Tag, ENTITLEMENT_UNIT_VALUES, RENEW_TYPE_VALUES,
 };
 
@@ -82,6 +88,30 @@ pub const STATUS_AVAILABLE: &str = "AVAILABLE";
 /// `PENDING_AVAILABLE` belongs to a license a grant workflow is still activating,
 /// which nothing in this slice produces.
 pub const LICENSE_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The `CheckoutType` of a checkout the license's provisional configuration bounds
+/// in time. One of the modelled `CheckoutType` values
+/// (`smithy_query(query="shape",shape="CheckoutType")`).
+pub const CHECKOUT_TYPE_PROVISIONAL: &str = "PROVISIONAL";
+
+/// The `CheckoutType` of a checkout no time to live bounds; it lasts as long as the
+/// license it was taken on is valid. The other modelled `CheckoutType` value.
+pub const CHECKOUT_TYPE_PERPETUAL: &str = "PERPETUAL";
+
+/// The entitlement unit that carries a resource rather than a count: the modelled
+/// `EntitlementUnit`/`EntitlementDataUnit` value `Entitlement.Value` is documented
+/// against ("Entitlement resource. Use only if the unit is None").
+pub const ENTITLEMENT_UNIT_NONE: &str = "None";
+
+/// The fewest characters a `SignedToken` carries: the modelled minimum length of
+/// the token a checkout answers with
+/// (`smithy_query(query="shape",shape="SignedToken")`).
+pub const SIGNED_TOKEN_MIN_LEN: usize = 4096;
+
+/// The domain tag mixed into the key a grant's signed token is MAC'd under, and
+/// into the filler that token carries, so neither can be confused with the issuer
+/// fingerprint digest [`issuer_key_fingerprint`] derives.
+const SIGNED_TOKEN_DOMAIN: &str = "license-manager:signed-token:v1";
 
 /// The version `CreateLicense` gives a license it mints. License versions are
 /// numbered from 1 and only `CreateLicenseVersion` moves one on
@@ -324,22 +354,364 @@ impl StoredLicense {
     }
 }
 
-/// One outstanding checkout's consumption of a license's entitlements, keyed by the
+/// One checkout's consumption of a license's entitlements, keyed by the
 /// `LicenseConsumptionToken` that checkout answered.
 ///
 /// Consumption is persisted HERE and nowhere else, so a license's entitlement usage
-/// is the sum over these records rather than a counter some operation moved: a
-/// record is added when a checkout grants entitlements and dropped when the grant is
-/// released, and every read of the usage recomputes the same total from them.
+/// is the sum over the grants that still hold units rather than a counter some
+/// operation moved: a record is added when a checkout grants entitlements and stops
+/// holding them when the grant is released or its expiration passes, and every read
+/// of the usage recomputes the same total from them.
 #[derive(Debug, Clone, Default)]
 pub struct StoredLicenseConsumption {
     /// The consumption token the checkout minted; this record's store key.
     pub token: String,
     /// The ARN of the license whose entitlements this record consumes.
     pub license_arn: String,
+    /// The `ClientToken` of the checkout that was answered with this grant, so a
+    /// repeat of that checkout is answered from this record instead of granting the
+    /// same entitlements twice.
+    pub client_token: String,
+    /// The `CheckoutType` the checkout asked for; one of
+    /// [`CHECKOUT_TYPE_PROVISIONAL`] and [`CHECKOUT_TYPE_PERPETUAL`].
+    pub checkout_type: String,
+    /// The node the checkout named, absent when it named none.
+    pub node_id: Option<String>,
+    /// The beneficiary the checkout named, absent when it named none.
+    pub beneficiary: Option<String>,
+    /// The entitlements this grant was allowed, as the checkout that minted it
+    /// reports them.
+    pub entitlements_allowed: Vec<EntitlementData>,
     /// How many units of each entitlement — keyed by the `Entitlement.Name` the
     /// license declares — this checkout holds, in that entitlement's own unit.
     pub consumed_units: BTreeMap<String, i64>,
+    /// The ISO8601-UTC instant this grant was issued at.
+    pub issued_at: String,
+    /// The ISO8601-UTC instant this grant expires at, absent when nothing bounds
+    /// it.
+    pub expiration: Option<String>,
+    /// The instant a check-in released this grant, absent while it is still
+    /// outstanding. A released grant is kept, so its token can never be reused.
+    pub checked_in_at: Option<String>,
+}
+
+impl StoredLicenseConsumption {
+    /// Whether this grant is still outstanding: no check-in has released it.
+    pub fn is_outstanding(&self) -> bool {
+        self.checked_in_at.is_none()
+    }
+
+    /// Whether this grant's expiration has passed.
+    pub fn has_expired(&self) -> bool {
+        self.expiration
+            .as_deref()
+            .and_then(parse_instant)
+            .is_some_and(|expiration| expiration <= now_secs())
+    }
+
+    /// Whether this grant still holds the units it consumed: a grant holds them
+    /// until a check-in releases it or its expiration passes, whichever comes
+    /// first.
+    ///
+    /// An expiration the clock has already made due releases the units whether or
+    /// not anybody calls, so it is answered HERE, from the stored instant, rather
+    /// than written into the store by whichever operation happens to look next.
+    pub fn holds_units(&self) -> bool {
+        self.is_outstanding() && !self.has_expired()
+    }
+
+    /// The `SignedToken` a checkout of this grant answers with: a compact JWS,
+    /// `<header>.<claims>.<mac>` with each segment base64url, whose claims are THIS
+    /// record and the license it is a grant on — so the token is derived from stored
+    /// state and from nothing else, and the repeat of a checkout answers the token
+    /// its first call answered.
+    ///
+    /// This emulator holds no issuer key material — [`issuer_key_fingerprint`]
+    /// IDENTIFIES an issuer, it does not certify one — so the third segment is an
+    /// HMAC-SHA256 over the first two under a key derived from that fingerprint: it
+    /// binds the token to one grant of one issuer's licenses in this store, and
+    /// certifies nothing.
+    ///
+    /// The member is modelled at [`SIGNED_TOKEN_MIN_LEN`] characters or more, which
+    /// the claims of a single grant do not reach, so a filler claim expanded from
+    /// this grant's own token carries it up to that length.
+    pub fn signed_token(&self, license: &StoredLicense) -> String {
+        let header = base64url(
+            ::serde_json::json!({"alg": "HS256", "typ": "JWT"})
+                .to_string()
+                .as_bytes(),
+        );
+        let mut filler_len = 0_usize;
+        loop {
+            let claims = self.token_claims(license, &token_filler(&self.token, filler_len));
+            let token = jws(&header, &claims.to_string(), &signed_token_key(license));
+            if token.len() >= SIGNED_TOKEN_MIN_LEN {
+                return token;
+            }
+            // Every filler character lengthens the token by at least one, so
+            // raising the filler by the shortfall converges in a couple of rounds.
+            filler_len += SIGNED_TOKEN_MIN_LEN - token.len();
+        }
+    }
+
+    /// The claims this grant's signed token carries: the grant, and the license it
+    /// is a grant on, plus `filler` under a `pad` claim — the token stays one whose
+    /// MAC covers every claim in it, and the padding is what carries its length up to
+    /// the modelled minimum.
+    fn token_claims(&self, license: &StoredLicense, filler: &str) -> ::serde_json::Value {
+        ::serde_json::json!({
+            "iss": license.issuer.name,
+            "sub": license.arn,
+            "jti": self.token,
+            "iat": parse_instant(&self.issued_at).map(|secs| secs as i64),
+            "exp": self.expiration.as_deref().and_then(parse_instant).map(|secs| secs as i64),
+            "ProductSKU": license.product_sku,
+            "KeyFingerprint": license.issuer.key_fingerprint,
+            "CheckoutType": self.checkout_type,
+            "NodeId": self.node_id,
+            "Beneficiary": self.beneficiary,
+            "LicenseName": license.license_name,
+            "ProductName": license.product_name,
+            "HomeRegion": license.home_region,
+            "Validity": {"Begin": license.validity.begin, "End": license.validity.end},
+            "EntitlementsAllowed": self
+                .entitlements_allowed
+                .iter()
+                .map(|entitlement| ::serde_json::json!({
+                    "Name": entitlement.name,
+                    "Value": entitlement.value,
+                    "Unit": entitlement.unit,
+                }))
+                .collect::<Vec<_>>(),
+            "pad": filler,
+        })
+    }
+}
+
+/// One compact JWS over `claims`: the base64url of `header` and of `claims`, joined
+/// by `.`, then the base64url of the HMAC-SHA256 of that text under `key`.
+fn jws(header: &str, claims: &str, key: &[u8]) -> String {
+    let signing_input = format!("{header}.{}", base64url(claims.as_bytes()));
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        // HMAC accepts a key of any length, so this cannot fail for a digest.
+        .expect("HMAC-SHA256 takes a key of any length");
+    mac.update(signing_input.as_bytes());
+    format!(
+        "{signing_input}.{}",
+        base64url(&mac.finalize().into_bytes())
+    )
+}
+
+/// One base64url segment of a compact JWS: unpadded, as that encoding requires.
+fn base64url(bytes: &[u8]) -> String {
+    ::base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// The key a grant on `license` has its signed token MAC'd under: the digest of
+/// this service's token domain and the license issuer's fingerprint. The
+/// fingerprint is a public identifier, so no key material is held here — the MAC
+/// makes a token self-consistent against this store, it does not certify it.
+fn signed_token_key(license: &StoredLicense) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(SIGNED_TOKEN_DOMAIN.as_bytes());
+    digest.update(
+        license
+            .issuer
+            .key_fingerprint
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    digest.finalize().into()
+}
+
+/// `len` characters of filler for a signed token's filler claim, expanded from
+/// `seed` block by block so one grant's token is stable and two grants' tokens
+/// differ.
+fn token_filler(seed: &str, len: usize) -> String {
+    let mut filler = String::with_capacity(len);
+    let mut block = 0_u64;
+    while filler.len() < len {
+        let mut digest = Sha256::new();
+        digest.update(SIGNED_TOKEN_DOMAIN.as_bytes());
+        digest.update(seed.as_bytes());
+        digest.update(block.to_be_bytes());
+        filler.push_str(&::hex::encode(digest.finalize()));
+        block = block.wrapping_add(1);
+    }
+    filler.truncate(len);
+    filler
+}
+
+/// The instant a checkout of `license` of type `checkout_type`, issued at
+/// `issued_at`, expires at — or `None` when nothing bounds it.
+///
+/// A `PROVISIONAL` checkout is bounded by the license's own
+/// `ConsumptionConfiguration.ProvisionalConfiguration.MaxTimeToLiveInMinutes`
+/// ("Maximum time for the provisional configuration, in minutes",
+/// `smithy_query(query="shape",shape="ProvisionalConfiguration")`), so it expires
+/// that many minutes after it is issued. No checkout outlives the license it is a
+/// checkout of, so a validity end that comes first wins; a `PERPETUAL` checkout —
+/// one no time to live bounds — expires exactly when the license's validity ends,
+/// and never when the license names no end.
+pub fn checkout_expiration(
+    license: &StoredLicense,
+    checkout_type: &str,
+    issued_at: &str,
+) -> Option<String> {
+    let time_to_live = (checkout_type == CHECKOUT_TYPE_PROVISIONAL)
+        .then_some(license.consumption_configuration.provisional_configuration.as_ref())
+        .flatten()
+        .and_then(|provisional| {
+            instant_plus_minutes(issued_at, i64::from(provisional.max_time_to_live_in_minutes))
+        });
+    match (time_to_live, license.validity.end.clone()) {
+        (Some(bound), Some(validity_end)) => Some(earlier(bound, validity_end)),
+        (Some(bound), None) => Some(bound),
+        (None, validity_end) => validity_end,
+    }
+}
+
+/// The earlier of two ISO8601 instants, decided on the PARSED instants so a zone
+/// offset is honoured rather than compared as text. An instant this emulator cannot
+/// parse leaves `first` in place, because the member's modelled pattern is what
+/// admits it.
+fn earlier(first: String, second: String) -> String {
+    match (parse_instant(&first), parse_instant(&second)) {
+        (Some(first_secs), Some(second_secs)) if second_secs < first_secs => second,
+        _ => first,
+    }
+}
+
+/// `instant` moved on by `minutes`, as an ISO8601-UTC instant, or `None` when
+/// `instant` is not one this emulator can parse.
+fn instant_plus_minutes(instant: &str, minutes: i64) -> Option<String> {
+    let seconds = parse_instant(instant)? as i64 + minutes.saturating_mul(60);
+    ::aws_smithy_types::DateTime::from_secs(seconds)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+}
+
+/// What a checkout of a license's entitlements was granted: the entitlements it is
+/// allowed, and the units of each of them it consumes.
+#[derive(Debug, Clone, Default)]
+pub struct CheckoutGrant {
+    /// The entitlements the checkout is allowed, in the order it asked for them.
+    pub entitlements_allowed: Vec<EntitlementData>,
+    /// The units of each allowed entitlement the checkout consumes, keyed by the
+    /// `Entitlement.Name` the license declares.
+    pub consumed_units: BTreeMap<String, i64>,
+}
+
+/// Why a checkout of a license's entitlements is not allowed, as the modelled error
+/// the refusal is answered on.
+#[derive(Debug, Clone)]
+pub enum CheckoutRefusal {
+    /// The license declares no entitlement the request named, or an entitlement it
+    /// named is already consumed up to the maximum count it caps — the two cases
+    /// the modelled `NoEntitlementsAllowedException` carries.
+    NoEntitlementsAllowed(String),
+    /// A value the request carried for an entitlement is not a count of that
+    /// entitlement's unit — the modelled `InvalidParameterValueException`.
+    InvalidParameterValue(String),
+}
+
+/// The message the modelled `ResourceNotFoundException` carries for a license
+/// consumption token that names no checkout this service can act on, as AWS words it
+/// for that error class. The member it names is the request's own
+/// `LicenseConsumptionToken`, and the value is not echoed back.
+pub const INVALID_CONSUMPTION_TOKEN: &str = "Invalid value of consumptionToken.";
+
+/// The message the modelled `NoEntitlementsAllowedException` carries, as AWS words
+/// it for that error class: a license that declares none of the entitlements a
+/// checkout asked for, and one whose entitlement is already consumed up to the
+/// maximum count it caps, are the same refusal in the same words.
+const NO_ENTITLEMENTS_ALLOWED: &str = "No Entitlements Allowed.";
+
+/// How many units of `entitlement` the request `data` takes of it.
+///
+/// `Value` is the count for every unit but `None`, which the model documents as
+/// carrying the entitlement RESOURCE rather than a count, so a grant on one of those
+/// is one grant; a request that carries no `Value` takes one unit. A count the
+/// entitlement's unit cannot hold — text that is not a number, or a negative one —
+/// is refused rather than rounded or ignored.
+fn requested_units(
+    entitlement: &Entitlement,
+    data: &EntitlementData,
+) -> Result<i64, CheckoutRefusal> {
+    if entitlement.unit == ENTITLEMENT_UNIT_NONE {
+        return Ok(1);
+    }
+    match data.value.as_deref() {
+        None => Ok(1),
+        Some(value) => value
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|units| *units >= 0)
+            .ok_or_else(|| {
+                CheckoutRefusal::InvalidParameterValue(format!(
+                    "Value of the entitlement '{}' must be a count of {}, got '{value}'",
+                    data.name, entitlement.unit
+                ))
+            }),
+    }
+}
+
+/// The `Value` a checkout reports for an entitlement it was allowed: the units it
+/// was granted for a counted entitlement, and the entitlement's own resource for one
+/// whose unit is `None`.
+fn granted_value(entitlement: &Entitlement, units: i64) -> Option<String> {
+    if entitlement.unit == ENTITLEMENT_UNIT_NONE {
+        entitlement.value.clone()
+    } else {
+        Some(units.to_string())
+    }
+}
+
+/// What a check-in of a consumption token did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckInOutcome {
+    /// The grant was still holding its units, and this check-in released them.
+    Released,
+    /// The token names a grant that holds nothing any more: an earlier check-in or
+    /// its expiration released it.
+    AlreadyReleased,
+    /// No checkout has ever been answered with this token.
+    UnknownToken,
+}
+
+/// Why the members a checkout carries are unacceptable, or `None` when every one of
+/// them fits the store.
+///
+/// The model publishes no length for any string on a checkout and no size for its
+/// entitlement list, so those bounds live here with the store that holds them, like
+/// every other caller-sized value of this service.
+pub fn checkout_input_rejection(
+    product_sku: &str,
+    key_fingerprint: &str,
+    node_id: Option<&str>,
+    beneficiary: Option<&str>,
+    entitlements: &[EntitlementData],
+) -> Option<String> {
+    text_rejection("ProductSKU", Some(product_sku))
+        .or_else(|| text_rejection("KeyFingerprint", Some(key_fingerprint)))
+        .or_else(|| text_rejection("NodeId", node_id))
+        .or_else(|| text_rejection("Beneficiary", beneficiary))
+        .or_else(|| {
+            list_rejection(
+                "Entitlements",
+                entitlements.len(),
+                MAX_COLLECTION_ENTRIES,
+            )
+        })
+        .or_else(|| {
+            entitlements.iter().find_map(|data| {
+                text_rejection("an Entitlements entry's Name", Some(&data.name)).or_else(|| {
+                    text_rejection("an Entitlements entry's Value", data.value.as_deref())
+                })
+            })
+        })
 }
 
 /// Per-service state for com-amazonaws-licensemanager-awslicensemanager. A handler
@@ -360,9 +732,10 @@ pub struct ComAmazonawsLicensemanagerAwslicensemanagerState {
     /// [`Self::remove_license`], so it holds at most one entry per stored license
     /// and is bounded by [`MAX_LICENSES`].
     pub license_client_tokens: BTreeMap<String, String>,
-    /// Every outstanding consumption of a license's entitlements, keyed by the
-    /// consumption token it was granted under. A `BTreeMap` so the usage read walks
-    /// them in one stable order, and so a token names at most one record.
+    /// Every consumption of a license's entitlements, keyed by the consumption token
+    /// it was granted under, whether it still holds those units or a check-in or its
+    /// expiration has released them. A `BTreeMap` so the usage read walks them in one
+    /// stable order, and so a token names at most one grant for ever.
     pub license_consumptions: BTreeMap<String, StoredLicenseConsumption>,
     /// Tags, keyed by resource ARN then tag key. Shared by `TagResource`,
     /// `UntagResource` and `ListTagsForResource`, and seeded from the `Tags` passed
@@ -466,18 +839,29 @@ impl ComAmazonawsLicensemanagerAwslicensemanagerState {
     }
 
     /// Store one checkout's consumption of a license's entitlements, refusing it —
-    /// and changing nothing — when the store already holds
-    /// [`MAX_LICENSE_CONSUMPTIONS`] or already holds a record under this token.
+    /// and changing nothing — when this token already names a grant, or when the
+    /// store is at [`MAX_LICENSE_CONSUMPTIONS`] and every grant it holds still holds
+    /// its units.
     ///
     /// The bound is enforced HERE, at the growth site, like every other store bound
     /// in this file, so no caller can grow the map past it by forgetting a
     /// pre-check, and a repeated token can never silently replace a stored grant.
+    /// It bounds the grants this emulator HOLDS rather than the history of them: at
+    /// the cap, the grant released longest ago is reclaimed to make room, which no
+    /// caller can tell apart, because a token whose grant was released is refused
+    /// whether the record is still there or not.
     /// `false` means nothing was stored.
     #[must_use]
     pub fn insert_consumption(&mut self, consumption: StoredLicenseConsumption) -> bool {
-        if self.license_consumptions.len() >= MAX_LICENSE_CONSUMPTIONS
-            || self.license_consumptions.contains_key(&consumption.token)
+        if self
+            .license_consumptions
+            .contains_key(&consumption.token)
             || consumption.token.is_empty()
+        {
+            return false;
+        }
+        if self.license_consumptions.len() >= MAX_LICENSE_CONSUMPTIONS
+            && !self.reclaim_released_consumption()
         {
             return false;
         }
@@ -486,17 +870,201 @@ impl ComAmazonawsLicensemanagerAwslicensemanagerState {
         true
     }
 
+    /// Drop the grant that stopped holding its units longest ago, and say whether
+    /// there was one to drop. A grant released by a check-in carries the instant
+    /// that released it; one released by its expiration carries none, so it is
+    /// reclaimed first, and the issue order breaks any tie.
+    fn reclaim_released_consumption(&mut self) -> bool {
+        let reclaimable = self
+            .license_consumptions
+            .values()
+            .filter(|consumption| !consumption.holds_units())
+            .min_by(|first, second| {
+                first
+                    .checked_in_at
+                    .cmp(&second.checked_in_at)
+                    .then_with(|| first.issued_at.cmp(&second.issued_at))
+            })
+            .map(|consumption| consumption.token.clone());
+        match reclaimable {
+            Some(token) => self.license_consumptions.remove(&token).is_some(),
+            None => false,
+        }
+    }
+
+    /// The license a checkout of `product_sku` presenting `key_fingerprint`
+    /// resolves to, or `None` when the store holds no license of that product from
+    /// that issuer.
+    ///
+    /// A checkout names no ARN: it names the product and the issuer key fingerprint,
+    /// which together are the key [`issuer_key_fingerprint`] exists to make
+    /// resolvable. The walk is over the ARN-keyed store, so the resolution is in one
+    /// stable total order on every call.
+    pub fn license_for_checkout(
+        &self,
+        product_sku: &str,
+        key_fingerprint: &str,
+    ) -> Option<&StoredLicense> {
+        self.licenses.values().find(|license| {
+            license.product_sku == product_sku
+                && license.issuer.key_fingerprint.as_deref() == Some(key_fingerprint)
+        })
+    }
+
+    /// Whether the store holds any license of the product `product_sku`, whatever
+    /// issuer issued it. What a checkout whose (`ProductSKU`, `KeyFingerprint`) pair
+    /// resolved nothing asks to say WHICH half of the pair named nothing.
+    pub fn has_license_for_product_sku(&self, product_sku: &str) -> bool {
+        self.licenses
+            .values()
+            .any(|license| license.product_sku == product_sku)
+    }
+
+    /// The grant `token` was issued under, whether it still holds its units or an
+    /// earlier check-in or its expiration has released them.
+    pub fn consumption(&self, token: &str) -> Option<&StoredLicenseConsumption> {
+        self.license_consumptions.get(token)
+    }
+
+    /// The still-held grant on the license `license_arn` that the checkout carrying
+    /// `client_token` was answered with, or `None` when no accepted checkout of that
+    /// license carried it. This is what makes the repeat of a checkout idempotent:
+    /// the second call reports this grant and consumes nothing more.
+    ///
+    /// The token is scoped to the license it was used against, like the one
+    /// [`Self::insert_license`] keys a create by, so reusing a token on another
+    /// license is answered with that license's own grant rather than this one's.
+    pub fn held_consumption_for_client_token(
+        &self,
+        license_arn: &str,
+        client_token: &str,
+    ) -> Option<&StoredLicenseConsumption> {
+        self.license_consumptions.values().find(|consumption| {
+            consumption.license_arn == license_arn
+                && consumption.client_token == client_token
+                && consumption.holds_units()
+        })
+    }
+
+    /// Move the expiration of the grant `token` names on to `expiration`, and say
+    /// whether a grant was there to move. A grant that holds nothing any more is not
+    /// moved: the caller resolves it first, so this only writes the new bound.
+    pub fn extend_consumption(&mut self, token: &str, expiration: Option<String>) -> bool {
+        match self.license_consumptions.get_mut(token) {
+            Some(consumption) if consumption.holds_units() => {
+                consumption.expiration = expiration;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Release the grant `token` names, at the instant `at`, and say what that did.
+    ///
+    /// The record is KEPT, holding nothing from now on, so the token names the grant
+    /// it was issued for: a grant that holds nothing any more — released by an
+    /// earlier check-in or by its expiration — releases nothing a second time, which
+    /// is the same question [`Self::extend_consumption`] asks of a token, and no
+    /// later checkout can be answered with it.
+    pub fn check_in_consumption(&mut self, token: &str, at: String) -> CheckInOutcome {
+        match self.license_consumptions.get_mut(token) {
+            None => CheckInOutcome::UnknownToken,
+            Some(consumption) if !consumption.holds_units() => CheckInOutcome::AlreadyReleased,
+            Some(consumption) => {
+                consumption.checked_in_at = Some(at);
+                CheckInOutcome::Released
+            }
+        }
+    }
+
+    /// What a checkout of `requested` against `license` is granted, or why it is
+    /// refused.
+    ///
+    /// A requested entitlement is matched against the ones the license DECLARES, by
+    /// name and unit together: a name the license does not declare, and a name it
+    /// declares in another unit, are both entitlements this license does not have.
+    /// The units a request takes of an entitlement are the count its `Value` names —
+    /// one unit when it names none, and one grant on the resource when the
+    /// entitlement's unit is `None`, where the model documents `Value` as the
+    /// resource rather than a count. A grant is allowed only while the units it
+    /// would add leave that entitlement's total at or below the maximum count the
+    /// entitlement caps, unless the entitlement allows overage, and an entitlement
+    /// that caps no maximum count caps nothing
+    /// (`smithy_query(query="shape",shape="Entitlement")`).
+    pub fn allow_checkout(
+        &self,
+        license: &StoredLicense,
+        requested: &[EntitlementData],
+    ) -> Result<CheckoutGrant, CheckoutRefusal> {
+        if requested.is_empty() {
+            return Err(CheckoutRefusal::NoEntitlementsAllowed(
+                NO_ENTITLEMENTS_ALLOWED.to_string(),
+            ));
+        }
+        let mut grant = CheckoutGrant::default();
+        for data in requested {
+            let entitlement = license
+                .entitlements
+                .iter()
+                .find(|entitlement| entitlement.name == data.name && entitlement.unit == data.unit)
+                .ok_or_else(|| {
+                    CheckoutRefusal::NoEntitlementsAllowed(NO_ENTITLEMENTS_ALLOWED.to_string())
+                })?;
+            let units = requested_units(entitlement, data)?;
+            let running = grant
+                .consumed_units
+                .entry(entitlement.name.clone())
+                .or_default();
+            *running = running.saturating_add(units);
+            let total = self
+                .consumed_entitlement_units(&license.arn, &entitlement.name)
+                .saturating_add(*running);
+            if let Some(max_count) = entitlement.max_count {
+                if total > max_count && !entitlement.overage.unwrap_or(false) {
+                    return Err(CheckoutRefusal::NoEntitlementsAllowed(
+                        NO_ENTITLEMENTS_ALLOWED.to_string(),
+                    ));
+                }
+            }
+            grant.entitlements_allowed.push(EntitlementData {
+                name: entitlement.name.clone(),
+                value: granted_value(entitlement, units),
+                unit: entitlement.unit.clone(),
+            });
+        }
+        Ok(grant)
+    }
+
+    /// A `<32 hex>` consumption token no grant in the store is keyed by.
+    pub fn fresh_consumption_token(&mut self) -> String {
+        let consumptions = &self.license_consumptions;
+        fresh_id(
+            &mut self.id_counter,
+            // No prefix: the model types `LicenseConsumptionToken` as a plain String
+            // and publishes no format for it
+            // (`smithy_query(query="operation",operation="CheckoutLicense")`), so a
+            // token is minted as the same opaque `<32 hex>` id every other record of
+            // this service is keyed by, under no prefix that would claim a format AWS
+            // does not document.
+            "",
+            consumptions.len(),
+            |candidate| consumptions.contains_key(candidate),
+        )
+    }
+
     /// How many units of the entitlement `entitlement_name` of the license
     /// `license_arn` are consumed: the sum of that entitlement's units over every
-    /// consumption record the store holds against that license. Zero when none is
-    /// outstanding, which is what a license nothing has checked out consumes.
+    /// grant the store holds against that license that still holds its units. Zero
+    /// when none does, which is what a license nothing has checked out consumes.
     ///
     /// A read of the usage computes this; it never writes, so two reads of an
     /// unchanged store report the same total.
     pub fn consumed_entitlement_units(&self, license_arn: &str, entitlement_name: &str) -> i64 {
         self.license_consumptions
             .values()
-            .filter(|consumption| consumption.license_arn == license_arn)
+            .filter(|consumption| {
+                consumption.license_arn == license_arn && consumption.holds_units()
+            })
             .filter_map(|consumption| consumption.consumed_units.get(entitlement_name))
             .fold(0_i64, |total, units| total.saturating_add(*units))
     }
@@ -1035,6 +1603,14 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .map(|scope| scope.region)
         .filter(|region| is_region_token(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Now, in seconds since the Unix epoch, for ordering a stored instant against the
+/// clock: what decides whether a grant's expiration has already passed.
+fn now_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |since_epoch| since_epoch.as_secs_f64())
 }
 
 /// Now, in nanoseconds since the Unix epoch — only an id-generator seed.

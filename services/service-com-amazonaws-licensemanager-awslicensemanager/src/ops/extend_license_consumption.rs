@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExtendLicenseConsumption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExtendLicenseConsumption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExtendLicenseConsumption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Extends the expiration of the ONE grant its consumption token names, to the instant
+//! a checkout of the same type taken now would expire at, and PERSISTS that — so a later
+//! read of the grant, and the check-in that releases it, see the extended bound. A grant
+//! nothing holds any more is not extended: its token named a checkout that is over.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +152,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExtendLicenseConsumption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExtendLicenseConsumptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExtendLicenseConsumption"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+
+        // The grant this token names, and the license it is a grant on: the bound an
+        // extension moves the grant to is the license's own, so it is read from the
+        // license rather than carried on the request. A token no checkout was answered
+        // with, and one whose grant a check-in or its expiration has already released,
+        // are one refusal: neither names a consumption there is anything left to
+        // extend.
+        let grant = store
+            .consumption(&input.license_consumption_token)
+            .filter(|grant| grant.holds_units())
+            .ok_or_else(not_found)?;
+        let license_arn = grant.license_arn.clone();
+        let checkout_type = grant.checkout_type.clone();
+        let license = store
+            .license(&license_arn)
+            .ok_or_else(|| {
+                // A license delete drops the grants on it, so a grant whose license is
+                // gone cannot be reached through the store at all.
+                store_inconsistent(&license_arn)
+            })?
+            .clone();
+
+        let expiration = crate::state::checkout_expiration(
+            &license,
+            &checkout_type,
+            &crate::state::now_iso8601(),
+        );
+
+        // `DryRun` asks what the request WOULD do without doing it, so the extension
+        // is computed and nothing is written; without it the new bound is persisted on
+        // the grant, which is what makes the extension outlive this call.
+        if !input.dry_run {
+            if !store.extend_consumption(&input.license_consumption_token, expiration.clone()) {
+                return Err(not_found());
+            }
+            crate::state::record_mutation(Self::NAME, &license_arn, ctx.parts());
+        }
+
+        Ok(ExtendLicenseConsumptionOutput {
+            license_consumption_token: Some(input.license_consumption_token),
+            expiration,
+        })
     }
+}
+
+/// The modelled server error for a store this handler cannot reach.
+fn store_unavailable() -> ExtendLicenseConsumptionError {
+    ExtendLicenseConsumptionErrorModeled::ServerInternalException(ServerInternalException {
+        message: Some("the license store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The modelled 400 for a consumption token that names no consumption this
+/// operation can extend, worded as AWS words it for that error class: the token is
+/// the only resource the request names, and the refusal names the member rather than
+/// echoing its value.
+fn not_found() -> ExtendLicenseConsumptionError {
+    ExtendLicenseConsumptionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::INVALID_CONSUMPTION_TOKEN.to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for a grant whose license the store no longer holds,
+/// which [`crate::state::ComAmazonawsLicensemanagerAwslicensemanagerState::remove_license`]
+/// makes unreachable: it is this service's own inconsistency, not a bad request.
+fn store_inconsistent(license_arn: &str) -> ExtendLicenseConsumptionError {
+    ExtendLicenseConsumptionErrorModeled::ServerInternalException(ServerInternalException {
+        message: Some(format!(
+            "the license {license_arn} this checkout was taken on is no longer stored"
+        )),
+    })
+    .into()
 }

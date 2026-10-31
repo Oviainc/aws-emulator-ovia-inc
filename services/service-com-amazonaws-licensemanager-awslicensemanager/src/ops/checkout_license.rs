@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CheckoutLicense
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CheckoutLicense`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Checks out entitlements of the ONE license the request's product SKU and issuer key
+//! fingerprint name, and PERSISTS that checkout as a grant keyed by the consumption
+//! token it answers with — so the units it consumed are in the license's usage until a
+//! check-in releases them or the grant expires, and the repeat of a checkout is answered
+//! from the grant its first call minted instead of consuming the entitlements twice.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CheckoutLicense::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `Beneficiary` is persisted on the grant rather than enforced. The operation documents
+//! that an account checking out a license it created must name itself as the beneficiary;
+//! this emulator models no per-principal ownership of a license — as `crate::state` records
+//! for the whole service, every record belongs to the one emulator account — so there is no
+//! caller identity to compare a beneficiary against, and the beneficiary a checkout names is
+//! reported back through its grant instead of deciding who may take one.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +183,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CheckoutLicense` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CheckoutLicenseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CheckoutLicense"))
+        // Every modelled constraint has already been refused by the centralized walk;
+        // the rejection below is this handler's own guard, because the model publishes
+        // no length for any string a checkout carries and no size for its entitlement
+        // list, so those bounds live with the store that holds them.
+        if let Some(why) = crate::state::checkout_input_rejection(
+            &input.product_sku,
+            &input.key_fingerprint,
+            input.node_id.as_deref(),
+            input.beneficiary.as_deref(),
+            &input.entitlements,
+        ) {
+            return Err(invalid_parameter(why));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+
+        // A checkout names no ARN: the license it is taken on is the one whose product
+        // SKU and issuer key fingerprint the request names. The record is cloned so the
+        // grant below can be written while the license it is a grant on is still read.
+        let license = match store
+            .license_for_checkout(&input.product_sku, &input.key_fingerprint)
+        {
+            Some(license) => license.clone(),
+            // Which half of the pair named nothing: a product this service holds no
+            // license of at all, or a fingerprint no issuer of that product has.
+            None if store.has_license_for_product_sku(&input.product_sku) => {
+                return Err(not_found("keyFingerprint"))
+            }
+            None => return Err(not_found("productSKU")),
+        };
+
+        // `ClientToken` is the caller's idempotency key on the license it was used
+        // against, so the repeat of an accepted checkout reports the grant that
+        // checkout minted and consumes nothing more: one token, one grant. The
+        // response is rebuilt from the stored grant, so it is the one the first call
+        // answered, down to the signed token.
+        if let Some(grant) =
+            store.held_consumption_for_client_token(&license.arn, &input.client_token)
+        {
+            return Ok(checkout_output(grant, &license));
+        }
+
+        // What this checkout is allowed, against the entitlements the license declares
+        // and the units the grants already held on it consume.
+        let granted = store
+            .allow_checkout(&license, &input.entitlements)
+            .map_err(|refusal| match refusal {
+                crate::state::CheckoutRefusal::NoEntitlementsAllowed(message) => {
+                    no_entitlements_allowed(message)
+                }
+                crate::state::CheckoutRefusal::InvalidParameterValue(message) => {
+                    invalid_parameter(message)
+                }
+            })?;
+
+        let issued_at = crate::state::now_iso8601();
+        let expiration =
+            crate::state::checkout_expiration(&license, &input.checkout_type, &issued_at);
+        let grant = crate::state::StoredLicenseConsumption {
+            token: store.fresh_consumption_token(),
+            license_arn: license.arn.clone(),
+            client_token: input.client_token,
+            checkout_type: input.checkout_type,
+            node_id: input.node_id,
+            beneficiary: input.beneficiary,
+            entitlements_allowed: granted.entitlements_allowed,
+            consumed_units: granted.consumed_units,
+            issued_at,
+            expiration,
+            checked_in_at: None,
+        };
+        // The store is finite, and `insert_consumption` is what enforces that: a
+        // checkout that would take it past its cap consumes nothing. This operation
+        // models no resource-limit error, so a store this emulator cannot grow is
+        // reported on the modelled server channel rather than blamed on the request.
+        if !store.insert_consumption(grant.clone()) {
+            return Err(store_full());
+        }
+
+        crate::state::record_mutation(Self::NAME, &license.arn, ctx.parts());
+        Ok(checkout_output(&grant, &license))
     }
+}
+
+/// The response a checkout answers with, computed from the stored grant and the
+/// license it is a grant on — so the first call and the idempotent repeat of it
+/// answer the same thing, and nothing in the response is held only in flight.
+fn checkout_output(
+    grant: &crate::state::StoredLicenseConsumption,
+    license: &crate::state::StoredLicense,
+) -> CheckoutLicenseOutput {
+    CheckoutLicenseOutput {
+        checkout_type: Some(grant.checkout_type.clone()),
+        license_consumption_token: Some(grant.token.clone()),
+        entitlements_allowed: Some(grant.entitlements_allowed.clone()),
+        signed_token: Some(grant.signed_token(license)),
+        node_id: grant.node_id.clone(),
+        issued_at: Some(grant.issued_at.clone()),
+        expiration: grant.expiration.clone(),
+        license_arn: Some(license.arn.clone()),
+    }
+}
+
+/// The modelled server error for a store this handler cannot reach.
+fn store_unavailable() -> CheckoutLicenseError {
+    CheckoutLicenseErrorModeled::ServerInternalException(ServerInternalException {
+        message: Some("the license store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for a store this emulator will not grow any further.
+fn store_full() -> CheckoutLicenseError {
+    CheckoutLicenseErrorModeled::ServerInternalException(ServerInternalException {
+        message: Some(format!(
+            "this emulator already holds the maximum of {} license checkouts",
+            crate::state::MAX_LICENSE_CONSUMPTIONS
+        )),
+    })
+    .into()
+}
+
+/// The modelled 400 this service answers for a parameter value it will not accept.
+fn invalid_parameter(message: impl Into<String>) -> CheckoutLicenseError {
+    CheckoutLicenseErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled 400 for a checkout of entitlements this license cannot grant.
+fn no_entitlements_allowed(message: impl Into<String>) -> CheckoutLicenseError {
+    CheckoutLicenseErrorModeled::NoEntitlementsAllowedException(NoEntitlementsAllowedException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled 400 for a request member that named no license this checkout could
+/// be taken on, worded as AWS words that error class for this service: the member is
+/// named, and the value it carried is not echoed back.
+fn not_found(member: &str) -> CheckoutLicenseError {
+    CheckoutLicenseErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Invalid value of {member}.")),
+    })
+    .into()
 }

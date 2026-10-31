@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CheckInLicense
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CheckInLicense`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Releases the ONE grant its consumption token names, so the units that checkout
+//! consumed leave the license's usage. The grant RECORD stays, holding nothing, so a
+//! token whose grant is already released — by an earlier check-in or by its expiration —
+//! names no checkout this operation can release, and is refused as a token this
+//! operation does not accept rather than releasing a second grant.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CheckInLicense::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `Entitlement.AllowCheckIn` is NOT enforced here: a grant is released whatever the
+//! entitlements it holds declare. The member says whether check-ins are allowed on an
+//! entitlement, and this operation models no error for a grant whose entitlements forbid
+//! one, so which refusal AWS answers for that is unknown to this emulator and is left to
+//! the issue that establishes it rather than guessed at.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +153,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CheckInLicense` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CheckInLicenseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CheckInLicense"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+
+        // The ARN this check-in changes the usage of, read before the release so the
+        // audit line names the license even though the record is keyed by the token.
+        // `Beneficiary` scopes a check-in to a principal, and this emulator models no
+        // per-principal ownership of a grant, so it is not enforced here.
+        let license_arn = store
+            .consumption(&input.license_consumption_token)
+            .map(|grant| grant.license_arn.clone());
+
+        match store.check_in_consumption(
+            &input.license_consumption_token,
+            crate::state::now_iso8601(),
+        ) {
+            crate::state::CheckInOutcome::Released => {
+                crate::state::record_mutation(
+                    Self::NAME,
+                    license_arn.as_deref().unwrap_or_default(),
+                    ctx.parts(),
+                );
+                Ok(CheckInLicenseOutput {})
+            }
+            // A grant already released — by an earlier check-in or by its expiration
+            // — and a token no checkout was ever answered with are one refusal:
+            // neither names a checkout this service can release, which is the same
+            // question `ExtendLicenseConsumption` asks of a token.
+            crate::state::CheckInOutcome::AlreadyReleased
+            | crate::state::CheckInOutcome::UnknownToken => Err(not_found()),
+        }
     }
+}
+
+/// The modelled server error for a store this handler cannot reach.
+fn store_unavailable() -> CheckInLicenseError {
+    CheckInLicenseErrorModeled::ServerInternalException(ServerInternalException {
+        message: Some("the license store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The modelled 400 for a consumption token that names no checkout to check in,
+/// worded as AWS words it for that error class: the token is the only parameter the
+/// request carries, and the refusal names it rather than echoing its value.
+fn not_found() -> CheckInLicenseError {
+    CheckInLicenseErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::INVALID_CONSUMPTION_TOKEN.to_string()),
+    })
+    .into()
 }

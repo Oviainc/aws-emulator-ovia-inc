@@ -48,8 +48,8 @@ const UNITS: &[&str] = &[
 
 /// One emulator: a single shared engine behind the router, exactly as
 /// `core/router` assembles it, plus the handle on that engine this suite seeds
-/// consumption records through — nothing mints them over the wire yet, because the
-/// checkout operations are still scaffolded.
+/// consumption records through, so a usage total can be driven from any set of
+/// outstanding grants rather than only from the ones a checkout would mint.
 fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -212,6 +212,10 @@ fn seed_consumption(
             .iter()
             .map(|(name, units)| ((*name).to_string(), *units))
             .collect::<BTreeMap<String, i64>>(),
+        // The rest of a grant — the checkout that minted it, what it was allowed,
+        // when it was issued and whether it is still held — does not change what the
+        // usage of these entitlements is.
+        ..StoredLicenseConsumption::default()
     });
     assert!(
         stored,
