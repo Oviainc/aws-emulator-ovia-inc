@@ -184,6 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// due at those instants whether or not anybody polled. Results are published only
     /// once the report has completed, from the snapshot the report froze, so every page
     /// of one report sees the same records in the same order.
+    ///
+    /// The `NextToken` the request carries is checked whatever status the report is in:
+    /// a token that names no position in this report's listing is refused, so polling a
+    /// report that is still generating never answers a token the completed report would
+    /// reject.
     async fn handle(
         &self,
         input: Self::Input,
@@ -215,19 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?
         };
 
-        // A report that has not completed has no results yet: the caller polls the
-        // status until it does.
-        if report.status != crate::state::REPORT_STATUS_COMPLETED {
-            return Ok(GetQuotaUtilizationReportOutput {
-                report_id: Some(report.id),
-                status: Some(report.status),
-                ..GetQuotaUtilizationReportOutput::default()
-            });
-        }
-
         let total_count = report.quotas.len();
         // The token names a position in THIS report, so one report's token cannot
-        // resume another's listing.
+        // resume another's listing. The cut is taken BEFORE the status is looked at:
+        // whether a `NextToken` names a position in this report is a property of the
+        // request, not of how far the clock has carried the report's generation, so a
+        // token naming no position is refused on every call rather than only once the
+        // report publishes records.
         let listing = crate::state::listing_label(Self::NAME, &[Some(&report.id)]);
         let page = crate::state::paginate_bounded(
             &listing,
@@ -246,6 +245,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+
+        // A report that has not completed has no results yet: the caller polls the
+        // status until it does.
+        if report.status != crate::state::REPORT_STATUS_COMPLETED {
+            return Ok(GetQuotaUtilizationReportOutput {
+                report_id: Some(report.id),
+                status: Some(report.status),
+                ..GetQuotaUtilizationReportOutput::default()
+            });
+        }
 
         Ok(GetQuotaUtilizationReportOutput {
             report_id: Some(report.id),
