@@ -89,6 +89,8 @@ mod extension_registry;
 mod failed_create_rollback;
 #[path = "all/forced_stack_deletion.rs"]
 mod forced_stack_deletion;
+#[path = "all/foreach_expanded_output_values.rs"]
+mod foreach_expanded_output_values;
 #[path = "all/generated_physical_names.rs"]
 mod generated_physical_names;
 #[path = "all/generated_template_body.rs"]
@@ -121,6 +123,8 @@ mod iam_capability_gate;
 mod iam_identity_resources;
 #[path = "all/include_transform.rs"]
 mod include_transform;
+#[path = "all/independent_gate_ready_set.rs"]
+mod independent_gate_ready_set;
 #[path = "all/in_flight_resource_status.rs"]
 mod in_flight_resource_status;
 #[path = "all/initiating_resource_events.rs"]
