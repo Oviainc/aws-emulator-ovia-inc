@@ -24,7 +24,10 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself. Here it carries
 //!   the transport's size guard: a request body above [`max_request_body_bytes`] is
-//!   answered with a bare HTTP 413 instead of reaching a handler.
+//!   answered with a bare HTTP 413 instead of reaching a handler — and, for every other
+//!   request, [`QueryCompatibleErrors`], which is NOT a re-route: the key and the handler
+//!   stay the generated routing table's, and the wrapper only completes the error envelope
+//!   this `awsQueryCompatible` service owes a client that asked for the legacy query code.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -59,6 +62,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// here because [`Service::override_operation`] hands back a reference borrowed from
     /// `&self`.
     oversized: RequestEntityTooLarge,
+    /// Every other request's modelled operation, served through the wrapper that completes
+    /// this service's error envelope ([`QueryCompatibleErrors`]), held here for the same
+    /// reason.
+    query_compatible: QueryCompatibleErrors,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -69,7 +76,23 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             oversized: RequestEntityTooLarge,
+            query_compatible: QueryCompatibleErrors,
         }
+    }
+
+    /// The wrapper that serves `req`'s own modelled operation and completes this service's
+    /// error envelope, or `None` when the generated routing table names no operation for
+    /// the request at all — which is the framework's routing failure and stays the
+    /// framework's.
+    fn serving_the_modelled_operation(
+        &self,
+        req: &aws_smithy_runtime_api::http::Request,
+    ) -> Option<&dyn ErasedOperation> {
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.entry
+            .routing_table()
+            .get(key)
+            .map(|_| &self.query_compatible as &dyn ErasedOperation)
     }
 }
 
@@ -182,6 +205,170 @@ impl ErasedOperation for RequestEntityTooLarge {
     }
 }
 
+/// The response header a service whose model carries `awsQueryCompatible` reports the
+/// legacy query error code in, for a client that asked for it.
+const QUERY_ERROR_HEADER: &str = "x-amzn-query-error";
+
+/// The request header a query-compatible SDK opts into that report with.
+const QUERY_MODE_HEADER: &str = "x-amzn-query-mode";
+
+/// The value that opt-in carries.
+const QUERY_MODE_ON: &str = "true";
+
+/// The fault side the report names for a refusal the CALLER caused — every 4xx.
+const SENDER_FAULT: &str = "Sender";
+
+/// The fault side it names for a failure the SERVICE caused — every 5xx.
+const RECEIVER_FAULT: &str = "Receiver";
+
+/// The lowest status that reports a failure rather than an answer, and so the one an error
+/// class is reported for at all.
+const FIRST_FAILURE_STATUS: u16 = 400;
+
+/// The lowest status whose fault is the service's own.
+const FIRST_SERVER_FAULT_STATUS: u16 = 500;
+
+/// The modelled class this service words a refused attribute NAME with ([`refusal_for`]),
+/// and — because the model defaults that shape's `awsQueryError` binding — the legacy query
+/// code of the same class.
+const UNKNOWN_ATTRIBUTE_NAME: &str = "InvalidAttributeName";
+
+/// Every error class this service words a BOUNDARY refusal with: what [`refusal_for`] can
+/// answer, which is also the only error a response carries no legacy code for by the time
+/// it leaves the framework. Each entry is BOTH the shape name the renderer writes into
+/// `__type` and the legacy query code of that class, because the model defaults the
+/// `awsQueryError` binding of every shape named here.
+const BOUNDARY_REFUSAL_CLASSES: &[&str] = &[UNKNOWN_ATTRIBUTE_NAME];
+
+/// Whether `req` asked for the legacy query error report.
+///
+/// A query-compatible SDK sends the opt-in on every request it makes to this service; a
+/// native JSON client sends nothing, and gets the unadorned JSON error. The report is
+/// additive, so only the opt-in decides — nothing of the answer is withheld without it.
+fn asked_for_the_query_error(req: &aws_smithy_runtime_api::http::Request) -> bool {
+    req.headers()
+        .get(QUERY_MODE_HEADER)
+        .is_some_and(|value| value.eq_ignore_ascii_case(QUERY_MODE_ON))
+}
+
+/// The legacy query code the answer `resp` owes, when it is an error this service worded
+/// at the BOUNDARY — and `None` for every other answer.
+///
+/// Only the boundary refusal is read here, and that is the whole point of reading a
+/// response at all: every error the per-operation sequence renders states its own legacy
+/// code through the error channel ([`crate::scaffolded`]'s `query_error_code`), so the
+/// framework has already reported it. A refusal the constraint walk raised is rendered
+/// OUTSIDE that sequence, from a code and a message alone ([`refusal_for`]), with no error
+/// value left to ask — so the class is recovered from the `__type` the renderer wrote, and
+/// only for the classes that seam words ([`BOUNDARY_REFUSAL_CLASSES`]).
+///
+/// A body naming anything else is left without a report rather than given a guessed one: the
+/// framework's own refusal classes (its generic validation failure, the scaffold's 501) are
+/// not error classes of this service's API, so they have no legacy code to name.
+fn boundary_refusal_code(resp: &aws_smithy_runtime_api::http::Response) -> Option<&'static str> {
+    let document: serde_json::Value = serde_json::from_slice(resp.body().bytes()?).ok()?;
+    let shape = document.get("__type")?.as_str()?;
+    let local = shape.split('#').next_back().unwrap_or(shape);
+    BOUNDARY_REFUSAL_CLASSES
+        .iter()
+        .find(|class| **class == local)
+        .copied()
+}
+
+/// `resp` with the legacy query error report added, for a request that asked for one.
+///
+/// `awsQueryCompatible` names an error class TWICE: the body's `__type` names the error
+/// SHAPE, and this header reports the legacy query code of the same class beside the fault
+/// side — `Sender` for a refusal the caller caused, `Receiver` for a failure this service
+/// caused — which is the only place a client still speaking the query vocabulary can
+/// recover the code from, since the body carries a shape id instead.
+///
+/// The framework's own per-operation sequence already writes this header from the error
+/// value's own legacy code, so a response that carries one keeps it. What is left for this
+/// to complete is the refusal the framework renders OUTSIDE that sequence
+/// ([`boundary_refusal_code`]).
+///
+/// A success is left alone (there is no class to name), and so is a header the HTTP layer
+/// will not carry: a report that could not be built costs the answer its header, never the
+/// answer.
+fn reporting_the_query_error(
+    req: &aws_smithy_runtime_api::http::Request,
+    mut resp: aws_smithy_runtime_api::http::Response,
+) -> aws_smithy_runtime_api::http::Response {
+    if resp.status().as_u16() < FIRST_FAILURE_STATUS
+        || resp.headers().get(QUERY_ERROR_HEADER).is_some()
+        || !asked_for_the_query_error(req)
+    {
+        return resp;
+    }
+    let Some(code) = boundary_refusal_code(&resp) else {
+        return resp;
+    };
+    let fault = if resp.status().as_u16() >= FIRST_SERVER_FAULT_STATUS {
+        RECEIVER_FAULT
+    } else {
+        SENDER_FAULT
+    };
+    let _ = resp
+        .headers_mut()
+        .try_insert(QUERY_ERROR_HEADER, format!("{code};{fault}"));
+    resp
+}
+
+/// Serves the modelled operation the generated routing table names for the request,
+/// exactly as that table would, and completes the error envelope this service owes on the
+/// way out ([`reporting_the_query_error`]).
+///
+/// It stores no operation of its own and makes no routing decision: the operation run is
+/// the one the service's own table names for the request, so the framework still owns the
+/// whole deserialize -> validate -> handle -> serialize sequence and every status, code and
+/// message it answers with. The same wrapper serves EVERY operation, so a refusal raised
+/// while ANY of them was being served — which the framework renders outside that sequence,
+/// and so without the report — passes through one place that can complete it.
+#[derive(Debug)]
+struct QueryCompatibleErrors;
+
+impl ErasedOperation for QueryCompatibleErrors {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // The definition is read and dropped inside this one statement: the operation
+            // it hands back is `Send`, the `&dyn ErasedServiceDefinition` it was read from
+            // is not, so holding it across the await below would make this future
+            // non-`Send`.
+            let modelled = {
+                let definition = svc.definition();
+                definition
+                    .protocol()
+                    .routing_key(req)
+                    .ok()
+                    .and_then(|key| definition.routing_table().get(key))
+            };
+            let response = match modelled {
+                Some(operation) => operation.run(svc, req, ctx).await,
+                // Unreachable through `override_operation`, which hands a request here
+                // only once the generated table has answered for its key; a request whose
+                // key the table does not name is the framework's own routing failure,
+                // worded by this service's entry exactly as it would be had nothing
+                // claimed the key.
+                None => svc.definition().routing_error_response(req),
+            };
+            reporting_the_query_error(req, response)
+        })
+    }
+
+    /// `None` is "defer to the modelled operation the routing key names" — which is the
+    /// operation this wrapper delegates to, so its model-declared schemes decide and
+    /// wrapping cannot weaken them.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+}
+
 /// The error Amazon SQS names for a value the boundary validator refused, or `None` to
 /// leave the framework's wording in place.
 ///
@@ -198,6 +385,9 @@ impl ErasedOperation for RequestEntityTooLarge {
 /// (`crate::state::validate_attributes`). This covers the LIST form
 /// (`GetQueueAttributes` `AttributeNames`), which the walk does validate.
 fn refusal_for(violation: &Violation) -> Option<Refused> {
+    // The class below is the one [`BOUNDARY_REFUSAL_CLASSES`] holds, read from there so the
+    // refusal and the legacy report of that same refusal cannot name two different classes.
+    let class = UNKNOWN_ATTRIBUTE_NAME;
     let ViolationKind::EnumValue(allowed) = &violation.kind else {
         return None;
     };
@@ -210,7 +400,7 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
     }
     let name = violation.value.as_deref().unwrap_or(&violation.path);
     Some(Refused {
-        code: "InvalidAttributeName".to_string(),
+        code: class.to_string(),
         message: format!("Unknown Attribute {name}."),
     })
 }
@@ -250,16 +440,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation is handed a request the transport could not accept and
         // nothing it carried is stored. A body the ceiling admits routes exactly as it
         // did before.
+        //
+        // Every other request the generated table CAN serve resolves to
+        // [`QueryCompatibleErrors`], which is not a re-route: it runs the very operation
+        // that table names for the request's own key and only completes the error envelope
+        // on the way out. A key the table does not name resolves to `None`, exactly as it
+        // would in an unedited service, and falls through to the framework's routing
+        // failure.
         match req.body().bytes() {
             Some(body) if body.len() > max_request_body_bytes() => Some(&self.oversized),
-            Some(_) => None,
+            Some(_) => self.serving_the_modelled_operation(req),
             // A body that is not in memory has no length to measure, so the ceiling
             // cannot be applied to it and this arm must not guess: it routes on. The
             // router buffers every request body before it looks an operation up, so the
             // arm is unreachable through dispatch, and that is what the suite in
             // `tests/all/request_size_transport_bound.rs` pins — a runtime that stopped
             // buffering would silently disable the bound, and those rows would fail.
-            None => None,
+            None => self.serving_the_modelled_operation(req),
         }
     }
 

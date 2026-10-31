@@ -141,17 +141,82 @@ pub async fn post_bytes_in(
     operation: &str,
     body: Vec<u8>,
 ) -> (u16, Vec<u8>) {
-    let request = http::Request::builder()
+    let response = router
+        .dispatch(request_for(region, operation, body, false))
+        .await;
+    (response.status().as_u16(), response.body().to_vec())
+}
+
+/// The request header a query-compatible SDK opts into the legacy query error report
+/// with, and the value it carries. Named here so the suites that drive that report and
+/// the ones that drive a native JSON client cannot spell the opt-in differently.
+pub const QUERY_MODE_HEADER: &str = "x-amzn-query-mode";
+
+/// The response header that report arrives in.
+pub const QUERY_ERROR_HEADER: &str = "x-amzn-query-error";
+
+/// One request as this service's wire protocol carries it: `awsJson1_0` over `POST /`
+/// with the target header, and — for `query_mode` — the header a query-compatible SDK
+/// sends on every call it makes to this service.
+fn request_for(
+    region: &str,
+    operation: &str,
+    body: Vec<u8>,
+    query_mode: bool,
+) -> http::Request<Bytes> {
+    let mut builder = http::Request::builder()
         .method("POST")
         .uri("/")
         .header("host", host_in(region))
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", format!("AmazonSQS.{operation}"))
-        .header("authorization", authorization_in(region))
+        .header("authorization", authorization_in(region));
+    if query_mode {
+        builder = builder.header(QUERY_MODE_HEADER, "true");
+    }
+    builder
         .body(Bytes::from(body))
-        .expect("a well-formed request");
+        .expect("a well-formed request")
+}
+
+/// Send one operation and answer its HTTP status, its response HEADERS and its parsed
+/// body — the seam for an answer that states something its body does not.
+pub async fn call_with_headers(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, http::HeaderMap, Value) {
+    answered(router, operation, body, false).await
+}
+
+/// The same call as a query-compatible SDK makes it, with the [`QUERY_MODE_HEADER`]
+/// opt-in: the seam for asserting the legacy query error report.
+pub async fn call_in_query_mode(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, http::HeaderMap, Value) {
+    answered(router, operation, body, true).await
+}
+
+/// `operation` dispatched through the emulator, as its status, headers and parsed body.
+async fn answered(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+    query_mode: bool,
+) -> (u16, http::HeaderMap, Value) {
+    let request = request_for(
+        REGION,
+        operation,
+        serde_json::to_vec(body).expect("the request body serializes"),
+        query_mode,
+    );
     let response = router.dispatch(request).await;
-    (response.status().as_u16(), response.body().to_vec())
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    (status, headers, parsed)
 }
 
 /// Send one operation and return its HTTP status and parsed body.
@@ -203,11 +268,36 @@ pub async fn ok_in(
 /// one the service itself made, so the two cannot name different statuses for it.
 pub const REQUEST_ENTITY_TOO_LARGE: u16 = 413;
 
-/// The wire error code of a refusal: awsJson1_0 carries it as the body's `__type`.
-pub fn error_code(body: &Value) -> String {
+/// The error SHAPE a refusal names: the body's `__type` discriminator, verbatim.
+///
+/// On `awsJson1_0` that is the shape id of the error that was thrown — a local shape name
+/// for one this service's model declares, and the request-validation framework's own
+/// namespaced id for a parameter refusal it raised.
+pub fn error_shape(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
+        .to_string()
+}
+
+/// The wire error CODE of a refusal — the name every suite here knows a refusal class by.
+///
+/// It is the error shape's own local name, except for the two parameter classes raised by
+/// the request-validation framework in front of this service: those name their class with
+/// that framework's shape id in the body and with this service's own legacy code in the
+/// [`QUERY_ERROR_HEADER`], so the code is read from the pair the service declares rather
+/// than cut out of the shape id. [`error_shape`] reports the discriminator itself.
+pub fn error_code(body: &Value) -> String {
+    use service_com_amazonaws_sqs_amazonsqs::scaffolded as refusals;
+
+    let shape = error_shape(body);
+    if shape == refusals::INVALID_PARAMETER_VALUE_SHAPE_ID {
+        return refusals::INVALID_PARAMETER_VALUE.to_string();
+    }
+    if shape == refusals::MISSING_PARAMETER_SHAPE_ID {
+        return refusals::MISSING_PARAMETER.to_string();
+    }
+    shape
         .rsplit(['#', '/'])
         .next()
         .unwrap_or("<no __type>")

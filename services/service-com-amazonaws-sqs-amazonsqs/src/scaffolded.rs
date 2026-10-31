@@ -186,6 +186,22 @@ pub const MISSING_PARAMETER: &str = "MissingParameter";
 /// this service accepts. Owned here for the same reason.
 pub const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 
+/// The error SHAPE a refusal of an absent parameter names — the shape id of the request
+/// validation framework that fronts Amazon SQS, which is what the JSON envelope's `__type`
+/// discriminator carries and what an SDK resolves the typed exception from.
+///
+/// It is NOT [`MISSING_PARAMETER`]: that is the LEGACY QUERY code for the same class, which
+/// this service reports in the `x-amzn-query-error` response header instead (see
+/// [`OperationError::query_error_code`] below and `crate::service`'s report). The two names
+/// for one class are what `awsQueryCompatible` means, and each has one place it is stated.
+pub const MISSING_PARAMETER_SHAPE_ID: &str =
+    "com.amazon.coral.service#MissingRequiredParameterException";
+
+/// The error shape a refusal of a parameter VALUE names, for the same reason as
+/// [`MISSING_PARAMETER_SHAPE_ID`]; its legacy query code is [`INVALID_PARAMETER_VALUE`].
+pub const INVALID_PARAMETER_VALUE_SHAPE_ID: &str =
+    "com.amazon.coral.service#InvalidParameterValueException";
+
 /// The `message` member of the synthetic `MissingParameter` error shape.
 static MISSING_PARAMETER_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
@@ -525,20 +541,22 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         }
     }
 
-    /// The wire error code (`__type` on JSON/CBOR, `<Code>` on XML).
+    /// The error SHAPE this failure names (`__type` on JSON/CBOR, `<Code>` on XML).
     ///
-    /// Keep the literal as it is: changing it changes the wire error code clients match
-    /// on. It is intentionally not tied to the Rust variant name.
+    /// Keep the literals as they are: changing one changes what clients match on. They are
+    /// intentionally not tied to the Rust variant names.
     fn shape_name(&self) -> &'static str {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
-            // The two codes the service documents for a parameter-level refusal, spelled
-            // once beside the variants that carry them: a batch result entry reports the
-            // same pair.
-            Self::MissingParameter(_) => MISSING_PARAMETER,
-            Self::InvalidParameterValue(_) => INVALID_PARAMETER_VALUE,
+            // A parameter-level refusal is raised by the request validation framework in
+            // front of this service, so the shape it names is that framework's, not one of
+            // this model's. The legacy query code for the same class travels in the
+            // `x-amzn-query-error` header ([`Self::query_error_code`]) and a batch result
+            // entry reports it per entry, which is why both names exist.
+            Self::MissingParameter(_) => MISSING_PARAMETER_SHAPE_ID,
+            Self::InvalidParameterValue(_) => INVALID_PARAMETER_VALUE_SHAPE_ID,
             Self::AccessDenied(_) => ACCESS_DENIED,
         }
     }
@@ -564,13 +582,23 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // no `awsQueryError` trait to honour. The 501 + `<Code>NotImplemented`
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
-            Self::Modeled(e) => e.query_error_code(),
+            // The model's own code for the class where it states one, and the error
+            // shape's own name where it DEFAULTS that binding (`InvalidAttributeName`,
+            // `InvalidAttributeValue`, `InvalidMessageContents`, `InvalidIdFormat`): a
+            // query-era client knows such a class by its name, and the shape name is what
+            // this service's wire code for it already is.
+            Self::Modeled(e) => e.query_error_code().or_else(|| Some(e.shape_name())),
             // Same reason as the scaffold signal: the synthetic shape carries no
             // `awsQueryError` trait.
             Self::ValidationException(_) => None,
-            Self::MissingParameter(_) => None,
-            Self::InvalidParameterValue(_) => None,
-            Self::AccessDenied(_) => None,
+            // The legacy query code of a parameter-level refusal, which is NOT the shape
+            // id [`Self::shape_name`] answers for it: the class is named by its Coral
+            // shape in the body and by this code in the `x-amzn-query-error` header, so a
+            // client still speaking the query vocabulary can recover it. The same pair a
+            // batch result entry reports per entry.
+            Self::MissingParameter(_) => Some(MISSING_PARAMETER),
+            Self::InvalidParameterValue(_) => Some(INVALID_PARAMETER_VALUE),
+            Self::AccessDenied(_) => Some(ACCESS_DENIED),
         }
     }
 }
