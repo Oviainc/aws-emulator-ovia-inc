@@ -51,7 +51,10 @@ const MEMBERS_UPDATE_NODE_NEVER_WRITES: [&str; 7] = [
 
 /// `UpdateNode` on one node of one cluster (`smithy_query(query="operation",
 /// operation="UpdateNode")`: `PUT /prod/clusters/{ClusterId}/nodes/{NodeId}`).
-async fn update_node(
+///
+/// The one copy every suite that drives a node update, accepted or refused,
+/// goes through.
+pub(crate) async fn update_node(
     router: &MultiServiceRouter,
     cluster_id: &str,
     node: &str,

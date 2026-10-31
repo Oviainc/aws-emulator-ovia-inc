@@ -78,7 +78,13 @@ pub(crate) fn node_uri(cluster: &str, node: &str) -> String {
     format!("/prod/clusters/{cluster}/nodes/{node}")
 }
 
-async fn create_node(router: &MultiServiceRouter, cluster: &str, body: Value) -> (u16, Value) {
+/// `CreateNode` on one cluster, answering its status and body — the one copy
+/// every suite that drives a node create, accepted or refused, goes through.
+pub(crate) async fn create_node(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    body: Value,
+) -> (u16, Value) {
     call(router, "POST", &nodes_uri(cluster), Some(body)).await
 }
 

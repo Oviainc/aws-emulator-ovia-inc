@@ -11,6 +11,11 @@
 //! node stays in here, because what moves it on is the registration script run
 //! on the node's own hardware (see `crate::state::nodes`).
 //!
+//! A node's `Name` is unique among the live nodes of its cluster, so a create
+//! that asks for a name one of them already holds stores nothing and is refused
+//! with this operation's modelled 422, carrying the wording every name collision
+//! in this service carries.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -253,6 +258,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// than the emulator stores is a bad request too (the request itself is out of
 /// bounds), while a full store is the throttle every other create in this
 /// service answers with once it can hold no more.
+///
+/// A `Name` a live node of the cluster already holds is the request's own
+/// `Name` member being unsatisfiable, so it is answered the way this service's
+/// other 422-modelling create answers the same collision
+/// (`CreateChannelPlacementGroup`): `UnprocessableEntityException` (422) — this
+/// operation models no `ConflictException` (`smithy_query(query="operation",
+/// operation="CreateNode")`) — carrying the fixed wording every name collision
+/// in this service carries and the one `ValidationErrors` entry naming the
+/// member it was found at.
 fn refusal(refusal: crate::state::NodeRefusal, cluster_id: &str) -> CreateNodeError {
     match refusal {
         crate::state::NodeRefusal::ClusterNotFound => {
@@ -273,6 +287,17 @@ fn refusal(refusal: crate::state::NodeRefusal, cluster_id: &str) -> CreateNodeEr
                     "This emulator stores at most {} nodes; delete one before creating another",
                     crate::state::MAX_NODES
                 )),
+            })
+            .into()
+        }
+        crate::state::NodeRefusal::NameTaken => {
+            let message = crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string();
+            CreateNodeErrorModeled::UnprocessableEntityException(UnprocessableEntityException {
+                message: Some(message.clone()),
+                validation_errors: Some(vec![ValidationError {
+                    element_path: Some("name".to_string()),
+                    error_message: Some(message),
+                }]),
             })
             .into()
         }

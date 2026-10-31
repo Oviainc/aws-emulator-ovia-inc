@@ -314,6 +314,9 @@ mod node_lifecycle;
 #[path = "all/node_listing.rs"]
 mod node_listing;
 
+#[path = "all/node_name_uniqueness.rs"]
+mod node_name_uniqueness;
+
 #[path = "all/node_registration_script.rs"]
 mod node_registration_script;
 

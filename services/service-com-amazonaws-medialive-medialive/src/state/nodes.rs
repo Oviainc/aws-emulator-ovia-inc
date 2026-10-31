@@ -40,6 +40,12 @@
 //! parameters, a card the hardware numbering reaches and an SdiSource this
 //! account holds.
 //!
+//! A node's `Name` is unique among the live nodes of its cluster whichever write
+//! set it, so BOTH writes resolve a requested name against
+//! [`ComAmazonawsMedialiveMedialiveState::node_named`] and refuse one another
+//! live node of that cluster already holds: the create stores nothing and the
+//! update changes nothing.
+//!
 //! A node's DELETION is a DEREGISTRATION: the `NodeState` enum models no
 //! `DELETING`/`DELETED` pair, it models `DEREGISTERING` and the terminal
 //! `DEREGISTERED`, which is what `DeleteNode`'s `202 Accepted` accepts and what
@@ -299,6 +305,9 @@ pub enum NodeRefusal {
     TooManyInterfaceMappings(usize),
     /// The store already holds [`MAX_NODES`] nodes.
     StoreFull,
+    /// Another live node of the same cluster already carries the requested
+    /// `Name`, which is documented to be unique in the Cluster.
+    NameTaken,
 }
 
 /// One created node, as `CreateNode` stored it plus its lifecycle state.
@@ -464,6 +473,11 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// REGISTRATION SCRIPT run on the node's own hardware that moves it on from
     /// there. This emulator runs no node hardware, so a created node stays
     /// `CREATED` rather than being walked to a `READY` it never reached.
+    ///
+    /// A `Name` a live node of that cluster already holds is REFUSED, because a
+    /// node's name is unique in the Cluster ([`Self::node_named`]) however the
+    /// node came to carry it: the create is held to the same rule the update is,
+    /// so the store cannot come to hold two nodes of one cluster under one name.
     pub fn insert_node(
         &mut self,
         region: &str,
@@ -486,6 +500,16 @@ impl ComAmazonawsMedialiveMedialiveState {
         }
         if self.nodes.len() >= MAX_NODES {
             return Err(NodeRefusal::StoreFull);
+        }
+        // The uniqueness of a node's name in its cluster, checked here as the
+        // update checks it ([`Self::apply_node_changes`]): a create that asked
+        // for a name a live node of this cluster holds stores nothing. A create
+        // that names no name collides with nothing — an absent name is not a
+        // name two nodes share.
+        if let Some(name) = name.as_deref() {
+            if self.node_named(cluster_id, name).is_some() {
+                return Err(NodeRefusal::NameTaken);
+            }
         }
 
         let id = self.mint_node_id();
@@ -788,14 +812,17 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// name it carried is free for another node, exactly as the channel
     /// placement group slice treats a group that is leaving.
     ///
-    /// Only the UPDATE resolves against this. The uniqueness sentence is on
-    /// `UpdateNodeRequest$Name` alone: `CreateNodeRequest$Name` is documented
-    /// "The user-specified name of the Node to be created"
-    /// (`smithy_query(query="doc", shape="CreateNodeRequest", member="Name")`),
-    /// stating no uniqueness and declaring no error for a clash, so
-    /// [`Self::insert_node`] takes the name the create asked for — unlike the
-    /// channel placement group slice, whose CREATE member carries the sentence
-    /// too and whose create therefore refuses a clash.
+    /// BOTH writes resolve against this. The sentence is written on
+    /// `UpdateNodeRequest$Name`, but it states a property of the NODE rather than
+    /// of one request — `CreateNodeRequest$Name` is "The user-specified name of
+    /// the Node to be created" (`smithy_query(query="doc",
+    /// shape="CreateNodeRequest", member="Name")`), which is the same name — so
+    /// [`Self::insert_node`] refuses a clash exactly as
+    /// [`Self::apply_node_changes`] does, the way every other named resource of
+    /// this service enforces its own uniqueness on the create as well as on the
+    /// update. That is also what keeps this lookup unambiguous: at most one live
+    /// node of a cluster can ever hold a given name, so the `find` has at most
+    /// one candidate to answer with.
     fn node_named(&self, cluster_id: &str, name: &str) -> Option<&NodeRecord> {
         self.nodes.values().find(|node| {
             node.cluster_id == cluster_id
