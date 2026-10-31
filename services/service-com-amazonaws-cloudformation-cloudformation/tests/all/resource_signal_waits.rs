@@ -35,7 +35,7 @@ use crate::stack_lifecycle::{
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::resource_status;
 use service_com_amazonaws_cloudformation_cloudformation::state::wait_conditions::{
-    DEFAULT_SIGNAL_COUNT, DEFAULT_TIMEOUT, MAX_TIMEOUT,
+    DEFAULT_SIGNAL_COUNT, DEFAULT_TIMEOUT, MAX_HELD_TIMEOUT, MAX_TIMEOUT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -426,8 +426,17 @@ struct PolicyCase {
     count: Option<&'static str>,
     /// `Timeout` as the attribute spells it, or `None` for one that states none.
     timeout: Option<&'static str>,
-    held: Duration,
+    /// The span that attribute ASKS the wait to run for.
+    asked_for: Duration,
     signals: usize,
+}
+
+impl PolicyCase {
+    /// How long the wait is really HELD for that attribute: what it asked for, bounded by
+    /// this emulator's ceiling on an open wait ([`MAX_HELD_TIMEOUT`]).
+    fn held(&self) -> Duration {
+        self.asked_for.min(MAX_HELD_TIMEOUT)
+    }
 }
 
 /// The class the bound covers: every `Timeout` and `Count` a `CreationPolicy`'s
@@ -436,7 +445,11 @@ struct PolicyCase {
 /// The published values are that attribute's own — `Timeout` is "in ISO8601 duration
 /// format", "Default: PT5M", "Maximum: PT12H", and `Count`'s "Default: 1" — so the rows
 /// include the maximum, one hour past it, a duration whose designators go beyond hours, the
-/// degenerate zero, a value that is no duration at all, and each member not stated.
+/// degenerate zero, a value that is no duration at all, and each member not stated. What the
+/// attribute asks for is one question and how long the wait is really held for it is
+/// another: nothing but a client's own signal ends this wait, so the hold is bounded by this
+/// emulator's ceiling on an open wait ([`MAX_HELD_TIMEOUT`]) whatever longer span the
+/// attribute asked for.
 fn policy_cases() -> Vec<PolicyCase> {
     vec![
         PolicyCase {
@@ -444,7 +457,7 @@ fn policy_cases() -> Vec<PolicyCase> {
             stack: "policy-ten-minutes",
             count: Some("1"),
             timeout: Some("PT10M"),
-            held: Duration::from_secs(600),
+            asked_for: Duration::from_secs(600),
             signals: 1,
         },
         PolicyCase {
@@ -452,7 +465,7 @@ fn policy_cases() -> Vec<PolicyCase> {
             stack: "policy-an-hour",
             count: Some("3"),
             timeout: Some("PT1H"),
-            held: Duration::from_secs(3_600),
+            asked_for: Duration::from_secs(3_600),
             signals: 3,
         },
         PolicyCase {
@@ -460,7 +473,7 @@ fn policy_cases() -> Vec<PolicyCase> {
             stack: "policy-compound",
             count: Some("2"),
             timeout: Some("PT1H30M15S"),
-            held: Duration::from_secs(5_415),
+            asked_for: Duration::from_secs(5_415),
             signals: 2,
         },
         PolicyCase {
@@ -468,7 +481,7 @@ fn policy_cases() -> Vec<PolicyCase> {
             stack: "policy-maximum",
             count: Some("1"),
             timeout: Some("PT12H"),
-            held: MAX_TIMEOUT,
+            asked_for: MAX_TIMEOUT,
             signals: 1,
         },
         PolicyCase {
@@ -476,7 +489,7 @@ fn policy_cases() -> Vec<PolicyCase> {
             stack: "policy-past-maximum",
             count: Some("1"),
             timeout: Some("PT13H"),
-            held: MAX_TIMEOUT,
+            asked_for: MAX_TIMEOUT,
             signals: 1,
         },
         PolicyCase {
@@ -484,7 +497,7 @@ fn policy_cases() -> Vec<PolicyCase> {
             stack: "policy-a-day",
             count: Some("1"),
             timeout: Some("P1D"),
-            held: MAX_TIMEOUT,
+            asked_for: MAX_TIMEOUT,
             signals: 1,
         },
         PolicyCase {
@@ -492,7 +505,7 @@ fn policy_cases() -> Vec<PolicyCase> {
             stack: "policy-zero",
             count: Some("1"),
             timeout: Some("PT0S"),
-            held: Duration::ZERO,
+            asked_for: Duration::ZERO,
             signals: 1,
         },
         PolicyCase {
@@ -500,7 +513,7 @@ fn policy_cases() -> Vec<PolicyCase> {
             stack: "policy-unstated",
             count: None,
             timeout: None,
-            held: DEFAULT_TIMEOUT,
+            asked_for: DEFAULT_TIMEOUT,
             signals: DEFAULT_SIGNAL_COUNT,
         },
         PolicyCase {
@@ -508,7 +521,7 @@ fn policy_cases() -> Vec<PolicyCase> {
             stack: "policy-unreadable",
             count: Some("0"),
             timeout: Some("ten minutes"),
-            held: DEFAULT_TIMEOUT,
+            asked_for: DEFAULT_TIMEOUT,
             signals: DEFAULT_SIGNAL_COUNT,
         },
     ]
@@ -522,6 +535,13 @@ async fn a_resource_signal_waits_for_what_the_attribute_states() {
         DEFAULT_TIMEOUT < MAX_TIMEOUT,
         "the default wait must be inside the published maximum, got {DEFAULT_TIMEOUT:?} \
          against {MAX_TIMEOUT:?}"
+    );
+    // ...and this emulator's ceiling on an open wait is inside that default, which is what
+    // makes every row above it hold for the ceiling.
+    assert!(
+        MAX_HELD_TIMEOUT < DEFAULT_TIMEOUT,
+        "the ceiling on an open wait must be inside the published default, got \
+         {MAX_HELD_TIMEOUT:?} against {DEFAULT_TIMEOUT:?}"
     );
 
     let (router, engine) = router_with_engine();
@@ -557,14 +577,23 @@ async fn a_resource_signal_waits_for_what_the_attribute_states() {
             .wait_conditions
             .first()
             .unwrap_or_else(|| panic!("case {:?}: the wait the policy opened", case.case));
+        let asked_for = barrier.declared.timeout;
+        assert_eq!(
+            asked_for, case.asked_for,
+            "case {:?}: expected a Timeout of {:?} to ask for {:?}, got {asked_for:?}",
+            case.case, case.timeout, case.asked_for
+        );
         let held_for = barrier
             .deadline()
             .duration_since(barrier.opened_at)
             .unwrap_or(Duration::ZERO);
         assert_eq!(
-            held_for, case.held,
+            held_for,
+            case.held(),
             "case {:?}: expected a Timeout of {:?} to be held for {:?}, got {held_for:?}",
-            case.case, case.timeout, case.held
+            case.case,
+            case.timeout,
+            case.held()
         );
         let count = barrier.count();
         assert_eq!(

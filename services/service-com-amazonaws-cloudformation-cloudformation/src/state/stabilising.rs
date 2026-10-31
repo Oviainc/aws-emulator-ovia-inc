@@ -46,17 +46,15 @@ use std::time::{Duration, SystemTime};
 /// The longest CloudFormation holds ONE resource's creation open waiting for the service
 /// that owns it to report the resource ready.
 ///
-/// Chosen, exactly as [`super::STATUS_TRANSITION_DELAY`] is, and for the same reason:
-/// CloudFormation publishes no value of its own for this (a real resource's create takes as
-/// long as the service behind it does), and nothing in the request asks for one — unlike the
-/// `Timeout` a template states for a resource signal, which is a wait the caller asked for
-/// and keeps its value ([`super::wait_conditions::WaitConditionBarrier::deadline`]). Long
-/// enough that every coming-up
+/// This emulator's ceiling on an open wait ([`super::MAX_HELD_WAIT`]), which is what every
+/// wait of this service is bounded by — the signal wait a declaration asks for
+/// ([`super::wait_conditions::MAX_HELD_TIMEOUT`]) included, so no open wait of one kind can
+/// outlive a client's poll loop while another cannot. Long enough that every coming-up
 /// span the services of this emulator owe a new resource falls due inside it many times
 /// over — including the span of the stack operation the wait is measured from
 /// ([`StabilisationBarrier::opened_at`]) — and short enough that a resource nothing will
 /// ever bring up fails the stack inside a client's poll loop instead of outliving it.
-pub const CREATE_STABILISATION_WINDOW: Duration = Duration::from_secs(15);
+pub const CREATE_STABILISATION_WINDOW: Duration = super::MAX_HELD_WAIT;
 
 /// One resource of the operation in flight whose creation is still open: the owning service
 /// accepted the create and does not report the resource ready yet.

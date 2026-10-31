@@ -35,7 +35,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_cloudformation_cloudformation::state::wait_conditions::{
-    DEFAULT_TIMEOUT, MAX_TIMEOUT,
+    DEFAULT_TIMEOUT, MAX_HELD_TIMEOUT, MAX_TIMEOUT,
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::{
     resource_status, status, CANNOT_CONTINUE_UPDATE_ROLLBACK,
@@ -827,84 +827,117 @@ async fn an_update_whose_wait_runs_out_is_rolled_back_in_the_services_that_own_i
     }
 }
 
-/// One row of the hold table: the `Timeout` the declaration states and how long the wait is
-/// held for it.
+/// One row of the hold table: the `Timeout` the declaration states, the span that asks for
+/// (bounded by the type's own published maximum, defaulted where it states none) and how
+/// long the wait is really held for it.
 struct HoldCase {
     case: &'static str,
     stack: &'static str,
     /// `Timeout` as the declaration spells it, or `None` for a declaration that states none.
     declared: Option<&'static str>,
-    held: Duration,
+    /// The span that declaration ASKS for.
+    asked_for: Duration,
+}
+
+impl HoldCase {
+    /// How long the wait is really HELD for that declaration: what it asked for, bounded by
+    /// this emulator's ceiling on an open wait.
+    fn held(&self) -> Duration {
+        self.asked_for.min(MAX_HELD_TIMEOUT)
+    }
 }
 
 /// The class the bound covers: every `Timeout` a declaration can state.
 ///
-/// A wait the template asked for is held for exactly as long as it asked. The published
-/// bound is the type's own: "the maximum time that can be specified for this
-/// property is 12 hours (43200 seconds)" (`AWS::CloudFormation::WaitCondition`'s `Timeout`),
-/// so the rows include it, one second past it, and the degenerate zero — plus a declaration
-/// that states no wait at all, which is held to the documented default.
+/// Two bounds apply to each row, and the rows span both. The span the declaration ASKS for
+/// is the type's own published one: "the maximum time that can be specified for this
+/// property is 12 hours (43200 seconds)" (`AWS::CloudFormation::WaitCondition`'s
+/// `Timeout`), with the documented default where it states none — so the rows include that
+/// maximum, one second past it, and a declaration that states nothing. How long the wait is
+/// really HELD is that span bounded by this emulator's ceiling on an open wait
+/// ([`MAX_HELD_TIMEOUT`]): nothing but a client's own signal ends this wait, so a
+/// declaration that asks to hold longer is held to the ceiling — hence the rows either side
+/// of it, and the degenerate zero.
 fn hold_cases() -> Vec<HoldCase> {
     vec![
         HoldCase {
             case: "a wait that is over the moment it starts",
             stack: "hold-zero",
             declared: Some("0"),
-            held: Duration::ZERO,
+            asked_for: Duration::ZERO,
         },
         HoldCase {
             case: "a wait of one second",
             stack: "hold-one",
             declared: Some("1"),
-            held: Duration::from_secs(1),
+            asked_for: Duration::from_secs(1),
         },
         HoldCase {
             case: "a wait of fourteen seconds",
             stack: "hold-just-inside",
             declared: Some("14"),
-            held: Duration::from_secs(14),
+            asked_for: Duration::from_secs(14),
+        },
+        HoldCase {
+            case: "a wait of exactly the ceiling",
+            stack: "hold-at-ceiling",
+            declared: Some("15"),
+            asked_for: MAX_HELD_TIMEOUT,
+        },
+        HoldCase {
+            case: "a wait one second past the ceiling",
+            stack: "hold-just-past-ceiling",
+            declared: Some("16"),
+            asked_for: MAX_HELD_TIMEOUT + Duration::from_secs(1),
         },
         HoldCase {
             case: "a wait of a minute and a half",
             stack: "hold-ninety",
             declared: Some("90"),
-            held: Duration::from_secs(90),
+            asked_for: Duration::from_secs(90),
         },
         HoldCase {
             case: "a wait just under the documented default",
             stack: "hold-just-under-default",
             declared: Some("299"),
-            held: Duration::from_secs(299),
+            asked_for: Duration::from_secs(299),
         },
         HoldCase {
             case: "a wait of the documented maximum",
             stack: "hold-maximum",
             declared: Some("43200"),
-            held: MAX_TIMEOUT,
+            asked_for: MAX_TIMEOUT,
         },
         HoldCase {
             case: "a wait past the documented maximum",
             stack: "hold-past-maximum",
             declared: Some("43201"),
-            held: MAX_TIMEOUT,
+            asked_for: MAX_TIMEOUT,
         },
         HoldCase {
             case: "a declaration that states no wait at all",
             stack: "hold-unstated",
             declared: None,
-            held: DEFAULT_TIMEOUT,
+            asked_for: DEFAULT_TIMEOUT,
         },
     ]
 }
 
 #[tokio::test]
-async fn a_wait_is_held_for_what_it_asked_bounded_by_the_documented_maximum() {
+async fn a_wait_is_held_for_what_it_asked_bounded_by_this_emulators_ceiling() {
     // The default a declaration that states nothing falls back to is inside the type's own
     // published ceiling, so no row can be held longer than the attribute permits.
     assert!(
         DEFAULT_TIMEOUT < MAX_TIMEOUT,
         "the default wait must be inside the documented Timeout maximum, got \
          {DEFAULT_TIMEOUT:?} against {MAX_TIMEOUT:?}"
+    );
+    // ...and this emulator's ceiling on an open wait is inside both, which is what makes
+    // every row above it hold for the ceiling.
+    assert!(
+        MAX_HELD_TIMEOUT < DEFAULT_TIMEOUT,
+        "the ceiling on an open wait must be inside the documented default, got \
+         {MAX_HELD_TIMEOUT:?} against {DEFAULT_TIMEOUT:?}"
     );
 
     let (router, engine) = router_with_engine();
@@ -933,14 +966,26 @@ async fn a_wait_is_held_for_what_it_asked_bounded_by_the_documented_maximum() {
             .wait_conditions
             .first()
             .unwrap_or_else(|| panic!("case {:?}: the wait condition's own barrier", case.case));
+        // What the declaration asked for, bounded by the maximum its own attribute
+        // publishes and defaulted where it stated nothing...
+        let asked_for = barrier.declared.timeout;
+        assert_eq!(
+            asked_for, case.asked_for,
+            "case {:?}: expected a declaration of {:?} to ask for {:?}, got {asked_for:?}",
+            case.case, case.declared, case.asked_for
+        );
+        // ...and how long the wait is really held for it.
         let held_for = barrier
             .deadline()
             .duration_since(barrier.opened_at)
             .unwrap_or(Duration::ZERO);
         assert_eq!(
-            held_for, case.held,
+            held_for,
+            case.held(),
             "case {:?}: expected a declaration of {:?} to be held for {:?}, got {held_for:?}",
-            case.case, case.declared, case.held
+            case.case,
+            case.declared,
+            case.held()
         );
     }
 }

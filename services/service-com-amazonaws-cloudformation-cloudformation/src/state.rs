@@ -349,6 +349,20 @@ pub mod timeline;
 /// errors that go with it, short enough that a test can wait for it.
 pub const STATUS_TRANSITION_DELAY: Duration = Duration::from_millis(500);
 
+/// The longest this emulator holds ONE stack operation open waiting for an event that may
+/// never arrive, whatever longer span the thing it waits for asks for.
+///
+/// Chosen, exactly as [`STATUS_TRANSITION_DELAY`] is, and the ceiling BOTH of this
+/// service's open waits are bounded by: the one for a resource whose owning service has not
+/// reported it ready ([`stabilising::CREATE_STABILISATION_WINDOW`]) and the one for the
+/// success signals a resource's declaration waits for
+/// ([`wait_conditions::MAX_HELD_TIMEOUT`]). Long enough that every span the services of
+/// this emulator owe a resource falls due inside it many times over, and that a client
+/// meaning to signal a resource has the whole of it to do so in; short enough that a wait
+/// nothing will ever satisfy fails the operation inside a client's poll loop instead of
+/// outliving it, so every status a client polls reaches a terminal value.
+pub const MAX_HELD_WAIT: Duration = Duration::from_secs(15);
+
 /// The region an unsigned request is served as. The emulator's own default; a signed
 /// request is served in the region of its SigV4 credential scope.
 pub const DEFAULT_REGION: &str = "us-east-1";

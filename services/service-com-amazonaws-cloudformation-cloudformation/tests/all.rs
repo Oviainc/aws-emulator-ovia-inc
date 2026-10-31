@@ -109,6 +109,8 @@ mod glue_job_resources;
 mod handler_progress_reports;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/held_signal_waits.rs"]
+mod held_signal_waits;
 #[path = "all/hook_result_detail.rs"]
 mod hook_result_detail;
 #[path = "all/hook_result_invocations.rs"]
