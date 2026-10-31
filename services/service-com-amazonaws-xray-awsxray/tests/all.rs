@@ -20,6 +20,9 @@ mod enablement_then_period_bucketing;
 #[path = "all/encryption_config.rs"]
 mod encryption_config;
 
+#[path = "all/enum_value_set_order.rs"]
+mod enum_value_set_order;
+
 #[path = "all/graphs_rules_retrievals_and_insights.rs"]
 mod graphs_rules_retrievals_and_insights;
 

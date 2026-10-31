@@ -62,6 +62,33 @@ pub mod request_layer;
 use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
+/// `refusal` with every enumerated value set stated in the order THIS service states
+/// one, and everything else — the member paths, the values echoed, every other
+/// requirement — untouched.
+///
+/// A refusal of a value outside an enumerated type names the values that type admits,
+/// and the order it names them in is the service's rather than the model's: the order a
+/// model happens to declare an enum's members in is an artefact of how the model was
+/// written, while this service states such a set sorted. The re-ordering itself is
+/// `service_common`'s one statement of that rule, applied to the violations as they
+/// arrive, so it answers for every enum of this model and every member targeting one, in
+/// any operation, rather than for a table of enums written out here.
+///
+/// Both of this service's refusal seams word their message through it — the framework's
+/// own ([`EmulatedService::override_refusal`]) and the pre-dispatch one
+/// ([`request_layer::ConstraintRefusal`]) — so the two cannot state one set two ways.
+pub(crate) fn in_stated_value_order(refusal: &Refusal) -> Refusal {
+    let Refusal::Invalid(violations) = refusal else {
+        return refusal.clone();
+    };
+    Refusal::Invalid(
+        violations
+            .iter()
+            .map(service_common::validation_message::in_sorted_enum_order)
+            .collect(),
+    )
+}
+
 /// The `com-amazonaws-xray-awsxray` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -169,7 +196,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // X-Ray's own `InvalidRequestException` is unaffected: it is what this
         // service's HANDLERS answer for a request they refuse themselves, and
         // they return it directly.
-        service_common::aws_validation_refusal(refusal)
+        //
+        // What this service chooses beyond that is the ORDER an enumerated value
+        // set is stated in ([`in_stated_value_order`]), which is not the order
+        // the model declares it in.
+        service_common::aws_validation_refusal(&in_stated_value_order(refusal))
     }
 
     fn override_routing_error(

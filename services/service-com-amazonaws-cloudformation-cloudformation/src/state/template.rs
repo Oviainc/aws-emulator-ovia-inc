@@ -2648,6 +2648,11 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Smithy model), which admits no upper case and no character a generated name
         // carries beyond letters, digits and the hyphen.
         OPENSEARCH_DOMAIN => rules(28, Characters::LowercaseAlphanumeric),
+        // AWS X-Ray `CreateSamplingRule.SamplingRule.RuleName`: `RuleName`,
+        // `@length(min: 1, max: 32)` (X-Ray's own Smithy model), which a generated name is
+        // already inside — letters, digits and the hyphen are all admitted — but is far
+        // shorter than one may be.
+        XRAY_SAMPLING_RULE => rules(32, Characters::AsGenerated),
         _ => None,
     }
 }
@@ -4677,6 +4682,13 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // rule was created under, and the record keeps it — a re-deploy of the same template
         // then sees the rule the stack already has rather than one to create again.
         || resource_type == SES_RECEIPT_RULE
+        // An AWS X-Ray sampling rule is one more, and in exactly that position: the rule's
+        // identity is the `RuleARN` `CreateSamplingRule` minted, which a declaration never
+        // states, and the NAME a declaration states lives inside that type's own
+        // `SamplingRule` property rather than in a name property the naming rules here
+        // could read. So the identifier in force is the one X-Ray answered with, and a
+        // re-deploy of the same template carries it forward rather than replacing the rule.
+        || resource_type == XRAY_SAMPLING_RULE
 }
 
 /// The type of an IAM access key: the long-term credential of an IAM user, under the
@@ -5207,6 +5219,15 @@ pub const GUARDDUTY_DETECTOR: &str = "AWS::GuardDuty::Detector";
 /// address the list by — so the id a stack reports for the resource is the one that
 /// service answered with. That is what [`identity_is_service_assigned`] names it for.
 pub const GUARDDUTY_IP_SET: &str = "AWS::GuardDuty::IPSet";
+
+/// An AWS X-Ray sampling rule's resource type (the X-Ray model:
+/// `cloudFormationName: XRay`). This is a type `super::provisioning` creates in X-Ray
+/// itself, and the type's identity is the `RuleARN` `CreateSamplingRule` MINTS — a
+/// declaration states the rule's name, never its ARN, and that ARN is what every X-Ray
+/// call on a rule can address it by — so the identifier a stack reports for the resource
+/// is the one that service answered with ([`identity_is_service_assigned`] names it for
+/// exactly that).
+pub const XRAY_SAMPLING_RULE: &str = "AWS::XRay::SamplingRule";
 
 /// A KMS key's resource type (the KMS model: `cloudFormationName: KMS`). This is a type
 /// `super::provisioning` creates in KMS itself, and "Ref returns the key ID" — `CreateKey`

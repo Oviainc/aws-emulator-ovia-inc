@@ -354,9 +354,14 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for ConstraintRefusal<Eng> {
                 Some(PreDispatchRefusal::Invalid(violations)) => violations,
                 _ => Vec::new(),
             };
-            let chosen = service_common::aws_validation_refusal(&Refusal::Invalid(
-                violations.clone(),
-            ));
+            // Worded by the same `service_common` entry point
+            // `Service::override_refusal` delegates to, over the violations in the
+            // ORDER this service states an enumerated value set in
+            // (`crate::service::in_stated_value_order`) — the one owner of that
+            // order, so the two seams cannot word one set two ways.
+            let chosen = service_common::aws_validation_refusal(
+                &crate::service::in_stated_value_order(&Refusal::Invalid(violations.clone())),
+            );
             svc.definition()
                 .refusal_response(ProtocolError::Invalid(violations), chosen)
         })

@@ -488,7 +488,7 @@ use super::template::{
     SNS_TOPIC, SQS_QUEUE, SQS_QUEUE_INLINE_POLICY, SQS_QUEUE_POLICY,
     SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
     TRANSFER_SERVER, WAFV2_IP_SET, WAFV2_REGEX_PATTERN_SET, WAFV2_RULE_GROUP, WAFV2_WEB_ACL,
-    WAFV2_WEB_ACL_ASSOCIATION, WAF_REGIONAL_IP_SET,
+    WAFV2_WEB_ACL_ASSOCIATION, WAF_REGIONAL_IP_SET, XRAY_SAMPLING_RULE,
 };
 use super::StoredResource;
 
@@ -712,6 +712,11 @@ pub(super) enum Provisioner {
     BackupVault,
     BackupPlan,
     BackupSelection,
+    /// `AWS::XRay::SamplingRule`: a sampling rule of AWS X-Ray, which
+    /// `CreateSamplingRule` creates under the rule name its declaration states and
+    /// `DeleteSamplingRule` deletes. X-Ray mints the `RuleARN` that type's `Ref`
+    /// returns and every call on a rule can address it by.
+    XraySamplingRule,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -823,6 +828,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         BACKUP_VAULT => Some(Provisioner::BackupVault),
         BACKUP_PLAN => Some(Provisioner::BackupPlan),
         BACKUP_SELECTION => Some(Provisioner::BackupSelection),
+        XRAY_SAMPLING_RULE => Some(Provisioner::XraySamplingRule),
         _ => None,
     }
 }
@@ -1194,6 +1200,9 @@ impl Provisioner {
             // `BackupSelection` and no tags: AWS Backup tags a plan and a vault, not a
             // selection, so no tags are propagated to one.
             Self::BackupSelection => create_backup_selection(ctx, region, resource).await,
+            Self::XraySamplingRule => {
+                create_sampling_rule(ctx, region, resource, propagated).await
+            }
         }
     }
 
@@ -1269,6 +1278,12 @@ impl Provisioner {
                 // key … must not start with aws:") — so a custom domain name carries the
                 // stack's own tags without the three.
                 | Self::ApiGatewayDomainName
+                // AWS X-Ray refuses a tag key in the reserved namespace on every call that
+                // takes tags — `CreateSamplingRule`'s `Tags` and `TagResource` alike, in
+                // the one check its own crate's tag validation makes ("Don't use `aws:` as
+                // a prefix for keys; it's reserved for Amazon Web Services use") — so a
+                // sampling rule carries the stack's own tags without the three.
+                | Self::XraySamplingRule
         );
         propagated
             .iter()
@@ -1939,6 +1954,9 @@ impl Provisioner {
             // The delete addresses the selection by the PAIR AWS Backup keys one by, and
             // the plan half of that pair is on the resource's own declaration.
             Self::BackupSelection => delete_backup_selection(ctx, region, resource).await,
+            // A rule is addressed by its name or by the ARN X-Ray minted — "either name
+            // or ARN, but not both" — and the ARN is this resource's physical id.
+            Self::XraySamplingRule => delete_sampling_rule(ctx, region, resource).await,
         }
     }
 
@@ -2260,6 +2278,9 @@ impl Provisioner {
             Self::RedshiftCluster => {
                 describe_redshift_cluster(ctx, region, physical_resource_id).await
             }
+            // X-Ray publishes no read of ONE sampling rule, so the rule is read out of the
+            // account's own listing, by the identity that service minted for it.
+            Self::XraySamplingRule => describe_sampling_rule(ctx, region, resource).await,
         }
     }
 }
@@ -24364,6 +24385,279 @@ fn reported_text(answered: &Value, member: &str) -> Option<String> {
         .get(member)
         .and_then(scalar_text)
         .filter(|text| !text.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// AWS X-Ray: AWS::XRay::SamplingRule
+// ---------------------------------------------------------------------------
+
+/// AWS X-Ray's signing name, from its model (`sigv4Name` and `endpointPrefix` `xray`),
+/// which speaks `restJson1`.
+const XRAY_SIGNING_NAME: &str = "xray";
+
+/// The URI bindings of the three X-Ray calls a sampling-rule deployment makes —
+/// `POST /CreateSamplingRule`, `POST /DeleteSamplingRule` and `POST /GetSamplingRules`
+/// (`smithy_query(operation="CreateSamplingRule,DeleteSamplingRule,GetSamplingRules")`).
+const XRAY_CREATE_SAMPLING_RULE_URI: &str = "/CreateSamplingRule";
+const XRAY_DELETE_SAMPLING_RULE_URI: &str = "/DeleteSamplingRule";
+const XRAY_GET_SAMPLING_RULES_URI: &str = "/GetSamplingRules";
+
+/// The one error class X-Ray answers a request of these calls it rejects under: "The
+/// request is missing required parameters or has invalid parameters"
+/// (`InvalidRequestException`, the 400 `CreateSamplingRule`, `DeleteSamplingRule` and
+/// `GetSamplingRules` each model).
+const XRAY_INVALID_REQUEST: &str = "InvalidRequestException";
+
+/// The property an `AWS::XRay::SamplingRule` states the rule under, which is also the
+/// member `CreateSamplingRule` takes it as and the member a record of
+/// `GetSamplingRules` carries it in.
+const XRAY_RULE_PROPERTY: &str = "SamplingRule";
+
+/// The deprecated property an older declaration states the same rule under, as the
+/// `SamplingRuleRecord` wrapper that type also publishes.
+const XRAY_RULE_RECORD_PROPERTY: &str = "SamplingRuleRecord";
+
+/// The member of a rule that NAMES it: "the name of the sampling rule. Specify a rule by
+/// either name or ARN, but not both" (`SamplingRule$RuleName`).
+const XRAY_RULE_NAME: &str = "RuleName";
+
+/// The member of a rule that carries the ARN X-Ray minted for it
+/// (`SamplingRule$RuleARN`), which is this type's identity.
+const XRAY_RULE_ARN: &str = "RuleARN";
+
+/// How many pages of `GetSamplingRules` one walk reads before it stops.
+///
+/// The listing is paginated (`NextToken`), and a walk over a service's own answers needs a
+/// bound rather than a loop that ends when that service says so: the cap is far above the
+/// number of rules an account can hold, so a rule that exists is always found, and a
+/// service answering an endless chain of pages cannot hold a stack operation open.
+const XRAY_SAMPLING_RULE_PAGES: usize = 64;
+
+/// Create the sampling rule an `AWS::XRay::SamplingRule` declares, and report the
+/// `RuleARN` X-Ray MINTED for it.
+///
+/// The rule itself is the declaration's own `SamplingRule` document, sent to
+/// `CreateSamplingRule` as it was declared: its member names are that call's own
+/// (`RuleName`, `ResourceARN`, `Priority`, `FixedRate`, `ReservoirSize`, `ServiceName`,
+/// `ServiceType`, `Host`, `HTTPMethod`, `URLPath`, `Version`, `Attributes`), so nothing is
+/// re-cased or re-mapped here and X-Ray's own validation is what judges the values — its
+/// refusal leaves the stack `CREATE_FAILED` rather than a rule configured differently from
+/// the template. An older declaration states the same document under the deprecated
+/// `SamplingRuleRecord` wrapper, which is read when the live property is absent; a
+/// declaration carrying neither describes no rule that could be created, so it is refused
+/// here rather than sent as a request X-Ray would have to reject.
+///
+/// A rule is keyed by its NAME, and a declaration that states none is created under the
+/// name CloudFormation decided for the resource ([`declared_name`] — the declared
+/// `RuleName` the type still publishes, or the `<stack>-<logical id>-<unique id>` name it
+/// generated, fitted to that member's own 32-character bound by the naming rules).
+///
+/// What comes back is the ARN that service minted, which no naming rule could compute:
+/// it is this resource's physical id ([`super::template::identity_is_service_assigned`]
+/// names the type) and its one published `Fn::GetAtt` attribute, so both are reported off
+/// the create's answer.
+async fn create_sampling_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let declared = resource
+        .properties
+        .get(XRAY_RULE_PROPERTY)
+        .or_else(|| {
+            resource
+                .properties
+                .get(XRAY_RULE_RECORD_PROPERTY)
+                .and_then(|record| record.get(XRAY_RULE_PROPERTY))
+        })
+        .and_then(Value::as_object);
+    let Some(declared) = declared else {
+        return Err(Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "{} declares no {XRAY_RULE_PROPERTY}",
+                resource.resource_type
+            ),
+        });
+    };
+    let mut rule = declared.clone();
+    // A rule is keyed by its NAME, so a declaration that identifies the rule nowhere is
+    // created under the name CloudFormation decided for the resource. A declaration that
+    // states the read-only `RuleARN` instead is left exactly as it stands: "specify a rule
+    // by either name or ARN, but not both", so adding a name to it would make the request a
+    // different one from the declaration, and X-Ray's own refusal is the honest answer.
+    let states = |member: &str| {
+        declared
+            .get(member)
+            .and_then(scalar_text)
+            .is_some_and(|text| !text.is_empty())
+    };
+    if !states(XRAY_RULE_NAME) && !states(XRAY_RULE_ARN) {
+        rule.insert(
+            XRAY_RULE_NAME.to_string(),
+            Value::String(declared_name(resource)),
+        );
+    }
+    let mut request = Map::new();
+    request.insert(XRAY_RULE_PROPERTY.to_string(), Value::Object(rule));
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    let reported = call_rest_json(
+        ctx,
+        XRAY_SIGNING_NAME,
+        region,
+        "POST",
+        XRAY_CREATE_SAMPLING_RULE_URI,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let created = reported
+        .get(XRAY_RULE_RECORD_PROPERTY)
+        .and_then(|record| record.get(XRAY_RULE_PROPERTY))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let Some(rule_arn) = reported_text(&created, XRAY_RULE_ARN) else {
+        // The create answered 2xx without the ARN its output models. Nothing addresses a
+        // rule by an identity nothing minted, so this is reported as a failure rather
+        // than recorded as a resource with a physical id this module invented.
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: format!("CreateSamplingRule answered no {XRAY_RULE_ARN}"),
+        });
+    };
+    let mut attributes = BTreeMap::new();
+    attributes.insert(XRAY_RULE_ARN.to_string(), rule_arn.clone());
+    Ok(Created {
+        physical_resource_id: Some(rule_arn),
+        attributes,
+    })
+}
+
+/// Delete the sampling rule a stack created, addressed the way X-Ray addresses one:
+/// "specify a rule by either name or ARN, but not both" ([`sampling_rule_handle`]).
+///
+/// A rule X-Ray no longer holds is already in the state the delete asks for. That service
+/// answers every client rejection of this call under ONE class, so the code alone does not
+/// say WHICH rejection it was: a refusal is confirmed by reading the account's rules back
+/// ([`held_sampling_rule`]), exactly as [`delete_guardduty_ip_set`] confirms one, and only
+/// a rule that listing no longer holds is treated as already deleted.
+async fn delete_sampling_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let (member, selector) = sampling_rule_handle(resource);
+    let mut request = Map::new();
+    request.insert(member.to_string(), Value::String(selector.to_string()));
+    let refusal = match call_rest_json(
+        ctx,
+        XRAY_SIGNING_NAME,
+        region,
+        "POST",
+        XRAY_DELETE_SAMPLING_RULE_URI,
+        Some(&Value::Object(request)),
+    )
+    .await
+    {
+        Ok(_) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    if refusal.code != XRAY_INVALID_REQUEST {
+        return Err(refusal);
+    }
+    match held_sampling_rule(ctx, region, resource).await? {
+        // The rule is still there, so the delete really was refused.
+        Some(_) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
+/// The rule's configuration as X-Ray reports it, for drift detection, in the shape the
+/// type declares it in — the rule document under its own `SamplingRule` property — so a
+/// declared member is compared against the member of the same name that service answers
+/// with.
+///
+/// A rule the listing no longer holds was deleted, which for a READ is what
+/// [`Provisioner::actual_configuration`] reports as `DELETED`.
+///
+/// `Tags` is not reported: the type publishes them as a `[{Key, Value}]` list, the listing
+/// carries none, and a property the actual document does not carry is not evidence of
+/// anything (`super::drift::differences`) — so a rule's tags are never read as drift
+/// rather than compared against a set this read cannot see.
+async fn describe_sampling_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let Some(rule) = held_sampling_rule(ctx, region, resource).await? else {
+        return Ok(None);
+    };
+    let mut actual = Map::new();
+    actual.insert(XRAY_RULE_PROPERTY.to_string(), rule);
+    Ok(Some(Value::Object(actual)))
+}
+
+/// The rule this resource names, as X-Ray's own `GetSamplingRules` reports it, or `None`
+/// for a rule that listing does not hold.
+///
+/// X-Ray publishes no read of ONE sampling rule, so the account's listing is what answers
+/// whether a rule is there — walked page by page ([`XRAY_SAMPLING_RULE_PAGES`]) and matched
+/// on the member that carries this resource's identity ([`sampling_rule_handle`]).
+async fn held_sampling_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let (member, selector) = sampling_rule_handle(resource);
+    let mut next_token: Option<String> = None;
+    for _ in 0..XRAY_SAMPLING_RULE_PAGES {
+        let mut request = Map::new();
+        if let Some(token) = &next_token {
+            request.insert("NextToken".to_string(), Value::String(token.clone()));
+        }
+        let answered = call_rest_json(
+            ctx,
+            XRAY_SIGNING_NAME,
+            region,
+            "POST",
+            XRAY_GET_SAMPLING_RULES_URI,
+            Some(&Value::Object(request)),
+        )
+        .await?;
+        let records = answered
+            .get("SamplingRuleRecords")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for record in &records {
+            let Some(rule) = record.get(XRAY_RULE_PROPERTY) else {
+                continue;
+            };
+            if reported_text(rule, member).as_deref() == Some(selector) {
+                return Ok(Some(rule.clone()));
+            }
+        }
+        match reported_text(&answered, "NextToken") {
+            Some(token) => next_token = Some(token),
+            None => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// The member a call on this resource's rule addresses it by, and the value to address it
+/// with: the `RuleARN` X-Ray minted, which is this type's physical id once its create went
+/// through, and otherwise the `RuleName` the resource carries — "specify a rule by either
+/// name or ARN, but not both", so exactly one of the two travels.
+fn sampling_rule_handle(resource: &StoredResource) -> (&'static str, &str) {
+    let identity = resource.physical_resource_id.as_str();
+    if identity.starts_with("arn:") {
+        return (XRAY_RULE_ARN, identity);
+    }
+    (XRAY_RULE_NAME, identity)
 }
 
 #[cfg(test)]

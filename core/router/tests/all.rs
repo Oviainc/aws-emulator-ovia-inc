@@ -676,6 +676,11 @@ mod cloudformation_provisions_route53resolver_rules;
 // both regions every concurrently landing router suite puts its line in.
 #[path = "all/cloudformation_provisions_route53resolver_firewall.rs"]
 mod cloudformation_provisions_route53resolver_firewall;
+// Declared HERE, beside the sibling CloudFormation provisioning suites in the same quiet
+// span, for the reason those entries record: the appended tail at the end of this file and
+// the `c` span are both regions every concurrently landing router suite puts its line in.
+#[path = "all/cloudformation_provisions_xray_sampling_rules.rs"]
+mod cloudformation_provisions_xray_sampling_rules;
 // `query_wire` and `rds_query_front_door` are declared HERE, in the sorted list,
 // rather than appended at the end: the end of this file is where every new router
 // suite lands, so a line added there collides with every other suite landing in the
