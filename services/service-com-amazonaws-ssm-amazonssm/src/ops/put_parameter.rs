@@ -13,6 +13,16 @@
 //! Implementing this operation also closes `issues/.../ssm-putparameter-stub.md`, which
 //! asks for exactly this handler; `GetParameter` needs it to have anything to read.
 //!
+//! ## A `SecureString` is stored encrypted
+//!
+//! A `SecureString`'s `Value` is "encrypt[ed] ... with the KMS ID that you want to use"
+//! before it is persisted, so what this store holds for such a version is the KMS
+//! ciphertext and not the value the request carried: the sealing is
+//! [`crate::state::secure_string::seal`], under the key `KeyId` names (the Amazon Web
+//! Services managed key of this service when it names none) and bound to this parameter
+//! by the encryption context. A `KeyId` that names no key at this endpoint therefore
+//! refuses the put with `InvalidKeyId` rather than storing the value in the clear.
+//!
 //! ## Parameter policies
 //!
 //! A `Policies` document is validated against the supported policy types and their
@@ -256,8 +266,6 @@ struct Existing {
     type_: Option<String>,
     /// Its current `Tier`, which an update may raise but not lower.
     tier: Option<String>,
-    /// The number the version this put creates will carry.
-    next_version: i64,
     /// How many versions are retained right now.
     retained: usize,
     /// Whether the oldest retained version carries a label, which stops it from being
@@ -569,17 +577,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let has_policies = policies > 0;
 
-        let mut store = state.lock();
-        let parameters_in_region = store.parameters_in_region(&region);
-        let existing = store.parameter(&region, name).map(|record| Existing {
-            type_: record.latest().map(|latest| latest.type_.clone()),
-            tier: record.latest().map(|latest| latest.tier.clone()),
-            next_version: record.next_version(),
-            retained: record.versions.len(),
-            oldest_labelled: record
-                .oldest()
-                .is_some_and(|oldest| !oldest.labels.is_empty()),
-        });
+        // What the store already holds, read under the guard and then released: a
+        // `SecureString` is sealed under its KMS key below, and no state of this service
+        // is held while KMS seals it.
+        let (parameters_in_region, parameters_total, existing) = {
+            let store = state.lock();
+            let existing = store.parameter(&region, name).map(|record| Existing {
+                type_: record.latest().map(|latest| latest.type_.clone()),
+                tier: record.latest().map(|latest| latest.tier.clone()),
+                retained: record.versions.len(),
+                oldest_labelled: record
+                    .oldest()
+                    .is_some_and(|oldest| !oldest.labels.is_empty()),
+            });
+            (
+                store.parameters_in_region(&region),
+                store.parameters.len(),
+                existing,
+            )
+        };
 
         // "The parameter already exists. You can't create duplicate parameters" —
         // unless the request asked to overwrite it.
@@ -697,9 +713,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let full = (parameters_in_region >= crate::state::MAX_PARAMETERS_PER_REGION)
                 .then_some(("Region", parameters_in_region, crate::state::MAX_PARAMETERS_PER_REGION))
                 .or_else(|| {
-                    (store.parameters.len() >= crate::state::MAX_PARAMETERS_TOTAL).then_some((
+                    (parameters_total >= crate::state::MAX_PARAMETERS_TOTAL).then_some((
                         "store",
-                        store.parameters.len(),
+                        parameters_total,
                         crate::state::MAX_PARAMETERS_TOTAL,
                     ))
                 });
@@ -715,23 +731,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let version = existing.as_ref().map_or(1, |held| held.next_version);
+        // "If you don't specify a key ID, the system uses the default key associated with
+        // your Amazon Web Services account", which Parameter Store reaches through this
+        // alias; a type that is not encrypted carries none.
+        let key_id = match (secure, input.key_id) {
+            (true, Some(key_id)) => Some(key_id),
+            (true, None) => Some(crate::state::DEFAULT_SECURE_STRING_KEY_ID.to_string()),
+            (false, _) => None,
+        };
+        // A `SecureString` is "the KMS ID that you want to use to encrypt a parameter"
+        // applied: the value is sealed under that key, bound to this parameter by the
+        // encryption context, and what this store holds for it is the CIPHERTEXT. Every
+        // other type is not encrypted, so its value is stored as the request supplied it.
+        let stored_value = match key_id.as_deref() {
+            None => input.value,
+            Some(key_id) => {
+                let parameter_arn = crate::state::parameter_arn(&region, name);
+                match crate::state::secure_string::seal(
+                    &*self.engine,
+                    &region,
+                    key_id,
+                    &parameter_arn,
+                    &input.value,
+                ) {
+                    Ok(sealed) => sealed,
+                    // "The query key ID isn't valid": the request named a key this
+                    // endpoint has none of, so there is nothing to encrypt the value
+                    // under and the put is refused rather than stored in the clear.
+                    Err(crate::state::secure_string::SealRefusal::UnknownKey(why)) => {
+                        return Err(PutParameterErrorModeled::InvalidKeyId(InvalidKeyId {
+                            message: Some(why),
+                        })
+                        .into())
+                    }
+                    Err(crate::state::secure_string::SealRefusal::Unavailable(why)) => {
+                        return Err(PutParameterErrorModeled::InternalServerError(
+                            InternalServerError { message: Some(why) },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        let mut store = state.lock();
+        // The version this put creates, read from the store it is written to: the number
+        // follows the versions the parameter holds now.
+        let version = store
+            .parameter(&region, name)
+            .map_or(1, crate::state::ParameterRecord::next_version);
         let stored_version = crate::state::ParameterVersionRecord {
             version,
-            value: input.value,
+            value: stored_value,
             type_,
             data_type,
             tier: tier.clone(),
             description: input.description,
             allowed_pattern: input.allowed_pattern,
-            // "If you don't specify a key ID, the system uses the default key
-            // associated with your Amazon Web Services account", which Parameter Store
-            // reaches through this alias; a type that is not encrypted carries none.
-            key_id: match (secure, input.key_id) {
-                (true, Some(key_id)) => Some(key_id),
-                (true, None) => Some(crate::state::DEFAULT_SECURE_STRING_KEY_ID.to_string()),
-                (false, _) => None,
-            },
+            key_id,
             policies: input.policies,
             last_modified_date: now,
             // Only `LabelParameterVersion` attaches a label, so a version is created

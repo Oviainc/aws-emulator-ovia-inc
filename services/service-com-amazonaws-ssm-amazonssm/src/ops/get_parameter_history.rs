@@ -22,10 +22,12 @@
 //!
 //! ## `WithDecryption` and `SecureString`
 //!
-//! This emulator holds no key material and encrypts nothing, so a `SecureString`'s value
-//! is reported exactly as `PutParameter` persisted it and `WithDecryption` selects
-//! nothing — the same stance `GetParameter` takes, rather than inventing a
-//! ciphertext-shaped blob nothing computed. For `String` and `StringList` the flag is
+//! Each `SecureString` version is stored as the KMS ciphertext its own put sealed, so
+//! `WithDecryption` selects which form every reported entry's value takes — the stored
+//! ciphertext, base64-encoded, when it is absent or false, and that version's plaintext,
+//! opened under the key the version names, when it is true. A key that refuses one entry
+//! refuses the whole page with `AccessDeniedException`, and a value no key of this
+//! endpoint opens any more is `InvalidKeyId`. For `String` and `StringList` the flag is
 //! ignored by the service too ("This flag is ignored for String and StringList parameter
 //! types").
 //!
@@ -271,15 +273,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it.
         //
         // `WithDecryption` asks for "decrypted values for secure string parameters". The
-        // store holds the value a put supplied, under the key that put recorded, and
-        // every parameter read in this crate reports that one stored value, so the flag
-        // changes nothing about WHICH value this read reports — what it selects is
-        // whether each reported `SecureString` version is opened under its own key, which
-        // that key's policy decides below.
+        // store holds each `SecureString` version as the KMS ciphertext its put sealed,
+        // so the flag selects which form this read reports: the stored ciphertext when it
+        // is absent or false, and the plaintext — opened under that version's own key,
+        // which that key's policy decides below — when it is true.
         //
         // The store guard is released before the keys are asked, so no state of this
         // service is held while KMS's decision is made.
-        let (parameters, next_token, decrypted) = {
+        let (mut parameters, next_token, to_open) = {
             let store = state.lock();
             let Some(record) = store.parameter(&region, query.name) else {
                 return Err(not_found().into());
@@ -302,7 +303,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let mut parameters = Vec::new();
-            let mut decrypted = Vec::new();
+            let mut to_open = Vec::new();
             let mut next_token = None;
             for version in &record.versions {
                 if resume_from.is_some_and(|from| version.version < from) {
@@ -316,21 +317,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     break;
                 }
                 parameters.push(version.to_parameter_history(record));
-                decrypted.extend(crate::state::secure_string::decrypted_value(
-                    input.with_decryption,
-                    record,
-                    version,
-                ));
+                to_open.extend(
+                    crate::state::secure_string::value_to_open(
+                        input.with_decryption,
+                        record,
+                        version,
+                    )
+                    .map(|sealed| (parameters.len() - 1, sealed)),
+                );
             }
-            (parameters, next_token, decrypted)
+            (parameters, next_token, to_open)
         };
 
-        crate::state::secure_string::authorize_decryption(&*self.engine, ctx, &region, &decrypted)
-            .map_err(|message| {
-                GetParameterHistoryErrorModeled::AccessDeniedException(AccessDeniedException {
-                    message,
-                })
-            })?;
+        for (at, plaintext) in
+            crate::state::secure_string::open(&*self.engine, ctx, &region, &to_open).map_err(
+                |refusal| match refusal {
+                    crate::state::secure_string::OpenRefusal::Denied(message) => {
+                        GetParameterHistoryErrorModeled::AccessDeniedException(
+                            AccessDeniedException { message },
+                        )
+                    }
+                    crate::state::secure_string::OpenRefusal::Key(message) => {
+                        GetParameterHistoryErrorModeled::InvalidKeyId(InvalidKeyId {
+                            message: Some(message),
+                        })
+                    }
+                },
+            )?
+        {
+            if let Some(reported) = parameters.get_mut(at) {
+                reported.value = Some(plaintext);
+            }
+        }
 
         Ok(GetParameterHistoryOutput {
             parameters: Some(parameters),

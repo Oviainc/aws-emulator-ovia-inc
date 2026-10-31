@@ -22,10 +22,13 @@
 //!
 //! ## `WithDecryption` and `SecureString`
 //!
-//! As for `GetParameter`: this emulator holds no key material and encrypts nothing, so a
-//! `SecureString`'s value is reported exactly as `PutParameter` persisted it and
-//! `WithDecryption` selects nothing. `InvalidKeyId` is therefore never the answer to a
-//! read — no key is resolved, so none is found invalid.
+//! As for `GetParameter`: a `SecureString`'s value is stored as the KMS ciphertext its put
+//! sealed, so `WithDecryption` selects which form each reported value takes — the stored
+//! ciphertext, base64-encoded, when it is absent or false, and the plaintext, opened under
+//! that parameter's own key, when it is true. Every value this read reports has to be
+//! opened before the answer is served, so a key that refuses one of them refuses the whole
+//! read with `AccessDeniedException`, and a value no key of this endpoint opens any more is
+//! `InvalidKeyId`.
 //!
 //! ## Paging
 //!
@@ -313,10 +316,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = request_region(ctx.parts());
         // The store guard is released before the keys are asked, so no state of this
         // service is held while KMS's decision is made.
-        let (parameters, next_token, decrypted) = {
+        let (mut parameters, next_token, to_open) = {
             let store = state.lock();
             let mut parameters = Vec::new();
-            let mut decrypted = Vec::new();
+            let mut to_open = Vec::new();
             let mut next_token = None;
             for (name, record) in store.parameters_of_region(&region) {
                 if resume_from.is_some_and(|from| name < from) {
@@ -342,24 +345,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // none: a selector is "either the version number or the label used to
                 // retrieve the parameter value" (`Parameter$Selector`).
                 parameters.push(version.to_parameter(record, None));
-                decrypted.extend(crate::state::secure_string::decrypted_value(
-                    input.with_decryption,
-                    record,
-                    version,
-                ));
+                to_open.extend(
+                    crate::state::secure_string::value_to_open(
+                        input.with_decryption,
+                        record,
+                        version,
+                    )
+                    .map(|sealed| (parameters.len() - 1, sealed)),
+                );
             }
-            (parameters, next_token, decrypted)
+            (parameters, next_token, to_open)
         };
 
         // A `WithDecryption` read has each reported `SecureString` opened under that
         // parameter's own KMS key, so every one of those keys decides the read before any
-        // value is reported.
-        crate::state::secure_string::authorize_decryption(&*self.engine, ctx, &region, &decrypted)
-            .map_err(|message| {
-                GetParametersByPathErrorModeled::AccessDeniedException(AccessDeniedException {
-                    message,
-                })
-            })?;
+        // value is reported; a read that asks for none reports the stored ciphertexts.
+        for (at, plaintext) in
+            crate::state::secure_string::open(&*self.engine, ctx, &region, &to_open).map_err(
+                |refusal| match refusal {
+                    crate::state::secure_string::OpenRefusal::Denied(message) => {
+                        GetParametersByPathErrorModeled::AccessDeniedException(
+                            AccessDeniedException { message },
+                        )
+                    }
+                    crate::state::secure_string::OpenRefusal::Key(message) => {
+                        GetParametersByPathErrorModeled::InvalidKeyId(InvalidKeyId {
+                            message: Some(message),
+                        })
+                    }
+                },
+            )?
+        {
+            if let Some(reported) = parameters.get_mut(at) {
+                reported.value = Some(plaintext);
+            }
+        }
 
         Ok(GetParametersByPathOutput {
             parameters: Some(parameters),

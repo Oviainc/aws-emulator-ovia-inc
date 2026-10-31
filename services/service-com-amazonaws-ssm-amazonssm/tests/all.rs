@@ -35,5 +35,7 @@ mod parameters_by_path;
 mod published_documents;
 #[path = "all/secure_string_decryption.rs"]
 mod secure_string_decryption;
+#[path = "all/secure_string_encryption_at_rest.rs"]
+mod secure_string_encryption_at_rest;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

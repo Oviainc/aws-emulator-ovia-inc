@@ -236,7 +236,15 @@ async fn a_name_written_again_after_a_delete_is_a_fresh_parameter() {
              {written}"
         );
 
-        let (status, read) = call(&router, "GetParameter", &json!({ "Name": row.name })).await;
+        // A `SecureString` is stored as the ciphertext its put sealed, so the read that
+        // compares the value with what the write supplied asks for it decrypted; the flag
+        // "is ignored for String and StringList parameter types".
+        let (status, read) = call(
+            &router,
+            "GetParameter",
+            &json!({ "Name": row.name, "WithDecryption": true }),
+        )
+        .await;
         let parameter = &read["Parameter"];
         assert_eq!(
             (

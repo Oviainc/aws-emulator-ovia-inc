@@ -71,6 +71,93 @@ pub(crate) fn router() -> MultiServiceRouter {
     router
 }
 
+/// A router with this service AND KMS mounted on one shared engine.
+///
+/// A `SecureString`'s value is sealed under the KMS key its put names, so a suite whose
+/// parameters name a customer managed key needs that key to be one KMS holds — and the
+/// key is created through KMS's own operations ([`kms_key_with_alias`]) rather than
+/// planted in a store.
+pub(crate) fn router_with_kms() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(service_com_amazonaws_ssm_amazonssm::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    router.register_service(
+        service_com_amazonaws_kms_trentservice::EmulatedService::new(engine),
+    );
+    router
+}
+
+/// Create a symmetric encryption key in [`REGION`] and point `alias` at it, through KMS's
+/// own operations, returning the key id.
+pub(crate) async fn kms_key_with_alias(router: &MultiServiceRouter, alias: &str) -> String {
+    kms_key_with_alias_in(router, REGION, alias).await
+}
+
+/// [`kms_key_with_alias`] at `region`'s endpoint: a KMS key is regional, so a parameter
+/// and the key it is sealed under live at the same endpoint. KMS is an awsJson1_1 service
+/// reached by `X-Amz-Target: TrentService.<Operation>`.
+pub(crate) async fn kms_key_with_alias_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    alias: &str,
+) -> String {
+    let created = kms(router, region, "CreateKey", &json!({ "Description": alias })).await;
+    let key_id = created["KeyMetadata"]["KeyId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateKey reports a KeyId, got {created}"))
+        .to_string();
+    kms(
+        router,
+        region,
+        "CreateAlias",
+        &json!({ "AliasName": alias, "TargetKeyId": key_id }),
+    )
+    .await;
+    key_id
+}
+
+/// One KMS call that must succeed, returning its parsed body.
+async fn kms(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("kms.{region}.amazonaws.com"))
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("TrentService.{operation}"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20240101/{region}/kms/aws4_request, \
+                 SignedHeaders=host;x-amz-target, Signature=0000"
+            ),
+        )
+        .body(Bytes::from(
+            serde_json::to_vec(body).expect("the request body serializes"),
+        ))
+        .expect("a valid test request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let raw = response.into_body();
+    let parsed: Value = if raw.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&raw).unwrap_or(Value::Null)
+    };
+    assert_eq!(
+        status, 200,
+        "KMS {operation} {body} must succeed, got {status} with {parsed}"
+    );
+    parsed
+}
+
 /// Call one operation signed for `region`, returning `(status, body)`.
 pub(crate) async fn call_in_region(
     router: &MultiServiceRouter,
@@ -136,8 +223,19 @@ async fn put(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "PutParameter", body).await
 }
 
+/// `GetParameter` of `name`, asking for the value decrypted.
+///
+/// A `SecureString` is stored as the KMS ciphertext its put sealed, so a round-trip that
+/// compares what a read reports with what the put supplied asks for the decrypted value;
+/// the flag "is ignored for String and StringList parameter types". What the undecrypted
+/// read reports is `all/secure_string_decryption.rs`'s subject.
 async fn get(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
-    call(router, "GetParameter", &json!({ "Name": name })).await
+    call(
+        router,
+        "GetParameter",
+        &json!({ "Name": name, "WithDecryption": true }),
+    )
+    .await
 }
 
 /// `PutParameter`, asserting it succeeded, and returning its response.
@@ -972,7 +1070,10 @@ async fn allowed_pattern_validates_the_value() {
 /// Parameter Store supports, and `Type` is required only when creating.
 #[tokio::test]
 async fn type_data_type_key_id_and_tag_rules() {
-    let router = router();
+    // A `SecureString` names a KMS key and is sealed under it, so KMS is mounted beside
+    // this service and the key the puts below name is one KMS created.
+    let router = router_with_kms();
+    kms_key_with_alias(&router, "alias/custom-key").await;
 
     let (status, response) = put(
         &router,

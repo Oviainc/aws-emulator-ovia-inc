@@ -362,6 +362,12 @@ pub fn resolve_tier(
 pub struct ParameterVersionRecord {
     /// This version's number, counting from 1 for a parameter's first version.
     pub version: i64,
+    /// The value AT REST, which is what a read reports when it asks for no decryption.
+    ///
+    /// For a [`TYPE_SECURE_STRING`] version that is the base64 of the KMS ciphertext the
+    /// put sealed the value into ([`secure_string::seal`]) — never the plaintext, which
+    /// this store does not hold. For every other type the value is not encrypted at all,
+    /// so it is the value as the put supplied it.
     pub value: String,
     /// A `ParameterType` value.
     pub type_: String,
@@ -551,12 +557,20 @@ impl ParameterRecord {
     /// This parameter's ARN. A hierarchical name keeps its whole path after the
     /// `parameter/` prefix: `arn:aws:ssm:<region>:<account>:parameter/Dev/DBServer`.
     pub fn arn(&self) -> String {
-        ::engine::emulator_arn(
-            ARN_SERVICE,
-            &self.region,
-            &format!("{ARN_RESOURCE_PREFIX}{}", canonical_name(&self.name)),
-        )
+        parameter_arn(&self.region, &self.name)
     }
+}
+
+/// The ARN of the parameter `name` names in `region` — the one spelling of it, for a
+/// caller that holds no record to ask ([`ParameterRecord::arn`] is the same ARN).
+///
+/// A hierarchical name keeps its whole path after the `parameter/` prefix.
+pub fn parameter_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{ARN_RESOURCE_PREFIX}{}", canonical_name(name)),
+    )
 }
 
 /// What a read's `Name` names: which parameter, in which Region and account, and the

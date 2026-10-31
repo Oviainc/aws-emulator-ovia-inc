@@ -11,19 +11,16 @@
 //!
 //! ## `WithDecryption` and `SecureString`
 //!
-//! This emulator holds no key material and encrypts nothing, so a `SecureString`'s value
-//! is reported exactly as `PutParameter` persisted it. What `WithDecryption` DOES select is
-//! whether this read has the value opened under the parameter's KMS key: a read that asks
-//! for the decrypted value of a `SecureString` is served only if that key's policy permits
-//! the caller `kms:Decrypt` under the encryption context binding the value to this
-//! parameter, and is otherwise refused with `AccessDeniedException` (HTTP 400) carrying
-//! KMS's own sentence — see [`crate::state::secure_string`]. For `String` and `StringList`
-//! the flag selects nothing, as it does for the service too ("This flag is ignored for
-//! String and StringList parameter types").
-//!
-//! Reporting an undecrypted read as a ciphertext-shaped blob would be inventing a value
-//! nothing computed, which is worse than reporting what is stored, so such a read reports
-//! the stored value.
+//! A `SecureString`'s value is stored as the KMS ciphertext `PutParameter` sealed it into,
+//! so `WithDecryption` selects which of the two forms this read reports: absent or false
+//! it reports the stored ciphertext, base64-encoded, which only KMS can open; true it
+//! reports the plaintext, and only if the parameter's key permits the caller `kms:Decrypt`
+//! under the encryption context binding the value to this parameter — otherwise the read
+//! is refused with `AccessDeniedException` (HTTP 400) carrying KMS's own sentence, and a
+//! value no key of this endpoint opens any more is `InvalidKeyId`. See
+//! [`crate::state::secure_string`]. For `String` and `StringList` the flag selects
+//! nothing, as it does for the service too ("This flag is ignored for String and
+//! StringList parameter types").
 //!
 //! ## Parameters nobody created
 //!
@@ -252,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The store guard is released before the key is asked, so no state of this
         // service is held while KMS's decision is made.
-        let (parameter, decrypted) = {
+        let (mut parameter, to_open) = {
             let store = state.lock();
             let Some(record) = store.parameter(&region, query.name) else {
                 return Err(not_found().into());
@@ -273,26 +270,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             (
                 version.to_parameter(record, query.selector),
-                crate::state::secure_string::decrypted_value(
-                    input.with_decryption,
-                    record,
-                    version,
-                ),
+                crate::state::secure_string::value_to_open(input.with_decryption, record, version)
+                    .map(|sealed| (0usize, sealed))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
             )
         };
 
         // A `WithDecryption` read of a `SecureString` has its value opened under the
         // parameter's own KMS key, so that key's policy decides the read before the value
-        // is reported.
-        crate::state::secure_string::authorize_decryption(
-            &*self.engine,
-            ctx,
-            &region,
-            decrypted.iter(),
-        )
-        .map_err(|message| {
-            GetParameterErrorModeled::AccessDeniedException(AccessDeniedException { message })
-        })?;
+        // is reported; a read that asks for none reports the stored ciphertext.
+        for (_, plaintext) in
+            crate::state::secure_string::open(&*self.engine, ctx, &region, &to_open).map_err(
+                |refusal| match refusal {
+                    crate::state::secure_string::OpenRefusal::Denied(message) => {
+                        GetParameterErrorModeled::AccessDeniedException(AccessDeniedException {
+                            message,
+                        })
+                    }
+                    crate::state::secure_string::OpenRefusal::Key(message) => {
+                        GetParameterErrorModeled::InvalidKeyId(InvalidKeyId {
+                            message: Some(message),
+                        })
+                    }
+                },
+            )?
+        {
+            parameter.value = Some(plaintext);
+        }
 
         Ok(GetParameterOutput {
             parameter: Some(parameter),

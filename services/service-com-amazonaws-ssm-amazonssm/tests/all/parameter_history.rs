@@ -262,7 +262,11 @@ async fn a_history_read_reports_every_version_a_put_created_oldest_first() {
 
     for (case, name, type_, values) in cases {
         let created = seed_versions(&router, name, type_, values).await;
-        let response = history_ok(&router, case, &json!({ "Name": name })).await;
+        // A `SecureString` version is stored as the ciphertext its put sealed, so a read
+        // that compares the reported values with what the puts wrote asks for them
+        // decrypted; the flag "is ignored for String and StringList parameter types".
+        let response =
+            history_ok(&router, case, &json!({ "Name": name, "WithDecryption": true })).await;
 
         assert_eq!(
             reported_versions(case, &response),
@@ -318,8 +322,14 @@ async fn a_history_read_reports_every_version_a_put_created_oldest_first() {
         }
 
         // Round trip through the implemented single-parameter read: the newest entry of
-        // the history is the version that read answers with.
-        let (status, latest) = call(&router, "GetParameter", &json!({ "Name": name })).await;
+        // the history is the version that read answers with. Both reads ask for the value
+        // decrypted, so an encrypted parameter is compared at its plaintext.
+        let (status, latest) = call(
+            &router,
+            "GetParameter",
+            &json!({ "Name": name, "WithDecryption": true }),
+        )
+        .await;
         assert_eq!(
             status, 200,
             "case {case}: GetParameter must succeed, got {status} {latest}"
@@ -814,10 +824,12 @@ async fn a_full_arn_and_a_bare_name_name_one_history_per_region() {
     );
 }
 
-/// `WithDecryption` does not change which value a history read reports: the store holds
-/// the value a put supplied and this read reports it either way.
+/// `WithDecryption` selects which FORM of each value a history read reports: the stored
+/// ciphertext of a `SecureString` when it is absent or false, that version's plaintext
+/// when it is true — and nothing at all for the two types "this flag is ignored for"
+/// (`GetParameterHistoryRequest$WithDecryption`), whose values are not encrypted.
 #[tokio::test]
-async fn with_decryption_reports_the_stored_value_for_every_type() {
+async fn with_decryption_selects_which_form_of_each_value_is_reported() {
     let router = router();
 
     // The `ParameterType` values the model's enum declares
@@ -825,7 +837,9 @@ async fn with_decryption_reports_the_stored_value_for_every_type() {
     for type_ in ["String", "StringList", "SecureString"] {
         let name = format!("/hist/decrypt/{type_}");
         let values = ["one", "two"];
+        let plaintexts: Vec<String> = values.iter().map(|value| (*value).to_string()).collect();
         seed_versions(&router, &name, type_, &values).await;
+        let encrypted = type_ == "SecureString";
         for with_decryption in [None, Some(false), Some(true)] {
             let case = format!("{type_} with WithDecryption {with_decryption:?}");
             let mut body = json!({ "Name": name });
@@ -833,11 +847,31 @@ async fn with_decryption_reports_the_stored_value_for_every_type() {
                 body["WithDecryption"] = json!(flag);
             }
             let response = history_ok(&router, &case, &body).await;
-            assert_eq!(
-                reported_values(&case, &response),
-                values.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
-                "case {case}: the history reports the stored values, got {response}"
-            );
+            let reported = reported_values(&case, &response);
+            if encrypted && with_decryption != Some(true) {
+                assert_eq!(
+                    reported.len(),
+                    plaintexts.len(),
+                    "case {case}: the history reports one value per version, got {response}"
+                );
+                for (reported, plaintext) in reported.iter().zip(&plaintexts) {
+                    assert_ne!(
+                        reported, plaintext,
+                        "case {case}: an undecrypted read reports the ciphertext, not the \
+                         plaintext, got {response}"
+                    );
+                    assert!(
+                        ::aws_smithy_types::base64::decode(reported).is_ok(),
+                        "case {case}: an undecrypted read reports base64 ciphertext, got \
+                         {reported:?}"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    reported, plaintexts,
+                    "case {case}: the history reports the values its puts wrote, got {response}"
+                );
+            }
         }
     }
 }

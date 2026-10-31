@@ -14,8 +14,6 @@
 //! top-level name, page size, the filter key, its comparison option and its values, and
 //! the signed Region — rather than the single path the recorded unit happened to read.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -47,17 +45,14 @@ const MAX_PAGE_SIZE: i64 = 10;
 /// `PutParameterRequest$KeyId`), which Parameter Store reaches through this alias.
 const DEFAULT_KEY_ALIAS: &str = "alias/aws/ssm";
 
-/// A router with just this service mounted on a fresh engine.
+/// A router with this service and KMS mounted on one shared engine (the crate's shared
+/// harness, `all/parameter_store.rs`).
+///
+/// KMS is there because a `SecureString`'s value is sealed under the key its put names:
+/// the hierarchy below holds `SecureString` parameters, and the one that names a customer
+/// managed key names a key KMS created.
 fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signatures are not what these tests are about; the router still reads the SigV4
-    // credential scope below, which is where a stored parameter's Region comes from.
-    router.set_request_authentication(false);
-    router.register_service(service_com_amazonaws_ssm_amazonssm::EmulatedService::new(
-        engine,
-    ));
-    router
+    super::parameter_store::router_with_kms()
 }
 
 /// Call one operation signed for `region`, returning `(status, body)`.
@@ -339,6 +334,9 @@ async fn a_path_read_reports_the_parameters_under_that_level() {
 #[tokio::test]
 async fn each_reported_parameter_is_the_persisted_one() {
     let router = router();
+    // The customer managed key one of the seeds names, created through KMS's own
+    // operations: a `SecureString` is sealed under the key its put names.
+    super::parameter_store::kms_key_with_alias(&router, "alias/custom-key").await;
     let seeds: &[Seed<'_>] = &[
         ("/Round/plain", "String", "plain-value", None),
         ("/Round/list", "StringList", "alpha,beta,gamma", None),
@@ -498,6 +496,7 @@ async fn paging_walks_the_hierarchy_once() {
 #[tokio::test]
 async fn filters_select_on_the_stored_parameter() {
     let router = router();
+    super::parameter_store::kms_key_with_alias(&router, "alias/custom-key").await;
     seed(
         &router,
         &[

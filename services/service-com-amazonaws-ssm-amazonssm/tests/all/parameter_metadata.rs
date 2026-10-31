@@ -16,7 +16,6 @@
 //! rather than the single listing the recorded unit happened to ask for.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -81,17 +80,13 @@ fn the_most_filters_a_describe_carries() -> Vec<Value> {
     filters
 }
 
-/// A router with just this service mounted on a fresh engine.
+/// A router with this service and KMS mounted on one shared engine (the crate's shared
+/// harness, `all/parameter_store.rs`).
+///
+/// KMS is there because a `SecureString`'s value is sealed under the key its put names,
+/// and the seeded hierarchy holds one that names a customer managed key.
 fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signatures are not what these tests are about; the router still reads the SigV4
-    // credential scope below, which is where a stored parameter's Region comes from.
-    router.set_request_authentication(false);
-    router.register_service(service_com_amazonaws_ssm_amazonssm::EmulatedService::new(
-        engine,
-    ));
-    router
+    super::parameter_store::router_with_kms()
 }
 
 /// Call one operation signed for `region` with `access_key`, carrying a session token
@@ -285,6 +280,9 @@ const SEEDED_NAMES: &[&str] = &[
 
 /// Seed [`seed_puts`] as `access_key` in `region`.
 async fn seed_as(router: &MultiServiceRouter, region: &str, access_key: &str) {
+    // The customer managed key one of the seeds names, created through KMS's own
+    // operations: a `SecureString` is sealed under the key its put names.
+    super::parameter_store::kms_key_with_alias_in(router, region, "alias/custom-key").await;
     for body in seed_puts() {
         let (status, response) =
             call_as(router, region, access_key, None, "PutParameter", &body).await;

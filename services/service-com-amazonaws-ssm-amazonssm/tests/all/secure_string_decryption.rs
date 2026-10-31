@@ -221,7 +221,8 @@ async fn put_secure(router: &MultiServiceRouter, case: &str, name: &str, key_id:
     .await;
 }
 
-/// `PutParameter`, which must succeed: a put names the key, it does not use it.
+/// `PutParameter`, which must succeed: the put seals the value under the key it names,
+/// and what the key's policy decides is the READ that opens it again.
 async fn put(router: &MultiServiceRouter, case: &str, body: &Value) {
     let (status, response) = call(router, "PutParameter", body).await;
     assert_eq!(
@@ -417,15 +418,22 @@ async fn an_encryption_context_condition_scopes_which_parameters_decrypt() {
                 );
             }
             // The flag selects the decrypt, so the read that asks for none is served
-            // whatever the key says — the same two parameters, read the other way.
+            // whatever the key says — and reports the stored ciphertext rather than the
+            // value, which is what makes the undecrypted read no disclosure of it.
             for flag in [None, Some(false)] {
                 let case = format!("{case} with WithDecryption {flag:?}");
                 let response =
                     read_parameter(&router, &case, name, flag, Expected::Served).await;
-                assert_eq!(
-                    reported_value(&case, &response),
+                let reported = reported_value(&case, &response);
+                assert_ne!(
+                    reported,
                     format!("value of {name}"),
-                    "case {case}: the read reports the stored value, got {response}"
+                    "case {case}: the read must report the ciphertext, not the value, got \
+                     {response}"
+                );
+                assert!(
+                    ::aws_smithy_types::base64::decode(&reported).is_ok(),
+                    "case {case}: the read reports base64 ciphertext, got {reported:?}"
                 );
             }
         }
@@ -547,11 +555,22 @@ async fn a_read_that_decrypts_nothing_is_never_refused() {
             let case = format!("{case}: {type_} with WithDecryption {flag:?}");
             let response = read_parameter(&router, &case, &name, flag, expected).await;
             if expected == Expected::Served {
-                assert_eq!(
-                    reported_value(&case, &response),
-                    value,
-                    "case {case}: the read reports the stored value, got {response}"
-                );
+                let reported = reported_value(&case, &response);
+                // Only an encrypted type has two forms: the undecrypted read of one
+                // reports its ciphertext, while a type the flag is ignored for reports
+                // the value it was written with however the read asks.
+                if type_ == "SecureString" {
+                    assert_ne!(
+                        reported, value,
+                        "case {case}: an undecrypted read of an encrypted value reports \
+                         the ciphertext, got {response}"
+                    );
+                } else {
+                    assert_eq!(
+                        reported, value,
+                        "case {case}: the read reports the stored value, got {response}"
+                    );
+                }
             }
         }
     }
@@ -570,7 +589,8 @@ enum KeyForm {
     /// associated with your Amazon Web Services account" (`PutParameter`'s `KeyId` doc),
     /// an Amazon Web Services managed key whose policy AWS manages for the service.
     Default,
-    /// A well-formed key id nobody created, which names no key at all.
+    /// A well-formed key id nobody created, which names no key at all — so a put naming
+    /// it has nothing to encrypt the value under.
     Unknown,
 }
 
@@ -578,9 +598,10 @@ enum KeyForm {
 const SUITE_ALIAS: &str = "alias/parameter-store-suite";
 
 /// The key a parameter is sealed under is resolved in every form a put may name it, and
-/// the scoped statement decides the read the same way through each — while the two forms
-/// nothing is attributed to, the Amazon Web Services managed key and a key nobody created,
-/// leave every read served.
+/// the scoped statement decides the read the same way through each — while the Amazon Web
+/// Services managed key a put naming none falls back to leaves every read served, and an
+/// identifier naming no key at all leaves the put with nothing to encrypt the value
+/// under, so it is refused rather than stored in the clear.
 #[tokio::test]
 async fn the_key_is_resolved_in_every_form_a_put_names_it() {
     let scoped_to_in_scope = policy(vec![allow_caller(
@@ -589,16 +610,26 @@ async fn the_key_is_resolved_in_every_form_a_put_names_it() {
     )]);
 
     // Each row: the form, and what a decrypting read of the in-scope and of the
-    // out-of-scope parameter must answer when the put named the key that way.
-    let rows: [(KeyForm, Expected, Expected); 5] = [
-        (KeyForm::KeyId, Expected::Served, Expected::Refused),
-        (KeyForm::KeyArn, Expected::Served, Expected::Refused),
-        (KeyForm::Alias, Expected::Served, Expected::Refused),
-        (KeyForm::Default, Expected::Served, Expected::Served),
-        (KeyForm::Unknown, Expected::Served, Expected::Served),
+    // out-of-scope parameter must answer when the put named the key that way — `None`
+    // for a form whose put is refused, so there is nothing to read.
+    let rows: [(KeyForm, Option<(Expected, Expected)>); 5] = [
+        (
+            KeyForm::KeyId,
+            Some((Expected::Served, Expected::Refused)),
+        ),
+        (
+            KeyForm::KeyArn,
+            Some((Expected::Served, Expected::Refused)),
+        ),
+        (
+            KeyForm::Alias,
+            Some((Expected::Served, Expected::Refused)),
+        ),
+        (KeyForm::Default, Some((Expected::Served, Expected::Served))),
+        (KeyForm::Unknown, None),
     ];
 
-    for (form, scoped, unscoped) in rows {
+    for (form, reads) in rows {
         let case = format!("a put naming the key as {form:?}");
         let router = router();
         let (key_id, key_arn) = key_with_policy(&router, &case, &scoped_to_in_scope).await;
@@ -619,7 +650,7 @@ async fn the_key_is_resolved_in_every_form_a_put_names_it() {
             KeyForm::Unknown => Some("11111111-2222-3333-4444-555555555555".to_string()),
         };
 
-        for (parameter, expected) in [(IN_SCOPE, scoped), (OUT_OF_SCOPE, unscoped)] {
+        for (index, parameter) in [IN_SCOPE, OUT_OF_SCOPE].into_iter().enumerate() {
             let case = format!("{case}: {parameter}");
             let mut body = json!({
                 "Name": parameter,
@@ -629,13 +660,33 @@ async fn the_key_is_resolved_in_every_form_a_put_names_it() {
             if let Some(named) = &named {
                 body["KeyId"] = json!(named);
             }
+            let Some((scoped, unscoped)) = reads else {
+                // "The query key ID isn't valid" (`InvalidKeyId`): nothing holds the key
+                // the put named, so the value cannot be encrypted and nothing is stored.
+                let (status, response) = call(&router, "PutParameter", &body).await;
+                assert_eq!(
+                    (status, error_code(&response).as_str()),
+                    (400, "InvalidKeyId"),
+                    "case {case}: a put naming no key must be refused, got {status} with \
+                     {response}"
+                );
+                let (status, response) =
+                    call(&router, "GetParameter", &json!({ "Name": parameter })).await;
+                assert_eq!(
+                    (status, error_code(&response).as_str()),
+                    (400, "ParameterNotFound"),
+                    "case {case}: the refused put stored nothing, got {status} with {response}"
+                );
+                continue;
+            };
+            let expected = if index == 0 { scoped } else { unscoped };
             put(&router, &case, &body).await;
             let response = read_parameter(&router, &case, parameter, Some(true), expected).await;
             if expected == Expected::Served {
                 assert_eq!(
                     reported_value(&case, &response),
                     format!("value of {parameter}"),
-                    "case {case}: a served read reports the stored value, got {response}"
+                    "case {case}: a served read reports the value the put wrote, got {response}"
                 );
             }
         }
