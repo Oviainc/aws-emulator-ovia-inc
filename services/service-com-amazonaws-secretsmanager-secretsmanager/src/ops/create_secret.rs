@@ -378,6 +378,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.secret_string.as_ref(),
             input.secret_binary.as_ref(),
         );
+        // A create stakes the secret's initial version, and "this parameter
+        // specifies the unique identifier for the new version. [...] If you
+        // generate a raw HTTP request to the Secrets Manager service endpoint,
+        // then you must generate a ClientRequestToken and include it in the
+        // request." (`CreateSecretRequest$ClientRequestToken`, this service's
+        // Smithy model.) The service sees only the request, so a token the client
+        // never generated is a missing one: the create is refused before anything
+        // is stored, rather than staking the secret under a version id the caller
+        // never chose and cannot retry with.
+        let Some(version_id) = input.client_request_token.clone() else {
+            return Err(missing_client_request_token());
+        };
 
         // What this create is refused for, decided under the store's guard;
         // sealing the initial value is a call to KMS, which cannot be made while
@@ -449,10 +461,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &format!("secret:{}-{}", input.name, crate::state::new_arn_suffix()),
         );
-        let version_id = input
-            .client_request_token
-            .clone()
-            .unwrap_or_else(crate::state::new_version_id);
         // The initial value is stored under the key this secret names, so storing
         // it means encrypting it under that key: a key KMS will not encrypt with is
         // the `EncryptionFailure` this create answers, and no secret is stored.
@@ -576,6 +584,17 @@ fn answer_existing(
         }),
         None => Err(already_exists(&existing.name)),
     }
+}
+
+/// `InvalidRequestException` — "A parameter value is not valid for the current
+/// state of the resource." — for a create that carries a value, and so creates
+/// the secret's initial version, without naming that version's id (see
+/// [`crate::state::MISSING_CLIENT_REQUEST_TOKEN_MESSAGE`]).
+fn missing_client_request_token() -> CreateSecretError {
+    CreateSecretErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(crate::state::MISSING_CLIENT_REQUEST_TOKEN_MESSAGE.to_string()),
+    })
+    .into()
 }
 
 /// `ResourceExistsException` for a name this service already holds a secret

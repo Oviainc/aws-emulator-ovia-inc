@@ -46,7 +46,12 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
         .header("x-amz-target", format!("secretsmanager.{operation}"))
         .header("authorization", AUTHORIZATION)
         .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body is serializable"),
+            // A write that stores a value creates a version the caller has to
+            // name; see `secret_client_request_token::with_staked_version`.
+            serde_json::to_vec(&crate::secret_client_request_token::with_staked_version(
+                operation, body,
+            ))
+            .expect("the request body is serializable"),
         ))
         .expect("a valid request");
     let response = router.dispatch(request).await;
@@ -707,11 +712,10 @@ async fn create_secret_is_idempotent_only_for_a_repeat_of_the_same_version() {
             Some("ResourceExistsException"),
         ),
         (
-            "no token",
-            json!({"Name": "idempotent", "SecretString": "v1"}),
-            Some("ResourceExistsException"),
-        ),
-        (
+            // A create that names NO token of its own creates no version at all:
+            // it is refused for the missing token, which
+            // `secret_client_request_token` is the suite for, so the rows here all
+            // name one.
             "a different token",
             json!({
                 "Name": "idempotent",

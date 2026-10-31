@@ -266,6 +266,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored, while the same token over a different value would modify an
         // existing version — "You can't modify an existing version, you can only
         // create a new version."
+        //
+        // So a call that stores a value has to NAME the version it creates: "If
+        // you generate a raw HTTP request to the Secrets Manager service
+        // endpoint, then you must generate a ClientRequestToken and include it in
+        // the request." It is refused before anything is stored rather than
+        // staking a version under an id the caller never chose. A call that
+        // stores no value creates no version, so it needs no token and the id
+        // below names nothing.
+        if value.is_some() && input.client_request_token.is_none() {
+            return Err(missing_client_request_token());
+        }
         let version_id = input
             .client_request_token
             .clone()
@@ -467,6 +478,17 @@ fn admit(
         kms_key_id,
         replay,
     })
+}
+
+/// `InvalidRequestException` — "A parameter value is not valid for the current
+/// state of the resource." — for a call that stores a value, and so creates a
+/// version, without naming that version's id (see
+/// [`crate::state::MISSING_CLIENT_REQUEST_TOKEN_MESSAGE`]).
+fn missing_client_request_token() -> UpdateSecretError {
+    UpdateSecretErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(crate::state::MISSING_CLIENT_REQUEST_TOKEN_MESSAGE.to_string()),
+    })
+    .into()
 }
 
 /// `EncryptionFailure` — "Secrets Manager can't encrypt the protected secret text

@@ -125,7 +125,10 @@ impl Emulator {
 
     /// One Secrets Manager operation.
     async fn sm(&self, operation: &str, body: &Value) -> (u16, Value) {
-        self.call("secretsmanager", "secretsmanager", operation, body)
+        // A write that stores a value creates a version the caller has to name;
+        // see `secret_client_request_token::with_staked_version`.
+        let body = crate::secret_client_request_token::with_staked_version(operation, body);
+        self.call("secretsmanager", "secretsmanager", operation, &body)
             .await
     }
 

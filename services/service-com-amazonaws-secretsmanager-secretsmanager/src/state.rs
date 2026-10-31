@@ -107,6 +107,26 @@ pub const SECRET_NOT_FOUND_MESSAGE: &str = "Secrets Manager can't find the speci
 /// operation answers with THIS constant.
 pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The pagination token is no longer valid.";
 
+/// The message `InvalidRequestException` carries for a write that would create a
+/// secret version without naming the version's id.
+///
+/// A write that stores a value creates a version, and "this parameter specifies
+/// the unique identifier for the new version. If you use the Amazon Web Services
+/// CLI or one of the Amazon Web Services SDKs to call this operation, then you
+/// can leave this parameter empty. The CLI or SDK generates a random UUID for you
+/// and includes it as the value for this parameter in the request. If you
+/// generate a raw HTTP request to the Secrets Manager service endpoint, then you
+/// must generate a ClientRequestToken and include it in the request."
+/// (`CreateSecretRequest$ClientRequestToken`, and the same text on
+/// `PutSecretValueRequest$ClientRequestToken` and
+/// `UpdateSecretRequest$ClientRequestToken`, this service's Smithy model.) The
+/// service sees only the request, so a token the client never generated is a
+/// missing one: the version is refused rather than staked under an id the caller
+/// never chose and cannot retry with. The wire message is this one constant
+/// sentence, which interpolates nothing from the request or from state.
+pub const MISSING_CLIENT_REQUEST_TOKEN_MESSAGE: &str =
+    "You must provide a ClientRequestToken value. We recommend a UUID-type value.";
+
 /// The message `InvalidRequestException` carries for an operation a caller
 /// cannot perform on a secret that is inside its recovery window: the secret
 /// still exists ("The secret is scheduled for deletion.",

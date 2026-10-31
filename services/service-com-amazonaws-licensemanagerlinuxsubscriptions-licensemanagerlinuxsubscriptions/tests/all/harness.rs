@@ -112,6 +112,19 @@ pub async fn create_secret(h: &Harness, name: &str, members: &Value) -> String {
     {
         body[member] = value.clone();
     }
+    // A create that stores a value creates that version, and Secrets Manager
+    // requires the caller to name it: "If you generate a raw HTTP request to the
+    // Secrets Manager service endpoint, then you must generate a
+    // ClientRequestToken and include it in the request."
+    // (`CreateSecretRequest$ClientRequestToken`, that service's Smithy model.)
+    if body.get("SecretString").is_some() || body.get("SecretBinary").is_some() {
+        let token: String = format!("client-request-token-{name}")
+            .chars()
+            .chain(std::iter::repeat('-'))
+            .take(40)
+            .collect();
+        body["ClientRequestToken"] = json!(token);
+    }
     let request = http::Request::builder()
         .method("POST")
         .uri(format!(

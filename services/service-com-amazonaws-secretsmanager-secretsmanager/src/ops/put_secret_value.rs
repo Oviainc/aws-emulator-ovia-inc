@@ -254,6 +254,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // This operation "creates a new version of your secret", so it always
+        // stakes a version — and the version's id is the token the CALLER
+        // generates: "If you generate a raw HTTP request to the Secrets Manager
+        // service endpoint, then you must generate a ClientRequestToken and
+        // include it in the request."
+        // (`PutSecretValueRequest$ClientRequestToken`, this service's Smithy
+        // model.) A request that carries none is refused before anything is
+        // encrypted or stored, rather than staking a version under an id the
+        // caller never chose, cannot retry with, and which would take AWSCURRENT
+        // off the version the caller does know.
+        let Some(version_id) = input.client_request_token.clone() else {
+            return Err(missing_client_request_token());
+        };
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
 
         // "If you don't include VersionStages, then Secrets Manager automatically
@@ -263,10 +277,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .filter(|stages| !stages.is_empty())
             .unwrap_or_else(|| vec![crate::state::STAGE_CURRENT.to_string()]);
-        let version_id = input
-            .client_request_token
-            .clone()
-            .unwrap_or_else(crate::state::new_version_id);
 
         // Everything this write is refused for before a value is encrypted at all,
         // decided under the store's guard; sealing the value is a call to KMS, which
@@ -430,6 +440,18 @@ fn no_such_secret() -> PutSecretValueError {
 fn encryption_failure(refusal: crate::state::envelope::KmsRefusal) -> PutSecretValueError {
     PutSecretValueErrorModeled::EncryptionFailure(EncryptionFailure {
         message: Some(refusal.encryption_failure_message()),
+    })
+    .into()
+}
+
+/// `InvalidRequestException` — "A parameter value is not valid for the current
+/// state of the resource." — for a version-creating write that names no
+/// `ClientRequestToken`, carrying the one sentence every Secrets Manager write
+/// refuses that with (see
+/// [`crate::state::MISSING_CLIENT_REQUEST_TOKEN_MESSAGE`]).
+fn missing_client_request_token() -> PutSecretValueError {
+    PutSecretValueErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(crate::state::MISSING_CLIENT_REQUEST_TOKEN_MESSAGE.to_string()),
     })
     .into()
 }

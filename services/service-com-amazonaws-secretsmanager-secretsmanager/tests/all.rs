@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/secret_batch_get.rs"]
 mod secret_batch_get;
+#[path = "all/secret_client_request_token.rs"]
+mod secret_client_request_token;
 #[path = "all/secret_error_responses.rs"]
 mod secret_error_responses;
 #[path = "all/secret_kms_key_state.rs"]

@@ -891,6 +891,11 @@ async fn tags_written_by_the_owning_service_are_visible_and_deletion_removes_the
         serde_json::json!({
             "Name": "fidelity-secret",
             "SecretString": "s3cr3t",
+            // A create that stores a value creates that version, and Secrets
+            // Manager requires a raw request to name it
+            // (`CreateSecretRequest$ClientRequestToken`, that service's Smithy
+            // model, `@length` 32..64).
+            "ClientRequestToken": "client-request-token-fidelity-secret",
             "Tags": [{ "Key": "Env", "Value": "dev" }]
         }),
     )
