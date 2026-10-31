@@ -31,12 +31,12 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::EmulatedService;
 pub(crate) const PAST_THE_SPAN: Duration = Duration::from_millis(150);
 
 /// Longer than the whole schedule a new search job is owed — its set-up span plus the
-/// transition span the scan itself takes (`state::CREATING_DELAY` then
-/// `state::TRANSITION_DELAY`, each counted from the phase before it) — so the clock has
-/// made every owed transition due by the time the next call is made. Derived from those
-/// spans rather than restated, so it cannot drift from them.
+/// span its scan runs for (`state::CREATING_DELAY` then `state::SCAN_DELAY`, each counted
+/// from the phase before it) — so the clock has made every owed transition due by the time
+/// the next call is made. Derived from those spans rather than restated, so it cannot
+/// drift from them.
 pub(crate) const PAST_THE_DUE_INSTANT: Duration = state::CREATING_DELAY
-    .saturating_add(state::TRANSITION_DELAY)
+    .saturating_add(state::SCAN_DELAY)
     .saturating_add(PAST_THE_SPAN);
 
 /// Longer than `crate::state::CREATING_DELAY` but shorter than the instant the terminal
@@ -258,6 +258,23 @@ pub(crate) fn held_s3_recovery_points(count: usize) -> Vec<types::SearchJobBacku
             )
         })
         .collect()
+}
+
+/// Carry this store's clock `span` forward WITHOUT waiting for it: every instant a record
+/// is owed a transition from is stored, so settling at an instant `span` ahead of now
+/// materialises exactly what the clock would have materialised then — and because a status
+/// only ever moves forward, the real clock every handler settles at afterwards can neither
+/// take that transition back nor add one that was not due.
+///
+/// What it is for: the span a scan runs for is the window a cancel has, so it is longer
+/// than any gap a client leaves between two calls — long enough that a suite pinning where
+/// that window ends would spend its time asleep. Beside the harness because the span
+/// belongs to the store and not to one suite.
+pub(crate) fn settle_a_span_ahead(engine: &engine::InMemoryEngine, span: Duration) {
+    let store = engine.state::<state::ComAmazonawsBackupsearchCryobackupsearchserviceState>();
+    store
+        .lock()
+        .settle(state::due_at(std::time::SystemTime::now(), span));
 }
 
 /// `StopSearchJob` for `identifier`, which is one call every suite that cancels a job
@@ -1066,7 +1083,7 @@ async fn an_identifier_no_job_exists_for_is_not_found_on_every_operation_that_ta
 
 #[tokio::test]
 async fn stopping_a_running_job_moves_it_to_stopping_and_then_to_stopped() {
-    let emulator = emulator();
+    let (emulator, engine) = emulator_with_engine();
     let started = call(
         &emulator,
         "us-west-2",
@@ -1121,8 +1138,9 @@ async fn stopping_a_running_job_moves_it_to_stopping_and_then_to_stopped() {
     );
 
     // Once the clock has made it due the job is STOPPED, with a completion time, and
-    // the list reports the same status.
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+    // the list reports the same status. The due instant is stored, so the clock is
+    // carried to it rather than waited out.
+    settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
     let settled = call(&emulator, "us-west-2", "GET", &job_uri, None).await;
     assert_eq!(
         settled.string("Status"),

@@ -28,7 +28,7 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::ops::types;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
-    call, emulator_with_engine, recovery_point, seed_recovery_points, Answer,
+    call, emulator_with_engine, recovery_point, seed_recovery_points, settle_a_span_ahead, Answer,
     PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
 };
 
@@ -174,8 +174,12 @@ pub(crate) async fn settled_search_job(
     let identifier = started.string("SearchJobIdentifier");
 
     if matches!(settled, Settled::Stopped) {
-        // A stop acts from the running scan, so wait for the set-up phase to pass first.
-        tokio::time::sleep(PAST_THE_CREATING_INSTANT).await;
+        // A stop acts from the running scan, so the set-up phase has to be behind the job
+        // first. What this helper needs is a job in a settled status, not a wall-clock
+        // wait, so it carries the clock to the due instant instead of sleeping until it
+        // (`settle_a_span_ahead`) — the span a scan runs for is the window a cancel has,
+        // which is deliberately longer than any gap a client leaves.
+        settle_a_span_ahead(engine, PAST_THE_CREATING_INSTANT);
         let stopped = call(
             emulator,
             region,
@@ -191,7 +195,7 @@ pub(crate) async fn settled_search_job(
         );
     }
 
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+    settle_a_span_ahead(engine, PAST_THE_DUE_INSTANT);
     let fetched = call(
         emulator,
         region,
@@ -336,8 +340,8 @@ async fn a_started_export_job_is_persisted_and_every_member_is_read_back_out_of_
 
         // Once the clock has made the owed transition due, the same read reports it —
         // this search job matched nothing, so the export had nothing to transmit and
-        // completes.
-        tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+        // completes. The due instant is stored, so the clock is carried to it.
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         let settled_export = get_export_job(&emulator, region, &identifier).await;
         assert_eq!(
             settled_export.string("Status"),
@@ -580,7 +584,7 @@ async fn an_export_is_refused_while_the_search_job_has_not_settled() {
 
         // Once the search job settles, the very same request is accepted: the refusal was
         // about the job's status and nothing else.
-        tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         let accepted = call(
             &emulator,
             "us-west-2",
@@ -773,7 +777,7 @@ async fn an_export_that_would_have_to_transmit_items_ends_in_the_modelled_failed
         running.get("StatusMessage")
     );
 
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+    settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
     let failed = get_export_job(&emulator, "us-west-2", &identifier).await;
     assert_eq!(
         failed.string("Status"),

@@ -25,7 +25,8 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::ops::types;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
-    call, emulator_with_engine, seed_indexed_recovery_points, Answer, PAST_THE_DUE_INSTANT,
+    call, emulator_with_engine, seed_indexed_recovery_points, settle_a_span_ahead, Answer,
+    PAST_THE_DUE_INSTANT,
 };
 
 const REGION: &str = "us-west-2";
@@ -240,9 +241,9 @@ fn the_status_table_covers_every_modelled_search_job_state() {
 
 #[tokio::test]
 async fn only_a_covered_backup_whose_index_is_readable_is_scanned_counted_and_paged() {
-    // One emulator per row, so each row's store holds exactly the index it seeds. Every
-    // job is started BEFORE the single sleep, so the clock makes every row's scan
-    // completion due at once instead of once per row.
+    // One emulator per row, so each row's store holds exactly the index it seeds. The
+    // scan's completion is owed at a STORED instant, so each row carries the clock to it
+    // rather than the table waiting it out.
     let mut rows: Vec<(StatusCase, MultiServiceRouter, String)> = Vec::new();
     for case in status_cases() {
         let (emulator, engine) = emulator_with_engine();
@@ -280,10 +281,9 @@ async fn only_a_covered_backup_whose_index_is_readable_is_scanned_counted_and_pa
             "case {:?}: StartSearchJob must accept the request, got {} ({:?})",
             case.case, started.status, started.body
         );
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         rows.push((case, emulator, started.string("SearchJobIdentifier")));
     }
-
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
 
     for (case, emulator, identifier) in rows {
         let StatusCase {
@@ -471,10 +471,9 @@ async fn an_item_filter_cannot_match_an_item_of_a_backup_the_search_left_out() {
             "case {:?}: StartSearchJob must accept the request, got {} ({:?})",
             case.case, started.status, started.body
         );
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         rows.push((case, emulator, started.string("SearchJobIdentifier")));
     }
-
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
 
     for (case, emulator, identifier) in rows {
         let FilterCase {
@@ -553,7 +552,7 @@ async fn a_scope_whose_every_covered_backup_is_unreadable_scans_nothing_and_disp
     );
     let identifier = started.string("SearchJobIdentifier");
 
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+    settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
 
     let fetched = call(
         &emulator,

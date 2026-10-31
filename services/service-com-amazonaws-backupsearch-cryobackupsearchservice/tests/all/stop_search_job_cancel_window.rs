@@ -28,8 +28,8 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 // cancels a job over a scope it chose uses the one copy.
 use crate::search_jobs::{
     call, cancel_search_job as cancel, emulator_with_engine, held_s3_recovery_points as held,
-    seed_recovery_points, start_s3_search_job, PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT,
-    WITHIN_THE_DUE_INSTANT,
+    seed_recovery_points, settle_a_span_ahead, start_s3_search_job, PAST_THE_CREATING_INSTANT,
+    PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
 };
 
 /// A cancel sent with no wait at all, which is what a back-to-back client call does.
@@ -140,7 +140,9 @@ async fn a_cancel_of_a_job_that_has_not_ended_is_accepted_and_converges_on_stopp
 
         // And the job converges on the status the cancel asked for, never on the one its
         // own scan would have reached.
-        tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+        // The end state the cancel asked for is owed, so carry the clock to the due
+        // instant rather than waiting it out: the instants are stored.
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         let settled = call(&emulator, region, "GET", &job_uri, None).await;
         assert_eq!(
             settled.string("Status"),
@@ -195,7 +197,7 @@ async fn concurrent_cancels_of_one_just_started_job_all_succeed_and_it_converges
             "case {case:?}: every concurrent cancel must succeed, got {statuses:?}"
         );
 
-        tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         let settled = call(
             &emulator,
             region,
@@ -229,7 +231,7 @@ async fn a_cancel_of_a_job_whose_scan_already_ended_conflicts_and_writes_nothing
         let identifier = start_s3_search_job(&emulator, region, case).await;
         let job_uri = format!("/search-jobs/{identifier}");
 
-        tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         let ended = call(&emulator, region, "GET", &job_uri, None).await;
         assert_eq!(
             ended.string("Status"),

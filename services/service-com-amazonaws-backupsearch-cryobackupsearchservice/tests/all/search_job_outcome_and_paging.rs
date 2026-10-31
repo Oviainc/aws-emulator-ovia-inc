@@ -33,7 +33,8 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::ops::types;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
-    call, emulator_with_engine, recovery_point, seed_recovery_points, PAST_THE_DUE_INSTANT,
+    call, emulator_with_engine, recovery_point, seed_recovery_points, settle_a_span_ahead,
+    PAST_THE_DUE_INSTANT,
 };
 
 /// The region every call in this suite is signed for.
@@ -212,8 +213,8 @@ fn scope_cases() -> Vec<ScopeCase> {
 #[tokio::test]
 async fn the_terminal_status_a_scan_settles_to_follows_the_resolved_scope() {
     // One emulator per row, so each row's store holds exactly the recovery points that
-    // row seeds. Every job is started BEFORE the single sleep below, so the clock makes
-    // every row's transition due at once instead of once per row.
+    // row seeds. The transition is owed at a STORED instant, so each row carries the clock
+    // to it rather than the table waiting it out.
     let mut rows: Vec<(ScopeCase, MultiServiceRouter, String)> = Vec::new();
     for case in scope_cases() {
         let (emulator, engine) = emulator_with_engine();
@@ -232,10 +233,9 @@ async fn the_terminal_status_a_scan_settles_to_follows_the_resolved_scope() {
             case.case, started.status, started.body
         );
         let identifier = started.string("SearchJobIdentifier");
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         rows.push((case, emulator, identifier));
     }
-
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
 
     for (case, emulator, identifier) in rows {
         let ScopeCase {
@@ -501,7 +501,7 @@ async fn every_identifier_this_service_mints_is_a_uuid_the_arn_names() {
 
     // The same rule holds for the other identifier this service mints: an export job's.
     // Its search job has a recovery point in scope, so it reaches an exportable status.
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+    settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
     let exported = call(
         &emulator,
         REGION,

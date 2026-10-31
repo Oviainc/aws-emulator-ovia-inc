@@ -3,14 +3,13 @@
 //! The SCHEDULE the clock owes a search job's phases on, driven over HTTP exactly as a
 //! client drives it: `StartSearchJob`, `GetSearchJob` and `StopSearchJob`.
 //!
-//! The rule under test: a status this service's clock owes a resource is due one
-//! transition span after the transition BEFORE it — the first of them one span after the
-//! call that started the resource — so every phase lasts a whole span and a client that
-//! acts on the resource after the call that put it in a phase is answered for THAT phase,
-//! not for one the clock has already carried it past. For a search job that means the
-//! set-up phase, the running scan and the terminal status its scope owes it are a span
-//! apart each, so a cancel sent any time before the scan has ended is accepted and the
-//! job converges on `STOPPED`.
+//! The rule under test: a status this service's clock owes a resource is due its own span
+//! after the transition BEFORE it — the first of them one span after the call that started
+//! the resource — so every phase lasts a whole span and a client that acts on the resource
+//! after the call that put it in a phase is answered for THAT phase, not for one the clock
+//! has already carried it past. For a search job that means the set-up phase lasts the
+//! set-up span and the running scan lasts the span a scan takes, so a cancel sent any time
+//! before the scan has ended is accepted and the job converges on `STOPPED`.
 //!
 //! What this suite adds over the two beside it is the SPACING of the schedule itself:
 //! `owed_status_due_instants.rs` pins that each due instant is computed fallibly, and
@@ -150,9 +149,9 @@ async fn each_owed_phase_is_due_one_span_after_the_phase_before_it() {
             .unwrap_or_else(|_| panic!("case {:?}: the schedule must run forwards", row.case));
         assert_eq!(
             gap,
-            state::TRANSITION_DELAY,
-            "case {:?}: the terminal status must be owed one span after the RUNNING phase, \
-             got {gap:?}",
+            state::SCAN_DELAY,
+            "case {:?}: the terminal status must be owed one scan span after the RUNNING \
+             phase, got {gap:?}",
             row.case
         );
         // A phase that lasts no time at all would be skipped by the very next call, so
@@ -223,7 +222,7 @@ fn cancel_rows() -> Vec<CancelRow> {
         CancelRow {
             case: "cancelled halfway through the running scan",
             wait_before_cancel: state::CREATING_DELAY
-                .saturating_add(state::TRANSITION_DELAY / 2),
+                .saturating_add(state::SCAN_DELAY / 2),
             phase: state::RUNNING,
         },
     ]

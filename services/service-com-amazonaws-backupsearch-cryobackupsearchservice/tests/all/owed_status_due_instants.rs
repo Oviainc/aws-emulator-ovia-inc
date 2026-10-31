@@ -30,8 +30,8 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::export_jobs::{settled_search_job, Settled};
 use crate::search_jobs::{
-    call, emulator_with_engine, recovery_point, seed_recovery_points, PAST_THE_CREATING_INSTANT,
-    PAST_THE_DUE_INSTANT,
+    call, emulator_with_engine, recovery_point, seed_recovery_points, settle_a_span_ahead,
+    PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT,
 };
 
 /// One nanosecond, the finest step a `Duration` takes and the step the bisection below
@@ -45,6 +45,7 @@ fn spans() -> Vec<(&'static str, Duration)> {
     vec![
         ("the set-up span", state::CREATING_DELAY),
         ("the transition span", state::TRANSITION_DELAY),
+        ("the span a scan takes", state::SCAN_DELAY),
         ("the published token window", state::CLIENT_TOKEN_VALIDITY),
         ("no span at all", Duration::ZERO),
         ("one nanosecond", ONE_NANOSECOND),
@@ -328,20 +329,21 @@ async fn a_started_search_job_owes_each_phase_at_its_span_after_the_call() {
             after,
             state::CREATING_DELAY,
         );
-        // The terminal status is owed a span after the phase BEFORE it, so measured from
-        // the call that started the job it is the set-up span plus the transition span.
+        // The terminal status is owed the span a scan takes after the phase BEFORE it, so
+        // measured from the call that started the job it is the set-up span plus that one.
         assert_due_after_the_call(
             row.case,
             "the terminal status",
             owed[1].0,
             before,
             after,
-            state::CREATING_DELAY.saturating_add(state::TRANSITION_DELAY),
+            state::CREATING_DELAY.saturating_add(state::SCAN_DELAY),
         );
 
         // The stored instants are what the clock materialises: once both spans have
-        // passed the job reports the terminal status its scope owes it.
-        tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+        // passed the job reports the terminal status its scope owes it. The instants are
+        // stored, so the clock is carried to them rather than waited out.
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         let settled = call(
             &emulator,
             row.region,
@@ -438,7 +440,7 @@ async fn a_stopped_search_job_owes_its_end_at_the_transition_span_after_the_stop
             state::TRANSITION_DELAY,
         );
 
-        tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         let settled = call(&emulator, region, "GET", &job_uri, None).await;
         assert_eq!(
             settled.string("Status"),
@@ -493,7 +495,7 @@ async fn a_started_export_job_owes_its_end_at_the_transition_span_after_the_call
             state::TRANSITION_DELAY,
         );
 
-        tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         let fetched = call(
             &emulator,
             region,

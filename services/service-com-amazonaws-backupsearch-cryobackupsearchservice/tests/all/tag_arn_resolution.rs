@@ -26,8 +26,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
-    call, emulator, percent_encode, query_value, Answer, PAST_THE_CREATING_INSTANT,
-    PAST_THE_DUE_INSTANT,
+    call, emulator_with_engine, percent_encode, query_value, settle_a_span_ahead, Answer,
+    PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT,
 };
 
 /// `GET /tags/{ResourceArn}` — the read path, whose resolution is the one under test.
@@ -100,6 +100,7 @@ fn tags_of(answer: &Answer) -> BTreeMap<String, String> {
 /// started from. Answers its identifier and its minted ARN.
 async fn stopped_search_job(
     emulator: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
     region: &str,
     case: &str,
     name: &str,
@@ -119,7 +120,7 @@ async fn stopped_search_job(
     );
     let identifier = started.string("SearchJobIdentifier");
 
-    tokio::time::sleep(PAST_THE_CREATING_INSTANT).await;
+    settle_a_span_ahead(engine, PAST_THE_CREATING_INSTANT);
     let stopped = call(
         emulator,
         region,
@@ -133,7 +134,9 @@ async fn stopped_search_job(
         "case {case:?}: StopSearchJob must succeed, got {} ({:?})",
         stopped.status, stopped.body
     );
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+    // The stop's end state is owed at a stored instant, so the clock is carried to it
+    // rather than waited out.
+    settle_a_span_ahead(engine, PAST_THE_DUE_INSTANT);
 
     (identifier, started.string("SearchJobArn"))
 }
@@ -170,15 +173,15 @@ async fn export_job_arn(
 #[tokio::test]
 async fn the_tag_read_path_and_the_tag_write_path_resolve_the_same_arns() {
     let region = "us-west-2";
-    let emulator = emulator();
+    let (emulator, engine) = emulator_with_engine();
 
     // Two search jobs and two export jobs, so a row can address the second record of a
     // type: the resolution has to find a record wherever it sits in the store, not only
     // the single one a one-record store leaves.
     let (first_search_job, first_search_job_arn) =
-        stopped_search_job(&emulator, region, "first search job", "resolved-one").await;
+        stopped_search_job(&emulator, &engine, region, "first search job", "resolved-one").await;
     let (second_search_job, second_search_job_arn) =
-        stopped_search_job(&emulator, region, "second search job", "resolved-two").await;
+        stopped_search_job(&emulator, &engine, region, "second search job", "resolved-two").await;
     let first_export_job_arn =
         export_job_arn(&emulator, region, "first export job", &first_search_job).await;
     let second_export_job_arn =

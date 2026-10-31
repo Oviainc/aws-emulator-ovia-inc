@@ -53,6 +53,8 @@ mod page_token_under_a_changing_filter;
 mod page_token_under_a_growing_sequence;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/scan_run_outlasts_a_client_gap.rs"]
+mod scan_run_outlasts_a_client_gap;
 #[path = "all/search_job_item_results.rs"]
 mod search_job_item_results;
 #[path = "all/search_job_outcome_and_paging.rs"]

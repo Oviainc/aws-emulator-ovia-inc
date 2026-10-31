@@ -24,8 +24,8 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::ops::types;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
-    call, emulator_with_engine, recovery_point, seed_indexed_recovery_points, Answer,
-    PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
+    call, emulator_with_engine, recovery_point, seed_indexed_recovery_points,
+    settle_a_span_ahead, Answer, PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
 };
 
 const REGION: &str = "us-west-2";
@@ -361,9 +361,9 @@ fn filter_cases() -> Vec<FilterCase> {
 
 #[tokio::test]
 async fn a_scan_records_the_indexed_items_its_item_filters_admit() {
-    // One emulator per row, so each row's store holds exactly the index it seeds. Every
-    // job is started BEFORE the single sleep, so the clock makes every row's scan
-    // completion due at once instead of once per row.
+    // One emulator per row, so each row's store holds exactly the index it seeds. The
+    // scan's completion is owed at a STORED instant, so each row carries the clock to it
+    // rather than the table waiting it out.
     let mut rows: Vec<(FilterCase, MultiServiceRouter, String)> = Vec::new();
     for case in filter_cases() {
         let (emulator, engine) = emulator_with_engine();
@@ -379,10 +379,9 @@ async fn a_scan_records_the_indexed_items_its_item_filters_admit() {
             case.case, started.status, started.body
         );
         let identifier = started.string("SearchJobIdentifier");
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         rows.push((case, emulator, identifier));
     }
-
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
 
     for (case, emulator, identifier) in rows {
         let FilterCase {
@@ -641,7 +640,7 @@ async fn every_condition_operator_the_model_declares_selects_by_its_own_comparis
             started.push((row, identifier));
         }
 
-        tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
 
         for (row, identifier) in started {
             let listed = call(
@@ -744,7 +743,7 @@ async fn the_matches_become_readable_when_the_scan_completes_and_are_paged_by_ma
         fetched.get("CurrentSearchProgress")
     );
 
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+    settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
     let settled = call(
         &emulator,
         REGION,

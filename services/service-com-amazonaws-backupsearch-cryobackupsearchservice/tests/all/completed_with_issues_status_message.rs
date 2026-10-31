@@ -23,8 +23,8 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::ops::types;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
-    call, emulator_with_engine, seed_indexed_recovery_points, PAST_THE_CREATING_INSTANT,
-    PAST_THE_DUE_INSTANT,
+    call, emulator_with_engine, seed_indexed_recovery_points, settle_a_span_ahead,
+    PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT,
 };
 
 const REGION: &str = "eu-west-1";
@@ -231,8 +231,8 @@ fn the_completion_with_issues_message_is_the_documented_sentence_over_the_jobs_o
 #[tokio::test]
 async fn a_settled_search_job_reports_the_issues_its_terminal_status_came_with() {
     // One emulator per row, so each row's store holds exactly the recovery points it
-    // seeds. Every job is started BEFORE the single sleep, so the clock makes every row's
-    // terminal status due at once instead of once per row.
+    // seeds. The terminal status is owed at a STORED instant, so each row carries the
+    // clock to it rather than the table waiting it out.
     let mut rows: Vec<(OutcomeCase, MultiServiceRouter, String)> = Vec::new();
     for case in outcome_cases() {
         let (emulator, engine) = emulator_with_engine();
@@ -262,10 +262,9 @@ async fn a_settled_search_job_reports_the_issues_its_terminal_status_came_with()
             "case {:?}: StartSearchJob must accept the request, got {} ({:?})",
             case.case, started.status, started.body
         );
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         rows.push((case, emulator, started.string("SearchJobIdentifier")));
     }
-
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
 
     for (case, emulator, identifier) in rows {
         let name = case.case;
@@ -396,7 +395,7 @@ async fn the_issues_message_is_written_only_once_the_terminal_status_is_due() {
         running.get("StatusMessage")
     );
 
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+    settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
     let settled = fetch(&emulator, &identifier).await;
     let expected = state::unscanned_points_message(1, 2);
     assert_eq!(

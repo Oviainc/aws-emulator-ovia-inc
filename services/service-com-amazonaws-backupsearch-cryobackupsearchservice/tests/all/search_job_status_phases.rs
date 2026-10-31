@@ -25,8 +25,8 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::ops::types;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
-    call, emulator_with_engine, recovery_point, seed_recovery_points, PAST_THE_CREATING_INSTANT,
-    PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
+    call, emulator_with_engine, recovery_point, seed_recovery_points, settle_a_span_ahead,
+    PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
 };
 
 const REGION: &str = "us-west-2";
@@ -309,7 +309,7 @@ async fn a_stop_replaces_whatever_the_scan_still_owed() {
             stopping.get("Status")
         );
 
-        tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         let settled = call(&emulator, REGION, "GET", &job_uri, None).await;
         assert_eq!(
             settled.string("Status"),

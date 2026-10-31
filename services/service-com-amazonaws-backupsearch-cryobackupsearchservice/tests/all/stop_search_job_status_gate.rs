@@ -25,7 +25,7 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
     call, emulator_with_engine, recovery_point, seed_indexed_recovery_points,
-    start_s3_search_job, PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT,
+    settle_a_span_ahead, start_s3_search_job, PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT,
     WITHIN_THE_DUE_INSTANT,
 };
 
@@ -150,8 +150,9 @@ async fn a_stop_before_the_scan_runs_is_accepted_and_replaces_what_the_scan_stil
         );
 
         // The stop replaced what the scan still owed, so the job converges on STOPPED and
-        // never on the terminal status that scan would have reached.
-        tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+        // never on the terminal status that scan would have reached. The due instant is
+        // stored, so the clock is carried to it rather than waited out.
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         let settled = call(&emulator, region, "GET", &job_uri, None).await;
         assert_eq!(
             settled.string("Status"),
@@ -234,7 +235,7 @@ async fn a_stop_of_a_running_scan_is_accepted_and_every_repeat_is_idempotent() {
 
         // And once the clock has made the stop due, the repeat against the end state is
         // the same no-op success.
-        tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         let settled = call(&emulator, region, "GET", &job_uri, None).await;
         assert_eq!(
             settled.string("Status"),

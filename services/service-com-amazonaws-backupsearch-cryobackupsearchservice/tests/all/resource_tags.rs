@@ -28,8 +28,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
-    call, emulator, percent_encode, query_value, Answer, PAST_THE_CREATING_INSTANT,
-    PAST_THE_DUE_INSTANT,
+    call, emulator_with_engine, percent_encode, query_value, settle_a_span_ahead, Answer,
+    PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT,
 };
 
 /// Which of this service's taggable resources a row addresses. The set is the resources
@@ -224,6 +224,7 @@ async fn untag_resource(
 /// export may be started from. Answers its identifier and its ARN.
 async fn stopped_search_job(
     emulator: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
     region: &str,
     case: &str,
     name: &str,
@@ -246,8 +247,8 @@ async fn stopped_search_job(
 
     // Cancel it once its scan is running, which is the status a stop acts from, then let
     // the clock make STOPPED due: a settled search job is what an export may be started
-    // from.
-    tokio::time::sleep(PAST_THE_CREATING_INSTANT).await;
+    // from. Both instants are stored, so the clock is carried to them.
+    settle_a_span_ahead(engine, PAST_THE_CREATING_INSTANT);
     let stopped = call(
         emulator,
         region,
@@ -261,7 +262,7 @@ async fn stopped_search_job(
         "case {case:?}: StopSearchJob must succeed, got {} ({:?})",
         stopped.status, stopped.body
     );
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+    settle_a_span_ahead(engine, PAST_THE_DUE_INSTANT);
 
     (identifier, started.string("SearchJobArn"))
 }
@@ -269,6 +270,7 @@ async fn stopped_search_job(
 /// Mint the resource a row addresses, carrying exactly `tags`, and answer its ARN.
 async fn resource_arn(
     emulator: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
     region: &str,
     case: &str,
     resource: Resource,
@@ -276,7 +278,7 @@ async fn resource_arn(
 ) -> String {
     match resource {
         Resource::SearchJob => {
-            stopped_search_job(emulator, region, case, "tagged-search-job", tags)
+            stopped_search_job(emulator, engine, region, case, "tagged-search-job", tags)
                 .await
                 .1
         }
@@ -285,7 +287,8 @@ async fn resource_arn(
             // minted WITHOUT tags, so a tag set read back off the export ARN can only
             // have come from the export record.
             let (search_job_identifier, _) =
-                stopped_search_job(emulator, region, case, "export-source", &json!({})).await;
+                stopped_search_job(emulator, engine, region, case, "export-source", &json!({}))
+                    .await;
             let mut body = json!({
                 "SearchJobIdentifier": search_job_identifier,
                 "ExportSpecification": {
@@ -317,8 +320,8 @@ async fn the_tags_of_every_resource_this_service_mints_are_read_back_added_to_an
         removed,
     } in tag_cases()
     {
-        let emulator = emulator();
-        let arn = resource_arn(&emulator, region, case, resource, &created_with).await;
+        let (emulator, engine) = emulator_with_engine();
+        let arn = resource_arn(&emulator, &engine, region, case, resource, &created_with).await;
         assert!(
             arn.contains(&format!(":{}/", resource.resource_segment())),
             "case {case:?}: the minted ARN must name the {} resource type, got {arn:?}",
@@ -376,13 +379,20 @@ async fn the_tags_of_every_resource_this_service_mints_are_read_back_added_to_an
 #[tokio::test]
 async fn a_tag_write_touches_only_the_resource_its_arn_names() {
     let region = "us-west-2";
-    let emulator = emulator();
+    let (emulator, engine) = emulator_with_engine();
 
     // One search job and one export job, created with the SAME keys, so a write addressed
     // at one can only be seen on that one if the ARN really selects the record.
     let shared = json!({"env": "prod", "team": "data"});
-    let (search_job_identifier, search_job_arn) =
-        stopped_search_job(&emulator, region, "isolation", "isolated-search-job", &shared).await;
+    let (search_job_identifier, search_job_arn) = stopped_search_job(
+        &emulator,
+        &engine,
+        region,
+        "isolation",
+        "isolated-search-job",
+        &shared,
+    )
+    .await;
     let started = call(
         &emulator,
         region,
@@ -460,11 +470,12 @@ async fn a_tag_write_touches_only_the_resource_its_arn_names() {
 #[tokio::test]
 async fn an_arn_no_held_resource_matches_is_not_found_on_every_tag_operation() {
     let region = "us-west-2";
-    let emulator = emulator();
+    let (emulator, engine) = emulator_with_engine();
     // Both resource types exist in the store, so a miss is a miss on the lookup and not
     // an empty store answering 404 for everything.
     let held_search_job = resource_arn(
         &emulator,
+        &engine,
         region,
         "not-found seed",
         Resource::SearchJob,
@@ -473,6 +484,7 @@ async fn an_arn_no_held_resource_matches_is_not_found_on_every_tag_operation() {
     .await;
     let held_export_job = resource_arn(
         &emulator,
+        &engine,
         region,
         "not-found seed",
         Resource::ExportJob,

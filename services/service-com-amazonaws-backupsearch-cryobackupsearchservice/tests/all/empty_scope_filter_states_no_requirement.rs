@@ -29,7 +29,7 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
     call, emulator_with_engine, recovery_point, seed_indexed_recovery_points,
-    PAST_THE_DUE_INSTANT,
+    settle_a_span_ahead, PAST_THE_DUE_INSTANT,
 };
 
 /// The region every call in this suite is signed for.
@@ -296,8 +296,8 @@ fn filter_cases() -> Vec<FilterCase> {
 #[tokio::test]
 async fn a_scope_filter_that_states_no_constraint_admits_every_recovery_point() {
     // One emulator per row, so each row's store holds exactly the recovery point it seeds.
-    // Every job is started BEFORE the single sleep, so the clock makes every row's
-    // transitions due at once instead of once per row.
+    // The transitions a started job is owed fall due at STORED instants, so each row
+    // carries the clock to them rather than the table waiting them out.
     let mut rows: Vec<(FilterCase, MultiServiceRouter, String)> = Vec::new();
     for case in filter_cases() {
         let (emulator, engine) = emulator_with_engine();
@@ -316,10 +316,9 @@ async fn a_scope_filter_that_states_no_constraint_admits_every_recovery_point() 
             "case {:?}: StartSearchJob must accept the scope, got {} ({:?})",
             case.case, started.status, started.body
         );
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         rows.push((case, emulator, started.string("SearchJobIdentifier")));
     }
-
-    tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
 
     for (case, emulator, identifier) in rows {
         let FilterCase {
@@ -474,7 +473,7 @@ async fn an_empty_creation_window_resolves_the_same_scope_as_no_window_at_all() 
             jobs.push((case, started.string("SearchJobIdentifier")));
         }
 
-        tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
+        settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
 
         let mut answers: Vec<(&str, u64, usize, Vec<String>)> = Vec::new();
         for (case, identifier) in jobs {
