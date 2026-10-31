@@ -844,6 +844,13 @@ impl MultiplexRecord {
         self.state == multiplex_state::DELETING || self.state == multiplex_state::DELETED
     }
 
+    /// Whether this multiplex has reached the terminal `DELETED` state: its
+    /// record stays readable there, but the multiplex is out of the account, so
+    /// nothing it held is a caller's to use any more.
+    fn is_deleted(&self) -> bool {
+        self.state == multiplex_state::DELETED
+    }
+
     /// Whether a program can be created in this multiplex right now: in every
     /// state but the two that take the multiplex away, since a multiplex that
     /// is `DELETING` or has reached the terminal `DELETED` holds nothing new.
@@ -1760,6 +1767,12 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// presented to one multiplex's endpoint says nothing about another's, so a
     /// replay can only ever surface a program of the multiplex the request
     /// named.
+    ///
+    /// A program's own delete removes it from the multiplex, which is what ends
+    /// its token's window; the multiplex it lives in is resolved through
+    /// [`MultiplexRecord::is_deleted`] for the same reason, since a program of a
+    /// multiplex that has reached the terminal `DELETED` state is no more a
+    /// caller's to use than one that was deleted on its own.
     pub fn multiplex_program_for_token(
         &self,
         multiplex_id: &str,
@@ -1770,7 +1783,8 @@ impl ComAmazonawsMedialiveMedialiveState {
             .created(&multiplex_program_token_key(multiplex_id, request_id))?;
         let program = self
             .multiplexes
-            .get(multiplex_id)?
+            .get(multiplex_id)
+            .filter(|multiplex| !multiplex.is_deleted())?
             .programs
             .get(program_name)?;
         Some(program.program_name.as_str())

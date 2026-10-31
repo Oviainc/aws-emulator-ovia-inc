@@ -543,14 +543,24 @@ impl ComAmazonawsMedialiveMedialiveState {
             .record(node_token_key(cluster_id, &token), node_id, MAX_NODE_TOKENS);
     }
 
-    /// The node a stored `RequestId` created in `cluster_id`, if that node still
-    /// exists in it.
+    /// The node a stored `RequestId` created in `cluster_id`, if that node is
+    /// still one a caller may use.
     ///
     /// The cluster is part of the key AND re-checked on the record: a token
     /// presented to one cluster's endpoint says nothing about another's.
+    ///
+    /// LIVENESS is part of the lookup, through
+    /// [`NodeRecord::is_deregistered`]: the delete keeps the record readable in
+    /// the terminal `DEREGISTERED` state, but a token's idempotency window is
+    /// over once the node it minted has reached that state — the name it carried
+    /// is already free for a new node — so the retried create mints one of its
+    /// own rather than answering with a node the caller could neither use nor
+    /// change.
     pub fn node_for_token(&self, cluster_id: &str, request_id: &str) -> Option<&str> {
         let id = self.node_tokens.created(&node_token_key(cluster_id, request_id))?;
-        self.node(cluster_id, id).map(|node| node.id.as_str())
+        self.node(cluster_id, id)
+            .filter(|node| !node.is_deregistered())
+            .map(|node| node.id.as_str())
     }
 
     /// The node `node_id` of the cluster `cluster_id`, whatever state it is in.

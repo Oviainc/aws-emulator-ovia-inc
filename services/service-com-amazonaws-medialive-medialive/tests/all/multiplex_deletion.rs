@@ -38,7 +38,11 @@ const IDLE: &str = "IDLE";
 /// `DeleteMultiplex`'s binding (`smithy_query(query="operation",
 /// operation="DeleteMultiplex")`: `DELETE /prod/multiplexes/{MultiplexId}`,
 /// success 202).
-async fn delete_multiplex(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+///
+/// Shared with [`crate::idempotency_token_after_terminal_delete`], whose rows
+/// also have to take a multiplex to its terminal state, so the two suites send
+/// the same delete.
+pub(crate) async fn delete_multiplex(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "DELETE", &format!("{MULTIPLEXES}/{id}"), None).await
 }
 

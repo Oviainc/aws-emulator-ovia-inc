@@ -2868,10 +2868,22 @@ impl ComAmazonawsMedialiveMedialiveState {
             .record(token, sdi_source_id, MAX_SDI_SOURCES);
     }
 
-    /// The SdiSource a stored `RequestId` created, if that source still exists.
+    /// The SdiSource a stored `RequestId` created, if that source is still one a
+    /// caller may use.
+    ///
+    /// LIVENESS is part of the lookup, through the same
+    /// [`SdiSourceRecord::is_deleted`] every other resolution of a source
+    /// applies: the delete keeps the record readable, but a token's idempotency
+    /// window is over once the source it minted has reached the terminal
+    /// `DELETED` state — the name it carried is already free for a new source —
+    /// so the retried create mints one of its own rather than answering with a
+    /// record the caller could neither use nor change.
     pub fn sdi_source_for_token(&self, request_id: &str) -> Option<&str> {
         let id = self.sdi_source_tokens.created(request_id)?;
-        self.sdi_sources.get(id).map(|source| source.id.as_str())
+        self.sdi_sources
+            .get(id)
+            .filter(|source| !source.is_deleted())
+            .map(|source| source.id.as_str())
     }
 
     /// The id of the SdiSource whose `Name` is `name`, if the store holds one.

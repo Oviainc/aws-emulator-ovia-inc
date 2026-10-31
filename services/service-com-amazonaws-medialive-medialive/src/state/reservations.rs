@@ -469,12 +469,23 @@ impl ComAmazonawsMedialiveMedialiveState {
             .record(token, reservation_id, MAX_RESERVATION_TOKENS);
     }
 
-    /// The reservation a stored `RequestId` purchased, if that reservation still
-    /// exists.
+    /// The reservation a stored `RequestId` purchased, if that reservation is
+    /// still one a caller may use.
+    ///
+    /// LIVENESS is part of the lookup, through the same
+    /// [`ReservationRecord::is_deleted`] a mutation of a reservation resolves
+    /// against: the delete keeps the record readable, but a token's idempotency
+    /// window is over once the reservation it purchased has reached the terminal
+    /// `DELETED` state, so a retried purchase buys a new reservation rather than
+    /// answering with one the caller could neither use nor change. The token
+    /// itself is dropped by that delete
+    /// ([`ComAmazonawsMedialiveMedialiveState::delete_reservation`]), so the
+    /// entry does not outlive the reservation either.
     pub fn reservation_for_token(&self, request_id: &str) -> Option<&str> {
         let id = self.reservation_tokens.created(request_id)?;
         self.reservations
             .get(id)
+            .filter(|reservation| !reservation.is_deleted())
             .map(|reservation| reservation.id.as_str())
     }
 
@@ -574,6 +585,11 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// losing it, and the delete is idempotent: a reservation already in that
     /// state is the state the caller asked for, so a repeat writes nothing and
     /// answers the same reservation.
+    ///
+    /// What the delete DOES take away is the purchase token that minted the
+    /// reservation: a token never outlives the resource it created, so a later
+    /// purchase carrying it buys a new reservation instead of replaying this
+    /// deleted one.
     pub fn delete_reservation(
         &mut self,
         id: &str,
@@ -590,6 +606,8 @@ impl ComAmazonawsMedialiveMedialiveState {
             }
             record.deleted = true;
         }
-        Ok(record.reservation(now))
+        let reservation = record.reservation(now);
+        self.reservation_tokens.forget(id);
+        Ok(reservation)
     }
 }

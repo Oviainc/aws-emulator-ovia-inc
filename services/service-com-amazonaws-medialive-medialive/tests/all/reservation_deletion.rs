@@ -131,7 +131,11 @@ async fn purchased(
 /// reservation over its term: `End` is on the record and the reported `State` is
 /// derived from it, so this drives the state through the one thing that owns it
 /// rather than writing a state nothing computed.
-fn end_the_lease(
+///
+/// Shared with [`crate::idempotency_token_after_terminal_delete`], whose rows
+/// also have to reach the expired lease a delete acts on, so the two suites run
+/// a reservation's clock the same way.
+pub(crate) fn end_the_lease(
     engine: &std::sync::Arc<engine::InMemoryEngine>,
     case: &str,
     id: &str,

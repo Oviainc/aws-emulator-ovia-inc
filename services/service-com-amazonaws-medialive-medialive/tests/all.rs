@@ -170,6 +170,9 @@ mod event_bridge_rule_templates;
 #[path = "all/held_reference_resolution.rs"]
 mod held_reference_resolution;
 
+#[path = "all/idempotency_token_after_terminal_delete.rs"]
+mod idempotency_token_after_terminal_delete;
+
 #[path = "all/identity_name_rule.rs"]
 mod identity_name_rule;
 
