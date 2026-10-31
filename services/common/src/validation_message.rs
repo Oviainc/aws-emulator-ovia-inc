@@ -58,6 +58,13 @@
 //! declares its members in an order of its own. A service hands its violations through it
 //! before the envelope is rendered, so the clause itself stays the framework's.
 //!
+//! The same seam carries one more rendering of the VALUE half: a floating-point value is
+//! quoted back the way a service formats one ([`float_value_text`], applied to a violation
+//! by [`in_float_value_rendering`]) rather than as Rust's decimal expansion of it, which
+//! prints a whole `5.0` as `5` and a small `-1.0E-6` as `-0.000001`. WHICH members are
+//! floating point is a property of each service's model, which the runtime schemas carry
+//! as the member's shape type, so the service passes that decision in.
+//!
 //! One constraint class reaches no refusal seam at all: a map's KEY, which the walk treats
 //! as a path segment rather than as a constrained leaf, so nothing is reported about it and
 //! the HANDLER applies the key shape's own constraints. [`map_key_refusal`] is the message
@@ -76,9 +83,9 @@
 //! recordings show it; the set is read off the MODEL (the schemas the caller hands over),
 //! because the refusal carries only the constraints that failed.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
-use aws_smithy_schema::{Schema, ShapeId, TraitMap};
+use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
 use aws_smithy_schema_server::constraints::{
     self, ElementConstraintsTrait, EnumTrait, LengthTrait, PatternTrait, RangeTrait,
 };
@@ -300,6 +307,126 @@ pub fn in_sorted_enum_order(violation: &Violation) -> Violation {
         path: violation.path.clone(),
         kind: ViolationKind::EnumValue(sorted),
         value: violation.value.clone(),
+    }
+}
+
+/// The magnitudes a floating-point value is quoted back in PLAIN decimal form: at least
+/// a thousandth, and below ten million. A value outside that band is quoted in scientific
+/// notation ([`float_value_text`]).
+const PLAIN_DECIMAL_BAND: std::ops::Range<f64> = 1e-3..1e7;
+
+/// The text a constraint-violation clause quotes a FLOATING-POINT value back with.
+///
+/// A service writes a floating-point value the way it formats one, which is NOT Rust's
+/// `to_string`: the value always carries a fractional part or an exponent (a whole `5`
+/// reads `5.0`, never `5`), and a magnitude outside [`PLAIN_DECIMAL_BAND`] is written in
+/// scientific notation — one digit before the point, at least one after it, then `E` and
+/// the signed exponent (`-0.000001` reads `-1.0E-6`, `12345678` reads `1.2345678E7`) —
+/// rather than expanded into the decimal digits of the same value. The digits themselves
+/// are the shortest that round-trip the value, so nothing is added to or dropped from
+/// what was submitted. A value with no decimal form at all (an infinity, a NaN) keeps
+/// Rust's own rendering rather than being given a fake one.
+///
+/// It shares its "a whole value grows a fractional part" step with
+/// [`crate::query_decimal_floats::decimal_double_text`], but is NOT that rendering and
+/// must not be folded into it: that one is the XML WIRE form of a member's value, which
+/// AWS writes as a plain decimal at every magnitude, while a validation clause quotes the
+/// value the way the service's own formatter prints it — scientific notation included.
+#[must_use]
+pub fn float_value_text(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    if value == 0.0 || PLAIN_DECIMAL_BAND.contains(&value.abs()) {
+        let plain = value.to_string();
+        return if plain.contains('.') {
+            plain
+        } else {
+            format!("{plain}.0")
+        };
+    }
+    // `{:e}` is the shortest text that round-trips the value in exponent form
+    // (`-1e-6`); the mantissa then grows the fractional digit this form always carries.
+    let exponent_form = format!("{value:e}");
+    let (mantissa, exponent) = exponent_form
+        .split_once('e')
+        .unwrap_or((exponent_form.as_str(), "0"));
+    let mantissa = if mantissa.contains('.') {
+        mantissa.to_string()
+    } else {
+        format!("{mantissa}.0")
+    };
+    format!("{mantissa}E{exponent}")
+}
+
+/// The validation paths of the members `shapes` types as `float` or `double`, built off the
+/// MODEL rather than named by hand.
+///
+/// `shapes` are the shapes a violation path of the calling service can name a member of,
+/// each with the path prefix the validating walk reports that shape's members under
+/// (the empty string for an operation input's own members). Codegen emits a member schema
+/// WITHOUT its target's own members (`Schema::new_member` takes a shape type and a name),
+/// so a NESTED shape is passed as its own schema under the member path that binds it.
+///
+/// A service hands the result to [`in_float_value_rendering`], so the two halves of that
+/// rule — which members are floating point, and how a floating-point value is written —
+/// have ONE owner each. THE HOME for this collection: `codebuild-codebuild-20161006`
+/// carries its own inlined copy of the same loop (`floating_point_member_paths`), written
+/// before this module had one, and is to be migrated onto this function rather than copied
+/// again — its migration is that service's own change, because its recordings also decide
+/// which VALUE rendering it quotes back.
+#[must_use]
+pub fn floating_point_member_paths(shapes: &[(&str, &'static Schema)]) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for (prefix, shape) in shapes {
+        for member in shape.members() {
+            let Some(name) = member.member_name() else {
+                continue;
+            };
+            if !matches!(member.shape_type(), ShapeType::Float | ShapeType::Double) {
+                continue;
+            }
+            // The casing of a validation path segment belongs to the path, not to the
+            // model, so it is spelled by the framework module that owns that spelling.
+            let segment = constraints::path::member(name);
+            paths.insert(if prefix.is_empty() {
+                segment
+            } else {
+                format!("{prefix}.{segment}")
+            });
+        }
+    }
+    paths
+}
+
+/// `violation` with the value half quoted back the way the service writes a FLOATING-POINT
+/// value ([`float_value_text`]), for a violation whose member `is_floating_point` answers
+/// `true` for; every other violation is returned unchanged.
+///
+/// The framework renders every numeric leaf with Rust's `to_string`, which has no way to
+/// know whether the member it is writing is an integral one — so WHICH members are
+/// floating point is a property of each service's model and is passed in, by the member
+/// path the clause names ([`floating_point_member_paths`] reads that set off the model).
+/// The clause, the member path and the requirement stay the framework's: only the
+/// submitted value's rendering changes, and only for a value that parses as a number.
+#[must_use]
+pub fn in_float_value_rendering(
+    violation: &Violation,
+    is_floating_point: impl Fn(&str) -> bool,
+) -> Violation {
+    let stated = violation.clone();
+    let Some(shown) = violation.value.as_deref() else {
+        return stated;
+    };
+    if !is_floating_point(&violation.path) {
+        return stated;
+    }
+    let Ok(value) = shown.parse::<f64>() else {
+        return stated;
+    };
+    Violation {
+        value: Some(float_value_text(value)),
+        ..stated
     }
 }
 
@@ -864,9 +991,9 @@ mod tests {
     use super::{
         aws_validation_refusal, aws_validation_refusal_over_elements, aws_validation_refusal_with,
         aws_validation_refusal_withholding, aws_validation_refusal_withholding_with,
-        enum_value_not_found, envelope_over, map_key_refusal, map_key_refusal_quoting,
-        pattern_mismatch, property_count_refusal, quoting_the_submitted_collection,
-        string_too_long, string_too_short,
+        enum_value_not_found, envelope_over, float_value_text, in_float_value_rendering,
+        map_key_refusal, map_key_refusal_quoting, pattern_mismatch, property_count_refusal,
+        quoting_the_submitted_collection, string_too_long, string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -883,6 +1010,39 @@ mod tests {
             path: path.to_owned(),
             kind,
             value: Some(value.to_owned()),
+        }
+    }
+
+    /// RULE: a floating-point value is quoted back with a fractional part or an exponent,
+    /// in scientific notation outside the plain-decimal band.
+    ///
+    /// The rows differ along what the rule generalises over: the magnitude (far below the
+    /// band, just below it, inside it, at and past its upper end), the sign, whether the
+    /// value is whole or fractional, how many digits it carries, and zero.
+    #[test]
+    fn a_floating_point_value_is_quoted_the_way_a_service_writes_one() {
+        let rows: [(f64, &str); 14] = [
+            (0.0, "0.0"),
+            (1.0, "1.0"),
+            (-5.0, "-5.0"),
+            (0.5, "0.5"),
+            (1.000001, "1.000001"),
+            (-0.000001, "-1.0E-6"),
+            (-1.5e-7, "-1.5E-7"),
+            (0.001, "0.001"),
+            (-0.0009, "-9.0E-4"),
+            (9999999.0, "9999999.0"),
+            (1e7, "1.0E7"),
+            (12345678.0, "1.2345678E7"),
+            (-1e30, "-1.0E30"),
+            (2.5e-12, "2.5E-12"),
+        ];
+        for (value, expected) in rows {
+            let rendered = float_value_text(value);
+            assert_eq!(
+                rendered, expected,
+                "case {value}: expected {expected:?}, got {rendered:?}"
+            );
         }
     }
 
@@ -952,6 +1112,34 @@ mod tests {
                 stated.value
             );
         }
+    }
+
+    /// RULE: the rendering reaches a clause only for a member the CALLER says is floating
+    /// point, and only the value half of that clause changes.
+    #[test]
+    fn only_a_floating_point_members_clause_is_requoted() {
+        let float = violation(
+            "inferenceConfig.topP",
+            ViolationKind::MinValue("0".to_owned()),
+            "-0.000001",
+        );
+        let integral = violation("maxResults", ViolationKind::MinValue("1".to_owned()), "0");
+        let is_float = |path: &str| path == "inferenceConfig.topP";
+        let requoted = in_float_value_rendering(&float, is_float);
+        assert_eq!(
+            requoted.message(),
+            "Value '-1.0E-6' at 'inferenceConfig.topP' failed to satisfy constraint: Member \
+             must have value greater than or equal to 0",
+            "expected the float member's value requoted, got {:?}",
+            requoted.message()
+        );
+        let untouched = in_float_value_rendering(&integral, is_float);
+        assert_eq!(
+            untouched.message(),
+            integral.message(),
+            "expected an integral member's clause untouched, got {:?}",
+            untouched.message()
+        );
     }
 
     /// RULE: a refusal about a map's KEY is the framework's envelope over a clause that

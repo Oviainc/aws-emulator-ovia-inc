@@ -4,7 +4,10 @@
 //! Lists the invocations `StartAsyncInvoke` created: it applies the time and
 //! status filters, sorts by submit time in the requested order, truncates at
 //! `maxResults` and emits an opaque `nextToken` that resumes exactly where the
-//! page just returned ended (absent on the last page).
+//! page just returned ended (absent on the last page). A `nextToken` the service
+//! cannot place is refused with the fixed sentence in
+//! [`crate::state::INVALID_PAGINATION_TOKEN_MESSAGE`], which quotes none of the
+//! request back.
 //!
 //! Reporting only: the one write it makes is to materialise the transitions out
 //! of `InProgress` the clock had already made due, exactly as `GetAsyncInvoke`
@@ -223,7 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => {
                 let Some((submit_time, invocation_arn)) = crate::state::decode_page_token(token)
                 else {
-                    return Err(validation(format!("The nextToken {token} is not valid.")));
+                    return Err(validation(
+                        crate::state::INVALID_PAGINATION_TOKEN_MESSAGE.to_string(),
+                    ));
                 };
                 let found = matching.iter().position(|record| {
                     record.submit_time == submit_time && record.invocation_arn == invocation_arn
@@ -231,7 +236,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 match found {
                     Some(position) => position + 1,
                     None => {
-                        return Err(validation(format!("The nextToken {token} is not valid.")))
+                        return Err(validation(
+                            crate::state::INVALID_PAGINATION_TOKEN_MESSAGE.to_string(),
+                        ))
                     }
                 }
             }

@@ -42,6 +42,7 @@
 
 use crate::ops::converse_stream::ConverseStream;
 use crate::ops::invoke_model_with_response_stream::InvokeModelWithResponseStream;
+use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::{Violation, ViolationKind};
 use service_common::event_stream::EventStreamRoute;
 // `request_path`: the one reader of a request URI's path, shared rather than inlined
@@ -50,7 +51,77 @@ use service_common::request_path;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, LazyLock};
+
+/// Each shape a constraint-violation path of this service can name a member of, with the
+/// path prefix the validating walk reports that shape's members under.
+///
+/// This is the LIST of shapes to look in, not a list of members: which of their members are
+/// floating point comes from the model
+/// ([`service_common::validation_message::floating_point_member_paths`]). The operation
+/// inputs this model declares are all listed, with no prefix; `InferenceConfiguration` is
+/// listed under `inferenceConfig`, the member both Converse operations bind it to, because
+/// codegen emits a member schema WITHOUT its target's own members (`Schema::new_member`
+/// takes a shape type and a name) — so a nested shape has to be named here to be looked in
+/// at all. An operation this model grows, or a second nested structure that carries a
+/// numeric member, therefore needs a line here.
+const VALIDATED_SHAPES: &[(&str, &Schema)] = &[
+    ("", crate::ops::types::APPLY_GUARDRAIL_INPUT_SCHEMA),
+    ("", crate::ops::types::CONVERSE_INPUT_SCHEMA),
+    ("", crate::ops::types::CONVERSE_STREAM_INPUT_SCHEMA),
+    ("", crate::ops::types::COUNT_TOKENS_INPUT_SCHEMA),
+    ("", crate::ops::types::GET_ASYNC_INVOKE_INPUT_SCHEMA),
+    ("", crate::ops::types::INVOKE_GUARDRAIL_CHECKS_INPUT_SCHEMA),
+    ("", crate::ops::types::INVOKE_MODEL_INPUT_SCHEMA),
+    (
+        "",
+        crate::ops::types::INVOKE_MODEL_WITH_RESPONSE_STREAM_INPUT_SCHEMA,
+    ),
+    ("", crate::ops::types::LIST_ASYNC_INVOKES_INPUT_SCHEMA),
+    ("", crate::ops::types::START_ASYNC_INVOKE_INPUT_SCHEMA),
+    (
+        "inferenceConfig",
+        crate::ops::types::INFERENCE_CONFIGURATION_SCHEMA,
+    ),
+];
+
+/// The validation paths of the members this service's MODEL types as `float` or `double`.
+///
+/// Built once off the schemas themselves, through the one shared reader of that set
+/// ([`service_common::validation_message::floating_point_member_paths`]), so nothing here
+/// names a member: a path is in this set exactly when the model says that member is
+/// floating point.
+fn floating_point_member_paths() -> &'static BTreeSet<String> {
+    static PATHS: LazyLock<BTreeSet<String>> = LazyLock::new(|| {
+        service_common::validation_message::floating_point_member_paths(VALIDATED_SHAPES)
+    });
+    &PATHS
+}
+
+/// `refusal` with every clause about a FLOATING-POINT member quoting the submitted value
+/// the way this service writes one, and everything else untouched.
+///
+/// A refusal states the value it was given, and a service writes a floating-point value
+/// with a fractional part or an exponent — `-1.0E-6`, not the decimal expansion
+/// `-0.000001` — whatever its magnitude. The rendering is the one shared implementation in
+/// `service_common`, so this service cannot drift from the others; which members it
+/// applies to comes from the model ([`floating_point_member_paths`]).
+fn in_float_value_rendering(refusal: &Refusal) -> Refusal {
+    let Refusal::Invalid(violations) = refusal else {
+        return refusal.clone();
+    };
+    Refusal::Invalid(
+        violations
+            .iter()
+            .map(|violation| {
+                service_common::validation_message::in_float_value_rendering(violation, |path| {
+                    floating_point_member_paths().contains(path)
+                })
+            })
+            .collect(),
+    )
+}
 
 /// Whether `path` is `/model/{modelId}/{tail}` — the URI space every inference
 /// operation of this service binds — and, if so, its `{tail}`.
@@ -244,8 +315,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // The value set of an ENUM requirement is listed in the order this service
         // lists those values in, which is not the order the model happens to declare
-        // them in (`in_service_value_order`).
-        service_common::validation_message::aws_validation_refusal(&in_service_value_order(refusal))
+        // them in (`in_service_value_order`), and a FLOATING-POINT member's submitted
+        // value is quoted back the way this service writes one
+        // (`in_float_value_rendering`).
+        service_common::validation_message::aws_validation_refusal(&in_float_value_rendering(
+            &in_service_value_order(refusal),
+        ))
     }
 
     fn override_routing_error(

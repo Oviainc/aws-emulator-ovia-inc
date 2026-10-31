@@ -14,6 +14,23 @@ Issue-Commit: d7c92a359e65b119da339df847b0735e9ef403e3
 
 > _Note: this issue was identified against the code base at commit `d7c92a359e65b119da339df847b0735e9ef403e3`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+Causes 2, 3 and 4 are FIXED: `InvokeModel` now validates its native body's inference parameters against the
+ranges the invoked model's provider documents (400 `ValidationException` naming the parameter and its bounds),
+`ListAsyncInvokes` refuses a pagination token it cannot place with the fixed `Invalid pagination token was
+passed` and quotes none of the request back, and a `@range` clause quotes a submitted floating-point value the
+way the service writes one (`-1.0E-6`, not `-0.000001`). Their three replay keys pass.
+
+Cause 1 is NOT fixed and is NOT closed: it is a platform blocker, and it stays FILED — its defect and its two
+replay keys (`bedrock-runtime.converse-basic-text-roundtrip`,
+`bedrock-runtime.converse-multiturn-context-retained`) now live on the open report that owns that defect,
+`issues/things-that-do-not-work/20261028T194707Z-bedrock-runtime-generation-stage-serves-a-constant-emulator.md`
+(which this report's own Cause 1 named as the one describing it). Nothing in this emulator can run a language
+model, and a stage that instead computes the text from the request was implemented and refused at the merge gate
+as output synthesised to look computed; the generation stage therefore still serves the notice that says no
+model ran.
+
 ## Operation
 Converse
 

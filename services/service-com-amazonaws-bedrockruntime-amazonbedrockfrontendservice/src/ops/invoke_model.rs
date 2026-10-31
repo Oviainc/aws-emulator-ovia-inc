@@ -4,10 +4,11 @@
 //! Serves one synchronous inference call: it resolves `modelId` against the
 //! inventory in [`crate::state`], applies the request rules the model documents
 //! (`application/json` bodies, and the three guardrail combinations that are an
-//! error), checks the body against the invoked family's own request schema,
-//! counts the prompt tokens the body carries, honours the generation cap
-//! the body carries for the model's family, and answers in the response envelope
-//! of that family so a client can parse it.
+//! error), checks the body against the invoked family's own request schema and
+//! the inference-parameter ranges that family's provider documents, counts the
+//! prompt tokens the body carries, honours the generation cap the body carries
+//! for the model's family, and answers in the response envelope of that family so
+//! a client can parse it.
 //!
 //! No language model runs in this emulator, so the text inside that envelope
 //! says so (see [`crate::state::emulated_completion_text`]); the envelope, the

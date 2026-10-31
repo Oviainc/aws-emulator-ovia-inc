@@ -41,6 +41,8 @@ mod guardrail_checks_inline;
 mod guardrail_checks_phone_numbers;
 #[path = "all/guardrail_checks_scores.rs"]
 mod guardrail_checks_scores;
+#[path = "all/inference_generation_and_refusal_wording.rs"]
+mod inference_generation_and_refusal_wording;
 #[path = "all/inference_stop_sequences.rs"]
 mod inference_stop_sequences;
 #[path = "all/resource_reference_refusals.rs"]

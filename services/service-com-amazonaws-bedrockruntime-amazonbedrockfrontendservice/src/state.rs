@@ -28,12 +28,12 @@
 //! No language model runs inside this emulator, so nothing here invents model
 //! output and presents it as inference: a synchronous completion carries, in the
 //! model family's own response envelope, text that says plainly that no model
-//! ran, together with the token accounting computed from the real request; an
-//! asynchronous invocation ends in the service's own `Failed` state with a
-//! failure message that says the same (see [`ASYNC_INVOKE_FAILURE_MESSAGE`]);
-//! and the arguments a forced tool call carries are the instantiation of the
-//! schema that tool was DECLARED with ([`tool_input_arguments`]), not values a
-//! model inferred from the conversation.
+//! ran ([`generation`]), together with the token accounting computed from the
+//! real request; an asynchronous invocation ends in the service's own `Failed`
+//! state with a failure message that says the same (see
+//! [`ASYNC_INVOKE_FAILURE_MESSAGE`]); and the arguments a forced tool call
+//! carries are the instantiation of the schema that tool was DECLARED with
+//! ([`tool_input_arguments`]), not values a model inferred from the conversation.
 //! Everything around that — resolution, validation, status, timestamps, ARNs,
 //! paging and the invocation log — is real and computed from persisted state.
 
@@ -54,6 +54,15 @@ pub mod invocation_metrics;
 /// The inline guardrail checks `InvokeGuardrailChecks` evaluates, and the
 /// text-unit accounting it reports for them.
 pub mod guardrail_checks;
+
+/// The generation stage every inference surface answers from: the assistant text
+/// a turn serves, which says plainly that no language model ran.
+pub mod generation;
+
+// Re-exported so every handler and every caller of this module reaches the
+// generation stage where it reached it before: the stage MOVED into its own
+// module, it did not change, and nothing about the text a turn serves differs.
+pub use generation::{emulated_completion, EmulatedCompletion, EMULATED_COMPLETION_FLOOR};
 
 /// The most async-invoke records this emulator retains.
 ///
@@ -1656,6 +1665,15 @@ pub fn encode_page_token(submit_time: i64, invocation_arn: &str) -> String {
     hex::encode(format!("{submit_time}|{invocation_arn}"))
 }
 
+/// The sentence a paginated read refuses a `nextToken` it cannot place with.
+///
+/// The whole message is FIXED text for this refusal: it states that the token
+/// handed over is not one the service can resume from and nothing else. In
+/// particular it carries NO value from the request — the rejected token is not
+/// quoted back — so the text a client matches or logs on is the same whatever
+/// bytes were submitted.
+pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str = "Invalid pagination token was passed";
+
 /// The sort key a page token carries, or `None` when the token is not one this
 /// emulator minted.
 pub fn decode_page_token(token: &str) -> Option<(i64, String)> {
@@ -2611,6 +2629,140 @@ pub fn body_stop_sequences(family: ModelFamily, body: &serde_json::Value) -> Vec
         .collect()
 }
 
+/// One inference parameter of a family's own `InvokeModel` request body whose
+/// value the provider bounds.
+#[derive(Debug, Clone, Copy)]
+pub struct BodyInferenceRange {
+    /// The JSON Pointer the family's request format binds the parameter to.
+    pub pointer: &'static str,
+    /// The name the parameter is called by — the family's own spelling of it,
+    /// which is also the name a refusal states.
+    pub name: &'static str,
+    /// The smallest value the provider documents for it.
+    pub min: f64,
+    /// The largest value the provider documents for it.
+    pub max: f64,
+}
+
+/// The bounded inference parameters each family's `InvokeModel` request body
+/// carries, with the range the provider documents for each.
+///
+/// Source: the per-family inference parameters in "Inference request parameters
+/// and response fields for foundation models" (Amazon Bedrock User Guide), the
+/// same table [`body_max_tokens`] and [`body_stop_sequences`] read their pointers
+/// off — Anthropic Claude's `temperature` and `top_p`, Titan Text's
+/// `textGenerationConfig.temperature` and `.topP`, Nova's
+/// `inferenceConfig.temperature` and `.topP`, Llama's and Mistral's `temperature`
+/// and `top_p`, and Cohere Command's `temperature` (which that provider bounds at
+/// 5, not at 1) and `p`. The bounds are the PROVIDER's, so a family that admits a
+/// wider range is not refused for a value the provider accepts.
+pub fn body_inference_ranges(family: ModelFamily) -> &'static [BodyInferenceRange] {
+    match family {
+        ModelFamily::AnthropicMessages | ModelFamily::Llama | ModelFamily::Mistral => &[
+            BodyInferenceRange {
+                pointer: "/temperature",
+                name: "temperature",
+                min: 0.0,
+                max: 1.0,
+            },
+            BodyInferenceRange {
+                pointer: "/top_p",
+                name: "top_p",
+                min: 0.0,
+                max: 1.0,
+            },
+        ],
+        ModelFamily::TitanText => &[
+            BodyInferenceRange {
+                pointer: "/textGenerationConfig/temperature",
+                name: "temperature",
+                min: 0.0,
+                max: 1.0,
+            },
+            BodyInferenceRange {
+                pointer: "/textGenerationConfig/topP",
+                name: "topP",
+                min: 0.0,
+                max: 1.0,
+            },
+        ],
+        ModelFamily::Nova => &[
+            BodyInferenceRange {
+                pointer: "/inferenceConfig/temperature",
+                name: "temperature",
+                min: 0.0,
+                max: 1.0,
+            },
+            BodyInferenceRange {
+                pointer: "/inferenceConfig/topP",
+                name: "topP",
+                min: 0.0,
+                max: 1.0,
+            },
+        ],
+        ModelFamily::CohereCommand => &[
+            BodyInferenceRange {
+                pointer: "/temperature",
+                name: "temperature",
+                min: 0.0,
+                max: 5.0,
+            },
+            BodyInferenceRange {
+                pointer: "/p",
+                name: "p",
+                min: 0.0,
+                max: 1.0,
+            },
+        ],
+    }
+}
+
+/// The sentence the invoke APIs refuse an inference parameter outside its
+/// documented range with.
+///
+/// Fixed text for this refusal class, with the parameter's own name and the two
+/// bounds of its documented range interpolated — the bounds come from
+/// [`body_inference_ranges`], never from the request — and each bound is written
+/// as the decimal a probability-style parameter is documented with.
+///
+/// The RECORDED wording behind it is the one Bedrock answers a Nova body's
+/// out-of-range `temperature` with; the same class of refusal is stated for every
+/// other family and parameter by interpolating that parameter's own name and its
+/// own bounds, so a later recording of one of them corrects only this template's
+/// variable parts.
+pub fn out_of_range_parameter_message(bound: &BodyInferenceRange) -> String {
+    format!(
+        "Malformed input request: the provided {} must be between {:.1} and {:.1}, please \
+         reformat your input and try again.",
+        bound.name, bound.min, bound.max
+    )
+}
+
+/// The refusal an `InvokeModel` body earns for an inference parameter outside the
+/// range its provider documents, or `None` when every parameter the body carries
+/// lies inside it.
+///
+/// The body is the PROVIDER's schema rather than a modelled shape, so this is
+/// where that schema's numeric bounds are applied: a parameter the body does not
+/// carry, or carries as something other than a number, bounds nothing here, and
+/// the parameters are checked in the order [`body_inference_ranges`] lists them so
+/// a body wrong in two of them is refused on the first. `parsed` is the body its
+/// caller has already decoded, so no request is parsed twice.
+pub fn body_inference_range_violation(
+    family: ModelFamily,
+    parsed: Option<&serde_json::Value>,
+) -> Option<String> {
+    let value = parsed?;
+    body_inference_ranges(family)
+        .iter()
+        .filter_map(|bound| {
+            let submitted = value.pointer(bound.pointer)?.as_f64()?;
+            (submitted < bound.min || submitted > bound.max)
+                .then(|| out_of_range_parameter_message(bound))
+        })
+        .next()
+}
+
 /// The only body MIME type the invoke APIs accept: "The MIME type of the input
 /// data in the request. You must specify application/json."
 pub const JSON_MIME: &str = "application/json";
@@ -2674,6 +2826,9 @@ pub fn validate_invoke_request(
     if body.is_empty() {
         return Err("The request body must contain the prompt and inference parameters.".to_string());
     }
+    // The body, decoded ONCE: the guardrail rule below and the inference-parameter
+    // ranges further down both read it, so no request is parsed twice.
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
 
     // The three guardrail combinations the model documents as errors. The
     // second one ("you enable the guardrail but the contentType isn't
@@ -2687,8 +2842,8 @@ pub fn validate_invoke_request(
         );
     }
     if guardrail_identifier.is_none()
-        && serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
+        && parsed
+            .as_ref()
             .is_some_and(|value| value.get(INLINE_GUARDRAIL_CONFIG_FIELD).is_some())
     {
         return Err(format!(
@@ -2702,6 +2857,12 @@ pub fn validate_invoke_request(
     // member the family's documented request schema requires, is refused naming
     // the violation.
     if let Some(message) = invoke_body_violation(family, body) {
+        return Err(message);
+    }
+    // The body's inference parameters, against the ranges the provider documents
+    // for them: a value outside one is refused rather than ignored, which is the
+    // same contract the Converse API's own `inferenceConfig` is validated under.
+    if let Some(message) = body_inference_range_violation(family, parsed.as_ref()) {
         return Err(message);
     }
     Ok(())
@@ -3415,83 +3576,6 @@ fn resolve_local_ref<'a>(
 pub fn latency_ms(elapsed: std::time::Duration) -> i64 {
     let millis = elapsed.as_micros().div_ceil(1_000).max(1);
     i64::try_from(millis).unwrap_or(i64::MAX)
-}
-
-/// The shortest completion this emulator answers an inference call with.
-///
-/// A generation cap is a CEILING on the response, not a target, so a completion
-/// is composed to FIT the budget the caller allowed: this sentence is the part
-/// that is always said, and [`emulated_completion`] appends the further clauses
-/// that still fit. A budget below this sentence is the only way generation is
-/// cut off mid-completion, which is what a length stop reason reports.
-pub const EMULATED_COMPLETION_FLOOR: &str = "No language model runs in this emulator.";
-
-/// One synthesized completion: the text served, and whether the generation cap
-/// cut it off before it was finished.
-#[derive(Debug, Clone)]
-pub struct EmulatedCompletion {
-    /// The assistant text. Never the request's own text echoed back as if
-    /// generated.
-    pub text: String,
-    /// `true` only when the cap was reached before the completion was finished,
-    /// i.e. the budget was too small even for [`EMULATED_COMPLETION_FLOOR`].
-    pub truncated: bool,
-}
-
-/// The completion a synchronous inference call answers with, composed to fit
-/// `max_output_tokens` and halted at the first stop sequence it carries.
-///
-/// No language model runs in this emulator, so the text says so, and carries
-/// only facts about the request that was actually served: how many messages it
-/// held and how many tokens of input they were. It is never the request's own
-/// text echoed back as if generated.
-///
-/// The caller's cap is the maximum number of tokens to ALLOW in the generated
-/// response, so a completion that has nothing left to say inside that ceiling
-/// has finished (`truncated` is `false`) however much room is left over: the
-/// clauses are appended in order only while the next one still fits. Only a
-/// budget smaller than [`EMULATED_COMPLETION_FLOOR`] genuinely reaches the
-/// ceiling, and that completion is reported as cut off.
-///
-/// `stop_sequences` are the sequences the request configured, applied by
-/// [`halt_at_stop_sequence`]: generation ends where the first of them completes,
-/// so a halted completion is NOT one the ceiling cut off however little of the
-/// budget it used.
-pub fn emulated_completion(
-    model_id: &str,
-    messages: u32,
-    input_tokens: u32,
-    max_output_tokens: u32,
-    stop_sequences: &[String],
-) -> EmulatedCompletion {
-    let halted = |text: String, truncated: bool| match halt_at_stop_sequence(&text, stop_sequences)
-    {
-        Some(text) => EmulatedCompletion {
-            text,
-            truncated: false,
-        },
-        None => EmulatedCompletion { text, truncated },
-    };
-    if count_text_tokens(EMULATED_COMPLETION_FLOOR) > max_output_tokens {
-        return halted(
-            truncate_to_tokens(EMULATED_COMPLETION_FLOOR, max_output_tokens),
-            true,
-        );
-    }
-    let mut text = EMULATED_COMPLETION_FLOOR.to_string();
-    for clause in [
-        format!(" {model_id} generated no text for this request."),
-        format!(
-            " The request carried {messages} message(s) and {input_tokens} input token(s)."
-        ),
-    ] {
-        let extended = format!("{text}{clause}");
-        if count_text_tokens(&extended) > max_output_tokens {
-            break;
-        }
-        text = extended;
-    }
-    halted(text, false)
 }
 
 /// The completion `text` as a configured stop sequence halts it, or `None` when
