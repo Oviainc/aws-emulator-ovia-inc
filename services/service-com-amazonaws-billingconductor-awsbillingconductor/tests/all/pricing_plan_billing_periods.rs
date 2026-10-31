@@ -77,7 +77,7 @@ pub(crate) async fn element_in(
 }
 
 /// Assert that `element` reports every member `expected` names with the value it names.
-fn assert_members(case: &str, element: &Value, expected: &Value) {
+pub(crate) fn assert_members(case: &str, element: &Value, expected: &Value) {
     let members = expected
         .as_object()
         .expect("an expectation is a map of member to value");

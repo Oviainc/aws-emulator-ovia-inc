@@ -109,6 +109,8 @@ mod pricing_plan_billing_periods;
 mod pricing_plan_delete;
 #[path = "all/pricing_plan_list.rs"]
 mod pricing_plan_list;
+#[path = "all/pricing_plan_unchanged_update.rs"]
+mod pricing_plan_unchanged_update;
 #[path = "all/pricing_plan_update.rs"]
 mod pricing_plan_update;
 #[path = "all/pricing_plans_associated_with_pricing_rule.rs"]

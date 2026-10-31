@@ -7,9 +7,10 @@
 //! modelled `PricingPlanArn` pattern spells that either as the full ARN or as the bare
 //! id, and both name ONE record), replaces exactly the members the request carries
 //! (`Name`, `Description`), keeps every member it omits at the value state already
-//! holds, moves `LastModifiedTime` to now, and answers with the plan's whole state
-//! afterwards — including `Size`, "the pricing rules count that's currently associated
-//! with this pricing plan", derived from the plan's associations rather than stored. A
+//! holds, moves `LastModifiedTime` to now when the call actually modified the plan, and
+//! answers with the plan's whole state afterwards — including `Size`, "the pricing rules
+//! count that's currently associated with this pricing plan", derived from the plan's
+//! associations rather than stored. A
 //! `Name` another plan holds is refused 409 `ConflictException`
 //! (`RESOURCE_NAME_CONFLICT`: "The name must be unique to each pricing plan"), an `Arn`
 //! no plan of this account answers to is 404 `ResourceNotFoundException`, and one of the
@@ -565,21 +566,36 @@ async fn either_spelling_of_the_arn_addresses_the_same_plan() {
 }
 
 #[tokio::test]
-async fn last_modified_time_moves_to_now_on_every_update() {
+async fn last_modified_time_moves_only_when_the_update_changed_the_plan() {
     let em = Emulator::new();
     let rules = em.create_rules("TimedRule", 2).await;
     let arn = em.create_plan(&base_plan("BasePlan", &rules)).await;
 
-    // (case, the patch the update carries) — a rename, a description change and an
-    // update that names nothing all move the timestamp, because the call is the event.
-    let rounds: Vec<(&str, Value)> = vec![
-        ("a description change", json!({ "Description": "first" })),
-        ("a rename", json!({ "Name": "TimedPlan" })),
-        ("an update naming no member", json!({})),
+    // (case, the patch the update carries, whether that patch asks for anything the plan
+    // does not already hold) — `LastModifiedTime` is "the most recent time when the
+    // pricing plan was modified", so a call that asked for a value the plan does not hold
+    // moves it to its own instant and a call that modified nothing leaves it where it was.
+    let rounds: Vec<(&str, Value, bool)> = vec![
+        ("a description change", json!({ "Description": "first" }), true),
+        ("a rename", json!({ "Name": "TimedPlan" }), true),
+        ("an update naming no member", json!({}), false),
+        (
+            "the Name the plan already holds",
+            json!({ "Name": "TimedPlan" }),
+            false,
+        ),
+        (
+            "the Description it already holds",
+            json!({ "Description": "first" }),
+            false,
+        ),
     ];
 
     let mut previous = 0_i64;
-    for (case, patch) in &rounds {
+    for (case, patch, changes) in &rounds {
+        // The clock the service stamps from has millisecond resolution, so a move is only
+        // observable once the call lands at a later instant than the write before it.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let before = now_millis();
         let (status, body) = em.update_plan(&arn, patch).await;
         let after = now_millis();
@@ -588,15 +604,31 @@ async fn last_modified_time_moves_to_now_on_every_update() {
             "case {case:?}: expected 200, got {status} with {body}"
         );
         let reported = integer(&body, "LastModifiedTime").unwrap_or_default();
-        assert!(
-            (before..=after).contains(&reported),
-            "case {case:?}: expected a LastModifiedTime inside the call's own window \
-             [{before}, {after}], got {reported}"
-        );
-        assert!(
-            reported >= previous,
-            "case {case:?}: expected LastModifiedTime not to go backwards from {previous}, got \
-             {reported}"
+        if *changes {
+            assert!(
+                (before..=after).contains(&reported),
+                "case {case:?}: expected a call that changed the plan to stamp a \
+                 LastModifiedTime inside its own window [{before}, {after}], got {reported}"
+            );
+            assert!(
+                reported > previous,
+                "case {case:?}: expected LastModifiedTime to move past {previous}, got \
+                 {reported}"
+            );
+        } else {
+            assert_eq!(
+                reported, previous,
+                "case {case:?}: expected a call that changed nothing to leave \
+                 LastModifiedTime at {previous}, got {reported}"
+            );
+        }
+        // Whatever the call did to the instant, the stored plan agrees with the answer.
+        let stored = em.read_back(&arn).await;
+        assert_eq!(
+            integer(&stored, "LastModifiedTime"),
+            Some(reported),
+            "case {case:?}: the answer and the stored plan must agree on LastModifiedTime, \
+             got {stored}"
         );
         previous = reported;
     }

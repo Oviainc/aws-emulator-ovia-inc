@@ -252,6 +252,21 @@ impl Emulator {
         record.last_modified_time_millis = at;
     }
 
+    /// How many SUPERSEDED generations of `plan_arn` the store holds: the slots this plan
+    /// has spent of the bounded version history a period-scoped read of a closed period
+    /// is answered from. Counted from the store because no read reports the size of that
+    /// history.
+    pub(crate) fn superseded_plan_generations(&self, plan_arn: &str) -> usize {
+        let state = self.engine.state::<BillingConductorState>();
+        let state = state.lock();
+        state
+            .pricing_plans
+            .get(plan_arn)
+            .expect("superseded_plan_generations: the plan was created above")
+            .superseded_versions
+            .len()
+    }
+
     /// Backdate the plan's CURRENT generation to `period`, as if the write that left the
     /// plan as it stands had been made in that billing period: how a world whose
     /// generations started in DIFFERENT periods is set up, which no request can ask for

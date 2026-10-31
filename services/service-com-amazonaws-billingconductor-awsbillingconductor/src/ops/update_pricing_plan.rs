@@ -4,9 +4,10 @@
 //!
 //! Updates the stored pricing plan the request's `Arn` names: every member the request
 //! carries replaces the stored one, every member it omits keeps the value state already
-//! holds, `LastModifiedTime` moves to now, and the response reports the plan's whole
-//! state afterwards — including `Size`, the count of pricing rules currently associated
-//! with the plan, which is derived from the association rather than stored.
+//! holds, `LastModifiedTime` moves to now when the call actually modified the plan, and
+//! the response reports the plan's whole state afterwards — including `Size`, the count
+//! of pricing rules currently associated with the plan, which is derived from the
+//! association rather than stored.
 //!
 //! ## Shape of an operation
 //!
@@ -232,15 +233,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(description) = input.description.clone() {
             updated.description = Some(description);
         }
-        updated.last_modified_time_millis = crate::state::now_millis();
 
-        // The name index follows the rename, so the old name frees up and the new one
-        // is taken by exactly this plan.
-        if updated.name != stored.name {
-            state.pricing_plan_names.remove(&stored.name);
-            state
-                .pricing_plan_names
-                .insert(updated.name.clone(), plan_arn.clone());
+        // `LastModifiedTime` is "the most recent time when the pricing plan was
+        // modified", so it moves only when this call actually modified the plan: a
+        // request that names no member, or names the values the plan already holds,
+        // leaves it where it was. The generation in force starts in the billing period
+        // that instant falls in, so a call that modified nothing writes no generation
+        // either — the same rule `UpdatePricingRule` and `UpdateBillingGroup` apply to
+        // the sibling resources, decided by the state method that names the members a
+        // generation carries
+        // ([`crate::state::PricingPlanRecord::holds_same_members_as`]).
+        let changed = !updated.holds_same_members_as(&stored);
+        if changed {
+            updated.last_modified_time_millis = crate::state::now_millis();
+            // The name index follows the rename, so the old name frees up and the new one
+            // is taken by exactly this plan.
+            if updated.name != stored.name {
+                state.pricing_plan_names.remove(&stored.name);
+                state
+                    .pricing_plan_names
+                    .insert(updated.name.clone(), plan_arn.clone());
+            }
         }
         // `Size`: "The pricing rules count that's currently associated with this pricing
         // plan list." Derived from the association the same state method every other
@@ -254,12 +267,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|arns| i64::try_from(arns.len()).unwrap_or(i64::MAX))
             .unwrap_or_default();
         let output = render(&updated, size);
-        // A read of a pricing plan is scoped to a billing period, so the write is stored
-        // as the plan's CURRENT generation and the generation it replaces is kept when
-        // this write lands in a later period than that one started in: a closed period
-        // still reports the plan as it stood then
-        // (`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_pricing_plan`).
-        state.put_pricing_plan(updated);
+        if changed {
+            // A read of a pricing plan is scoped to a billing period, so the write is
+            // stored as the plan's CURRENT generation and the generation it replaces is
+            // kept when this write lands in a later period than that one started in: a
+            // closed period still reports the plan as it stood then
+            // (`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_pricing_plan`).
+            state.put_pricing_plan(updated);
+        }
 
         // The audit record for a state-changing call: who asked, what changed and that
         // it succeeded. Never a secret, and never a `@sensitive` member (the plan's name
@@ -269,8 +284,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = Self::NAME,
             akid = %::engine::extract_akid(&ctx.parts().headers),
             pricing_plan_arn = %plan_arn,
-            outcome = "updated",
-            "pricing plan updated"
+            outcome = if changed { "updated" } else { "unchanged" },
+            "pricing plan update served"
         );
         Ok(output)
     }

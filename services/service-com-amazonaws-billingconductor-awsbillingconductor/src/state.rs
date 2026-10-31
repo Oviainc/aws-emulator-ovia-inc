@@ -1220,6 +1220,18 @@ impl PricingPlanRecord {
             .filter(|association| !association.is_live())
             .count()
     }
+
+    /// Do this record and `other` hold the SAME values for every member a write can
+    /// change — exactly the members one generation of the plan carries
+    /// ([`VersionedResource::current_version`]), named here once so the two cannot drift?
+    ///
+    /// What decides whether a write modified the plan at all: `LastModifiedTime` is the
+    /// instant of the write that left the plan as it stands, and the generation in force
+    /// starts in the period that instant falls in, so a write leaving every one of these
+    /// members where it was neither moves the instant nor opens a generation.
+    pub fn holds_same_members_as(&self, other: &Self) -> bool {
+        self.name == other.name && self.description == other.description
+    }
 }
 
 /// The billing-period versioning rule, as a pricing plan carries it: a generation of a
