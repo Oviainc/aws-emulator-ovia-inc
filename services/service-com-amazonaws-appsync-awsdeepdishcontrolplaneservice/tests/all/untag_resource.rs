@@ -48,14 +48,19 @@ use crate::resource_tags::{
     encode_label, ABSENT_API_ID, ACCOUNT, TAG_COUNT_MAX, TAG_KEY_MAX_LEN,
 };
 use crate::tag_resource::{
-    list_tags, numbered_pairs, pairs, tag_map, tag_resource, API_NOT_FOUND, TAG_KEY_MIN_LEN,
+    list_tags, numbered_pairs, pairs, tag_map, tag_resource, RESOURCE_NOT_FOUND, TAG_KEY_MIN_LEN,
+    TAG_WRITE_STATUS,
 };
 
 /// `DELETE /v1/tags/{resourceArn}?tagKeys=…`, as a client issues it: `tagKeys` is a
 /// LIST bound to a repeated query parameter (`smithy_query(query="operation",
 /// operation="UntagResource")` — `tagKeys` targets `TagKeyList` with
 /// `httpQuery: "tagKeys"`), so one parameter is sent per key.
-async fn untag_resource(router: &MultiServiceRouter, arn: &str, keys: &[String]) -> Answer {
+pub(crate) async fn untag_resource(
+    router: &MultiServiceRouter,
+    arn: &str,
+    keys: &[String],
+) -> Answer {
     let query = keys
         .iter()
         .map(|key| format!("tagKeys={}", encode_label(key)))
@@ -225,8 +230,8 @@ async fn an_untag_removes_exactly_the_keys_it_names() {
 
         let removed = untag_resource(&router, &arn, &row.removed).await;
         assert_eq!(
-            removed.status, 200,
-            "case {label}: expected UntagResource 200, got {} {} {:?}",
+            removed.status, TAG_WRITE_STATUS,
+            "case {label}: expected UntagResource {TAG_WRITE_STATUS}, got {} {} {:?}",
             removed.status, removed.error_type, removed.body
         );
         // `UntagResourceResponse` models no members, so the answer carries none.
@@ -266,8 +271,8 @@ async fn an_untag_removes_exactly_the_keys_it_names() {
         // Naming the same keys again is a no-op: they are already gone.
         let again = untag_resource(&router, &arn, &row.removed).await;
         assert_eq!(
-            again.status, 200,
-            "case {label}: expected a repeated UntagResource 200, got {} {} {:?}",
+            again.status, TAG_WRITE_STATUS,
+            "case {label}: expected a repeated UntagResource {TAG_WRITE_STATUS}, got {} {} {:?}",
             again.status, again.error_type, again.body
         );
         let relisted = list_tags(&router, &arn).await;
@@ -313,8 +318,8 @@ async fn a_removed_key_is_absent_and_can_be_set_again() {
 
         let removed = untag_resource(&router, &arn, &keys(&["env"])).await;
         assert_eq!(
-            removed.status, 200,
-            "case {label}: expected UntagResource 200, got {} {} {:?}",
+            removed.status, TAG_WRITE_STATUS,
+            "case {label}: expected UntagResource {TAG_WRITE_STATUS}, got {} {} {:?}",
             removed.status, removed.error_type, removed.body
         );
         let listed = list_tags(&router, &arn).await;
@@ -334,8 +339,8 @@ async fn a_removed_key_is_absent_and_can_be_set_again() {
 
         let written = tag_resource(&router, &arn, json!({ "env": second })).await;
         assert_eq!(
-            written.status, 200,
-            "case {label}: expected TagResource 200 after the removal, got {} {} {:?}",
+            written.status, TAG_WRITE_STATUS,
+            "case {label}: expected TagResource {TAG_WRITE_STATUS} after the removal, got {} {} {:?}",
             written.status, written.error_type, written.body
         );
         let relisted = list_tags(&router, &arn).await;
@@ -376,8 +381,8 @@ async fn an_untag_reaches_only_the_resource_named() {
     // Untag the FIRST resource only.
     let removed = untag_resource(&router, &arns[0], &keys(&["env", "team"])).await;
     assert_eq!(
-        removed.status, 200,
-        "case untag the first resource: expected 200, got {} {:?}",
+        removed.status, TAG_WRITE_STATUS,
+        "case untag the first resource: expected {TAG_WRITE_STATUS}, got {} {:?}",
         removed.status, removed.body
     );
 
@@ -453,8 +458,8 @@ async fn an_arn_naming_no_resource_is_not_found() {
                 removed.error_type.as_str(),
                 removed.message.as_str()
             ),
-            (404, "NotFoundException", API_NOT_FOUND),
-            "case {label} ({candidate}): expected 404 NotFoundException {API_NOT_FOUND:?}, got {} {} {:?}",
+            (404, "NotFoundException", RESOURCE_NOT_FOUND),
+            "case {label} ({candidate}): expected 404 NotFoundException {RESOURCE_NOT_FOUND:?}, got {} {} {:?}",
             removed.status,
             removed.error_type,
             removed.body
@@ -587,7 +592,7 @@ async fn a_key_outside_the_modelled_rule_is_refused_and_changes_nothing() {
     // none is not served and removes nothing.
     let none = untag_resource(&router, &arn, &[]).await;
     assert_ne!(
-        none.status, 200,
+        none.status, TAG_WRITE_STATUS,
         "case no tagKeys at all: expected the call not to be served, got {} {} {:?}",
         none.status, none.error_type, none.body
     );
@@ -636,8 +641,8 @@ async fn an_event_api_is_untagged_through_the_same_route() {
 
     let removed = untag_resource(&router, &arn, &keys(&["env"])).await;
     assert_eq!(
-        removed.status, 200,
-        "case untag an Event API: expected 200, got {} {} {:?}",
+        removed.status, TAG_WRITE_STATUS,
+        "case untag an Event API: expected {TAG_WRITE_STATUS}, got {} {} {:?}",
         removed.status, removed.error_type, removed.body
     );
 

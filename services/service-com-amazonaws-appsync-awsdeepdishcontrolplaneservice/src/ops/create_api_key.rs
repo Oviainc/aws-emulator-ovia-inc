@@ -222,13 +222,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Mint the key id and its creation order from the state's own counters, then
-        // store it under its parent API.
-        let mut key_id = format!("{KEY_VERSION_PREFIX}{}", guard.mint_id());
+        // store it under its parent API. A key id leads with the version the key is of
+        // — this service mints the current one, whose keys accept a caller-provided
+        // expiration and can be updated (`crate::state::CURRENT_API_KEY_VERSION`).
+        let version = crate::state::CURRENT_API_KEY_VERSION;
+        let mut key_id = format!("{version}-{}", guard.mint_id());
         while guard
             .api_keys_of(&input.api_id)
             .is_some_and(|api_keys| api_keys.contains_key(&key_id))
         {
-            key_id = format!("{KEY_VERSION_PREFIX}{}", guard.mint_id());
+            key_id = format!("{version}-{}", guard.mint_id());
         }
         let seq = guard.next_seq();
         // `ApiKeyRecord::new` floors the requested instant to the hour and derives the
@@ -256,11 +259,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The key version this service mints, as the `ApiKey` shape's own documentation
-/// describes it: `da2` keys report `expires`/`deletes` in seconds and accept a
-/// caller-provided expiration. (`da1` keys ceased to be valid in February 2018.)
-const KEY_VERSION_PREFIX: &str = "da2-";
 
 /// `CreateApiKey`'s documented default: "The default value for this parameter is 7
 /// days from creation time."

@@ -168,15 +168,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let guard = state.lock();
 
-        // `ResourceArn` is constrained to ONE ARN shape — an AppSync API's — and that
-        // constraint is enforced before this handler runs, so the value here is a
-        // well-formed API ARN and the only question left is whether this account holds
-        // the API it names. Resolved through the store's `tags_of`, the single lookup a
-        // tag read and a tag write share, so an API of either resource family lists the
-        // tags its create persisted.
+        // `ResourceArn` is constrained to ONE ARN shape — an AppSync API's — and a value
+        // that is not one is refused before this handler runs (see the service's
+        // `override_refusal`), so the value here is a well-formed resource ARN and the
+        // only question left is whether this account holds the resource it names.
+        // Resolved through the store's `tags_of`, the single lookup a tag read and a tag
+        // write share, so an API of either resource family lists the tags its create
+        // persisted — and an ARN naming no resource is refused as the absent RESOURCE it
+        // is, the way the whole tagging surface refuses one.
         let Some(tags) = guard.tags_of(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+                message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         };

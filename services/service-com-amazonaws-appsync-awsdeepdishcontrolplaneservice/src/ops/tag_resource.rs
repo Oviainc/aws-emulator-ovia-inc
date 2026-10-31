@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
@@ -169,13 +169,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The entry COUNT and every VALUE are refused by the request boundary against
         // the modelled bounds before this handler runs; a map KEY is not covered there,
-        // so a key's own bounds, alphabet and reserved prefix are enforced here. Checked
-        // before anything is written, so a refused call leaves the stored tags as they
-        // were.
+        // so a key's own bounds, alphabet and reserved prefix are enforced here — each
+        // ground worded as the service words it (`crate::state::tag_key_refusal`).
+        // Checked before anything is written, so a refused call leaves the stored tags
+        // as they were.
         for key in input.tags.keys() {
-            if !crate::state::is_tag_key(key) {
+            if let Some(message) = crate::state::tag_key_refusal(key) {
                 return Err(TagResourceErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(crate::state::invalid_tag_key_message(key)),
+                    message: Some(message),
                     ..Default::default()
                 })
                 .into());
@@ -184,9 +185,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
+        // The tagging surface addresses a RESOURCE, so an ARN naming none is refused as
+        // the absent resource it is rather than as an absent API.
         let Some(tags) = guard.tags_of_mut(&input.resource_arn) else {
             return Err(TagResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+                message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         };
@@ -214,7 +217,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `TagResourceResponse` models no members: the stored map is what the tag
-        // listing answers with, and this call reports only that the write happened.
+        // listing answers with, and this call reports only that the write happened — as
+        // a 204 with no body at all (`SUCCESS_STATUS` above).
         Ok(TagResourceOutput {})
     }
 }

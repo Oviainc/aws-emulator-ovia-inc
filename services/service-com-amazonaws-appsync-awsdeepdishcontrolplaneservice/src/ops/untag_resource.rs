@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
@@ -176,14 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bounds before this handler runs, but its alphabet and its reserved prefix are
         // stated by a pattern with a negative lookahead, which the boundary's regex
         // engine cannot compile and therefore treats as satisfied — so the key's own
-        // rule is enforced here, through the same predicate the tag write uses. Checked
+        // rule is enforced here, through the same refusal the tag write uses. Checked
         // before anything is removed, so a refused call leaves the stored tags as they
         // were.
         for key in &input.tag_keys {
-            if !crate::state::is_tag_key(key) {
+            if let Some(message) = crate::state::tag_key_refusal(key) {
                 return Err(UntagResourceErrorModeled::BadRequestException(
                     BadRequestException {
-                        message: Some(crate::state::invalid_tag_key_message(key)),
+                        message: Some(message),
                         ..Default::default()
                     },
                 )
@@ -193,9 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
+        // The tagging surface addresses a RESOURCE, so an ARN naming none is refused as
+        // the absent resource it is rather than as an absent API.
         let Some(tags) = guard.tags_of_mut(&input.resource_arn) else {
             return Err(UntagResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+                message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         };
@@ -209,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `UntagResourceResponse` models no members: what is left of the stored map is
         // what the tag listing answers, and this call reports only that the removal
-        // happened.
+        // happened — as a 204 with no body at all (`SUCCESS_STATUS` above).
         Ok(UntagResourceOutput {})
     }
 }

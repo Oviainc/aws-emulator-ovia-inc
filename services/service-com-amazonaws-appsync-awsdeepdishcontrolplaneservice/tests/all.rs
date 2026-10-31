@@ -91,6 +91,8 @@ mod source_graphql_api_association;
 mod start_schema_merge;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/api_key_version_and_tagging_refusals.rs"]
+mod api_key_version_and_tagging_refusals;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
 #[path = "all/untag_resource.rs"]

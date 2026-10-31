@@ -47,8 +47,20 @@ use crate::resource_tags::{
 /// shape="TagKey")` — `@length` min 1, max 128.
 pub(crate) const TAG_KEY_MIN_LEN: usize = 1;
 
-/// The fixed text AppSync answers for an API that is absent.
-pub(crate) const API_NOT_FOUND: &str = "API not found.";
+/// The status a tag WRITE answers: 204, with no body at all. `TagResourceResponse` and
+/// `UntagResourceResponse` model no members, and the tagging surface answers a served
+/// write as no content rather than as an empty body.
+pub(crate) const TAG_WRITE_STATUS: u16 = 204;
+
+/// The fixed text the tagging surface answers for a resource that is absent: it
+/// addresses a RESOURCE by ARN, so the refusal names no resource kind.
+pub(crate) const RESOURCE_NOT_FOUND: &str = "Resource was not found";
+
+/// The fixed text AppSync answers for a tag key under the prefix it reserves — one
+/// sentence of its own, naming the prefix and the comparison rather than reciting the
+/// whole tag-key grammar.
+pub(crate) const RESERVED_TAG_KEY_REFUSAL: &str =
+    "Invalid tag key. Customers cannot set tag keys starting with aws: (case insensitive)";
 
 /// `POST /v1/tags/{resourceArn}` carrying `tags`, as a client issues it.
 pub(crate) async fn tag_resource(router: &MultiServiceRouter, arn: &str, tags: Value) -> Answer {
@@ -244,8 +256,8 @@ async fn a_tag_write_merges_into_the_map_the_resource_holds() {
 
         let written = tag_resource(&router, &arn, tag_map(&row.submitted)).await;
         assert_eq!(
-            written.status, 200,
-            "case {label}: expected TagResource 200, got {} {} {:?}",
+            written.status, TAG_WRITE_STATUS,
+            "case {label}: expected TagResource {TAG_WRITE_STATUS}, got {} {} {:?}",
             written.status, written.error_type, written.body
         );
         // `TagResourceResponse` models no members, so the answer carries none.
@@ -285,8 +297,8 @@ async fn a_tag_write_merges_into_the_map_the_resource_holds() {
         // Writing the same pairs again is a no-op: a merge of a map into itself.
         let again = tag_resource(&router, &arn, tag_map(&row.submitted)).await;
         assert_eq!(
-            again.status, 200,
-            "case {label}: expected a repeated TagResource 200, got {} {:?}",
+            again.status, TAG_WRITE_STATUS,
+            "case {label}: expected a repeated TagResource {TAG_WRITE_STATUS}, got {} {:?}",
             again.status, again.body
         );
         let relisted = list_tags(&router, &arn).await;
@@ -336,8 +348,8 @@ async fn an_event_api_is_tagged_through_the_same_route() {
 
     let written = tag_resource(&router, &arn, json!({ "env": "staging", "team": "events" })).await;
     assert_eq!(
-        written.status, 200,
-        "case tag an Event API: expected 200, got {} {} {:?}",
+        written.status, TAG_WRITE_STATUS,
+        "case tag an Event API: expected {TAG_WRITE_STATUS}, got {} {} {:?}",
         written.status, written.error_type, written.body
     );
 
@@ -384,8 +396,8 @@ async fn a_write_reaches_only_the_resource_named() {
     // Tag the FIRST resource only.
     let written = tag_resource(&router, &arns[0], json!({ "env": "dev", "owner": "platform" })).await;
     assert_eq!(
-        written.status, 200,
-        "case tag the first resource: expected 200, got {} {:?}",
+        written.status, TAG_WRITE_STATUS,
+        "case tag the first resource: expected {TAG_WRITE_STATUS}, got {} {:?}",
         written.status, written.body
     );
 
@@ -451,8 +463,8 @@ async fn an_arn_naming_no_resource_is_not_found() {
         let written = tag_resource(&router, candidate, json!({ "env": "prod" })).await;
         assert_eq!(
             (written.status, written.error_type.as_str(), written.message.as_str()),
-            (404, "NotFoundException", API_NOT_FOUND),
-            "case {label} ({candidate}): expected 404 NotFoundException {API_NOT_FOUND:?}, got {} {} {:?}",
+            (404, "NotFoundException", RESOURCE_NOT_FOUND),
+            "case {label} ({candidate}): expected 404 NotFoundException {RESOURCE_NOT_FOUND:?}, got {} {} {:?}",
             written.status,
             written.error_type,
             written.body
@@ -540,8 +552,8 @@ async fn a_key_outside_the_modelled_rule_is_a_bad_request() {
     let accepted = "k".repeat(TAG_KEY_MAX_LEN);
     let written = tag_resource(&router, &arn, tag_map(&[(accepted, "v".to_string())])).await;
     assert_eq!(
-        written.status, 200,
-        "case a key at the maximum of {TAG_KEY_MAX_LEN}: expected 200, got {} {:?}",
+        written.status, TAG_WRITE_STATUS,
+        "case a key at the maximum of {TAG_KEY_MAX_LEN}: expected {TAG_WRITE_STATUS}, got {} {:?}",
         written.status, written.body
     );
 }
@@ -581,8 +593,8 @@ async fn a_write_past_the_tag_quota_is_refused_and_changes_nothing() {
         let listed = list_tags(&router, &arn).await;
         if served {
             assert_eq!(
-                written.status, 200,
-                "case {label}: expected 200, got {} {} {:?}",
+                written.status, TAG_WRITE_STATUS,
+                "case {label}: expected {TAG_WRITE_STATUS}, got {} {} {:?}",
                 written.status, written.error_type, written.body
             );
             assert_eq!(
@@ -630,8 +642,8 @@ async fn a_write_past_the_tag_quota_is_refused_and_changes_nothing() {
         .collect::<Vec<(String, String)>>();
     let written = tag_resource(&router, &arn, tag_map(&overwrite)).await;
     assert_eq!(
-        written.status, 200,
-        "case an overwrite at the quota: expected 200, got {} {} {:?}",
+        written.status, TAG_WRITE_STATUS,
+        "case an overwrite at the quota: expected {TAG_WRITE_STATUS}, got {} {} {:?}",
         written.status, written.error_type, written.body
     );
     let listed = list_tags(&router, &arn).await;

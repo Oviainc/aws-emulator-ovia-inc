@@ -367,10 +367,47 @@ pub fn unix_seconds() -> i64 {
         .map_or(0, |since| since.as_secs() as i64)
 }
 
+/// The fixed half of the text `NotFoundException` (HTTP 404) carries for an API key its
+/// parent API does not hold ([`api_key_not_found_message`] fills the rest).
+pub const API_KEY_NOT_FOUND_PREFIX: &str = "API key not found: ";
+
 /// The text `NotFoundException` (HTTP 404) carries for an API key its parent API does
-/// not hold. The requirement the refusal answers is the status and the error shape; no
-/// recording pins AppSync's own wording, so this states the absent resource.
-pub const API_KEY_NOT_FOUND_MESSAGE: &str = "API key not found.";
+/// not hold: AppSync's fixed sentence ([`API_KEY_NOT_FOUND_PREFIX`]) followed by the key
+/// id the request addressed, so a caller deleting or updating several keys can see WHICH
+/// id named nothing. Shared by every operation that addresses a key by id, so they word
+/// one absence one way.
+pub fn api_key_not_found_message(id: &str) -> String {
+    format!("{API_KEY_NOT_FOUND_PREFIX}{id}")
+}
+
+/// The key version this service mints, and the only one whose keys an update is
+/// available for.
+///
+/// Source: the `ApiKey` shape's own documentation (`smithy_query(query="doc",
+/// shape="ApiKey")`), which describes two key versions — `da1`, introduced in November
+/// 2017, which "ceased to be valid after February 21, 2018" and for which "UpdateApiKey
+/// is not available", and `da2`, introduced in February 2018, whose `UpdateApiKey`
+/// "accepts a user-provided expiration time in seconds". A key id states its version in
+/// the segment before its first `-`, which is how a key is classified by version before
+/// anything is resolved.
+pub const CURRENT_API_KEY_VERSION: &str = "da2";
+
+/// Whether `id` states the key version an update is available for
+/// ([`CURRENT_API_KEY_VERSION`]), i.e. whether it could name a key an update can reach
+/// at all.
+///
+/// The version is the id's leading segment, so the separator is part of the test: an id
+/// that states another version, or no version at all, states no version an update
+/// serves.
+pub fn is_updatable_api_key_version(id: &str) -> bool {
+    id.strip_prefix(CURRENT_API_KEY_VERSION)
+        .is_some_and(|rest| rest.starts_with('-'))
+}
+
+/// AppSync's fixed text for a call that addresses a key of a version it is not available
+/// for, carried by `BadRequestException` (HTTP 400): the request names a key version the
+/// operation cannot serve, and no part of the sentence varies with the request.
+pub const UNSUPPORTED_API_KEY_VERSION_MESSAGE: &str = "Unsupported API key version.";
 
 /// One stored data source of a `GraphqlApiRecord`.
 ///
@@ -1096,7 +1133,7 @@ pub const DOMAIN_NAME_EXISTS_MESSAGE: &str = "Domain name already exists.";
 /// addresses, so an absent one is reported as the absent association it is.
 ///
 /// Worded after the service's other absent-resource sentences ([`API_NOT_FOUND_MESSAGE`],
-/// [`API_KEY_NOT_FOUND_MESSAGE`]); AppSync's own sentence for this one is not among the
+/// [`API_KEY_NOT_FOUND_PREFIX`]); AppSync's own sentence for this one is not among the
 /// texts this service has to go on, so it is provisional until the real one is known.
 pub const API_ASSOCIATION_NOT_FOUND_MESSAGE: &str = "API association not found.";
 
@@ -2208,10 +2245,22 @@ pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 /// than a caller can submit, so the per-call bound is also the per-resource ceiling.
 pub const TAGS_PER_RESOURCE: usize = 50;
 
+/// Whether `candidate` sits under the key prefix AWS reserves
+/// ([`RESERVED_TAG_KEY_PREFIX`]).
+///
+/// Compared WITHOUT regard to case, which is how the service states the rule: a caller
+/// "cannot set tag keys starting with aws: (case insensitive)", so a key differing from
+/// the prefix only in case is reserved too.
+pub fn is_reserved_tag_key(candidate: &str) -> bool {
+    candidate
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
 /// Whether `candidate` is a well-formed `TagKey`: between [`TAG_KEY_MIN_LEN`] and
 /// [`TAG_KEY_MAX_LEN`] characters drawn from the alphabet `TagKey`'s modelled pattern
 /// admits (`[ a-zA-Z+-=._:/]`, whose `+-=` range also admits the digits and `,;<`),
-/// and not under the reserved prefix ([`RESERVED_TAG_KEY_PREFIX`]).
+/// and not under the reserved prefix ([`is_reserved_tag_key`]).
 ///
 /// A map KEY is not checked by the request boundary (only map values and the entry
 /// count are), so the service enforces the key's own rule — the same split
@@ -2219,10 +2268,36 @@ pub const TAGS_PER_RESOURCE: usize = 50;
 pub fn is_tag_key(candidate: &str) -> bool {
     let length = candidate.chars().count();
     (TAG_KEY_MIN_LEN..=TAG_KEY_MAX_LEN).contains(&length)
-        && !candidate.starts_with(RESERVED_TAG_KEY_PREFIX)
+        && !is_reserved_tag_key(candidate)
         && candidate
             .chars()
             .all(|character| matches!(character, ' ' | '_' | 'a'..='z' | 'A'..='Z' | '+'..='='))
+}
+
+/// AppSync's fixed text for a tag key under the prefix AWS reserves, carried by
+/// `BadRequestException` (HTTP 400).
+///
+/// The reserved prefix is a rule of its own rather than one clause of the tag-key
+/// grammar, and the service states it as one sentence that names the prefix and the
+/// comparison: no part of it varies with the request, so the rejected key is not echoed.
+pub const RESERVED_TAG_KEY_MESSAGE: &str =
+    "Invalid tag key. Customers cannot set tag keys starting with aws: (case insensitive)";
+
+/// Why `key` is not a tag key a caller may set, as the text a `BadRequestException`
+/// (HTTP 400) states it with, or `None` when it is one.
+///
+/// The two grounds are worded separately, because the service states them separately: a
+/// key under the reserved prefix takes [`RESERVED_TAG_KEY_MESSAGE`], and a key outside
+/// `TagKey`'s length bounds or alphabet takes [`invalid_tag_key_message`]. Shared by
+/// every operation that carries tag keys, so one key is refused one way.
+pub fn tag_key_refusal(key: &str) -> Option<String> {
+    if is_reserved_tag_key(key) {
+        return Some(RESERVED_TAG_KEY_MESSAGE.to_string());
+    }
+    if !is_tag_key(key) {
+        return Some(invalid_tag_key_message(key));
+    }
+    None
 }
 
 /// AppSync's refusal text for a tag key that is not a `TagKey` ([`is_tag_key`]): the
@@ -2249,6 +2324,24 @@ pub fn tag_limit_exceeded_message(requested: usize) -> String {
 /// AppSync's fixed, request-independent text for an API that is absent, carried by
 /// `NotFoundException` (HTTP 404) by every operation that resolves an `apiId`.
 pub const API_NOT_FOUND_MESSAGE: &str = "API not found.";
+
+/// AppSync's fixed, request-independent text for a tagged resource that is absent,
+/// carried by `NotFoundException` (HTTP 404) by every operation that resolves a
+/// `resourceArn`.
+///
+/// The tagging surface addresses a RESOURCE rather than an API — one route tags every
+/// resource kind an ARN can name — so its refusal states the absent resource and names
+/// no resource kind, where an operation addressing an `apiId` states the absent API
+/// ([`API_NOT_FOUND_MESSAGE`]).
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// AppSync's fixed, request-independent text for a `resourceArn` that is not a resource
+/// ARN at all, carried by `BadRequestException` (HTTP 400).
+///
+/// The tagging operations model no constraint-violation error, so a value their
+/// `resourceArn` cannot be is refused as the malformed request it is, under the one
+/// client-error shape they do model; the rejected value is not echoed.
+pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn";
 
 /// AppSync's fixed, request-independent text for a `nextToken` a list operation cannot
 /// resume from, carried by `BadRequestException` (HTTP 400).

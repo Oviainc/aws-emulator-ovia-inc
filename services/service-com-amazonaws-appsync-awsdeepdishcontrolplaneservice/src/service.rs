@@ -209,6 +209,43 @@ fn without_rejected_enum_values(violations: &[Violation]) -> Option<Refused> {
     })
 }
 
+/// The member every tagging operation addresses its resource by.
+///
+/// Source: `smithy_query(query="operation", operation="TagResource,UntagResource,
+/// ListTagsForResource")` — each takes `resourceArn`, bound to the one `/v1/tags/…`
+/// path label and targeting `ResourceArn`, whose `@length` and `@pattern` admit one ARN
+/// shape.
+const RESOURCE_ARN_MEMBER: &str = "resourceArn";
+
+/// AppSync's own refusal for a `resourceArn` whose VALUE cannot be a resource ARN at all
+/// — outside the shape's length bounds or its pattern.
+///
+/// The tagging operations model `BadRequestException` and no constraint-violation error,
+/// so the framework's generic report (`ValidationException`, with every broken clause
+/// recited) names a shape no operation of this service models and a client's error-type
+/// dispatch cannot match it. The service states the malformed ARN as one fixed sentence
+/// instead, which is why the rejected value is not echoed.
+///
+/// `None` when no violation is of that member and kind, which leaves every other
+/// refusal to the wordings the rest of this file states.
+fn resource_arn_refusal(violations: &[Violation]) -> Option<Refused> {
+    violations
+        .iter()
+        .find(|violation| {
+            violated_member(&violation.path) == RESOURCE_ARN_MEMBER
+                && matches!(
+                    violation.kind,
+                    ViolationKind::MinLength(_)
+                        | ViolationKind::MaxLength(_)
+                        | ViolationKind::Pattern(_)
+                )
+        })
+        .map(|_| Refused {
+            code: BAD_REQUEST_CODE.to_string(),
+            message: crate::state::INVALID_RESOURCE_ARN_MESSAGE.to_string(),
+        })
+}
+
 /// The `com-amazonaws-appsync-awsdeepdishcontrolplaneservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -262,8 +299,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this service
-        // reword it. AppSync states two of those classes itself:
+        // reword it. AppSync states three of those classes itself:
         //
+        // * a `resourceArn` whose value cannot be a resource ARN at all is its own
+        //   `BadRequestException` with the service's fixed sentence for a malformed ARN
+        //   (`resource_arn_refusal`), the only client error its operations model;
         // * a member the model rules out outright — absent though required, or
         //   outside its modelled `@range` — is its own `BadRequestException` naming
         //   that member, and its range when it has one (`member_refusal`); the
@@ -276,7 +316,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Every other refusal — a length, a pattern — keeps the framework's wording
         // and code.
         match refusal {
-            Refusal::Invalid(violations) => member_refusal(violations)
+            Refusal::Invalid(violations) => resource_arn_refusal(violations)
+                .or_else(|| member_refusal(violations))
                 .or_else(|| without_rejected_enum_values(violations)),
             // Authentication refusals, and any refusal kind added later, keep the
             // framework's wording.

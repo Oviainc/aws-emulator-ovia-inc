@@ -171,6 +171,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "UpdateApiKey is not available for this key version": a key id states the
+        // version of the key it names, so an id that states no version this operation
+        // serves names no key it can update — classified from the request, before the
+        // lookup, which would otherwise report such an id as merely absent (see
+        // `crate::state::is_updatable_api_key_version`).
+        if !crate::state::is_updatable_api_key_version(&input.id) {
+            return Err(UpdateApiKeyErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::UNSUPPORTED_API_KEY_VERSION_MESSAGE.to_string()),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // "From the update time, the time after which the API key expires": the window
         // the new expiration has to land in is measured from THIS call, and is judged
         // on the submitted instant, before it is floored. An `expires` the request did
@@ -205,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // does not hold is the not-found case, and nothing is written for it.
         let Some(stored) = api_keys.get_mut(&input.id) else {
             return Err(UpdateApiKeyErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::API_KEY_NOT_FOUND_MESSAGE.to_string()),
+                message: Some(crate::state::api_key_not_found_message(&input.id)),
             })
             .into());
         };

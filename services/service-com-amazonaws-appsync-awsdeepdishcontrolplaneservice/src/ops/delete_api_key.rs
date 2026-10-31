@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // took in the per-API quota is free again.
         if api_keys.remove(&input.id).is_none() {
             return Err(DeleteApiKeyErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::API_KEY_NOT_FOUND_MESSAGE.to_string()),
+                message: Some(crate::state::api_key_not_found_message(&input.id)),
             })
             .into());
         }
