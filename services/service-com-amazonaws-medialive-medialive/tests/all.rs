@@ -386,6 +386,9 @@ mod shared_alert_state_filter_rule;
 #[path = "all/shared_batch_outcome_rule.rs"]
 mod shared_batch_outcome_rule;
 
+#[path = "all/shared_idempotency_token_after_delete_rule.rs"]
+mod shared_idempotency_token_after_delete_rule;
+
 #[path = "all/shared_minted_token_spelling_rule.rs"]
 mod shared_minted_token_spelling_rule;
 

@@ -1129,10 +1129,12 @@ impl ComAmazonawsMedialiveMedialiveState {
             self.multiplex_tokens.forget(&id);
         }
 
-        // Every condition is observed BEFORE anything is written, because a
-        // condition reads the channel store as well as the multiplex it is
+        // Every ALERT condition is observed BEFORE any alert is written, because
+        // a condition reads the channel store as well as the multiplex it is
         // about: an alert on one multiplex can therefore not be raised out of a
-        // store another alert has already changed.
+        // store another alert has already changed. The token drops above are not
+        // among those conditions — no alert condition reads the token map — so
+        // they are settled with the states they belong to.
         //
         // Only a multiplex that is transmitting can have a condition hold, and
         // only one carrying a set alert can have one stop holding, so no other

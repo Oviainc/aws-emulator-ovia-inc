@@ -419,14 +419,21 @@ impl NodeRecord {
     /// Materialise the transition the clock has already made due: a node
     /// `DeleteNode` accepted into `DEREGISTERING` becomes the terminal
     /// `DEREGISTERED` once the span has passed.
-    fn settle(&mut self, now: SystemTime) {
+    ///
+    /// Answers whether THIS call is what settled the node into that terminal
+    /// state, which is what ends the idempotency window of the tokens that
+    /// created it
+    /// ([`ComAmazonawsMedialiveMedialiveState::settle_nodes`]).
+    fn settle(&mut self, now: SystemTime) -> bool {
         let Some(transition) = self.transition else {
-            return;
+            return false;
         };
-        if now >= transition.due {
-            self.state = transition.to.to_string();
-            self.transition = None;
+        if now < transition.due {
+            return false;
         }
+        self.state = transition.to.to_string();
+        self.transition = None;
+        self.is_deregistered()
     }
 }
 
@@ -444,8 +451,22 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// `now`. Called from [`ComAmazonawsMedialiveMedialiveState::settle`], which
     /// every operation runs first.
     pub(super) fn settle_nodes(&mut self, now: SystemTime) {
-        for node in self.nodes.values_mut() {
-            node.settle(now);
+        // Only a node that settles into the terminal `DEREGISTERED` on THIS call
+        // is collected, so the work here does not grow with the number of nodes
+        // that have already reached that state.
+        let mut just_deregistered: Vec<String> = Vec::new();
+        for (id, node) in &mut self.nodes {
+            if node.settle(now) {
+                just_deregistered.push(id.clone());
+            }
+        }
+        // A token never outlives the node it minted: once the node's
+        // deregistration has come due it is no longer a resource the cluster
+        // holds, so its idempotency window is over and a retried create mints a
+        // new node rather than answering with a deregistered one — the rule the
+        // cluster and channel placement group tokens of the same family follow.
+        for id in just_deregistered {
+            self.node_tokens.forget(&id);
         }
     }
 

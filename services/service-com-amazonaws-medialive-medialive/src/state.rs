@@ -1989,8 +1989,9 @@ pub struct SdiSourceRecord {
     /// the three states the model gives it (`smithy_query(query="shape",
     /// shape="SdiSourceState")`: IDLE | IN_USE | DELETED), and it is terminal,
     /// so the record stays readable in that state rather than vanishing. PRIVATE,
-    /// so the only way into it is [`delete_sdi_source`] and the only way to read
-    /// it is [`SdiSourceRecord::is_deleted`].
+    /// so the only way into it is
+    /// [`ComAmazonawsMedialiveMedialiveState::delete_sdi_source`] and the only way
+    /// to read it is [`SdiSourceRecord::is_deleted`].
     deleted: bool,
 }
 
@@ -2972,6 +2973,29 @@ impl ComAmazonawsMedialiveMedialiveState {
             tags: Some(source.tags.clone()),
             r#type: source.r#type.clone(),
         })
+    }
+
+    /// Delete the SdiSource `id` names and answer it as the delete left it, or
+    /// `None` when the store holds no source with that id.
+    ///
+    /// The source moves to the terminal `DELETED` state and STAYS in the
+    /// account, so `DescribeSdiSource` and `ListSdiSources` keep reporting it
+    /// there rather than losing it. Idempotent — deleting an already deleted
+    /// source changes nothing.
+    ///
+    /// A token never outlives the resource it minted: the source's idempotency
+    /// window is over the moment it reaches that terminal state, so the tokens
+    /// that created it are dropped here and a create retried with one of them
+    /// mints a new source instead of answering with the deleted one — the rule
+    /// the channel, input, network and cluster tokens follow when their own
+    /// deletes come due.
+    ///
+    /// The state write and the projection live together here, so the response
+    /// reports the source that was stored rather than one a handler assembled.
+    pub fn delete_sdi_source(&mut self, id: &str) -> Option<SdiSource> {
+        self.sdi_sources.get_mut(id)?.deleted = true;
+        self.sdi_source_tokens.forget(id);
+        self.sdi_source_description(id)
     }
 
     /// The `SdiSourceSummary` projection of one stored source. The summary shape
@@ -6484,14 +6508,6 @@ pub fn new_sdi_source(id: String, arn: String) -> SdiSourceRecord {
         tags: HashMap::new(),
         deleted: false,
     }
-}
-
-/// Delete an SdiSource: it moves to the terminal `DELETED` state and stays in
-/// the account, so `DescribeSdiSource` and `ListSdiSources` keep reporting it
-/// there rather than losing it. Idempotent — deleting an already deleted source
-/// changes nothing.
-pub fn delete_sdi_source(source: &mut SdiSourceRecord) {
-    source.deleted = true;
 }
 
 /// Build a new eventbridge rule template group record.

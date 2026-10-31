@@ -193,16 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in that state instead of losing it. A repeated delete is idempotent:
         // the state the caller asked for is already the stored one, and nothing
         // in the model or the contract says a second delete is refused.
-        let source = state
-            .sdi_sources
-            .get_mut(&input.sdi_source_id)
-            .ok_or_else(unavailable)?;
-        crate::state::delete_sdi_source(source);
-
-        // Read back out of the store, so the response reports the state that was
-        // written rather than one this handler assembled.
+        //
+        // The write, the idempotency tokens it ends the window of and the
+        // projection all live in the state slice, so this handler cannot write
+        // one of them and report past another; the response is read back out of
+        // the store rather than assembled here.
         let sdi_source = state
-            .sdi_source_description(&input.sdi_source_id)
+            .delete_sdi_source(&input.sdi_source_id)
             .ok_or_else(unavailable)?;
 
         Ok(DeleteSdiSourceOutput {
