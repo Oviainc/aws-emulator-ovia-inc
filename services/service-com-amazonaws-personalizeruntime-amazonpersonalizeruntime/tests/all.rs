@@ -27,6 +27,8 @@ mod filter_value_quoting;
 mod inference;
 #[path = "all/metadata_member_presence.rs"]
 mod metadata_member_presence;
+#[path = "all/no_inference_target_refusal.rs"]
+mod no_inference_target_refusal;
 #[path = "all/optional_input_refusal_order.rs"]
 mod optional_input_refusal_order;
 #[path = "all/promotion_share.rs"]

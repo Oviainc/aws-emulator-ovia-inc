@@ -389,6 +389,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The refusal this operation states for a request that names NO inference target.
+///
+/// `campaignArn` and `recommenderArn` are alternatives and neither is `@required`, so a
+/// request supplying neither reaches the handler and is refused here. The sentence is
+/// FIXED text end to end: it names the two members the caller could have supplied and
+/// substitutes nothing from the request or from state — which is what separates it from
+/// [`crate::state::Denied::unresolvable`]'s sentence, the refusal a request that DID name
+/// a target earns. Both carry the same code and status, so the message is the only
+/// observable a client can discriminate the two conditions on.
+const NO_INFERENCE_TARGET: &str = "campaignArn or recommenderArn required.";
+
+/// The refusal this operation states for a request that names BOTH alternatives.
+///
+/// The other condition the two ARN members settle on their own, and likewise fixed text
+/// end to end: the members are alternatives, so a request naming both identifies two
+/// things to recommend from and the service states that without echoing either ARN.
+const BOTH_INFERENCE_TARGETS: &str = "Cannot provide both a campaignArn and recommenderArn";
+
 /// What the request's `campaignArn` or `recommenderArn` resolved to.
 struct Resolved {
     /// The resolved ARN: the scope every score and the minted `recommendationId` are
@@ -422,10 +440,8 @@ fn resolve(
     recommender_arn: Option<&str>,
 ) -> Result<Resolved, GetRecommendationsError> {
     match (campaign_arn, recommender_arn) {
-        (Some(_), Some(_)) => Err(invalid(
-            "Provide either campaignArn or recommenderArn, not both.",
-        )),
-        (None, None) => Err(invalid("Either campaignArn or recommenderArn is required.")),
+        (Some(_), Some(_)) => Err(invalid(BOTH_INFERENCE_TARGETS)),
+        (None, None) => Err(invalid(NO_INFERENCE_TARGET)),
         (Some(arn), None) => {
             let campaign = state.campaign(arn).map_err(deny)?;
             if !campaign.recipe_type.served_by(operation) {
