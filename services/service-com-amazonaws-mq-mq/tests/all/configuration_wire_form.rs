@@ -17,9 +17,10 @@
 //! 3. A configuration always carries its `Tags` map, empty when it holds no tag.
 //! 4. An `UpdateConfiguration` makes the NEXT revision of the configuration, carrying
 //!    the `Description` the request supplied, and every later read reports that one.
-//! 5. A `ConfigurationId` that names no configuration — never minted, or deleted — is
-//!    refused with the modelled `NotFoundException`, whose sentence names the requested
-//!    id and whose `errorAttribute` names the input member at fault.
+//! 5. A `ConfigurationId` that names no configuration is refused: a READ of one —
+//!    never minted, or deleted — with the modelled `NotFoundException`, whose sentence
+//!    names the requested id and whose `errorAttribute` names the input member at
+//!    fault. (The write path tells the two apart: see `configuration_deleted_id`.)
 //! 6. `EngineVersion` defaults to the latest version Amazon MQ offers for the engine.
 //!
 //! The value catalogs the tables span are the model's own enumerations
@@ -171,7 +172,7 @@ impl Mq {
 /// An ActiveMQ `broker.xml` and a RabbitMQ Cuttlefish document, base64 as the `Data`
 /// member documents ("the base64-encoded XML configuration" / "base64-encoded
 /// Cuttlefish"). Encoded here rather than pasted so the rows carry real documents.
-fn base64_data(document: &str) -> String {
+pub(crate) fn base64_data(document: &str) -> String {
     aws_smithy_types::base64::encode(document)
 }
 
@@ -909,7 +910,7 @@ async fn the_revision_chain_bound_refuses_the_update_past_it() {
 }
 
 /// `ConfigurationId`s that name nothing, one per form a caller plausibly sends.
-const IDS_NAMING_NOTHING: &[&str] = &[
+pub(crate) const IDS_NAMING_NOTHING: &[&str] = &[
     "c-doesnotexist000000",
     "c-00000000-0000-0000-0000-000000000000",
     "c-",

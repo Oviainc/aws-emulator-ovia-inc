@@ -6,8 +6,9 @@
 //!
 //! The revision the call makes carries the `Description` the request supplied and the
 //! `Data` document it sent; a `ConfigurationId` that names no configuration is
-//! answered with the modelled `NotFoundException` (HTTP 404), and a `Data` that is not
-//! the base64 the member documents with `BadRequestException` (HTTP 400).
+//! answered with the modelled `NotFoundException` (HTTP 404), one this service issued
+//! and has since deleted with the modelled `ConflictException` (HTTP 409), and a `Data`
+//! that is not the base64 the member documents with `BadRequestException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -184,7 +185,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = service_state.lock();
+        // Which refusal a `ConfigurationId` this store holds no configuration
+        // under earns: an id this service ISSUED and has since deleted is a
+        // configuration whose state this revision cannot be added to, so the
+        // write loses the race with that state and is refused as a conflict
+        // (HTTP 409); only an id this service never issued is an unknown
+        // resource (HTTP 404). Read before the record lookup, which borrows the
+        // store for as long as the record it hands back is held.
+        let retired = store.is_configuration_retired(&input.configuration_id);
         let Some(configuration) = store.configurations.get_mut(&input.configuration_id) else {
+            if retired {
+                return Err(UpdateConfigurationErrorModeled::ConflictException(
+                    ConflictException {
+                        // No member of the request is at fault — the
+                        // configuration's deleted state is — so the refusal
+                        // names no input attribute, exactly as this service's
+                        // other state-rather-than-member refusals do.
+                        error_attribute: None,
+                        message: Some(state::configuration_revision_conflict_message(
+                            &input.configuration_id,
+                        )),
+                        resource_share_errors: None,
+                    },
+                )
+                .into());
+            }
             return Err(UpdateConfigurationErrorModeled::NotFoundException(
                 NotFoundException {
                     error_attribute: Some(state::CONFIGURATION_ID_ATTRIBUTE.to_string()),

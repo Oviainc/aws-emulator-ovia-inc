@@ -9,7 +9,7 @@
 //! model's documented value constraints — lives here rather than in a module
 //! `lib.rs` could not name.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 /// Region used for an ARN when the request carries no SigV4 credential scope to
@@ -136,6 +136,18 @@ pub const MAX_CONFIGURATIONS: usize = 50;
 /// bounds the record without refusing a revision a real rollout would ask for.
 /// An update past it is refused rather than stored.
 pub const MAX_CONFIGURATION_REVISIONS: usize = 1_000;
+
+/// How many retired `ConfigurationId`s one store remembers — the ids that were
+/// issued and have since been deleted, which a write is refused as a conflict
+/// with ([`ComAmazonawsMqMqState::retire_configuration`]).
+///
+/// A retired id costs only the id itself, but one is added per delete, so the
+/// emulator applies a RESOURCE bound of its own — not an AWS one — and remembers
+/// the most recently retired ids, dropping the oldest once the bound is reached.
+/// It is deliberately far above the number of configurations an account may hold
+/// at once ([`MAX_CONFIGURATIONS`]), so a workflow that recycles its
+/// configurations still finds every id it deleted remembered.
+pub const MAX_RETIRED_CONFIGURATIONS: usize = 1_000;
 
 /// The engine versions Amazon MQ offers for ActiveMQ, oldest first, so the last
 /// entry is the latest available one.
@@ -512,6 +524,16 @@ pub struct ComAmazonawsMqMqState {
     /// The mint sequence behind the next `ConfigurationId` — see
     /// [`Self::next_broker_sequence`].
     pub next_configuration_sequence: u64,
+    /// Every `ConfigurationId` this service issued and has since deleted, oldest
+    /// retirement first, bounded by [`MAX_RETIRED_CONFIGURATIONS`].
+    ///
+    /// A deleted configuration is gone as a RESOURCE — nothing reads back
+    /// through it — but the id it was issued under is not forgotten, so a write
+    /// against it can be told apart from a write against an id this service
+    /// never issued. The ids are held here rather than as deleted records in
+    /// [`Self::configurations`] so that every operation reading that map still
+    /// reports exactly the configurations that exist.
+    pub retired_configuration_ids: VecDeque<String>,
 }
 
 impl ComAmazonawsMqMqState {
@@ -561,10 +583,44 @@ impl ComAmazonawsMqMqState {
             let sequence = self.next_configuration_sequence;
             self.next_configuration_sequence = sequence.wrapping_add(1);
             let candidate = mint_resource_id("c", sequence, created, name);
-            if !self.configurations.contains_key(&candidate) {
+            // An id this store ever issued is never issued twice, so a retired
+            // one is as taken as a live one.
+            if !self.configurations.contains_key(&candidate)
+                && !self.is_configuration_retired(&candidate)
+            {
                 return candidate;
             }
         }
+    }
+
+    /// Whether `configuration_id` is an id this service issued and has since
+    /// deleted.
+    pub fn is_configuration_retired(&self, configuration_id: &str) -> bool {
+        self.retired_configuration_ids
+            .iter()
+            .any(|retired| retired == configuration_id)
+    }
+
+    /// Delete the configuration `configuration_id` names and retire the id,
+    /// reporting the record that was removed, or `None` when no configuration
+    /// is held under that id.
+    ///
+    /// Removing the record is what makes the configuration gone: every operation
+    /// that reads [`Self::configurations`] resolves that id to nothing
+    /// afterwards. Retiring the id is what keeps the store from forgetting that
+    /// it issued it, so a later write against it is answered as the conflict it
+    /// is rather than as an unknown resource. The oldest retirement is dropped
+    /// once [`MAX_RETIRED_CONFIGURATIONS`] are remembered.
+    pub fn retire_configuration(&mut self, configuration_id: &str) -> Option<ConfigurationRecord> {
+        let record = self.configurations.remove(configuration_id)?;
+        if !self.is_configuration_retired(configuration_id) {
+            self.retired_configuration_ids
+                .push_back(configuration_id.to_string());
+            while self.retired_configuration_ids.len() > MAX_RETIRED_CONFIGURATIONS {
+                self.retired_configuration_ids.pop_front();
+            }
+        }
+        Some(record)
     }
 
     /// Every configuration in a stable order — the ordering guarantee
@@ -835,6 +891,15 @@ pub const CONFIGURATION_ID_ATTRIBUTE: &str = "configuration-id";
 /// Shared for the same reason [`broker_not_found_message`] is.
 pub fn configuration_not_found_message(configuration_id: &str) -> String {
     format!("Configuration ID [{configuration_id}] can't be found. Make sure it exists.")
+}
+
+/// The sentence Amazon MQ answers a write that would make a new revision of a
+/// configuration whose id it issued and has since deleted with — the id it
+/// cannot revise is interpolated, and is the only part that varies.
+pub fn configuration_revision_conflict_message(configuration_id: &str) -> String {
+    format!(
+        "Concurrent update to Configuration [{configuration_id}]. Retry to create a new revision."
+    )
 }
 
 /// The input member a refusal names when the `ConfigurationRevision` of the

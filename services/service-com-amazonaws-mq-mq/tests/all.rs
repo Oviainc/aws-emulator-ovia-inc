@@ -17,6 +17,8 @@ mod bad_request_error_attribute;
 mod broker_instance_options;
 #[path = "all/broker_lifecycle.rs"]
 mod broker_lifecycle;
+#[path = "all/configuration_deleted_id.rs"]
+mod configuration_deleted_id;
 #[path = "all/configuration_lifecycle.rs"]
 mod configuration_lifecycle;
 #[path = "all/configuration_name.rs"]

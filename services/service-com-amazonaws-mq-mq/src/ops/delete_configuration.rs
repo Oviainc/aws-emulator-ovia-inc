@@ -8,6 +8,10 @@
 //! (HTTP 404) — which is also the answer for an id that named no configuration in the
 //! first place.
 //!
+//! The id a deleted configuration was issued under stays known to this service as one
+//! it issued, so a later write that would make a new revision of it is refused as a
+//! conflict with that deleted state rather than as an unknown resource.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -154,11 +158,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = service_state.lock();
-        // Removing the record is the whole operation: the configuration is gone
-        // from the store, so every later read of that id resolves to nothing. An
+        // Retiring the record is the whole operation: the configuration is gone
+        // from the store, so every later read of that id resolves to nothing,
+        // while the id itself stays known as one this service issued — which is
+        // what lets a later write against it be answered as a conflict with the
+        // configuration's deleted state rather than as an unknown resource. An
         // id that already named no configuration is refused rather than reported
         // as deleted, naming the member at fault and the id from the request.
-        if store.configurations.remove(&input.configuration_id).is_none() {
+        if store.retire_configuration(&input.configuration_id).is_none() {
             return Err(DeleteConfigurationErrorModeled::NotFoundException(
                 NotFoundException {
                     error_attribute: Some(state::CONFIGURATION_ID_ATTRIBUTE.to_string()),
