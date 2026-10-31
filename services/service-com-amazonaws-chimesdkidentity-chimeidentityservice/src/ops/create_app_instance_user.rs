@@ -226,6 +226,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A user carries a last-updated instant from the moment it is created.
             last_updated_timestamp: now,
             expiration_settings: input.expiration_settings,
+            // A freshly created user has registered no endpoints yet.
+            endpoints: ::std::collections::BTreeMap::new(),
         };
 
         match state.insert_user(record) {

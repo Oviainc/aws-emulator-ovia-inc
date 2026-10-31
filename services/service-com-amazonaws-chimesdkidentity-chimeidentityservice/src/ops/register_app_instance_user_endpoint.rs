@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterAppInstanceUserEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterAppInstanceUserEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterAppInstanceUserEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -175,20 +166,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterAppInstanceUserEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterAppInstanceUserEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterAppInstanceUserEndpointErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    code: Some("ServiceFailure".to_string()),
+                    message: Some("the AppInstance store is unavailable".to_string()),
+                },
+            )
+        })?;
+        // The whole register runs under ONE lock — the token lookup, the state the
+        // `ResourceArn` implies, and the insert — so two registers carrying the same
+        // token cannot each find no endpoint and then each mint one.
+        let mut state = state.lock();
+
+        let fingerprint = crate::state::endpoint_request_fingerprint(
+            &input.r#type,
+            &input.resource_arn,
+            &input.endpoint_attributes,
+            input.name.as_deref(),
+            input.allow_messages.as_deref(),
+        );
+
+        // Idempotency (`@idempotencyToken` on `ClientRequestToken`): a retry with the
+        // same token answers with the endpoint the first call registered and registers
+        // no second one. A token stands for one REQUEST, so the same token presented
+        // with different parameters is a mismatched reuse rather than a retry, and is
+        // refused with the modelled conflict instead of answering about an endpoint the
+        // caller did not ask for.
+        if let Some(registered) = state
+            .endpoint_registered_with(&input.app_instance_user_arn, &input.client_request_token)
+        {
+            if registered.request_fingerprint == fingerprint {
+                return Ok(RegisterAppInstanceUserEndpointOutput {
+                    app_instance_user_arn: Some(registered.app_instance_user_arn.clone()),
+                    endpoint_id: Some(registered.endpoint_id.clone()),
+                });
+            }
+            return Err(
+                RegisterAppInstanceUserEndpointErrorModeled::ConflictException(ConflictException {
+                    code: Some("Conflict".to_string()),
+                    message: Some(
+                        "The provided ClientRequestToken is already associated with an existing \
+                         resource."
+                            .to_string(),
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        // `EndpointState` is a read-only field: the service computes it, the caller never
+        // sends it. Every endpoint type delivers its push notification through the Amazon
+        // Pinpoint application the register's `ResourceArn` names, so the service
+        // resolves that application before it registers anything:
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterAppInstanceUserEndpoint"))
+        // * an ARN in Pinpoint's own `apps` space that names no application Pinpoint
+        //   could have minted resolves to no application this caller may push through,
+        //   which is a permanent, caller-side refusal rather than a registered endpoint;
+        // * an ARN that is no Pinpoint application ARN at all is registered, but with
+        //   nothing behind it to deliver through, so it is INACTIVE carrying the reason
+        //   the model declares for exactly that input;
+        // * an ARN that resolves registers an ACTIVE endpoint, which has no reason to
+        //   report.
+        let endpoint_state = match crate::state::pinpoint_application_of(&input.resource_arn) {
+            crate::state::PinpointApplication::Resolved => EndpointState {
+                status: "ACTIVE".to_string(),
+                status_reason: None,
+            },
+            crate::state::PinpointApplication::NotAPinpointApplication => EndpointState {
+                status: "INACTIVE".to_string(),
+                status_reason: Some("INVALID_PINPOINT_ARN".to_string()),
+            },
+            crate::state::PinpointApplication::Unresolvable => {
+                return Err(
+                    RegisterAppInstanceUserEndpointErrorModeled::ForbiddenException(
+                        ForbiddenException {
+                            code: Some("Forbidden".to_string()),
+                            message: Some(
+                                "You are not authorized to perform this action.".to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let endpoint_id = crate::state::new_endpoint_id();
+        let record = crate::state::AppInstanceUserEndpointRecord {
+            endpoint_id: endpoint_id.clone(),
+            app_instance_user_arn: input.app_instance_user_arn.clone(),
+            name: input.name,
+            r#type: input.r#type,
+            resource_arn: input.resource_arn,
+            endpoint_attributes: input.endpoint_attributes,
+            created_timestamp: now,
+            // An endpoint carries a last-updated instant from the moment it is
+            // registered; every operation that changes it re-stamps that instant.
+            last_updated_timestamp: now,
+            allow_messages: input.allow_messages,
+            endpoint_state,
+            client_request_token: input.client_request_token,
+            request_fingerprint: fingerprint,
+        };
+
+        // An endpoint exists only under an `AppInstanceUser`, and the store is bounded —
+        // `insert_endpoint` does the ONE parent lookup and reports which of the modelled
+        // refusals applies. In either refusal nothing is written.
+        match state.insert_endpoint(record) {
+            crate::state::InsertEndpoint::Stored => {}
+            // This operation models no 404 shape, so an unknown user is refused with
+            // the modelled `BadRequestException` carrying the `NotFound` error code.
+            crate::state::InsertEndpoint::NoSuchAppInstanceUser => {
+                return Err(
+                    RegisterAppInstanceUserEndpointErrorModeled::BadRequestException(
+                        BadRequestException {
+                            code: Some("NotFound".to_string()),
+                            message: Some(format!(
+                                "AppInstanceUser {} does not exist",
+                                input.app_instance_user_arn
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::InsertEndpoint::AtCapacity => {
+                return Err(
+                    RegisterAppInstanceUserEndpointErrorModeled::ResourceLimitExceededException(
+                        ResourceLimitExceededException {
+                            code: Some("ResourceLimitExceeded".to_string()),
+                            message: Some(format!(
+                                "AppInstanceUser {} already holds the maximum of {} \
+                                 AppInstanceUserEndpoints",
+                                input.app_instance_user_arn,
+                                crate::state::MAX_APP_INSTANCE_USER_ENDPOINTS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        Ok(RegisterAppInstanceUserEndpointOutput {
+            app_instance_user_arn: Some(input.app_instance_user_arn),
+            endpoint_id: Some(endpoint_id),
+        })
     }
 }

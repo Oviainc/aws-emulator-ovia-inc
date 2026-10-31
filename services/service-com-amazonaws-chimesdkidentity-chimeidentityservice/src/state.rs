@@ -14,6 +14,13 @@
 //! * `idempotency` — a create operation's `ClientRequestToken` to the ARN that token
 //!   already minted, so repeating one token never mints a second resource.
 //!
+//! An `AppInstanceUserEndpoint` is not addressed by an ARN of its own — every operation
+//! on one names its owning user's ARN plus an `EndpointId` — so an endpoint is held in
+//! its user's own `endpoints` map rather than in an index beside the two above, and the
+//! deletion of a user (or of the instance that cascades to it) takes its endpoints with
+//! it. For the same reason the register token that minted an endpoint lives ON the
+//! endpoint record rather than in `idempotency`, which maps a token to an ARN.
+//!
 //! `BTreeMap` (not `HashMap`) everywhere: list operations page in key order, so the
 //! iteration order has to be stable for a `NextToken` to be resumable.
 //!
@@ -27,7 +34,7 @@ use std::hash::BuildHasher as _;
 use std::ops::Bound;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{Configuration, ExpirationSettings};
+use crate::ops::types::{Configuration, EndpointAttributes, EndpointState, ExpirationSettings};
 
 /// The region used for a minted ARN when the request carries no SigV4 credential
 /// scope to read one from (an unsigned or presigned request).
@@ -64,6 +71,12 @@ pub const MAX_APP_INSTANCE_USERS: usize = 500;
 /// why the store is bounded at all.
 pub const MAX_APP_INSTANCE_BOTS: usize = 100;
 
+/// How many `AppInstanceUserEndpoint`s one `AppInstanceUser` holds; see
+/// [`MAX_APP_INSTANCES`] for why the store is bounded at all. A register past the bound
+/// is refused with the modelled `ResourceLimitExceededException`, which
+/// `RegisterAppInstanceUserEndpoint` declares.
+pub const MAX_APP_INSTANCE_USER_ENDPOINTS: usize = 100;
+
 /// The ceiling on
 /// [`idempotency`](ComAmazonawsChimesdkidentityChimeidentityserviceState::idempotency).
 ///
@@ -91,6 +104,45 @@ pub struct AppInstanceUserRecord {
     /// an [`AppInstanceRecord`], whose stamp appears only on a real update.
     pub last_updated_timestamp: SystemTime,
     pub expiration_settings: Option<ExpirationSettings>,
+    /// This user's endpoints, keyed by `EndpointId`.
+    pub endpoints: BTreeMap<String, AppInstanceUserEndpointRecord>,
+}
+
+/// A persisted `AppInstanceUserEndpoint`: a device registered under an
+/// `AppInstanceUser` that receives that user's messages.
+#[derive(Debug, Clone)]
+pub struct AppInstanceUserEndpointRecord {
+    /// The minted `EndpointId`, which is also this record's key in its user's map.
+    pub endpoint_id: String,
+    pub app_instance_user_arn: String,
+    /// `Name` is optional on a register, so an endpoint may carry none.
+    pub name: Option<String>,
+    /// `AppInstanceUserEndpointType` — one of `APNS`, `APNS_SANDBOX`, `GCM`.
+    pub r#type: String,
+    /// The ARN of the resource the endpoint belongs to, which for every endpoint type
+    /// is the Amazon Pinpoint application that delivers the push notification.
+    pub resource_arn: String,
+    pub endpoint_attributes: EndpointAttributes,
+    pub created_timestamp: SystemTime,
+    /// When this endpoint was last written: stamped when it is registered and
+    /// re-stamped by every operation that changes it, like an
+    /// [`AppInstanceUserRecord`]'s.
+    pub last_updated_timestamp: SystemTime,
+    /// `AllowMessages` as the caller set it, or `None` while no call has: the model
+    /// declares no default for the member, so an endpoint nobody opted in or out
+    /// reports none.
+    pub allow_messages: Option<String>,
+    /// The read-only state the service computed for this endpoint.
+    pub endpoint_state: EndpointState,
+    /// The `ClientRequestToken` whose register minted this endpoint, so a repeat of
+    /// that token replays this endpoint instead of minting a second one. It is released
+    /// with the record, so a deregistered endpoint's token is free again.
+    pub client_request_token: String,
+    /// The fingerprint of the register request that minted this endpoint, so a token
+    /// presented again with DIFFERENT parameters is told apart from a retry. Written
+    /// once at register and never re-stamped: a later update changes the endpoint, not
+    /// the request this token stands for.
+    pub request_fingerprint: String,
 }
 
 /// A persisted `AppInstanceBot`: an Amazon Lex V2 chat bot created under an
@@ -149,6 +201,19 @@ pub enum InsertUser {
     AtCapacity,
 }
 
+/// What [`ComAmazonawsChimesdkidentityChimeidentityserviceState::insert_endpoint`] did,
+/// so the handler maps each outcome to the error the model declares for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertEndpoint {
+    /// The endpoint was stored under its owning user.
+    Stored,
+    /// The named `AppInstanceUserArn` does not exist; nothing was written.
+    NoSuchAppInstanceUser,
+    /// The user already holds [`MAX_APP_INSTANCE_USER_ENDPOINTS`] endpoints; nothing
+    /// was written.
+    AtCapacity,
+}
+
 /// What [`ComAmazonawsChimesdkidentityChimeidentityserviceState::insert_bot`] did, so
 /// the handler maps each outcome to the error the model declares for it. The variants
 /// mirror [`InsertUser`]'s, minus the already-exists case: a bot ARN carries a freshly
@@ -191,6 +256,69 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
             .get_mut(&instance_arn)?
             .users
             .get_mut(user_arn)
+    }
+
+    /// The endpoint `endpoint_id` names under the user `user_arn` names.
+    pub fn endpoint(
+        &self,
+        user_arn: &str,
+        endpoint_id: &str,
+    ) -> Option<&AppInstanceUserEndpointRecord> {
+        self.user(user_arn)?.endpoints.get(endpoint_id)
+    }
+
+    /// The endpoint a previous register under `user_arn` already minted for `token`.
+    ///
+    /// The token lives on the record it minted, so a token whose endpoint has since
+    /// been deregistered resolves to nothing here and is free to mint another.
+    pub fn endpoint_registered_with(
+        &self,
+        user_arn: &str,
+        token: &str,
+    ) -> Option<&AppInstanceUserEndpointRecord> {
+        self.user(user_arn)?
+            .endpoints
+            .values()
+            .find(|endpoint| endpoint.client_request_token == token)
+    }
+
+    /// The endpoint `endpoint_id` names under the user `user_arn` names, for a caller
+    /// that is about to CHANGE it.
+    pub fn endpoint_mut(
+        &mut self,
+        user_arn: &str,
+        endpoint_id: &str,
+    ) -> Option<&mut AppInstanceUserEndpointRecord> {
+        self.user_mut(user_arn)?.endpoints.get_mut(endpoint_id)
+    }
+
+    /// Remove an endpoint from the user it belongs to.
+    ///
+    /// The register token that minted it lives on the record, so it goes with the
+    /// endpoint and is free to mint another.
+    pub fn remove_endpoint(
+        &mut self,
+        user_arn: &str,
+        endpoint_id: &str,
+    ) -> Option<AppInstanceUserEndpointRecord> {
+        self.user_mut(user_arn)?.endpoints.remove(endpoint_id)
+    }
+
+    /// Store an endpoint under the user it belongs to.
+    ///
+    /// The user lookup here is the ONLY one a caller needs: an absent user is reported
+    /// as [`InsertEndpoint::NoSuchAppInstanceUser`] and a full one as
+    /// [`InsertEndpoint::AtCapacity`], and in neither case is anything written.
+    pub fn insert_endpoint(&mut self, record: AppInstanceUserEndpointRecord) -> InsertEndpoint {
+        let user_arn = record.app_instance_user_arn.clone();
+        let Some(user) = self.user_mut(&user_arn) else {
+            return InsertEndpoint::NoSuchAppInstanceUser;
+        };
+        if user.endpoints.len() >= MAX_APP_INSTANCE_USER_ENDPOINTS {
+            return InsertEndpoint::AtCapacity;
+        }
+        user.endpoints.insert(record.endpoint_id.clone(), record);
+        InsertEndpoint::Stored
     }
 
     /// The bot with this ARN, resolved through the `bots_by_arn` index in one hop.
@@ -506,6 +634,108 @@ pub fn app_instance_user_arn(app_instance_arn: &str, app_instance_user_id: &str)
 /// from the request.
 pub fn new_app_instance_bot_arn(app_instance_arn: &str) -> String {
     format!("{app_instance_arn}/bot/{}", new_uuid_v4())
+}
+
+/// A fresh `EndpointId` for an `AppInstanceUserEndpoint`.
+///
+/// An endpoint carries no ARN and no caller-chosen id, so its id is a freshly minted
+/// uuid — the same source as an `AppInstanceArn`'s — which fits the modelled
+/// `String64`.
+pub fn new_endpoint_id() -> String {
+    new_uuid_v4()
+}
+
+/// What the `ResourceArn` of an `AppInstanceUserEndpoint` has to name: an Amazon
+/// Pinpoint application, the resource that delivers the push notification for every
+/// endpoint type (`RegisterAppInstanceUserEndpoint$Type` documents `ResourceArn` as the
+/// Pinpoint app ARN for APNS, APNS_SANDBOX and GCM alike). Pinpoint publishes
+/// `mobiletargeting` as its ARN namespace and writes an application as
+/// `apps/<application-id>`.
+const PINPOINT_APPLICATION: ::service_common::arn::Requirement =
+    ::service_common::arn::Requirement {
+        vendor: "mobiletargeting",
+        resource_type: Some("apps"),
+        label: "an Amazon Pinpoint application",
+    };
+
+/// The length of an Amazon Pinpoint application id: Pinpoint mints a project id as 32
+/// hexadecimal characters, which is the `apps/<application-id>` segment of its ARN.
+const PINPOINT_APPLICATION_ID_LENGTH: usize = 32;
+
+/// What the `ResourceArn` of an `AppInstanceUserEndpoint` resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinpointApplication {
+    /// The ARN names an application Pinpoint could have minted.
+    Resolved,
+    /// The ARN is in Pinpoint's namespace and names an application, but no application
+    /// Pinpoint mints: there is nothing for it to resolve to.
+    Unresolvable,
+    /// The ARN is not a Pinpoint application ARN at all, so there is no Pinpoint
+    /// application to resolve — an endpoint registered against it can never deliver.
+    NotAPinpointApplication,
+}
+
+/// What `resource_arn` resolves to, read against the one ARN parse in
+/// [`::service_common::arn`].
+///
+/// A value that is not an ARN, one of another vendor and one of another Pinpoint
+/// resource type name no Pinpoint application at all; one in the `apps` space whose id
+/// is not an id Pinpoint mints ([`names_pinpoint_application_id`]) names an application
+/// that cannot exist.
+pub fn pinpoint_application_of(resource_arn: &str) -> PinpointApplication {
+    if !PINPOINT_APPLICATION.admits(resource_arn) {
+        return PinpointApplication::NotAPinpointApplication;
+    }
+    match ::service_common::arn::resource_id_of_type(resource_arn, "apps") {
+        Some(application_id) if names_pinpoint_application_id(application_id) => {
+            PinpointApplication::Resolved
+        }
+        // `apps` with no id at all (`apps`, no separator) names no application either.
+        _ => PinpointApplication::Unresolvable,
+    }
+}
+
+/// Whether `application_id` is an id Pinpoint mints for an application: exactly
+/// [`PINPOINT_APPLICATION_ID_LENGTH`] hexadecimal characters.
+fn names_pinpoint_application_id(application_id: &str) -> bool {
+    application_id.len() == PINPOINT_APPLICATION_ID_LENGTH
+        && application_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The fingerprint of the register request an endpoint was minted by.
+///
+/// A `ClientRequestToken` stands for ONE request, so a token presented again has to be
+/// compared against the request it first carried. Every member the register call
+/// persists goes into a sha256 over LENGTH-PREFIXED fields, so no value containing a
+/// separator can impersonate a different split of the same bytes, and an absent
+/// optional member is distinct from an empty one.
+pub fn endpoint_request_fingerprint(
+    endpoint_type: &str,
+    resource_arn: &str,
+    attributes: &EndpointAttributes,
+    name: Option<&str>,
+    allow_messages: Option<&str>,
+) -> String {
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    let mut field = |value: Option<&str>| match value {
+        Some(value) => {
+            hasher.update(b"s");
+            hasher.update(value.len().to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        None => hasher.update(b"n"),
+    };
+    field(Some(endpoint_type));
+    field(Some(resource_arn));
+    field(Some(attributes.device_token.as_str()));
+    field(attributes.voip_device_token.as_deref());
+    field(name);
+    field(allow_messages);
+    ::hex::encode(hasher.finalize())
 }
 
 /// A stored instant as the wire timestamp the model declares (`Timestamp`).
