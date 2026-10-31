@@ -242,7 +242,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The maximum this resource's own `Tags` doc states — "You can associate as many as
-        // 50 tags with an SLO" — which the modelled `TagList` bound is wider than.
+        // 50 tags with an SLO" — which the modelled `TagList` bound is wider than. The bound
+        // is on the tag SET the created resource will carry, counted over distinct keys by the
+        // one rule every tag attachment in this service is held to, so a list this create
+        // admits is a list a later `TagResource` of it admits too.
         if let Some(message) = crate::state::tag_count_refusal(input.tags.as_deref()) {
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }

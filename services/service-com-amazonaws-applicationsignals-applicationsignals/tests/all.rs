@@ -137,6 +137,8 @@ mod state_roundtrip;
 mod stated_instant_rendering;
 #[path = "all/tag_attachment.rs"]
 mod tag_attachment;
+#[path = "all/tag_count_rule.rs"]
+mod tag_count_rule;
 #[path = "all/tagged_arn_identity.rs"]
 mod tagged_arn_identity;
 #[path = "all/time_ranged_reads.rs"]

@@ -440,20 +440,9 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     }
 
     /// How many tags the resource stored under `arn` would carry once `tags` were attached by
-    /// [`Self::put_tags`].
-    ///
-    /// Counted over the UNION of the stored keys and the request's, because attaching is per
-    /// key: a request that only re-values keys the resource already carries adds nothing to
-    /// the count, and a key repeated in the request counts once.
+    /// [`Self::put_tags`]: [`tag_count_after_attach`] over that resource's stored set.
     pub fn tag_count_after_put(&self, arn: &str, tags: &[Tag]) -> usize {
-        let stored = self.tags.get(arn);
-        let added = tags
-            .iter()
-            .filter(|tag| stored.is_none_or(|stored| !stored.contains_key(&tag.key)))
-            .map(|tag| tag.key.as_str())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        stored.map_or(0, BTreeMap::len) + added
+        tag_count_after_attach(self.tags.get(arn), tags)
     }
 
     /// Detach `keys` from the tag set of the resource stored under `arn`, leaving every
@@ -964,7 +953,8 @@ pub fn validation_envelope(clauses: &[String]) -> String {
 }
 
 /// The refusal for a request that attaches more tags to one resource than that resource's
-/// API documents, or `None` when the list is within [`MAX_TAGS_PER_RESOURCE`].
+/// API documents, or `None` when the tag set the new resource will carry is within
+/// [`MAX_TAGS_PER_RESOURCE`].
 ///
 /// One helper for every CREATE that attaches a `TagList` to a resource with a documented tag
 /// maximum, so the bound one create enforces is the bound they all enforce. Worded through
@@ -972,12 +962,21 @@ pub fn validation_envelope(clauses: &[String]) -> String {
 /// create that is what this is: a maximum on the member's length that the model states too
 /// wide to enforce, checked against the whole tag set the new resource will carry.
 ///
+/// That SET is what is counted, through the one counting rule every tag attachment in this
+/// service is held to (`tag_count_after_attach`) — a create starts from no tags, so the
+/// count is the number of DISTINCT keys the request names. A key named twice in one request
+/// is one stored tag
+/// ([`ComAmazonawsApplicationsignalsApplicationsignalsState::put_tags`]), so counting the
+/// member's entries instead would
+/// refuse a request whose resulting set is within the maximum, and refuse it where an
+/// attachment of the same list to the same resource is admitted.
+///
 /// An operation that attaches tags to an EXISTING resource ends up over the maximum through
 /// the tags the resource already carries as much as through the ones the request names, so the
 /// count there is a property of the resource rather than the length of a member — see
 /// [`tag_quota_message`].
 pub fn tag_count_refusal(tags: Option<&[Tag]>) -> Option<String> {
-    let count = tags.map_or(0, <[Tag]>::len);
+    let count = tags.map_or(0, |tags| tag_count_after_attach(None, tags));
     (count > MAX_TAGS_PER_RESOURCE).then(|| {
         validation_envelope(&[constraint_clause(
             "tags",
@@ -986,6 +985,26 @@ pub fn tag_count_refusal(tags: Option<&[Tag]>) -> Option<String> {
             ),
         )])
     })
+}
+
+/// How many tags a resource whose stored tag set is `stored` would carry once `tags` were
+/// attached to it by [`ComAmazonawsApplicationsignalsApplicationsignalsState::put_tags`].
+///
+/// The ONE counting rule every tag maximum in this service is enforced with, so a create and
+/// a later attachment of one list to one resource cannot disagree about how many tags that
+/// list leaves the resource carrying. A stored tag set is a map from key to value, so the
+/// count is over the UNION of the stored keys and the request's KEYS: a request that only
+/// re-values keys the resource already carries adds nothing to the count, and a key named more
+/// than once in one request counts once, because it is one stored tag. `None` is the set of a
+/// resource carrying no tags — what a create starts from.
+fn tag_count_after_attach(stored: Option<&BTreeMap<String, String>>, tags: &[Tag]) -> usize {
+    let added = tags
+        .iter()
+        .filter(|tag| stored.is_none_or(|stored| !stored.contains_key(&tag.key)))
+        .map(|tag| tag.key.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    stored.map_or(0, BTreeMap::len) + added
 }
 
 /// The most tags the resource an ARN addresses may carry: the maximum that resource's own API
