@@ -92,6 +92,9 @@ mod error_message_bounds;
 #[path = "all/execute_query.rs"]
 mod execute_query;
 
+#[path = "all/execute_query_composite_components.rs"]
+mod execute_query_composite_components;
+
 #[path = "all/execute_query_hierarchy.rs"]
 mod execute_query_hierarchy;
 

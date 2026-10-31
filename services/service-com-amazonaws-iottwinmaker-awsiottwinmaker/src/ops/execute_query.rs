@@ -24,15 +24,18 @@
 //! The graph:
 //!
 //! * a NODE is a stored entity of the workspace, labelled with the `componentTypeId` of
-//!   each of its components, so `(e:com.example.type)` selects the entities carrying a
-//!   component of that type;
+//!   each of its components — its top-level components and the composite components held
+//!   inside them alike, a composite component being a component of the entity too — so
+//!   `(e:com.example.type)` selects the entities carrying a component of that type at any
+//!   path;
 //! * an EDGE is a stored relationship between two entities of the workspace, of EITHER
 //!   kind this service stores one:
 //!   * the entity HIERARCHY, which an entity's stored parent records: an edge from the
 //!     child to its parent, labelled [`HIERARCHY_RELATIONSHIP_NAME`], so a hierarchy hop
 //!     matches without the caller having modelled the hierarchy as a property;
-//!   * a component property whose value carries a `relationshipValue` naming a target
-//!     entity of the same workspace, labelled with the property's name.
+//!   * a property of ANY of the entity's components, at any path, whose value carries a
+//!     `relationshipValue` naming a target entity of the same workspace, labelled with
+//!     the property's name.
 //!
 //!   The label is what `-[:isLocationOf]->` matches on, and a relationship whose other
 //!   end is not an entity of this workspace (a target outside it, or the root sentinel a
@@ -1407,7 +1410,9 @@ struct GraphEdge<'a> {
     /// the property holding it, or [`HIERARCHY_RELATIONSHIP_NAME`] for the hierarchy.
     relationship_name: &'a str,
     /// The component holding the relationship, and `None` for the hierarchy, which is
-    /// held between the entities themselves rather than on a component of either.
+    /// held between the entities themselves rather than on a component of either. A
+    /// composite component is named by its own name, the last segment of its path, the
+    /// way `GetEntity` keys it.
     component_name: Option<&'a str>,
     target_component_name: Option<&'a str>,
 }
@@ -1420,7 +1425,8 @@ struct Graph<'a> {
     /// them in), so a row set (and therefore a page boundary) is the same for the same
     /// state.
     entities: Vec<&'a crate::state::Entity>,
-    /// Each entity's node labels: the `componentTypeId` of each of its components.
+    /// Each entity's node labels: the `componentTypeId` of each of its components, at
+    /// every path the entity holds one at.
     labels: Vec<BTreeSet<&'a str>>,
     edges: Vec<GraphEdge<'a>>,
     /// Edge indices by source entity, and by target entity.
@@ -1438,13 +1444,19 @@ impl<'a> Graph<'a> {
             .enumerate()
             .map(|(index, entity)| (entity.entity_id.as_str(), index))
             .collect();
+        // Every component the entity holds, walked through the one scan every
+        // component-scoped reader of this crate shares
+        // ([`crate::state::Entity::components_at_every_path`]): a composite component is a
+        // component of the entity too, with a `componentTypeId` and properties of its
+        // own, so the type it instantiates labels the node just as a top-level
+        // component's does.
         let labels: Vec<BTreeSet<&str>> = entities
             .iter()
+            .copied()
             .map(|entity| {
                 entity
-                    .components
-                    .values()
-                    .filter_map(|component| component.component_type_id.as_deref())
+                    .components_at_every_path()
+                    .filter_map(|component| component.component_type_id())
                     .collect()
             })
             .collect();
@@ -1452,7 +1464,7 @@ impl<'a> Graph<'a> {
         let mut edges = Vec::new();
         let mut outgoing = vec![Vec::new(); entities.len()];
         let mut incoming = vec![Vec::new(); entities.len()];
-        for (source, entity) in entities.iter().enumerate() {
+        for (source, entity) in entities.iter().copied().enumerate() {
             // The hierarchy relationship, from the child to the parent entity it is
             // stored under. An entity at the top of the hierarchy names the root
             // sentinel rather than an entity, so it has no such edge — the same rule as
@@ -1469,8 +1481,8 @@ impl<'a> Graph<'a> {
                 outgoing[source].push(index);
                 incoming[parent].push(index);
             }
-            for component in entity.components.values() {
-                for (property_name, property) in &component.properties {
+            for component in entity.components_at_every_path() {
+                for (property_name, property) in component.properties() {
                     let Some(relationship) = property
                         .value
                         .as_ref()
@@ -1492,7 +1504,7 @@ impl<'a> Graph<'a> {
                         source,
                         target,
                         relationship_name: property_name.as_str(),
-                        component_name: Some(component.component_name.as_str()),
+                        component_name: Some(component.component_name()),
                         target_component_name: relationship.target_component_name.as_deref(),
                     });
                     outgoing[source].push(index);
@@ -1597,31 +1609,35 @@ fn node_member(entity: &crate::state::Entity, field: &str) -> Option<Document> {
     }
 }
 
-/// The entity's stored components, each with the properties stored on it.
+/// The entity's stored components, each with the properties stored on it: every
+/// component the entity holds, at every path it holds one at, so a composite component is
+/// reported as the component of the entity it is. A composite component carries the
+/// `componentPath` it is addressed by, the member this service reports one by
+/// (`ComponentSummary::componentPath`), which a top-level component — addressed by name
+/// alone — does not have.
 fn components_document(entity: &crate::state::Entity) -> Document {
     Document::Array(
         entity
-            .components
-            .values()
+            .components_at_every_path()
             .map(|component| {
                 let mut members = HashMap::from([(
                     "componentName".to_string(),
-                    text(&component.component_name),
+                    text(component.component_name()),
                 )]);
-                if let Some(component_type_id) = &component.component_type_id {
-                    members.insert(
-                        "componentTypeId".to_string(),
-                        text(component_type_id),
-                    );
+                if let Some(component_type_id) = component.component_type_id() {
+                    members.insert("componentTypeId".to_string(), text(component_type_id));
                 }
-                if let Some(description) = &component.description {
+                if let Some(component_path) = component.component_path() {
+                    members.insert("componentPath".to_string(), text(component_path));
+                }
+                if let Some(description) = component.description() {
                     members.insert("description".to_string(), text(description));
                 }
                 members.insert(
                     "properties".to_string(),
                     Document::Array(
                         component
-                            .properties
+                            .properties()
                             .iter()
                             .map(|(property_name, property)| {
                                 let mut property_members = HashMap::from([(

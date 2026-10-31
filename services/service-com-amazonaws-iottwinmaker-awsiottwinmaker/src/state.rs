@@ -3901,9 +3901,11 @@ pub fn stored_composite_component_path(
 ///
 /// The two are kept apart rather than reduced on the spot, because a caller
 /// reports them differently — a composite component is named by its own
-/// `ComponentPath` — while every caller needs the same two things out of the
-/// resolution, which [`component_type_id`](Self::component_type_id) and
-/// [`properties`](Self::properties) answer.
+/// `ComponentPath` — while every caller needs the same few things out of the
+/// resolution, which [`component_type_id`](Self::component_type_id),
+/// [`properties`](Self::properties), [`component_name`](Self::component_name),
+/// [`component_path`](Self::component_path) and
+/// [`description`](Self::description) answer.
 #[derive(Debug, Clone, Copy)]
 pub enum ComponentAtPath<'a> {
     /// The path named one of the entity's top-level components: it had a single
@@ -3940,6 +3942,35 @@ impl<'a> ComponentAtPath<'a> {
         match self {
             Self::TopLevel(component) => &component.properties,
             Self::Composite { composite, .. } => &composite.properties,
+        }
+    }
+
+    /// The component's own name: a top-level component's name, or — for a
+    /// composite component — the LAST segment of its path, which is the name
+    /// `GetEntity` keys it under.
+    pub fn component_name(&self) -> &'a str {
+        match self {
+            Self::TopLevel(component) => &component.component_name,
+            Self::Composite { composite, .. } => &composite.component_name,
+        }
+    }
+
+    /// The whole `ComponentPath` this component is addressed by, for a COMPOSITE
+    /// component; `None` for a top-level one, which is addressed by its name
+    /// alone. This is the same split `ComponentSummary` reports, where only a
+    /// composite component carries a `componentPath`.
+    pub fn component_path(&self) -> Option<&'a str> {
+        match self {
+            Self::TopLevel(_) => None,
+            Self::Composite { composite, .. } => Some(&composite.component_path),
+        }
+    }
+
+    /// The description stored on the component, absent when it carries none.
+    pub fn description(&self) -> Option<&'a str> {
+        match self {
+            Self::TopLevel(component) => component.description.as_deref(),
+            Self::Composite { composite, .. } => composite.description.as_deref(),
         }
     }
 }
