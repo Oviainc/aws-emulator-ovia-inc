@@ -16,9 +16,13 @@
 //! `ListPrivateGraphEndpoints`), and, per listing, the FORM of the unissued token — not
 //! hex at all, hex of a position in each other id space of the service, hex of a value
 //! carrying this listing's own prefix but outside its pattern, hex of a value in no id
-//! space, and a token three thousand characters long. Each listing is also asked with a
-//! token it DID issue, so the refusals are about the token rather than about pagination
-//! being refused outright.
+//! space, a bare position in this listing's own id space carrying no listing, and a
+//! token three thousand characters long. Each listing is also asked with a token it DID
+//! issue, so the refusals are about the token rather than about pagination being refused
+//! outright.
+//!
+//! Which listing a token belongs to is `tests/all/page_token_listing_scope.rs`'s rule;
+//! here it is only how a token this listing never issued is REPORTED.
 
 use std::sync::Arc;
 
@@ -115,6 +119,13 @@ struct Listing {
     prefixed_but_invalid: &'static str,
 }
 
+/// The token this service issues for `position` in the listing `operation` pages: the
+/// listing that minted it and the position it reached, hex-encoded, which is what binds
+/// a token to one listing's order.
+fn issued_token(operation: &str, position: &str) -> String {
+    hex::encode(format!("{operation}:{position}"))
+}
+
 /// Create one graph and return its id, so the endpoint listing has a graph to be a
 /// listing OF — its token gate runs ahead of that lookup, which the refusal rows below
 /// do not depend on, but the accepted row does.
@@ -193,6 +204,15 @@ async fn every_listing_refuses_an_unissued_token_with_the_modelled_validation_ex
             // Three thousand characters, well inside `PaginationToken`'s 1..8192, so
             // the refusal is not about the length of the value.
             hex::encode("z".repeat(1500)),
+            // A bare position in this listing's own id space, naming no listing at all:
+            // not a value this service ever handed out.
+            hex::encode(
+                ID_SPACES
+                    .iter()
+                    .find(|(space, _)| *space == listing.space)
+                    .map(|(_, position)| *position)
+                    .unwrap_or_default(),
+            ),
         ];
         // Every OTHER id space of the service: one listing's token never pages another's.
         tokens.extend(
@@ -241,7 +261,7 @@ async fn every_listing_refuses_an_unissued_token_with_the_modelled_validation_ex
             .find(|(space, _)| *space == listing.space)
             .map(|(_, position)| *position)
             .unwrap_or_else(|| panic!("case {operation}: no id space named {}", listing.space));
-        let token = hex::encode(own);
+        let token = issued_token(operation, own);
         let case = format!("{operation} with issued token {token:?}");
         let path = format!("{}?nextToken={token}", listing.path);
         let (status, answer) = call(&router, "GET", &path, None).await;

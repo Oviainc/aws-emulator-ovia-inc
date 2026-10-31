@@ -606,12 +606,14 @@ async fn list_import_tasks_pages_over_every_task_without_repeats() {
         );
     }
 
-    // A token that names a position in the task-id space resumes from that position,
-    // even though no task was ever minted with that id: a page resumes after a
-    // POSITION, so a row that leaves the store between two pages cannot hide the rows
-    // that follow it.
+    // A token OF THIS LISTING that names a position in the task-id space resumes from
+    // that position, even though no task was ever minted with that id: a page resumes
+    // after a POSITION, so a row that leaves the store between two pages cannot hide the
+    // rows that follow it. (A token is the minting listing and the position it reached,
+    // hex-encoded; which listing a token belongs to is
+    // `tests/all/page_token_listing_scope.rs`'s rule.)
     let position = "t-aaaaaaaaaa";
-    let unissued = hex::encode(position);
+    let unissued = hex::encode(format!("ListImportTasks:{position}"));
     let (status, body) = list(&router, REGION, &format!("nextToken={unissued}")).await;
     let listed = entries("an unissued position", status, &body);
     for entry in &listed {

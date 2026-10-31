@@ -401,12 +401,14 @@ async fn list_graph_snapshots_pages_over_every_snapshot_without_repeats() {
         );
     }
 
-    // A token that names a position in the snapshot-id space resumes from that
-    // position, even though no snapshot was ever minted with that id: a page resumes
-    // after a POSITION, so a snapshot deleted between two pages cannot hide the
-    // snapshots that follow it.
+    // A token OF THIS LISTING that names a position in the snapshot-id space resumes
+    // from that position, even though no snapshot was ever minted with that id: a page
+    // resumes after a POSITION, so a snapshot deleted between two pages cannot hide the
+    // snapshots that follow it. (A token is the minting listing and the position it
+    // reached, hex-encoded; which listing a token belongs to is
+    // `tests/all/page_token_listing_scope.rs`'s rule.)
     let position = "gs-aaaaaaaaaa";
-    let unissued = hex::encode(position);
+    let unissued = hex::encode(format!("ListGraphSnapshots:{position}"));
     let (status, body) = list(&router, REGION, &format!("nextToken={unissued}")).await;
     let listed = entries("an unissued position", status, &body);
     for entry in &listed {

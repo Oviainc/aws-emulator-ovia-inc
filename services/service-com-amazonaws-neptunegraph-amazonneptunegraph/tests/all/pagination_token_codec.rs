@@ -6,11 +6,12 @@
 //!
 //! The rule every assertion here is about: this service has a SINGLE pagination-token
 //! format, so a client that pages one listing and then another sees one token grammar.
-//! A token is the hex encoding of the key of the last entry the page reported; a token
-//! is accepted only when it decodes to a position in the id space that listing orders
-//! (so one listing's token never pages another's); and a token naming a position no
-//! stored entry occupies still resumes from that position, because a page resumes after
-//! a POSITION rather than after a row.
+//! A token is the hex encoding of the listing that minted it and the key of the last
+//! entry that page reported; a token is accepted only by that listing, and only when it
+//! decodes to a position in the id space that listing orders (so one listing's token
+//! never pages another's); and a token naming a position no stored entry occupies still
+//! resumes from that position, because a page resumes after a POSITION rather than after
+//! a row.
 //!
 //! The table spans what the rule generalises over: every listing the service
 //! implements — `ListGraphs` (graph ids), `ListGraphSnapshots` (snapshot ids),
@@ -210,6 +211,12 @@ struct Listing {
     foreign_tokens: Vec<String>,
 }
 
+/// The token this service issues for `position` in the listing `operation` pages: the
+/// listing that minted it and the position it reached, hex-encoded.
+fn issued_token(operation: &str, position: &str) -> String {
+    hex::encode(format!("{operation}:{position}"))
+}
+
 /// `GET` the listing with the query string `query` (already encoded, without the `?`).
 async fn list(router: &MultiServiceRouter, listing: &Listing, query: &str) -> (u16, Value) {
     let path = if query.is_empty() {
@@ -344,7 +351,7 @@ async fn every_listing_issues_and_accepts_the_one_pagination_token_format() {
         );
 
         // Every page a token is issued for carries that token as the hex encoding of
-        // the key of its last entry, whatever the page size.
+        // this listing and the key of its last entry, whatever the page size.
         for page_size in [1, 2, POPULATION] {
             let mut seen: Vec<String> = Vec::new();
             let mut token: Option<String> = None;
@@ -370,8 +377,9 @@ async fn every_listing_issues_and_accepts_the_one_pagination_token_format() {
                     .unwrap_or_else(|| panic!("case {case}: a token was issued for an empty page"));
                 assert_eq!(
                     issued,
-                    hex::encode(last),
-                    "case {case}: expected the token to be the hex encoding of {last:?}, got {issued:?}"
+                    issued_token(operation, last),
+                    "case {case}: expected the token to be the hex encoding of this listing and \
+                     {last:?}, got {issued:?}"
                 );
             }
             assert!(
@@ -404,7 +412,7 @@ async fn every_listing_issues_and_accepts_the_one_pagination_token_format() {
         // entry occupies that position, which is what keeps an entry deleted between
         // two pages from hiding the entries that follow it.
         let position = listing.probe_position;
-        let token = hex::encode(position);
+        let token = issued_token(operation, position);
         let (status, body) = list(&router, listing, &format!("nextToken={token}")).await;
         let case = format!("{operation}, position {position:?}");
         let resumed = keys(&case, listing, status, &body);

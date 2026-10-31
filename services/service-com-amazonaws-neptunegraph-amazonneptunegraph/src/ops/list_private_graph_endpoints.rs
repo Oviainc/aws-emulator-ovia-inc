@@ -80,7 +80,11 @@ use super::types::*;
 // service shares, hosted once in `crate::state` beside the token codec and the id-space
 // predicates its decode half takes. Only the id space and the key an entry is ordered
 // by are this listing's own.
-use crate::state::{resolve_page_size, take_page, unissued_page_token};
+// The page-size resolution and the page-plus-token decision every listing of this
+// service shares, hosted once in `crate::state` beside the token codec and the listing
+// scopes its two halves take. Only which listing this is, and the key an entry is
+// ordered by, are this file's own.
+use crate::state::{resolve_page_size, take_page, unissued_page_token, PagedListing};
 // The token format itself is reached through `take_page`, so only this file's own
 // round-trip test names it.
 #[cfg(test)]
@@ -213,7 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .private_endpoints_of(&graph_id, start_after.as_deref())
             .map(PrivateGraphEndpointSummary::from);
         let (private_graph_endpoints, next_token) =
-            take_page(&mut remaining, page_size, |endpoint| &endpoint.vpc_id);
+            take_page(&mut remaining, page_size, LISTING, |endpoint| {
+                &endpoint.vpc_id
+            });
 
         Ok(Self::Output {
             private_graph_endpoints,
@@ -222,26 +228,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// Which listing of this service the tokens this file mints and takes back belong to: a
+/// token is accepted only by the listing that handed it out.
+const LISTING: PagedListing = PagedListing::PrivateGraphEndpoints;
+
 /// The VPC id a token resumes after, or `None` when the token is not one
-/// [`crate::state::encode_page_token`] produced for the VPC-id space.
+/// [`crate::state::encode_page_token`] produced for THIS listing.
 ///
-/// Only the id space is this listing's own: the wire format, and the decision to refuse
-/// a value that names no position in that space rather than treat it as the start of the
-/// list, are [`crate::state::decode_page_token`]'s.
+/// Only the listing is this file's own: the wire format, and the decision to refuse a
+/// value that names no position in that listing's order rather than treat it as the
+/// start of the list, are [`crate::state::decode_page_token`]'s.
 fn decode_page_token(token: &str) -> Option<String> {
-    crate::state::decode_page_token(token, crate::state::is_vpc_id)
+    crate::state::decode_page_token(token, LISTING)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_page_token, encode_page_token};
+    use super::{decode_page_token, encode_page_token, PagedListing, LISTING};
 
-    /// A token round-trips to the VPC id it was minted from, and a token this service
+    /// A token round-trips to the VPC id it was minted from, and a token this listing
     /// never issued is rejected rather than silently treated as the first page.
     #[test]
     fn page_tokens_round_trip_and_reject_foreign_tokens() {
         for vpc_id in ["vpc-0", "vpc-abc", "vpc-0a1b2c3d4e5f67890"] {
-            let token = encode_page_token(vpc_id);
+            let token = encode_page_token(LISTING, vpc_id);
             let decoded = decode_page_token(&token);
             assert_eq!(
                 decoded.as_deref(),
@@ -259,6 +269,14 @@ mod tests {
             &hex::encode("VPC-ABC"),
             // A graph id is a position in another id space.
             &hex::encode("g-0123456789"),
+            // A bare position, in this listing's own id space, carrying no listing: not
+            // a value this listing ever handed out.
+            &hex::encode("vpc-0a1b2c3d"),
+            // Every OTHER listing's token for a position in its own id space.
+            &encode_page_token(PagedListing::Graphs, "g-0123456789"),
+            &encode_page_token(PagedListing::GraphSnapshots, "gs-0123456789"),
+            &encode_page_token(PagedListing::ImportTasks, "t-0123456789"),
+            &encode_page_token(PagedListing::ExportTasks, "t-0123456789"),
         ] {
             let decoded = decode_page_token(foreign);
             assert!(

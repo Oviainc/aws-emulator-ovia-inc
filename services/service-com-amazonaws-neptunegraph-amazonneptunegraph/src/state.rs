@@ -2581,43 +2581,112 @@ pub const TAG_KEY_PATTERN: &str = "^[a-zA-Z+-=._:/]+$";
 /// From the modelled `TagValue`: `@length(0..256)`.
 pub const MAX_TAG_VALUE_CHARS: usize = 256;
 
-/// The pagination token that resumes a listing after `last_returned_key` — the id, or
-/// other stable key, of the last entry the page just returned.
+/// One paginated listing of this service, as the scope a pagination token belongs to.
 ///
-/// ONE token format for every listing of this service, so a client that pages one
-/// listing and then another sees one token grammar: hex keeps the token opaque to a
-/// client and within `PaginationToken`'s 1..8192 length.
-pub fn encode_page_token(last_returned_key: &str) -> String {
-    hex::encode(last_returned_key)
+/// A token names a position in ONE listing's order — the order of the listing that
+/// handed it out — so the listing is part of what a token carries and is checked when
+/// the token comes back. The id space the position lies in does not identify the
+/// listing on its own: the model spells one `^t-[a-z0-9]{10}$` pattern for an import
+/// task and an export task (`smithy_query(query="shape",shape="TaskId,ExportTaskId")`),
+/// so the two task listings order two independently keyed collections by positions drawn
+/// from the SAME space, and a position in that space names a different cut point in each
+/// of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagedListing {
+    /// `ListGraphs`, ordered by graph id.
+    Graphs,
+    /// `ListGraphSnapshots`, ordered by snapshot id.
+    GraphSnapshots,
+    /// `ListImportTasks`, ordered by import-task id.
+    ImportTasks,
+    /// `ListExportTasks`, ordered by export-task id.
+    ExportTasks,
+    /// `ListPrivateGraphEndpoints`, ordered by VPC id.
+    PrivateGraphEndpoints,
 }
 
-/// The position a token resumes after, or `None` when it is not a token
-/// [`encode_page_token`] minted for the id space `in_id_space` accepts.
+impl PagedListing {
+    /// The name a token carries the listing that minted it under: the operation's own
+    /// name, which no two listings of this service share.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Graphs => "ListGraphs",
+            Self::GraphSnapshots => "ListGraphSnapshots",
+            Self::ImportTasks => "ListImportTasks",
+            Self::ExportTasks => "ListExportTasks",
+            Self::PrivateGraphEndpoints => "ListPrivateGraphEndpoints",
+        }
+    }
+
+    /// Whether `key` names a position in the order this listing pages: the id space its
+    /// entries are keyed by, one of the `is_*_id` predicates below.
+    fn holds_position(self, key: &str) -> bool {
+        match self {
+            Self::Graphs => is_graph_id(key),
+            Self::GraphSnapshots => is_snapshot_id(key),
+            // One predicate for both, because the model gives the two task listings one
+            // id pattern; what separates their tokens is the listing, not the pattern.
+            Self::ImportTasks | Self::ExportTasks => is_task_id(key),
+            Self::PrivateGraphEndpoints => is_vpc_id(key),
+        }
+    }
+}
+
+/// What separates the minting listing from the position inside a token's decoded
+/// payload.
 ///
-/// `in_id_space` is the listing's own id-space predicate, one of the `is_*_id`
-/// predicates below: a decoded value naming no position in it is refused rather than
-/// treated as the start of the list, which is also what stops one listing's token from
-/// paging another's id space.
+/// Neither a listing's name nor any key this service orders a listing by carries this
+/// character, so a payload splits back into exactly the two parts it was built from.
+const PAGE_TOKEN_SEPARATOR: char = ':';
+
+/// The pagination token `listing` resumes after `last_returned_key` — the id, or other
+/// stable key, of the last entry the page just returned.
+///
+/// ONE token format for every listing of this service, so a client that pages one
+/// listing and then another sees one token grammar: the listing and the position it
+/// reached, hex-encoded, which keeps the token opaque to a client and within
+/// `PaginationToken`'s 1..8192 length.
+pub fn encode_page_token(listing: PagedListing, last_returned_key: &str) -> String {
+    hex::encode(format!(
+        "{}{PAGE_TOKEN_SEPARATOR}{last_returned_key}",
+        listing.label()
+    ))
+}
+
+/// The position a token resumes `listing` after, or `None` when it is not a token
+/// [`encode_page_token`] minted for that listing.
+///
+/// A token is a token OF ONE LISTING: it is accepted only when it names `listing`
+/// itself and a position in the id space `listing` orders its entries by. A token
+/// another listing minted — even one whose position lies in the same modelled id space,
+/// as an import-task token's does for the export-task listing — names no position in
+/// this listing's order, so it is refused rather than used as a cut point in a
+/// collection it was never taken from.
 ///
 /// Membership in the store is deliberately NOT required: a resource deleted between two
 /// pages must still leave its successors reachable, which is what resuming from a
 /// position — rather than from a row — gives.
 ///
-/// The accepted set is exactly the MINTED set: a value is a token of this service only
+/// The accepted set is exactly the MINTED set: a value is a token of this listing only
 /// when it is, byte for byte, the token [`encode_page_token`] produces for the position
 /// it decodes to. Decoding alone is weaker than that — several spellings of the token
 /// grammar can carry the same bytes, and only one of them is ever handed out — so the
 /// token is compared against its own canonical minting before the id space is consulted.
-pub fn decode_page_token(token: &str, in_id_space: impl Fn(&str) -> bool) -> Option<String> {
+pub fn decode_page_token(token: &str, listing: PagedListing) -> Option<String> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    if encode_page_token(&decoded) != token {
+    let position = decoded
+        .strip_prefix(listing.label())?
+        .strip_prefix(PAGE_TOKEN_SEPARATOR)?;
+    if encode_page_token(listing, position) != token {
         return None;
     }
-    in_id_space(&decoded).then_some(decoded)
+    listing
+        .holds_position(position)
+        .then(|| position.to_string())
 }
 
 /// The modelled `ValidationException` for a `nextToken` [`decode_page_token`] refuses:
-/// a value this service never issued for the id space the listing pages.
+/// a value this service never issued for the listing it was sent to.
 ///
 /// The service models its own `ValidationException`, which carries a `reason` beside
 /// `message` (`smithy_query(query="shape",shape="ValidationException")`), so every
@@ -2673,11 +2742,13 @@ pub fn resolve_page_size(max_results: Option<i32>) -> usize {
 pub fn take_page<T, I: Iterator<Item = T>>(
     entries: &mut I,
     page_size: usize,
+    listing: PagedListing,
     key_of: impl Fn(&T) -> &str,
 ) -> (Vec<T>, Option<String>) {
     let page: Vec<T> = entries.by_ref().take(page_size).collect();
     let next_token = if entries.next().is_some() {
-        page.last().map(|entry| encode_page_token(key_of(entry)))
+        page.last()
+            .map(|entry| encode_page_token(listing, key_of(entry)))
     } else {
         None
     };
@@ -2686,8 +2757,8 @@ pub fn take_page<T, I: Iterator<Item = T>>(
 
 /// Whether `value` matches the modelled `GraphId` pattern `^g-[a-z0-9]{10}$`.
 ///
-/// Shared by the id generator's own test and by `ListGraphs`, which refuses a
-/// pagination token that does not name a position in the graph-id space.
+/// Shared by the id generator's own test and by [`PagedListing::holds_position`], which
+/// refuses a pagination token that does not name a position in the graph-id space.
 pub fn is_graph_id(value: &str) -> bool {
     is_resource_id(value, "g-")
 }
@@ -2718,18 +2789,6 @@ pub fn is_vpc_id(value: &str) -> bool {
 /// an import task and an export task, and this service mints both from it.
 pub fn is_task_id(value: &str) -> bool {
     is_resource_id(value, TASK_ID_PREFIX)
-}
-
-/// Whether `value` matches the modelled `ExportTaskId` pattern `^t-[a-z0-9]{10}$` —
-/// the same check as [`is_task_id`], under the name the export surface reads it by.
-pub fn is_export_task_id(value: &str) -> bool {
-    is_task_id(value)
-}
-
-/// Whether `value` matches the modelled `TaskId` pattern `^t-[a-z0-9]{10}$` - the same
-/// check as [`is_task_id`], under the name the import surface reads it by.
-pub fn is_import_task_id(value: &str) -> bool {
-    is_task_id(value)
 }
 
 /// The prefix the modelled `ExportTaskId` pattern `^t-[a-z0-9]{10}$` requires: the
@@ -4101,7 +4160,7 @@ mod tests {
         for _ in 0..2_000 {
             let id = state.next_export_task_id();
             assert!(
-                is_export_task_id(&id),
+                is_task_id(&id),
                 "id {id:?}: expected a match for ^t-[a-z0-9]{{10}}$"
             );
             assert!(seen.insert(id.clone()), "id {id:?}: minted twice");

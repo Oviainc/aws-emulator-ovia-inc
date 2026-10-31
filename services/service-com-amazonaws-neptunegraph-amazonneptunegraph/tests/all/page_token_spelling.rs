@@ -114,6 +114,13 @@ struct Listing {
     positions: [&'static str; 2],
 }
 
+/// The token this service issues for `position` in the listing `operation` pages: the
+/// listing that minted it and the position it reached, hex-encoded. The spelling of
+/// that hex is what this suite varies.
+fn issued_token(operation: &str, position: &str) -> String {
+    hex::encode(format!("{operation}:{position}"))
+}
+
 /// The byte offsets of the letters of `token` — the only digits of the hex grammar that
 /// have more than one spelling.
 fn letter_offsets(token: &str) -> Vec<usize> {
@@ -242,7 +249,7 @@ async fn every_listing_accepts_only_the_token_spelling_it_mints() {
         let operation = listing.operation;
         for position in listing.positions {
             // The one spelling the service mints for this position resumes the listing.
-            let issued = hex::encode(position);
+            let issued = issued_token(operation, position);
             let case = format!("{operation} with the issued token {issued:?}");
             let path = format!("{}?nextToken={issued}", listing.path);
             let (status, answer) = call(&router, "GET", &path, None).await;

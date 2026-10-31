@@ -567,11 +567,13 @@ async fn list_graphs_pages_over_every_graph_without_repeats() {
         );
     }
 
-    // A token that does name a position in the graph-id space resumes from that
-    // position, even though no graph was ever minted with that id: a page resumes
-    // after a POSITION, so a graph deleted between two pages cannot hide the graphs
-    // that follow it.
-    let unissued = hex::encode("g-aaaaaaaaaa");
+    // A token OF THIS LISTING that does name a position in the graph-id space resumes
+    // from that position, even though no graph was ever minted with that id: a page
+    // resumes after a POSITION, so a graph deleted between two pages cannot hide the
+    // graphs that follow it. (A token is the minting listing and the position it
+    // reached, hex-encoded; which listing a token belongs to is
+    // `tests/all/page_token_listing_scope.rs`'s rule.)
+    let unissued = hex::encode("ListGraphs:g-aaaaaaaaaa");
     let (status, body) =
         call(&router, "GET", &format!("/graphs?nextToken={unissued}"), None).await;
     assert_eq!(status, 200, "case unissued position: expected 200, got {status}: {body}");

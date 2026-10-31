@@ -77,10 +77,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 // The page-size resolution and the page-plus-token decision every listing of this
-// service shares, hosted once in `crate::state` beside the token codec and the id-space
-// predicates its decode half takes. Only the id space and the key an entry is ordered
-// by are this listing's own.
-use crate::state::{resolve_page_size, take_page, unissued_page_token};
+// service shares, hosted once in `crate::state` beside the token codec and the listing
+// scopes its two halves take. Only which listing this is, and the key an entry is
+// ordered by, are this file's own.
+use crate::state::{resolve_page_size, take_page, unissued_page_token, PagedListing};
 // The token format itself is reached through `take_page`, so only this file's own
 // round-trip test names it.
 #[cfg(test)]
@@ -212,32 +212,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut remaining = store
             .import_tasks_in(&region, of_graph.as_deref(), start_after.as_deref())
             .map(ImportTaskSummary::from);
-        let (tasks, next_token) = take_page(&mut remaining, page_size, |summary| &summary.task_id);
+        let (tasks, next_token) = take_page(&mut remaining, page_size, LISTING, |summary| {
+            &summary.task_id
+        });
 
         Ok(Self::Output { tasks, next_token })
     }
 }
 
-/// The import-task id a token resumes after, or `None` when the token is not one
-/// [`crate::state::encode_page_token`] produced for the task-id space.
+/// Which listing of this service the tokens this file mints and takes back belong to.
 ///
-/// Only the id space is this listing's own: the wire format, and the decision to refuse
-/// a value that names no position in that space rather than treat it as the start of the
-/// list, are [`crate::state::decode_page_token`]'s.
+/// An import task and an export task share one modelled id pattern while living in two
+/// independently keyed collections, so the listing — not the pattern — is what binds a
+/// token to the order it names a position in.
+const LISTING: PagedListing = PagedListing::ImportTasks;
+
+/// The import-task id a token resumes after, or `None` when the token is not one
+/// [`crate::state::encode_page_token`] produced for THIS listing.
+///
+/// Only the listing is this file's own: the wire format, and the decision to refuse a
+/// value that names no position in that listing's order rather than treat it as the
+/// start of the list, are [`crate::state::decode_page_token`]'s.
 fn decode_page_token(token: &str) -> Option<String> {
-    crate::state::decode_page_token(token, crate::state::is_import_task_id)
+    crate::state::decode_page_token(token, LISTING)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_page_token, encode_page_token};
+    use super::{decode_page_token, encode_page_token, PagedListing, LISTING};
 
-    /// A token round-trips to the id it was minted from, and a token this service never
+    /// A token round-trips to the id it was minted from, and a token this listing never
     /// issued is rejected rather than silently treated as the first page.
     #[test]
     fn page_tokens_round_trip_and_reject_foreign_tokens() {
         for id in ["t-0000000000", "t-abcdefghij", "t-zz99zz99zz"] {
-            let token = encode_page_token(id);
+            let token = encode_page_token(LISTING, id);
             let decoded = decode_page_token(&token);
             assert_eq!(
                 decoded.as_deref(),
@@ -252,9 +261,19 @@ mod tests {
             // Decodes cleanly, but names no position in the task-id space.
             &hex::encode("not-a-task-id"),
             &hex::encode("t-short"),
+            // A bare position, in this listing's own id space, carrying no listing: not
+            // a value this listing ever handed out.
+            &hex::encode("t-0123456789"),
             // A graph id and a snapshot id are positions in OTHER id spaces.
             &hex::encode("g-0123456789"),
             &hex::encode("gs-0123456789"),
+            // The token the SIBLING task listing mints for a position in the one task-id
+            // space both are keyed by: a cut point in the other collection's order.
+            &encode_page_token(PagedListing::ExportTasks, "t-0123456789"),
+            // And every other listing's token for a position in its own id space.
+            &encode_page_token(PagedListing::Graphs, "g-0123456789"),
+            &encode_page_token(PagedListing::GraphSnapshots, "gs-0123456789"),
+            &encode_page_token(PagedListing::PrivateGraphEndpoints, "vpc-0a1b2c3d"),
         ] {
             let decoded = decode_page_token(foreign);
             assert!(

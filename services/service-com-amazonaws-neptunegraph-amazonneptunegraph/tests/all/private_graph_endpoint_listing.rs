@@ -477,12 +477,14 @@ async fn the_listing_pages_over_every_endpoint_without_repeats() {
         );
     }
 
-    // A token that names a position in the VPC-id space resumes from that position,
-    // even though no endpoint was ever created in that VPC: a page resumes after a
-    // POSITION, so an endpoint deleted between two pages cannot hide the endpoints that
-    // follow it.
+    // A token OF THIS LISTING that names a position in the VPC-id space resumes from
+    // that position, even though no endpoint was ever created in that VPC: a page
+    // resumes after a POSITION, so an endpoint deleted between two pages cannot hide the
+    // endpoints that follow it. (A token is the minting listing and the position it
+    // reached, hex-encoded; which listing a token belongs to is
+    // `tests/all/page_token_listing_scope.rs`'s rule.)
     let position = "vpc-page3";
-    let unissued = hex::encode(position);
+    let unissued = hex::encode(format!("ListPrivateGraphEndpoints:{position}"));
     let (status, body) = list(&router, REGION, &graph, &format!("nextToken={unissued}")).await;
     let listed = entries("an unissued position", status, &body);
     assert!(
