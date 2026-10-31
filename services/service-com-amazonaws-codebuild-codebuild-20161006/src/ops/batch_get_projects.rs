@@ -140,13 +140,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A read: it reports what CreateProject stored, in the order the request
         // named the projects, and splits the names it does not hold into
-        // `projectsNotFound`.
+        // `projectsNotFound`. The webhook's `secret` is the one member a read withholds
+        // ([`crate::state::project_without_webhook_secret`]): it is reported by the call
+        // that minted it and by no other.
         let guard = state.lock();
         let mut projects = Vec::new();
         let mut not_found = Vec::new();
         for name in &input.names {
             match guard.projects.get(name) {
-                Some(stored) => projects.push(stored.project.clone()),
+                Some(stored) => projects.push(crate::state::project_without_webhook_secret(
+                    stored.project.clone(),
+                )),
                 None => not_found.push(name.clone()),
             }
         }

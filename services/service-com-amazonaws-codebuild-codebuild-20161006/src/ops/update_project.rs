@@ -291,7 +291,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         Ok(UpdateProjectOutput {
-            project: Some(project),
+            // The updated project as it is REPORTED: this call changes a project's
+            // settings and mints no webhook secret, so the webhook it reports withholds
+            // the stored one exactly as `BatchGetProjects` does
+            // ([`crate::state::project_without_webhook_secret`]).
+            project: Some(crate::state::project_without_webhook_secret(project)),
         })
     }
 }

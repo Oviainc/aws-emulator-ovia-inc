@@ -144,6 +144,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // metadata takes part in resolving it.
         let _ = ctx;
 
+        // The ARN is PARSED before anything is read: it is typed only `NonEmptyString`,
+        // so a value that is not a token ARN of this service — one whose resource segment
+        // is not `token/<a ServerType>` — names no credential this service could have
+        // minted, which is a malformed request rather than an absent resource. The same
+        // reading `crate::ops::get_resource_policy` applies to the resource ARN it
+        // resolves, and it is settled with no lock held: the constraint is on the request
+        // alone.
+        if crate::state::source_credential_server_type_from_arn(&input.arn).is_none() {
+            return Err(
+                DeleteSourceCredentialsErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::INVALID_TOKEN_ARN_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut guard = state.lock();
         // The ARN is the credential's whole identity, so it is matched against the
         // stored ARN rather than re-derived from the input: a caller holding an ARN

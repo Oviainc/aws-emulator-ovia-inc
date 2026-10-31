@@ -462,7 +462,8 @@ use super::template::{
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
     APIGATEWAYV2_STAGE, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT, BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, CLOUDWATCH_DASHBOARD,
-    CLOUDWATCH_METRIC_STREAM, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
+    CLOUDWATCH_METRIC_STREAM, CODEBUILD_REPORT_GROUP, CODECOMMIT_REPOSITORY,
+    CODEDEPLOY_APPLICATION,
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_SECURITY_GROUP, EC2_SUBNET,
     EC2_VOLUME, EC2_VPC,
@@ -602,6 +603,10 @@ pub(super) enum Provisioner {
     IamAccessKey,
     IamManagedPolicy,
     CodePipelinePipeline,
+    /// `AWS::CodeBuild::ReportGroup`: a report group of AWS CodeBuild, which
+    /// `CreateReportGroup` creates under the name the template states and
+    /// `DeleteReportGroup` removes by the ARN that service keyed it by.
+    CodeBuildReportGroup,
     EcsCluster,
     SqsQueue,
     /// `AWS::SQS::QueuePolicy` and `AWS::SQS::QueueInlinePolicy`, which are not resources
@@ -735,6 +740,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         IAM_ACCESS_KEY => Some(Provisioner::IamAccessKey),
         IAM_MANAGED_POLICY => Some(Provisioner::IamManagedPolicy),
         CODEPIPELINE_PIPELINE => Some(Provisioner::CodePipelinePipeline),
+        CODEBUILD_REPORT_GROUP => Some(Provisioner::CodeBuildReportGroup),
         ECS_CLUSTER => Some(Provisioner::EcsCluster),
         SQS_QUEUE => Some(Provisioner::SqsQueue),
         SQS_QUEUE_POLICY | SQS_QUEUE_INLINE_POLICY => Some(Provisioner::SqsQueuePolicy),
@@ -1161,6 +1167,9 @@ impl Provisioner {
             }
             Self::CodeCommitRepository => {
                 create_codecommit_repository(ctx, region, resource, propagated).await
+            }
+            Self::CodeBuildReportGroup => {
+                create_codebuild_report_group(ctx, region, resource, propagated).await
             }
             // `AWS::SES::ConfigurationSet` publishes `Name`, `DeliveryOptions`,
             // `ReputationOptions`, `SendingOptions`, `SuppressionOptions`,
@@ -1909,6 +1918,11 @@ impl Provisioner {
             Self::CodeCommitRepository => {
                 delete_codecommit_repository(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the group by the ARN CodeBuild keyed it by, which the
+            // resource's own record carries.
+            Self::CodeBuildReportGroup => {
+                delete_codebuild_report_group(ctx, region, resource).await
+            }
             Self::SesConfigurationSet => {
                 delete_ses_configuration_set(ctx, region, physical_resource_id).await
             }
@@ -2222,6 +2236,10 @@ impl Provisioner {
             }
             Self::CodeCommitRepository => {
                 describe_codecommit_repository(ctx, region, physical_resource_id).await
+            }
+            // Read back by the same ARN the delete addresses the group by.
+            Self::CodeBuildReportGroup => {
+                describe_codebuild_report_group(ctx, region, resource).await
             }
             Self::SesConfigurationSet => {
                 describe_ses_configuration_set(ctx, region, physical_resource_id).await
@@ -20879,6 +20897,223 @@ async fn api_gateway_deleted(
         Err(refusal) if refusal.code == API_GATEWAY_NOT_FOUND => Ok(()),
         Err(refusal) => Err(refusal),
     }
+}
+
+// ---------------------------------------------------------------------------
+// AWS CodeBuild: AWS::CodeBuild::ReportGroup
+// ---------------------------------------------------------------------------
+
+/// CodeBuild's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: codebuild`, service shape `CodeBuild_20161006`), which speaks
+/// `awsJson1_1`.
+const CODEBUILD_SIGNING_NAME: &str = "codebuild";
+const CODEBUILD_TARGET_PREFIX: &str = "CodeBuild_20161006";
+
+/// The `AWS::CodeBuild::ReportGroup` properties `CreateReportGroup` takes under its own
+/// member name, as `(property, member)` pairs.
+///
+/// Source: AWS's CloudFormation resource reference for the type against that call's own
+/// members — the same member under a lower-case initial. `Name` is not here because it is
+/// the one value CloudFormation decides (this resource's physical id), `ExportConfig` is
+/// not because it is a nested structure whose members are mapped in turn
+/// ([`report_export_config`]), `Tags` is not because the tags CloudFormation gives the
+/// resource travel beside the declared ones ([`tags_of`]), and `DeleteReports` is not a
+/// member of that create at all — it governs the DELETE
+/// ([`CODEBUILD_DELETE_REPORTS_PROPERTY`]).
+const CODEBUILD_REPORT_GROUP_MEMBERS: &[(&str, &str)] = &[("Type", "type")];
+
+/// The members of the type's `ExportConfig` property, as `ReportExportConfig`'s own
+/// members: each the property with its initial letter lower-cased. `S3Destination` is
+/// mapped separately, since it is a structure of its own.
+const CODEBUILD_EXPORT_CONFIG_MEMBERS: &[(&str, &str)] =
+    &[("ExportConfigType", "exportConfigType")];
+
+/// The members of that configuration's `S3Destination`, as `S3ReportExportConfig`'s own
+/// members. A property no pair names is no member of that shape, so it is not sent.
+const CODEBUILD_S3_DESTINATION_MEMBERS: &[(&str, &str)] = &[
+    ("Bucket", "bucket"),
+    ("BucketOwner", "bucketOwner"),
+    ("Path", "path"),
+    ("Packaging", "packaging"),
+    ("EncryptionKey", "encryptionKey"),
+    ("EncryptionDisabled", "encryptionDisabled"),
+];
+
+/// The property that says whether the reports held in the group go with it when the stack
+/// removes it, which is `DeleteReportGroup`'s own `deleteReports` member.
+const CODEBUILD_DELETE_REPORTS_PROPERTY: &str = "DeleteReports";
+
+/// The `ReportGroup` members CodeBuild reports under this type's own property names, as
+/// `(property, member)` pairs, for drift detection.
+///
+/// `ExportConfig` is not among them: it is a nested structure spelled differently on each
+/// side, and a property the read does not report is not evidence of anything
+/// ([`super::drift`]) — the same position `AWS::CodeCommit::Repository`'s `Triggers` is
+/// in. `Tags` is left out for the reason it is everywhere here: the tags a resource
+/// carries change independently of its declaration.
+const CODEBUILD_REPORT_GROUP_REPORTED_PROPERTIES: &[(&str, &str)] =
+    &[("Name", "name"), ("Type", "type")];
+
+/// Create the report group an `AWS::CodeBuild::ReportGroup` declares — so a client that
+/// deployed the stack and then calls `codebuild BatchGetReportGroups` with the ARN the
+/// stack publishes reads the group back, and `PutResourcePolicy` against that ARN has a
+/// resource to attach a policy to, rather than CodeBuild reporting the ARN its own stack
+/// just completed in `reportGroupsNotFound`.
+///
+/// "Ref returns the report group name", which is this resource's physical id and the one
+/// value `CreateReportGroup` takes to key the group by, so the group is created under it
+/// and the id the stack already computed stays in force. The ARN that create ANSWERS with
+/// is recorded as the type's published `Arn` attribute, so `Fn::GetAtt` reads the ARN
+/// CodeBuild really keyed the group by.
+///
+/// The group carries the tags the declaration asks for plus the stack's own
+/// ([`tags_of`]), as the `[{key, value}]` list CodeBuild's own `Tag` shape spells.
+async fn create_codebuild_report_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let mut request = Map::new();
+    request.insert(
+        "name".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    copy_members(&properties, CODEBUILD_REPORT_GROUP_MEMBERS, &mut request);
+    if let Some(declared) = properties.get("ExportConfig") {
+        request.insert(
+            "exportConfig".to_string(),
+            report_export_config(declared),
+        );
+    }
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), tags_as_list(&tags, LOWER_CASED_TAG));
+    }
+
+    let answered =
+        call_codebuild(ctx, region, "CreateReportGroup", &Value::Object(request)).await?;
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = reported_member(&answered, "reportGroup")
+        .get("arn")
+        .and_then(scalar_text)
+    {
+        attributes.insert("Arn".to_string(), arn);
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// The declared `ExportConfig` as `CreateReportGroup` takes it: the configuration's own
+/// member plus the S3 destination it may carry, each mapped member by member.
+fn report_export_config(declared: &Value) -> Value {
+    let mut mapped = mapped_members(declared, CODEBUILD_EXPORT_CONFIG_MEMBERS);
+    let Value::Object(members) = &mut mapped else {
+        return mapped;
+    };
+    if let Some(destination) = declared.get("S3Destination") {
+        members.insert(
+            "s3Destination".to_string(),
+            mapped_members(destination, CODEBUILD_S3_DESTINATION_MEMBERS),
+        );
+    }
+    mapped
+}
+
+/// Delete the report group a stack created, addressed by its ARN — the handle
+/// `DeleteReportGroup` takes.
+///
+/// `DeleteReportGroup` models no does-not-exist error: a group CodeBuild no longer holds
+/// is already in the state the delete asks for, and that call says so itself. Whether the
+/// reports held in the group go with it is the declaration's `DeleteReports`, which is
+/// that call's own `deleteReports` member, and it is sent only where the declaration
+/// states it — the member carries a documented default of its own.
+async fn delete_codebuild_report_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let mut request = Map::new();
+    request.insert(
+        "arn".to_string(),
+        Value::String(codebuild_report_group_arn(resource, region)),
+    );
+    if let Some(delete_reports) = resource
+        .properties
+        .get(CODEBUILD_DELETE_REPORTS_PROPERTY)
+        .and_then(Value::as_bool)
+    {
+        request.insert("deleteReports".to_string(), Value::Bool(delete_reports));
+    }
+    call_codebuild(ctx, region, "DeleteReportGroup", &Value::Object(request)).await?;
+    Ok(())
+}
+
+/// The report group's configuration as CodeBuild reports it, for drift detection.
+///
+/// `BatchGetReportGroups` reports an ARN it holds no group for in `reportGroupsNotFound`
+/// rather than refusing the read, so an answer carrying no group is that service saying it
+/// no longer holds the resource — the `DELETED` drift status.
+async fn describe_codebuild_report_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({
+        "reportGroupArns": [codebuild_report_group_arn(resource, region)],
+    });
+    let answered = call_codebuild(ctx, region, "BatchGetReportGroups", &request).await?;
+    let Some(group) = answered
+        .get("reportGroups")
+        .and_then(Value::as_array)
+        .and_then(|groups| groups.first())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(reported_as_properties(
+        group,
+        CODEBUILD_REPORT_GROUP_REPORTED_PROPERTIES,
+    )))
+}
+
+/// The ARN of the report group a resource record describes: the `Arn` attribute its
+/// create reported, which is the ARN CodeBuild keyed the group by.
+///
+/// A record with no such attribute (one whose attribute budget was spent) falls back to
+/// the ARN that service forms for the group's NAME, which is this resource's physical id —
+/// the `report-group/<name>` path under the one account id this emulator mints, so the two
+/// are the same ARN.
+fn codebuild_report_group_arn(resource: &StoredResource, region: &str) -> String {
+    if let Some(arn) = resource.attributes.get("Arn") {
+        return arn.clone();
+    }
+    ::emulator_server::emulator_arn(
+        super::template::CODEBUILD_ARN_NAMESPACE,
+        region,
+        &format!("report-group/{}", resource.physical_resource_id),
+    )
+}
+
+/// Call one CodeBuild operation on the awsJson1_1 wire its model declares.
+async fn call_codebuild(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        CODEBUILD_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{CODEBUILD_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

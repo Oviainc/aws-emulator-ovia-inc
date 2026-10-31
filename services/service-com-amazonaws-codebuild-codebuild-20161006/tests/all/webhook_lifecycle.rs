@@ -7,7 +7,9 @@
 //! The rule under test is that a webhook is a record kept against a project whose
 //! source provider sends repository events: it is created once per project, computed
 //! from the project the request names, and reported by a later read exactly as it was
-//! persisted. An update rewrites that record's configuration from the request it
+//! persisted — bar the `secret`, which the call that MINTS it reports and a read
+//! withholds (see `tests/all/webhook_secret_is_minted_once.rs`). An update rewrites that
+//! record's configuration from the request it
 //! carries — the request IS the configuration afterwards, so a member it omits is
 //! cleared — while the members identifying the created webhook, and its secret unless
 //! `rotateSecret` asks for a new one, are left alone. Every table below spans a
@@ -154,6 +156,19 @@ fn error_type(body: &Value) -> String {
     body["__type"].as_str().unwrap_or_default().to_string()
 }
 
+/// The webhook a creating call reported, as a READ of the project reports it: the same
+/// record with `secret` withheld.
+///
+/// The secret is handed to the call that MINTED it and to no other, so a round trip
+/// compares a read against this rather than against the creating call's own answer.
+fn webhook_as_read(created: &Value) -> Value {
+    let mut reported = created.clone();
+    if let Some(members) = reported.as_object_mut() {
+        members.remove("secret");
+    }
+    reported
+}
+
 /// The project a later read reports, through the implemented reader `BatchGetProjects`.
 async fn read_project(router: &MultiServiceRouter, name: &str) -> Value {
     let (status, body) = call(router, "BatchGetProjects", json!({"names": [name]})).await;
@@ -209,6 +224,10 @@ fn assert_webhook_shape(case: &str, webhook: &Value, source_type: &str) {
 #[tokio::test]
 async fn create_webhook_spans_every_source_type() {
     let router = emulator();
+    // The secret each creating call minted, kept per project: a later read withholds it,
+    // so the only place to compare two projects' secrets is the calls that minted them.
+    let mut created_secrets: std::collections::BTreeMap<String, Value> =
+        std::collections::BTreeMap::new();
 
     for (source_type, supported) in SOURCE_TYPES {
         let case = format!("source type {source_type}");
@@ -250,21 +269,25 @@ async fn create_webhook_spans_every_source_type() {
             "{case}: expected the request's branchFilter, got {webhook}"
         );
 
-        // Round trip: the project reports exactly the webhook that was created, and
-        // reads do not recompute it.
+        // Round trip: the project reports exactly the webhook that was created — bar the
+        // secret, which the minting call reports and a read withholds — and reads do not
+        // recompute it.
         let stored = read_project(&router, &project).await["webhook"].clone();
         assert_eq!(
-            stored, webhook,
+            stored,
+            webhook_as_read(&webhook),
             "{case}: BatchGetProjects must report the created webhook, got {stored}"
         );
         let again = read_project(&router, &project).await["webhook"].clone();
         assert_eq!(
-            again, webhook,
+            again, stored,
             "{case}: a second read must report the same webhook, got {again}"
         );
+        created_secrets.insert(project.clone(), webhook["secret"].clone());
     }
 
-    // Each project's payload URL and secret are its own.
+    // Each project's payload URL is its own, and so is the secret each creating call
+    // minted.
     let first = read_project(&router, "webhook-github").await["webhook"].clone();
     let second = read_project(&router, "webhook-gitlab").await["webhook"].clone();
     assert_ne!(
@@ -272,7 +295,7 @@ async fn create_webhook_spans_every_source_type() {
         "two projects must not share a payload URL: {first} vs {second}"
     );
     assert_ne!(
-        first["secret"], second["secret"],
+        created_secrets["webhook-github"], created_secrets["webhook-gitlab"],
         "two projects must not share a webhook secret"
     );
 }
@@ -323,7 +346,8 @@ async fn a_second_webhook_for_one_project_is_refused() {
 
     let stored = read_project(&router, "webhook-twice").await["webhook"].clone();
     assert_eq!(
-        stored, created,
+        stored,
+        webhook_as_read(&created),
         "a refused repeat must leave the first webhook untouched, got {stored}"
     );
     // And the store holds the webhook on the project itself, not a second copy.
@@ -1154,7 +1178,7 @@ async fn a_delete_removes_the_webhook_and_leaves_the_project() {
         let again = body["webhook"].clone();
         assert_eq!(
             read_project(&router, &project).await["webhook"],
-            again,
+            webhook_as_read(&again),
             "{case}: the read must report the re-created webhook, got {again}"
         );
     }

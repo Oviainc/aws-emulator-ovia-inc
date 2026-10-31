@@ -2481,6 +2481,10 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Amazon ECR Public `CreateRepository.repositoryName`: `RepositoryName`,
         // `@length(min: 2, max: 205)`, lowercase (Amazon ECR Public's own Smithy model).
         ECR_PUBLIC_REPOSITORY => rules(205, Characters::LowercaseAlphanumeric),
+        // CodeBuild `CreateReportGroup.name`: `ReportGroupName`,
+        // `@length(min: 2, max: 128)` (CodeBuild's own Smithy model), which a generated
+        // name is already inside character-wise and may only be longer than.
+        CODEBUILD_REPORT_GROUP => rules(128, Characters::AsGenerated),
         // CodeCommit `CreateRepository.repositoryName`: `RepositoryName`,
         // `@length(min: 1, max: 100)` with pattern `^[\w\.-]+$` (CodeCommit's own Smithy
         // model), which a generated name is already inside — letters, digits and the hyphen
@@ -3058,6 +3062,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     CLOUDFRONT_RESPONSE_HEADERS_POLICY,
     "AWS::CloudWatch::Alarm",
     CLOUDWATCH_METRIC_STREAM,
+    CODEBUILD_REPORT_GROUP,
     COGNITO_USER_POOL,
     "AWS::DynamoDB::Table",
     EC2_DHCP_OPTIONS,
@@ -3144,6 +3149,22 @@ fn return_values(
     let properties = &declared.properties;
     let mut attributes = BTreeMap::new();
     match resource_type {
+        // "Ref returns the report group name"; Fn::GetAtt: Arn. This is the type
+        // `super::provisioning` creates in CodeBuild itself, which then answers with the
+        // report group's own ARN — the same ARN this computes, since both are built from
+        // the one account id this emulator mints and the group's name, which is how
+        // CodeBuild keys a report group (`report_group_arn` in its own state module).
+        CODEBUILD_REPORT_GROUP => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    CODEBUILD_ARN_NAMESPACE,
+                    region,
+                    &format!("report-group/{name}"),
+                ),
+            );
+            (name.to_string(), attributes)
+        }
         // "Ref returns the topic ARN"; Fn::GetAtt: TopicArn, TopicName. This is the type
         // `super::provisioning` creates in Amazon SNS itself, which then answers with the
         // topic's own ARN — the same ARN this computes, since both are built from the one
@@ -4454,6 +4475,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         "AWS::BedrockAgentCore::WorkloadIdentity" => &["Name", "WorkloadIdentityArn"],
         "AWS::RUM::AppMonitor" => &["Id"],
         "AWS::CloudWatch::Alarm" => &["Arn"],
+        CODEBUILD_REPORT_GROUP => &["Arn"],
         CLOUDWATCH_METRIC_STREAM => &["Arn"],
         COGNITO_USER_POOL => &["Arn", "ProviderName", "ProviderURL"],
         FIS_EXPERIMENT_TEMPLATE => &["Id"],
@@ -4908,6 +4930,24 @@ pub const ECR_PUBLIC_REPOSITORY: &str = "AWS::ECR::PublicRepository";
 
 /// An Amazon ECR repository's resource type (ECR's model: `cloudFormationName: ECR`).
 pub const ECR_REPOSITORY: &str = "AWS::ECR::Repository";
+
+/// An AWS CodeBuild report group's resource type (CodeBuild's model:
+/// `awsService.cloudFormationName: CodeBuild`). This is the type `super::provisioning`
+/// creates in CodeBuild itself, through that service's own `CreateReportGroup`.
+///
+/// Its physical resource id is the report group's NAME — that type's published return
+/// value ("Ref returns the report group name"), which is also the `Name` property a
+/// declaration states it under ([`physical_name`]) and the one value
+/// `CreateReportGroup` takes to key the group by. [`return_values`] carries its one
+/// published attribute, `Arn`: the ARN CodeBuild forms for a report group is that
+/// service's own `report-group/<name>` path under the single account id this emulator
+/// mints, so the value computed here and the one the create answers with are the same
+/// ARN — the position [`SNS_TOPIC`] is in.
+pub const CODEBUILD_REPORT_GROUP: &str = "AWS::CodeBuild::ReportGroup";
+
+/// The ARN namespace of the CodeBuild service, from its model's `aws.api#service`
+/// `arnNamespace` — the service segment of every ARN it forms.
+pub const CODEBUILD_ARN_NAMESPACE: &str = "codebuild";
 
 /// An AWS CodeCommit repository's resource type (that model:
 /// `awsService.cloudFormationName: CodeCommit`). This is the type `super::provisioning`

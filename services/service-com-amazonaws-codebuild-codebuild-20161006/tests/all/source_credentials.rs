@@ -421,8 +421,10 @@ async fn an_import_the_api_cannot_perform_is_refused_and_persists_nothing() {
 }
 
 /// RULE: `DeleteSourceCredentials` resolves its `arn` against the stored token ARNs, so
-/// an ARN naming no stored credential is refused with HTTP 400
-/// `ResourceNotFoundException` and every other credential survives the refusal.
+/// a WELL-FORMED token ARN naming no stored credential is refused with HTTP 400
+/// `ResourceNotFoundException` and every other credential survives the refusal. (A value
+/// that is not a token ARN of this service at all is a different class — it is refused
+/// before the registry is read; see `tests/all/source_credential_arn_shape.rs`.)
 #[tokio::test]
 async fn deleting_an_arn_that_names_no_stored_credential_is_refused() {
     let router = emulator();
@@ -450,13 +452,9 @@ async fn deleting_an_arn_that_names_no_stored_credential_is_refused() {
             expected_arn("GITHUB").replace(REGION, "eu-central-1"),
         ),
         (
-            "an ARN of another resource kind",
-            format!(
-                "arn:aws:codebuild:{REGION}:{}:project/github",
-                engine::EMULATOR_ACCOUNT_ID
-            ),
+            "the right server type in another account",
+            expected_arn("GITHUB").replace(engine::EMULATOR_ACCOUNT_ID, "123456789012"),
         ),
-        ("not an ARN at all", "GITHUB".to_string()),
     ];
 
     for (case, arn) in unknown {

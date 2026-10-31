@@ -73,6 +73,8 @@ mod sandbox_idle_timeout;
 mod sandbox_lifecycle;
 #[path = "all/sandbox_sessions.rs"]
 mod sandbox_sessions;
+#[path = "all/source_credential_arn_shape.rs"]
+mod source_credential_arn_shape;
 #[path = "all/source_credentials.rs"]
 mod source_credentials;
 #[path = "all/state_roundtrip.rs"]
@@ -89,3 +91,5 @@ mod update_report_group;
 mod webhook_access_token;
 #[path = "all/webhook_lifecycle.rs"]
 mod webhook_lifecycle;
+#[path = "all/webhook_secret_is_minted_once.rs"]
+mod webhook_secret_is_minted_once;

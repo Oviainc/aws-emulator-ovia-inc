@@ -1,13 +1,8 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: codebuild.codebuild-junit-report-ingestion-reports-each-test-case-with-its-exact-status codebuild.describe-test-cases-absent-report-not-found codebuild.e2e-webhook-triggered-build-retry-flow codebuild.list-reports-for-report-group-sort-order-consistent codebuild.report-group-trend-reflects-created-reports codebuild.get-resource-policy-absent-resource-not-found codebuild.resource-policy-sharing-not-listed-for-owner codebuild.webhook-filter-groups-unicode-round-trip codebuild.delete-build-batch-in-progress-rejected codebuild.webhook-secret-and-filter-groups-round-trip codebuild.delete-webhook-oauth-provider-error-blocked codebuild.delete-source-credentials-invalid-arn codebuild.deploy-codebuild-report-group-cfn-policy-applies
+Issue-Trace-Ids: codebuild.get-resource-policy-absent-resource-not-found codebuild.resource-policy-sharing-not-listed-for-owner codebuild.webhook-filter-groups-unicode-round-trip codebuild.delete-build-batch-in-progress-rejected codebuild.webhook-secret-and-filter-groups-round-trip codebuild.delete-webhook-oauth-provider-error-blocked codebuild.delete-source-credentials-invalid-arn codebuild.deploy-codebuild-report-group-cfn-policy-applies
 Issue-Shape-Id: com.amazonaws.codebuild#CodeBuild_20161006
-Issue-Key: codebuild.codebuild-junit-report-ingestion-reports-each-test-case-with-its-exact-status|run#12|AssertionError|assert build["buildStatus"] == "SUCCEEDED", (
-Issue-Key: codebuild.describe-test-cases-absent-report-not-found|_create_real_report#2|AssertionError|assert build["buildStatus"] == "SUCCEEDED", (
-Issue-Key: codebuild.e2e-webhook-triggered-build-retry-flow|run#21|AssertionError|assert build1_final["buildStatus"] == "SUCCEEDED", (
-Issue-Key: codebuild.list-reports-for-report-group-sort-order-consistent|run#18|AssertionError|assert status_1 == "SUCCEEDED", f"build 1 did not succeed: {status_1}"
-Issue-Key: codebuild.report-group-trend-reflects-created-reports|run#15|AssertionError|assert final_build["buildStatus"] == "SUCCEEDED", (
 Issue-Key: codebuild.get-resource-policy-absent-resource-not-found|run#9|AssertionError|assert code == "ResourceNotFoundException", f"expected ResourceNotFoundException, got {code!r}"
 Issue-Key: codebuild.resource-policy-sharing-not-listed-for-owner|run#9|AssertionError|assert baseline_code == "ResourceNotFoundException", (
 Issue-Key: codebuild.webhook-filter-groups-unicode-round-trip|run#16|AssertionError|assert code == "ResourceNotFoundException", (
@@ -21,6 +16,8 @@ Issue-Commit: 461d317fc71f56ed8ab822edc66618d36d651bfa
 # CodeBuild: 8 further divergences — GetResourcePolicy/UpdateWebhook/DeleteBuildBatch stubs, BatchGetProjects leaks the webhook secret, CreateWebhook/DeleteSourceCredentials preconditions, CFN ReportGroup never materialized, and report flows blocked by FAULTing builds
 
 > _Note: this issue was identified against the code base at commit `461d317fc71f56ed8ab822edc66618d36d651bfa`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+> _Resolution note: causes 2, 3, 4 and 6 were closed by earlier changes (`src/ops/get_resource_policy.rs`, `src/ops/update_webhook.rs`, `src/ops/delete_build_batch.rs` and the access-token precondition in `src/ops/create_webhook.rs` / `src/ops/delete_webhook.rs`), and causes 5, 7 and 8 by the change that resolved this report (the webhook-secret projection on project reads, token-ARN parsing ahead of the source-credential lookup, and the CloudFormation provisioner for `AWS::CodeBuild::ReportGroup`). CAUSE 1 IS NOT CLOSED: running a buildspec needs a build container, which this platform does not provide, so it was SPLIT OUT — with its five replay keys and trace ids, which are no longer listed above — into the still-open report `issues/things-that-do-not-work/20261025T014438Z-codebuild-builds-never-execute-so-no-report-or-test-case-flow-is-observable.md`. Cause 1's text below is kept for the record; that report, not this one, owns it._
 
 ## Operation
 StartBuild

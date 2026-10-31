@@ -215,6 +215,8 @@ mod log_alarm_scheduled_query;
 // Declared beside the entry above, at the head, for the same reason: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions concurrent
 // suites add their line to.
+#[path = "all/cloudformation_provisions_codebuild_report_groups.rs"]
+mod cloudformation_provisions_codebuild_report_groups;
 #[path = "all/cloudformation_provisions_codecommit_repositories.rs"]
 mod cloudformation_provisions_codecommit_repositories;
 // Declared here, at the head, for the reason the entry above records: the appended tail

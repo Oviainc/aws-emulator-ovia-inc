@@ -2961,6 +2961,60 @@ pub fn webhook_access_token_violation(
     })
 }
 
+/// One project as a READ reports it: the stored record with its webhook's `secret`
+/// withheld.
+///
+/// `Webhook$secret` is "the secret token of the associated repository" — the value the
+/// repository provider signs its payloads with. AWS hands it to the call that MINTED it
+/// and to no other: the webhook-creating call (documented under `manualCreation` as
+/// returning "payloadUrl and secret values for the webhook"), and an update that rotated
+/// it. Every other projection of a project is a REPORT of the resource, and a report does
+/// not carry a secret, so a principal holding only a reporting permission is never handed
+/// the hook's signing secret. The stored record keeps the secret, so the webhook goes on
+/// being the one the provider signs for; only what is reported drops it.
+pub fn project_without_webhook_secret(mut project: Project) -> Project {
+    if let Some(webhook) = project.webhook.as_mut() {
+        webhook.secret = None;
+    }
+    project
+}
+
+/// What CodeBuild states as the reason a value handed to a source-credential-addressing
+/// operation is not one of its token ARNs, carried by the modelled
+/// `InvalidInputException`.
+///
+/// Recorded behaviour: this is the sentence a recorded CodeBuild answer carries for a
+/// token ARN whose server-type component is not a source provider (the wire fixture
+/// `codebuild-source-credentials-import-and-remove`, step `task#3`, as the open issue
+/// `20261023T134241Z-codebuild-absent-codebuild-resources-accepted-instead-of-modeled-error`
+/// records it for its cause 5); the model states no message for the error. The sentence is
+/// wholly fixed: it quotes neither the rejected value nor the ARN form that would be
+/// accepted, so every malformed value is refused with the same text and a client can key
+/// on it — the same rule [`INVALID_REPORT_ARN_MESSAGE`] states for the other resources
+/// this service addresses by ARN alone.
+pub const INVALID_TOKEN_ARN_MESSAGE: &str = "Invalid token ARN: server type is invalid";
+
+/// The server type an `arn:<partition>:codebuild:<region>:<account>:token/<server type>`
+/// ARN identifies, or `None` when the value is not a source-credential ARN of this
+/// service.
+///
+/// The inverse of [`source_credential_arn`]'s resource segment: the server type is the
+/// ONLY request value a token ARN carries, which is why a credential is held per server
+/// type — so a resource segment that is not `token/<a ServerType>` names no credential
+/// this service could have minted, whatever the registry holds. The set it is held
+/// against is the model's own `ServerType` list, `crate::ops::types::SERVER_TYPE_VALUES`,
+/// so the two never drift apart. It answers the SYNTAX question only, the way
+/// [`project_name_from_arn`] does; whether this account holds that credential is a lookup
+/// in the store. The comparison ignores case because the ARN is minted with the server
+/// type lowercased while the enum spells it in upper case.
+pub fn source_credential_server_type_from_arn(arn: &str) -> Option<&str> {
+    let server_type = resource_from_arn(arn, "token/")?;
+    crate::ops::types::SERVER_TYPE_VALUES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(server_type))
+        .then_some(server_type)
+}
+
 /// `arn:aws:codebuild:<region>:<account>:build-batch/<id>`.
 ///
 /// `build-batch` is CodeBuild's own resource type for a batch build, which is
