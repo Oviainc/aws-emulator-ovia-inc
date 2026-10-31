@@ -17,6 +17,8 @@ mod accept_connection_proposal;
 mod acceptance_attach_point_arn_resolves_in_full;
 #[path = "all/acceptance_does_not_race_the_clock.rs"]
 mod acceptance_does_not_race_the_clock;
+#[path = "all/arn_region_segment_is_not_a_scope.rs"]
+mod arn_region_segment_is_not_a_scope;
 #[path = "all/arn_scope_refusals.rs"]
 mod arn_scope_refusals;
 #[path = "all/arn_scope_is_relative_to_the_request.rs"]

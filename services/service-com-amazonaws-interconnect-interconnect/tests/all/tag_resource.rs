@@ -7,9 +7,10 @@
 //! names every key the request carries with the value the request gives it — a key
 //! the resource already holds takes the new value and every key the request does not
 //! name keeps the value it had — so the call is a MERGE, is idempotent, and changes
-//! nothing else about the resource. An `arn` that names no resource of this service
-//! is refused with HTTP 400 — the client fault for an in-scope ARN naming nothing,
-//! the validation fault for one outside the scope the request addresses — and one
+//! nothing else about the resource. An `arn` that addresses no resource of this
+//! service is refused with HTTP 400 — this service's own client fault, worded with a
+//! fixed sentence, for an ARN of the request's scope that resolves to nothing, the
+//! validation fault for one whose account or partition is not that scope — and one
 //! that is not a connection ARN at all is
 //! refused as invalid input (HTTP 400), never with a 501. A resource's tag set is
 //! also bounded: a write that would leave it holding more tags than one resource
@@ -30,9 +31,9 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
+use crate::arn_scope_refusals::{assert_answers_fault, Fault, TAG_READER};
 use crate::emulator::{
-    code, create_with_tags, message, placements, remote_account_for, tags_of, text, without_tags,
-    Emulator,
+    code, create_with_tags, placements, remote_account_for, tags_of, text, without_tags, Emulator,
 };
 
 /// The account id every emulator ARN carries.
@@ -431,13 +432,14 @@ async fn tag_resource_touches_only_the_resource_its_arn_names() {
     }
 }
 
-/// RULE: an `arn` that names no resource of this store is refused with HTTP 400 and
-/// creates nothing — tagging never brings a resource into existence — with DIFFERENT
-/// codes for the two ways it can name none: `InterconnectValidationException` for an
-/// ARN outside the partition, Region and account this request addresses, and
-/// `InterconnectClientException` for an in-scope ARN that names no connection. An
-/// `arn` that is not a connection ARN at all is likewise invalid input (HTTP 400).
-/// None of them is ever a 404 or a 501.
+/// RULE: an `arn` that addresses no resource of this store changes nothing — tagging
+/// never brings a resource into existence — and the two ways it can address none are
+/// refused with DIFFERENT codes: `InterconnectValidationException` for an ARN whose
+/// account or partition is not the scope this request addresses, and
+/// `InterconnectClientException`, worded with the fixed not-found sentence, for an ARN
+/// of that scope which resolves to no connection. An `arn` that is not a connection
+/// ARN at all is likewise invalid input (HTTP 400). None of them is ever a 404 or a
+/// 501.
 #[tokio::test]
 async fn tag_resource_refuses_an_arn_that_names_no_connection() {
     let emulator = Emulator::new();
@@ -448,59 +450,47 @@ async fn tag_resource_refuses_an_arn_that_names_no_connection() {
     let live_arn = text(&live, "arn");
     let written = map(&[("team", "network")]);
 
-    // In-scope, well-formed connection ARNs that name nothing this account holds
-    // (the client fault), then ARNs outside the scope this request addresses (the
-    // validation fault): two negative classes with two codes.
+    // ARNs of this request's scope that resolve to nothing (the client fault), then
+    // ARNs whose account or partition is another scope (the validation fault): two
+    // negative classes with two codes. The Region segment puts nothing out of scope,
+    // so a row carrying another Region belongs to the FIRST class.
     let elsewhere = vec![
         (
             "an id that was never allocated",
             format!("arn:aws:interconnect:{REGION}:{ACCOUNT_ID}:connection/mcc-00000000"),
-            "InterconnectClientException",
+            Fault::NoSuchConnection,
         ),
         (
             "the other id prefix, never allocated",
             format!("arn:aws:interconnect:{REGION}:{ACCOUNT_ID}:connection/lmcc-zzzzzzzz"),
-            "InterconnectClientException",
+            Fault::NoSuchConnection,
+        ),
+        (
+            "an unallocated id spelled with another region",
+            format!("arn:aws:interconnect:eu-west-3:{ACCOUNT_ID}:connection/mcc-00000000"),
+            Fault::NoSuchConnection,
         ),
         (
             "another account",
             live_arn.replace(ACCOUNT_ID, "123456789012"),
-            "InterconnectValidationException",
-        ),
-        (
-            "another region",
-            live_arn.replace(REGION, "eu-west-3"),
-            "InterconnectValidationException",
+            Fault::OutOfScope,
         ),
         (
             "another partition",
             live_arn.replace("arn:aws:", "arn:aws-cn:"),
-            "InterconnectValidationException",
+            Fault::OutOfScope,
         ),
     ];
-    for (name, arn, expected_code) in elsewhere {
+    for (name, arn, fault) in elsewhere {
         let (status, body) = tag(&emulator, &arn, &written).await;
-        assert_eq!(
-            status, 400,
-            "case {name:?}: expected HTTP 400 for an ARN naming no connection, got {status} with {body:?}"
-        );
-        assert!(
-            code(&body).contains(expected_code),
-            "case {name:?}: expected {expected_code}, got {body:?}"
-        );
-        assert!(
-            message(&body).contains(&arn),
-            "case {name:?}: expected the refusal to name the requested ARN, got {:?}",
-            message(&body)
-        );
-        // The refusal brought no resource into existence.
+        assert_answers_fault(name, "TagResource", fault, &arn, status, &body);
+        // The refusal brought no resource into existence: the companion read still
+        // reports no tag for the ARN (and refuses it outright where the ARN is not one
+        // this request may address at all).
         let (listed_status, listed) = emulator
-            .ic("ListTagsForResource", json!({ "arn": arn }))
+            .ic(TAG_READER, json!({ "arn": arn }))
             .await;
-        assert_eq!(
-            listed_status, 400,
-            "case {name:?}: expected the refused ARN to still name no resource, got {listed_status} with {listed:?}"
-        );
+        assert_answers_fault(name, TAG_READER, fault, &arn, listed_status, &listed);
     }
 
     // An `arn` that is not an Interconnect connection ARN is a 400 on the input,
@@ -663,7 +653,7 @@ async fn tag_resource_bounds_the_tags_one_resource_holds() {
 /// RULE: a resource exists until its delete completes — tagging a connection that is
 /// still `deleting` succeeds, and once the clock has settled it into the terminal
 /// `deleted` state the resource is gone and tagging it is refused as the client
-/// fault for an in-scope ARN that names no connection.
+/// fault for an ARN that resolves to no connection.
 #[tokio::test]
 async fn tag_resource_follows_the_resource_out_of_existence() {
     let emulator = Emulator::new();

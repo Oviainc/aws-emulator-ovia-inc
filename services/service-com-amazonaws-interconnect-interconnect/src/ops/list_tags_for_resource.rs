@@ -135,13 +135,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// holds — exactly what `CreateConnection$tags`, `TagResource` and
     /// `UntagResource` last left in the store, with no key the store does not hold
     /// and none of the ones it does left out. Listing tags never changes a tag set,
-    /// so two calls with no tag write in between answer the same, and an `arn` that
-    /// names no resource of this service is refused rather than answered with an
-    /// empty listing: "no tags" and "no resource" are different answers. The two
-    /// ways an `arn` can name no resource are refused with DIFFERENT codes, so a
-    /// caller can tell them apart: one outside the scope the request addresses is a
-    /// fault in the request, and one inside it that names nothing is this service's
-    /// own client fault.
+    /// so two calls with no tag write in between answer the same. The listing does
+    /// not validate that the resource exists: an `arn` of the scope the request
+    /// addresses that resolves to no resource carries no tags, and the EMPTY tag set
+    /// is that answer rather than a refusal — nothing was ever tagged, which is what
+    /// a read asked. What is refused is an `arn` the caller is not talking to at all:
+    /// one whose partition or account is not the scope the request addresses is a
+    /// fault in the request. The ARN's Region segment is unconstrained in the model,
+    /// so it is a value the caller may spell any way rather than a scope of its own:
+    /// the resource is the one the ARN's id names among those the called endpoint
+    /// holds.
     async fn handle(
         &self,
         input: Self::Input,
@@ -173,14 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // An ARN identifies its resource in FULL, so one whose partition, Region or
-        // account is not the one this request addresses names a resource outside the
-        // scope the caller is talking to — a fault in the REQUEST, refused as
-        // invalid input, and a DIFFERENT code from an in-scope ARN that merely names
-        // nothing (below), which is what lets a caller tell "wrong account" from "no
-        // such resource".
+        // The scope an ARN addresses is its partition and its account, so one
+        // carrying either of another scope names a resource the caller is not talking
+        // to at all — a fault in the REQUEST, refused as invalid input. The Region
+        // segment is not judged here: the member's pattern leaves it unconstrained,
+        // so it is resolved rather than scope-checked.
         let region = crate::state::request_region(ctx);
-        if let Some(message) = crate::state::arn_scope_violation(&parsed, &region) {
+        if let Some(message) = crate::state::arn_scope_violation(&parsed) {
             return Err(
                 ListTagsForResourceErrorModeled::InterconnectValidationException(
                     InterconnectValidationException { message },
@@ -193,34 +195,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already made due (`deleting` -> `deleted`, `updating` -> the state the
         // connection came from), which were owed at this instant whether or not
         // anybody asked. No tag is added, removed or rewritten on a read, so a later
-        // caller sees exactly what this one saw.
+        // caller sees exactly what this one saw. The resource is the one the ARN's id
+        // names among those the Region the request addressed holds, resolved the way
+        // every ARN-addressed operation here resolves it.
         let found = {
             let mut store = state.lock();
             store.materialise_due_transitions(::std::time::Instant::now());
             store
-                .connection_in_by_arn(&region, &input.arn)
+                .connection_in_for_arn(&region, &input.arn)
                 .map(|stored| stored.connection.tags.clone())
         };
 
-        // In scope and well-formed, but naming no connection this account holds (an
-        // id that was never allocated, or one whose connection has reached the
-        // terminal deleted state): this service's own CLIENT fault, the modelled 400,
-        // not a 404.
-        let Some(tags) = found else {
-            return Err(ListTagsForResourceErrorModeled::InterconnectClientException(
-                InterconnectClientException {
-                    message: crate::state::connection_not_retrievable_message(&input.arn),
-                },
-            )
-            .into());
-        };
-
-        // A resource carrying no tags is stored as `None` (how a connection created
-        // without tags is held, and what `UntagResource` leaves once the last key
-        // goes). The listing of it is the EMPTY tag set, not an absent member: the
-        // resource exists and currently has nothing on it.
+        // A tag set with nothing in it is the answer to BOTH ways an `arn` can carry
+        // no tags, because a read asks what is on the resource and not whether it is
+        // there: a resource that exists carrying no tags (stored as `None`, how a
+        // connection created without tags is held and what `UntagResource` leaves once
+        // the last key goes), and an `arn` of this scope resolving to no resource at
+        // all, which nothing has ever tagged. Either way the answer is the EMPTY tag
+        // set rather than an absent member.
         Ok(ListTagsForResourceOutput {
-            tags: Some(tags.unwrap_or_default()),
+            tags: Some(found.flatten().unwrap_or_default()),
         })
     }
 }

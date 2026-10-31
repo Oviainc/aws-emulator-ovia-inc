@@ -133,11 +133,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// it, or naming a key that was never applied, succeeds and changes nothing.
     /// An `arn` that names no resource of this service is refused — untagging never
     /// brings a resource into existence — and the two ways it can name none are
-    /// refused with DIFFERENT codes: an ARN outside the scope the request addresses
-    /// is a fault in the request, while an in-scope ARN that names nothing is this
-    /// service's own client fault. A key in the namespace AWS reserves for its
-    /// own system tags is not the caller's to remove, so a request naming one is
-    /// refused on the input and the tag set is left exactly as it was.
+    /// refused with DIFFERENT codes: an ARN whose partition or account is not the
+    /// scope the request addresses is a fault in the request, while an ARN of that
+    /// scope which resolves to no resource is this service's own client fault, worded
+    /// with the same fixed sentence the sibling tag write answers. The ARN's Region
+    /// segment is unconstrained in the model, so it is a value the caller may spell
+    /// any way rather than a scope of its own: the resource is the one the ARN's id
+    /// names among those the called endpoint holds. A key in the namespace AWS
+    /// reserves for its own system tags is not the caller's to remove, so a request
+    /// naming one is refused on the input and the tag set is left exactly as it was.
     async fn handle(
         &self,
         input: Self::Input,
@@ -167,14 +171,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An ARN identifies its resource in FULL, so one whose partition, Region or
-        // account is not the one this request addresses names a resource outside the
-        // scope the caller is talking to — a fault in the REQUEST, refused as
-        // invalid input, and a DIFFERENT code from an in-scope ARN that merely names
-        // nothing (below), which is what lets a caller tell "wrong account" from "no
-        // such resource".
+        // The scope an ARN addresses is its partition and its account, so one
+        // carrying either of another scope names a resource the caller is not talking
+        // to at all — a fault in the REQUEST, refused as invalid input, and a
+        // DIFFERENT code from an ARN of this scope that merely resolves to nothing
+        // (below), which is what lets a caller tell "wrong account" from "no such
+        // resource". The Region segment is not judged here: the member's pattern
+        // leaves it unconstrained, so it is resolved rather than scope-checked.
         let region = crate::state::request_region(ctx);
-        if let Some(message) = crate::state::arn_scope_violation(&parsed, &region) {
+        if let Some(message) = crate::state::arn_scope_violation(&parsed) {
             return Err(UntagResourceErrorModeled::InterconnectValidationException(
                 InterconnectValidationException { message },
             )
@@ -202,15 +207,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose delete has completed is seen as `deleted` here.
         guard.materialise_due_transitions(::std::time::Instant::now());
 
-        // The same ARN resolution every ARN-identified input here uses: full-ARN
-        // match inside the Region the request addressed, and a connection in the
-        // terminal deleted state no longer has a tag set. In scope and well-formed
-        // but naming no connection this account holds is this service's own CLIENT
-        // fault, the modelled 400, not a 404.
-        let Some(stored) = guard.connection_in_by_arn_mut(&region, &input.arn) else {
+        // The same resolution every ARN-ADDRESSED operation here uses: the connection
+        // the ARN's id names among those the Region the request addressed holds, and a
+        // connection in the terminal deleted state no longer has a tag set. An ARN
+        // that resolves to no connection this account holds is this service's own
+        // CLIENT fault, the modelled 400, not a 404 — worded with the same fixed
+        // sentence the sibling tag write answers, so the two writers report a missing
+        // resource identically.
+        let Some(stored) = guard.connection_in_for_arn_mut(&region, &input.arn) else {
             return Err(UntagResourceErrorModeled::InterconnectClientException(
                 InterconnectClientException {
-                    message: crate::state::connection_not_retrievable_message(&input.arn),
+                    message: crate::state::arn_resource_absent_message(),
                 },
             )
             .into());

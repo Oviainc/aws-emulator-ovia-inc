@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end suite for how the ARN-identified operations refuse an
+//! End-to-end suite for how the ARN-ADDRESSED operations answer an
 //! `AmazonResourceName` they cannot resolve, driven over the wire through the
 //! shared [`crate::emulator`] harness.
 //!
-//! RULE under test: an operation that identifies its resource by ARN splits the two
-//! ways an ARN can name no resource and reports BOTH with HTTP 400 — an ARN whose
-//! partition, Region or account is not the one the request addresses is a fault in
-//! the request (`InterconnectValidationException`), while an ARN inside that scope
-//! that names no stored resource is this service's own client fault
-//! (`InterconnectClientException`) — so a client can tell "wrong account" from "no
-//! such resource", and neither is answered with the connection-scoped 404.
+//! RULE under test: an operation whose `arn` member IS the resource it acts on splits
+//! the two ways that ARN can fail to address one. An ARN whose PARTITION or ACCOUNT is
+//! not the one the request addresses names a resource the caller is not talking to at
+//! all: a fault in the request, HTTP 400 `InterconnectValidationException`, whichever
+//! of the three operations carried it. An ARN of that scope which resolves to no
+//! resource is not a malformed request at all: the two tag WRITES refuse it as this
+//! service's own client fault (HTTP 400 `InterconnectClientException`, worded with a
+//! fixed sentence carrying nothing of the ARN), and the `@readonly` LISTING answers
+//! HTTP 200 with the empty tag set. Neither class is ever the connection-scoped 404.
 //!
-//! The operations covered are every one whose input identifies a resource by
+//! The operations covered are every one whose input addresses its resource by
 //! `AmazonResourceName`: `ListTagsForResource`, `TagResource` and `UntagResource`
 //! (`smithy_query(query="operation",operation="ListTagsForResource,TagResource,UntagResource")`
 //! — each takes `arn` -> `AmazonResourceName`, `@length 59..150`, `@pattern
@@ -21,15 +23,20 @@
 //! `InterconnectValidationException` (400)).
 //!
 //! Every assertion is about that rule over a TABLE of ARNs whose rows differ in
-//! WHICH field puts the ARN out of the request's scope (partition, Region, account,
-//! several at once), in the value of that field, in the id prefix (`mcc`/`lmcc`), and
-//! in the ARN's overall length (both ends of the modelled 59..150 bound) — crossed
-//! with all three operations.
+//! WHICH field puts the ARN out of the request's scope (partition, account, both at
+//! once), in the value of that field, in the Region segment the ARN carries (which
+//! puts nothing out of scope, since the member leaves it unconstrained), in the id
+//! prefix (`mcc`/`lmcc`), and in the ARN's overall length (both ends of the modelled
+//! 59..150 bound) — crossed with all three operations.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+
+use service_com_amazonaws_interconnect_interconnect::state::{
+    arn_resource_absent_message, arn_scope_violation, parse_connection_arn,
+};
 
 use crate::emulator::{
     code, create_with_tags, message, placements, tags_of, text, Emulator, SIGNING_NAME,
@@ -93,23 +100,85 @@ pub(crate) fn arn_operations() -> Vec<ArnOperation> {
 // The two negative classes
 // ---------------------------------------------------------------------------
 
-/// The two ways an ARN the model's `@pattern` admits can name no resource.
+/// The operation among [`arn_operations`] that only READS a tag set; the other two
+/// write one, and what the rule answers for an ARN resolving to no resource differs
+/// between the two kinds.
+pub(crate) const TAG_READER: &str = "ListTagsForResource";
+
+/// The two ways an ARN the model's `@pattern` admits can fail to address a resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Fault {
-    /// Its partition, Region or account is not the one the request addresses.
+    /// Its partition or account is not the one the request addresses, so it names a
+    /// resource outside the scope the caller is talking to.
     OutOfScope,
-    /// Inside the request's scope, naming no stored connection.
+    /// Inside the request's scope, resolving to no stored connection.
     NoSuchConnection,
 }
 
 impl Fault {
-    /// The modelled error code this class is reported with.
+    /// The modelled error code this class is reported with, where it is reported as an
+    /// error at all.
     pub(crate) fn code(self) -> &'static str {
         match self {
             Fault::OutOfScope => "InterconnectValidationException",
             Fault::NoSuchConnection => "InterconnectClientException",
         }
     }
+
+    /// How this service words the refusal of `arn` in this class.
+    pub(crate) fn message(self, arn: &str) -> String {
+        match self {
+            Fault::OutOfScope => {
+                let parsed = parse_connection_arn(arn)
+                    .expect("the row's ARN is a well-formed Interconnect connection ARN");
+                arn_scope_violation(&parsed)
+                    .expect("the row's ARN is outside the scope the request addresses")
+            }
+            Fault::NoSuchConnection => arn_resource_absent_message(),
+        }
+    }
+}
+
+/// Assert `(status, body)` is what `operation` answers an `arn` of class `fault`: the
+/// empty tag set from the READ for an ARN that resolves to no resource, and otherwise
+/// the modelled 400 under that class's code and wording.
+pub(crate) fn assert_answers_fault(
+    case: &str,
+    operation: &str,
+    fault: Fault,
+    arn: &str,
+    status: u16,
+    body: &Value,
+) {
+    if fault == Fault::NoSuchConnection && operation == TAG_READER {
+        assert_eq!(
+            status, 200,
+            "case {case:?} on {operation}: expected HTTP 200 for an ARN that resolves to no resource, got {status} with {body:?}"
+        );
+        assert_eq!(
+            body["tags"],
+            json!({}),
+            "case {case:?} on {operation}: expected the empty tag set, got {:?}",
+            body["tags"]
+        );
+        return;
+    }
+    assert_eq!(
+        status, 400,
+        "case {case:?} on {operation}: expected HTTP 400 for an ARN that addresses no resource, got {status} with {body:?}"
+    );
+    let answered = code(body);
+    assert!(
+        answered.contains(fault.code()),
+        "case {case:?} on {operation}: expected {}, got {answered:?} with {body:?}",
+        fault.code()
+    );
+    assert_eq!(
+        message(body),
+        fault.message(arn),
+        "case {case:?} on {operation}: expected this service's own wording for the class, got {:?}",
+        message(body)
+    );
 }
 
 /// One row: a name, the `arn` to send and the class it belongs to.
@@ -137,12 +206,13 @@ fn connection_arn(partition: &str, region: &str, account: &str, id: &str) -> Str
 }
 
 /// The table: rows that differ in which field is out of the request's scope and in
-/// its value, rows inside the scope that name nothing, and rows at both ends of the
-/// modelled ARN length.
+/// its value, rows of that scope that resolve to nothing (including ones whose Region
+/// segment is not the called Region, which puts nothing out of scope), and rows at
+/// both ends of the modelled ARN length.
 fn table(live_arn: &str) -> Vec<Case> {
-    // A Region long enough to take the ARN to its modelled maximum length, and one
-    // short enough to take it to the minimum: everything around the Region field is
-    // fixed, so the ARN's length is that Region's length plus the rest.
+    // A Region segment long enough to take the ARN to its modelled maximum length, and
+    // one short enough to take it to the minimum: everything around that segment is
+    // fixed, so the ARN's length is the segment's length plus the rest.
     let floor_id = "mcc-00000000";
     let ceiling_id = "lmcc-00000000";
     let shortest_region = "r".repeat(
@@ -167,16 +237,6 @@ fn table(live_arn: &str) -> Vec<Case> {
             Fault::OutOfScope,
         ),
         Case::new(
-            "another region",
-            live_arn.replace(REGION, "eu-west-3"),
-            Fault::OutOfScope,
-        ),
-        Case::new(
-            "another region, on the other side of the world",
-            live_arn.replace(REGION, "ap-southeast-2"),
-            Fault::OutOfScope,
-        ),
-        Case::new(
             "another partition",
             live_arn.replace(&format!("arn:{PARTITION}:"), "arn:aws-cn:"),
             Fault::OutOfScope,
@@ -186,9 +246,10 @@ fn table(live_arn: &str) -> Vec<Case> {
             live_arn.replace(&format!("arn:{PARTITION}:"), "arn:aws-us-gov:"),
             Fault::OutOfScope,
         ),
-        // Out of scope by several fields at once.
+        // Out of scope by several fields at once, and with a Region segment that is
+        // not the called one either: the account and the partition still decide.
         Case::new(
-            "another account in another region",
+            "another account, spelled with another Region",
             live_arn
                 .replace(ACCOUNT_ID, "123456789012")
                 .replace(REGION, "eu-west-3"),
@@ -201,19 +262,22 @@ fn table(live_arn: &str) -> Vec<Case> {
                 .replace(&format!("arn:{PARTITION}:"), "arn:aws-cn:"),
             Fault::OutOfScope,
         ),
-        // Out of scope at each end of the modelled ARN length.
+        // In the request's scope, resolving to nothing: an id this endpoint never
+        // allocated, carried by a Region segment at each end of the modelled ARN
+        // length.
         Case::new(
-            "an out-of-scope region at the ARN length floor",
+            "an unallocated id at the ARN length floor",
             connection_arn(PARTITION, &shortest_region, ACCOUNT_ID, floor_id),
-            Fault::OutOfScope,
+            Fault::NoSuchConnection,
         ),
         Case::new(
-            "an out-of-scope region at the ARN length ceiling",
+            "an unallocated id at the ARN length ceiling",
             connection_arn(PARTITION, &longest_region, ACCOUNT_ID, ceiling_id),
-            Fault::OutOfScope,
+            Fault::NoSuchConnection,
         ),
-        // In the request's scope, naming nothing: both id prefixes, and ids whose
-        // characters span the `[a-z0-9]` alphabet the id's pattern allows.
+        // In the request's scope, resolving to nothing: both id prefixes, ids whose
+        // characters span the `[a-z0-9]` alphabet the id's pattern allows, and Region
+        // segments both matching and not matching the called Region.
         Case::new(
             "an id that was never allocated",
             connection_arn(PARTITION, REGION, ACCOUNT_ID, "mcc-00000000"),
@@ -227,6 +291,16 @@ fn table(live_arn: &str) -> Vec<Case> {
         Case::new(
             "an unallocated id mixing letters and digits",
             connection_arn(PARTITION, REGION, ACCOUNT_ID, "mcc-a1b2c3d4"),
+            Fault::NoSuchConnection,
+        ),
+        Case::new(
+            "an unallocated id spelled with another Region",
+            connection_arn(PARTITION, "eu-west-3", ACCOUNT_ID, "mcc-a1b2c3d4"),
+            Fault::NoSuchConnection,
+        ),
+        Case::new(
+            "an unallocated id spelled with a Region on the other side of the world",
+            connection_arn(PARTITION, "ap-southeast-2", ACCOUNT_ID, "lmcc-zzzzzzzz"),
             Fault::NoSuchConnection,
         ),
         Case::new(
@@ -261,10 +335,10 @@ fn table(live_arn: &str) -> Vec<Case> {
 // The rule
 // ---------------------------------------------------------------------------
 
-/// RULE: every ARN-identified operation refuses an unresolvable `arn` with HTTP 400,
-/// and with the code of the class the ARN belongs to — the request fault for one
-/// outside the scope the request addresses, this service's client fault for one
-/// inside it that names nothing.
+/// RULE: every ARN-addressed operation answers an `arn` it cannot resolve by the class
+/// that ARN belongs to — the request fault for one outside the scope the request
+/// addresses, this service's client fault for one of that scope resolving to nothing,
+/// and the empty tag set where that one reaches the READ.
 #[tokio::test]
 async fn arn_refusals_split_the_two_negative_classes() {
     let emulator = Emulator::new();
@@ -292,27 +366,19 @@ async fn arn_refusals_split_the_two_negative_classes() {
     for (operation, body) in arn_operations() {
         for case in &rows {
             let (status, answer) = emulator.ic(operation, body(&case.arn)).await;
-            assert_eq!(
-                status, 400,
-                "case {:?} on {operation}: expected HTTP 400 for an ARN naming no resource, got {status} with {answer:?}",
-                case.name
+            assert_answers_fault(
+                &case.name,
+                operation,
+                case.fault,
+                &case.arn,
+                status,
+                &answer,
             );
-            let answered = code(&answer);
-            assert!(
-                answered.contains(case.fault.code()),
-                "case {:?} on {operation}: expected {}, got {answered:?} with {answer:?}",
-                case.name,
-                case.fault.code()
-            );
-            assert!(
-                message(&answer).contains(&case.arn),
-                "case {:?} on {operation}: expected the refusal to name the requested ARN, got {:?}",
-                case.name,
-                message(&answer)
-            );
-            seen.entry(case.fault)
-                .or_default()
-                .insert(format!("{operation}/{}", case.name), answered);
+            if status == 400 {
+                seen.entry(case.fault)
+                    .or_default()
+                    .insert(format!("{operation}/{}", case.name), code(&answer));
+            }
         }
     }
 
@@ -372,8 +438,8 @@ async fn the_same_operations_serve_an_in_scope_arn() {
 
 /// RULE: the class an ARN falls into follows the resource — a connection still
 /// `deleting` is served, and once the clock has settled it into the terminal
-/// `deleted` state its ARN is in scope and names nothing, which is the client fault
-/// and never a 404.
+/// `deleted` state its ARN resolves to nothing, which is the client fault for the two
+/// writes and the empty tag set for the read, and never a 404.
 #[tokio::test]
 async fn a_settled_delete_moves_its_arn_into_the_client_fault_class() {
     let emulator = Emulator::new();
@@ -394,10 +460,16 @@ async fn a_settled_delete_moves_its_arn_into_the_client_fault_class() {
         "case \"straight after the delete\": expected the transient state, got {:?}",
         deleted["connection"]["state"]
     );
-    let (status, answer) = emulator.ic("ListTagsForResource", list_tags_body(&arn)).await;
+    let (status, answer) = emulator.ic(TAG_READER, list_tags_body(&arn)).await;
     assert_eq!(
         status, 200,
         "case \"while deleting\": expected the resource to still be served, got {status} with {answer:?}"
+    );
+    assert_eq!(
+        tags_of(&answer),
+        tags,
+        "case \"while deleting\": expected the tags of a resource that still exists, got {:?}",
+        answer["tags"]
     );
 
     tokio::time::sleep(SETTLE_WAIT).await;
@@ -411,14 +483,13 @@ async fn a_settled_delete_moves_its_arn_into_the_client_fault_class() {
 
     for (operation, body) in arn_operations() {
         let (status, answer) = emulator.ic(operation, body(&arn)).await;
-        assert_eq!(
-            status, 400,
-            "case \"after the delete settles\" on {operation}: expected HTTP 400, got {status} with {answer:?}"
-        );
-        assert!(
-            code(&answer).contains(Fault::NoSuchConnection.code()),
-            "case \"after the delete settles\" on {operation}: expected {}, got {answer:?}",
-            Fault::NoSuchConnection.code()
+        assert_answers_fault(
+            "after the delete settles",
+            operation,
+            Fault::NoSuchConnection,
+            &arn,
+            status,
+            &answer,
         );
     }
 }

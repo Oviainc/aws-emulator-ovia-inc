@@ -494,10 +494,11 @@ impl ComAmazonawsInterconnectInterconnectState {
             .filter(move |(_, stored)| visible_in(stored, region))
     }
 
-    /// The stored connection an `AmazonResourceName` names IN `region`, for every
-    /// input that identifies a connection by its ARN rather than by its id.
+    /// The stored connection an `AmazonResourceName` names field for field IN
+    /// `region`, for the input that carries an ARN as a HANDLE on another resource
+    /// (`AttachPoint$arn`) rather than as the address of the resource it acts on.
     ///
-    /// The ARN identifies the resource in FULL — partition, region and account
+    /// Here the ARN identifies the resource in FULL — partition, Region and account
     /// included — so an ARN whose fields differ from the stored one names a
     /// resource this store does not hold, exactly as an unknown id does. And the
     /// store is scoped by the SAME predicate every other resolution here uses
@@ -518,7 +519,7 @@ impl ComAmazonawsInterconnectInterconnectState {
     /// connection a new Connection is ever provisioned onto by ARN.
     ///
     /// Two filters, both of them rules this crate already applies elsewhere. The ARN
-    /// resolves the resource the way every ARN-addressed operation here does
+    /// resolves the resource the way a HANDLE on a connection resolves here
     /// ([`Self::connection_in_by_arn`]): in full, and inside the scope the request
     /// addressed. And the connectivity behind it has to still be there: an attach
     /// point is a handle whose whole subject is the connectivity the new Connection is
@@ -538,17 +539,35 @@ impl ComAmazonawsInterconnectInterconnectState {
             .filter(|stored| !is_deleted_or_deleting(&stored.connection.state))
     }
 
-    /// [`Self::connection_in_by_arn`] for the operations that MUTATE the record they
+    /// The stored connection an `AmazonResourceName` ADDRESSES in `region`, for the
+    /// operations whose `arn` member IS the resource they act on (the tag operations).
+    ///
+    /// What identifies the resource is the `ConnectionId` the ARN's resource segment
+    /// carries, resolved among the connections the called endpoint holds by the same
+    /// predicate every other resolution here uses ([`visible_in`]). The ARN's Region
+    /// segment is NOT part of that key: the member's pattern leaves it unconstrained
+    /// (`[^:]+`), so it is a value the caller may spell any way and it addresses no
+    /// scope of its own — the scope an ARN-addressed request is judged against is its
+    /// partition and account ([`arn_scope_violation`]), and the Region it reaches is
+    /// the one the request itself is signed for. A connection that has reached the
+    /// terminal `deleted` state is gone: the record stays readable by its identifier
+    /// so a caller polling a delete sees the terminal state, but a deleted resource is
+    /// no longer one this account holds.
+    pub fn connection_in_for_arn(&self, region: &str, arn: &str) -> Option<&StoredConnection> {
+        let id = connection_id_from_arn(arn)?;
+        self.connection_in(region, id).filter(|stored| exists_as_resource(stored))
+    }
+
+    /// [`Self::connection_in_for_arn`] for the operations that MUTATE the tag set they
     /// resolve, resolving the same resource under the same rule.
-    pub fn connection_in_by_arn_mut(
+    pub fn connection_in_for_arn_mut(
         &mut self,
         region: &str,
         arn: &str,
     ) -> Option<&mut StoredConnection> {
         let id = connection_id_from_arn(arn)?;
-        self.connections
-            .get_mut(id)
-            .filter(|stored| visible_in(stored, region) && holds_arn(stored, arn))
+        self.connection_in_mut(region, id)
+            .filter(|stored| exists_as_resource(stored))
     }
 
     /// Make room for one more record: while the store is at [`MAX_STORED_RECORDS`],
@@ -1060,6 +1079,18 @@ pub fn connection_not_retrievable_message(identifier: &str) -> String {
     format!("{REFUSAL_ENVELOPE}Unable to retrieve connection {identifier}, as it does not exist")
 }
 
+/// How an ARN-ADDRESSED operation words an `arn` that resolves to no resource of this
+/// account.
+///
+/// A distinct construction from [`connection_not_retrievable_message`], which is what
+/// an identifier-addressed read words: this sentence is entirely FIXED — it names
+/// neither the ARN, nor the connection id, nor the resource type — so a refusal on an
+/// ARN the caller supplied reproduces nothing of it, and it says in one breath both
+/// ways a resource can be absent (never created, or deleted since).
+pub fn arn_resource_absent_message() -> String {
+    format!("{REFUSAL_ENVELOPE}Resource does not exist or is deleted")
+}
+
 /// How `DescribeConnectionProposal` words an `activationKey` that resolves to no
 /// stored proposal.
 ///
@@ -1170,19 +1201,22 @@ pub fn not_a_connection_arn_message(arn: &str) -> String {
 }
 
 /// Why `parsed` does not address the scope the request it arrived on is for — or
-/// `None` when its partition, Region and account are all that scope's.
+/// `None` when its partition and account are both that scope's.
 ///
-/// An ARN identifies a resource in FULL, so one whose partition, Region or account
-/// is not the one the request addresses names a resource outside the scope the
-/// caller is talking to: a fault in the REQUEST, not a resource this scope is
-/// missing. The message is built from the request — the field that differs, the
-/// value the ARN carried for it and the value this request is for — so a caller can
-/// see WHICH field put the ARN elsewhere.
-pub fn arn_scope_violation(parsed: &ConnectionArn<'_>, region: &str) -> Option<String> {
+/// The scope an ARN addresses is its PARTITION and its ACCOUNT: an ARN carrying
+/// either of another scope names a resource the caller is not talking to at all, which
+/// is a fault in the REQUEST rather than a resource this scope is missing. The Region
+/// segment is NOT part of that judgement — the member's pattern leaves it
+/// unconstrained (`[^:]+`), so any spelling of it is a well-formed value of the member
+/// and the resource it names is resolved like any other
+/// ([`ComAmazonawsInterconnectInterconnectState::connection_in_for_arn`]). The message
+/// is built from the request — the field that differs, the value the ARN carried for it
+/// and the value this request is for — so a caller can see WHICH field put the ARN
+/// elsewhere.
+pub fn arn_scope_violation(parsed: &ConnectionArn<'_>) -> Option<String> {
     let account = ::emulator_server::emulator_account_id();
     let (field, carried, addressed) = [
         ("partition", parsed.partition, ARN_PARTITION),
-        ("region", parsed.region, region),
         ("account", parsed.account, account),
     ]
     .into_iter()
@@ -1403,10 +1437,17 @@ pub fn is_deleted_or_deleting(state: &str) -> bool {
     state == DELETING_CONNECTION_STATE || state == DELETED_CONNECTION_STATE
 }
 
+/// Whether `stored` is still a resource of this account: a connection that has reached
+/// the terminal `deleted` state is gone, while the record itself stays readable by its
+/// identifier so a caller polling a delete sees that terminal state.
+fn exists_as_resource(stored: &StoredConnection) -> bool {
+    stored.connection.state != DELETED_CONNECTION_STATE
+}
+
 /// Whether `stored` is the live resource `arn` names: the stored ARN matches field
 /// for field, and the connection has not reached the terminal deleted state.
 fn holds_arn(stored: &StoredConnection, arn: &str) -> bool {
-    stored.connection.arn == arn && stored.connection.state != DELETED_CONNECTION_STATE
+    stored.connection.arn == arn && exists_as_resource(stored)
 }
 
 /// The `ConnectionState` a new connection is returned in ("requested: The initial
