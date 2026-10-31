@@ -1,0 +1,766 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! @op StartSpeechSynthesisStream
+//!
+//! `POST /v1/synthesisStream -> 200`. Opens a bidirectional synthesis stream:
+//! reads the synthesis parameters off the request headers, consumes the
+//! `TextEvent` / `CloseStreamEvent` action events the caller frames into the
+//! request body, and answers with the modelled `AudioEvent` frames for the text it
+//! was sent followed by the `StreamClosedEvent` that closes the stream.
+//!
+//! ## What is real, and what the emulator cannot do
+//!
+//! THE EMULATOR PERFORMS NO TEXT-TO-SPEECH — the same statement
+//! [`super::synthesize_speech`] makes, and for the same reason: there is no speech
+//! synthesiser in this process and none it may reach. So each `AudioEvent` carries
+//! a SILENT signal, encoded in the format the request asked for and lasting as long
+//! as this emulator's timeline model
+//! ([`super::synthesize_speech::CHARACTERS_PER_SECOND`]) says the text it covers
+//! takes to speak. Nothing is echoed back and no bytes are matched against the
+//! input.
+//!
+//! Everything around the synthesis is computed from the request and from state, and
+//! is the same rule the single-shot sibling applies, so the two operations cannot
+//! disagree:
+//!
+//! * `Engine` admits only the engine the model documents for this operation —
+//!   "currently, only the `generative` engine is supported"
+//!   ([`STREAMING_ENGINE`]) — and the voice the request names must support it, as
+//!   the voice catalog `DescribeVoices` serves records it;
+//! * `OutputFormat` admits the AUDIO formats only, because "Amazon Polly does not
+//!   support JSON speech marks" on this operation, and this stream carries audio
+//!   chunks;
+//! * `SampleRate` is accepted only when it is one of the spellings the chosen
+//!   format enumerates ([`super::synthesize_speech::valid_sample_rates`]), and
+//!   defaults per format and engine the same way;
+//! * every name in `LexiconNames` is resolved in the lexicon store of the Region
+//!   the request was signed for;
+//! * `LanguageCode` has to be a language the voice speaks;
+//! * each `TextEvent` is billed the way Amazon Polly bills characters — every
+//!   character of plain text, and for `ssml` the text content only — and `ssml`
+//!   text is read as a real XML document and checked against the SSML vocabulary
+//!   Amazon Polly publishes, so a document that is not well-formed, or markup
+//!   outside that vocabulary, is refused rather than synthesised;
+//! * `StreamClosedEvent$RequestCharacters` is "the total number of characters
+//!   synthesized during the streaming session" — the sum of those billed counts.
+//!
+//! One format is not served: `ogg_vorbis` needs a Vorbis encoder's
+//! encoder-generated codebooks, which no pure-Rust encoder publishes and no
+//! external process here can supply, so it answers the scaffold's 501 exactly as
+//! `SynthesizeSpeech` does for it rather than a stream no decoder accepts.
+//!
+//! ## Where the audio events fall
+//!
+//! `TextEvent$FlushStreamConfiguration` decides that: it "specifies whether to
+//! force the synthesis engine to immediately write buffered audio data to the
+//! output stream". So the billed characters of each `TextEvent` accumulate, and the
+//! accumulated audio is written as ONE `AudioEvent` at each flush point — a
+//! `TextEvent` whose `FlushStreamConfiguration$Force` is set, and the end of the
+//! input stream, where `CloseStreamEvent` says "all audio will be returned". A
+//! stream that forces no flush therefore answers with the audio of its whole text
+//! in one chunk, which is the audio `SynthesizeSpeech` answers for that same text.
+//!
+//! ## Why this operation is hand-authored
+//!
+//! Its input carries a `@streaming` event-stream member and its output is a
+//! `@streaming` union. The op-stub generator declines the first
+//! (`src/ops/SKIPPED_STUBS.md`) and the generated `ErasedOperation` shim declines
+//! the second, because `serialize_as_event_stream<P>` needs a `Sized` protocol that
+//! an object-safe `run` cannot hand it. The framing, the request reader, the
+//! response and the routing seam are the shared ones in
+//! `service_common::event_stream`; `src/service.rs` routes a request here through
+//! `Service::override_operation`, which the router consults BEFORE the generated
+//! routing table. Two things are local to this file, both because the shared module
+//! has nothing for them. The ONE frame written here is the `AudioEvent`:
+//! `AudioChunk` is that event's `@eventPayload`, so the frame payload is the raw
+//! chunk rather than a JSON object carrying a member, which the protocol's generic
+//! event serializer cannot express. And the two READERS a streaming input needs —
+//! the header-bound half of the request, and one frame's payload — are driven
+//! through the shared `deserialize_request` here, the same way
+//! `service-com-amazonaws-transcribestreaming-transcribe` drives them in its own
+//! crate; the generic home for both is that shared module, whose header already
+//! books that migration together with the Transcribe Streaming copies.
+//!
+//! ## Input (every member an `@httpHeader` except the payload)
+//!
+//! * `Engine` (Engine: generative | long-form | neural | standard) **required**
+//! * `OutputFormat` (OutputFormat: json | mp3 | ogg_opus | ogg_vorbis | pcm |
+//!   mulaw | alaw) **required**
+//! * `VoiceId` (VoiceId) **required**
+//! * `LanguageCode` (LanguageCode), `LexiconNames` (list, len 0..5), `SampleRate`
+//!   (string)
+//! * `ActionStream` (`@httpPayload`, `@streaming` union of `TextEvent`,
+//!   `CloseStreamEvent`)
+//!
+//! ## Output
+//!
+//! * `EventStream` (`@httpPayload`, `@streaming` union of `AudioEvent`,
+//!   `StreamClosedEvent`, and the four errors below as in-band exceptions) — the
+//!   response body, HTTP 200.
+//!
+//! ## Errors
+//!
+//! * `ValidationException` (HTTP 400) — "the input fails to satisfy the constraints
+//!   specified by the service", with the `reason` naming the class:
+//!   `fieldValidationFailed` for a header the rules above refuse,
+//!   `invalidInboundEvent` for an action event the input union does not admit or
+//!   that is not valid, and `other` for a stream past this emulator's capacity.
+//! * `ServiceFailureException` (HTTP 500) — this service's own state is unreachable.
+//! * `ThrottlingException` (HTTP 400) and `ServiceQuotaExceededException` (HTTP 402)
+//!   are modelled and declared, and nothing here constructs either: see the note on
+//!   each shape in `super::types`.
+
+#[allow(unused_imports)]
+use super::types::*;
+use super::synthesize_speech::{
+    audio, billed_characters, default_sample_rate, resolve_sample_rate, spoken_duration_ms,
+    valid_sample_rates, DEFAULT_TEXT_TYPE,
+};
+use aws_smithy_eventstream::frame::{read_message_from, write_message_to};
+use aws_smithy_runtime_api::http::{Request, Response};
+use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
+use bytes::Buf;
+use service_common::event_stream::{
+    deserialize_request, error_response, event_stream_only_response, frame_event,
+};
+use smithy_server_runtime::{BoxFuture, OperationContext, ServerHttpProtocol, Service};
+use std::sync::Arc;
+
+smithy_macros::smithy_model!("smithy-model/com-amazonaws-polly-parrot-v1.json");
+
+/// The URI the model binds this operation to
+/// (smithy_query(query="operation", operation="StartSpeechSynthesisStream"):
+/// `POST /v1/synthesisStream`). `src/service.rs` routes that method and path here.
+pub const MODELED_PATH: &str = "/v1/synthesisStream";
+
+/// The one engine this operation accepts.
+///
+/// `StartSpeechSynthesisStreamInput$Engine`: "Currently, only the
+/// `generative` engine is supported. If you specify a voice that the selected
+/// engine doesn't support, Amazon Polly returns an error."
+pub const STREAMING_ENGINE: &str = "generative";
+
+/// The most action events one stream may carry.
+///
+/// A caller chooses both how many frames a body holds and how small each one is, so
+/// decoding them is work a caller sizes: a body the transport accepts still holds
+/// hundreds of thousands of tiny frames, and each one becomes a decoded event and a
+/// flush point. The count is refused before any of that work is done.
+pub const MAX_ACTION_EVENTS: usize = 1024;
+
+/// The most characters one stream synthesizes here.
+///
+/// CHOSEN, not an Amazon Polly quota: a stream is open-ended and the real service
+/// publishes no total for it, while this emulator buffers the whole answer before
+/// sending it, and every billed character becomes audio bytes
+/// ([`super::synthesize_speech::CHARACTERS_PER_SECOND`]). The bound is the total
+/// `SynthesizeSpeech` documents for ONE request, so a stream's buffered answer is
+/// the same order of size as that operation's and the two cost the same memory.
+pub const MAX_STREAM_CHARACTERS: usize = super::synthesize_speech::MAX_TOTAL_CHARACTERS;
+
+/// How many action events are handled between yields to the runtime.
+///
+/// Decoding frames and encoding audio is synchronous work inside an async future,
+/// and a future with no await point cannot be cancelled or timed out part-way;
+/// yielding every so often gives a cancellation somewhere to land.
+const EVENTS_PER_YIELD: usize = 64;
+
+/// Event-stream prelude headers.
+const FRAME_HEADER_MESSAGE_TYPE: &str = ":message-type";
+const FRAME_HEADER_EVENT_TYPE: &str = ":event-type";
+const FRAME_HEADER_CONTENT_TYPE: &str = ":content-type";
+/// The `:message-type` of a union member; a client sends only these.
+const FRAME_MESSAGE_TYPE_EVENT: &str = "event";
+/// The `:content-type` an `@eventPayload` blob frame declares.
+const FRAME_CONTENT_TYPE_BINARY: &str = "application/octet-stream";
+
+/// The members of `StartSpeechSynthesisStreamActionStream` (the input union).
+const MEMBER_TEXT_EVENT: &str = "TextEvent";
+const MEMBER_CLOSE_STREAM_EVENT: &str = "CloseStreamEvent";
+/// The two members of `StartSpeechSynthesisStreamEventStream` this stream carries.
+const MEMBER_AUDIO_EVENT: &str = "AudioEvent";
+const MEMBER_STREAM_CLOSED_EVENT: &str = "StreamClosedEvent";
+
+/// The `ValidationExceptionReason` values this operation answers with.
+const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
+const REASON_INVALID_INBOUND_EVENT: &str = "invalidInboundEvent";
+const REASON_OTHER: &str = "other";
+
+// `#[operation_error]` below expands to an invocation of the LOCAL declarative
+// `smithy!` macro, which the `smithy_model!` line above is what emits into this
+// module.
+//
+// The operation's MODELED errors: the macro accepts exactly the variants the model
+// declares for the operation, so all four are here even though only two are ever
+// constructed (`super::types` records why for the other two).
+#[smithy_macros::operation_error("com.amazonaws.polly#StartSpeechSynthesisStream")]
+#[derive(Debug)]
+pub enum StartSpeechSynthesisStreamErrorModeled {
+    ServiceFailureException(ServiceFailureException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
+    ThrottlingException(ThrottlingException),
+    ValidationException(ValidationException),
+}
+
+/// This operation's error channel. The wrapper is what lets the one format this
+/// emulator cannot encode answer the scaffold's 501 rather than a success carrying
+/// a stream no decoder accepts.
+pub type StartSpeechSynthesisStreamError =
+    crate::scaffolded::Scaffolded<StartSpeechSynthesisStreamErrorModeled>;
+
+/// Lets a modelled failure lift into the error channel with `.into()`.
+impl From<StartSpeechSynthesisStreamErrorModeled> for StartSpeechSynthesisStreamError {
+    fn from(modeled: StartSpeechSynthesisStreamErrorModeled) -> Self {
+        crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// Refuse one header-bound member, the way the service's own request-validation
+/// envelope words a refusal: the member's path, the value that failed and the
+/// constraint it failed.
+///
+/// `name` is the member's path in the envelope's own lowerCamel convention, and
+/// `constraint` states what the member must satisfy; both also travel in the
+/// modelled `fields` list, which is where a client reads WHICH member to fix.
+fn field_refusal(name: &str, value: &str, constraint: &str) -> StartSpeechSynthesisStreamError {
+    StartSpeechSynthesisStreamErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "1 validation error detected: Value '{value}' at '{name}' failed to satisfy \
+             constraint: {constraint}"
+        ),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        fields: Some(vec![ValidationExceptionField {
+            name: name.to_string(),
+            message: constraint.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// Refuse an action event the input stream may not carry: one the union does not
+/// admit, one that is not a readable event, or one that arrives after the stream
+/// was closed.
+fn inbound_event_refusal(message: impl Into<String>) -> StartSpeechSynthesisStreamError {
+    StartSpeechSynthesisStreamErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: REASON_INVALID_INBOUND_EVENT.to_string(),
+        fields: None,
+    })
+    .into()
+}
+
+/// Refuse a stream past this emulator's own capacity — neither a field of the
+/// request nor a malformed event, so the reason is the model's catch-all.
+fn capacity_refusal(message: impl Into<String>) -> StartSpeechSynthesisStreamError {
+    StartSpeechSynthesisStreamErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: REASON_OTHER.to_string(),
+        fields: None,
+    })
+    .into()
+}
+
+/// This service's own state could not be reached.
+fn service_failure() -> StartSpeechSynthesisStreamError {
+    StartSpeechSynthesisStreamErrorModeled::ServiceFailureException(
+        crate::service::errors::service_failure(),
+    )
+    .into()
+}
+
+/// The `OutputFormat` values this operation accepts: every value of the model's
+/// enum except the speech-mark one, which this operation does not support.
+fn audio_output_formats() -> Vec<&'static str> {
+    OUTPUT_FORMAT_VALUES
+        .iter()
+        .copied()
+        .filter(|format| *format != SPEECH_MARK_OUTPUT_FORMAT)
+        .collect()
+}
+
+/// The `OutputFormat` that carries speech marks rather than audio.
+const SPEECH_MARK_OUTPUT_FORMAT: &str = "json";
+
+/// The one `OutputFormat` this emulator has no encoder for.
+///
+/// A conformant Vorbis stream needs a setup header of encoder-generated codebooks,
+/// and no pure-Rust Vorbis encoder is published, so there is nothing to frame for it
+/// — the same gap `SynthesizeSpeech` answers the scaffold's 501 for.
+const UNENCODABLE_OUTPUT_FORMAT: &str = "ogg_vorbis";
+
+/// One decoded member of `StartSpeechSynthesisStreamActionStream`.
+#[derive(Debug, Clone)]
+enum ActionEvent {
+    /// Text to synthesize, as the caller framed it.
+    Text(TextEvent),
+    /// The end of the input stream.
+    CloseStream,
+}
+
+/// The `StartSpeechSynthesisStream` operation.
+///
+/// Owns the shared engine (the constructor seam). The generated routing table holds
+/// one of these — where its `ErasedOperation` shim declines a `@streaming`-output
+/// operation — and `service.rs` holds another wrapped in an `EventStreamRoute`;
+/// both reach the same lexicons and the same voice catalog, because that state
+/// lives in the shared engine rather than on the operation.
+pub struct StartSpeechSynthesisStream<Eng> {
+    engine: Arc<Eng>,
+}
+
+impl<Eng> StartSpeechSynthesisStream<Eng> {
+    /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
+    /// construction-time dependency, so engine access is guaranteed by the time any
+    /// request runs.
+    pub fn new(engine: Arc<Eng>) -> Self {
+        Self { engine }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> StartSpeechSynthesisStream<Eng> {
+    /// The whole request: settle the synthesis parameters, consume the action
+    /// events, and frame the audio and the closing event they produce.
+    async fn respond(
+        &self,
+        protocol: &dyn ServerHttpProtocol,
+        req: &Request,
+        ctx: &OperationContext<'_>,
+    ) -> Result<Response, StartSpeechSynthesisStreamError> {
+        let settings = settings_from_headers(protocol, req).map_err(|message| {
+            // The header half is read and checked by the MODEL (its enums, its list
+            // length), so this sentence is the framework's own envelope, naming the
+            // member that failed as that boundary names it; it carries no `fields`
+            // list because the boundary reports the member in the sentence rather
+            // than as a member path this code could lift out of it.
+            StartSpeechSynthesisStreamErrorModeled::ValidationException(ValidationException {
+                message,
+                reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+                fields: None,
+            })
+        })?;
+
+        let output_format = settings.output_format.as_str();
+        if settings.engine != STREAMING_ENGINE {
+            return Err(field_refusal(
+                "engine",
+                &settings.engine,
+                &format!("Member must satisfy enum value set [{STREAMING_ENGINE}]"),
+            ));
+        }
+        if output_format == SPEECH_MARK_OUTPUT_FORMAT {
+            // "Currently, Amazon Polly does not support JSON speech marks"
+            // (`StartSpeechSynthesisStreamInput$OutputFormat`), and this stream
+            // carries audio chunks, so the accepted set is the audio formats.
+            return Err(field_refusal(
+                "outputFormat",
+                output_format,
+                &format!(
+                    "Member must satisfy enum value set [{}]",
+                    audio_output_formats().join(", ")
+                ),
+            ));
+        }
+        if output_format == UNENCODABLE_OUTPUT_FORMAT {
+            // Decided HERE, with the other parameter rules, rather than when audio is
+            // first built: whether a format can be encoded at all is a property of
+            // the format, so the answer may not depend on whether the stream then
+            // carried any text.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartSpeechSynthesisStream with OutputFormat ogg_vorbis",
+            ));
+        }
+        let sample_rate = match settings.sample_rate.as_deref() {
+            Some(requested) => resolve_sample_rate(output_format, requested).ok_or_else(|| {
+                field_refusal(
+                    "sampleRate",
+                    requested,
+                    &format!(
+                        "Member must satisfy enum value set [{}]",
+                        valid_sample_rates(output_format).join(", ")
+                    ),
+                )
+            })?,
+            None => default_sample_rate(output_format, &settings.engine),
+        };
+
+        // The two state reads: the lexicons this request names must be stored in the
+        // Region it was signed for, and the voice it names decides which engine and
+        // which language it may ask for — read off the catalog `DescribeVoices`
+        // serves, so the two operations cannot disagree about a voice.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(service_failure)?;
+        if let Some(names) = settings.lexicon_names.as_ref() {
+            let region = crate::state::request_region(ctx.parts());
+            let guard = state.lock();
+            let missing = names
+                .iter()
+                .find(|name| guard.lexicon(&region, name).is_none())
+                .cloned();
+            drop(guard);
+            if let Some(missing) = missing {
+                return Err(field_refusal(
+                    "lexiconNames",
+                    &missing,
+                    "Member must name a lexicon stored in this Region",
+                ));
+            }
+        }
+        // The voice catalog carries one row for every value of the model's `VoiceId`
+        // enum (`crate::state::VOICE_CATALOG`), and the boundary has already refused
+        // a value outside that enum, so every request that reaches here names a
+        // catalogued voice. The lookup still FAILS CLOSED: a catalog that stopped
+        // covering the enum would be this emulator's own fault, and is reported as
+        // one rather than serving a stream whose voice nothing checked.
+        // `SynthesizeSpeech` reads the voice the same way, so the two cannot disagree
+        // about one.
+        let voice = {
+            let guard = state.lock();
+            guard
+                .voices
+                .iter()
+                .find(|voice| voice.id == settings.voice_id)
+                .copied()
+        };
+        let voice = voice.ok_or_else(service_failure)?;
+        if !voice.supports_engine(STREAMING_ENGINE) {
+            return Err(field_refusal(
+                "voiceId",
+                &settings.voice_id,
+                &format!("Member must be a voice that supports the {STREAMING_ENGINE} engine"),
+            ));
+        }
+        // A bilingual voice's additional language counts, which is what
+        // `LanguageCode` is for.
+        if let Some(language) = settings.language_code.as_deref() {
+            if !voice.speaks(language, true) {
+                return Err(field_refusal(
+                    "languageCode",
+                    language,
+                    &format!(
+                        "Member must be a language the voice {} speaks",
+                        settings.voice_id
+                    ),
+                ));
+            }
+        }
+
+        let events = decode_action_stream(protocol, req).await?;
+        frame_stream(protocol, output_format, sample_rate, &events).await
+    }
+}
+
+/// Consume the action events in arrival order and frame what they produce: one
+/// `AudioEvent` per flush point, then the `StreamClosedEvent` carrying the
+/// characters the session synthesized.
+async fn frame_stream(
+    protocol: &dyn ServerHttpProtocol,
+    output_format: &str,
+    sample_rate: u32,
+    events: &[ActionEvent],
+) -> Result<Response, StartSpeechSynthesisStreamError> {
+    let mut frames: Vec<u8> = Vec::new();
+    // The characters billed since the last flush, and over the whole session.
+    let mut buffered = 0usize;
+    let mut synthesized = 0usize;
+    for (index, event) in events.iter().enumerate() {
+        if index % EVENTS_PER_YIELD == EVENTS_PER_YIELD - 1 {
+            tokio::task::yield_now().await;
+        }
+        let text_event = match event {
+            ActionEvent::Text(text_event) => text_event,
+            // "After sending this event, the input stream will be closed and all
+            // audio will be returned" — so nothing after it is consumed, and the
+            // flush below is what returns that audio.
+            ActionEvent::CloseStream => break,
+        };
+        let text_type = text_event.text_type.as_deref().unwrap_or(DEFAULT_TEXT_TYPE);
+        // `ssml` text is read as a real XML document against the published SSML
+        // vocabulary, and what is billed is its text content; plain text bills every
+        // character. The same rule, and the same reader, `SynthesizeSpeech` applies.
+        let billed = billed_characters(&text_event.text, text_type)
+            .map_err(|_| inbound_event_refusal(crate::service::errors::INVALID_SSML.to_string()))?;
+        synthesized = synthesized.saturating_add(billed);
+        if synthesized > MAX_STREAM_CHARACTERS {
+            // Checked BEFORE any audio is built, so every allocation below is sized
+            // from a count this bound already dominates rather than from the text
+            // the caller sent.
+            return Err(capacity_refusal(format!(
+                "the input stream carries more than the {MAX_STREAM_CHARACTERS} characters this \
+                 emulator synthesizes in one stream"
+            )));
+        }
+        buffered = buffered.saturating_add(billed);
+        let forced = text_event
+            .flush_stream_configuration
+            .as_ref()
+            .is_some_and(|flush| flush.force);
+        if forced {
+            flush(&mut frames, output_format, sample_rate, &mut buffered)?;
+        }
+    }
+    // The input stream ends with the request body, so whatever is still buffered is
+    // written out before the stream closes.
+    flush(&mut frames, output_format, sample_rate, &mut buffered)?;
+
+    let closed = StreamClosedEvent {
+        request_characters: i32::try_from(synthesized).unwrap_or(i32::MAX),
+    };
+    frames.extend_from_slice(
+        &frame_event(
+            protocol,
+            MEMBER_STREAM_CLOSED_EVENT,
+            false,
+            &closed,
+            &StreamClosedEvent::SCHEMA,
+        )
+        .map_err(|_| service_failure())?,
+    );
+    // `StartSpeechSynthesisStreamOutput` binds no header: the stream IS the response.
+    Ok(event_stream_only_response(frames))
+}
+
+/// Write the audio of the buffered characters as one `AudioEvent`, and empty the
+/// buffer. A flush with nothing buffered writes no frame: there is no audio to
+/// return for text that was never sent.
+fn flush(
+    frames: &mut Vec<u8>,
+    output_format: &str,
+    sample_rate: u32,
+    buffered: &mut usize,
+) -> Result<(), StartSpeechSynthesisStreamError> {
+    let billed = std::mem::take(buffered);
+    if billed == 0 {
+        return Ok(());
+    }
+    let chunk = synthesized_chunk(output_format, sample_rate, billed)?;
+    // `AudioEvent$AudioChunk` is the event's `@eventPayload`, so the frame payload
+    // IS the chunk — which is why this one frame is written here rather than through
+    // the protocol's generic event serializer, whose JSON object would carry the
+    // chunk as a member instead.
+    let message = Message::new(chunk)
+        .add_header(Header::new(
+            FRAME_HEADER_MESSAGE_TYPE,
+            HeaderValue::String(FRAME_MESSAGE_TYPE_EVENT.into()),
+        ))
+        .add_header(Header::new(
+            FRAME_HEADER_EVENT_TYPE,
+            HeaderValue::String(MEMBER_AUDIO_EVENT.into()),
+        ))
+        .add_header(Header::new(
+            FRAME_HEADER_CONTENT_TYPE,
+            HeaderValue::String(FRAME_CONTENT_TYPE_BINARY.into()),
+        ));
+    write_message_to(&message, frames).map_err(|_| service_failure())?;
+    Ok(())
+}
+
+/// The audio for `billed` characters, in the encoding the request settled.
+///
+/// Every byte of it is silence — see the module note — and every encoder is the one
+/// `SynthesizeSpeech` answers that format with, so one request's audio and one
+/// stream's audio for the same text are the same bytes.
+fn synthesized_chunk(
+    output_format: &str,
+    sample_rate: u32,
+    billed: usize,
+) -> Result<Vec<u8>, StartSpeechSynthesisStreamError> {
+    let duration_ms = spoken_duration_ms(billed);
+    match output_format {
+        "pcm" => Ok(audio::pcm_silence(sample_rate, duration_ms)),
+        "mulaw" => Ok(audio::mulaw_silence(sample_rate, duration_ms)),
+        "alaw" => Ok(audio::alaw_silence(sample_rate, duration_ms)),
+        // The rate was settled against the format's own documented value set before
+        // the stream was accepted, and every one of those values is a rate these
+        // encoders carry, so a `None` here is this emulator failing to encode a rate
+        // it admitted — a server fault, never a second refusal of a member the
+        // request was already told was acceptable.
+        "mp3" => audio::mp3_silence(sample_rate, duration_ms).ok_or_else(service_failure),
+        "ogg_opus" => audio::ogg_opus_silence(sample_rate, duration_ms).ok_or_else(service_failure),
+        // Refused with the other parameter rules in `respond`, so this arm is the
+        // exhaustiveness of the match rather than the path a request takes.
+        UNENCODABLE_OUTPUT_FORMAT => Err(crate::scaffolded::Scaffolded::not_implemented(
+            "StartSpeechSynthesisStream with OutputFormat ogg_vorbis",
+        )),
+        // `respond` has already narrowed `OutputFormat` to the formats this
+        // operation serves, so reaching here would be this emulator failing to
+        // encode a format it admitted — a server fault, like the two arms above,
+        // never a second refusal of a member the request was told was acceptable.
+        _ => Err(service_failure()),
+    }
+}
+
+/// Read the `@httpHeader`-bound half of the request into the settings shape and
+/// check it against the model.
+///
+/// Driven through the shared request reader over a copy of the request whose body is
+/// EMPTY: every member of the settings shape is header-bound (its event-stream
+/// payload member is excluded from it), so an empty body is what keeps the body
+/// codec from being pointed at event-stream frames, and the model's own enums and
+/// bounds are what admit or refuse the request. `Err` carries the refusal sentence
+/// the framework's own boundary would have worded.
+fn settings_from_headers(
+    protocol: &dyn ServerHttpProtocol,
+    req: &Request,
+) -> Result<StartSpeechSynthesisStreamSettings, String> {
+    let mut headers_only = Request::new(SdkBody::empty());
+    headers_only
+        .set_uri(req.uri())
+        .map_err(|error| format!("the request URI could not be read: {error}"))?;
+    headers_only
+        .set_method(req.method())
+        .map_err(|error| format!("the request method could not be read: {error}"))?;
+    for (name, value) in req.headers().iter() {
+        headers_only
+            .headers_mut()
+            .append(name.to_string(), value.to_string());
+    }
+    deserialize_request(
+        protocol,
+        &headers_only,
+        &StartSpeechSynthesisStreamSettings::SCHEMA,
+    )
+}
+
+/// Read ONE decoded frame's payload into the modelled event structure and check it
+/// against the model.
+///
+/// The payload is handed to the shared request reader as a body, and an event shape
+/// binds no HTTP member, so the protocol's body codec is what parses it. An event
+/// whose structure carries an `@eventPayload` member is not read this way — there
+/// the frame payload IS that member's raw value.
+fn event_payload<T>(
+    protocol: &dyn ServerHttpProtocol,
+    payload: &[u8],
+    schema: &aws_smithy_schema::Schema,
+) -> Result<T, String>
+where
+    T: aws_smithy_schema_server::DeserializableStruct + aws_smithy_schema::serde::SerializableStruct,
+{
+    let body = Request::new(SdkBody::from(payload.to_vec()));
+    deserialize_request(protocol, &body, schema)
+}
+
+/// Split the request body into the action events it frames, in arrival order.
+///
+/// Each frame names its union member in the `:event-type` header the AWS SDKs set;
+/// a `TextEvent`'s payload is the event structure in the protocol's own body
+/// format, which is what reads it back into the modelled shape. An EMPTY body is a
+/// stream that carried no action event, which is not a refusal: `ActionStream` is
+/// not a required member.
+async fn decode_action_stream(
+    protocol: &dyn ServerHttpProtocol,
+    req: &Request,
+) -> Result<Vec<ActionEvent>, StartSpeechSynthesisStreamError> {
+    let body = req
+        .body()
+        .bytes()
+        .ok_or_else(|| inbound_event_refusal("the request body is not available as bytes"))?;
+    let mut buffer = bytes::Bytes::copy_from_slice(body);
+    let mut events: Vec<ActionEvent> = Vec::new();
+    let mut closed = false;
+    while buffer.has_remaining() {
+        if events.len() % EVENTS_PER_YIELD == EVENTS_PER_YIELD - 1 {
+            tokio::task::yield_now().await;
+        }
+        if events.len() >= MAX_ACTION_EVENTS {
+            return Err(capacity_refusal(format!(
+                "the input stream carries more than the {MAX_ACTION_EVENTS} events this emulator \
+                 accepts in one request"
+            )));
+        }
+        let before = buffer.remaining();
+        let message = read_message_from(&mut buffer).map_err(|e| {
+            inbound_event_refusal(format!(
+                "the request body is not a valid {} message stream: {e}",
+                service_common::event_stream::EVENT_STREAM_CONTENT_TYPE
+            ))
+        })?;
+        if buffer.remaining() >= before {
+            return Err(inbound_event_refusal(
+                "the request body carries a zero-length event-stream frame",
+            ));
+        }
+        let header = |name: &str| {
+            message
+                .headers()
+                .iter()
+                .find(|header| header.name().as_str() == name)
+                .and_then(|header| match header.value() {
+                    HeaderValue::String(value) => Some(value.as_str().to_string()),
+                    _ => None,
+                })
+        };
+        let message_type = header(FRAME_HEADER_MESSAGE_TYPE).unwrap_or_default();
+        if message_type != FRAME_MESSAGE_TYPE_EVENT {
+            return Err(inbound_event_refusal(format!(
+                "an event-stream frame with {FRAME_HEADER_MESSAGE_TYPE} '{message_type}' may not \
+                 be sent on an input stream; only '{FRAME_MESSAGE_TYPE_EVENT}' frames may"
+            )));
+        }
+        let event_type = header(FRAME_HEADER_EVENT_TYPE).ok_or_else(|| {
+            inbound_event_refusal(format!(
+                "an event-stream frame carries no {FRAME_HEADER_EVENT_TYPE} header naming the \
+                 event it is"
+            ))
+        })?;
+        if closed {
+            return Err(inbound_event_refusal(format!(
+                "a {event_type} follows the {MEMBER_CLOSE_STREAM_EVENT} that closed the input \
+                 stream; no event may be sent on a closed input stream"
+            )));
+        }
+        match event_type.as_str() {
+            MEMBER_TEXT_EVENT => {
+                let text_event: TextEvent =
+                    event_payload(protocol, message.payload(), &TextEvent::SCHEMA)
+                        .map_err(inbound_event_refusal)?;
+                events.push(ActionEvent::Text(text_event));
+            }
+            MEMBER_CLOSE_STREAM_EVENT => {
+                closed = true;
+                events.push(ActionEvent::CloseStream);
+            }
+            other => {
+                return Err(inbound_event_refusal(format!(
+                    "'{other}' is not a member of StartSpeechSynthesisStreamActionStream; send \
+                     {MEMBER_TEXT_EVENT} or {MEMBER_CLOSE_STREAM_EVENT} events"
+                )))
+            }
+        }
+    }
+    Ok(events)
+}
+
+impl<Eng: Send + Sync + 'static> service_common::event_stream::EventStreamOperation
+    for StartSpeechSynthesisStream<Eng>
+{
+    fn serve<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, Response> {
+        Box::pin(async move {
+            // This service overrides its wire protocol (`crate::service::wire`), so
+            // the stream is framed and its failures are rendered through the SAME
+            // codec every other operation of it answers in.
+            let protocol = svc
+                .override_protocol()
+                .unwrap_or_else(|| svc.definition().protocol());
+            let response = match self.respond(protocol, req, ctx).await {
+                Ok(response) => response,
+                Err(error) => error_response(protocol, &error),
+            };
+            // One access record per request, so a refused stream is diagnosable. No
+            // request payload and no credential reaches it.
+            tracing::debug!(
+                operation = "StartSpeechSynthesisStream",
+                service = ctx.identity().signing_name(),
+                method = ctx.parts().method.as_str(),
+                status = response.status().as_u16(),
+                "served an event-stream request"
+            );
+            response
+        })
+    }
+}

@@ -68,7 +68,31 @@ impl Polly {
         path: &str,
         body: &str,
     ) -> http::Response<Bytes> {
-        let request = http::Request::builder()
+        self.call_bytes_in_region(
+            region,
+            method,
+            path,
+            &[("content-type", "application/json")],
+            body.as_bytes().to_vec(),
+        )
+        .await
+    }
+
+    /// One call whose body is BYTES and whose request headers the caller chooses —
+    /// the shape an operation that binds its input to headers and its payload to an
+    /// event stream takes.
+    ///
+    /// Every call above goes through this one, so there is a single definition of how
+    /// a test request is signed and addressed.
+    pub(crate) async fn call_bytes_in_region(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> http::Response<Bytes> {
+        let mut request = http::Request::builder()
             .method(method)
             .uri(format!("https://polly.{region}.amazonaws.com{path}"))
             .header(
@@ -77,9 +101,12 @@ impl Polly {
                     "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/polly/aws4_request, \
                      SignedHeaders=host, Signature=0"
                 ),
-            )
-            .header("content-type", "application/json")
-            .body(Bytes::from(body.to_owned()))
+            );
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request
+            .body(Bytes::from(body))
             .expect("a well-formed test request");
         self.router.dispatch(request).await
     }

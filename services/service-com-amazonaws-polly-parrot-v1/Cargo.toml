@@ -7,6 +7,10 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# The `vnd.amazon.eventstream` framing, the request reader and the routing seam the
+# hand-authored `StartSpeechSynthesisStream` needs, plus the shared request-path
+# reader that routes it.
+service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -33,6 +37,11 @@ ogg = "0.9"
 # rather than scanning the text by hand. `v5` is for the deterministic task ids
 # the test fixtures derive from a label.
 uuid = { version = "1", features = ["v4", "v5"] }
+# Encodes and decodes one `application/vnd.amazon.eventstream` frame:
+# `StartSpeechSynthesisStream` reads the caller's action events out of the request
+# body and writes each `AudioEvent` frame, whose `@eventPayload` chunk the
+# protocol's generic event serializer cannot express.
+aws-smithy-eventstream = "0.60"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

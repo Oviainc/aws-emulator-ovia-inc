@@ -22,6 +22,7 @@ pub mod list_lexicons_types;
 pub mod list_speech_synthesis_tasks_types;
 pub mod put_lexicon_types;
 pub mod shared_types;
+pub mod start_speech_synthesis_stream_types;
 pub mod start_speech_synthesis_task_types;
 pub mod synthesize_speech_types;
 
@@ -41,6 +42,8 @@ pub use list_speech_synthesis_tasks_types::*;
 pub use put_lexicon_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use start_speech_synthesis_stream_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use start_speech_synthesis_task_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

@@ -45,6 +45,8 @@ mod sample_rate_spelling;
 mod shared_pls_fixture;
 #[path = "all/speech_mark_stream_for_every_text_type.rs"]
 mod speech_mark_stream_for_every_text_type;
+#[path = "all/speech_synthesis_stream.rs"]
+mod speech_synthesis_stream;
 #[path = "all/ssml_billed_characters.rs"]
 mod ssml_billed_characters;
 #[path = "all/ssml_vocabulary.rs"]

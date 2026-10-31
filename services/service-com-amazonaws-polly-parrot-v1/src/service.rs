@@ -54,6 +54,10 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+use crate::ops::start_speech_synthesis_stream::{self, StartSpeechSynthesisStream};
+use service_common::event_stream::EventStreamRoute;
+use service_common::request_path;
+
 pub mod wire;
 /// What XML itself admits around a document element, for the operations that read one.
 pub mod xml;
@@ -69,6 +73,16 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// document of [`wire`]. Built once here because [`Service::override_protocol`]
     /// hands back a borrow of it.
     protocol: wire::NullMessageRestJson,
+    /// The one event-stream operation this service serves. It is in the generated
+    /// routing table too, but not in a servable form: the generated
+    /// `ErasedOperation` shim of an operation whose output is a `@streaming` union
+    /// declines the request (it cannot drive `serialize_as_event_stream<P>` through
+    /// an object-safe `run`), so this copy is held behind an [`EventStreamRoute`]
+    /// and routed by [`EmulatedService::override_operation`] — which the router
+    /// consults FIRST, before the generated table. Both copies read the same
+    /// lexicons and the same voice catalog, because that state lives in the shared
+    /// engine rather than on the operation.
+    start_speech_synthesis_stream: EventStreamRoute<StartSpeechSynthesisStream<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -77,8 +91,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             protocol: wire::NullMessageRestJson::new(),
+            start_speech_synthesis_stream: EventStreamRoute(StartSpeechSynthesisStream::new(
+                engine,
+            )),
         }
     }
 }
@@ -109,7 +126,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        //
+        // ONE operation is routed here: `StartSpeechSynthesisStream`, whose output
+        // is a `@streaming` union and whose generated shim therefore declines the
+        // request. It is matched by the method and the path the model binds it to,
+        // through the operation's own const, so this table cannot drift from the
+        // model; every other request still resolves through the generated table.
+        if req.method() == "POST"
+            && request_path(req.uri()) == start_speech_synthesis_stream::MODELED_PATH
+        {
+            return Some(&self.start_speech_synthesis_stream);
+        }
         None
     }
 

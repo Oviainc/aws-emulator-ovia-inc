@@ -18,4 +18,19 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 `@required`-member reference cycle are NOT decline reasons — a scaffolded
 handler returns an error, so it never has to construct a value.
 
-// SKIPPED: StartSpeechSynthesisStream — unsupported shape construct: operation 'StartSpeechSynthesisStream' has a @streaming event-stream input member, which needs wire framing the generator does not emit
+`StartSpeechSynthesisStream` was skipped for that reason and is now HAND-AUTHORED,
+so it is no longer unwired: it has its own file in `src/ops/`, its shapes are in
+`src/ops/types/start_speech_synthesis_stream_types.rs`, the
+`vnd.amazon.eventstream` framing and the request reader are the shared ones in
+`service_common::event_stream`, and `src/service.rs` routes a request to it through
+`Service::override_operation` — which the router consults BEFORE the generated
+routing table, whose shim for a `@streaming`-output operation declines the request.
+
+What it does NOT do is synthesise speech: there is no speech synthesiser in this
+process, so each `AudioEvent` carries a SILENT signal in the requested encoding
+lasting as long as this emulator's timeline model says the text takes to speak —
+the same answer `SynthesizeSpeech` gives. Everything around the synthesis is real:
+the engine and voice rules, the lexicon resolution, the sample-rate domain, the
+billed character count and the modelled refusals.
+
+// HAND-AUTHORED: StartSpeechSynthesisStream — src/ops/start_speech_synthesis_stream.rs
