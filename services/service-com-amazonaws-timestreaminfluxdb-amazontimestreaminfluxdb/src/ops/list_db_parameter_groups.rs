@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDbParameterGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDbParameterGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDbParameterGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the DB parameter groups this service's state holds, in a stable
+//! order, resuming after the token a previous page handed back.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +148,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDbParameterGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDbParameterGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDbParameterGroups"))
+        use crate::state as st;
+        use ::std::ops::Bound;
+
+        let _ = ctx;
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(ListDbParameterGroupsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` is modeled `range 1..100`, so the framework has already refused
+        // anything outside it; an omitted value pages at that modeled maximum.
+        let page_size = usize::try_from(input.max_results.unwrap_or(st::MAX_RESULTS_DEFAULT))
+            .unwrap_or(st::MAX_RESULTS_DEFAULT as usize)
+            .max(1);
+
+        // Reporting only: a parameter group has no lifecycle status and owes the clock
+        // nothing, so this handler never writes.
+        let state = state.lock();
+
+        // The token is the id the previous page ended on, so a page resumes strictly
+        // after it: every stored group is yielded exactly once even if the group the
+        // token names stopped existing between pages.
+        let lower = match input.next_token.as_deref() {
+            Some(token) => Bound::Excluded(token.to_string()),
+            None => Bound::Unbounded,
+        };
+        let mut remaining = state.db_parameter_groups.range((lower, Bound::Unbounded));
+        let items: Vec<DbParameterGroupSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, record)| record.to_summary())
+            .collect();
+        // A token comes back only when a further page exists, and it names the last id
+        // on THIS page so the next request resumes after it.
+        let next_token = remaining
+            .next()
+            .and_then(|_| items.last().map(|item| item.id.clone()));
+
+        Ok(ListDbParameterGroupsOutput { items, next_token })
     }
 }

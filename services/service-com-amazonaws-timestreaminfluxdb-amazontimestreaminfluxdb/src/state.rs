@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DbBackupConfiguration, DbBackupConfigurationOutput, DbInstanceSummary,
-    LogDeliveryConfiguration, MaintenanceSchedule, Parameters,
+    DbParameterGroupSummary, LogDeliveryConfiguration, MaintenanceSchedule, Parameters,
 };
 
 /// `Status` values this service's records use, each one a member of
@@ -298,6 +298,22 @@ macro_rules! db_parameter_group_record_projections {
 db_parameter_group_record_projections! {
     to_create_output -> crate::ops::types::CreateDbParameterGroupOutput,
     to_get_output -> crate::ops::types::GetDbParameterGroupOutput,
+}
+
+impl DbParameterGroup {
+    /// The list-shaped projection of this record.
+    ///
+    /// `DbParameterGroupSummary` models only `id`, `name`, `arn` and `description`
+    /// (`smithy_query(query="shape", shape="DbParameterGroupSummary")`), so a summary
+    /// carries no `parameters`; every member it does carry comes from the stored record.
+    pub fn to_summary(&self) -> DbParameterGroupSummary {
+        DbParameterGroupSummary {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            description: self.description.clone(),
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-timestreaminfluxdb-amazontimestreaminfluxdb. A handler reaches it through [`service_state`].
