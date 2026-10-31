@@ -954,6 +954,162 @@ async fn an_ip_set_reference_judges_the_address_at_the_configured_header_positio
     }
 }
 
+/// The rule over what a forwarded-IP block ANSWERS: the refusal is generated at the
+/// edge, so the origin's own body is absent from it, and the `FallbackBehavior` decides
+/// a request whose configured position holds no valid address — the position is a
+/// position in the header as the client wrote it, so an address behind a non-address
+/// entry is not judged in its place.
+///
+/// One row per fallback behavior crossed with where the listed address sits, what the
+/// entry at the position is, and whether the header is there at all; each row asserts
+/// the status AND whether the origin's body came back, which is what says the
+/// integration ran.
+#[tokio::test]
+async fn a_forwarded_ip_block_is_answered_at_the_edge_without_the_origin_body() {
+    let edge = Edge::new();
+    let api = Api::build(&edge, "edge-forwarded-fallback").await;
+
+    /// The one address the IP set holds.
+    const LISTED: &str = "198.51.100.7";
+    const OTHER: &str = "203.0.113.9";
+
+    let ip_set = edge
+        .waf_ok(
+            "CreateIPSet",
+            json!({
+                "Name": "listed-fallback",
+                "Scope": SCOPE,
+                "IPAddressVersion": "IPV4",
+                "Addresses": [format!("{LISTED}/32")],
+            }),
+        )
+        .await;
+    let ip_set_arn = ip_set["Summary"]["ARN"]
+        .as_str()
+        .expect("Summary.ARN")
+        .to_string();
+
+    // One stage per fallback behavior, each with the same `FIRST` rule in front of it.
+    for fallback in ["NO_MATCH", "MATCH"] {
+        let stage = fallback.to_ascii_lowercase();
+        api.deploy(&edge, &stage).await;
+        let (_, arn, _) = create_web_acl(
+            &edge,
+            &format!("fallback-{stage}"),
+            json!({ "Allow": {} }),
+            json!([rule(
+                "forwarded",
+                0,
+                json!({
+                    "IPSetReferenceStatement": {
+                        "ARN": ip_set_arn,
+                        "IPSetForwardedIPConfig": {
+                            "HeaderName": "X-Forwarded-For",
+                            "FallbackBehavior": fallback,
+                            "Position": "FIRST",
+                        }
+                    }
+                }),
+                json!({ "Block": {} }),
+            )]),
+            json!({}),
+        )
+        .await;
+        associate(&edge, &arn, &api.id, &stage).await;
+    }
+
+    /// One request, the status it must be answered with, and whether the origin's body
+    /// must be part of that answer.
+    struct Case {
+        case: &'static str,
+        stage: &'static str,
+        forwarded: Option<String>,
+        status: u16,
+        from_origin: bool,
+    }
+
+    let cases = [
+        Case {
+            case: "NO_MATCH: the listed address heads the chain",
+            stage: "no_match",
+            forwarded: Some(format!("{LISTED}, {OTHER}")),
+            status: 403,
+            from_origin: false,
+        },
+        Case {
+            case: "NO_MATCH: the listed address sits second in the chain",
+            stage: "no_match",
+            forwarded: Some(format!("{OTHER}, {LISTED}")),
+            status: 200,
+            from_origin: true,
+        },
+        Case {
+            case: "NO_MATCH: the request carries no forwarded-for header",
+            stage: "no_match",
+            forwarded: None,
+            status: 200,
+            from_origin: true,
+        },
+        Case {
+            case: "NO_MATCH: the entry at the position is not an address, a listed one \
+                   follows it",
+            stage: "no_match",
+            forwarded: Some(format!("unknown, {LISTED}")),
+            status: 200,
+            from_origin: true,
+        },
+        Case {
+            case: "MATCH: the request carries no forwarded-for header",
+            stage: "match",
+            forwarded: None,
+            status: 403,
+            from_origin: false,
+        },
+        Case {
+            case: "MATCH: the entry at the position is not an address",
+            stage: "match",
+            forwarded: Some(format!("unknown, {OTHER}")),
+            status: 403,
+            from_origin: false,
+        },
+        Case {
+            case: "MATCH: the position holds an address outside the set",
+            stage: "match",
+            forwarded: Some(OTHER.to_string()),
+            status: 200,
+            from_origin: true,
+        },
+    ];
+
+    for case in &cases {
+        let headers: Vec<(&str, &str)> = case
+            .forwarded
+            .as_deref()
+            .map(|value| vec![("x-forwarded-for", value)])
+            .unwrap_or_default();
+        let answered = edge
+            .invoke(
+                &api.id,
+                "GET",
+                &format!("/{}/orders", case.stage),
+                &headers,
+                &[],
+            )
+            .await;
+        assert_eq!(
+            answered.status, case.status,
+            "case {:?}: expected status {}, got {} with {:?}",
+            case.case, case.status, answered.status, answered.body
+        );
+        let carries_origin = answered.body.contains(&origin_body("orders"));
+        assert_eq!(
+            carries_origin, case.from_origin,
+            "case {:?}: expected the origin's body present={}, got {:?}",
+            case.case, case.from_origin, answered.body
+        );
+    }
+}
+
 /// The rule over a MANAGED rule group: its rules run against the request, a
 /// `ScopeDownStatement` limits WHICH requests reach them, and the sample WAF stores
 /// names the rule within the group that decided.

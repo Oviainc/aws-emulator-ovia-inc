@@ -29,6 +29,8 @@ mod check_capacity;
 mod exception_messages;
 #[path = "all/firewall_manager_rule_groups.rs"]
 mod firewall_manager_rule_groups;
+#[path = "all/forwarded_ip_set_reference.rs"]
+mod forwarded_ip_set_reference;
 #[path = "all/get_web_acl_for_resource.rs"]
 mod get_web_acl_for_resource;
 #[path = "all/invalid_permission_policy_message.rs"]

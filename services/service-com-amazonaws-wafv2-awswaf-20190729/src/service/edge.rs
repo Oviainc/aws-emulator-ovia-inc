@@ -2053,20 +2053,25 @@ impl MatchContext<'_> {
         let Some(config) = reference.ip_set_forwarded_ip_config.as_ref() else {
             return address_in_set(&self.request.client_ip, version, addresses);
         };
-        let forwarded = forwarded_addresses(self.request, &config.header_name);
-        if forwarded.is_empty() {
-            // `FallbackBehavior`: what WAF does "if it doesn't find the header you
-            // specified in the request, or the header you specified contains an IP
-            // address that isn't valid".
+        // The entries the POSITION names are the only ones inspected, and they are
+        // positions in the header's list as the client wrote it: an entry that is not
+        // an address still occupies its place, so one elsewhere in the header never
+        // stands in for it.
+        let entries = forwarded_entries(self.request, &config.header_name);
+        let Some(candidates) = positioned(&entries, &config.position) else {
+            // A position the enum does not declare names nothing to inspect, and a
+            // criterion with nothing to inspect is not satisfied.
+            return false;
+        };
+        if !candidates
+            .iter()
+            .any(|entry| entry.parse::<IpAddr>().is_ok())
+        {
+            // `FallbackBehavior`: "the match status to assign to the web request if the
+            // request doesn't have a valid IP address in the specified position" — which
+            // covers a request carrying no such header at all.
             return config.fallback_behavior == "MATCH";
         }
-        // `Position`: "the position in the header to search for the IP address".
-        let candidates: Vec<&String> = match config.position.as_str() {
-            "FIRST" => forwarded.first().into_iter().collect(),
-            "LAST" => forwarded.last().into_iter().collect(),
-            "ANY" => forwarded.iter().collect(),
-            _ => Vec::new(),
-        };
         candidates
             .into_iter()
             .any(|address| address_in_set(address, version, addresses))
@@ -2205,18 +2210,57 @@ fn percent_decoded(value: &str) -> String {
 ///
 /// A forwarded-for header is "a comma-separated list of IP addresses", so each entry
 /// is trimmed and kept only when it parses as an address — an entry that is not one is
-/// not an address WAF could match.
+/// not an address WAF could match. Where a POSITION within the list decides which entry
+/// is inspected, [`forwarded_entries`] is what reads it, because dropping an entry would
+/// move the ones behind it.
 fn forwarded_addresses(request: &InspectedRequest, header_name: &str) -> Vec<String> {
+    forwarded_entries(request, header_name)
+        .into_iter()
+        .filter(|entry| entry.parse::<IpAddr>().is_ok())
+        .collect()
+}
+
+/// The entries the forwarded-for header `header_name` lists, in header order, trimmed
+/// and kept whether or not they are addresses.
+///
+/// `Position` is "the position in the header to search for the IP address", so the list
+/// it indexes is the one the client wrote: an entry that is not an address occupies its
+/// place and makes that position hold no valid address. An EMPTY entry is punctuation
+/// rather than an element, so a trailing or doubled comma adds no position.
+fn forwarded_entries(request: &InspectedRequest, header_name: &str) -> Vec<String> {
     request
         .headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case(header_name))
         .flat_map(|(_, value)| value.split(','))
-        .filter_map(|entry| {
-            let entry = entry.trim();
-            entry.parse::<IpAddr>().ok().map(|_| entry.to_string())
-        })
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
         .collect()
+}
+
+/// How many forwarded addresses an `ANY` position inspects: "If the header contains
+/// more than 10 IP addresses, WAF inspects the last 10"
+/// (`IPSetForwardedIPConfig$Position`).
+const MAX_INSPECTED_FORWARDED_ENTRIES: usize = 10;
+
+/// The entries of a forwarded-for header `position` inspects, or `None` for a position
+/// the `ForwardedIPPosition` enum does not declare.
+///
+/// `FIRST` is "the first IP address in the list of IP addresses in the header", `LAST`
+/// "the last IP address in the list" and `ANY` "all IP addresses in the header", bounded
+/// by [`MAX_INSPECTED_FORWARDED_ENTRIES`].
+fn positioned<'a>(entries: &'a [String], position: &str) -> Option<Vec<&'a String>> {
+    match position {
+        "FIRST" => Some(entries.first().into_iter().collect()),
+        "LAST" => Some(entries.last().into_iter().collect()),
+        "ANY" => Some(
+            entries[entries.len().saturating_sub(MAX_INSPECTED_FORWARDED_ENTRIES)..]
+                .iter()
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// Whether `address` is in the CIDR ranges of an IP set of family `version`.
