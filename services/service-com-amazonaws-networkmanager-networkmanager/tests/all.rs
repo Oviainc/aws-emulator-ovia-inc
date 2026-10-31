@@ -57,6 +57,8 @@ mod connection_lifecycle;
 mod connection_teardown_order;
 #[path = "all/core_network_change_events.rs"]
 mod core_network_change_events;
+#[path = "all/core_network_change_free_update.rs"]
+mod core_network_change_free_update;
 #[path = "all/core_network_change_set.rs"]
 mod core_network_change_set;
 #[path = "all/core_network_change_set_execution.rs"]
