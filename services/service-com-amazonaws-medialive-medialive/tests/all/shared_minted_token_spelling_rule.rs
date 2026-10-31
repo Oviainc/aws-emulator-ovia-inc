@@ -19,6 +19,12 @@
 //! reads too) — and, within each, the spellings a client can write the same
 //! number in.
 //!
+//! The rule holds whatever page the number an unminted spelling resembles would
+//! have named — the first page, a page inside the sequence, or a position past
+//! its end, which a handed-out token answers with an empty last page — so the
+//! positional table below runs it at each of those pages as well as at each
+//! spelling.
+//!
 //! What each of those readers does with a token it DID hand out is pinned by
 //! `tests/all/shared_position_cursor_rule.rs`, `tests/all/multiplex_alerts.rs`
 //! and `tests/all/offering_catalog.rs`; this suite pins which spellings of one
@@ -35,7 +41,7 @@ use crate::channel_lifecycle::wait_for_the_clock;
 use crate::multiplex_lifecycle::settings;
 use crate::multiplex_start::{add_programs, multiplex_with_settings, start_multiplex};
 use crate::shared_position_cursor_rule::{
-    answer, entry_names, filled_sequence, positional_listings, reported, token,
+    answer, entry_names, filled_sequence, positional_listings, reported, token, ENTRIES,
 };
 use crate::support::percent_encoded;
 use crate::wire::{call, error_code, error_message, medialive, medialive_with_engine};
@@ -51,6 +57,19 @@ fn other_spellings(minted: &str) -> Vec<String> {
         format!("000{minted}"),
         format!("+0{minted}"),
     ]
+}
+
+/// The positions whose plain rendering a positional listing answers DIFFERENTLY,
+/// over a sequence of `entries` entries: the first page, a page inside the
+/// sequence, the position exactly at its end and two past it (a walk of a
+/// sequence that has since shrunk, which the cursor rule answers with an empty
+/// last page rather than a refusal), and one far past it.
+///
+/// A spelling the service never handed out is not a position at any of them, so
+/// running the table at each is what keeps a reader that refuses only the
+/// spellings naming a page it would otherwise have reported from passing.
+fn positions(entries: usize) -> Vec<usize> {
+    vec![0, 1, entries, entries + 2, entries + 7]
 }
 
 /// `ListMultiplexAlerts` on one multiplex, with `query` appended
@@ -219,6 +238,92 @@ async fn a_positional_token_is_honoured_only_as_the_listing_mints_it() {
             *count,
             other_spellings("1").len(),
             "case {op:?}: expected every other spelling to have been refused, got {count}"
+        );
+    }
+}
+
+/// Rule: the spelling is what makes a `NextToken` one this listing handed out, so
+/// a spelling it never mints is refused with the modelled 400 whatever page the
+/// number it resembles names — the first page, a page inside the sequence or a
+/// position past its end, each of which the plain rendering of that same number
+/// is served at.
+///
+/// The rows span the OPERATION — all three positional listings, over three
+/// unrelated derived sequences — and, within each, five positions answered three
+/// different ways (the whole sequence, its tail, an empty last page) crossed with
+/// the plain rendering the listing mints (which must be served, and reports
+/// exactly the tail from that position) and four other spellings of the same
+/// number (which must not be served at all).
+#[tokio::test]
+async fn an_unminted_positional_spelling_is_refused_whatever_page_its_number_names() {
+    let names = entry_names();
+    // Per listing: the spellings it refused, so a row that quietly stopped
+    // running is visible at the end.
+    let mut refused: Vec<(&'static str, Vec<String>)> = Vec::new();
+
+    for row in positional_listings() {
+        // A router of its own per row, so each listing is driven against a store
+        // only this row filled.
+        let (router, engine) = medialive_with_engine();
+        let owner = filled_sequence(&router, &engine, &row).await;
+        let mut answered: Vec<String> = Vec::new();
+
+        for position in positions(ENTRIES) {
+            // The control: the plain rendering of this position is the one
+            // spelling the listing hands out, so it is served and reports the
+            // sequence from there on — which is what makes the refusals below a
+            // statement about the SPELLING and not about the number.
+            let plain = position.to_string();
+            let case = format!("{} nextToken={plain:?}", row.op);
+            let (status, body) =
+                answer(&router, &row, &owner, &[("nextToken", plain.clone())]).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the spelling this listing mints to be served, got \
+                 {status}: {body}"
+            );
+            let served = reported(&case, &row, &body);
+            assert_eq!(
+                served,
+                names[position.min(names.len())..],
+                "case {case:?}: expected the sequence from position {position} on, got {served:?}"
+            );
+            let handed_out = token(&body);
+            assert_eq!(
+                handed_out, None,
+                "case {case:?}: expected no token beside a page reaching the end, got \
+                 {handed_out:?}"
+            );
+
+            // Every other spelling of that same position: refused, because the
+            // listing never handed one of them out — however it would have
+            // answered the position itself.
+            for asked_for in other_spellings(&plain) {
+                let case = format!("{} nextToken={asked_for:?}", row.op);
+                let (status, body) =
+                    answer(&router, &row, &owner, &[("nextToken", asked_for.clone())]).await;
+                assert_refused(&case, row.member, &asked_for, status, &body);
+                answered.push(asked_for);
+            }
+        }
+        refused.push((row.op, answered));
+    }
+
+    // Every positional listing of this service ran the rows above, which is what
+    // makes this a statement about the SERVICE's rule and not one listing's.
+    assert_eq!(
+        refused.len(),
+        3,
+        "case \"every positional listing\": expected all three listings to have run, got \
+         {refused:?}"
+    );
+    let expected = positions(ENTRIES).len() * other_spellings("1").len();
+    for (op, answered) in &refused {
+        assert_eq!(
+            answered.len(),
+            expected,
+            "case {op:?}: expected every other spelling of every position to have been refused, \
+             got {answered:?}"
         );
     }
 }
