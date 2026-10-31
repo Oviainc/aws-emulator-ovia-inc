@@ -1,0 +1,46 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: secretsmanager.update-secret-kms-key-change-re-encrypts-so-the-old-key-is-no-longer-needed
+Issue-Shape-Id: com.amazonaws.secretsmanager#secretsmanager
+Issue-Key: secrets-manager|GetSecretValue|DecryptionFailure
+Issue-Commit: c0f2084881d9020926616aaa2d19581de4851935
+
+# REOPENS: UpdateSecret(KmsKeyId=...) does not re-encrypt the secret's labelled versions, so GetSecretValue is refused DecryptionFailure once the OLD key is disabled (1 cause)
+
+> _Note: this issue was identified against the code base at commit `c0f2084881d9020926616aaa2d19581de4851935`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+UpdateSecret
+
+## Description
+REOPENS 20261029T175759Z-kms-secretsmanager-getsecretvalue-and-putsecretvalue-never-consult-the.md: its fix left the call refused. That issue made the Secrets Manager envelope path consult KMS on read and write (GetSecretValue now fails DecryptionFailure for a disabled CMK, which is right). The surviving defect is on the other side of the same seam: because a KmsKeyId change never re-keys the stored versions, the read is now refused in the case real AWS SERVES — a secret that has been migrated to a new CMK stops being readable as soon as the OLD, no-longer-referenced key is disabled. This is a refusal of GetSecretValue, the operation that fixed issue named, so it is reported as a reopen rather than as a new defect.
+
+ONE cause. Also related but NOT covering: open issue 20261025T173233Z-secretsmanager-secrets-manager-updatesecret-updatesecretversionstage-awspending-is-not-evicted.md lists this check among its trace ids, but its recorded replay key for it is a 60 s harness Timeout ("...|run#20|Timeout|time.sleep(3.0)") produced when no KMS call happened at all; the emulator now answers KMS-backed and the check fails earlier with a concrete DecryptionFailure, so that issue does not carry this failure's key and the suite did not mark it OWNED.
+
+Cause 1 of 1: a KmsKeyId change is metadata-only — existing AWSCURRENT/AWSPENDING/AWSPREVIOUS versions stay sealed under the OLD key.
+AWS: Smithy: UpdateSecretRequest$KmsKeyId is documented as "The ARN, key ID, or alias of the KMS key that Secrets Manager uses to encrypt new secret versions AS WELL AS ANY EXISTING VERSIONS WITH THE STAGING LABELS AWSCURRENT, AWSPENDING, OR AWSPREVIOUS. If you don't have kms:Encrypt permission to the new key, Secrets Manager does not re-encrypt existing secret versions with the new key." So re-encryption of the labelled versions is the DEFAULT behavior; only a caller lacking kms:Encrypt on the new key gets the no-re-encrypt fallback. Consequences AWS therefore shows: after UpdateSecret(SecretId=<arn>, KmsKeyId=<new key>), DescribeSecret names the new key; the OLD key can be disabled and GetSecretValue(SecretId=<arn>) still returns the original SecretString with HTTP 200; the key change mints no new version, so GetSecretValue(SecretId=<arn>, VersionStage='AWSPENDING') is refused ResourceNotFoundException with the message "Secrets Manager can't find the specified secret value for staging label: AWSPENDING" (fixed text, with the staging label taken from the request); and only once the NEW key is disabled does GetSecretValue fail with code DecryptionFailure (that message embeds the downstream KMS request id and is per-run, so only the code is a requirement).
+Emulator: UpdateSecret assigns `secret.kms_key_id` and seals nothing — the handler only calls `envelope::seal` when the request carries SecretString/SecretBinary, so a KmsKeyId-only update rewrites metadata and leaves every stored version's wrapped data key bound to the OLD key. The read path then asks the OLD key to unwrap it, so with the old key disabled GetSecretValue is refused 400 DecryptionFailure, message "Secrets Manager can't decrypt the secret value: <OLD key arn> is disabled. (Service: AWSKMS; Status Code: 400; Error Code: DisabledException; Request ID: <id>; Proxy: null)" — where AWS returns the value. (The key arn, request id and account in that message are per-run values filling the relay template, not part of the requirement.) DescribeSecret naming the new key passes, so the divergence begins immediately after it. The crate states the inverted rule as its intent: services/service-com-amazonaws-secretsmanager-secretsmanager/src/state/envelope.rs documents the sealed blob as keeping "a version readable after the secret is pointed at another key — 'Secrets Manager does not re-encrypt existing secret versions with the new key'", quoting only the model's conditional kms:Encrypt-less clause as if it were the rule.
+Why: this breaks the standard CMK migration and key-retirement procedure. A client re-keys a secret, verifies DescribeSecret reports the new key, then disables or schedules deletion of the old key — and every subsequent read of the secret fails, in the emulator, with an error AWS only produces when the CURRENT key is unusable. Worse, the failure is mis-attributed: the message names a key the secret no longer references, so an operator debugging it is sent to the wrong key, and automation that treats DecryptionFailure as "the configured CMK is broken" takes remediation against the new key. The inverse is also hidden: code that must handle the real no-re-encrypt fallback (caller without kms:Encrypt on the new key) is never distinguished from the normal path.
+Fix: the KmsKeyId branch of the UpdateSecret handler — services/service-com-amazonaws-secretsmanager-secretsmanager/src/ops/update_secret.rs (the `if input.kms_key_id.is_some()` arm that today only assigns `secret.kms_key_id`, and the `envelope::seal` call above it that runs only for a value-carrying request) — must, when the key changes, re-seal each version currently labelled AWSCURRENT, AWSPENDING or AWSPREVIOUS under the new key (open under the old wrapped data key, seal under the new one, keeping each version's own VersionId encryption context) and store the new envelopes, without minting a new version or disturbing staging labels. The re-seal helper belongs beside `seal`/`open` in services/service-com-amazonaws-secretsmanager-secretsmanager/src/state/envelope.rs, whose header comment should stop asserting the no-re-encrypt clause as the unconditional rule.
+
+## Evidence
+Suite: secretsmanager 93/190 (49%). The check is in the failing list, marked neither ALREADY FILED nor OWNED by.
+
+[error] secretsmanager.update-secret-kms-key-change-re-encrypts-so-the-old-key-is-no-longer-needed
+  botocore.errorfactory.DecryptionFailure: An error occurred (DecryptionFailure) when calling the GetSecretValue operation: Secrets Manager can't decrypt the secret value: arn:aws:kms:us-west-2:<account>:key/<OLD key id> is disabled. (Service: AWSKMS; Status Code: 400; Error Code: DisabledException; Request ID: <id>; Proxy: null)
+
+  Sequence the check ran: kms CreateKey twice -> old_key, new_key; CreateSecret(KmsKeyId=old_key, SecretString='value-under-the-first-key'); UpdateSecret(SecretId=<arn>, KmsKeyId=new_key); DescribeSecret -> KmsKeyId == new_key (PASSED, so the metadata half is right); kms DisableKey(old_key) and poll kms Encrypt(old_key) until DisabledException (PASSED, so KMS really does honor the disable); GetSecretValue(SecretId=<arn>) -> must return 'value-under-the-first-key'.
+  Expected at that step: HTTP 200 with SecretString == 'value-under-the-first-key' (the version was re-keyed to new_key, so the disabled old_key is not consulted at all).
+  Actual: 400 DecryptionFailure naming the OLD key as quoted — the stored envelope is still wrapped by old_key.
+  Steps the check never reached, and which are also part of the contract: GetSecretValue(VersionStage='AWSPENDING') -> ResourceNotFoundException "Secrets Manager can't find the specified secret value for staging label: AWSPENDING"; then kms DisableKey(new_key) -> GetSecretValue must fail with code DecryptionFailure (that case is the only one in which this code is correct here).
+
+## Steps to Reproduce
+1. kms CreateKey(KeyUsage='ENCRYPT_DECRYPT', KeySpec='SYMMETRIC_DEFAULT') twice -> old_key, new_key.
+2. CreateSecret(Name=<fresh>, KmsKeyId=old_key, SecretString='value-under-the-first-key') -> <arn>.
+3. UpdateSecret(SecretId=<arn>, KmsKeyId=new_key)  (no SecretString/SecretBinary).
+4. DescribeSecret(SecretId=<arn>) -> KmsKeyId == new_key (correct today).
+5. kms DisableKey(KeyId=old_key); poll kms Encrypt(KeyId=old_key) until it answers DisabledException.
+6. GetSecretValue(SecretId=<arn>) -> observe 400 DecryptionFailure "Secrets Manager can't decrypt the secret value: <old_key arn> is disabled. (Service: AWSKMS; ... Error Code: DisabledException; ...)"; expect HTTP 200 with SecretString == 'value-under-the-first-key'.
+7. GetSecretValue(SecretId=<arn>, VersionStage='AWSPENDING') -> must be ResourceNotFoundException with "Secrets Manager can't find the specified secret value for staging label: AWSPENDING" (the key change must mint no new version).
+8. kms DisableKey(KeyId=new_key); poll kms Encrypt(KeyId=new_key) until DisabledException; GetSecretValue(SecretId=<arn>) -> NOW the refusal must be code DecryptionFailure (message per-run).
