@@ -86,6 +86,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::RemovableResource;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -234,15 +236,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The first delete starts the clock; a repeat while the configuration is
-        // still DELETING answers the same state and leaves the due instant where
-        // it was, so retrying the call never postpones the removal.
-        if worker.state != crate::state::WORKER_CONFIGURATION_DELETING {
-            worker.state = crate::state::WORKER_CONFIGURATION_DELETING.to_string();
-            worker.pending = Some(crate::state::PendingChange::in_a_moment(
-                crate::state::PendingKind::Remove,
-            ));
-        }
+        // The one removal-start rule every delete of this service runs
+        // ([`crate::state::RemovableResource::start_removal`]): the first delete
+        // starts the clock, and a repeat while the configuration is still
+        // DELETING leaves the due instant where it was.
+        worker.start_removal();
 
         Ok(DeleteWorkerConfigurationOutput {
             worker_configuration_arn: Some(worker.arn.clone()),

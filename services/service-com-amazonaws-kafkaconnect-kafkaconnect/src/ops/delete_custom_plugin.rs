@@ -81,6 +81,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::RemovableResource;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -222,12 +224,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if plugin.state != crate::state::CUSTOM_PLUGIN_DELETING {
-            plugin.state = crate::state::CUSTOM_PLUGIN_DELETING.to_string();
-            plugin.pending = Some(crate::state::PendingChange::in_a_moment(
-                crate::state::PendingKind::Remove,
-            ));
-        }
+        // The one removal-start rule every delete of this service runs
+        // ([`crate::state::RemovableResource::start_removal`]): the first delete
+        // starts the clock, and a repeat while the plugin is still DELETING
+        // leaves the due instant where it was.
+        plugin.start_removal();
 
         Ok(DeleteCustomPluginOutput {
             custom_plugin_arn: Some(plugin.arn.clone()),

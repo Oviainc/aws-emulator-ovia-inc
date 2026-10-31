@@ -1457,6 +1457,63 @@ impl RegionalResource for WorkerConfigurationRecord {
     }
 }
 
+/// A stored resource a delete of this service starts the removal of, and whose
+/// removal the clock — not the next call — finishes.
+///
+/// The ONE removal-start rule every delete runs, so no delete can differ from
+/// another on when the clock is owed the removal: a record that is not already
+/// reporting its kind's [`Self::DELETING`] state moves there and the clock is
+/// owed a [`PendingKind::Remove`] [`TRANSITION_SPAN`] out, while a record that
+/// already is keeps both its state and its due instant, so a repeat of an
+/// `@idempotent` delete answers the same state and never postpones the removal.
+/// Only the state the kind reports while deleting and the record's own fields
+/// stay per kind, and each handler still reads the record's `state` for its own
+/// output member after the call — the same shape as [`capacity_refusal`],
+/// [`ConnectorRecord::not_running_refusal`] and
+/// [`ComAmazonawsKafkaconnectKafkaconnectState::start_connector_operation`], the
+/// other rules these handlers share.
+pub trait RemovableResource {
+    /// The state this kind of resource reports while its removal is in flight.
+    const DELETING: &'static str;
+
+    /// This record's lifecycle state and the change the clock owes it, both
+    /// mutably, so [`Self::start_removal`] writes the pair together.
+    fn removal_lifecycle(&mut self) -> (&mut String, &mut Option<PendingChange>);
+
+    /// Start this resource's removal, idempotently — the rule in the trait docs.
+    fn start_removal(&mut self) {
+        let (state, pending) = self.removal_lifecycle();
+        if state.as_str() != Self::DELETING {
+            *state = Self::DELETING.to_string();
+            *pending = Some(PendingChange::in_a_moment(PendingKind::Remove));
+        }
+    }
+}
+
+impl RemovableResource for CustomPluginRecord {
+    const DELETING: &'static str = CUSTOM_PLUGIN_DELETING;
+
+    fn removal_lifecycle(&mut self) -> (&mut String, &mut Option<PendingChange>) {
+        (&mut self.state, &mut self.pending)
+    }
+}
+
+impl RemovableResource for ConnectorRecord {
+    const DELETING: &'static str = CONNECTOR_DELETING;
+
+    fn removal_lifecycle(&mut self) -> (&mut String, &mut Option<PendingChange>) {
+        (&mut self.state, &mut self.pending)
+    }
+}
+
+impl RemovableResource for WorkerConfigurationRecord {
+    const DELETING: &'static str = WORKER_CONFIGURATION_DELETING;
+
+    fn removal_lifecycle(&mut self) -> (&mut String, &mut Option<PendingChange>) {
+        (&mut self.state, &mut self.pending)
+    }
+}
+
 /// The record `arn` names, as an endpoint for `region` sees it.
 ///
 /// A regional endpoint serves only its own region's resources, so a well-formed

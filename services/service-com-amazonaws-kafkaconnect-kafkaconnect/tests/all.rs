@@ -55,6 +55,8 @@ mod page_token_belongs_to_one_listing;
 mod page_token_carries_the_filter_that_narrowed_it;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
+#[path = "all/removal_start_is_one_rule.rs"]
+mod removal_start_is_one_rule;
 #[path = "all/restart_connector_scope.rs"]
 mod restart_connector_scope;
 #[path = "all/state_roundtrip.rs"]
