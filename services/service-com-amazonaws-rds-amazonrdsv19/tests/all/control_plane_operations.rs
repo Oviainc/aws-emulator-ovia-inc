@@ -885,6 +885,42 @@ async fn the_blue_green_operations_keep_their_two_validation_layers_apart() {
             code,
         );
     }
+
+    // A `Source` ARN of ANOTHER region is refused by the sentence Amazon RDS words for it:
+    // the ARN the request carried, single-quoted, and the kind of database that ARN names.
+    for (case, source, database_kind) in [
+        (
+            "a DB instance ARN in another region",
+            format!("arn:aws:rds:eu-west-1:{ACCOUNT}:db:emu-bg-source"),
+            "DB Instance",
+        ),
+        (
+            "a DB cluster ARN in another region",
+            format!("arn:aws:rds:ap-south-1:{ACCOUNT}:cluster:emu-bg-cluster"),
+            "DB Cluster",
+        ),
+    ] {
+        let refused = expect_error(
+            case,
+            call(
+                &router,
+                "CreateBlueGreenDeployment",
+                &[
+                    ("BlueGreenDeploymentName", "emu-bg-probe"),
+                    ("Source", source.as_str()),
+                ],
+            )
+            .await,
+            400,
+            "InvalidParameterValue",
+        );
+        let message = text(&refused, "Message");
+        assert_eq!(
+            message,
+            format!("'{source}' is not a valid {database_kind} ARN in this region"),
+            "case {case:?}: got {message:?}"
+        );
+    }
     // A cluster source resolves, so the deployment is created from it.
     let created = expect_ok(
         "a cluster source",

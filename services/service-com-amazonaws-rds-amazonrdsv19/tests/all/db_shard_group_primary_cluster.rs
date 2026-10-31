@@ -261,11 +261,24 @@ async fn a_create_resolves_its_primary_cluster_and_acts_only_on_a_state_it_can()
             Expected::Refused(status, code) => {
                 let refused = expect_error(row.case, answer, status, code);
                 let message = text(&refused, "Message");
-                assert!(
-                    message.contains(row.cluster),
-                    "case {:?}: the refusal must name the cluster, got {message:?}",
-                    row.case
-                );
+                // The state fault names the cluster whose state refused the create, while
+                // the not-found fault for a cluster this call cannot resolve carries the
+                // one fixed sentence that names nothing — so each is asserted as the
+                // service words it.
+                if code == "DBClusterNotFoundFault" {
+                    assert_eq!(
+                        message,
+                        "The DB cluster doesn't exist.",
+                        "case {:?}: expected the fixed not-found sentence, got {message:?}",
+                        row.case
+                    );
+                } else {
+                    assert!(
+                        message.contains(row.cluster),
+                        "case {:?}: the refusal must name the cluster, got {message:?}",
+                        row.case
+                    );
+                }
                 // A refused create leaves nothing behind: the identifier it named is
                 // still one nothing created.
                 expect_error(

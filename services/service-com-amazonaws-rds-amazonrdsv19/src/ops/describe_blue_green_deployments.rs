@@ -190,9 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             DescribeBlueGreenDeploymentsError::from(
                             DescribeBlueGreenDeploymentsErrorModeled::BlueGreenDeploymentNotFoundFault(
                                 BlueGreenDeploymentNotFoundFault {
-                                    message: Some(format!(
-                                        "BlueGreenDeployment {requested} not found."
-                                    )),
+                                    message: Some(
+                                        crate::state::blue_green_deployment_not_found_message(
+                                            requested,
+                                        ),
+                                    ),
                                 },
                             ),
                         )

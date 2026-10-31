@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(task) = store.export_tasks.get_mut(&key) else {
             return Err(CancelExportTaskErrorModeled::ExportTaskNotFoundFault(
                 ExportTaskNotFoundFault {
-                    message: Some(format!("ExportTask {requested} not found.")),
+                    message: Some(crate::state::export_task_not_found_message(&requested)),
                 },
             )
             .into());

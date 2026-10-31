@@ -572,7 +572,8 @@ async fn requests_outside_what_the_operation_serves_are_refused_and_change_nothi
     wait_for_settle();
 
     // A name no create stored in this region — and one nothing created anywhere — is the
-    // modelled not-found fault, which names the shard group the request could not resolve.
+    // modelled not-found fault, which Amazon RDS words as one FIXED sentence naming neither
+    // the identifier nor the account the request was signed for.
     for case in ["emu-mod-shard-nothing-created", "emu-mod-shard-guard"] {
         let refused = expect_error(
             case,
@@ -580,9 +581,10 @@ async fn requests_outside_what_the_operation_serves_are_refused_and_change_nothi
             404,
             "DBShardGroupNotFound",
         );
-        assert!(
-            text(&refused, "Message").contains(case),
-            "case {case:?}: the refusal must name the shard group, got {refused}"
+        assert_eq!(
+            text(&refused, "Message"),
+            "The DB shard group with requested identifier in requested account doesn't exist.",
+            "case {case:?}: got {refused}"
         );
     }
 

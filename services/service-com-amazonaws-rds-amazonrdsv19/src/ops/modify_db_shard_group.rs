@@ -232,9 +232,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.db_shard_groups.get(&key) else {
             return Err(ModifyDBShardGroupErrorModeled::DBShardGroupNotFoundFault(
                 DBShardGroupNotFoundFault {
-                    message: Some(crate::state::db_shard_group_not_found_message(
-                        &input.db_shard_group_identifier,
-                    )),
+                    message: Some(
+                        crate::state::DB_SHARD_GROUP_DOES_NOT_EXIST_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

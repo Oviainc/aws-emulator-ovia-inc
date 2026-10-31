@@ -177,8 +177,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteBlueGreenDeploymentErrorModeled::BlueGreenDeploymentNotFoundFault(
                     BlueGreenDeploymentNotFoundFault {
-                        message: Some(format!(
-                            "BlueGreenDeployment {identifier} not found."
+                        message: Some(crate::state::blue_green_deployment_not_found_message(
+                            &input.blue_green_deployment_identifier,
                         )),
                     },
                 )

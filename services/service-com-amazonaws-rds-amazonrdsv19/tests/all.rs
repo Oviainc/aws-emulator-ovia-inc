@@ -125,6 +125,8 @@ mod modify_event_subscription;
 mod neptune_engine_catalog;
 #[path = "all/not_found_paths.rs"]
 mod not_found_paths;
+#[path = "all/not_found_refusal_sentences.rs"]
+mod not_found_refusal_sentences;
 #[path = "all/option_group_copy.rs"]
 mod option_group_copy;
 #[path = "all/option_group_deletion.rs"]

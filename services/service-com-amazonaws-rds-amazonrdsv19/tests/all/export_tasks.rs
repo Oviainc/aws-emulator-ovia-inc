@@ -68,7 +68,10 @@ fn rds_arn(region: &str, resource: &str) -> String {
 }
 
 /// One seeded export task — what `StartExportTask` will write.
-struct SeedSpec {
+///
+/// `pub(crate)` so a sibling suite of this one test target can seed the same records
+/// through [`stored_task`] rather than writing a second copy of them.
+pub(crate) struct SeedSpec {
     /// `ExportTaskIdentifier`.
     identifier: &'static str,
     /// The resource part of `SourceArn`: a DB snapshot, a DB cluster snapshot or a DB
@@ -190,7 +193,7 @@ const TERMINAL_STATUSES: [&str; 3] = [
 ];
 
 /// The seeded spec of `identifier`.
-fn spec(identifier: &str) -> &'static SeedSpec {
+pub(crate) fn spec(identifier: &str) -> &'static SeedSpec {
     SEEDED
         .iter()
         .find(|spec| spec.identifier == identifier)
@@ -198,7 +201,7 @@ fn spec(identifier: &str) -> &'static SeedSpec {
 }
 
 /// A complete export-task record of `spec` in `region`.
-fn stored_task(region: &str, spec: &SeedSpec) -> ExportTaskRecord {
+pub(crate) fn stored_task(region: &str, spec: &SeedSpec) -> ExportTaskRecord {
     ExportTaskRecord {
         identifier: spec.identifier.to_string(),
         region: region.to_string(),
@@ -224,7 +227,7 @@ fn stored_task(region: &str, spec: &SeedSpec) -> ExportTaskRecord {
 }
 
 /// A router carrying this service, holding `tasks` — `(region, record)` — in its store.
-fn emulator_holding(tasks: Vec<(String, ExportTaskRecord)>) -> MultiServiceRouter {
+pub(crate) fn emulator_holding(tasks: Vec<(String, ExportTaskRecord)>) -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     {
         let store = state::service_state(&*engine).expect("this service's store");

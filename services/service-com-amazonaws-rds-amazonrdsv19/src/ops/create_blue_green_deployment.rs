@@ -270,12 +270,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             }
         };
+        // An ARN of another region names no database of the region this request is signed
+        // for, which Amazon RDS refuses as a value the parameter does not accept, worded as
+        // a statement about the ARN and the kind of database it names.
         if source_arn.region != region {
+            let database_kind = if source_is_cluster {
+                "DB Cluster"
+            } else {
+                "DB Instance"
+            };
             return Err(CreateBlueGreenDeploymentError::invalid_parameter_value(
-                format!(
-                    "invalid value '{source_named}' for Source: the source database must be \
-                     in {region}, the region this request is signed for"
-                ),
+                format!("'{source_named}' is not a valid {database_kind} ARN in this region"),
             ));
         }
         // The source identifier is stored lowercased, as both database types' identifiers

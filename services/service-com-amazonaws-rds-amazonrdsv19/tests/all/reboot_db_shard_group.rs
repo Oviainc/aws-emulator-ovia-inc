@@ -494,7 +494,8 @@ async fn a_reboot_is_refused_for_a_shard_group_it_cannot_restart() {
     create_cluster(&router, REGION, CLUSTER).await;
 
     // A name no create stored in this region — and one nothing created anywhere — is the
-    // modelled not-found fault, which names the shard group the request could not resolve.
+    // modelled not-found fault, which Amazon RDS words as one FIXED sentence about a shard
+    // group it cannot reach rather than naming the identifier the request carried.
     for case in ["emu-reboot-shard-nothing-created", "emu-reboot-shard-absent"] {
         let refused = expect_error(
             case,
@@ -502,9 +503,10 @@ async fn a_reboot_is_refused_for_a_shard_group_it_cannot_restart() {
             404,
             "DBShardGroupNotFound",
         );
-        assert!(
-            text(&refused, "Message").contains(case),
-            "case {case:?}: the refusal must name the shard group, got {refused}"
+        assert_eq!(
+            text(&refused, "Message"),
+            "DB shard group not found or can not be accessed",
+            "case {case:?}: got {refused}"
         );
     }
 

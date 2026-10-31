@@ -61,6 +61,18 @@ const TERMINAL_STATUSES: [&str; 3] = [
     EXPORT_TASK_STATUS_FAILED,
 ];
 
+/// The sentence an `ExportTaskNotFoundFault` carries for an `ExportTaskIdentifier` that
+/// names no stored export task.
+///
+/// Amazon RDS words this fault as a statement about the export task, naming the identifier
+/// the request carried — unquoted — inside it, so a caller matching the sentence against
+/// what it sent finds its own identifier there. It lives here beside the family's other
+/// rules so every operation that resolves an `ExportTaskIdentifier` words the one fault the
+/// same way.
+pub fn export_task_not_found_message(named: &str) -> String {
+    format!("The export task {named} doesn't exist.")
+}
+
 /// A persisted snapshot or cluster export task.
 ///
 /// Every member of the modelled `ExportTask` shape is stored rather than recomputed per

@@ -113,7 +113,8 @@ pub mod tags;
 pub mod tenant_databases;
 
 pub use blue_green::{
-    blue_green_deployment_identifier_of, check_blue_green_deployment_identifier, green_identifier,
+    blue_green_deployment_identifier_of, blue_green_deployment_not_found_message,
+    check_blue_green_deployment_identifier, green_identifier,
     mint_blue_green_deployment_identifier, BlueGreenDeploymentRecord,
     BLUE_GREEN_DEPLOYMENT_QUOTA_PER_REGION, BLUE_GREEN_IDENTIFIER_PREFIX,
     BLUE_GREEN_STATUS_AVAILABLE, BLUE_GREEN_STATUS_DELETING, BLUE_GREEN_STATUS_PROVISIONING,
@@ -141,7 +142,8 @@ pub use events::{
     DESCRIBE_EVENTS_SOURCE_TYPES, EVENT_RETENTION_SECONDS, MAX_EVENTS_PER_REGION,
 };
 pub use export_tasks::{
-    ExportTaskRecord, EXPORT_TASK_STATUS_CANCELED, EXPORT_TASK_STATUS_CANCELING,
+    export_task_not_found_message, ExportTaskRecord, EXPORT_TASK_STATUS_CANCELED,
+    EXPORT_TASK_STATUS_CANCELING,
     EXPORT_TASK_STATUS_COMPLETE, EXPORT_TASK_STATUS_FAILED, EXPORT_TASK_STATUS_IN_PROGRESS,
     EXPORT_TASK_STATUS_STARTING, EXPORT_TASK_STATUS_VALUES,
 };
@@ -4011,16 +4013,47 @@ pub fn check_not_empty(member: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The message a `DBShardGroupNotFoundFault` carries: "the specified DB shard group name
-/// wasn't found", in the `<resource type> <name> not found.` wording this front door
-/// answers a named resource it cannot resolve with.
+/// The message a `DBShardGroupNotFoundFault` carries where the call only REPORTS the DB
+/// shard groups: "the specified DB shard group name wasn't found", in the
+/// `<resource type> <name> not found.` wording this front door answers a named resource it
+/// cannot resolve with.
 ///
 /// `named` is the value the REQUEST carried, not the key the store folded it to, so a
 /// caller matching the message against what it sent finds it there — the same reason
 /// [`db_cluster_not_found_message`] names the request's spelling.
+///
+/// The calls that ACT on the shard group word the same fault differently, as Amazon RDS
+/// does: see [`DB_SHARD_GROUP_DOES_NOT_EXIST_MESSAGE`] and
+/// [`DB_SHARD_GROUP_NOT_ACCESSIBLE_MESSAGE`].
 pub fn db_shard_group_not_found_message(named: &str) -> String {
     format!("DBShardGroup {named} not found.")
 }
+
+/// The sentence a `DBShardGroupNotFoundFault` carries where the call MODIFIES the shard
+/// group's configuration.
+///
+/// It has NO variable parts: Amazon RDS interpolates neither the identifier the request
+/// carried nor the account it was signed for — it says only that the pair named nothing —
+/// so this is a constant rather than a `format!` over the request, and a caller matching
+/// the sentence sees exactly what the real service sends.
+pub const DB_SHARD_GROUP_DOES_NOT_EXIST_MESSAGE: &str =
+    "The DB shard group with requested identifier in requested account doesn't exist.";
+
+/// The sentence a `DBShardGroupNotFoundFault` carries where the call acts on the shard
+/// group as a whole — the delete that removes it and the reboot that restarts it.
+///
+/// Amazon RDS words this one as a statement about reachability rather than about the
+/// identifier, with no variable part and no terminal period, so it too is a constant.
+pub const DB_SHARD_GROUP_NOT_ACCESSIBLE_MESSAGE: &str =
+    "DB shard group not found or can not be accessed";
+
+/// The sentence a `DBClusterNotFoundFault` carries where the DB cluster is a cluster the
+/// request names for a DB SHARD GROUP to hang off.
+///
+/// Unlike the wordings above it names NO cluster: the Aurora Limitless Database calls
+/// report only that the primary cluster the request named does not exist, so nothing from
+/// the request is interpolated into it.
+pub const DB_CLUSTER_DOES_NOT_EXIST_MESSAGE: &str = "The DB cluster doesn't exist.";
 
 /// The message a `DBClusterNotFoundFault` carries where the call LOOKS a DB cluster UP —
 /// it reports the cluster or resolves one it reads something else out of.

@@ -96,6 +96,23 @@ pub fn check_blue_green_deployment_identifier(member: &str, value: &str) -> Resu
     ))
 }
 
+/// The sentence a `BlueGreenDeploymentNotFoundFault` carries for a
+/// `BlueGreenDeploymentIdentifier` that names no stored deployment.
+///
+/// Amazon RDS words this fault as a statement about the deployment, with the identifier the
+/// request named QUOTED inside it, and the same sentence whichever call failed to resolve
+/// it — so it lives here beside the family's other rules rather than in each handler.
+/// `named` is the deployment identifier the request carried: the member also accepts the
+/// deployment's ARN, so it is the identifier part of that value
+/// ([`blue_green_deployment_identifier_of`]), which is the handle the caller gave the
+/// deployment.
+pub fn blue_green_deployment_not_found_message(named: &str) -> String {
+    format!(
+        "Blue Green Deployment '{}' doesn't exist.",
+        blue_green_deployment_identifier_of(named)
+    )
+}
+
 /// The identifier of the database this service creates in the GREEN environment for a
 /// deployment whose source is `source_identifier`.
 ///
