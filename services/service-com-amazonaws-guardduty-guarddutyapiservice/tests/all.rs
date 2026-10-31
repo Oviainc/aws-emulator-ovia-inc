@@ -129,6 +129,8 @@ mod malware_protection_plan_listing;
 mod malware_protection_plan_update;
 #[path = "all/malware_scan.rs"]
 mod malware_scan;
+#[path = "all/malware_scan_continuous_window.rs"]
+mod malware_scan_continuous_window;
 #[path = "all/malware_scan_description.rs"]
 mod malware_scan_description;
 #[path = "all/malware_scan_lifecycle.rs"]

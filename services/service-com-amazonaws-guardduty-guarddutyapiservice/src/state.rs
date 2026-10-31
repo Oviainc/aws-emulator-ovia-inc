@@ -1296,6 +1296,23 @@ pub fn iso8601(millis: i64) -> String {
     }
 }
 
+/// One instant of an SDK timestamp in epoch milliseconds, the form this service holds
+/// every instant in — the ONE conversion every instant, reported or received, goes
+/// through.
+///
+/// It SATURATES at the representable bound rather than failing, because the bound is
+/// this store's and not the API's: a modelled `Timestamp` carries no `@range`, so an
+/// instant whose milliseconds do not fit an `i64` is input the service must accept.
+/// Saturating keeps the instant — and so the member that carries it — present and in
+/// time order; a fallible conversion would turn a value the caller sent into no value
+/// at all.
+pub fn millis_of(instant: &::aws_smithy_types::DateTime) -> i64 {
+    instant
+        .secs()
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(instant.subsec_nanos() / 1_000_000))
+}
+
 /// `DetectorStatus` / `FeatureStatus` / `DataSourceStatus` — every one of the three
 /// enums is `ENABLED | DISABLED` (`smithy_query(shape="DetectorStatus")`).
 pub const ENABLED: &str = "ENABLED";

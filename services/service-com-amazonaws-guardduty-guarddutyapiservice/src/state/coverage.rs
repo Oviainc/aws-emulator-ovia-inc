@@ -20,6 +20,10 @@
 #[allow(unused_imports)]
 use crate::ops::types::*;
 
+// Every instant this module turns into the milliseconds the service holds goes
+// through the crate's one conversion.
+use crate::state::millis_of;
+
 /// How many pages of ONE owner's inventory a coverage read walks.
 ///
 /// The resources are the account's and their number is bounded by the owning
@@ -611,15 +615,6 @@ macro_rules! callback_client {
             .build();
         ::$sdk::Client::from_conf(config)
     }};
-}
-
-/// One instant of an SDK timestamp in epoch milliseconds, the form this service holds
-/// every instant in.
-fn millis_of(instant: &::aws_smithy_types::DateTime) -> i64 {
-    instant
-        .secs()
-        .saturating_mul(1_000)
-        .saturating_add(i64::from(instant.subsec_nanos() / 1_000_000))
 }
 
 /// The coverage of the account's EC2 instances, asked of the service that owns them.
