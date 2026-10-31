@@ -533,19 +533,38 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// response it produces are bounded by the page rather than by the number of stored
     /// records. The range scan itself still steps over any record the filter rejects, so a
     /// selector that matches few SLOs walks the stored set once.
+    ///
+    /// The token is opaque but not authenticated, so the KEY inside the tag is a value a
+    /// caller may have written: it is honoured only when it is a boundary this paging can have
+    /// minted over the set being read ([`issued_key`]), and `Err` otherwise carries the
+    /// service's ONE wording for a token it did not issue ([`UNISSUED_NEXT_TOKEN`]).
     pub fn page<F>(
         &self,
         token_tag: &str,
         cursor: Option<&str>,
         page_size: usize,
         matches: F,
-    ) -> (Vec<ServiceLevelObjectiveSummary>, Option<String>)
+    ) -> Result<(Vec<ServiceLevelObjectiveSummary>, Option<String>), String>
     where
         F: Fn(&ServiceLevelObjective) -> bool,
     {
         let lower = match cursor {
-            Some(cursor) => Bound::Excluded(cursor),
             None => Bound::Unbounded,
+            Some(cursor) => {
+                // The name of the LAST objective this selection reports, and so the one
+                // position past which this paging can have minted no boundary over the set
+                // being read. A selection that reports nothing has minted none at all.
+                let last_name = self
+                    .slos
+                    .values()
+                    .rev()
+                    .find(|slo| matches(slo))
+                    .map(|slo| slo.name.as_str());
+                Bound::Excluded(
+                    issued_key(cursor, last_name, well_formed_slo_name)
+                        .ok_or_else(|| UNISSUED_NEXT_TOKEN.to_string())?,
+                )
+            }
         };
         let mut window: Vec<&ServiceLevelObjective> = self
             .slos
@@ -561,7 +580,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         } else {
             None
         };
-        (window.into_iter().map(summary_of).collect(), next_cursor)
+        Ok((window.into_iter().map(summary_of).collect(), next_cursor))
     }
 }
 
@@ -692,6 +711,40 @@ pub fn slo_name_in_id(id: &str) -> &str {
 /// every other about what an ARN is.
 pub fn slo_name_in_arn(arn: &str) -> Option<&str> {
     ::service_common::arn::resource_id_of_type(arn, SLO_ARN_RESOURCE)
+}
+
+/// The shortest and longest SLO name the modelled `ServiceLevelObjectiveName` pattern
+/// admits (`^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$`): the two anchored alphanumeric
+/// characters, plus up to 126 between them.
+const SLO_NAME_LENGTH: ::std::ops::RangeInclusive<usize> = 2..=128;
+
+/// Whether `name` is a `ServiceLevelObjectiveName`: an alphanumeric first and last
+/// character, and `-`, `.`, `_`, a space or another alphanumeric between them.
+///
+/// This is the KEY SPACE of the SLO store — a record is keyed by its name, and a create that
+/// names anything else is refused at the boundary — so it is also what says whether a value a
+/// request carried could be a key of that store at all: the budget report reads an `Id` by it
+/// (a member the model types as a plain string), and the objective listing reads a page
+/// boundary by it ([`issued_key`]).
+///
+/// Compared byte for byte, which is exact because every character the pattern admits is
+/// ASCII: any byte of a multi-byte character fails every class below.
+pub fn well_formed_slo_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if !SLO_NAME_LENGTH.contains(&bytes.len()) {
+        return false;
+    }
+    let Some((first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    let Some((last, middle)) = rest.split_last() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && last.is_ascii_alphanumeric()
+        && middle
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b' '))
 }
 
 /// The SLO name a tagging operation's `ResourceArn` names, or `None` when the ARN names no
@@ -1708,6 +1761,18 @@ pub fn unissued_next_token_in(scope: &str) -> String {
     format!("{UNISSUED_NEXT_TOKEN} for {scope}")
 }
 
+/// The SCOPE a `ListInstrumentationConfigurations` cursor is only a cursor within, as
+/// [`unissued_next_token_in`] narrows that read's refusal by: the request members that pick
+/// the one ordered set its tokens are issued over
+/// ([`instrumentation_token_tag`]), and never their values.
+///
+/// Stated once so the refusal for a token carrying no tag of that scope and the refusal for a
+/// payload inside such a tag that names no boundary of it
+/// ([`ComAmazonawsApplicationsignalsApplicationsignalsState::page_instrumentation_configurations`])
+/// are the SAME text: both say the token is not one this service issued for that scope.
+pub const INSTRUMENTATION_CURSOR_SCOPE: &str =
+    "this service, environment and instrumentation type";
+
 /// The page size a list read serves for the `MaxResults` a request states, or the refusal
 /// for a bound outside the range that member admits: at least [`MIN_PAGE_BOUND`] and at
 /// most `maximum`.
@@ -1846,6 +1911,50 @@ fn issued_window_ordinal(cursor: &str, last_ordinal: u64) -> Option<u64> {
     (FIRST_EXCLUSION_WINDOW_ORDINAL..last_ordinal)
         .contains(&ordinal)
         .then_some(ordinal)
+}
+
+/// The key `cursor` names as the boundary of a page over a stored, key-ordered collection
+/// whose last key is `last_key`, or `None` when it is not a boundary [`page_keyed`] can have
+/// minted over the set being read — where `spelled` answers whether a value is spelled the way
+/// that collection's keys are.
+///
+/// A page token is minted by keying on the LAST record the page served, and only while the set
+/// still holds a record beyond it, so every key this paging hands out is a key of the
+/// collection's own key space with at least one stored key after it: a value `spelled` rejects
+/// is no key of that collection at all — the empty payload a bare tag carries is one such — and
+/// a key at or past the last stored key bounds no page, the first record being served by the
+/// request that states no cursor. A payload outside that range, or spelled a way the
+/// collection's keys never are, is therefore a boundary no read of this service issued over
+/// the set being read, exactly as for the ordinal and offset cursors
+/// ([`issued_window_ordinal`], [`issued_offset`]) — and honouring it would re-serve the first
+/// page under a cursor, or report the set as exhausted to a caller whose cursor is not one it
+/// was given.
+///
+/// A key INSIDE that range is honoured whether or not the set still holds the record it keys
+/// on, which is what makes a boundary survive the removal of that very record — the property
+/// a key cursor is chosen for ([`page_keyed`]). That is also why the LOW end of the range is
+/// the key space rather than the set's own first key: these keys are not dense, so a floor
+/// read off the stored set would turn a boundary this service really issued into a refusal as
+/// soon as the records before it were removed, while the ordinal cursors take their floor from
+/// the one position their dense key space starts at.
+///
+/// The HIGH end is the set as it stands NOW, because that is the only set this read can place
+/// a boundary in, exactly as for the ordinal cursor ([`issued_window_ordinal`]): a caller whose
+/// boundary and every record after it have since been removed is therefore refused rather than
+/// served an empty last page. That refusal loses no record — the survivors are all before the
+/// boundary and a cursorless read reports them — while admitting a key past the last one would
+/// report any set as exhausted to a caller whose cursor is not one it was given, which is the
+/// failure this check exists for. The two ends are asymmetric because the harms are: below the
+/// set, honouring costs a re-served first page and refusing costs a resumable listing; at or
+/// above it, honouring costs the listing's own termination signal and refusing costs nothing
+/// the caller cannot read without a cursor.
+fn issued_key<'a>(
+    cursor: &'a str,
+    last_key: Option<&str>,
+    spelled: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    let last = last_key?;
+    (cursor < last && spelled(cursor)).then_some(cursor)
 }
 
 /// One page of a derived projection, plus the token for the page after it.
@@ -5373,28 +5482,53 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// is stored records takes from [`page_keyed`]. The key a boundary carries is the one the
     /// set holds the record under, which is that configuration's own
     /// [`instrumentation_key`].
+    ///
+    /// The token is opaque but not authenticated, so the key inside the tag is a value a
+    /// caller may have written: it is honoured only when it is a boundary this paging can have
+    /// minted over the set being read ([`issued_key`]), and `Err` otherwise carries this
+    /// read's wording for a token it did not issue for that scope
+    /// ([`INSTRUMENTATION_CURSOR_SCOPE`]).
     pub fn page_instrumentation_configurations(
         &self,
         scope: &InstrumentationScope,
         cursor: Option<&str>,
         page_size: usize,
-    ) -> (
-        Vec<InstrumentationConfigurationWithoutServiceEnv>,
-        Option<String>,
-    ) {
-        let Some(set) = self.instrumentation_configurations.get(scope) else {
-            return (Vec::new(), None);
+    ) -> Result<
+        (
+            Vec<InstrumentationConfigurationWithoutServiceEnv>,
+            Option<String>,
+        ),
+        String,
+    > {
+        let stored = self.instrumentation_configurations.get(scope);
+        // The key of the LAST configuration this scope holds, and so the one position past
+        // which this paging can have minted no boundary over the set being read. A scope
+        // holding no configurations has minted none at all.
+        let last_key = stored
+            .and_then(|set| set.configurations.keys().next_back())
+            .map(String::as_str);
+        let boundary = match cursor {
+            None => None,
+            Some(cursor) => Some(
+                issued_key(cursor, last_key, well_formed_instrumentation_key)
+                    .ok_or_else(|| unissued_next_token_in(INSTRUMENTATION_CURSOR_SCOPE))?,
+            ),
         };
-        let lower = match cursor {
-            Some(cursor) => Bound::Excluded(cursor),
+        let Some(set) = stored else {
+            // A scope holding no configurations reports none, and the only cursor that could
+            // have reached this line over an empty set was refused just above.
+            return Ok((Vec::new(), None));
+        };
+        let lower = match boundary {
+            Some(key) => Bound::Excluded(key),
             None => Bound::Unbounded,
         };
         let (window, next) = page_keyed::<String, str, _>(&set.configurations, lower, page_size);
         let next_token = next.map(|key| encode_cursor(&instrumentation_token_tag(scope), key));
-        (
+        Ok((
             window.into_iter().map(without_service_env).collect(),
             next_token,
-        )
+        ))
     }
 }
 
@@ -5410,6 +5544,25 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
 /// can contain one.
 pub fn instrumentation_key(signal_type: &str, location_hash: &str) -> String {
     format!("{signal_type}/{location_hash}")
+}
+
+/// Whether `key` is spelled the way [`instrumentation_key`] spells a key of one scope's
+/// ordered set: a modelled `DynamicInstrumentationSignalType` value, the one separator, and a
+/// `LocationHash` — the 16 lowercase hex characters [`stable_hash`] writes, which is the
+/// length and alphabet the member's own model fixes (`length 16..16`, and the
+/// `InstrumentationConfigurationArn` pattern's hash segment).
+///
+/// Anything else is a value no record of this store is keyed by, and so no boundary the paging
+/// over such a set can have minted ([`issued_key`]).
+fn well_formed_instrumentation_key(key: &str) -> bool {
+    let Some((signal_type, location_hash)) = key.split_once('/') else {
+        return false;
+    };
+    crate::ops::types::DYNAMIC_INSTRUMENTATION_SIGNAL_TYPE_VALUES.contains(&signal_type)
+        && location_hash.len() == LOCATION_HASH_BYTES * 2
+        && location_hash
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The ARN of the configuration at `location_hash` in `scope`, in the format the modelled

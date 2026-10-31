@@ -1291,7 +1291,9 @@ fn an_expired_configuration_lapses_and_its_emptied_scope_is_dropped() {
     // A second before it falls due the configuration is still reported.
     let before = DateTime::from_secs_f64(expires_at.as_secs_f64() - 1.0);
     store.expire_instrumentation_configurations(&before);
-    let (page, next_token) = store.page_instrumentation_configurations(&breakpoint, None, 10);
+    let (page, next_token) = store
+        .page_instrumentation_configurations(&breakpoint, None, 10)
+        .expect("a cursorless read resolves no boundary");
     assert_eq!(
         (page.len(), next_token.is_none()),
         (1, true),
@@ -1302,7 +1304,9 @@ fn an_expired_configuration_lapses_and_its_emptied_scope_is_dropped() {
     // At the instant it falls due it is gone, and the lapse is news to a caller that synced
     // before it but not to one that synced after it.
     store.expire_instrumentation_configurations(&expires_at);
-    let (page, _) = store.page_instrumentation_configurations(&breakpoint, None, 10);
+    let (page, _) = store
+        .page_instrumentation_configurations(&breakpoint, None, 10)
+        .expect("a cursorless read resolves no boundary");
     assert!(
         page.is_empty(),
         "case \"at the expiry\": expected the lapsed configuration to be gone, got {page:?}"
@@ -1318,7 +1322,9 @@ fn an_expired_configuration_lapses_and_its_emptied_scope_is_dropped() {
     );
 
     // The PROBE configuration does not expire, so only what the clock owed was dropped.
-    let (page, _) = store.page_instrumentation_configurations(&probe, None, 10);
+    let (page, _) = store
+        .page_instrumentation_configurations(&probe, None, 10)
+        .expect("a cursorless read resolves no boundary");
     assert_eq!(
         page.len(),
         1,

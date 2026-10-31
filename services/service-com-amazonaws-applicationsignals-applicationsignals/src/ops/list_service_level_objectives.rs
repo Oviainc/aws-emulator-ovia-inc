@@ -162,7 +162,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// page boundary is a cursor on that order and paging over more SLOs than `MaxResults`
     /// terminates having visited each matching SLO exactly once. `NextToken` is returned
     /// only while matching SLOs remain after the page, and carries the selection it was
-    /// counted in, so it resumes that listing and no other.
+    /// counted in, so it resumes that listing and no other — and the key inside it resumes
+    /// one only when it is a boundary this listing's own paging could have minted.
     async fn handle(
         &self,
         input: Self::Input,
@@ -216,18 +217,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::names_other_account`, the one reader of that rule). For the same
         // reason `IncludeLinkedAccounts` is not consulted: there is no second account whose
         // SLOs it could add, so the flag selects nothing extra and the answer is the same
-        // either way.
+        // either way. Such a selection is paged like any other, rather than short-circuited:
+        // it holds no objective a cursor could bound a page at, so a token presented with it
+        // is refused instead of being answered with an empty page.
         let other_account =
             crate::state::names_other_account(input.slo_owner_aws_account_id.as_deref());
 
+        // The PAYLOAD inside that tag is caller-editable too, so the key it carries is
+        // honoured only when it is a boundary this paging can have minted over the set this
+        // request selects, and refused with the same wording otherwise
+        // ([`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::page`]).
         let store = state.lock();
-        let (slo_summaries, next_token) = if other_account {
-            (Vec::new(), None)
-        } else {
-            store.page(&token_tag, cursor.as_deref(), page_size, |slo| {
-                matches_filters(slo, &input)
+        let (slo_summaries, next_token) = store
+            .page(&token_tag, cursor.as_deref(), page_size, |slo| {
+                !other_account && matches_filters(slo, &input)
             })
-        };
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         Ok(ListServiceLevelObjectivesOutput {
             slo_summaries: Some(slo_summaries),

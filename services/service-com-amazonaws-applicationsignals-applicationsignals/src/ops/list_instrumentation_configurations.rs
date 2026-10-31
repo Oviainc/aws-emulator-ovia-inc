@@ -216,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(crate::scaffolded::Scaffolded::validation(
                         crate::state::unissued_next_token_in(
-                            "this service, environment and instrumentation type",
+                            crate::state::INSTRUMENTATION_CURSOR_SCOPE,
                         ),
                     ))
                 }
@@ -237,8 +237,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
         let (latest_configurations, next_token) = if changed {
-            let (page, next_token) =
-                store.page_instrumentation_configurations(&scope, cursor.as_deref(), page_size);
+            // The key inside the tag is caller-editable too, so it is honoured only when it
+            // is a boundary this scope's paging can have minted, and refused with the same
+            // wording otherwise.
+            let (page, next_token) = store
+                .page_instrumentation_configurations(&scope, cursor.as_deref(), page_size)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
             (Some(page), next_token)
         } else {
             (None, None)

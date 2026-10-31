@@ -141,37 +141,13 @@ const SLO_ID_PATTERN: &str = "^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$|\
      ^arn:(aws|aws-us-gov):application-signals:[^:]*:[^:]*:slo/\
      [0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$";
 
-/// The shortest and longest SLO name the modelled `ServiceLevelObjectiveName` pattern
-/// admits (`^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$`): the two anchored alphanumeric
-/// characters, plus up to 126 between them.
-const SLO_NAME_LENGTH: ::std::ops::RangeInclusive<usize> = 2..=128;
-
-/// Whether `name` is a `ServiceLevelObjectiveName`: an alphanumeric first and last
-/// character, and `-`, `.`, `_`, a space or another alphanumeric between them.
-///
-/// Compared byte for byte, which is exact because every character the pattern admits is
-/// ASCII: any byte of a multi-byte character fails every class below.
-fn well_formed_slo_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    if !SLO_NAME_LENGTH.contains(&bytes.len()) {
-        return false;
-    }
-    let Some((first, rest)) = bytes.split_first() else {
-        return false;
-    };
-    let Some((last, middle)) = rest.split_last() else {
-        return false;
-    };
-    first.is_ascii_alphanumeric()
-        && last.is_ascii_alphanumeric()
-        && middle
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b' '))
-}
-
 /// Whether `id` is a `ServiceLevelObjectiveId` ([`SLO_ID_PATTERN`]): a well-formed SLO name,
 /// or an ARN of this service, in a partition the pattern admits, whose resource is
 /// `slo/<well-formed name>`.
+///
+/// The name form is read through `crate::state::well_formed_slo_name` — the crate's ONE
+/// statement of the SLO store's key space, which the objective listing also resolves a page
+/// boundary by — so an id this accepts spells a name a record could be stored under.
 ///
 /// The ARN branch is told from the name branch by the `arn:` prefix the pattern spells: no
 /// `ServiceLevelObjectiveName` can carry a `:` at all, so the two branches cannot both
@@ -186,11 +162,11 @@ fn well_formed_slo_name(name: &str) -> bool {
 /// resolution.
 fn is_slo_id(id: &str) -> bool {
     if !id.starts_with("arn:") {
-        return well_formed_slo_name(id);
+        return crate::state::well_formed_slo_name(id);
     }
     ::service_common::arn::parse_of(id, crate::state::SIGNING_NAME)
         .is_some_and(|arn| ARN_PARTITIONS.contains(&arn.partition))
-        && crate::state::slo_name_in_arn(id).is_some_and(well_formed_slo_name)
+        && crate::state::slo_name_in_arn(id).is_some_and(crate::state::well_formed_slo_name)
 }
 
 /// The budget report of one stored SLO, as of the instant `at`, with `now` the instant the

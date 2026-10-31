@@ -305,7 +305,10 @@ fn entries(answer: &Value, items: &str) -> Vec<Value> {
 
 /// The plaintext inside a token: a token is the hex of a tag and a payload, with no signature
 /// over either, which is why the payload is caller-editable at all.
-fn plaintext(token: &str) -> String {
+///
+/// `pub(crate)` so the sibling suite that forges a KEY payload reads a token through this one
+/// decode rather than a copy of it (`issued_key_boundary`).
+pub(crate) fn plaintext(token: &str) -> String {
     String::from_utf8(::hex::decode(token).expect("an issued token is hex"))
         .expect("an issued token is hex of text")
 }
