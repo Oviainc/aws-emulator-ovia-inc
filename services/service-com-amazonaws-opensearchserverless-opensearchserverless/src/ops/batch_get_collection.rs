@@ -150,15 +150,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // From `ids`' and `names`' own documentation: "You can't provide names and IDs in
-        // the same request" — and a request that names neither selects no collection at
-        // all, so neither combination is servable.
-        let refusal = match (input.ids.as_deref(), input.names.as_deref()) {
-            (Some(_), Some(_)) => Some("ids and names cannot be provided in the same request"),
-            (None, None) => Some("one of ids or names must be provided"),
-            _ => None,
-        };
-        if let Some(message) = refusal {
+        // The ids/names selector rule, in one place for both batch readers:
+        // `crate::state::batch_selector_refusal`.
+        if let Some(message) =
+            crate::state::batch_selector_refusal(input.ids.as_deref(), input.names.as_deref())
+        {
             return Err(BatchGetCollectionErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(message.to_string()),

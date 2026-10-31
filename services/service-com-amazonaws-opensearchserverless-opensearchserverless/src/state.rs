@@ -2668,6 +2668,28 @@ pub fn vpc_endpoint_error_for_id(id: &str) -> VpcEndpointErrorDetail {
     }
 }
 
+/// Why a batch read's `ids`/`names` pair selects nothing servable, if it does not select
+/// exactly one of the two.
+///
+/// Both of this service's id-or-name batch readers take the same pair of selectors, and
+/// `ids` and `names` carry the same sentence on BOTH request shapes — "You can't provide
+/// names and IDs in the same request"
+/// (`smithy_query(query="doc", shape="BatchGetCollectionRequest", member="ids")` and
+/// `smithy_query(query="doc", shape="BatchGetCollectionGroupRequest", member="ids")`) — and
+/// a request carrying neither member selects no resource at all, so neither combination is
+/// servable. The branch and both sentences live here rather than in each reader, so one
+/// shape of request cannot be answered two ways depending on which resource was read.
+pub fn batch_selector_refusal(
+    ids: Option<&[String]>,
+    names: Option<&[String]>,
+) -> Option<&'static str> {
+    match (ids, names) {
+        (Some(_), Some(_)) => Some("ids and names cannot be provided in the same request"),
+        (None, None) => Some("one of ids or names must be provided"),
+        _ => None,
+    }
+}
+
 /// A refusal worded as this service's validation layer words one: the
 /// `<n> validation error detected: Value '<value>' at '<member>' failed to satisfy
 /// constraint: <constraint>` sentence the framework renders for a modelled constraint

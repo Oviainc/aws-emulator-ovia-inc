@@ -21,6 +21,8 @@ mod account_settings;
 mod account_settings_audit;
 #[path = "all/audit_capture.rs"]
 mod audit_capture;
+#[path = "all/batch_selector_rule.rs"]
+mod batch_selector_rule;
 #[path = "all/client_error_status.rs"]
 mod client_error_status;
 #[path = "all/client_token_scope.rs"]
