@@ -205,6 +205,8 @@ mod s3vectors_resource_types;
 mod resolved_properties;
 #[path = "all/sam_deployed_resources.rs"]
 mod sam_deployed_resources;
+#[path = "all/sam_policies_shorthand.rs"]
+mod sam_policies_shorthand;
 #[path = "all/sam_transform.rs"]
 mod sam_transform;
 #[path = "all/scan_and_registry_reads.rs"]

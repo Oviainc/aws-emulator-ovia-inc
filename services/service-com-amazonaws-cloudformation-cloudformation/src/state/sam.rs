@@ -32,6 +32,11 @@
 //!   `$default` stage.
 //! * `AWS::Serverless::Api` and `AWS::Serverless::HttpApi` become that same API trio from
 //!   the definition the declaration states.
+//! * A declaration's `Policies` is what the role generated for it grants: every entry that
+//!   is not an AWS managed policy becomes one INLINE policy on that role, named for the
+//!   declaration and the entry's position ([`role_policies`]), and the role carries the
+//!   managed policy each of the function's event sources needs
+//!   ([`EVENT_SOURCE_POLICIES`]).
 //! * `AWS::Serverless::SimpleTable` becomes an `AWS::DynamoDB::Table`,
 //!   `AWS::Serverless::LayerVersion` an `AWS::Lambda::LayerVersion` and
 //!   `AWS::Serverless::StateMachine` an `AWS::StepFunctions::StateMachine` (plus its
@@ -77,6 +82,10 @@
 use ::serde_json::{json, Map, Value};
 
 use super::template::{declared_transforms, MAX_TEMPLATE_DEPTH, PARTITION};
+
+/// The policy templates a `Policies` entry's shorthand can name, and the policy document
+/// each one stands for.
+mod policy_templates;
 
 /// The macro name the AWS Serverless Application Model is published under, as a template's
 /// `Transform` section names it.
@@ -128,6 +137,37 @@ const CREATED_BY_TAG: (&str, &str) = ("lambda:createdBy", "SAM");
 /// Spelled with the partition rather than `${AWS::Partition}`, which is how the recorded
 /// expansion spells every ARN it writes: the transform runs in one partition and names it.
 const BASIC_EXECUTION_POLICY: &str = "iam::aws:policy/service-role/AWSLambdaBasicExecutionRole";
+
+/// The managed policy the role a function executes as needs for one EVENT SOURCE TYPE:
+/// an event source the Lambda service READS FROM on the function's behalf is polled with
+/// the function's own permissions, so the transform attaches the execution-role policy
+/// published for that source ("AWS SAM … adds the permissions the event source needs to the
+/// function's execution role").
+///
+/// Keyed by the event type an `Events` entry declares, spelled as
+/// [`EVENT_SOURCE_MAPPINGS`] spells it. A pull source whose permissions the published
+/// expansion grants as policy STATEMENTS rather than as one managed policy (an Amazon MQ
+/// broker, a self-managed cluster, a DocumentDB change stream — each of which needs the
+/// secret and the network of the resource it reads) has no entry here: nothing is attached
+/// for it, rather than a policy nothing published.
+const EVENT_SOURCE_POLICIES: &[(&str, &str)] = &[
+    (
+        "DynamoDB",
+        "iam::aws:policy/service-role/AWSLambdaDynamoDBExecutionRole",
+    ),
+    (
+        "Kinesis",
+        "iam::aws:policy/service-role/AWSLambdaKinesisExecutionRole",
+    ),
+    (
+        "SQS",
+        "iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
+    ),
+    (
+        "MSK",
+        "iam::aws:policy/service-role/AWSLambdaMSKExecutionRole",
+    ),
+];
 
 /// The function timeout the transform states when the declaration states none (SAM's
 /// documented default for `AWS::Serverless::Function$Timeout`, which is Lambda's own
@@ -660,27 +700,17 @@ fn function_code(properties: &Value) -> Option<Value> {
 
 /// The execution role the transform creates for a function that names none: the role Lambda
 /// assumes, carrying the basic execution managed policy, the managed policies the
-/// declaration names and the inline policy documents it states.
+/// declaration names, the one each of its event sources needs and one inline policy per
+/// other `Policies` entry.
 fn execution_role(logical_id: &str, properties: &Value) -> Value {
+    let (declared_managed, inline) = role_policies(logical_id, properties);
     let mut managed = vec![json!(arn(BASIC_EXECUTION_POLICY))];
-    let mut inline: Vec<Value> = Vec::new();
-    for (position, policy) in declared_policies(properties.get("Policies"))
-        .iter()
-        .enumerate()
-    {
-        match policy {
-            // "A list of … AWS managed policy names, or … policy ARNs" — a string names a
-            // policy to attach.
-            Value::String(_) => managed.push(policy.clone()),
-            // An inline policy document is the one object form whose meaning is known here:
-            // "Statement" is what makes a value a policy document. A policy TEMPLATE
-            // (`SQSPollerPolicy` and the rest) expands into permissions this module does
-            // not carry, so it contributes none.
-            Value::Object(_) if policy.get("Statement").is_some() => inline.push(json!({
-                "PolicyName": format!("{logical_id}RolePolicy{position}"),
-                "PolicyDocument": policy,
-            })),
-            _ => {}
+    managed.extend(declared_managed);
+    for policy in event_source_policies(properties) {
+        // A policy is either attached or it is not, so two events needing the same one
+        // attach it once.
+        if !managed.contains(&policy) {
+            managed.push(policy);
         }
     }
     let mut role = Map::new();
@@ -709,6 +739,29 @@ fn execution_role(logical_id: &str, properties: &Value) -> Value {
     resource("AWS::IAM::Role", role)
 }
 
+/// The managed policies the function's own EVENT SOURCES need on the role it executes as,
+/// one per source type that publishes one ([`EVENT_SOURCE_POLICIES`]), in the order the
+/// `Events` entries are walked and without repeats.
+fn event_source_policies(properties: &Value) -> Vec<Value> {
+    let mut policies: Vec<Value> = Vec::new();
+    for declaration in object(properties.get("Events")).values() {
+        let Some(kind) = declaration.get("Type").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((_, policy)) = EVENT_SOURCE_POLICIES
+            .iter()
+            .find(|(event_type, _)| *event_type == kind)
+        else {
+            continue;
+        };
+        let policy = json!(arn(policy));
+        if !policies.contains(&policy) {
+            policies.push(policy);
+        }
+    }
+    policies
+}
+
 /// `Policies` as the list of entries it states, whichever of its spellings the declaration
 /// uses: "This property accepts a single value or a list of values."
 fn declared_policies(policies: Option<&Value>) -> Vec<Value> {
@@ -716,6 +769,66 @@ fn declared_policies(policies: Option<&Value>) -> Vec<Value> {
         Some(Value::Array(entries)) => entries.clone(),
         Some(entry) => vec![entry.clone()],
         None => Vec::new(),
+    }
+}
+
+/// What a `Policies` declaration puts on the role the transform generates for it: the
+/// managed policy ARNs to attach, and the INLINE policies to embed.
+///
+/// Each entry is one of the three things the property accepts, and every entry that is not
+/// a managed policy becomes exactly ONE inline policy, named for the resource the role
+/// belongs to and the entry's POSITION in the declared list
+/// (`<LogicalId>RolePolicy<position>`), so the role embeds the entries in declaration
+/// order:
+///
+/// * "a list of … AWS managed policy names, or … policy ARNs" — a string names a policy to
+///   attach, which is a `ManagedPolicyArns` entry and no inline policy at all;
+/// * an IAM policy document, which `Statement` is what makes a value one — embedded as it
+///   is stated;
+/// * "a list of AWS SAM policy templates" — a single-member object naming a published
+///   template and the parameters it is applied with, embedded as the document that template
+///   grants ([`policy_templates`]).
+///
+/// An entry that is none of those three (an object that is no document and names no
+/// template this module carries) contributes no inline policy, rather than a document
+/// nothing computed.
+fn role_policies(logical_id: &str, properties: &Value) -> (Vec<Value>, Vec<Value>) {
+    let mut managed: Vec<Value> = Vec::new();
+    let mut inline: Vec<Value> = Vec::new();
+    for (position, policy) in declared_policies(properties.get("Policies"))
+        .iter()
+        .enumerate()
+    {
+        let document = match policy {
+            Value::String(_) => {
+                managed.push(policy.clone());
+                continue;
+            }
+            Value::Object(_) if policy.get("Statement").is_some() => Some(policy.clone()),
+            Value::Object(entry) => named_policy_template(entry)
+                .and_then(|(name, parameters)| policy_templates::document(name, parameters)),
+            _ => None,
+        };
+        if let Some(document) = document {
+            inline.push(json!({
+                "PolicyName": format!("{logical_id}RolePolicy{position}"),
+                "PolicyDocument": document,
+            }));
+        }
+    }
+    (managed, inline)
+}
+
+/// The template a policy-template entry names and the parameters it states for it: a
+/// policy template is applied as a ONE-member object, the member's name being the
+/// template's and its value the parameters.
+fn named_policy_template(entry: &Map<String, Value>) -> Option<(&str, &Value)> {
+    match entry.len() {
+        1 => entry
+            .iter()
+            .next()
+            .map(|(name, parameters)| (name.as_str(), parameters)),
+        _ => None,
     }
 }
 
@@ -1225,6 +1338,16 @@ fn expanded_state_machine(
                     }],
                 }),
             );
+            // A state machine states its permissions the same way a function does, and the
+            // role generated for it carries them the same way ([`role_policies`]).
+            let (managed, inline) =
+                role_policies(logical_id, &Value::Object(properties.clone()));
+            if !managed.is_empty() {
+                role.insert("ManagedPolicyArns".to_string(), Value::Array(managed));
+            }
+            if !inline.is_empty() {
+                role.insert("Policies".to_string(), Value::Array(inline));
+            }
             (machine, Some(resource("AWS::IAM::Role", role)))
         }
     }
