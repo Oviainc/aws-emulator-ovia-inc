@@ -46,7 +46,7 @@ const UNSUPPORTED_MESSAGE: &str = "Unsupported resource ARN";
 /// members may have — "the types of resources that you can add to this group" in
 /// the AWS "Service configurations for resource groups" reference, which is the
 /// vocabulary `GroupConfigurationParameter$Name` is documented against.
-const ALLOWED_RESOURCE_TYPES: &str = "allowed-resource-types";
+pub(crate) const ALLOWED_RESOURCE_TYPES: &str = "allowed-resource-types";
 
 /// One resource: its ARN, and the CloudFormation-style resource type that ARN
 /// names.

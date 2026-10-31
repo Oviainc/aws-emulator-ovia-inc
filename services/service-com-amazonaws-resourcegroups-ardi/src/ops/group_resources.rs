@@ -5,9 +5,9 @@
 //! Records each ARN in `ResourceArns` as a static member of the group `Group` names, in
 //! [`crate::state`], and reports in `Succeeded` the memberships THIS call added. Adding an
 //! ARN that is already a member is a no-op, so a repeated call neither duplicates the
-//! membership nor reports an addition for it — and since `Succeeded` targets a list whose
-//! declared length starts at one, a call that added nothing omits the member rather than
-//! answering an empty list.
+//! membership nor reports an addition for it — and a call that added nothing reports that
+//! with an EMPTY `Succeeded` list rather than leaving the member out, since every list
+//! member of this answer is reported on the wire whatever the call changed.
 //!
 //! Only a group whose stored service configuration declares one of the supported
 //! configuration types ([`crate::state::STATIC_MEMBERSHIP_CONFIGURATION_TYPES`]) accepts a
@@ -293,10 +293,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "resources added to a resource group",
         );
         Ok(GroupResourcesOutput {
-            // `Succeeded` targets `ResourceArnList`, whose declared length starts
-            // at one, so a call that added no membership cannot say so with an
-            // empty list: the member is left out of the answer instead.
-            succeeded: crate::state::reported_list(succeeded),
+            // The memberships this call added, reported whatever they are: a call
+            // that added none says so with `[]`, the way the siblings below and the
+            // query-evaluating listings' own report members do. The length declared
+            // on the target bounds the `ResourceArns` a REQUEST may carry; it does
+            // not turn a report with nothing in it into an omission, which would
+            // leave "added nothing" indistinguishable from "not reported".
+            succeeded: Some(succeeded),
             // One entry per ARN the group does not support — the only way this
             // operation refuses a single named resource rather than the whole
             // request. An ARN the group already held did not FAIL to be added, so

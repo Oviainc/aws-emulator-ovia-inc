@@ -6,9 +6,9 @@
 //! names, in [`crate::state`], and reports the resources THIS call removed in
 //! `Succeeded`. Removing an ARN the group does not hold removes nothing, so that ARN
 //! is reported in neither `Succeeded` nor `Failed`; a repeated call therefore changes
-//! nothing and reports no removal — and since `Succeeded` targets a list whose declared
-//! length starts at one, a call that removed nothing omits the member rather than
-//! answering an empty list.
+//! nothing and reports no removal — reporting that with an EMPTY `Succeeded` list rather
+//! than leaving the member out, since every list member of this answer is reported on the
+//! wire whatever the call changed.
 //!
 //! Only a group the store records as populated through a static grouping, or one whose
 //! service configuration still declares one of the supported configuration types
@@ -274,10 +274,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "resources removed from a resource group",
         );
         Ok(UngroupResourcesOutput {
-            // `Succeeded` targets `ResourceArnList`, whose declared length starts
-            // at one, so a call that dropped no membership cannot say so with an
-            // empty list: the member is left out of the answer instead.
-            succeeded: crate::state::reported_list(succeeded),
+            // The memberships this call dropped, reported whatever they are: a call
+            // that dropped none says so with `[]`, the way the siblings below and
+            // the query-evaluating listings' own report members do. The length
+            // declared on the target bounds the `ResourceArns` a REQUEST may carry;
+            // it does not turn a report with nothing in it into an omission, which
+            // would leave "removed nothing" indistinguishable from "not reported".
+            succeeded: Some(succeeded),
             // One entry per ARN the group neither holds nor supports — the only way
             // this operation refuses a single named resource rather than the whole
             // request. An ARN the group simply does not hold did not FAIL to be

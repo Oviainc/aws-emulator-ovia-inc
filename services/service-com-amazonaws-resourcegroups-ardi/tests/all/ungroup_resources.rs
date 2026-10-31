@@ -118,12 +118,10 @@ pub(crate) async fn listed_members(emulator: &Emulator, case: &str, name: &str) 
 
 /// The `Succeeded` list of an answer, sorted.
 ///
-/// A call that removed nothing reports no ARN, which the wire carries either as an
-/// empty list or as no member at all — both read here as no ARN.
+/// The member is required to be on the wire: a call that changed no membership
+/// reports that as `[]`, so an answer that leaves `Succeeded` out is a failure here
+/// rather than another spelling of "no ARN".
 pub(crate) fn succeeded(case: &str, answered: &Value) -> Vec<String> {
-    if answered["Succeeded"].is_null() {
-        return Vec::new();
-    }
     sorted(
         answered["Succeeded"]
             .as_array()
