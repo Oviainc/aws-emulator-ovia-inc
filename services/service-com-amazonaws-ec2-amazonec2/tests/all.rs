@@ -1105,3 +1105,10 @@ mod create_transit_gateway_metering_policy;
 // an association — the route table's own and the attachment's — answer with that one record.
 #[path = "all/transit_gateway_route_table_associations.rs"]
 mod transit_gateway_route_table_associations;
+// Appended at the END of this file, for the reason the header gives. What
+// `CreateTransitGatewayVpcAttachment` computes a VPC attachment from — the gateway, the VPC and
+// the subnets the request names, the VPC's stored owner, and the options it asked for or
+// inherited from the gateway — the `pending` -> `available` move the clock owes it, and what it
+// refuses.
+#[path = "all/create_transit_gateway_vpc_attachment.rs"]
+mod create_transit_gateway_vpc_attachment;

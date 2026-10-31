@@ -32782,6 +32782,45 @@ impl ComAmazonawsEc2Amazonec2State {
         Some(attachment_id)
     }
 
+    /// Store a transit gateway VPC attachment in the non-terminal state a create leaves it
+    /// in, with the move to `available` the clock owes it, and answer the
+    /// `TransitGatewayAttachmentId` it was given — or `None` when the store is at
+    /// [`MAX_STORED_RECORDS_PER_STORE`] and nothing was stored.
+    ///
+    /// The id, the state and the owed move are minted HERE rather than taken from `view`, on
+    /// the contract of [`Self::insert_transit_gateway_connect`], so no path can report a VPC
+    /// attachment in a state the store does not hold; the id and the byte charge are the
+    /// shared [`Self::insert_transit_gateway_attachment`]'s, so a VPC attachment is stored
+    /// and charged exactly like every other kind.
+    ///
+    /// An attachment carries traffic only once the transit gateway it is on carries traffic,
+    /// so the move it owes falls due one [`TRANSITION_DELAY`] after the gateway's own move to
+    /// `available` is due ([`Self::transit_gateway_available_at`]) — and one span after this
+    /// call for a gateway that is in service already. Nothing is slept for either way.
+    pub fn insert_transit_gateway_vpc_attachment(
+        &mut self,
+        mut view: TransitGatewayVpcAttachment,
+    ) -> Option<String> {
+        view.state = Some(TRANSIT_GATEWAY_ATTACHMENT_STATE_PENDING.to_string());
+        let now = Instant::now();
+        let gateway_ready_at = view
+            .transit_gateway_id
+            .as_deref()
+            .and_then(|transit_gateway_id| self.transit_gateway_available_at.get(transit_gateway_id))
+            .copied()
+            .unwrap_or(now);
+        let due_at = now.max(gateway_ready_at) + TRANSITION_DELAY;
+        let attachment_id =
+            self.insert_transit_gateway_attachment(TransitGatewayAttachmentView::Vpc(view))?;
+        if let Some(record) = self.transit_gateway_attachments.get_mut(&attachment_id) {
+            record.pending = Some(PendingStateMove {
+                to: TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE.to_string(),
+                due_at,
+            });
+        }
+        Some(attachment_id)
+    }
+
     /// Store a transit gateway multicast domain and answer the
     /// `TransitGatewayMulticastDomainId` it was given — or `None` when the store is at its
     /// ceiling and nothing was stored.

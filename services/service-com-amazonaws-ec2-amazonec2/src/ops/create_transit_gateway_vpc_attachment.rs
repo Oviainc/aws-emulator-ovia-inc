@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGatewayVpcAttachment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGatewayVpcAttachment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGatewayVpcAttachment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does
+//!
+//! "Attaches the specified VPC to the specified transit gateway": it resolves the subnets the
+//! request names against the VPC it names, resolves that VPC and the transit gateway, and
+//! stores ONE VPC attachment in the one attachment store in the non-terminal `pending` state
+//! with the clock owing it `available`. `DescribeTransitGatewayVpcAttachments` and
+//! `DescribeTransitGatewayAttachments` read the very record this writes.
+//!
+//! Nothing about the answer is taken from a recording: the attachment id comes from the
+//! store's id mint, the VPC's owner from the stored VPC, the subnets from the request (each
+//! resolved against the store, de-duplicated, in the order the request names them), the
+//! options from the request where it carries them and otherwise from the gateway's own
+//! options or the member's documented default, and the state from the one writer that stores
+//! a VPC attachment, which is the only place its state and its owed move are set.
+//!
+//! Every parent the attachment needs has to be there: a subnet this account does not hold —
+//! or one of another VPC, which this attachment cannot reach — is refused with the subnet's
+//! own `NotFound` code, as are a VPC and a transit gateway the store holds none of, and a
+//! second attachment of one VPC to one gateway is refused rather than stored.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +89,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -145,18 +158,340 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayVpcAttachment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayVpcAttachmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — the gateway,
+        // the VPC and the subnets are each named by id, and everything else is read off the
+        // store, which is reached through the engine held on `self`.
+        let _ = ctx;
+        use std::time::SystemTime;
+
+        // The request's own form first, before anything is resolved, so "not an id of this
+        // kind" never reads as "no such resource" and is never answered by the DryRun arm
+        // below either.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayVpcAttachment"))
+        // "You must specify at least one subnet" (`SubnetIds`): the member is `@required`, so
+        // the boundary validator already refuses a request that leaves it out; this is the
+        // backstop that keeps an empty list from reading as a success whatever reaches the
+        // handler, worded as EC2 words a parameter the request left out.
+        if input.subnet_ids.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter SubnetIds",
+            ));
+        }
+        // The model publishes no bound on that list and every id named is resolved against
+        // the store, so the number of ids one request may name is capped here — the same
+        // ceiling the rest of this crate puts on a caller-chosen id list — before any work
+        // proportional to it is done.
+        if input.subnet_ids.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "SubnetIds carries {supplied} ids, above the maximum of {maximum}",
+                supplied = input.subnet_ids.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
+        }
+        // `InvalidSubnetID.Malformed` is the refusal EC2's error catalogue documents for a
+        // subnet id of the wrong form. The list has already been capped above, so this scan
+        // is bounded.
+        if let Some(subnet_id) = input
+            .subnet_ids
+            .iter()
+            .find(|subnet_id| !state::prefixed_id_is_well_formed(state::SUBNET_ID_PREFIX, subnet_id))
+        {
+            return Err(state::invalid_subnet_id_malformed(subnet_id));
+        }
+
+        // "The tags to apply to the VPC attachment" (`TagSpecifications`) — "you must specify
+        // the resource type to tag, otherwise the request will fail" (`TagSpecification`), and
+        // the only type this action tags is the attachment it creates. The tag payload's own
+        // bounds are applied by the one shared reader every create holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT,
+            Self::NAME,
+        )?;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether the gateway and the attachments it already carries admit
+        // this call is asked of the state they are ACTUALLY in rather than of the one their
+        // last writer left them in.
+        store.materialize_due_transitions();
+
+        // "The IDs of one or more subnets. You can specify only one subnet per Availability
+        // Zone" (`SubnetIds`): the transit gateway "uses one IP address from each specified
+        // subnet", so each subnet has to be a subnet of the VPC being attached — a subnet this
+        // account does not hold, or one of another VPC, is refused with the subnet's own
+        // `NotFound` code, the way every other operation of this crate resolves a subnet
+        // inside a VPC. A subnet named twice asks for ONE address in it, so the list is
+        // reduced to the subnets it names, in the order it names them.
+        let mut subnet_ids: Vec<String> = Vec::with_capacity(input.subnet_ids.len());
+        let mut zones: Vec<(String, String)> = Vec::with_capacity(input.subnet_ids.len());
+        for subnet_id in &input.subnet_ids {
+            let Some(subnet) = store
+                .subnets
+                .get(subnet_id)
+                .filter(|subnet| subnet.vpc_id.as_deref() == Some(input.vpc_id.as_str()))
+            else {
+                return Err(state::invalid_subnet_id_not_found(subnet_id));
+            };
+            if subnet_ids.iter().any(|named| named == subnet_id) {
+                continue;
+            }
+            let zone = subnet.availability_zone.clone().unwrap_or_default();
+            if let Some((_, held)) = zones.iter().find(|(named_zone, _)| *named_zone == zone) {
+                return Err(duplicate_subnets_in_same_zone(held, subnet_id, &zone));
+            }
+            zones.push((zone, subnet_id.clone()));
+            subnet_ids.push(subnet_id.clone());
+        }
+
+        // "The ID of the VPC" (`VpcId`), and "the ID of the Amazon Web Services account that
+        // owns the VPC" (`TransitGatewayVpcAttachment$VpcOwnerId`), which is read off the
+        // STORED VPC rather than from the request, which does not carry it.
+        //
+        // Every subnet resolved above is a subnet OF this VPC, so a store that holds them
+        // holds the VPC and the refusal below is a backstop: a request that names a VPC this
+        // account does not hold is already refused above, for the subnets of it that are not
+        // there either — which is what AWS answers such a request, naming the subnet. It is
+        // kept so that a VPC the store somehow does not hold can never read as a success.
+        let Some(vpc) = store.vpcs.get(&input.vpc_id) else {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        };
+        let vpc_owner_id = vpc
+            .owner_id
+            .clone()
+            .unwrap_or_else(|| ::engine::emulator_account_id().to_string());
+
+        // "The ID of the transit gateway" (`TransitGatewayId`) the VPC is attached to: an
+        // attachment is a resource OF a transit gateway, so an id this account holds no
+        // gateway for has nothing to attach the VPC to. Resolved against the store alone — the
+        // one refusal `DescribeTransitGateways` answers for a `TransitGatewayId` it cannot
+        // resolve, so one resource family reads one way.
+        let Some(transit_gateway) = store.transit_gateways.get(&input.transit_gateway_id) else {
+            return Err(state::invalid_transit_gateway_id_not_found(
+                &input.transit_gateway_id,
+            ));
+        };
+        let gateway_options = transit_gateway.options.clone();
+
+        // "The VPC attachment options" (`Options`): the value the REQUEST asked for, and for a
+        // member it left out the gateway's own setting where the gateway carries that option —
+        // "the modified options are applied to new transit gateway attachments only"
+        // (`ModifyTransitGateway`), so what a new attachment inherits is the gateway's
+        // current option — otherwise the member's own documented default. Each value is read
+        // by the one reader this crate holds an `enable`/`disable` option to, so a value no
+        // enum publishes cannot reach the store whatever reaches this handler.
+        let requested = input.options.as_ref();
+        let options = TransitGatewayVpcAttachmentOptions {
+            // "Enable or disable DNS support. The default is enable" — and the gateway's own
+            // `DnsSupport` where it has one.
+            dns_support: Some(resolve_option(
+                requested.and_then(|options| options.dns_support.as_deref()),
+                "dnsSupport",
+                gateway_options
+                    .as_ref()
+                    .and_then(|options| options.dns_support.clone()),
+                state::OPTION_ENABLE,
+            )?),
+            // "Enables you to reference a security group across VPCs attached to a transit
+            // gateway … at the transit gateway level the default is set to disable", so an
+            // attachment the request asked nothing for takes the gateway's setting.
+            security_group_referencing_support: Some(resolve_option(
+                requested.and_then(|options| options.security_group_referencing_support.as_deref()),
+                "securityGroupReferencingSupport",
+                gateway_options
+                    .as_ref()
+                    .and_then(|options| options.security_group_referencing_support.clone()),
+                state::OPTION_DISABLE,
+            )?),
+            // "Specifies whether IPv6 support is enabled for the attachment … The default is
+            // disable": no transit gateway option corresponds to it, so the member's own
+            // default applies.
+            ipv6_support: Some(resolve_option(
+                requested.and_then(|options| options.ipv6_support.as_deref()),
+                "ipv6Support",
+                None,
+                state::OPTION_DISABLE,
+            )?),
+            // "Enable or disable support for appliance mode … The default is disable", with no
+            // gateway-level option either.
+            appliance_mode_support: Some(resolve_option(
+                requested.and_then(|options| options.appliance_mode_support.as_deref()),
+                "applianceModeSupport",
+                None,
+                state::OPTION_DISABLE,
+            )?),
+        };
+
+        // One VPC is attached to one transit gateway once: the gateway already carries an
+        // attachment of this VPC, so a second one is refused and NOTHING is written. An
+        // attachment the lifecycle has finished with — deleted, rejected or failed — attaches
+        // nothing any more, so it does not stand in the way of a new one.
+        if let Some(held) = store
+            .transit_gateway_attachments
+            .iter()
+            .filter_map(|(attachment_id, record)| match &record.view {
+                state::TransitGatewayAttachmentView::Vpc(attachment) => {
+                    Some((attachment_id, attachment))
+                }
+                _ => None,
+            })
+            .find(|(_, attachment)| {
+                attachment.transit_gateway_id.as_deref() == Some(input.transit_gateway_id.as_str())
+                    && attachment.vpc_id.as_deref() == Some(input.vpc_id.as_str())
+                    && !attachment_is_finished(attachment.state.as_deref())
+            })
+            .map(|(attachment_id, _)| attachment_id.clone())
+        {
+            return Err(duplicate_transit_gateway_attachment(
+                &input.transit_gateway_id,
+                &held,
+                &input.vpc_id,
+            ));
+        }
+
+        // "Information about the VPC attachment" as it is about to be stored. The id, the
+        // state and the move the clock owes it are left for the store to mint, so no path can
+        // report an attachment in a state the store does not hold.
+        let view = TransitGatewayVpcAttachment {
+            transit_gateway_attachment_id: None,
+            transit_gateway_id: Some(input.transit_gateway_id.clone()),
+            vpc_id: Some(input.vpc_id.clone()),
+            vpc_owner_id: Some(vpc_owner_id),
+            state: None,
+            subnet_ids: Some(subnet_ids),
+            creation_time: Some(state::system_time_to_date_time(SystemTime::now())),
+            options: Some(options),
+            tags: (!tags.is_empty()).then(|| tags.clone()),
+        };
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_transit_gateway_attachment_capacity() {
+            return Err(state::resource_count_exceeded(
+                "This emulator holds as many transit gateway attachments as it will store",
+            ));
+        }
+        // The very number the insert then charges, asked of the budget before anything is
+        // written: the record's own overhead plus the caller-chosen bytes it holds, which for
+        // a VPC attachment are its tags.
+        let payload_bytes = state::STORED_RECORD_OVERHEAD_BYTES + state::tag_list_bytes(&tags);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you have
+        // the required permissions, the error response is DryRunOperation" (`DryRun`). Nothing
+        // has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let Some(attachment_id) = store.insert_transit_gateway_vpc_attachment(view) else {
+            return Err(state::resource_count_exceeded(
+                "This emulator holds as many transit gateway attachments as it will store",
+            ));
+        };
+
+        // The answer is the record as it was STORED, so this operation and
+        // `DescribeTransitGatewayVpcAttachments` cannot drift apart.
+        let Some(state::TransitGatewayAttachmentView::Vpc(stored)) = store
+            .transit_gateway_attachments
+            .get(&attachment_id)
+            .map(|record| &record.view)
+        else {
+            return Err(state::internal_error(
+                "the transit gateway VPC attachment just created could not be read back",
+            ));
+        };
+        Ok(CreateTransitGatewayVpcAttachmentOutput {
+            transit_gateway_vpc_attachment: Some(stored.clone()),
+        })
     }
+}
+
+/// One `enable`/`disable` attachment option: the value the request asked for, else the
+/// gateway's own setting for it, else `default`.
+///
+/// A value the request carried is read by the ONE reader this crate holds such a value to
+/// ([`crate::state::transit_gateway_option_value`]), so a value outside the two members those
+/// enums publish is refused with EC2's own sentence rather than defaulted — a typo never
+/// reads as "the default".
+fn resolve_option(
+    requested: Option<&str>,
+    member: &str,
+    inherited: Option<String>,
+    default: &str,
+) -> Result<String, CreateTransitGatewayVpcAttachmentError> {
+    match requested {
+        Some(value) => state::transit_gateway_option_value(value, member),
+        None => Ok(inherited.unwrap_or_else(|| default.to_string())),
+    }
+}
+
+/// Whether a VPC attachment in `state` has finished its lifecycle, so it attaches nothing any
+/// more and does not stand in the way of a new attachment of the same VPC.
+///
+/// The terminal states of the attachment state enum that are not "in service"
+/// (`smithy_query(query="shape",shape="TransitGatewayAttachmentState")`): an attachment that
+/// was deleted, one the owner rejected, and one that could not be made.
+fn attachment_is_finished(attachment_state: Option<&str>) -> bool {
+    matches!(
+        attachment_state,
+        Some(
+            state::TRANSIT_GATEWAY_ATTACHMENT_STATE_DELETED
+                | state::TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTED
+                | state::TRANSIT_GATEWAY_ATTACHMENT_STATE_FAILED
+        )
+    )
+}
+
+/// `DuplicateTransitGatewayAttachment` (HTTP 400): the gateway already carries an attachment
+/// of this VPC, which is the refusal EC2 answers a second attachment of one VPC to one
+/// transit gateway with — it names the gateway, the attachment it already holds and the VPC.
+const DUPLICATE_TRANSIT_GATEWAY_ATTACHMENT: &str = "DuplicateTransitGatewayAttachment";
+
+/// Refuse a second attachment of one VPC to one transit gateway: HTTP 400
+/// [`DUPLICATE_TRANSIT_GATEWAY_ATTACHMENT`], naming the gateway, the attachment it already
+/// holds for that VPC and the VPC — all three from the request and the store.
+fn duplicate_transit_gateway_attachment(
+    transit_gateway_id: &str,
+    attachment_id: &str,
+    vpc_id: &str,
+) -> CreateTransitGatewayVpcAttachmentError {
+    crate::scaffolded::Scaffolded::service_error(
+        DUPLICATE_TRANSIT_GATEWAY_ATTACHMENT,
+        400,
+        format!(
+            "{transit_gateway_id} has non-deleted Transit Gateway Attachment \
+             {attachment_id} with VPC {vpc_id}"
+        ),
+    )
+}
+
+/// Refuse a request naming two subnets of one Availability Zone: HTTP 400
+/// [`crate::state::DUPLICATE_SUBNETS_IN_SAME_ZONE`], the code EC2 answers a second subnet of a
+/// zone with, naming the zone and both subnets.
+///
+/// Worded here rather than by [`crate::state::duplicate_subnets_in_same_zone`], whose sentence
+/// is the VPC endpoint's own: the attachment "uses one IP address from each specified subnet"
+/// and takes "only one subnet per Availability Zone" (`SubnetIds`), so this refusal names the
+/// zone the two subnets share.
+fn duplicate_subnets_in_same_zone(
+    held: &str,
+    requested: &str,
+    availability_zone: &str,
+) -> CreateTransitGatewayVpcAttachmentError {
+    crate::scaffolded::Scaffolded::service_error(
+        state::DUPLICATE_SUBNETS_IN_SAME_ZONE,
+        400,
+        format!(
+            "The subnets {held} and {requested} are both in the Availability Zone \
+             {availability_zone}; you can specify only one subnet per Availability Zone"
+        ),
+    )
 }
