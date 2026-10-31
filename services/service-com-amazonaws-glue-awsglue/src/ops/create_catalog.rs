@@ -4,9 +4,11 @@
 //!
 //! Registers one catalog resource in the Data Catalog of the account this endpoint serves
 //! ([`crate::state::CatalogDefinition`]): the whole definition comes from the request's
-//! `CatalogInput`, the name must be free, and the catalog is then addressed by the id the
-//! create derives from the account and the name ([`crate::state::child_catalog_id`]).
-//! `GetCatalog` reads the record back.
+//! `CatalogInput`, which must name a source outside the Glue Data Catalog and one this
+//! account has a registration for ([`crate::state::is_registered_federation_source`]), the
+//! name must be free, and the catalog is then addressed by the id the create derives from
+//! the account and the name ([`crate::state::child_catalog_id`]). `GetCatalog` reads the
+//! record back.
 //!
 //! ## Shape of an operation
 //!
@@ -196,6 +198,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // A catalog resource of the Glue Data Catalog points at a source OUTSIDE it: the
+        // shape is "a logical grouping of databases in the Glue Data Catalog or a
+        // federated source", and what a create registers is "a Redshift-federated catalog
+        // or a catalog containing resource links to Redshift databases in another account
+        // or region" (`Catalog`) — the input's `FederatedCatalog` and its
+        // `TargetRedshiftCatalog` respectively. An input naming neither describes a NATIVE
+        // catalog, which this operation does not create, so it is refused here, before any
+        // state is read or written, and nothing is persisted.
+        if input.catalog_input.federated_catalog.is_none()
+            && input.catalog_input.target_redshift_catalog.is_none()
+        {
+            return Err(CreateCatalogErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        crate::state::messages::CREATE_NATIVE_CATALOG_UNSUPPORTED.to_string(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // The source a federated catalog points at has to be REGISTERED for this account:
+        // the sources an account holds a registration for without registering anything are
+        // the ones AWS's own managed integrations register for it, reached through the
+        // integration's own federation connection
+        // (`crate::state::is_registered_federation_source`); a Glue connection the account
+        // created is a connection TO a source, not a registration OF it. A create pointing
+        // at an unregistered source is refused as unauthorized, before any state is read or
+        // written, so nothing is persisted.
+        if let Some(federated) = input.catalog_input.federated_catalog.as_ref() {
+            if !crate::state::is_registered_federation_source(federated) {
+                // The data source is the entity the input identified
+                // (`FederatedCatalog$Identifier`: "A unique identifier for the federated
+                // catalog"); where the input identified none, the connection it named is
+                // the only thing naming the source.
+                let source = federated
+                    .identifier
+                    .as_deref()
+                    .or(federated.connection_name.as_deref())
+                    .unwrap_or_default();
+                return Err(CreateCatalogErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(
+                            crate::state::messages::federation_source_not_registered(source),
+                        ),
+                    },
+                )
+                .into());
+            }
         }
 
         // The catalog is keyed by its folded name, so a read reaches it under any casing

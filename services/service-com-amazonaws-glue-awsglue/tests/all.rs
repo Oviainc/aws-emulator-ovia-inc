@@ -127,6 +127,8 @@ mod etl_connections;
 mod etl_jobs_and_connections;
 #[path = "all/event_batching_conditions.rs"]
 mod event_batching_conditions;
+#[path = "all/federated_catalogs.rs"]
+mod federated_catalogs;
 #[path = "all/form_type_deletion.rs"]
 mod form_type_deletion;
 #[path = "all/form_types.rs"]

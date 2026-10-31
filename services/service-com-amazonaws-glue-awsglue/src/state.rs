@@ -11250,11 +11250,24 @@ pub mod messages {
     pub const DATABASE_ALREADY_EXISTS: &str = "Database already exists.";
 
     /// A read that addresses ONE catalog resource by its `CatalogId` (`GetCatalog`) for a
-    /// name the addressed account's Data Catalog holds no catalog under. NOT recorded:
-    /// the sentence follows the per-resource template of [`database_not_found`], built
-    /// from the name the request addressed, which is the whole address of a catalog.
-    pub fn catalog_not_found(name: &str) -> String {
-        format!("Catalog {name} not found.")
+    /// name the addressed account's Data Catalog holds no catalog under. Recorded
+    /// constant: the whole sentence is fixed text, and the id the request addressed is
+    /// deliberately withheld — like [`DATABASE_ALREADY_EXISTS`] and unlike
+    /// [`database_not_found`], whose recorded wording does name its resource.
+    pub const CATALOG_NOT_FOUND: &str = "Catalog not found.";
+
+    /// `CreateCatalog` for a `CatalogInput` that names no source outside the Glue Data
+    /// Catalog. Recorded constant: the whole sentence is fixed text, naming neither the
+    /// catalog the request asked for nor any member of its input.
+    pub const CREATE_NATIVE_CATALOG_UNSUPPORTED: &str =
+        "Create glue native catalog is not supported.";
+
+    /// `CreateCatalog` for a federated catalog whose data source this account holds no
+    /// registration for ([`super::is_registered_federation_source`]). Recorded template:
+    /// the sentence names, in brackets, the data source the input pointed at and nothing
+    /// else of the request.
+    pub fn federation_source_not_registered(source: &str) -> String {
+        format!("The data source [{source}] is not registered.")
     }
 
     /// `CreateCatalog` for a `Name` the account already holds a catalog under. NOT
@@ -11918,6 +11931,11 @@ pub fn fold_name(name: &str) -> String {
 /// AWS reserves for its own resources.
 pub const CATALOG_NAME_PATTERN: &str = r"^(?!(.*[.\/\\]|aws:)).*$";
 
+/// The prefix AWS reserves for its own resources: a catalog's own name may not open with
+/// it ([`CATALOG_NAME_PATTERN`]), and the connections of AWS's own managed federation
+/// integrations are named under it ([`is_managed_federation_connection`]).
+pub const RESERVED_NAME_PREFIX: &str = "aws:";
+
 /// Whether `name` satisfies [`CATALOG_NAME_PATTERN`].
 ///
 /// Checked here rather than left to the boundary validator because that pattern uses a
@@ -11926,7 +11944,41 @@ pub const CATALOG_NAME_PATTERN: &str = r"^(?!(.*[.\/\\]|aws:)).*$";
 /// name the model forbids through to the store. The `@length(1, 64)` half of the
 /// constraint IS enforced upstream, so it is not repeated here.
 pub fn is_catalog_name(name: &str) -> bool {
-    !name.contains(['.', '/', '\\']) && !name.starts_with("aws:")
+    !name.contains(['.', '/', '\\']) && !name.starts_with(RESERVED_NAME_PREFIX)
+}
+
+/// Whether the connection `name` is one of the federation connections AWS's OWN managed
+/// integrations use, rather than one an account creates for itself.
+///
+/// Such a connection is named under the prefix AWS reserves for its own resources
+/// ([`RESERVED_NAME_PREFIX`]) — the prefix a tenant's catalog name may not take either —
+/// and no `CreateConnection` of this account can hold it.
+pub fn is_managed_federation_connection(name: &str) -> bool {
+    name.starts_with(RESERVED_NAME_PREFIX)
+}
+
+/// Whether the data source `federated` points at is REGISTERED for the account this
+/// endpoint serves, and so one a catalog of that account may be federated to.
+///
+/// The sources an account holds a registration for without having registered anything are
+/// the ones AWS's own managed integrations register for it, and an account reaches those
+/// through the integration's own federation connection
+/// ([`is_managed_federation_connection`]). Every other source is one the account has to
+/// register with the data lake itself before a catalog may be federated to it: the Glue
+/// connection a federation names is a connection TO the source
+/// (`FederatedCatalog$ConnectionName`: "The name of the connection to an external data
+/// source, for example a Redshift-federated catalog"), not a registration OF it, so
+/// holding one does not make its source available — and a federation naming no connection
+/// at all names nothing through which a source could be reached.
+///
+/// This emulator records no registration of its own, so a source outside AWS's managed
+/// integrations is unregistered here, which is what a `CreateCatalog` naming one is
+/// refused for ([`messages::federation_source_not_registered`]).
+pub fn is_registered_federation_source(federated: &FederatedCatalog) -> bool {
+    federated
+        .connection_name
+        .as_deref()
+        .is_some_and(is_managed_federation_connection)
 }
 
 /// Ceiling on the size of the matcher one name pattern compiles to, in bytes.
@@ -12034,6 +12086,29 @@ pub fn resolve_catalog_id(catalog_id: Option<&String>) -> String {
 /// such a catalog are not served through the account-level operations yet.
 pub fn is_known_catalog(catalog_id: &str) -> bool {
     catalog_id == ::engine::emulator_account_id()
+}
+
+/// The account's own Data Catalog as the modelled `Catalog` shape, as addressed in
+/// `region`.
+///
+/// Every account HAS this catalog: it is the default a request that names no `CatalogId`
+/// resolves to ([`resolve_catalog_id`]) and the container the account's databases and its
+/// created catalogs live in, so an operation that addresses it by the account's own id
+/// reports it instead of searching the records a `CreateCatalog` wrote
+/// ([`ComAmazonawsGlueAwsglueState::catalog_definition`]).
+///
+/// Its name and id are the account's own number, and its ARN is the Data Catalog's own
+/// ([`catalog_arn`]) rather than one naming a catalog resource inside it. It carries no
+/// definition members and no instants: no `CreateCatalog` wrote it, so there is no
+/// `CatalogInput` behind it and no write to timestamp.
+pub fn account_data_catalog(region: &str) -> crate::ops::types::Catalog {
+    let account_id = ::engine::emulator_account_id().to_string();
+    crate::ops::types::Catalog {
+        catalog_id: Some(account_id.clone()),
+        name: account_id.clone(),
+        resource_arn: Some(catalog_arn(region, &account_id)),
+        ..crate::ops::types::Catalog::default()
+    }
 }
 
 /// The `CatalogId` of the catalog `name` inside the Data Catalog of `account_id`: the

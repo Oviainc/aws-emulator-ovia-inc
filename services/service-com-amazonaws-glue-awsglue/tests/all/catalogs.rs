@@ -38,6 +38,10 @@ async fn get_in(router: &MultiServiceRouter, region: &str, catalog_id: &str) -> 
 }
 
 /// Register the catalog `name` with a definition that is distinguishable per name.
+///
+/// Every create names a source outside the Glue Data Catalog, because that is the only
+/// catalog `CreateCatalog` registers (the rule is pinned by
+/// [`crate::federated_catalogs`]).
 async fn create_catalog(router: &MultiServiceRouter, name: &str) {
     ok(
         router,
@@ -47,6 +51,10 @@ async fn create_catalog(router: &MultiServiceRouter, name: &str) {
             "CatalogInput": {
                 "Description": format!("the {name} catalog"),
                 "Parameters": { "owner": name },
+                "FederatedCatalog": {
+                    "Identifier": format!("arn:aws:s3tables:{REGION}:{ACCOUNT_ID}:bucket/{name}"),
+                    "ConnectionName": "aws:s3tables",
+                },
             },
         }),
     )
@@ -98,7 +106,7 @@ async fn reading_a_catalog_changes_nothing_a_later_caller_sees() {
         );
         assert_eq!(
             error_message(&body),
-            "Catalog not-yet-created not found.",
+            "Catalog not found.",
             "case {attempt} miss: expected the miss wording, got {:?}",
             error_message(&body)
         );

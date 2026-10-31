@@ -27,6 +27,19 @@ use crate::wire::{assert_echoed, call, emulator, emulator_on, error_code, error_
 /// (`smithy_query operation=CreateCatalog`).
 const MAX_CATALOG_NAME_LENGTH: usize = 64;
 
+/// A `FederatedCatalog` naming the source outside the Glue Data Catalog that the catalog
+/// `name` points at.
+///
+/// `CreateCatalog` registers only a catalog that names such a source, so every row below
+/// that is not a Redshift resource link carries one; the rule itself is pinned by
+/// [`crate::federated_catalogs`].
+fn federation_source(name: &str) -> Value {
+    json!({
+        "Identifier": format!("arn:aws:s3tables:{REGION}:{ACCOUNT_ID}:bucket/{name}"),
+        "ConnectionName": "aws:s3tables",
+    })
+}
+
 /// Create a catalog and return the response body.
 async fn create(router: &MultiServiceRouter, body: &Value) -> Value {
     ok(router, "CreateCatalog", body).await
@@ -64,8 +77,11 @@ async fn created_catalogs_are_read_back_from_the_store() {
     let cases: Vec<(&str, Value)> = vec![
         (
             // The shape a lifecycle client sends: the required members alone.
-            "an empty CatalogInput",
-            json!({ "Name": "bare-catalog", "CatalogInput": {} }),
+            "a CatalogInput naming its federation source and nothing else",
+            json!({
+                "Name": "bare-catalog",
+                "CatalogInput": { "FederatedCatalog": federation_source("bare-catalog") },
+            }),
         ),
         (
             "a federated catalog, as a lake-formation client registers one",
@@ -89,7 +105,7 @@ async fn created_catalogs_are_read_back_from_the_store() {
                     "Description": "a federated Redshift catalog",
                     "FederatedCatalog": {
                         "Identifier": "arn:aws:redshift:us-east-1:000000000000:namespace/orders",
-                        "ConnectionName": "redshift-connection",
+                        "ConnectionName": "aws:redshift",
                         "ConnectionType": "REDSHIFT",
                     },
                 },
@@ -102,18 +118,28 @@ async fn created_catalogs_are_read_back_from_the_store() {
                 "CatalogInput": {
                     "Description": "a catalog carrying parameters",
                     "Parameters": { "owner": "analytics", "tier": "gold" },
+                    "FederatedCatalog": federation_source("parameterised"),
                 },
             }),
         ),
         (
             "an empty parameter map, which is not the same as none",
-            json!({ "Name": "empty-parameters", "CatalogInput": { "Parameters": {} } }),
+            json!({
+                "Name": "empty-parameters",
+                "CatalogInput": {
+                    "Parameters": {},
+                    "FederatedCatalog": federation_source("empty-parameters"),
+                },
+            }),
         ),
         (
             "many parameters",
             json!({
                 "Name": "many-parameters",
-                "CatalogInput": { "Parameters": Value::Object(many_parameters) },
+                "CatalogInput": {
+                    "Parameters": Value::Object(many_parameters),
+                    "FederatedCatalog": federation_source("many-parameters"),
+                },
             }),
         ),
         (
@@ -121,6 +147,7 @@ async fn created_catalogs_are_read_back_from_the_store() {
             json!({
                 "Name": "property-rich",
                 "CatalogInput": {
+                    "FederatedCatalog": federation_source("property-rich"),
                     "CatalogProperties": {
                         "DataLakeAccessProperties": {
                             "DataLakeAccess": true,
@@ -144,6 +171,7 @@ async fn created_catalogs_are_read_back_from_the_store() {
             json!({
                 "Name": "no-data-lake-access",
                 "CatalogInput": {
+                    "FederatedCatalog": federation_source("no-data-lake-access"),
                     "CatalogProperties": {
                         "DataLakeAccessProperties": { "DataLakeAccess": false },
                     },
@@ -167,6 +195,7 @@ async fn created_catalogs_are_read_back_from_the_store() {
             json!({
                 "Name": "governed-catalog",
                 "CatalogInput": {
+                    "FederatedCatalog": federation_source("governed-catalog"),
                     "CreateDatabaseDefaultPermissions": [{
                         "Principal": { "DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS" },
                         "Permissions": ["ALL"],
@@ -180,17 +209,29 @@ async fn created_catalogs_are_read_back_from_the_store() {
         ),
         (
             "a name at the modelled length bound",
-            json!({ "Name": long_name, "CatalogInput": { "Description": "the longest name" } }),
+            json!({
+                "Name": long_name,
+                "CatalogInput": {
+                    "Description": "the longest name",
+                    "FederatedCatalog": federation_source("longest"),
+                },
+            }),
         ),
         (
             "a name carrying a space and a tab",
-            json!({ "Name": "catalog one\ttwo", "CatalogInput": {} }),
+            json!({
+                "Name": "catalog one\ttwo",
+                "CatalogInput": { "FederatedCatalog": federation_source("spaced") },
+            }),
         ),
         (
             "tags sent with the create",
             json!({
                 "Name": "tagged-catalog",
-                "CatalogInput": { "Parameters": { "kept": "yes" } },
+                "CatalogInput": {
+                    "Parameters": { "kept": "yes" },
+                    "FederatedCatalog": federation_source("tagged-catalog"),
+                },
                 "Tags": { "owner": "data-platform", "tier": "silver" },
             }),
         ),
@@ -295,7 +336,10 @@ async fn iceberg_optimization_properties_report_when_they_were_written() {
     for (case, request, expects_properties) in [
         (
             "no catalog properties at all",
-            json!({ "Name": "no-properties", "CatalogInput": {} }),
+            json!({
+                "Name": "no-properties",
+                "CatalogInput": { "FederatedCatalog": federation_source("no-properties") },
+            }),
             false,
         ),
         (
@@ -303,6 +347,7 @@ async fn iceberg_optimization_properties_report_when_they_were_written() {
             json!({
                 "Name": "custom-properties-only",
                 "CatalogInput": {
+                    "FederatedCatalog": federation_source("custom-properties-only"),
                     "CatalogProperties": { "CustomProperties": { "a": "b" } },
                 },
             }),
@@ -313,6 +358,7 @@ async fn iceberg_optimization_properties_report_when_they_were_written() {
             json!({
                 "Name": "iceberg-properties",
                 "CatalogInput": {
+                    "FederatedCatalog": federation_source("iceberg-properties"),
                     "CatalogProperties": {
                         "IcebergOptimizationProperties": {
                             "RoleArn": "arn:aws:iam::000000000000:role/iceberg",
@@ -360,6 +406,7 @@ async fn no_managed_compute_is_reported_for_a_data_lake_access_catalog() {
             &json!({
                 "Name": name,
                 "CatalogInput": {
+                    "FederatedCatalog": federation_source(&name),
                     "CatalogProperties": {
                         "DataLakeAccessProperties": { "DataLakeAccess": data_lake_access },
                     },
@@ -403,7 +450,10 @@ async fn a_catalog_is_reached_by_name_and_by_its_full_id() {
         &router,
         &json!({
             "Name": "MixedCaseCatalog",
-            "CatalogInput": { "Description": "reached under any casing" },
+            "CatalogInput": {
+                "Description": "reached under any casing",
+                "FederatedCatalog": federation_source("mixedcasecatalog"),
+            },
         }),
     )
     .await;
@@ -434,7 +484,13 @@ async fn a_catalog_is_reached_by_name_and_by_its_full_id() {
     // prefix of an id is told apart from the name by being an account number.
     create(
         &router,
-        &json!({ "Name": "team:catalog", "CatalogInput": { "Description": "a colon inside" } }),
+        &json!({
+            "Name": "team:catalog",
+            "CatalogInput": {
+                "Description": "a colon inside",
+                "FederatedCatalog": federation_source("team-catalog"),
+            },
+        }),
     )
     .await;
     for (case, catalog_id) in [
@@ -468,18 +524,54 @@ async fn a_duplicate_catalog_name_is_refused_and_changes_nothing() {
     let cases: Vec<(&str, Value, Value)> = vec![
         (
             "the same name, a different description",
-            json!({ "Name": "duplicate-one", "CatalogInput": { "Description": "first" } }),
-            json!({ "Name": "duplicate-one", "CatalogInput": { "Description": "second" } }),
+            json!({
+                "Name": "duplicate-one",
+                "CatalogInput": {
+                    "Description": "first",
+                    "FederatedCatalog": federation_source("duplicate-one"),
+                },
+            }),
+            json!({
+                "Name": "duplicate-one",
+                "CatalogInput": {
+                    "Description": "second",
+                    "FederatedCatalog": federation_source("duplicate-one"),
+                },
+            }),
         ),
         (
             "the same name in another casing",
-            json!({ "Name": "duplicate-two", "CatalogInput": { "Description": "first" } }),
-            json!({ "Name": "DUPLICATE-TWO", "CatalogInput": { "Description": "second" } }),
+            json!({
+                "Name": "duplicate-two",
+                "CatalogInput": {
+                    "Description": "first",
+                    "FederatedCatalog": federation_source("duplicate-two"),
+                },
+            }),
+            json!({
+                "Name": "DUPLICATE-TWO",
+                "CatalogInput": {
+                    "Description": "second",
+                    "FederatedCatalog": federation_source("duplicate-two"),
+                },
+            }),
         ),
         (
             "the same name and the identical definition",
-            json!({ "Name": "duplicate-three", "CatalogInput": { "Description": "same" } }),
-            json!({ "Name": "duplicate-three", "CatalogInput": { "Description": "same" } }),
+            json!({
+                "Name": "duplicate-three",
+                "CatalogInput": {
+                    "Description": "same",
+                    "FederatedCatalog": federation_source("duplicate-three"),
+                },
+            }),
+            json!({
+                "Name": "duplicate-three",
+                "CatalogInput": {
+                    "Description": "same",
+                    "FederatedCatalog": federation_source("duplicate-three"),
+                },
+            }),
         ),
     ];
 
@@ -531,7 +623,10 @@ async fn a_catalog_name_outside_its_modelled_pattern_is_refused() {
         let (status, body) = call(
             &router,
             "CreateCatalog",
-            &json!({ "Name": name, "CatalogInput": {} }),
+            &json!({
+                "Name": name,
+                "CatalogInput": { "FederatedCatalog": federation_source("patterns") },
+            }),
         )
         .await;
         assert_eq!(
@@ -559,7 +654,14 @@ async fn a_catalog_name_outside_its_modelled_pattern_is_refused() {
         ("a colon that is not the prefix", "my-aws:catalog"),
         ("a dash and digits", "catalog-2"),
     ] {
-        create(&router, &json!({ "Name": name, "CatalogInput": {} })).await;
+        create(
+            &router,
+            &json!({
+                "Name": name,
+                "CatalogInput": { "FederatedCatalog": federation_source("near-misses") },
+            }),
+        )
+        .await;
         let read = get(&router, name).await;
         assert_eq!(
             read.get("Name").and_then(Value::as_str),
@@ -579,7 +681,10 @@ async fn a_catalog_named_after_the_account_is_refused() {
     let (status, body) = call(
         &router,
         "CreateCatalog",
-        &json!({ "Name": ACCOUNT_ID, "CatalogInput": {} }),
+        &json!({
+            "Name": ACCOUNT_ID,
+            "CatalogInput": { "FederatedCatalog": federation_source("account-named") },
+        }),
     )
     .await;
     assert_eq!(
@@ -595,26 +700,30 @@ async fn a_catalog_named_after_the_account_is_refused() {
         "case the account id as a name: the refusal must state the requirement, got {body}"
     );
 
-    // Nothing was stored under that id, so the account's own Data Catalog is still no
-    // catalog resource this read reports.
-    let (status, _) = call(&router, "GetCatalog", &json!({ "CatalogId": ACCOUNT_ID })).await;
-    assert_eq!(
-        status, 400,
-        "case the account id as a name: the refused create must have stored nothing"
+    // Nothing was stored under that id, so the account's own id still reports the
+    // account's own Data Catalog — the container every account has, which carries no
+    // definition a create wrote.
+    let read = get(&router, ACCOUNT_ID).await;
+    assert!(
+        read.get("FederatedCatalog").is_none_or(Value::is_null),
+        "case the account id as a name: the refused create must have stored nothing, got \
+         {read}"
     );
 }
 
 /// A read for an id this account holds no catalog under is refused with the modelled
 /// `EntityNotFoundException`. The rows differ along how the requested id misses: never
-/// created, a prefix of a stored name, a suffix of one, the account's own Data Catalog
-/// (which no create brought into existence), and a name qualified by this account that
-/// still names nothing.
+/// created, a prefix of a stored name, a suffix of one, and a name qualified by this
+/// account that still names nothing.
 #[tokio::test]
 async fn reading_an_unknown_catalog_is_refused() {
     let router = emulator();
     create(
         &router,
-        &json!({ "Name": "stored-catalog", "CatalogInput": {} }),
+        &json!({
+            "Name": "stored-catalog",
+            "CatalogInput": { "FederatedCatalog": federation_source("stored-catalog") },
+        }),
     )
     .await;
 
@@ -622,7 +731,6 @@ async fn reading_an_unknown_catalog_is_refused() {
         ("never created", "no-such-catalog".to_string()),
         ("a prefix of a stored name", "stored".to_string()),
         ("a suffix of a stored name", "catalog".to_string()),
-        ("the account's own Data Catalog", ACCOUNT_ID.to_string()),
         (
             "this account and a name nothing created",
             format!("{ACCOUNT_ID}:absent"),
@@ -656,7 +764,14 @@ async fn reading_an_unknown_catalog_is_refused() {
 #[tokio::test]
 async fn reading_another_accounts_catalog_is_refused_as_unauthorized() {
     let router = emulator();
-    create(&router, &json!({ "Name": "shared", "CatalogInput": {} })).await;
+    create(
+        &router,
+        &json!({
+            "Name": "shared",
+            "CatalogInput": { "FederatedCatalog": federation_source("shared") },
+        }),
+    )
+    .await;
 
     for (case, catalog_id) in [
         (
@@ -716,8 +831,14 @@ async fn a_create_past_the_catalog_ceiling_is_refused() {
         }
     }
 
-    let last = json!({ "Name": "last-catalog", "CatalogInput": {} });
-    let past = json!({ "Name": "one-too-many", "CatalogInput": {} });
+    let last = json!({
+        "Name": "last-catalog",
+        "CatalogInput": { "FederatedCatalog": federation_source("last-catalog") },
+    });
+    let past = json!({
+        "Name": "one-too-many",
+        "CatalogInput": { "FederatedCatalog": federation_source("one-too-many") },
+    });
 
     create(&router, &last).await;
     let (status, body) = call(&router, "CreateCatalog", &past).await;

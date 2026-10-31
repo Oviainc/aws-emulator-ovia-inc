@@ -4,8 +4,9 @@
 //!
 //! Reports ONE catalog resource of the Data Catalog: the definition a `CreateCatalog`
 //! stored under the id the request addresses ([`crate::state::CatalogDefinition`]),
-//! projected into the modelled `Catalog` shape. A reporting operation — it reads the
-//! store and writes nothing.
+//! projected into the modelled `Catalog` shape, or the account's own Data Catalog for an
+//! id that is the account's number ([`crate::state::account_data_catalog`]). A reporting
+//! operation — it reads the store and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -185,14 +186,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An id that is the served account's own number addresses that account's Data
+        // Catalog itself, which every account HAS — it is the default a request naming no
+        // catalog resolves to — rather than a record a `CreateCatalog` wrote, so it is
+        // reported from the account this endpoint serves and not looked up among those
+        // records (`crate::state::account_data_catalog`).
+        if crate::state::is_known_catalog(&input.catalog_id) {
+            return Ok(GetCatalogOutput {
+                catalog: Some(crate::state::account_data_catalog(&region)),
+            });
+        }
+
         let store = state.lock();
-        // A name this account holds no catalog under is a miss, including the account's
-        // own id: that id addresses the Data Catalog itself, which no `CreateCatalog`
-        // created and which therefore is no catalog resource this read reports.
+        // A name this account holds no catalog under is a miss.
         let Some(definition) = store.catalog_definition(&reference) else {
             return Err(GetCatalogErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::catalog_not_found(&reference.name)),
+                    message: Some(crate::state::messages::CATALOG_NOT_FOUND.to_string()),
                     from_federation_source: None,
                 },
             )
