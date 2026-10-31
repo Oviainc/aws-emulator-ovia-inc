@@ -25,21 +25,21 @@ use super::app_bundle_ingestion_lifecycle::{arn_of, encode, uuid_of, Answer, Emu
 
 /// One paginated listing of this service, as everything a test needs to drive it
 /// and to mint a token of its own.
-struct Listing {
+pub(crate) struct Listing {
     /// The case name every assertion below reports.
-    case: &'static str,
+    pub(crate) case: &'static str,
     /// The request path of the listing, without a query string.
-    path: String,
+    pub(crate) path: String,
     /// The member of the response holding the page.
-    items: &'static str,
+    pub(crate) items: &'static str,
     /// The listing name its tokens are scoped to, from the `state` helpers.
-    listing: String,
+    pub(crate) listing: String,
 }
 
 /// A store holding TWO records in each of the four paginated listings, so every
 /// listing really does issue a `nextToken` for a page of one, and the page after
 /// that token holds a record.
-async fn two_records_in_every_listing(emulator: &Emulator) -> Vec<Listing> {
+pub(crate) async fn two_records_in_every_listing(emulator: &Emulator) -> Vec<Listing> {
     // A second bundle, so `ListAppBundles` has two records. A Region holds only
     // one app bundle, hence two Regions.
     let bundle = emulator.fixture_bundle(0).await;
@@ -108,7 +108,7 @@ async fn two_records_in_every_listing(emulator: &Emulator) -> Vec<Listing> {
 
 /// The first page of `listing`, one record wide, with the `nextToken` it hands
 /// out for the page after it.
-async fn first_page_token(emulator: &Emulator, listing: &Listing) -> String {
+pub(crate) async fn first_page_token(emulator: &Emulator, listing: &Listing) -> String {
     let answer = emulator
         .call("GET", &format!("{}?maxResults=1", listing.path), None)
         .await;
@@ -131,7 +131,7 @@ async fn first_page_token(emulator: &Emulator, listing: &Listing) -> String {
 }
 
 /// `listing` replayed with `token`.
-async fn replay(emulator: &Emulator, listing: &Listing, token: &str) -> Answer {
+pub(crate) async fn replay(emulator: &Emulator, listing: &Listing, token: &str) -> Answer {
     emulator
         .call(
             "GET",
@@ -161,7 +161,7 @@ fn token_aged(listing: &Listing, issued_token: &str, age: Duration) -> String {
 }
 
 /// The `message` of a refusal, or `""`.
-fn message(answer: &Answer) -> String {
+pub(crate) fn message(answer: &Answer) -> String {
     answer
         .body
         .get("message")

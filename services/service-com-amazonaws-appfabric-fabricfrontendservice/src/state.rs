@@ -1506,7 +1506,8 @@ pub struct Page<T> {
 /// page starts after it even when records in between were deleted.
 /// `listing` names the listing the token belongs to (see [`encode_page_token`]),
 /// so a token one listing issued is refused by another instead of silently
-/// skipping records.
+/// skipping records, and a token no listing issued at all is refused by every
+/// one of them.
 ///
 /// `now` is the instant the call is answered as of: the token this page hands
 /// out carries it as its issue time, and a token the caller brought is refused
@@ -1560,18 +1561,61 @@ pub fn page<R, T>(
 /// ([`PAGE_TOKEN_LIFETIME`]): it is carried so that a later call can tell how old
 /// the token it is handed is, which a token holding only a position cannot.
 ///
-/// The rendering is a version prefix, the listing and two fixed-width hex
+/// The INTEGRITY TAG ([`page_token_tag`]) is part of it because a `nextToken` is
+/// opaque: a position is a position only because this listing rendered a token
+/// naming it, so the token carries this service's own derivation over its fields.
+/// Decoding recomputes it, which is what lets a value this service never
+/// rendered — any other rendering of these same fields included — be refused
+/// instead of read as some position in the listing.
+///
+/// The rendering is a version prefix, the listing and three fixed-width hex
 /// fields: every character is URL-unreserved, so the token survives a round trip
 /// through a query string whatever the client's encoder does with it (base64's
 /// `+` and `/` do not), and it is well inside the 1..=2048 the model allows.
 pub fn encode_page_token(listing: &str, sequence: u64, issued_at: SystemTime) -> String {
     let issued_at = epoch_millis(issued_at);
-    format!("v1-{listing}-{sequence:016x}-{issued_at:016x}")
+    let fields = format!("v1-{listing}-{sequence:016x}-{issued_at:016x}");
+    let tag = page_token_tag(&fields);
+    format!("{fields}-{tag}")
+}
+
+/// Bytes of the integrity tag a [`encode_page_token`] token carries after the
+/// fields it is taken over.
+const PAGE_TOKEN_TAG_LEN: usize = 8;
+
+/// The domain separator the tag is taken over, so a tag minted for one of this
+/// service's page tokens is a tag for nothing else.
+const PAGE_TOKEN_DOMAIN: &[u8] = b"appfabric/page-token/v1\0";
+
+/// The integrity tag of `fields`, the rendered fields of a page token: the
+/// leading [`PAGE_TOKEN_TAG_LEN`] bytes of SHA-256 over the domain separator and
+/// those fields, in hex.
+///
+/// It is a DERIVATION, not a secret-keyed authenticator: no key takes part, so
+/// what it establishes is that the token is one this service's own encoder
+/// rendered for exactly these fields — which is what a listing needs to tell a
+/// token it issued from a position a caller wrote itself, since a token is
+/// opaque and nothing publishes the derivation.
+///
+/// It is taken over the fields AS RENDERED rather than over their values, so a
+/// token whose fields are re-rendered — a position written with fewer digits,
+/// hex in another case — carries a tag that is not the one for it.
+fn page_token_tag(fields: &str) -> String {
+    let mut digest = <::sha2::Sha256 as ::sha2::Digest>::new();
+    ::sha2::Digest::update(&mut digest, PAGE_TOKEN_DOMAIN);
+    ::sha2::Digest::update(&mut digest, fields.as_bytes());
+    ::hex::encode(&::sha2::Digest::finalize(digest)[..PAGE_TOKEN_TAG_LEN])
 }
 
 /// The position a `nextToken` names in `listing`, or a `ValidationException`
 /// naming the member when the token is not one this listing issued, or is one it
 /// issued longer than [`PAGE_TOKEN_LIFETIME`] before `now`.
+///
+/// A token is one this listing rendered only when it carries the integrity tag
+/// [`encode_page_token`] derives for the very fields it holds: the digits a token
+/// spells are read as a position, an issue instant and nothing else AFTER that
+/// tag has been checked, so a well-formed position no page of this listing ever
+/// handed out is refused here rather than answered with a page.
 pub fn decode_page_token(
     listing: &str,
     token: &str,
@@ -1580,10 +1624,17 @@ pub fn decode_page_token(
     let not_a_token =
         || field_validation_failed("nextToken", "nextToken is not a valid pagination token");
 
-    let (sequence, issued_at) = token
+    // The tag is the last field, and the ones before it are what it is taken
+    // over — the listing included, so a token of another listing fails the tag
+    // as well as the prefix.
+    let (fields, tag) = token.rsplit_once('-').ok_or_else(not_a_token)?;
+    let (sequence, issued_at) = fields
         .strip_prefix(&format!("v1-{listing}-"))
         .and_then(|fields| fields.split_once('-'))
         .ok_or_else(not_a_token)?;
+    if page_token_tag(fields) != tag {
+        return Err(not_a_token());
+    }
     let sequence = u64::from_str_radix(sequence, 16).map_err(|_| not_a_token())?;
     let issued_at = u64::from_str_radix(issued_at, 16).map_err(|_| not_a_token())?;
 
