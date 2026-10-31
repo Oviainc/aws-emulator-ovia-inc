@@ -205,6 +205,8 @@ mod route_analysis;
 mod site_ids_filter_maximum;
 #[path = "all/site_to_site_vpn_attachment_lifecycle.rs"]
 mod site_to_site_vpn_attachment_lifecycle;
+#[path = "all/site_to_site_vpn_attachment_telemetry.rs"]
+mod site_to_site_vpn_attachment_telemetry;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_dispatch_agreement.rs"]

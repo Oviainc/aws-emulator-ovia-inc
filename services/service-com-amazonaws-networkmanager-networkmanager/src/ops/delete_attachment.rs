@@ -189,6 +189,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
+        // Removing the attachment unties the connection it attached from the global network
+        // that owned its core network, so the registration that attachment made for that
+        // connection's session goes with it — no global network is left reporting the
+        // session of a connection it no longer holds. A record that registered none (every
+        // attachment kind whose attached resource has no session to measure) drops nothing.
+        store.deregister_attachment_telemetry(&removed);
+
         // The instant the record was removed, taken on the path that removes it: the
         // delete is the change the answer's `UpdatedAt` reports, and a refusal above
         // changed nothing and needs no clock.

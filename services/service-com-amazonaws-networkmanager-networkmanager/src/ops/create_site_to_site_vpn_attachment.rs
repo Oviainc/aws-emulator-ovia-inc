@@ -355,7 +355,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // otherwise `CREATING` until the settle span the clock owes elapses, so the response
         // reports the state the stored record is in now.
         let site_to_site_vpn_attachment = record.to_site_to_site_vpn_attachment(now);
-        store.attachments.insert(id, record);
+        store.attachments.insert(id.clone(), record);
+
+        // Attaching the VPN connection to the core network is what makes the global network
+        // that owns that core network aware of the connection's IPsec session, so this is
+        // where the session is registered for telemetry — the same point the two Connect
+        // peer associates register the BGP session they tie in. An attachment the policy
+        // held for an acceptance has nothing created yet, so it registers nothing until
+        // `AcceptAttachment` releases it (`crate::state::register_attachment_telemetry`
+        // decides that from the stored record).
+        store.register_attachment_telemetry(&id, now);
 
         Ok(CreateSiteToSiteVpnAttachmentOutput {
             site_to_site_vpn_attachment,

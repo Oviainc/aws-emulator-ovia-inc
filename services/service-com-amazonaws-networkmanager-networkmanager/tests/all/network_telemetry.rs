@@ -18,9 +18,10 @@
 //! the answer is seeded — the ids, account ids and health a telemetry entry reports are
 //! computed by the handler out of those records. The registrations a request DOES make are
 //! covered by `crate::connect_peer_association_lifecycle`, which associates a core network
-//! Connect peer, and by `crate::transit_gateway_connect_peer_association_lifecycle`, which
-//! associates a Connect peer of a transit gateway; both read the session back through this
-//! operation.
+//! Connect peer, by `crate::transit_gateway_connect_peer_association_lifecycle`, which
+//! associates a Connect peer of a transit gateway, and by
+//! `crate::site_to_site_vpn_attachment_telemetry`, which attaches a VPN connection to a
+//! core network; all three read the session back through this operation.
 
 use std::time::{Duration, SystemTime};
 

@@ -188,8 +188,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The accepted attachment is `CREATING` until the settle span the clock now owes
         // elapses, so the response reports the state the stored record is in at this
         // instant, computed from that record like every other read of it.
+        let attachment = record.to_attachment(now);
+
+        // The acceptance is what starts attaching, so an attachment that attaches a
+        // connection whose session this service measures registers it with the global
+        // network here — the create of such an attachment registered nothing while it was
+        // still held for this acceptance. The helper answers for any attachment kind, so
+        // one that attaches no such connection registers nothing.
+        store.register_attachment_telemetry(&input.attachment_id, now);
+
         Ok(AcceptAttachmentOutput {
-            attachment: Some(record.to_attachment(now)),
+            attachment: Some(attachment),
         })
     }
 }

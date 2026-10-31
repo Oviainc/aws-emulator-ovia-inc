@@ -3081,6 +3081,29 @@ impl AttachmentRecord {
         }
     }
 
+    /// The telemetry resource type of the connection this attachment attaches — one of
+    /// [`TELEMETRY_RESOURCE_TYPES`] — or `None` when what it attaches is not a connection
+    /// whose session this service measures.
+    ///
+    /// A site-to-site VPN attachment attaches a VPN CONNECTION ([`VPN_CONNECTION_TYPE`],
+    /// reported with the IPsec session health [`CONNECTION_TYPE_IPSEC`]), so tying one to a
+    /// core network is what makes that connection's session known to the global network
+    /// owning the core network ([`ComAmazonawsNetworkmanagerNetworkmanagerState::register_attachment_telemetry`]).
+    /// What the other kinds attach is a VPC, a Direct Connect gateway, a transit gateway
+    /// route table or another attachment: resources of the inventory rather than sessions,
+    /// none of them a type `GetNetworkTelemetry` reports on. A Connect attachment carries
+    /// BGP sessions, but each is a CONNECT PEER of its own, registered by the associate that
+    /// ties that peer to the global network rather than by the attachment carrying it.
+    pub fn telemetry_resource_type(&self) -> Option<&'static str> {
+        match &self.detail {
+            AttachmentDetail::SiteToSiteVpn => Some(VPN_CONNECTION_TYPE),
+            AttachmentDetail::Vpc { .. }
+            | AttachmentDetail::Connect { .. }
+            | AttachmentDetail::DirectConnectGateway { .. }
+            | AttachmentDetail::TransitGatewayRouteTable { .. } => None,
+        }
+    }
+
     /// The modelled `Attachment` envelope of this record, as of `now`.
     ///
     /// `EdgeLocations` is absent because "this is returned only for Direct Connect gateway
@@ -4819,7 +4842,10 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// contributes nothing, not a placeholder. A connection registered with a global
     /// network only for its telemetry lives in a different store
     /// ([`Self::telemetry_resources`]) that [`Self::network_resource_count`] does not count
-    /// either, and nothing registers one yet, so the two agree on that zero as well. A
+    /// either, so the two agree on those registrations as well: a connection's session is
+    /// reported by `GetNetworkTelemetry` alone, while the resource the registration hangs
+    /// off — the Connect peer, or the attachment that attached the VPN connection — is what
+    /// this inventory lists. A
     /// transit gateway registered with the global network
     /// ([`Self::transit_gateway_registrations`]) is a resource of Amazon VPC rather than one
     /// this service holds, so it is not part of this inventory either.
@@ -5258,6 +5284,85 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             telemetry_key(&record.global_network_id, &record.resource_arn),
             record,
         );
+    }
+
+    /// Register the connection the attachment `attachment_id` attaches as a
+    /// telemetry-bearing connection of the global network that owns its core network, at
+    /// `now`, answering whether a registration was made.
+    ///
+    /// The call that ties a connection into a global network is what registers its session
+    /// ([`Self::register_telemetry_resource`], the same point the two Connect peer
+    /// associates register theirs), so an attachment that attaches a connection whose
+    /// session this service measures ([`AttachmentRecord::telemetry_resource_type`]) is
+    /// registered by the call that starts attaching it: its create, or the acceptance that
+    /// releases one the policy held for one. Nothing is registered for an attachment that
+    /// attaches no such connection, for one still waiting for that acceptance or already
+    /// rejected (nothing is created for it, so there is no session to measure:
+    /// [`AttachmentRecord::is_created`]), or for one whose core network is no longer stored.
+    ///
+    /// The session starts DOWN and comes up when the attachment carrying it reaches
+    /// `AVAILABLE` ([`AttachmentRecord::available_at`]) — the transition the clock already
+    /// owes that attachment, so the session the registration starts needs no span of its
+    /// own and no handler sleeps for it. Every member of the registration is read off the
+    /// attachment: the connection's own ARN identifies it, the attachment's edge location is
+    /// the Region the session lands in, and its core network is the one the connection
+    /// reaches. `address` is left unset because a VPN connection's far end is Amazon VPC's
+    /// record, which this service holds no inventory of.
+    pub fn register_attachment_telemetry(&mut self, attachment_id: &str, now: SystemTime) -> bool {
+        let Some(attachment) = self.attachments.get(attachment_id) else {
+            return false;
+        };
+        let Some(resource_type) = attachment.telemetry_resource_type() else {
+            return false;
+        };
+        let Some(connected_at) = attachment.available_at.filter(|_| attachment.is_created()) else {
+            return false;
+        };
+        let Some(global_network_id) = self
+            .core_networks
+            .get(&attachment.core_network_id)
+            .map(|core_network| core_network.global_network_id.clone())
+        else {
+            return false;
+        };
+        let record = TelemetryResourceRecord {
+            global_network_id,
+            resource_type: resource_type.to_string(),
+            resource_arn: attachment.resource_arn.clone(),
+            aws_region: attachment.edge_location.clone(),
+            core_network_id: Some(attachment.core_network_id.clone()),
+            // The connection reaches a core network edge rather than a gateway registered
+            // with the global network, so no registration carries it.
+            registered_gateway_arn: None,
+            address: None,
+            registered_at: now,
+            connected_at,
+        };
+        self.register_telemetry_resource(record);
+        true
+    }
+
+    /// Drop the registration the attachment `attachment` made for the connection it
+    /// attaches, answering whether one was dropped.
+    ///
+    /// The counterpart of [`Self::register_attachment_telemetry`]: the call that unties the
+    /// connection from the global network — the delete of the attachment that attached it —
+    /// is what deregisters it, so a global network reports no session for a connection it
+    /// no longer holds. Takes the record rather than its id, so the delete can untie an
+    /// attachment it has already removed from the store.
+    pub fn deregister_attachment_telemetry(&mut self, attachment: &AttachmentRecord) -> bool {
+        if attachment.telemetry_resource_type().is_none() {
+            return false;
+        }
+        let Some(global_network_id) = self
+            .core_networks
+            .get(&attachment.core_network_id)
+            .map(|core_network| core_network.global_network_id.clone())
+        else {
+            return false;
+        };
+        self.deregister_telemetry_resource(&global_network_id, &attachment.resource_arn)
+            .is_some()
     }
 
     /// Drop the registration `global_network_id` holds for the connection `resource_arn`,
