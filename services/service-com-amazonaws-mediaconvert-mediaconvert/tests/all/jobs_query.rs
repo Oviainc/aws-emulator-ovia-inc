@@ -36,7 +36,10 @@ use super::job_lifecycle::{arn, Emulator, Reply, ROLE};
 const FIXTURE_ENGINE_VERSION: &str = "2024-09-25";
 
 /// A completion span short enough that a case can wait past it.
-const SHORT_QUERY: Duration = Duration::from_millis(20);
+///
+/// `pub(crate)` beside [`pin_query_span`] and [`run_query`], so a suite elsewhere that
+/// has to drive a completed query uses this span rather than a second copy of it.
+pub(crate) const SHORT_QUERY: Duration = Duration::from_millis(20);
 
 /// Comfortably past [`SHORT_QUERY`], so a case that waits always observes the
 /// completion, while keeping the suite's total real waiting small.
@@ -115,7 +118,11 @@ fn result_ids(reply: &Reply) -> Vec<String> {
 }
 
 /// Start a query, wait past its completion and return the results reply.
-async fn run_query(emulator: &Emulator, body: Value) -> Reply {
+///
+/// `pub(crate)` for the same reason [`pin_query_span`] is: one place that starts a query
+/// and waits for it beats a second copy, which could drift from the status and paging
+/// contract this suite pins.
+pub(crate) async fn run_query(emulator: &Emulator, body: Value) -> Reply {
     let started = start_query(emulator, body.clone()).await;
     assert_eq!(
         started.status, 201,

@@ -1044,11 +1044,17 @@ pub fn job_template_name_from_reference(reference: &str) -> &str {
 ///
 /// One function for every kind of reference this service resolves, because the resource id
 /// of a MediaConvert ARN is `<plural type>/<name>` for all of them (see
-/// [`TaggedResource::resource_id`]); a value that is not an ARN is the name itself.
+/// [`TaggedResource::resource_id`]).
+///
+/// The ARN form is recognised by [`mediaconvert_arn_parts`] — the module's ONE ARN
+/// decomposer — and only when the ARN's resource kind is the kind the member references,
+/// so a reference resolves a resource of this service and of that kind or nothing at all.
+/// Anything else is the name itself: a value that is not an ARN, an ARN of another service
+/// and an ARN naming another kind of resource are all read as the literal name the caller
+/// sent, which this account holds a resource under only if someone created one with it.
 fn resource_name_from_reference<'a>(resource_type: &str, reference: &'a str) -> &'a str {
-    let separator = format!(":{resource_type}/");
-    match reference.rsplit_once(separator.as_str()) {
-        Some((prefix, name)) if prefix.starts_with("arn:") => name,
+    match mediaconvert_arn_parts(reference) {
+        Some((kind, name)) if kind == resource_type => name,
         _ => reference,
     }
 }
@@ -1781,9 +1787,10 @@ impl TaggedResource {
 /// an ARN at all.
 ///
 /// `arn:<partition>:<service>:<region>:<account>:<resource id>` — the ONE place this
-/// module takes an ARN apart, so the two kinds of ARN its request paths accept (this
-/// service's own resources, and the ACM certificate the certificate operations name)
-/// cannot disagree about what an ARN is. The partition and the ARN's own region and
+/// module takes an ARN apart, so the kinds of ARN its request paths accept (this
+/// service's own resources, whether addressed directly or named by a reference member,
+/// and the ACM certificate the certificate operations name) cannot disagree about what an
+/// ARN is. The partition and the ARN's own region and
 /// account are not part of a record's identity here, but they must be present for the
 /// value to be an ARN at all. Total over any input: every field is taken with `?`, so a
 /// value with too few of them is `None` rather than a panic.
@@ -1799,6 +1806,26 @@ fn arn_namespace_and_resource(arn: &str) -> Option<(&str, &str)> {
     Some((namespace, fields.next()?))
 }
 
+/// The resource KIND and NAME a MediaConvert resource ARN carries, or `None` when the
+/// value is not one.
+///
+/// `arn:<partition>:mediaconvert:<region>:<account>:<plural type>/<name>` with a non-empty
+/// name, taken apart by the module's one ARN decomposer
+/// ([`arn_namespace_and_resource`]) — so this service's namespace and the shape of a
+/// resource id are checked in exactly one place, and every request path that resolves a
+/// reference to one of this service's resources ([`parse_resource_arn`] for the ARN the
+/// tagging operations address, [`resource_name_from_reference`] for the members that
+/// accept a name or an ARN) agrees about which values are MediaConvert ARNs. The borrowed
+/// halves let a caller resolve a reference without copying it.
+fn mediaconvert_arn_parts(arn: &str) -> Option<(&str, &str)> {
+    let (namespace, resource_id) = arn_namespace_and_resource(arn)?;
+    if namespace != ARN_NAMESPACE {
+        return None;
+    }
+    let (kind, name) = resource_id.split_once('/')?;
+    (!name.is_empty()).then_some((kind, name))
+}
+
 /// The resource an ARN names, or `None` when the value is not a MediaConvert resource
 /// ARN at all.
 ///
@@ -1809,14 +1836,7 @@ fn arn_namespace_and_resource(arn: &str) -> Option<(&str, &str)> {
 /// value — the handlers answer it with the modelled `BadRequestException`. Whether the
 /// named resource EXISTS is a separate question, answered by [`ComAmazonawsMediaconvertMediaconvertState::tags`].
 pub fn parse_resource_arn(arn: &str) -> Option<TaggedResource> {
-    let (namespace, resource_id) = arn_namespace_and_resource(arn)?;
-    if namespace != ARN_NAMESPACE {
-        return None;
-    }
-    let (kind, name) = resource_id.split_once('/')?;
-    if name.is_empty() {
-        return None;
-    }
+    let (kind, name) = mediaconvert_arn_parts(arn)?;
     match kind {
         RESOURCE_TYPE_QUEUES => Some(TaggedResource::Queue(name.to_string())),
         RESOURCE_TYPE_JOBS => Some(TaggedResource::Job(name.to_string())),

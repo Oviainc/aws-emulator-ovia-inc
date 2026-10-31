@@ -45,6 +45,8 @@ mod create_job_validation;
 mod created_resource_defaults;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/foreign_arn_reference.rs"]
+mod foreign_arn_reference;
 #[path = "all/idempotent_repeats.rs"]
 mod idempotent_repeats;
 #[path = "all/input_probe.rs"]
