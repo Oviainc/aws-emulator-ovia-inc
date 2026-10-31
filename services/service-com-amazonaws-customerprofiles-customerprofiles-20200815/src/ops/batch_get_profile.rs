@@ -172,12 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             match domain.profiles.get(profile_id) {
                 Some(stored) => profiles.push(stored.profile.clone()),
+                // The per-item entry identifies the item that failed through `ProfileId`
+                // and classifies it through `Code`; its `Message` is the service's fixed
+                // sentence for the failure class and interpolates nothing.
                 None => errors.push(BatchGetProfileError2 {
                     code: PROFILE_NOT_FOUND_CODE.to_string(),
-                    message: format!(
-                        "The profile {} does not exist in domain {}",
-                        profile_id, input.domain_name
-                    ),
+                    message: PROFILE_NOT_FOUND_MESSAGE.to_string(),
                     profile_id: profile_id.clone(),
                 }),
             }
@@ -199,6 +199,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// status this operation's `ResourceNotFoundException` ("The requested resource does not
 /// exist, or access was denied") is bound to — not that exception's name.
 const PROFILE_NOT_FOUND_CODE: &str = "404";
+
+/// The per-item `Message` for a requested profile the domain does not hold.
+///
+/// `BatchGetProfileError$Code` and `$ProfileId` are what carry the request- and
+/// state-derived values of the entry; `$Message` only "describ[es] why a specific profile
+/// failed", and the service words each failure class with ONE fixed sentence — no
+/// requested id and no domain name are interpolated into it, so two callers comparing the
+/// reason of a not-found id read the same text whatever they asked for.
+const PROFILE_NOT_FOUND_MESSAGE: &str = "Profile was not found in domain";
 
 /// The store is unreachable — a server fault, not a bad request.
 fn unavailable() -> BatchGetProfileError {

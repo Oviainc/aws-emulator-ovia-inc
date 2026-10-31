@@ -5,9 +5,11 @@
 //! The rule under test: a batch read answers each DISTINCT requested id out of the
 //! domain's stored profiles — an id the domain holds is reported in `Profiles` exactly as
 //! it was stored, an id it does not hold is reported as its own entry in `Errors` whose
-//! `Code` is the status of the equivalent single-item failure (404) and whose `ProfileId`
-//! echoes the id that failed — so an unknown id never fails the whole batch, and the
-//! batch is partial-success. Both lists follow the order the request named the ids. Only
+//! `Code` is the status of the equivalent single-item failure (404), whose `ProfileId`
+//! echoes the id that failed and whose `Message` is the service's fixed sentence for that
+//! failure class, interpolating neither the requested id nor the domain name — so an
+//! unknown id never fails the whole batch, and the batch is partial-success. Both lists
+//! follow the order the request named the ids. Only
 //! the domain named in the path is searched, and a domain that is not stored is
 //! `ResourceNotFoundException` (404) while an input outside a modelled constraint is
 //! `BadRequestException` (400).
@@ -24,6 +26,11 @@ use crate::domain_profile_lifecycle::{error_code, Emulator};
 /// The per-item `Code` `BatchGetProfileError` carries for a requested profile the domain
 /// does not hold.
 const NOT_FOUND_CODE: &str = "404";
+
+/// The per-item `Message` `BatchGetProfileError` carries for a requested profile the
+/// domain does not hold: the service's fixed sentence for that failure class, the same
+/// text for every requested id and every domain.
+const NOT_FOUND_MESSAGE: &str = "Profile was not found in domain";
 
 /// `BatchGetProfileIdList` is `len 1..20`, so 20 ids is the published maximum.
 const MAX_PROFILE_IDS: usize = 20;
@@ -237,9 +244,9 @@ async fn a_batch_answers_each_distinct_id_out_of_the_domains_stored_profiles() {
                 code, NOT_FOUND_CODE,
                 "case {case:?}: expected Code {NOT_FOUND_CODE} for {profile_id}, got {code:?}"
             );
-            assert!(
-                message.contains(profile_id) && message.contains("batchdom"),
-                "case {case:?}: expected a Message naming {profile_id} and the domain, got {message:?}"
+            assert_eq!(
+                message, NOT_FOUND_MESSAGE,
+                "case {case:?}: expected the fixed Message {NOT_FOUND_MESSAGE:?} for {profile_id}, got {message:?}"
             );
         }
 
@@ -316,6 +323,90 @@ async fn a_batch_read_changes_nothing_a_later_caller_sees() {
         (200, 1),
         "case \"found-id-still-stored\": expected the profile to still be stored, got {status} {searched:?}"
     );
+}
+
+/// The per-item failure reason is the service's FIXED sentence: the same `Message` for
+/// every unknown id and in every domain, with nothing interpolated into it.
+///
+/// The table varies what a synthesized sentence would have leaked — the domain name (its
+/// length, its case and its separators, up to `name`'s modelled maximum of 64) and the
+/// shape of the requested id inside the modelled pattern `^[a-f0-9]{32}$` (all-zero,
+/// all-`f`, mixed hex), as well as how many ids fail and where in the batch they sit.
+#[tokio::test]
+async fn an_unresolvable_id_reports_the_services_fixed_failure_message() {
+    let emulator = Emulator::new();
+
+    // `DomainName` targets `name`: len 1..64, pattern ^[a-zA-Z0-9_-]+$ (smithy_query
+    // shape=name / BatchGetProfileRequest$DomainName).
+    const MAX_DOMAIN_NAME: usize = 64;
+    let long_domain = format!("msg-{}", "x".repeat(MAX_DOMAIN_NAME - 4));
+    let domains = [
+        "msgdom",
+        "msg_Dom-9",
+        long_domain.as_str(),
+    ];
+
+    // Ids inside the modelled `ProfileId` pattern that nothing created.
+    let absent_ids = [
+        ("all-zero-hex", "0".repeat(32)),
+        ("all-f-hex", "f".repeat(32)),
+        ("mixed-hex", "0a1b2c3d4e5f60718293a4b5c6d7e8f9".to_string()),
+    ];
+
+    for domain in domains {
+        emulator.create_domain(domain, 90).await;
+        let stored = emulator
+            .create_profile(domain, json!({ "FirstName": "Ida" }))
+            .await;
+
+        for (id_case, absent) in &absent_ids {
+            // The unknown id alone, and the same id beside a stored one, so the entry is
+            // asserted both in an all-failed batch and in a partial-success batch.
+            let batches: [(&str, Vec<String>); 3] = [
+                ("alone", vec![absent.clone()]),
+                ("after-a-stored-id", vec![stored.clone(), absent.clone()]),
+                ("before-a-stored-id", vec![absent.clone(), stored.clone()]),
+            ];
+            for (position, ids) in batches {
+                let case = format!("{domain}/{id_case}/{position}");
+                let (status, body) = batch_get(&emulator, domain, &ids).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected 200, got {status} {body:?}"
+                );
+
+                let errors = returned_errors(&body);
+                assert_eq!(
+                    errors.len(),
+                    1,
+                    "case {case:?}: expected exactly one Errors entry, got {body:?}"
+                );
+                let (profile_id, code, message) = &errors[0];
+                assert_eq!(
+                    profile_id, absent,
+                    "case {case:?}: expected ProfileId {absent:?}, got {profile_id:?}"
+                );
+                assert_eq!(
+                    code, NOT_FOUND_CODE,
+                    "case {case:?}: expected Code {NOT_FOUND_CODE:?}, got {code:?}"
+                );
+                assert_eq!(
+                    message, NOT_FOUND_MESSAGE,
+                    "case {case:?}: expected the fixed Message {NOT_FOUND_MESSAGE:?}, got {message:?}"
+                );
+                assert!(
+                    !message.contains(absent.as_str()) && !message.contains(domain),
+                    "case {case:?}: expected a Message interpolating neither the id nor the domain, got {message:?}"
+                );
+                // `BatchGetProfileError$Message` targets string1To1000: @length 1..1000.
+                assert!(
+                    (1..=1000).contains(&message.chars().count()),
+                    "case {case:?}: expected a Message within the modelled length 1..1000, got {} characters in {message:?}",
+                    message.chars().count()
+                );
+            }
+        }
+    }
 }
 
 /// The refusals: a domain that is not stored is 404, and an input outside a modelled
