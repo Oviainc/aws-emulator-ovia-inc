@@ -89,7 +89,10 @@ fn running_event(index: usize, due_in: Duration) -> StoredEvent {
 /// the contention every case here is about. The join handle reports the instant
 /// recorded [`RELEASE_MARGIN`] before the guard was released, so any timestamp
 /// read under the lock is strictly later than it.
-fn hold_store_lock(
+///
+/// `pub(crate)` because [`crate::event_window_floor`] puts the same contention
+/// behind its own cases rather than growing a copy of this.
+pub(crate) fn hold_store_lock(
     engine: &Arc<engine::InMemoryEngine>,
     hold: Duration,
 ) -> (mpsc::Receiver<()>, std::thread::JoinHandle<SystemTime>) {

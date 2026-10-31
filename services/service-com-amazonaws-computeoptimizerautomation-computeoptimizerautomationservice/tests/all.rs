@@ -61,6 +61,8 @@ mod enrollment_write_timestamps;
 mod enum_parameter_rejection;
 #[path = "all/error_payloads.rs"]
 mod error_payloads;
+#[path = "all/event_window_floor.rs"]
+mod event_window_floor;
 #[path = "all/filter_name_enum_boundary.rs"]
 mod filter_name_enum_boundary;
 #[path = "all/filter_name_refusals.rs"]

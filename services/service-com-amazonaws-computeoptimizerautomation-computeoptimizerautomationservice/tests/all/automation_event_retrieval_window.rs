@@ -85,7 +85,11 @@ fn seeded_event(index: usize, base: i64, age_secs: i64) -> StoredEvent {
 
 /// The `eventId`s one `ListAutomationEvents` response reports, in response
 /// order.
-fn listed_ids(body: &Value) -> Vec<String> {
+///
+/// `pub(crate)` with [`summarised_count`] below, because the sibling suite about
+/// the instant this window is judged at reads a response the same way rather
+/// than growing a copy.
+pub(crate) fn listed_ids(body: &Value) -> Vec<String> {
     member(body, "automationEvents")
         .as_array()
         .unwrap_or_else(|| panic!("automationEvents must be a list, got {body}"))
@@ -96,7 +100,7 @@ fn listed_ids(body: &Value) -> Vec<String> {
 
 /// How many events one `ListAutomationEventSummaries` response counted, over
 /// every group it reports.
-fn summarised_count(body: &Value) -> i64 {
+pub(crate) fn summarised_count(body: &Value) -> i64 {
     let listed = member(body, "automationEventSummaries");
     if listed.is_null() {
         return 0;
