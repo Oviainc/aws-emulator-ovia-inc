@@ -81,9 +81,24 @@ pub fn tracing_header(text: &str) -> Option<&str> {
     names_a_trace.then_some(text)
 }
 
+/// The trace id the tracing header `text` carries in its [`ROOT_FIELD`] field, when
+/// `text` IS a tracing header ([`tracing_header`]).
+///
+/// That id is what every hop of ONE request chain carries — "the trace-id associated
+/// with" the request — so it is how a service recognises two calls as belonging to the
+/// same chain. Text that names no trace carries no root, and so names no chain.
+#[must_use]
+pub fn trace_root(text: &str) -> Option<&str> {
+    tracing_header(text)?
+        .split(FIELD_SEPARATOR)
+        .filter_map(|field| field.split_once('='))
+        .find(|(name, _)| *name == ROOT_FIELD)
+        .map(|(_, value)| value)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_trace_id, tracing_header};
+    use super::{is_trace_id, trace_root, tracing_header};
 
     /// Which text is a trace id — over a TABLE whose rows differ along the
     /// version, the width of each part, the alphabet of each part, and how many
@@ -164,6 +179,41 @@ mod tests {
                     "case {case:?}: a tracing header is carried as written"
                 );
             }
+        }
+    }
+
+    /// Which trace id a tracing header names its chain by — over a TABLE whose rows
+    /// differ along where the root field sits, which fields sit beside it, and every
+    /// shape that names no chain at all.
+    #[test]
+    fn the_root_field_is_the_chain_a_tracing_header_names() {
+        let root = "1-5759e988-bd862e3fe1be46a994272793";
+        let other = "1-00000000-000000000000000000000000";
+        let rows: Vec<(&str, String, Option<&str>)> = vec![
+            ("the root alone", format!("Root={root}"), Some(root)),
+            ("a sampled header", format!("Root={root};Sampled=1"), Some(root)),
+            (
+                "the root after another field",
+                format!("Sampled=1;Parent=53995c3f42cd8ad8;Root={other}"),
+                Some(other),
+            ),
+            (
+                "a field of the tracer's own beside it",
+                format!("Root={root};Lineage=1:11fb77a2:0"),
+                Some(root),
+            ),
+            ("no root field", "Sampled=1".to_string(), None),
+            ("a root that is not a trace id", "Root=whatever".to_string(), None),
+            ("no field at all", "not-a-trace-header".to_string(), None),
+            ("empty text", String::new(), None),
+        ];
+        for (case, text, expected) in rows {
+            let actual = trace_root(&text);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the chain of {text:?} to be {expected:?}, got \
+                 {actual:?}"
+            );
         }
     }
 }

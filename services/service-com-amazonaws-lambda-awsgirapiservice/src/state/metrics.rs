@@ -31,7 +31,8 @@
 //!
 //! What a series is identified by and what one observation of it is are this module's
 //! ([`series`], [`observation`], [`append`]), so every metric this service publishes —
-//! the per-function ones here and the account-level concurrency metering in
+//! the per-function ones here, the invocations Lambda's recursive-loop guardrail drops
+//! ([`super::recursion`]) and the account-level concurrency metering in
 //! [`super::concurrency_metering`] — reaches the store the same way and carries the same
 //! resolution. An account-level series carries NO dimension: "a metric is uniquely defined
 //! by a name, a namespace, and zero or more dimensions", and the quantity such a series
@@ -158,6 +159,18 @@ pub const ITERATOR_AGE_METRIC: &str = "IteratorAge";
 /// The unit that age carries: it is a span of milliseconds, which CloudWatch's
 /// `StandardUnit` spells `Milliseconds`.
 pub const ITERATOR_AGE_UNIT: &str = "Milliseconds";
+
+/// How many invocation REQUESTS Lambda dropped because it detected the function being
+/// invoked as part of a recursive loop and the function's recursive loop detection
+/// configuration told it to stop the chain.
+///
+/// The name is the one Lambda's own series carries in [`METRIC_NAMESPACE`]:
+/// `RecursiveInvocationsDropped`, dimensioned on the function whose invocation was
+/// stopped ([`FUNCTION_NAME_DIMENSION`]) and counted in [`COUNT_UNIT`]. It is the only way
+/// a client learns the guardrail fired, so one datapoint is published per invocation
+/// stopped and none at all for a function whose loops are allowed — see
+/// [`super::recursion`].
+pub const RECURSIVE_INVOCATIONS_DROPPED_METRIC: &str = "RecursiveInvocationsDropped";
 
 /// The `StorageResolution` these datapoints are published at, in seconds: regular
 /// resolution, "which CloudWatch stores at 1-minute resolution"
@@ -309,6 +322,22 @@ impl FunctionMetrics {
     /// shard when it was read.
     pub fn publish_iterator_age(&self, function_name: &str, age_millis: f64) {
         self.publish(ITERATOR_AGE_METRIC, function_name, age_millis, ITERATOR_AGE_UNIT);
+    }
+
+    /// Publish that ONE invocation of the function `function_name` names was dropped by
+    /// the recursive-loop guardrail: a single observation of
+    /// [`RECURSIVE_INVOCATIONS_DROPPED_METRIC`], counting that one dropped invocation.
+    ///
+    /// Each drop is its own datapoint rather than a running total, so a reader summing a
+    /// window over the series gets the invocations dropped in it, and a window in which
+    /// the guardrail dropped nothing holds no datapoint at all.
+    pub fn publish_recursive_invocations_dropped(&self, function_name: &str) {
+        self.publish(
+            RECURSIVE_INVOCATIONS_DROPPED_METRIC,
+            function_name,
+            1.0,
+            COUNT_UNIT,
+        );
     }
 
     /// Publish what ONE pass of the event source mapping `uuid` names did with the events

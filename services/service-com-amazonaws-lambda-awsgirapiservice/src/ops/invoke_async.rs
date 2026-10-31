@@ -10,6 +10,11 @@
 //! its failed outcome once its delivery attempt is due, carrying the reason it never
 //! ran, and no result, log tail or duration is ever reported for it.
 //!
+//! An invocation Lambda's recursive-loop guardrail STOPS is accepted the same way and
+//! never delivered: the event is held with the outcome that records the guardrail stopped
+//! it, and the stop is metered as one `RecursiveInvocationsDropped` datapoint for the
+//! function (`crate::state::recursion`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -331,7 +336,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // queued for invocation." Nothing about the run is reported, because nothing has
         // run — the queue entry records that outcome itself once its delivery attempt
         // comes due (see `FunctionRecord::materialize`).
-        record.queue_async_invocation(&version, input.invoke_args, now);
+        //
+        // Whether the invocation happens at all is Lambda's recursive-loop guardrail's
+        // decision, taken here for the same reason as on `Invoke`: an invocation arriving
+        // as part of a request chain that has already come back round into this function
+        // is one a `Terminate` function has stopped, and the stop is metered as one
+        // `RecursiveInvocationsDropped` datapoint (`crate::state::recursion`). The chain is
+        // the one THIS request carries; what this operation's own documentation withholds
+        // is propagating a trace id onward to the function ("Trace ID is not propagated to
+        // the function"), which is not what the chain of the request is read for.
+        let chain = crate::state::request_chain(ctx);
+        let stopped = crate::state::guardrail(record, chain.as_deref(), now)
+            == crate::state::Guardrail::Stopped;
+        let function_name = record.config.name.clone();
+        if stopped {
+            record.record_stopped_async_invocation(&version, input.invoke_args, now);
+        } else {
+            record.queue_async_invocation(&version, input.invoke_args, now);
+        }
+        drop(store);
+        if stopped {
+            crate::state::publish_recursive_invocation_dropped(&*self.engine, &function_name);
+        }
 
         Ok(InvokeAsyncOutput {
             status: ACCEPTED_STATUS,

@@ -38,7 +38,12 @@
 //! type, this status code is 204."
 //!
 //! `InvocationType=RequestResponse` means "run the deployment package and stream what its
-//! handler writes". This emulator has no in-process runtime that can run a deployment
+//! handler writes". Whether that invocation happens at all is decided first by Lambda's
+//! recursive-loop guardrail: one arriving as part of a request chain that has already come
+//! back round into this function is stopped when the function's recursive loop detection
+//! configuration is `Terminate`, which is the modelled `RecursiveInvocationException` and
+//! one `RecursiveInvocationsDropped` datapoint for the function
+//! (`crate::state::recursion`). This emulator has no in-process runtime that can run a deployment
 //! package (the same gap `crate::ops::invoke` states for the same reason), and a chunk
 //! sequence, a trailer error code or a log tail invented for a handler that never ran would
 //! be indistinguishable from a real one — so that path is refused, naming the function and
@@ -352,8 +357,26 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             // "DryRun – Validate parameter values and verify that the user or role has
             // permission to invoke the function." Nothing runs for a dry run even on the
             // real service, so the validation above IS the operation, and the model's own
-            // `StatusCode` documentation states the status it answers.
+            // `StatusCode` documentation states the status it answers. It invokes nothing,
+            // so it is no hop of any request chain either.
             return Ok(dry_run_response(&version));
+        }
+
+        // Lambda's recursive-loop guardrail decides whether this invocation happens at
+        // all, exactly as it does on `Invoke`: a response-streaming invocation is an
+        // invocation of the function, so it is counted against the request chain it belongs
+        // to, and one the guardrail stops is the modelled 400 and one
+        // `RecursiveInvocationsDropped` datapoint (`crate::state::recursion`). The metric is
+        // published with the store lock released, because it goes into CloudWatch's own
+        // store.
+        let chain = crate::state::request_chain(ctx);
+        let stopped = crate::state::guardrail(record, chain.as_deref(), now)
+            == crate::state::Guardrail::Stopped;
+        let function_name = record.config.name.clone();
+        drop(store);
+        if stopped {
+            crate::state::publish_recursive_invocation_dropped(&*self.engine, &function_name);
+            return Err(recursive_invocation());
         }
 
         // Running the deployment package is what this path means, and this emulator has no
@@ -488,6 +511,17 @@ fn invalid_request_content(message: String) -> InvokeWithResponseStreamError {
         InvalidRequestContentException {
             r#type: None,
             message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 400 for an invocation Lambda's recursive-loop guardrail stopped.
+fn recursive_invocation() -> InvokeWithResponseStreamError {
+    InvokeWithResponseStreamErrorModeled::RecursiveInvocationException(
+        RecursiveInvocationException {
+            r#type: None,
+            message: Some(crate::state::RECURSIVE_INVOCATION_MESSAGE.to_string()),
         },
     )
     .into()

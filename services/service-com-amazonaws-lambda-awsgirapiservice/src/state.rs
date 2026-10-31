@@ -250,6 +250,18 @@ pub use concurrency_metering::{
     drive_concurrency_metering, publish_account_concurrency, AccountConcurrency,
 };
 
+/// What Lambda's RECURSIVE-LOOP guardrail counts, when it stops an invocation and what it
+/// meters when it does lives in [`recursion`], beside the per-function series in [`metrics`]
+/// it publishes through. It is re-exported here for the same reason as
+/// [`capacity_provider`]: the function record it counts on, and the store that holds it,
+/// stay in this module.
+pub mod recursion;
+pub use recursion::{
+    guardrail, publish_recursive_invocation_dropped, request_chain, Guardrail,
+    RequestChainRecord, MAX_REQUEST_CHAIN_INVOCATIONS, RECURSIVE_INVOCATION_MESSAGE,
+    RECURSIVE_LOOP_ALLOW, RECURSIVE_LOOP_TERMINATE,
+};
+
 /// The region an ARN carries when the request is unsigned and therefore names no
 /// SigV4 credential scope to read a region from.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -379,7 +391,7 @@ pub const DEFAULT_TRACING_MODE: &str = "PassThrough";
 /// model's own `RecursiveLoop` member documentation states twice — on
 /// `GetFunctionRecursionConfig`'s output and on `PutFunctionRecursionConfig`'s input:
 /// "By default, Lambda sets your function's configuration to Terminate."
-pub const DEFAULT_RECURSIVE_LOOP: &str = "Terminate";
+pub const DEFAULT_RECURSIVE_LOOP: &str = recursion::RECURSIVE_LOOP_TERMINATE;
 
 /// The `UpdateRuntimeOn` values a runtime management configuration may carry, from the
 /// model's `UpdateRuntimeOn` enum (`Auto | Manual | FunctionUpdate`).
@@ -1895,6 +1907,17 @@ pub const ASYNC_NOT_EXECUTED_REASON: &str =
     "the event was accepted and queued, but no in-process runtime in this emulator can \
      run the function's deployment package, so it was never executed";
 
+/// Why an accepted asynchronous invocation never ran when Lambda's recursive-loop
+/// guardrail stopped it: the function's recursive loop detection configuration is
+/// [`recursion::RECURSIVE_LOOP_TERMINATE`] and the chain this invocation belongs to had
+/// already come back round into the function, so Lambda "stops your function being
+/// invoked" instead of delivering the event. Recorded on the entry at the moment the
+/// invocation is stopped, because there is no delivery attempt still to come.
+pub const ASYNC_RECURSION_STOPPED_REASON: &str =
+    "the invocation was stopped by Lambda's recursive loop detection: the request chain it \
+     belongs to had already invoked this function, and the function's recursive loop \
+     detection configuration is Terminate, so the event was never delivered";
+
 /// The most queued asynchronous invocations this emulator keeps for one function.
 ///
 /// An EMULATOR-CHOSEN ceiling for the same reason as [`MAX_FUNCTIONS`]: the queue is in
@@ -2389,6 +2412,11 @@ pub struct FunctionRecord {
     /// The asynchronous invocations accepted for this function, oldest first, bounded
     /// by [`MAX_QUEUED_ASYNC_INVOCATIONS`].
     pub async_invocations: VecDeque<AsyncInvocationRecord>,
+    /// What each request chain this function has been invoked as part of has produced so
+    /// far: the bookkeeping Lambda's recursive-loop guardrail counts on, oldest hop first
+    /// and bounded by [`recursion::MAX_TRACKED_REQUEST_CHAINS`]. Written through
+    /// [`Self::count_chain_invocation`]; see [`recursion`] for what it decides.
+    pub request_chains: VecDeque<RequestChainRecord>,
     /// The durable executions of this function, keyed by execution name — the name
     /// "must be unique within the function"
     /// (`Invoke$DurableExecutionAlreadyStartedException`), so one name names one
@@ -2533,13 +2561,42 @@ impl FunctionRecord {
     /// oldest entry makes room for the newest, so accepting an event never fails for
     /// want of memory.
     pub fn queue_async_invocation(&mut self, version: &str, payload: Vec<u8>, now: SystemTime) {
-        self.async_invocations.push_back(AsyncInvocationRecord {
+        self.hold_async_invocation(AsyncInvocationRecord {
             version: version.to_string(),
             payload,
             received: iso8601(now),
             attempt_due: now + ASYNC_DELIVERY_DELAY,
             outcome: AsyncInvocationOutcome::Queued,
         });
+    }
+
+    /// Record one asynchronous invocation of `version` carrying `payload`, accepted at
+    /// `now`, that Lambda's recursive-loop guardrail STOPPED
+    /// ([`recursion::Guardrail::Stopped`]).
+    ///
+    /// It is held like any other accepted event, and settled from the start: the guardrail
+    /// "stops your function being invoked", so there is no delivery attempt still to come
+    /// and the entry carries [`ASYNC_RECURSION_STOPPED_REASON`] rather than waiting to
+    /// record that nothing ran.
+    pub fn record_stopped_async_invocation(
+        &mut self,
+        version: &str,
+        payload: Vec<u8>,
+        now: SystemTime,
+    ) {
+        self.hold_async_invocation(AsyncInvocationRecord {
+            version: version.to_string(),
+            payload,
+            received: iso8601(now),
+            attempt_due: now,
+            outcome: AsyncInvocationOutcome::Failed(ASYNC_RECURSION_STOPPED_REASON.to_string()),
+        });
+    }
+
+    /// Hold one accepted asynchronous invocation, keeping the queue inside
+    /// [`MAX_QUEUED_ASYNC_INVOCATIONS`] by making room with the oldest entry.
+    fn hold_async_invocation(&mut self, invocation: AsyncInvocationRecord) {
+        self.async_invocations.push_back(invocation);
         while self.async_invocations.len() > MAX_QUEUED_ASYNC_INVOCATIONS {
             self.async_invocations.pop_front();
         }

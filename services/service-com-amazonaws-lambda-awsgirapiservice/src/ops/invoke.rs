@@ -21,6 +21,15 @@
 //! answers the execution already started rather than a duplicate, and one carrying a
 //! different payload is the modelled `DurableExecutionAlreadyStartedException`.
 //!
+//! Whether the invocation happens AT ALL is decided before any of that, by Lambda's
+//! recursive-loop guardrail: an invocation that arrives as part of a request chain which
+//! has already come back round into this function is one Lambda "stops […] being invoked"
+//! when the function's recursive loop detection configuration is `Terminate`, and serves
+//! untouched when it is `Allow`. A stopped synchronous invocation is the modelled
+//! `RecursiveInvocationException`, a stopped asynchronous one is accepted and never
+//! delivered, and each is metered as one `RecursiveInvocationsDropped` datapoint for the
+//! function (`crate::state::recursion`).
+//!
 //! Running the deployment package is NOT implemented: this emulator has no in-process
 //! runtime for a Lambda zip archive or container image, so `RequestResponse` answers
 //! HTTP 501 rather than a payload no function produced, and a queued asynchronous
@@ -498,7 +507,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // Lambda's RECURSIVE-LOOP guardrail decides whether this invocation happens at
+        // all, which is before anything is queued, started or run: "When Lambda detects a
+        // recursive loop and your function's recursive loop detection configuration is set
+        // to Terminate, it stops your function being invoked and notifies you"
+        // (`PutFunctionRecursionConfig`). So the invocation is counted against the request
+        // chain it belongs to and the decision read off the function's own stored
+        // configuration (`crate::state::recursion`), and an invocation the guardrail stops
+        // is metered as one `RecursiveInvocationsDropped` datapoint for the function —
+        // published off the response path, with the store lock released, because it goes
+        // into CloudWatch's own store.
+        //
+        // The DRY RUN returns above this point deliberately: it "validate[s] parameter
+        // values and verif[ies] that the user or role has permission to invoke the
+        // function" and invokes nothing, so it is no hop of any chain.
+        let chain = crate::state::request_chain(ctx);
+        let stopped = crate::state::guardrail(record, chain.as_deref(), now)
+            == crate::state::Guardrail::Stopped;
+        let function_name = record.config.name.clone();
+
         if invocation_type == INVOCATION_TYPE_EVENT {
+            // An accepted event whose invocation the guardrail stopped is still ACCEPTED —
+            // the answer to an asynchronous invocation "only includes a status code" and
+            // reports the queueing, which happened — but the invocation it would have been
+            // delivered to does not happen, and no durable execution starts for a run
+            // Lambda stopped. The entry records that outcome at once rather than waiting
+            // for a delivery attempt that will never be made.
+            if stopped {
+                record.record_stopped_async_invocation(&version, payload, now);
+                drop(store);
+                crate::state::publish_recursive_invocation_dropped(&*self.engine, &function_name);
+                return Ok(InvokeOutput {
+                    status_code: ACCEPTED_STATUS,
+                    payload: Some(Vec::new()),
+                    ..InvokeOutput::default()
+                });
+            }
             // "Event – Invoke the function asynchronously. […] The API response only
             // includes a status code": an asynchronous invocation's answer says nothing
             // about the run, because the run has not happened when it is given. What the
@@ -543,6 +587,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 durable_execution_arn: started.durable_execution_arn,
                 ..InvokeOutput::default()
             });
+        }
+
+        // A synchronous invocation the guardrail stopped is the modelled 400: Lambda
+        // "stopped your function's invocation", so there is no run to report on and the
+        // client is told the loop was detected. This is decided before the run is
+        // attempted at all, and only for an invocation the function's own configuration
+        // says must be stopped.
+        if stopped {
+            drop(store);
+            crate::state::publish_recursive_invocation_dropped(&*self.engine, &function_name);
+            return Err(InvokeErrorModeled::RecursiveInvocationException(
+                RecursiveInvocationException {
+                    r#type: None,
+                    message: Some(crate::state::RECURSIVE_INVOCATION_MESSAGE.to_string()),
+                },
+            )
+            .into());
         }
 
         // RequestResponse means "run the deployment package and answer with what it

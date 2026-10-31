@@ -181,6 +181,8 @@ mod published_function_arn;
 mod queue_message_count_snapshot;
 #[path = "all/read_representation_and_download_plane.rs"]
 mod read_representation_and_download_plane;
+#[path = "all/recursive_loop_guardrail.rs"]
+mod recursive_loop_guardrail;
 #[path = "all/refusal_message_rules.rs"]
 mod refusal_message_rules;
 #[path = "all/refused_value_echo.rs"]
