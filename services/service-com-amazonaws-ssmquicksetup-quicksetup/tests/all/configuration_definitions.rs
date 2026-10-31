@@ -710,7 +710,9 @@ async fn configuration_rows(
 }
 
 /// A `{ManagerArn}/{Id}` pair that names no stored definition is the modelled 404, and
-/// nothing is written for it.
+/// nothing is written for it. (A pair whose MANAGER ARN names no stored manager is not
+/// one of these: the route's target is authorized ahead of the handler, so that request
+/// never reaches the lookup — `tests/all/target_authorization.rs`.)
 #[tokio::test]
 async fn a_pair_that_names_no_stored_definition_is_a_404() {
     let router = emulator();
@@ -740,11 +742,6 @@ async fn a_pair_that_names_no_stored_definition_is_a_404() {
     .await;
 
     let cases: Vec<(&str, String, String)> = vec![
-        (
-            "a manager ARN no create minted",
-            UNKNOWN_MANAGER_ARN.to_string(),
-            ids[0].clone(),
-        ),
         (
             "a definition id this manager does not own",
             manager_arn.clone(),
@@ -776,6 +773,26 @@ async fn a_pair_that_names_no_stored_definition_is_a_404() {
         after.get("ConfigurationDefinitions"),
         before.get("ConfigurationDefinitions"),
         "a refused update must write nothing, got {after:?}"
+    );
+
+    // A pair whose MANAGER ARN names no stored manager is refused in front of the
+    // handler, by the stage that authorizes the route's target, so the definition id it
+    // carries is never looked at.
+    let (status, answer) = update_definition(
+        &router,
+        UNKNOWN_MANAGER_ARN,
+        &ids[0],
+        &json!({ "TypeVersion": "9" }),
+    )
+    .await;
+    assert_eq!(
+        status, 401,
+        "case \"a manager ARN no create minted\": expected 401, got {status} / {answer:?}"
+    );
+    assert_eq!(
+        error_code(&answer),
+        "UnauthorizedException",
+        "case \"a manager ARN no create minted\": expected UnauthorizedException, got {answer:?}"
     );
 }
 

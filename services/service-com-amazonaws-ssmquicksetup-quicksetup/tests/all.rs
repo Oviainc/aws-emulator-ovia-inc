@@ -61,6 +61,8 @@ mod state_roundtrip;
 mod status_summaries;
 #[path = "all/store_bounds_after_teardown.rs"]
 mod store_bounds_after_teardown;
+#[path = "all/target_authorization.rs"]
+mod target_authorization;
 #[path = "all/target_regions_required.rs"]
 mod target_regions_required;
 #[path = "all/type_version_filter.rs"]

@@ -9,6 +9,13 @@
 //! merged set. `@idempotent`: repeating a request leaves the same stored tags, and the
 //! stamp moves only when the stored record actually changed.
 //!
+//! This route's label is any taggable resource's ARN rather than the ARN of a resource
+//! kind this operation addresses, so `crate::service`'s request-authorization stage
+//! authorizes that ARN before this handler is reached — and so before the `Tags` map is
+//! judged: a request whose ARN names no resource this endpoint serves is refused there.
+//! The modelled 404 below is what remains for a caller that reaches the handler with no
+//! such resource.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

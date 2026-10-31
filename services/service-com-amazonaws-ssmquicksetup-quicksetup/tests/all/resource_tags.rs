@@ -11,7 +11,9 @@
 //! value whether or not the resource already carried it, and every key the request does
 //! not name is left as it was — so a later `GetConfigurationManager` reports the merged
 //! set and repeating the same request answers the same way (the operation is
-//! `@idempotent`). An ARN naming no stored resource is the modelled 404, and a request
+//! `@idempotent`). An ARN naming no stored resource is refused ahead of the handler by
+//! the stage that authorizes the resource a route targets
+//! (`tests/all/target_authorization.rs`), and a request
 //! that would leave the resource carrying more tags than the service accepts is the
 //! modelled 400 with nothing stored.
 //!
@@ -21,8 +23,8 @@
 //! key the resource does not carry as nothing to do — so a later
 //! `GetConfigurationManager` reports what is left and repeating the same request answers
 //! the same way (the operation is `@idempotent`). An ARN naming no stored resource is
-//! the modelled 404, and a request naming no key at all is the modelled 400 with
-//! nothing removed.
+//! refused by that same stage, and a request naming no key at all is the modelled 400
+//! with nothing removed.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -476,12 +478,13 @@ async fn tag_resource_is_idempotent() {
     );
 }
 
-/// An ARN naming no stored resource is the modelled 404, whatever form it takes, and an
-/// assignment against one stores nothing.
+/// An ARN naming no stored resource is refused ahead of the assignment, by the stage
+/// that authorizes the resource a route targets — HTTP 401 `UnauthorizedException`,
+/// whatever form the ARN takes — and an assignment against one stores nothing.
 #[tokio::test]
 async fn tag_resource_rejects_an_arn_naming_no_resource() {
     let router = emulator();
-    // A manager that exists, so the 404s below are about the ARN rather than an empty
+    // A manager that exists, so the refusals below are about the ARN rather than an empty
     // store.
     let live = create_manager(&router, "a live manager", &tags(&[("Env", "prod")])).await;
     let deleted = create_manager(&router, "a deleted manager", &tags(&[("Env", "prod")])).await;
@@ -514,13 +517,13 @@ async fn tag_resource_rejects_an_arn_naming_no_resource() {
     ] {
         let (status, answer) = tag(&router, &arn, &tags(&[("Team", "platform")])).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404, got {status} / {answer:?}"
+            status, 401,
+            "case {case:?}: expected 401, got {status} / {answer:?}"
         );
         assert_eq!(
             error_code(&answer),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
+            "UnauthorizedException",
+            "case {case:?}: expected UnauthorizedException, got {answer:?}"
         );
     }
 
@@ -834,12 +837,13 @@ async fn untag_resource_is_idempotent() {
     );
 }
 
-/// An ARN naming no stored resource is the modelled 404, whatever form it takes, and a
-/// removal against one stores nothing.
+/// An ARN naming no stored resource is refused ahead of the removal, by the stage that
+/// authorizes the resource a route targets — HTTP 401 `UnauthorizedException`, whatever
+/// form the ARN takes — and a removal against one stores nothing.
 #[tokio::test]
 async fn untag_resource_rejects_an_arn_naming_no_resource() {
     let router = emulator();
-    // A manager that exists, so the 404s below are about the ARN rather than an empty
+    // A manager that exists, so the refusals below are about the ARN rather than an empty
     // store.
     let live = create_manager(&router, "a live manager", &tags(&[("Env", "prod")])).await;
     let deleted = create_manager(&router, "a deleted manager", &tags(&[("Env", "prod")])).await;
@@ -869,13 +873,13 @@ async fn untag_resource_rejects_an_arn_naming_no_resource() {
     ] {
         let (status, answer) = untag(&router, &arn, &["Env"]).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404, got {status} / {answer:?}"
+            status, 401,
+            "case {case:?}: expected 401, got {status} / {answer:?}"
         );
         assert_eq!(
             error_code(&answer),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
+            "UnauthorizedException",
+            "case {case:?}: expected UnauthorizedException, got {answer:?}"
         );
     }
 

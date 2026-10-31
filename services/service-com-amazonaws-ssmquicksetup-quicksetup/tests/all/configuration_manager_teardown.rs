@@ -557,9 +557,12 @@ async fn a_delete_winds_the_manager_and_its_configurations_down_before_removing_
             "case {name:?}: got {answer:?}"
         );
 
+        // The tag plane's route labels any taggable resource's ARN rather than the
+        // resource it addresses, so it is the authorization stage — not this handler —
+        // that answers an ARN naming nothing (`tests/all/target_authorization.rs`).
         let (status, answer) = list_tags(&router, &doomed).await;
         assert_eq!(
-            status, 404,
+            status, 401,
             "case {name:?}: a torn-down manager is no resource to read tags of, got {status} / {answer:?}"
         );
 
@@ -756,18 +759,27 @@ async fn a_manager_being_torn_down_takes_no_further_mutation() {
             "case {name}: a refused mutation must not disturb the teardown, got {actual:?}"
         );
 
-        // And once the teardown has completed there is no resource to mutate.
+        // And once the teardown has completed there is no resource to mutate. WHICH
+        // refusal says so follows the route: `/configurationManager/{ManagerArn}` labels
+        // the manager it addresses and resolves the ARN itself, while the tag plane's and
+        // the configuration-definition route's labels name a resource they do not address
+        // and are authorized ahead of the handler
+        // (`tests/all/target_authorization.rs`).
         tokio::time::sleep(past_transition()).await;
+        let (expected_status, expected_code) = match name {
+            "UpdateConfigurationManager" => (404, "ResourceNotFoundException"),
+            _ => (401, "UnauthorizedException"),
+        };
         let (status, answer) =
             call(&router, mutation.method, &uri, mutation.body.as_ref()).await;
         assert_eq!(
-            status, 404,
+            status, expected_status,
             "case {name}: a torn-down manager is absent, got {status} / {answer:?}"
         );
         assert_eq!(
             error_code(&answer),
-            "ResourceNotFoundException",
-            "case {name}: expected ResourceNotFoundException, got {answer:?}"
+            expected_code,
+            "case {name}: expected {expected_code}, got {answer:?}"
         );
     }
 }

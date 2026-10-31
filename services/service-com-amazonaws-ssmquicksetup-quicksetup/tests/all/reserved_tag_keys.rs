@@ -37,7 +37,7 @@ use smithy_server_runtime::MultiServiceRouter;
 const REGION: &str = "us-west-2";
 
 /// A well-formed `ManagerArn` (the modelled pattern ends in a uuid) that no create ever
-/// minted, for the case that pits request validation against resource resolution.
+/// minted, for the case that pits request validation against target authorization.
 const UNKNOWN_MANAGER_ARN: &str =
     "arn:aws:ssm-quicksetup:us-west-2:000000000000:configuration-manager/\
      00000000-0000-4000-8000-000000000000";
@@ -506,25 +506,56 @@ async fn untag_resource_refuses_a_reserved_tag_key() {
     }
 }
 
-/// A reserved key is refused as a REQUEST, before the ARN is resolved: the modelled 400
-/// answers even when the ARN names no stored resource, which would otherwise be a 404.
+/// Where the reserved-key refusal sits in the order: BEHIND the stage that authorizes
+/// the resource a route targets, so an ARN naming no stored resource is refused there
+/// (HTTP 401 `UnauthorizedException`) whether the keys are reserved or ordinary, and the
+/// modelled 400 is what a request against a served target earns.
 #[tokio::test]
-async fn untag_resource_refuses_a_reserved_tag_key_before_resolving_the_resource() {
+async fn the_reserved_key_refusal_comes_after_the_target_is_authorized() {
     let router = emulator();
+    let stored = seeded();
+    let served = create_ok(&router, "a served target", &stored).await;
 
-    // The 404 the same ARN earns with an ordinary key, so the rows differ only in
-    // whether the key is reserved.
+    // The refusal the same ARN earns with an ordinary key, so the rows below differ only
+    // in whether the key is reserved — and both are the authorization refusal.
     let (status, answer) = untag(&router, UNKNOWN_MANAGER_ARN, &["Env"]).await;
     assert_eq!(
-        status, 404,
-        "case \"an ordinary key on an unknown ARN\": expected 404, got {status} / {answer:?}"
+        status, 401,
+        "case \"an ordinary key on an unknown ARN\": expected 401, got {status} / {answer:?}"
     );
 
     for (case, key) in reserved_keys() {
-        let case = format!("{case} on an unknown ARN");
+        let unserved_case = format!("{case} on an unknown ARN");
         let (status, answer) = untag(&router, UNKNOWN_MANAGER_ARN, &[key.as_str()]).await;
-        assert_reserved_refusal(&case, "TagKeys", KeyEcho::Named, &key, status, &answer);
+        assert_eq!(
+            status, 401,
+            "case {unserved_case:?}: expected 401, got {status} / {answer:?}"
+        );
+        assert_eq!(
+            error_code(&answer),
+            "UnauthorizedException",
+            "case {unserved_case:?}: expected UnauthorizedException, got {answer:?}"
+        );
+
+        // The same request against a target the endpoint serves reaches the rule under
+        // test, so the two refusals are told apart by the ARN and nothing else.
+        let served_case = format!("{case} on a served ARN");
+        let (status, answer) = untag(&router, &served, &[key.as_str()]).await;
+        assert_reserved_refusal(
+            &served_case,
+            "TagKeys",
+            KeyEcho::Named,
+            &key,
+            status,
+            &answer,
+        );
     }
+
+    let left = stored_tags(&router, "a served target", &served).await;
+    assert_eq!(
+        left, stored,
+        "a refused removal must remove nothing, expected {stored:?}, got {left:?}"
+    );
 }
 
 /// A key that only resembles the reserved prefix is the caller's own: it is stored,

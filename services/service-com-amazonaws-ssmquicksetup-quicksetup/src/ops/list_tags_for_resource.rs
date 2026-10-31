@@ -6,6 +6,12 @@
 //! one `TagEntry` per stored key. `@readonly`: it reports what the last mutating call
 //! left stored and writes nothing, so two reads of one resource answer the same way.
 //!
+//! This route's label is any taggable resource's ARN rather than the ARN of a resource
+//! kind this operation addresses, so `crate::service`'s request-authorization stage
+//! authorizes that ARN before this handler is reached: a request whose ARN names no
+//! resource this endpoint serves is refused there. The modelled 404 below is what remains
+//! for a caller that reaches the handler with no such resource.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

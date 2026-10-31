@@ -7,13 +7,20 @@
 //! restJson1 serialization, the modelled-constraint walk and the handlers — so what is
 //! asserted is what a signed AWS SDK request observes.
 //!
-//! The rule under test: an operation that addresses a configuration manager by ARN and
-//! finds none stored under it answers the modelled `ResourceNotFoundException` (HTTP
-//! 404) whose `Message` is the service's not-found sentence — the fixed text
-//! `Quick setup manager with arn: ` and ` could not be found.` around the ARN THE
-//! REQUEST carried, echoed verbatim. Nothing else about the sentence varies: no account
-//! id, Region or uuid of any one run is part of it, so each row below supplies a
-//! different ARN and expects that same ARN back inside the same fixed text.
+//! The rule under test: an operation that resolves a configuration-manager ARN its
+//! request carried and finds none stored under it answers the modelled
+//! `ResourceNotFoundException` (HTTP 404) whose `Message` is the service's not-found
+//! sentence — the fixed text `Quick setup manager with arn: ` and ` could not be found.`
+//! around the ARN THE REQUEST carried, echoed verbatim. Nothing else about the sentence
+//! varies: no account id, Region or uuid of any one run is part of it, so each row below
+//! supplies a different ARN and expects that same ARN back inside the same fixed text.
+//!
+//! The operations here are the ones that reach that lookup: the three whose route labels
+//! the very manager they address, and `ListConfigurations`, which takes the ARN as a body
+//! member. The cross-resource routes — the tag plane, and the configuration-definition
+//! route labelled with its parent's ARN — are refused ahead of the handler by the stage in
+//! `tests/all/target_authorization.rs`, so an ARN naming no manager never reaches this
+//! sentence there.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,17 +141,12 @@ fn expected_message(arn: &str) -> String {
     format!("Quick setup manager with arn: {arn} could not be found.")
 }
 
-/// Every operation that addresses a configuration manager by ARN, by the name used in
-/// each assertion below. `UpdateConfigurationDefinition` also names a definition id, so
-/// every caller passes one.
+/// Every operation that reaches this service's own configuration-manager lookup, by the
+/// name used in each assertion below.
 const MANAGER_ARN_OPERATIONS: &[&str] = &[
     "GetConfigurationManager",
     "DeleteConfigurationManager",
     "UpdateConfigurationManager",
-    "UpdateConfigurationDefinition",
-    "ListTagsForResource",
-    "TagResource",
-    "UntagResource",
     "ListConfigurations",
 ];
 
@@ -154,7 +156,7 @@ async fn call_naming(
     router: &MultiServiceRouter,
     operation: &str,
     arn: &str,
-    definition_id: &str,
+    _definition_id: &str,
 ) -> (u16, Value) {
     match operation {
         "GetConfigurationManager" => {
@@ -181,38 +183,6 @@ async fn call_naming(
                 "PUT",
                 &format!("/configurationManager/{}", label(arn)),
                 Some(&json!({ "Name": "renamed" })),
-            )
-            .await
-        }
-        "UpdateConfigurationDefinition" => {
-            call(
-                router,
-                "PUT",
-                &format!(
-                    "/configurationDefinition/{}/{}",
-                    label(arn),
-                    label(definition_id)
-                ),
-                Some(&json!({ "TypeVersion": "LATEST" })),
-            )
-            .await
-        }
-        "ListTagsForResource" => call(router, "GET", &format!("/tags/{}", label(arn)), None).await,
-        "TagResource" => {
-            call(
-                router,
-                "PUT",
-                &format!("/tags/{}", label(arn)),
-                Some(&json!({ "Tags": { "Env": "prod" } })),
-            )
-            .await
-        }
-        "UntagResource" => {
-            call(
-                router,
-                "DELETE",
-                &format!("/tags/{}?tagKeys=Env", label(arn)),
-                None,
             )
             .await
         }
@@ -303,8 +273,8 @@ const UNKNOWN_MANAGER_ARNS: &[(&str, &str)] = &[
     ),
 ];
 
-/// A definition id for the rows whose manager does not exist: the manager is looked for
-/// first, so the id only has to satisfy the modelled `^[a-z0-9-]{1,20}$`.
+/// A definition id for the rows that name one: the manager is looked for first, so the id
+/// only has to satisfy the modelled `^[a-z0-9-]{1,20}$`.
 const SOME_DEFINITION_ID: &str = "cfg-1";
 
 /// Every operation that names a manager by ARN refuses an ARN naming no stored manager

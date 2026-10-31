@@ -11,8 +11,14 @@
 //! `ListConfigurations` report them. `@idempotent`: a request that stores no new value
 //! — a replay of one already served, or a body carrying none of the optional members —
 //! changes nothing, so neither the stamps nor the deployment statuses the manager and
-//! its configurations report move for it. The modelled 404 when no manager has that ARN
-//! or that manager holds no definition with that id; an empty body on success.
+//! its configurations report move for it. The modelled 404 when the manager this ARN
+//! names holds no definition with that id; an empty body on success.
+//!
+//! This route addresses one configuration definition and labels it with the ARN of the
+//! configuration manager that OWNS it, so `crate::service`'s request-authorization stage
+//! authorizes that ARN before this handler is reached — and before the modelled
+//! `@pattern` of either label is checked: a request whose ARN names no manager this
+//! endpoint serves is refused there, whatever its definition id says.
 //!
 //! ## Shape of an operation
 //!

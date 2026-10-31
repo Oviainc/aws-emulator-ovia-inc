@@ -12,7 +12,8 @@
 //! carry, and no entry belonging to another resource. Being `@readonly` it changes
 //! nothing, so repeating it answers identically and every other reported value stays
 //! where the last mutating call left it; a request whose ARN names no stored resource is
-//! the modelled 404.
+//! refused ahead of the read by the stage that authorizes the resource a route targets
+//! (`tests/all/target_authorization.rs`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -487,11 +488,13 @@ async fn list_tags_for_resource_reports_only_the_named_resource() {
     );
 }
 
-/// An ARN naming no stored resource is the modelled 404, whatever form it takes.
+/// An ARN naming no stored resource is refused ahead of the read, by the stage that
+/// authorizes the resource a route targets: HTTP 401 `UnauthorizedException`, whatever
+/// form the ARN takes.
 #[tokio::test]
 async fn list_tags_for_resource_rejects_an_arn_naming_no_resource() {
     let router = emulator();
-    // A manager that exists, so the 404s below are about the ARN rather than an empty
+    // A manager that exists, so the refusals below are about the ARN rather than an empty
     // store.
     let live = create_manager(&router, "a live manager", &tags(&[("Env", "prod")])).await;
     let deleted = create_manager(&router, "a deleted manager", &tags(&[("Env", "prod")])).await;
@@ -528,13 +531,13 @@ async fn list_tags_for_resource_rejects_an_arn_naming_no_resource() {
     ] {
         let (status, answer) = list_tags(&router, &arn).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404, got {status} / {answer:?}"
+            status, 401,
+            "case {case:?}: expected 401, got {status} / {answer:?}"
         );
         assert_eq!(
             error_code(&answer),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
+            "UnauthorizedException",
+            "case {case:?}: expected UnauthorizedException, got {answer:?}"
         );
     }
 

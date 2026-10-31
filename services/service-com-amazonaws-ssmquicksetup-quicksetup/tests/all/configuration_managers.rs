@@ -1403,7 +1403,10 @@ async fn a_delete_removes_the_manager_and_the_configurations_it_owned() {
     );
 }
 
-/// An ARN no create ever minted is a 404 on every operation that names one.
+/// An ARN no create ever minted is a 404 on every operation whose route labels the very
+/// manager it addresses: those three resolve the ARN themselves, so the stage that fronts
+/// this service's cross-resource routes (`tests/all/target_authorization.rs`) is not what
+/// answers them.
 #[tokio::test]
 async fn an_unknown_manager_arn_is_a_404_on_every_operation() {
     let router = emulator();
@@ -1563,7 +1566,7 @@ async fn the_deployment_status_settles_once_the_clock_owes_it() {
 // this service is now implemented (no `//! SCAFFOLDED, NOT IMPLEMENTED:` marker is left
 // under `src/ops/`), so the census has nothing to assert and is gone: the last entry it
 // held, `PUT /tags/{ResourceArn}` (`TagResource`), is implemented and covered end to end
-// by `tests/all/resource_tags.rs`, including the 404 an ARN naming no resource earns.
+// by `tests/all/resource_tags.rs`, including the refusal an ARN naming no resource earns.
 
 // ---------------------------------------------------------------------------
 // GetConfiguration

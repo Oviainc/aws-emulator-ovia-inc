@@ -14,7 +14,12 @@
 //! that says there is no next page) and finds none of its
 //! identifiers, which `ListConfigurations` states for itself: it "returns configurations
 //! deployed by Quick Setup in the requesting Amazon Web Services account and Amazon Web
-//! Services Region" (`smithy_query(query="doc",shape="ListConfigurations")`).
+//! Services Region" (`smithy_query(query="doc",shape="ListConfigurations")`). WHICH
+//! refusal such a request earns follows where the resource was named: a route that labels
+//! a resource the operation does not itself address is refused by the stage in front of
+//! the service (`tests/all/target_authorization.rs`), while every other — the manager's
+//! own route, a `ManagerArn` in the body, a configuration id — is refused by the handler,
+//! in this service's own modelled shapes ([`cross_region_refusal`]).
 //!
 //! The Region a configuration REPORTS is a different thing: `ConfigurationSummary$Region`
 //! is "The Amazon Web Services Region where the configuration was deployed"
@@ -563,6 +568,20 @@ const PER_RESOURCE_OPERATIONS: &[&str] = &[
     "DeleteConfigurationManager",
 ];
 
+/// Which refusal one of [`PER_RESOURCE_OPERATIONS`] earns for a resource of another
+/// Region: the 401 of the stage that fronts this service's cross-resource routes where
+/// the ROUTE labels a resource the operation does not itself address (the tag plane's
+/// `ResourceArn`, the configuration-definition route's parent `ManagerArn`), and the
+/// handler's own modelled 404 everywhere else — the manager's own route, a `ManagerArn`
+/// in the body, a configuration id.
+fn cross_region_refusal(operation: &str) -> (u16, &'static str) {
+    match operation {
+        "ListTagsForResource" | "TagResource" | "UntagResource"
+        | "UpdateConfigurationDefinition" => (401, "UnauthorizedException"),
+        _ => (404, "ResourceNotFoundException"),
+    }
+}
+
 /// One of [`PER_RESOURCE_OPERATIONS`], addressing `fixture`'s identifiers but signed for
 /// `region`.
 async fn per_resource_call(
@@ -676,14 +695,15 @@ async fn an_identifier_of_another_region_is_not_found() {
                 );
                 let (status, got) =
                     per_resource_call(&router, operation, caller.region, owner).await;
+                let (expected_status, expected_code) = cross_region_refusal(operation);
                 assert_eq!(
-                    status, 404,
-                    "case {case}: expected 404, got {status} / {got:?}"
+                    status, expected_status,
+                    "case {case}: expected {expected_status}, got {status} / {got:?}"
                 );
                 assert_eq!(
                     error_code(&got),
-                    "ResourceNotFoundException",
-                    "case {case}: expected ResourceNotFoundException, got {got:?}"
+                    expected_code,
+                    "case {case}: expected {expected_code}, got {got:?}"
                 );
             }
         }
