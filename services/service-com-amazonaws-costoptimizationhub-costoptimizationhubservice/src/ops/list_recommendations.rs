@@ -186,12 +186,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListRecommendationsErrorModeled::ValidationException(refused).into());
         }
 
-        // The row this page starts at, under the one pagination-token rule every
-        // paginated read of this service applies
-        // (`crate::service::page_offset`).
-        let offset = crate::service::page_offset(Self::NAME, PAGE_KIND, input.next_token.as_deref())
-            .map_err(ListRecommendationsErrorModeled::ValidationException)?;
-
         // An `orderBy` the request SETS is honoured as a whole, or the request is
         // refused rather than silently served in another order: `dimension` is
         // the member that says which values the rows are put in order of, so an
@@ -236,7 +230,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sort_rows(&mut rows, dimension, descending, mode);
         }
 
-        let page = crate::state::paginate(PAGE_KIND, &rows, offset, input.max_results);
+        // The page this read answers, under the one pagination-token rule every
+        // paginated read of this service applies (`crate::service::page`).
+        let page = crate::service::page(
+            Self::NAME,
+            PAGE_KIND,
+            &rows,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(ListRecommendationsErrorModeled::ValidationException)?;
         let items: Vec<Recommendation> = page.items.iter().map(|row| render(row, mode)).collect();
 
         Ok(ListRecommendationsOutput {

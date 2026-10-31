@@ -173,13 +173,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The row this page starts at, under the one pagination-token rule every
-        // paginated read of this service applies
-        // (`crate::service::page_offset`).
-        let offset =
-            crate::service::page_offset(Self::NAME, PAGE_KIND, input.next_token.as_deref())
-                .map_err(ListEnrollmentStatusesErrorModeled::ValidationException)?;
-
         let caller = crate::state::caller_account_id();
         let (include_member_accounts, mut enrollments) = {
             let store = state.lock();
@@ -219,7 +212,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // previous page stopped at.
         enrollments.sort_by(|a, b| a.account_id.cmp(&b.account_id));
 
-        let page = crate::state::paginate(PAGE_KIND, &enrollments, offset, input.max_results);
+        // The page this read answers, under the one pagination-token rule every
+        // paginated read of this service applies (`crate::service::page`).
+        let page = crate::service::page(
+            Self::NAME,
+            PAGE_KIND,
+            &enrollments,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(ListEnrollmentStatusesErrorModeled::ValidationException)?;
         let items: Vec<AccountEnrollmentStatus> = page
             .items
             .iter()

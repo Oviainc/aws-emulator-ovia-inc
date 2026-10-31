@@ -257,13 +257,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .is_some_and(|metrics| metrics.iter().any(|metric| metric == SAVINGS_PERCENTAGE));
 
-        // The row this page starts at, under the one pagination-token rule every
-        // paginated read of this service applies
-        // (`crate::service::page_offset`).
-        let offset =
-            crate::service::page_offset(Self::NAME, PAGE_KIND, input.next_token.as_deref())
-                .map_err(ListRecommendationSummariesErrorModeled::ValidationException)?;
-
         // The same shared rule `ListRecommendations` reads its rows through
         // (`crate::state::...::recommendation_view`): the organization gate on
         // `filter.accountIds` — only the organization's management account may
@@ -313,7 +306,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deduped.iter().map(|row| row.monthly_savings(mode)).sum(),
         );
 
-        let page = crate::state::paginate(PAGE_KIND, &groups, offset, input.max_results);
+        // The page this read answers, under the one pagination-token rule every
+        // paginated read of this service applies (`crate::service::page`).
+        let page = crate::service::page(
+            Self::NAME,
+            PAGE_KIND,
+            &groups,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(ListRecommendationSummariesErrorModeled::ValidationException)?;
 
         let metrics = savings_percentage_requested.then(|| SummaryMetricsResult {
             savings_percentage: Some(savings_percentage(

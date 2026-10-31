@@ -18,6 +18,14 @@
 //! the whole refusal body (status, code, `reason`, `message` and the single
 //! `fields` entry, which differ between operations only in the operation named)
 //! and, for an accepted token, the rows the page resumes at.
+//!
+//! A token's ROW is part of what the list issued: a list hands a token out only
+//! for a page that has rows before it and rows after it, so the rows it ever
+//! resumes at are the ones inside the collection being read and never its first.
+//! The suite therefore spans, for every paginated read, the rows a token can
+//! name — the first row, one past the last, further past it, and a row inside
+//! the collection — including a token this service really issued for a WIDER
+//! scope of the same list and then presented to a narrower one.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_costoptimizationhub_costoptimizationhubservice as cost_optimization_hub;
@@ -261,4 +269,128 @@ async fn an_absent_token_starts_at_the_first_row_and_an_issued_one_resumes() {
              got {walked:?}"
         );
     }
+}
+
+/// A `nextToken` in the encoding `issued` is carried in — the one the list that
+/// issued `issued` writes its tokens in — naming `row` instead.
+///
+/// Built from a token the list really handed out, so a case states only the row
+/// it is about and nothing about how this service encodes a token or which list
+/// it belongs to.
+fn token_at_row(issued: &str, row: usize) -> String {
+    let decoded = hex::decode(issued).expect("an issued token is hex");
+    let text = String::from_utf8(decoded).expect("an issued token decodes to text");
+    let (head, _) = text
+        .rsplit_once(':')
+        .expect("an issued token carries the row it resumes at last");
+    hex::encode(format!("{head}:{row}"))
+}
+
+/// A row of a paginated read is a row a token can name only when the list could
+/// have issued a token for it: a list issues one only for a page with rows
+/// before it and rows after it, so the first row and every row from the end of
+/// the collection onwards were never issued, whatever else the token looks like.
+/// Each is refused with the one refusal body, not answered with the empty final
+/// page a completed listing answers.
+#[tokio::test]
+async fn a_token_naming_a_row_this_list_never_issued_is_refused_by_every_paginated_read() {
+    let router = paged_router();
+
+    for (operation, base) in paginated_reads() {
+        let (whole, _) = page(&router, operation, &base, None, None).await;
+        let rows = whole.len();
+        assert!(
+            rows > 1,
+            "case {operation}: expected more than one row to page over, got {whole:?}"
+        );
+
+        // A token this list genuinely issued, so the cases differ from it only in
+        // the row they name.
+        let (_, issued) = page(&router, operation, &base, Some(1), None).await;
+        let issued = issued.unwrap_or_else(|| {
+            panic!("case {operation}: expected a token after a page of one row, got none")
+        });
+
+        let never_issued: Vec<(String, usize)> = vec![
+            ("the first row of the collection".to_string(), 0),
+            ("the row one past the last".to_string(), rows),
+            ("two rows past the last".to_string(), rows + 1),
+            ("a row far past the last".to_string(), rows + 4_000),
+        ];
+        for (form, row) in &never_issued {
+            let case = format!("{operation} given a token naming {form}");
+            let token = token_at_row(&issued, *row);
+            let (status, payload) =
+                call(&router, operation, &request(&base, None, Some(&token))).await;
+            assert_refused(&case, operation, status, &payload);
+            assert!(
+                payload["items"].is_null(),
+                "case {case:?}: expected a refusal rather than a page of rows, got {payload}"
+            );
+        }
+
+        // The complement, from the same table: the last row a token of this list
+        // can name is served, and it resumes exactly there — so the boundary is
+        // the end of the collection and not the shape of any one request.
+        let last = rows - 1;
+        let case = format!("{operation} given a token naming its last resumable row");
+        let (items, next) = page(
+            &router,
+            operation,
+            &base,
+            None,
+            Some(&token_at_row(&issued, last)),
+        )
+        .await;
+        assert_eq!(
+            items,
+            whole[last..].to_vec(),
+            "case {case:?}: expected the rows from {last} on ({:?}), got {items:?}",
+            &whole[last..]
+        );
+        assert!(
+            next.is_none(),
+            "case {case:?}: a page ending at the last row carries no token, got {next:?}"
+        );
+    }
+}
+
+/// The same rule holds for a token this service really issued: the rows it can
+/// resume at are the rows of the collection the read it is presented to answers,
+/// so a token the organization-wide enrollment read issued names no row of the
+/// caller's own one-record read and is refused there, rather than answered with
+/// the empty final page.
+#[tokio::test]
+async fn an_issued_token_naming_a_row_outside_the_read_it_is_given_to_is_refused() {
+    let router = paged_router();
+    let operation = "ListEnrollmentStatuses";
+    let organization = json!({"includeOrganizationInfo": true});
+    let caller_only = json!({"includeOrganizationInfo": false});
+
+    // The organization's view pages over the caller and its two members, so its
+    // second page resumes at a row the caller's own one-record view does not have.
+    let (_, issued) = page(&router, operation, &organization, Some(2), None).await;
+    let issued = issued.unwrap_or_else(|| {
+        panic!("case {operation}: expected a token after two of three rows, got none")
+    });
+
+    let (own, _) = page(&router, operation, &caller_only, None, None).await;
+    assert_eq!(
+        own.len(),
+        1,
+        "case setup: the caller's own read answers its one record, got {own:?}"
+    );
+
+    let (status, payload) = call(
+        &router,
+        operation,
+        &request(&caller_only, None, Some(&issued)),
+    )
+    .await;
+    assert_refused(
+        "ListEnrollmentStatuses given the organization view's token",
+        operation,
+        status,
+        &payload,
+    );
 }

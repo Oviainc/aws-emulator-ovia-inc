@@ -875,9 +875,13 @@ pub fn encode_page_token(kind: &str, offset: usize) -> String {
     ::hex::encode(format!("{PAGE_TOKEN_VERSION}:{kind}:{offset}"))
 }
 
-/// The offset a `nextToken` resumes at, or `None` when the token was not issued
-/// by [`encode_page_token`] for this `kind`.
-pub fn decode_page_token(kind: &str, token: &str) -> Option<usize> {
+/// The offset a `nextToken` carries, or `None` when the token is not in the
+/// encoding [`encode_page_token`] writes for this `kind`.
+///
+/// Whether the offset is one this service ever handed out for a list is decided
+/// against that list, by [`paginate`], which is the whole rule and the only
+/// caller a handler reaches this through.
+fn decode_page_token(kind: &str, token: &str) -> Option<usize> {
     let decoded = ::hex::decode(token).ok()?;
     let text = String::from_utf8(decoded).ok()?;
     let offset = text.strip_prefix(&format!("{PAGE_TOKEN_VERSION}:{kind}:"))?;
@@ -891,7 +895,35 @@ pub struct Page<'a, T> {
     pub next_token: Option<String>,
 }
 
-/// Cut the page `next_token` asks for out of `all`.
+/// That a `nextToken` is not one this service issued for the list being read, so
+/// it names no row to resume at: either it is not in the encoding
+/// [`encode_page_token`] writes for that list, or it carries an offset no page of
+/// that list ever ended at.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TokenNotIssued;
+
+/// The row a `nextToken` for a list of `len` rows resumes at, or
+/// [`TokenNotIssued`] when the list never handed that token out.
+///
+/// [`paginate`] issues a token only when rows remain after the page it closes,
+/// and it closes a page carrying at least one row, so every offset this service
+/// hands out for a list of `len` rows points at a row of that list and never at
+/// its first: the issued offsets are `1..len`. An offset outside them resumes at
+/// no row the list could have resumed at, so it was not issued for it.
+fn issued_offset(kind: &str, len: usize, token: &str) -> Result<usize, TokenNotIssued> {
+    let offset = decode_page_token(kind, token).ok_or(TokenNotIssued)?;
+    if offset == 0 || offset >= len {
+        return Err(TokenNotIssued);
+    }
+    Ok(offset)
+}
+
+/// Cut the page `next_token` asks for out of `all`, or refuse the token.
+///
+/// No token asks for the first row; a token this list issued resumes at the row
+/// the page that issued it stopped at; any other value is [`TokenNotIssued`],
+/// because it names no row of this list to resume at and serving a page in its
+/// place would answer an invalid request as a listing.
 ///
 /// `max_results` caps the page; absent, the whole remainder is returned. The
 /// token is issued only when rows remain after this page, so the last page
@@ -899,10 +931,13 @@ pub struct Page<'a, T> {
 pub fn paginate<'a, T>(
     kind: &str,
     all: &'a [T],
-    offset: usize,
+    next_token: Option<&str>,
     max_results: Option<i32>,
-) -> Page<'a, T> {
-    let start = offset.min(all.len());
+) -> Result<Page<'a, T>, TokenNotIssued> {
+    let start = match next_token {
+        None => 0,
+        Some(token) => issued_offset(kind, all.len(), token)?,
+    };
     let remaining = &all[start..];
     let limit = max_results.map_or(remaining.len(), |m| usize::try_from(m).unwrap_or(0));
     let items = &remaining[..limit.min(remaining.len())];
@@ -912,7 +947,7 @@ pub fn paginate<'a, T>(
     } else {
         Some(encode_page_token(kind, end))
     };
-    Page { items, next_token }
+    Ok(Page { items, next_token })
 }
 
 /// Per-service state for com-amazonaws-costoptimizationhub-costoptimizationhubservice. A handler reaches it through [`service_state`].
