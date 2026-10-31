@@ -1761,7 +1761,7 @@ const UNNAMED_CODE_PREFIX: &str = "HTTP ";
 ///
 /// One entry per service whose reported wording this emulator pins; a service with no entry
 /// has its message reported exactly as it worded it, with no diagnostic invented for it.
-const SDK_SERVICE_NAMES: &[(&str, &str)] = &[("es", "OpenSearch")];
+const SDK_SERVICE_NAMES: &[(&str, &str)] = &[("es", "OpenSearch"), ("iam", "Iam")];
 
 /// The diagnostic an AWS SDK appends to the message of the exception it raises for a refused
 /// call: which service refused it, the HTTP status it answered with, the id of the call and
@@ -1814,7 +1814,7 @@ fn sdk_attempt_count(code: &str) -> u32 {
 /// One refused answer's message as the SDK of the called service raises it: the message that
 /// service worded, then that SDK's diagnostic of the call where this crate words one
 /// ([`sdk_diagnostic`]).
-fn sdk_message(signing_name: &str, status: u16, code: &str, message: &str) -> String {
+pub(super) fn sdk_message(signing_name: &str, status: u16, code: &str, message: &str) -> String {
     match sdk_diagnostic(signing_name, status, code) {
         Some(diagnostic) if message.is_empty() => diagnostic,
         Some(diagnostic) => format!("{message} {diagnostic}"),

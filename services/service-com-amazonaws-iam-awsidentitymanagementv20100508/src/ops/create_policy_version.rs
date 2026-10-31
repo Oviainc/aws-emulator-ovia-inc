@@ -214,10 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The request was rejected because the policy document was malformed" — the
         // content of a managed policy version must be an IAM JSON policy, not merely a
-        // non-empty string, which is all `policyDocumentType`'s own pattern asks for.
-        // The rule, and its wording, are the shared ones every operation taking a policy
-        // document applies.
-        if let Some(defect) = crate::state::policy_document_defect(&input.policy_document) {
+        // non-empty string, which is all `policyDocumentType`'s own pattern asks for, and
+        // every statement of it must name the actions and resources an identity policy's
+        // statements are required to. The rule, and its wording, are the shared ones
+        // both operations writing a managed policy's document apply.
+        if let Some(defect) = crate::state::managed_policy_document_defect(&input.policy_document) {
             return Err(
                 CreatePolicyVersionErrorModeled::MalformedPolicyDocumentException(
                     MalformedPolicyDocumentException {

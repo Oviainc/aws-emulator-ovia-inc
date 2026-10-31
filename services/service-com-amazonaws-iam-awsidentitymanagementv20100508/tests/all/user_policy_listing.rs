@@ -25,9 +25,12 @@ use crate::user_lifecycle::{call, element, elements, error_code, router};
 const DEFAULT_MAX_ITEMS: usize = 100;
 
 /// The document every policy this suite embeds carries: the listing reports NAMES,
-/// so the document is not what is under test here.
+/// so the document is not what is under test here. It is a complete identity-policy
+/// statement — naming an action and a resource — because the managed policy this suite
+/// attaches below is created from the same text, and `CreatePolicy` holds a managed
+/// policy's statements to that requirement.
 const EMBEDDED_DOCUMENT: &str =
-    r#"{"Statement":[{"Sid":"s","Effect":"Allow","Action":"s3:GetObject"}]}"#;
+    r#"{"Statement":[{"Sid":"s","Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#;
 
 /// Create a user, failing the test when the create this suite depends on does not
 /// succeed.

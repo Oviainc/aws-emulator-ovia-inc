@@ -147,6 +147,8 @@ mod list_stack_sets;
 mod list_types;
 #[path = "all/macro_acknowledgement_and_include_refresh.rs"]
 mod macro_acknowledgement_and_include_refresh;
+#[path = "all/malformed_policy_document_rollback.rs"]
+mod malformed_policy_document_rollback;
 #[path = "all/nested_resource_outputs.rs"]
 mod nested_resource_outputs;
 #[path = "all/no_echo_parameters.rs"]

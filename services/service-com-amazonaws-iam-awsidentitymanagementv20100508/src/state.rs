@@ -6022,10 +6022,10 @@ pub fn remove_tags<'a, I: IntoIterator<Item = &'a str>>(
 ///
 /// Validation deliberately stops at that top level: the grammar BELOW `Statement`
 /// is not checked here, so a 200 from an operation taking a policy document is the
-/// claim "stored", not "every statement is valid IAM". Deepening it is its own
-/// change. This is the ONE definition of the rule, shared by every operation that
-/// accepts a policy document (`PutUserPolicy`'s inline policy, `CreateRole`'s trust
-/// policy).
+/// claim "stored", not "every statement is valid IAM". What a MANAGED policy's own
+/// statements must carry beside it is [`managed_policy_document_defect`]. This is the
+/// ONE definition of the top-level rule, shared by every operation that accepts a policy
+/// document (`PutUserPolicy`'s inline policy, `CreateRole`'s trust policy).
 pub fn is_policy_document(document: &str) -> bool {
     policy_document_defect(document).is_none()
 }
@@ -6047,6 +6047,13 @@ pub enum PolicyDocumentDefect {
     /// The value IS a JSON object, and carries no `Statement` element — the one element
     /// that grammar requires.
     NoStatements,
+    /// A statement of the document names no actions: it carries neither an `Action` nor
+    /// a `NotAction` element, so it says nothing about what it applies to.
+    NoActions,
+    /// A statement of the document names no resources: it carries neither a `Resource`
+    /// nor a `NotResource` element, which an identity-based policy's every statement
+    /// must.
+    NoResources,
 }
 
 /// The fixed sentence IAM refuses a document that does not parse as a JSON object with.
@@ -6065,6 +6072,13 @@ pub const TRUST_POLICY_INVALID_JSON: &str = "This policy contains invalid Json";
 /// The fixed sentence IAM refuses a JSON object carrying no `Statement` element with.
 pub const POLICY_HAS_NO_STATEMENTS: &str = "Policy has no statements";
 
+/// The fixed sentence IAM refuses a statement naming no actions with.
+pub const STATEMENT_WITHOUT_ACTIONS: &str = "Policy statement must contain actions.";
+
+/// The fixed sentence IAM refuses a statement of an identity-based policy naming no
+/// resources with.
+pub const STATEMENT_WITHOUT_RESOURCES: &str = "Policy statement must contain resources.";
+
 impl PolicyDocumentDefect {
     /// How IAM words this defect in the modelled `MalformedPolicyDocumentException`: a
     /// FIXED sentence per defect, carrying nothing of the document and nothing of the
@@ -6074,6 +6088,8 @@ impl PolicyDocumentDefect {
         match self {
             Self::Syntax => SYNTAX_ERRORS_IN_POLICY,
             Self::NoStatements => POLICY_HAS_NO_STATEMENTS,
+            Self::NoActions => STATEMENT_WITHOUT_ACTIONS,
+            Self::NoResources => STATEMENT_WITHOUT_RESOURCES,
         }
     }
 
@@ -6088,7 +6104,7 @@ impl PolicyDocumentDefect {
     pub fn trust_policy_message(self) -> &'static str {
         match self {
             Self::Syntax => TRUST_POLICY_INVALID_JSON,
-            Self::NoStatements => POLICY_HAS_NO_STATEMENTS,
+            other => other.message(),
         }
     }
 }
@@ -6098,12 +6114,93 @@ impl PolicyDocumentDefect {
 /// The ONE reader of the rule [`is_policy_document`] states, so the refusal an operation
 /// answers and the decision it answers it on cannot drift apart.
 pub fn policy_document_defect(document: &str) -> Option<PolicyDocumentDefect> {
+    policy_statements(document).err()
+}
+
+/// The `Statement` element of `document`, or the defect that says `document` is no policy
+/// document at all.
+///
+/// The ONE place the top-level grammar is read, so the decision
+/// [`policy_document_defect`] reports and the statements
+/// [`managed_policy_document_defect`] walks come from one parse of one rule.
+fn policy_statements(document: &str) -> Result<::serde_json::Value, PolicyDocumentDefect> {
     match ::serde_json::from_str::<::serde_json::Value>(document) {
-        Ok(::serde_json::Value::Object(elements)) => {
-            (!elements.contains_key("Statement")).then_some(PolicyDocumentDefect::NoStatements)
-        }
-        Ok(_) | Err(_) => Some(PolicyDocumentDefect::Syntax),
+        Ok(::serde_json::Value::Object(mut elements)) => elements
+            .remove("Statement")
+            .ok_or(PolicyDocumentDefect::NoStatements),
+        Ok(_) | Err(_) => Err(PolicyDocumentDefect::Syntax),
     }
+}
+
+/// The elements the IAM JSON policy grammar REQUIRES of every statement of an
+/// identity-based policy, each with the defect a statement naming none of its spellings
+/// is reported under.
+///
+/// A statement of an identity policy "must include … the Action element" and "the
+/// Resource element", each of which the grammar also admits in its negated spelling
+/// (`NotAction`, `NotResource`) — the element is what says WHICH operations the statement
+/// is about and WHICH resources they may be performed on, and an identity policy carries
+/// no `Principal` because the identity it is attached to is the principal ("Grammar of
+/// the IAM JSON policy language", IAM User Guide).
+const IDENTITY_STATEMENT_ELEMENTS: &[(&[&str], PolicyDocumentDefect)] = &[
+    (
+        &["Action", "NotAction"],
+        PolicyDocumentDefect::NoActions,
+    ),
+    (
+        &["Resource", "NotResource"],
+        PolicyDocumentDefect::NoResources,
+    ),
+];
+
+/// Whether `element` NAMES something: a statement element that is absent, null or an
+/// empty list names nothing, and so does not satisfy a requirement of the grammar.
+fn names_something(element: Option<&::serde_json::Value>) -> bool {
+    match element {
+        None | Some(::serde_json::Value::Null) => false,
+        Some(::serde_json::Value::Array(values)) => !values.is_empty(),
+        Some(_) => true,
+    }
+}
+
+/// Why `document` is no document a MANAGED policy can hold, or `None` when it is one.
+///
+/// A managed policy's document is an IDENTITY-based policy — "a customer managed policy
+/// … can be attached to a user, group or role" and grants that identity its permissions —
+/// so it is the document [`policy_document_defect`] judges, held to the grammar BELOW
+/// `Statement` as well: every statement of it must name the actions it is about and the
+/// resources those actions apply to ([`IDENTITY_STATEMENT_ELEMENTS`]), and a statement
+/// omitting one describes no permission IAM could enforce, so the operation taking the
+/// document is refused with the modelled `MalformedPolicyDocumentException`. `Statement`
+/// is read both as the list and as the single statement the grammar admits, and a
+/// statement that is not an object at all is no statement — which is the SYNTAX defect,
+/// not a missing element.
+///
+/// This is the ONE definition of the rule, shared by both operations that write a managed
+/// policy's document: `CreatePolicy` and `CreatePolicyVersion`.
+pub fn managed_policy_document_defect(document: &str) -> Option<PolicyDocumentDefect> {
+    let statement = match policy_statements(document) {
+        Ok(statement) => statement,
+        Err(defect) => return Some(defect),
+    };
+    let statements = match statement.as_array() {
+        Some(statements) => statements.as_slice(),
+        None => ::std::slice::from_ref(&statement),
+    };
+    for statement in statements {
+        let Some(elements) = statement.as_object() else {
+            return Some(PolicyDocumentDefect::Syntax);
+        };
+        for (spellings, defect) in IDENTITY_STATEMENT_ELEMENTS {
+            if !spellings
+                .iter()
+                .any(|spelling| names_something(elements.get(*spelling)))
+            {
+                return Some(*defect);
+            }
+        }
+    }
+    None
 }
 
 /// What IAM reads out of a SAML provider's metadata document.

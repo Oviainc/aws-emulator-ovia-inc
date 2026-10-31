@@ -5181,7 +5181,7 @@ async fn create_role(
             // ACCOUNT, so this is also what a template whose role name is not
             // Region-qualified gets when it is deployed a second time — the refusal
             // belongs to the stack, not to this module.
-            return Err(refusal_of(&error));
+            return Err(iam_refusal_of(&error));
         }
     }
     // "Policies — adds or updates an inline policy document that is embedded in the
@@ -5200,7 +5200,7 @@ async fn create_role(
             .policy_document(body)
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
     // "ManagedPolicyArns — a list of Amazon Resource Names (ARNs) of the IAM managed
     // policies that you want to attach to the role", each applied with the call that
@@ -5212,7 +5212,7 @@ async fn create_role(
             .policy_arn(policy_arn)
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
     Ok(Created::attributes(attributes))
 }
@@ -5323,7 +5323,7 @@ async fn update_role(
             .policy_document(trust_policy)
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
 
     // "Updates the description or maximum session duration setting of a role" — one call
@@ -5353,7 +5353,7 @@ async fn update_role(
             };
             call = call.max_session_duration(duration);
         }
-        call.send().await.map_err(|error| refusal_of(&error))?;
+        call.send().await.map_err(|error| iam_refusal_of(&error))?;
     }
 
     // "Policies — adds or updates an inline policy document that is embedded in the
@@ -5379,7 +5379,7 @@ async fn update_role(
                 .policy_document(body)
                 .send()
                 .await
-                .map_err(|error| refusal_of(&error))?;
+                .map_err(|error| iam_refusal_of(&error))?;
         }
         for name in dropped_policy_names(held_policies, declared_policies) {
             client
@@ -5388,7 +5388,7 @@ async fn update_role(
                 .policy_name(name)
                 .send()
                 .await
-                .map_err(|error| refusal_of(&error))?;
+                .map_err(|error| iam_refusal_of(&error))?;
         }
     }
 
@@ -5405,7 +5405,7 @@ async fn update_role(
                 .policy_arn(policy_arn)
                 .send()
                 .await
-                .map_err(|error| refusal_of(&error))?;
+                .map_err(|error| iam_refusal_of(&error))?;
         }
         for policy_arn in held_arns
             .iter()
@@ -5417,7 +5417,7 @@ async fn update_role(
                 .policy_arn(policy_arn)
                 .send()
                 .await
-                .map_err(|error| refusal_of(&error))?;
+                .map_err(|error| iam_refusal_of(&error))?;
         }
     }
 
@@ -5460,7 +5460,7 @@ async fn retag_role(
             })
             .unwrap_or_default(),
         Err(error) => {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code == NO_SUCH_ENTITY {
                 return Ok(());
             }
@@ -5496,7 +5496,7 @@ async fn retag_role(
             .set_tags(Some(added))
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
     if !removed.is_empty() {
         client
@@ -5505,7 +5505,7 @@ async fn retag_role(
             .set_tag_keys(Some(removed))
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
     Ok(())
 }
@@ -5562,7 +5562,7 @@ async fn delete_role(
             .send()
             .await
         {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code != NO_SUCH_ENTITY {
                 return Err(refusal);
             }
@@ -5579,7 +5579,7 @@ async fn delete_role(
             .send()
             .await
         {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code != NO_SUCH_ENTITY {
                 return Err(refusal);
             }
@@ -5588,7 +5588,7 @@ async fn delete_role(
     match client.delete_role().role_name(role_name).send().await {
         Ok(_) => Ok(()),
         Err(error) => {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code == NO_SUCH_ENTITY {
                 return Ok(());
             }
@@ -5616,7 +5616,7 @@ async fn describe_role(
     {
         Ok(answer) => answer,
         Err(error) => {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code == NO_SUCH_ENTITY {
                 return Ok(None);
             }
@@ -5689,7 +5689,7 @@ async fn create_instance_profile(
         .set_path(resource.properties.get("Path").and_then(scalar_text))
         .send()
         .await
-        .map_err(|error| refusal_of(&error))?;
+        .map_err(|error| iam_refusal_of(&error))?;
     let mut attributes = BTreeMap::new();
     // What IAM answered wins over the computed ARN: it carries the account and the path IAM
     // built the profile under, which is what a client reads back off the profile.
@@ -5707,7 +5707,7 @@ async fn create_instance_profile(
             .role_name(role)
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
     Ok(Created::attributes(attributes))
 }
@@ -5730,7 +5730,7 @@ async fn delete_instance_profile(
             .send()
             .await
         {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code != NO_SUCH_ENTITY {
                 return Err(refusal);
             }
@@ -5744,7 +5744,7 @@ async fn delete_instance_profile(
     {
         Ok(_) => Ok(()),
         Err(error) => {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code == NO_SUCH_ENTITY {
                 return Ok(());
             }
@@ -5772,7 +5772,7 @@ async fn describe_instance_profile(
     {
         Ok(answer) => answer,
         Err(error) => {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code == NO_SUCH_ENTITY {
                 return Ok(None);
             }
@@ -5854,7 +5854,7 @@ async fn attach_managed_policy_to(
             .send()
             .await
             .map(|_| ())
-            .map_err(|error| refusal_of(&error)),
+            .map_err(|error| iam_refusal_of(&error)),
         "Roles" => client
             .attach_role_policy()
             .role_name(entity)
@@ -5862,7 +5862,7 @@ async fn attach_managed_policy_to(
             .send()
             .await
             .map(|_| ())
-            .map_err(|error| refusal_of(&error)),
+            .map_err(|error| iam_refusal_of(&error)),
         _ => client
             .attach_user_policy()
             .user_name(entity)
@@ -5870,7 +5870,7 @@ async fn attach_managed_policy_to(
             .send()
             .await
             .map(|_| ())
-            .map_err(|error| refusal_of(&error)),
+            .map_err(|error| iam_refusal_of(&error)),
     };
     sent
 }
@@ -5892,7 +5892,7 @@ async fn detach_managed_policy_from(
             .send()
             .await
             .map(|_| ())
-            .map_err(|error| refusal_of(&error)),
+            .map_err(|error| iam_refusal_of(&error)),
         "Roles" => client
             .detach_role_policy()
             .role_name(entity)
@@ -5900,7 +5900,7 @@ async fn detach_managed_policy_from(
             .send()
             .await
             .map(|_| ())
-            .map_err(|error| refusal_of(&error)),
+            .map_err(|error| iam_refusal_of(&error)),
         _ => client
             .detach_user_policy()
             .user_name(entity)
@@ -5908,7 +5908,7 @@ async fn detach_managed_policy_from(
             .send()
             .await
             .map(|_| ())
-            .map_err(|error| refusal_of(&error)),
+            .map_err(|error| iam_refusal_of(&error)),
     };
     match sent {
         Err(refusal) if refusal.code == NO_SUCH_ENTITY => Ok(()),
@@ -5976,7 +5976,7 @@ async fn create_managed_policy(
         .set_description(resource.properties.get("Description").and_then(scalar_text))
         .send()
         .await
-        .map_err(|error| refusal_of(&error))?;
+        .map_err(|error| iam_refusal_of(&error))?;
     let policy = created.policy();
     let Some(arn) = policy.and_then(|policy| policy.arn()) else {
         // The create answered 2xx without the ARN its output models. Nothing addresses a
@@ -6085,7 +6085,7 @@ async fn update_managed_policy(
             .set_as_default(true)
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
 
     // An entity the deployment adds to a list gets the attachment; one it no longer lists
@@ -6169,7 +6169,7 @@ async fn delete_managed_policy(
                     .send()
                     .await
                 {
-                    let refusal = refusal_of(&error);
+                    let refusal = iam_refusal_of(&error);
                     if refusal.code != NO_SUCH_ENTITY {
                         return Err(refusal);
                     }
@@ -6177,7 +6177,7 @@ async fn delete_managed_policy(
             }
         }
         Err(error) => {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code != NO_SUCH_ENTITY {
                 return Err(refusal);
             }
@@ -6186,7 +6186,7 @@ async fn delete_managed_policy(
     match client.delete_policy().policy_arn(policy_arn).send().await {
         Ok(_) => Ok(()),
         Err(error) => {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code == NO_SUCH_ENTITY {
                 return Ok(());
             }
@@ -6214,7 +6214,7 @@ async fn describe_managed_policy(
     {
         Ok(answer) => answer,
         Err(error) => {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code == NO_SUCH_ENTITY {
                 return Ok(None);
             }
@@ -6318,7 +6318,7 @@ async fn create_iam_user(
                 attributes.insert("UserId".to_string(), user.user_id().to_string());
             }
         }
-        Err(error) => return Err(refusal_of(&error)),
+        Err(error) => return Err(iam_refusal_of(&error)),
     }
     // "Policies — adds or updates an inline policy document that is embedded in the
     // specified IAM user", each entry a `{PolicyName, PolicyDocument}` pair.
@@ -6336,7 +6336,7 @@ async fn create_iam_user(
             .policy_document(body)
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
     // "ManagedPolicyArns — a list of ARNs of the IAM managed policies that you want to
     // attach to the user", each applied with the call that attaches one.
@@ -6347,7 +6347,7 @@ async fn create_iam_user(
             .policy_arn(policy_arn)
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
     // "Groups — a list of group names that the user is added to", each the membership
     // `AddUserToGroup` writes.
@@ -6358,7 +6358,7 @@ async fn create_iam_user(
             .group_name(group)
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
     // "LoginProfile — creates a login profile for the user, so that the user can access
     // the Amazon Web Services Management Console": the password the declaration carries is
@@ -6371,7 +6371,7 @@ async fn create_iam_user(
             .set_password_reset_required(reset_required)
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
     Ok(Created::attributes(attributes))
 }
@@ -6458,7 +6458,7 @@ async fn update_iam_user(
             )
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
 
     // "Policies": a policy this deployment declares with a new document is put again under
@@ -6483,7 +6483,7 @@ async fn update_iam_user(
                 .policy_document(body)
                 .send()
                 .await
-                .map_err(|error| refusal_of(&error))?;
+                .map_err(|error| iam_refusal_of(&error))?;
         }
         for name in dropped_policy_names(held_policies, declared_policies) {
             client
@@ -6492,7 +6492,7 @@ async fn update_iam_user(
                 .policy_name(name)
                 .send()
                 .await
-                .map_err(|error| refusal_of(&error))?;
+                .map_err(|error| iam_refusal_of(&error))?;
         }
     }
 
@@ -6508,7 +6508,7 @@ async fn update_iam_user(
                 .policy_arn(policy_arn)
                 .send()
                 .await
-                .map_err(|error| refusal_of(&error))?;
+                .map_err(|error| iam_refusal_of(&error))?;
         }
         for policy_arn in held_arns
             .iter()
@@ -6520,7 +6520,7 @@ async fn update_iam_user(
                 .policy_arn(policy_arn)
                 .send()
                 .await
-                .map_err(|error| refusal_of(&error))?;
+                .map_err(|error| iam_refusal_of(&error))?;
         }
     }
 
@@ -6536,7 +6536,7 @@ async fn update_iam_user(
                 .group_name(group)
                 .send()
                 .await
-                .map_err(|error| refusal_of(&error))?;
+                .map_err(|error| iam_refusal_of(&error))?;
         }
         for group in held_groups
             .iter()
@@ -6548,7 +6548,7 @@ async fn update_iam_user(
                 .group_name(group)
                 .send()
                 .await
-                .map_err(|error| refusal_of(&error))?;
+                .map_err(|error| iam_refusal_of(&error))?;
         }
     }
 
@@ -6569,7 +6569,7 @@ async fn update_iam_user(
                     .set_password_reset_required(reset_required)
                     .send()
                     .await
-                    .map_err(|error| refusal_of(&error))?;
+                    .map_err(|error| iam_refusal_of(&error))?;
             }
             (Some(_), Some((password, reset_required))) => {
                 client
@@ -6579,7 +6579,7 @@ async fn update_iam_user(
                     .set_password_reset_required(reset_required)
                     .send()
                     .await
-                    .map_err(|error| refusal_of(&error))?;
+                    .map_err(|error| iam_refusal_of(&error))?;
             }
             (Some(_), None) => {
                 client
@@ -6587,7 +6587,7 @@ async fn update_iam_user(
                     .user_name(user_name)
                     .send()
                     .await
-                    .map_err(|error| refusal_of(&error))?;
+                    .map_err(|error| iam_refusal_of(&error))?;
             }
             (None, None) => {}
         }
@@ -6636,7 +6636,7 @@ async fn retag_iam_user(
             })
             .unwrap_or_default(),
         Err(error) => {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code == NO_SUCH_ENTITY {
                 return Ok(());
             }
@@ -6672,7 +6672,7 @@ async fn retag_iam_user(
             .set_tags(Some(added))
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
     if !removed.is_empty() {
         client
@@ -6681,7 +6681,7 @@ async fn retag_iam_user(
             .set_tag_keys(Some(removed))
             .send()
             .await
-            .map_err(|error| refusal_of(&error))?;
+            .map_err(|error| iam_refusal_of(&error))?;
     }
     Ok(())
 }
@@ -6747,7 +6747,7 @@ async fn delete_iam_user(
     match client.delete_user().user_name(user_name).send().await {
         Ok(_) => Ok(()),
         Err(error) => {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code == NO_SUCH_ENTITY {
                 return Ok(());
             }
@@ -6760,11 +6760,19 @@ async fn delete_iam_user(
 /// entity, the policy or the membership the step would have removed, which is the state the
 /// step asks for. Judged on IAM's own not-found CODE, never on a message, exactly as
 /// [`Provisioner::delete`] judges a resource its service no longer holds.
-fn tolerated_absence<E>(error: &E) -> Result<(), Refusal>
+fn tolerated_absence<E>(
+    error: &::aws_smithy_runtime_api::client::result::SdkError<
+        E,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> Result<(), Refusal>
 where
-    E: ::aws_smithy_types::error::metadata::ProvideErrorMetadata + ::std::fmt::Display,
+    ::aws_smithy_runtime_api::client::result::SdkError<
+        E,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >: ::aws_smithy_types::error::metadata::ProvideErrorMetadata + ::std::fmt::Display,
 {
-    let refusal = refusal_of(error);
+    let refusal = iam_refusal_of(error);
     if refusal.code == NO_SUCH_ENTITY {
         return Ok(());
     }
@@ -6789,7 +6797,7 @@ async fn describe_iam_user(
     {
         Ok(answer) => answer,
         Err(error) => {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code == NO_SUCH_ENTITY {
                 return Ok(None);
             }
@@ -6855,7 +6863,7 @@ async fn create_iam_access_key(
         .user_name(&user_name)
         .send()
         .await
-        .map_err(|error| refusal_of(&error))?;
+        .map_err(|error| iam_refusal_of(&error))?;
     let Some(minted) = answer.access_key() else {
         return Err(Refusal {
             code: UNIDENTIFIED_FAILURE.to_string(),
@@ -6878,7 +6886,7 @@ async fn create_iam_access_key(
             .status(::aws_sdk_iam::types::StatusType::from(status.as_str()))
             .send()
             .await
-            .map_err(|error| refusal_of(&error))
+            .map_err(|error| iam_refusal_of(&error))
         {
             // The key is not the one the declaration asked for and the resource is not
             // created, so the credential this arm just minted is WITHDRAWN before the
@@ -6891,7 +6899,7 @@ async fn create_iam_access_key(
                 .access_key_id(&access_key_id)
                 .send()
                 .await
-                .map_err(|error| refusal_of(&error))?;
+                .map_err(|error| iam_refusal_of(&error))?;
             return Err(refusal);
         }
     }
@@ -6935,7 +6943,7 @@ async fn update_iam_access_key(
         .status(::aws_sdk_iam::types::StatusType::from(status.as_str()))
         .send()
         .await
-        .map_err(|error| refusal_of(&error))?;
+        .map_err(|error| iam_refusal_of(&error))?;
     // The id and the secret are the ones the create reported and are unchanged by this
     // call, so the attributes in force are the ones the resource already carries.
     Ok(Some(Created::attributes(BTreeMap::new())))
@@ -6988,7 +6996,7 @@ async fn describe_iam_access_key(
     {
         Ok(answer) => answer,
         Err(error) => {
-            let refusal = refusal_of(&error);
+            let refusal = iam_refusal_of(&error);
             if refusal.code == NO_SUCH_ENTITY {
                 return Ok(None);
             }
@@ -7343,6 +7351,48 @@ where
         message: error
             .message()
             .map_or_else(|| error.to_string(), ToString::to_string),
+    }
+}
+
+/// IAM's own signing name, which is how the diagnostic below looks up the name an SDK of
+/// IAM reports it under (`super::provisioning::SDK_SERVICE_NAMES`).
+const IAM_SIGNING_NAME: &str = "iam";
+
+/// A refused IAM call as the [`Refusal`] the stack reports: [`refusal_of`]'s code and
+/// message, with the diagnostic the SDK appends to the exception it raises for a refused
+/// call ([`super::provisioning::sdk_message`]) — the service, the HTTP STATUS of the answer
+/// IAM gave, the id of the call and the attempts made at it.
+///
+/// A resource provider does not word its own diagnosis of a refused call: what it reports
+/// is the exception its SDK raised, which is the called service's message plus that
+/// diagnostic, so the reason a stack carries for a resource IAM refused is the one a client
+/// of IAM would read. The status comes from the answer itself — never from the error code —
+/// so an answer that carried no response at all (the call was never made) is reported
+/// exactly as the service worded it, with no diagnostic invented for it.
+fn iam_refusal_of<E>(
+    error: &::aws_smithy_runtime_api::client::result::SdkError<
+        E,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> Refusal
+where
+    ::aws_smithy_runtime_api::client::result::SdkError<
+        E,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >: ::aws_smithy_types::error::metadata::ProvideErrorMetadata + ::std::fmt::Display,
+{
+    let refusal = refusal_of(error);
+    match error.raw_response().map(|answer| answer.status().as_u16()) {
+        Some(status) => Refusal {
+            message: super::provisioning::sdk_message(
+                IAM_SIGNING_NAME,
+                status,
+                &refusal.code,
+                &refusal.message,
+            ),
+            ..refusal
+        },
+        None => refusal,
     }
 }
 
