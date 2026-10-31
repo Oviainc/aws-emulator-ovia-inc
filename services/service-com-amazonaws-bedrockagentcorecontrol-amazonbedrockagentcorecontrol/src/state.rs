@@ -69,7 +69,8 @@ use crate::ops::types::{
     TargetSummary,
     ToolDefinition, ToolSchema, VersionCreatedBySource, VersionLineageMetadata,
     CreateWorkloadIdentityOutput, GetWorkloadIdentityOutput, UpdateWorkloadIdentityOutput,
-    UpdateGatewayOutput, ValidationException, ValidationExceptionField, WafConfiguration,
+    UpdateGatewayOutput, UpdateGatewayTargetOutput, ValidationException, ValidationExceptionField,
+    WafConfiguration,
     WorkloadIdentityDetails, WorkloadIdentityType,
 };
 
@@ -720,6 +721,36 @@ impl GatewayTargetRecord {
             authorization_data: None,
             target_type: Some(target_type(&self.target_configuration).to_string()),
             listing_mode: mcp_server.and_then(|server| server.listing_mode.clone()),
+        }
+    }
+
+    /// This target as `UpdateGatewayTarget`'s response envelope — the same members
+    /// [`Self::create_output`] renders, so an update reports exactly the record it
+    /// just wrote and a later `GetGatewayTarget` cannot differ from it.
+    pub fn update_output(
+        &self,
+        gateway_arn: &str,
+        now: SystemTime,
+    ) -> UpdateGatewayTargetOutput {
+        let created = self.create_output(gateway_arn, now);
+        UpdateGatewayTargetOutput {
+            gateway_arn: created.gateway_arn,
+            target_id: created.target_id,
+            created_at: created.created_at,
+            updated_at: created.updated_at,
+            status: created.status,
+            status_reasons: created.status_reasons,
+            name: created.name,
+            description: created.description,
+            target_configuration: created.target_configuration,
+            credential_provider_configurations: created.credential_provider_configurations,
+            last_synchronized_at: created.last_synchronized_at,
+            metadata_configuration: created.metadata_configuration,
+            private_endpoint: created.private_endpoint,
+            private_endpoint_managed_resources: created.private_endpoint_managed_resources,
+            authorization_data: created.authorization_data,
+            protocol_type: created.protocol_type,
+            certificate_configurations: created.certificate_configurations,
         }
     }
 

@@ -33,6 +33,8 @@ mod gateway_mcp_endpoint;
 mod gateway_mutation;
 #[path = "all/gateway_target_listing.rs"]
 mod gateway_target_listing;
+#[path = "all/gateway_target_mutation.rs"]
+mod gateway_target_mutation;
 #[path = "all/gateway_wire_shape.rs"]
 mod gateway_wire_shape;
 #[path = "all/harness.rs"]

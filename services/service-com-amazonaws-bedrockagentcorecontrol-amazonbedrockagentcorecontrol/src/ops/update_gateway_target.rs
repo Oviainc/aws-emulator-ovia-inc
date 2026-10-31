@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGatewayTarget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGatewayTarget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGatewayTarget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -217,18 +208,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGatewayTarget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGatewayTargetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGatewayTarget"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateGatewayTargetErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the gateway store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // Everything that can be decided from stored state alone is decided
+        // first, and the store guard is DROPPED before the cross-service call
+        // below: a lock is not held across an await, and the Lambda the new
+        // configuration names is resolved only for a request that would
+        // otherwise be written.
+        {
+            let mut store = state.lock();
+            // A gateway whose deletion the clock has already made due is gone
+            // before this call looks for it, and its targets with it.
+            store.expire_deleted_gateways(now);
+            let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
+                UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::ACTION_RETRIEVE,
+                        crate::state::RESOURCE_GATEWAY,
+                    ),
+                )
+            })?;
+            // A target is served BY the gateway, so the gateway has to be ready
+            // to serve it: while the gateway is still in the transient status the
+            // clock owes a transition for (`CREATING`, `UPDATING`), or on its way
+            // out in `DELETING`, its targets cannot be reconfigured, and the
+            // caller is told which status to wait out. The refusal is worded by
+            // the ONE helper every operation this service refuses on gateway
+            // status shares, so they cannot drift.
+            let status = gateway.status_at(now);
+            if status != crate::state::STATUS_READY {
+                return Err(UpdateGatewayTargetErrorModeled::ValidationException(
+                    crate::state::gateway_status_conflict(Self::NAME, status),
+                )
+                .into());
+            }
+            // A target id naming no target OF THIS GATEWAY is the modelled 404:
+            // an update reconfigures a stored target, it does not mint one.
+            if !gateway.targets.contains_key(&input.target_id) {
+                return Err(UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::ACTION_UPDATE,
+                        crate::state::RESOURCE_GATEWAY_TARGET,
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // The cross-service check `CreateGatewayTarget` makes, for the same
+        // reason: the gateway has to invoke the function a Lambda MCP target
+        // names, so a configuration naming one that is not there is refused and
+        // nothing is written. Only a Lambda target has one to resolve.
+        if let Some(lambda_arn) = crate::state::mcp_lambda_arn(&input.target_configuration) {
+            if crate::state::lambda_function_is_absent(ctx, lambda_arn).await {
+                return Err(UpdateGatewayTargetErrorModeled::ValidationException(
+                    crate::state::field_validation_failed(
+                        crate::state::LAMBDA_ARN_MEMBER,
+                        crate::state::LAMBDA_FUNCTION_ABSENT,
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        // The gateway and the target are read again under the guard that WRITES:
+        // the guard was dropped for the call above, so nothing promises either is
+        // still there, nor that the gateway is still in the status that admits the
+        // change — a `DeleteGateway` in between moves it to `DELETING`, and the
+        // clock may have made that deletion due.
+        store.expire_deleted_gateways(now);
+        let gateway = store
+            .gateways
+            .get_mut(&input.gateway_identifier)
+            .ok_or_else(|| {
+                UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::ACTION_RETRIEVE,
+                        crate::state::RESOURCE_GATEWAY,
+                    ),
+                )
+            })?;
+        let status = gateway.status_at(now).to_string();
+        if status != crate::state::STATUS_READY {
+            return Err(UpdateGatewayTargetErrorModeled::ValidationException(
+                crate::state::gateway_status_conflict(Self::NAME, &status),
+            )
+            .into());
+        }
+        let gateway_arn = gateway.gateway_arn.clone();
+        let record = gateway.targets.get_mut(&input.target_id).ok_or_else(|| {
+            UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::ACTION_UPDATE,
+                    crate::state::RESOURCE_GATEWAY_TARGET,
+                ),
+            )
+        })?;
+
+        // Every configurable member of the target is replaced by what this
+        // request carries, and a member the request omits is CLEARED: this is the
+        // target's whole configuration and not a patch of it, which is what the
+        // model documents for the one member it spells the rule out for
+        // (`certificateConfigurations`: "To remove a previously configured
+        // certificate authority, omit this field on update.").
+        record.description = input.description;
+        record.target_configuration = input.target_configuration;
+        record.metadata_configuration = input.metadata_configuration;
+        record.private_endpoint = input.private_endpoint;
+        record.certificate_configurations = input.certificate_configurations;
+        // `credentialProviderConfigurations` is optional on the request and
+        // `@required` with one entry on every response that reports a target, so a
+        // request carrying none leaves the target on the same default
+        // `CreateGatewayTarget` stores for one: the gateway's own IAM role.
+        record.credential_provider_configurations =
+            crate::state::effective_credential_provider_configurations(
+                input.credential_provider_configurations,
+            );
+        // `name` is optional on the request and `@required` on every response, so
+        // a request naming none keeps the stored name rather than clearing a
+        // member the wire cannot render without.
+        if let Some(name) = input.name {
+            record.name = name;
+        }
+        record.updated_at = now;
+        // An updated target is not ready again at once: the transition back to
+        // READY is owed by the clock, not by this call.
+        record.transient_status = crate::state::STATUS_UPDATING.to_string();
+        record.settled_status = crate::state::STATUS_READY.to_string();
+        record.settles_at = now + crate::state::GATEWAY_SETTLE_DELAY;
+        let output = record.update_output(&gateway_arn, now);
+
+        // The gateway's configuration includes the targets it serves, so
+        // reconfiguring one touches the gateway too — the same bookkeeping
+        // `CreateGatewayTarget` does when it adds one.
+        gateway.updated_at = now;
+
+        Ok(output)
     }
 }
