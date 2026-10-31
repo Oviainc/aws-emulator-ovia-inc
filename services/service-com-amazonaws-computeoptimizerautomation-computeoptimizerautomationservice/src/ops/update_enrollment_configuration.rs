@@ -3,7 +3,9 @@
 //! @op UpdateEnrollmentConfiguration
 //!
 //! IMPLEMENTED. Persists the calling account's enrollment status and reports back
-//! what was stored, including the store time as `lastUpdatedTimestamp`.
+//! what was stored, including as `lastUpdatedTimestamp` the instant the stored
+//! configuration last CHANGED — a repeat of the status it already reports
+//! changes nothing, so it re-stamps nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -253,14 +255,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let stored_at = crate::state::now();
-        {
-            let enrollment = guard.enrollments.entry(account_id.clone()).or_default();
-            enrollment.status = input.status.clone();
-            // The reason belongs to the status it explains; a status the caller
-            // set successfully has none.
-            enrollment.status_reason = None;
-            enrollment.last_updated_timestamp = Some(stored_at);
-        }
+        // Store the requested status, stamping the configuration's update
+        // instant only when that write actually changed it: a repeat of the
+        // status the account already reports updates nothing, so it moves no
+        // timestamp. Entry creation counts as a change, so the first call for an
+        // account stamps the instant it was stored.
+        guard.set_enrollment_status(&account_id, &input.status, stored_at);
 
         // "Active - Enables the Automation feature for your account": opting in
         // is what starts the analysis of the account's resources, and a

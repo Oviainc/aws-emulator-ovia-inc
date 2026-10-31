@@ -3580,6 +3580,47 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
         changed
     }
 
+    /// Set `account_id`'s OWN enrollment status to `status`, as
+    /// `UpdateEnrollmentConfiguration` documents: the status it stores is "The
+    /// desired enrollment status", and the reason belongs to the status it
+    /// explains, so a status a caller set successfully carries none.
+    ///
+    /// Answers whether the stored configuration CHANGED. `at` is stamped as the
+    /// account's `lastUpdatedTimestamp` ("The timestamp when the enrollment
+    /// configuration was last updated") only when it did — the same rule the
+    /// other writers of this field follow ([`Self::associate_account`],
+    /// [`Self::disassociate_account`], [`StoredRule::set_tags`]) — so a repeat of
+    /// the status the account already reports leaves its stored configuration,
+    /// timestamp included, exactly where it was, and no reader claims an instant
+    /// at which nothing was updated.
+    ///
+    /// Recording a configuration for an account the store holds none for IS a
+    /// change, whatever status that first call asks for: the entry it creates is
+    /// what makes the account one this service knows and reports
+    /// ([`Self::accounts_in_order`]), so that call stamps the instant it stored
+    /// it.
+    pub fn set_enrollment_status(
+        &mut self,
+        account_id: &str,
+        status: &str,
+        at: ::aws_smithy_types::DateTime,
+    ) -> bool {
+        let mut changed = !self.enrollments.contains_key(account_id);
+        let enrollment = self.enrollments.entry(account_id.to_string()).or_default();
+        if enrollment.status != status {
+            enrollment.status = status.to_string();
+            changed = true;
+        }
+        if enrollment.status_reason.is_some() {
+            enrollment.status_reason = None;
+            changed = true;
+        }
+        if changed {
+            enrollment.last_updated_timestamp = Some(at);
+        }
+        changed
+    }
+
     /// Remove `account_id`'s association with the organization's management
     /// account, as `DisassociateAccounts` documents the removal: "Once
     /// disassociated, organization rules no longer apply to the member account,

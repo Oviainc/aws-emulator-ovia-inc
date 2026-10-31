@@ -55,6 +55,8 @@ mod empty_value_lists;
 mod enrollment_gate;
 #[path = "all/enrollment_rule_mode.rs"]
 mod enrollment_rule_mode;
+#[path = "all/enrollment_write_timestamps.rs"]
+mod enrollment_write_timestamps;
 #[path = "all/enum_parameter_rejection.rs"]
 mod enum_parameter_rejection;
 #[path = "all/error_payloads.rs"]
