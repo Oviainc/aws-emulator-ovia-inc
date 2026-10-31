@@ -20,7 +20,15 @@ pub struct CreateBrowserProfileInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#CreateBrowserProfileResponse")]
+/// `CreateBrowserProfileResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` targets `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="CreateBrowserProfile")`), and the derive
+/// does not put that trait on a member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct CreateBrowserProfileOutput {
     pub profile_id: String,
@@ -28,4 +36,16 @@ pub struct CreateBrowserProfileOutput {
     pub created_at: ::aws_smithy_types::DateTime,
     pub status: String,
 }
+
+agentcore_schema_and_codec!(
+    CreateBrowserProfileOutput,
+    CREATE_BROWSER_PROFILE_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#CreateBrowserProfileResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "CreateBrowserProfileResponse",
+    (M_PROFILE_ID, profile_id, "profileId", 0, req, string),
+    (M_PROFILE_ARN, profile_arn, "profileArn", 1, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 2, req, date_time),
+    (M_STATUS, status, "status", 3, req, string),
+);
 

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBrowserProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBrowserProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBrowserProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +162,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBrowserProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBrowserProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBrowserProfile"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBrowserProfileErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the browser profile store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the
+        // profile that token first produced, rather than minting a second one:
+        // "If this token matches a previous request, Amazon Bedrock AgentCore
+        // ignores the request but does not return an error."
+        if let Some(profile_id) =
+            store.replayed_browser_profile_result(Self::NAME, input.client_token.as_deref())
+        {
+            // `replayed_browser_profile_result` answers only for a profile the
+            // store still holds, so this lookup cannot miss.
+            if let Some(record) = store.browser_profiles.get(&profile_id) {
+                return Ok(record.create_output());
+            }
+        }
+
+        // "The name must be unique within your account", so a repeated name is a
+        // conflict, not a second profile that later reads cannot tell apart.
+        if let Some(existing) = store.browser_profile_names.get(&input.name) {
+            return Err(CreateBrowserProfileErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "a browser profile named {} already exists (profileId {existing})",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        // The store this request would grow is bounded, so a caller looping on
+        // create meets the modelled quota instead of this process's memory limit.
+        if store.browser_profiles.len() >= crate::state::MAX_BROWSER_PROFILES {
+            return Err(CreateBrowserProfileErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} browser profiles",
+                        crate::state::MAX_BROWSER_PROFILES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let profile_id = store.mint_browser_profile_id(&input.name, now);
+        let record = crate::state::BrowserProfileRecord {
+            profile_arn: crate::state::browser_profile_arn(&region, &profile_id),
+            profile_id: profile_id.clone(),
+            name: input.name,
+            description: input.description,
+            tags: crate::state::sorted_map(input.tags),
+            created_at: now,
+            updated_at: now,
+            // `BrowserProfileStatus` models no creating status, so a created
+            // profile is one a browser session can already save into: it is
+            // READY from this call on, and the clock owes it no transition.
+            status: crate::state::BROWSER_PROFILE_STATUS_READY.to_string(),
+            // Nothing has saved browser session data into a profile this call
+            // just minted.
+            last_saved_at: None,
+            last_saved_browser_session_id: None,
+            last_saved_browser_id: None,
+        };
+        let output = record.create_output();
+
+        store
+            .browser_profile_names
+            .insert(record.name.clone(), profile_id.clone());
+        store.remember_browser_profile_client_token(Self::NAME, input.client_token, &profile_id);
+        store.browser_profiles.insert(profile_id, record);
+
+        Ok(output)
     }
 }

@@ -15,6 +15,8 @@
 mod agent_runtime_lifecycle;
 #[path = "all/browser_lifecycle.rs"]
 mod browser_lifecycle;
+#[path = "all/browser_profile_lifecycle.rs"]
+mod browser_profile_lifecycle;
 #[path = "all/capacity_provider_runtime_versions.rs"]
 mod capacity_provider_runtime_versions;
 #[path = "all/code_artifact_object.rs"]

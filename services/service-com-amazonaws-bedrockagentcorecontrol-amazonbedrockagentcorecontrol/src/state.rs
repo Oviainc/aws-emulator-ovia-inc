@@ -25,6 +25,10 @@
 //!   the configuration `CreateBrowser` persisted and the statuses the clock owes
 //!   it, so `GetBrowser` reports exactly that and `DeleteBrowser` reports what it
 //!   is removing;
+//! * the browser profile (`/browser-profiles/`): one [`BrowserProfileRecord`]
+//!   per `profileId`, holding the name, description and tags
+//!   `CreateBrowserProfile` persisted and the instant a browser session last
+//!   saved data into it, so `GetBrowserProfile` reports exactly that;
 //! * the code interpreter (`/code-interpreters/`): one
 //!   [`CodeInterpreterRecord`] per `codeInterpreterId`, holding the
 //!   configuration `CreateCodeInterpreter` persisted and the statuses the clock
@@ -58,6 +62,7 @@ use crate::ops::types::{
     CodeInterpreterNetworkConfiguration, CreateCodeInterpreterOutput, DeleteCodeInterpreterOutput,
     GetCodeInterpreterOutput,
     CreateBrowserOutput, CreateGatewayOutput, DeleteBrowserOutput, GetBrowserOutput,
+    CreateBrowserProfileOutput, GetBrowserProfileOutput,
     RecordingConfig, ToolsFileSystemConfiguration,
     CreateGatewayTargetOutput, CredentialProviderConfiguration, CustomTransformConfiguration,
     FilesystemConfiguration, GatewayInterceptorConfiguration, GatewayPolicyEngineConfiguration,
@@ -2182,6 +2187,102 @@ impl BrowserRecord {
     }
 }
 
+/// The modelled not-found error for a browser profile this account does not
+/// hold.
+///
+/// This control plane words a missing resource in terms of the id the request
+/// named — the sentence around the identifier is fixed, and the identifier
+/// itself is the caller's own value — exactly as [`browser_not_found`] words the
+/// sibling resource. Shared by the handlers rather than written per operation,
+/// so one profile cannot be reported missing in two different sentences by two
+/// operations.
+pub fn browser_profile_not_found(profile_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Browser profile with ID {profile_id} does not exist"
+        )),
+    }
+}
+
+/// The ARN resource type a browser profile carries. `BrowserProfileArn` is
+/// `…:browser-profile/{profileId}` (`smithy_query shape=BrowserProfileArn`),
+/// whose `arnReference` names `AWS::BedrockAgentCore::BrowserProfile`.
+pub const BROWSER_PROFILE_ARN_RESOURCE: &str = "browser-profile";
+
+/// The `BrowserProfileStatus` a profile holds from its creation on. The enum's
+/// full value list is `READY | SAVING | DELETING | DELETED`
+/// (`shared_types::BROWSER_PROFILE_STATUS_VALUES`, from `smithy_query
+/// shape=BrowserProfileStatus`): it models no creating status, so a created
+/// profile is one that is ready to be used by a browser session, and the other
+/// three are driven by a session saving into it and by its deletion.
+pub const BROWSER_PROFILE_STATUS_READY: &str = "READY";
+
+/// How many browser profiles this emulator will hold.
+///
+/// `CreateBrowserProfile` models `ServiceQuotaExceededException` (HTTP 402) for
+/// exceeding the real service's quota; this number is not a fidelity claim about
+/// that quota but the emulator's own ceiling, set generously so no realistic
+/// workflow meets it, so a caller looping on create cannot grow this process's
+/// memory without bound.
+pub const MAX_BROWSER_PROFILES: usize = 1_000;
+
+/// One browser profile: everything `CreateBrowserProfile` persisted for it, and
+/// what a browser session last saved into it.
+///
+/// Every read of the profile reports this record, so a create and a later read
+/// cannot disagree about its name, description or status.
+#[derive(Debug, Clone)]
+pub struct BrowserProfileRecord {
+    pub profile_id: String,
+    pub profile_arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// The status the profile reports. A created profile is `READY` and stays
+    /// there: `BrowserProfileStatus` models no creating status, so the clock
+    /// owes a fresh profile no transition.
+    pub status: String,
+    /// When browser session data was last saved into this profile, and the
+    /// session and browser it came from — `None` for a profile nothing has
+    /// saved into yet. The data plane's session save is what sets them; no
+    /// operation of this control plane does.
+    pub last_saved_at: Option<SystemTime>,
+    pub last_saved_browser_session_id: Option<String>,
+    pub last_saved_browser_id: Option<String>,
+}
+
+impl BrowserProfileRecord {
+    /// What the create of this profile reports: the four members
+    /// `CreateBrowserProfileResponse` declares, every one of them off the record
+    /// just written.
+    pub fn create_output(&self) -> CreateBrowserProfileOutput {
+        CreateBrowserProfileOutput {
+            profile_id: self.profile_id.clone(),
+            profile_arn: self.profile_arn.clone(),
+            created_at: timestamp(self.created_at),
+            status: self.status.clone(),
+        }
+    }
+
+    /// What a read of this profile reports.
+    pub fn get_output(&self) -> GetBrowserProfileOutput {
+        GetBrowserProfileOutput {
+            profile_id: self.profile_id.clone(),
+            profile_arn: self.profile_arn.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            status: self.status.clone(),
+            created_at: timestamp(self.created_at),
+            last_updated_at: timestamp(self.updated_at),
+            last_saved_at: self.last_saved_at.map(timestamp),
+            last_saved_browser_session_id: self.last_saved_browser_session_id.clone(),
+            last_saved_browser_id: self.last_saved_browser_id.clone(),
+        }
+    }
+}
+
 /// The modelled not-found error for a code interpreter this account does not
 /// hold.
 ///
@@ -2544,6 +2645,8 @@ impl ConfigurationBundleRecord {
 /// [`MAX_HARNESSES`] the harnesses (and with them their 1:1 name index),
 /// [`MAX_REGISTRIES`] the registries (and with them their 1:1 name index),
 /// [`MAX_BROWSERS`] the browsers (and with them their 1:1 name index),
+/// [`MAX_BROWSER_PROFILES`] the browser profiles (and with them their 1:1 name
+/// index),
 /// [`MAX_CODE_INTERPRETERS`] the code interpreters (and with them their 1:1
 /// name index),
 /// [`MAX_CONFIGURATION_BUNDLES`] the configuration bundles (and with them their
@@ -2667,6 +2770,23 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::browser_idempotency`] in the order they were first
     /// recorded, so the oldest record is the one evicted at the ceiling.
     browser_idempotency_order: VecDeque<String>,
+    /// Every browser profile, keyed by `profileId` — the identifier every
+    /// browser-profile route addresses it by. The key order is the
+    /// deterministic list order a browser-profile listing pages over.
+    pub browser_profiles: BTreeMap<String, BrowserProfileRecord>,
+    /// `name` -> `profileId`, so a duplicate name at create time is a
+    /// `ConflictException` ("The name must be unique within your account").
+    /// One entry per stored profile.
+    pub browser_profile_names: BTreeMap<String, String>,
+    /// `<operation>/<clientToken>` -> the browser profile that token first
+    /// produced, so a replayed `CreateBrowserProfile` answers with its first
+    /// result instead of minting a second profile. Separate from the maps above
+    /// because the record is validated against a different store; the key
+    /// carries the operation for the same reason as there.
+    browser_profile_idempotency: BTreeMap<String, String>,
+    /// The keys of [`Self::browser_profile_idempotency`] in the order they were
+    /// first recorded, so the oldest record is the one evicted at the ceiling.
+    browser_profile_idempotency_order: VecDeque<String>,
     /// Every custom code interpreter, keyed by `codeInterpreterId` — the
     /// identifier every code-interpreter route addresses it by. The key order is
     /// the deterministic list order a code-interpreter listing pages over.
@@ -3217,6 +3337,58 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
             .retain(|token| live.contains_key(token));
     }
 
+    /// Mint a `profileId` for `name` that no stored browser profile holds: the
+    /// name + `-` + 10 alphanumerics, per `BrowserProfileId`'s pattern
+    /// `^[a-zA-Z][a-zA-Z0-9_]{0,47}-[a-zA-Z0-9]{10}$`.
+    ///
+    /// `BrowserProfileName` is `^[a-zA-Z][a-zA-Z0-9_]{0,47}$`, which is exactly
+    /// the stem that pattern admits, so the name needs no reshaping.
+    pub fn mint_browser_profile_id(&mut self, name: &str, at: SystemTime) -> String {
+        loop {
+            self.mint_counter = self.mint_counter.wrapping_add(1);
+            let candidate = format!("{name}-{}", suffix_for(name, self.mint_counter, at));
+            if !self.browser_profiles.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// The browser profile a previous request to `operation` carrying this
+    /// `clientToken` produced, if the record is still held and the profile still
+    /// exists.
+    pub fn replayed_browser_profile_result(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+    ) -> Option<String> {
+        let profile_id = self
+            .browser_profile_idempotency
+            .get(&token_key(operation, client_token?))?;
+        self.browser_profiles
+            .contains_key(profile_id)
+            .then(|| profile_id.clone())
+    }
+
+    /// Record what a `clientToken` produced for `operation`, evicting the oldest
+    /// record once [`MAX_REMEMBERED_CLIENT_TOKENS`] are held, for the same
+    /// reason [`Self::remember_browser_client_token`] does.
+    pub fn remember_browser_profile_client_token(
+        &mut self,
+        operation: &str,
+        client_token: Option<String>,
+        profile_id: &str,
+    ) {
+        let Some(token) = client_token else {
+            return;
+        };
+        remember_token(
+            &mut self.browser_profile_idempotency,
+            &mut self.browser_profile_idempotency_order,
+            token_key(operation, &token),
+            profile_id.to_string(),
+        );
+    }
+
     /// Mint a `codeInterpreterId` for `name` that no stored code interpreter
     /// holds: the name + `-` + 10 alphanumerics, per `CodeInterpreterId`'s
     /// pattern
@@ -3638,6 +3810,16 @@ pub fn browser_arn(region: &str, browser_id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{BROWSER_ARN_RESOURCE}/{browser_id}"),
+    )
+}
+
+/// `arn:aws:bedrock-agentcore:{region}:{account}:browser-profile/{profileId}` —
+/// `BrowserProfileArn`'s pattern.
+pub fn browser_profile_arn(region: &str, profile_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{BROWSER_PROFILE_ARN_RESOURCE}/{profile_id}"),
     )
 }
 
