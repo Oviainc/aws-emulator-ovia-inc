@@ -196,9 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(guardrail) = store.guardrail(&config.guardrail_identifier) else {
             return Err(missing_revision().into());
         };
-        if guardrail.revision(Some(&config.guardrail_version)).is_none() {
+        let Some(revision) = guardrail.revision(Some(&config.guardrail_version)) else {
             return Err(missing_revision().into());
-        }
+        };
+        // The revision's own policies, which are what the inference plane evaluates a
+        // request against once this configuration is installed.
+        let revision = revision.clone();
         let guardrail_id = guardrail.id.clone();
         let guardrail_arn = guardrail.arn.clone();
 
@@ -220,9 +223,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         if !addresses_installed {
             let named = input.config_id.as_deref().unwrap_or_default();
-            return Err(not_found(format!(
-                "no enforced guardrail configuration {named} exists in this account"
-            ))
+            return Err(not_found(
+                crate::state::enforced_guardrail_configuration_not_found(named),
+            )
             .into());
         }
         let (config_id, created_at, created_by) = match installed {
@@ -252,8 +255,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exactly what the listing reports.
         let stored = store
             .enforced_guardrail_configuration
-            .as_ref()
+            .clone()
             .expect("the configuration stored just above is there");
+        drop(store);
+
+        // An enforced configuration is applied SERVER-SIDE to inference the caller never
+        // opted in to, so the enforcement it puts in force is installed in the inference
+        // plane's own store — the one home the invocation surfaces read it from — with no
+        // store of this service held.
+        crate::state::enforce_guardrail_on_inference(&*self.engine, Some((&stored, &revision)));
+
         Ok(PutEnforcedGuardrailConfigurationOutput {
             config_id: Some(stored.config_id.clone()),
             updated_at: Some(crate::state::date_time(stored.updated_at)),

@@ -20,6 +20,9 @@
 //! * the **prompt-cache** entries a Converse-API `cachePoint` marker writes
 //!   (`prompt_cache`), which is what lets a later call with the same marked
 //!   prefix report it as read from the cache instead of as input tokens;
+//! * the **account-enforced guardrail** ([`enforced_guardrail`]) the Bedrock
+//!   control plane installs, which every invocation surface evaluates its
+//!   request against whether or not the request asked for a guardrail;
 //! * the **metric publication** ([`invocation_metrics`]) that turns a served
 //!   inference's token accounting, the request it is and the duration measured
 //!   for it into `AWS/Bedrock` metric data, so the counts and the latency a
@@ -54,6 +57,10 @@ pub mod invocation_metrics;
 /// The inline guardrail checks `InvokeGuardrailChecks` evaluates, and the
 /// text-unit accounting it reports for them.
 pub mod guardrail_checks;
+
+/// The account-enforced guardrail the control plane installs, and how an
+/// invocation is evaluated against it.
+pub mod enforced_guardrail;
 
 /// The generation stage every inference surface answers from: the assistant text
 /// a turn serves, which says plainly that no language model ran.
@@ -137,6 +144,12 @@ pub struct ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
     /// [`prompt_cache_key`]. Bounded by [`MAX_PROMPT_CACHE_ENTRIES`], and an
     /// entry leaves it once its time to live has run out.
     pub prompt_cache: BTreeMap<String, PromptCacheEntry>,
+    /// The guardrail this account enforces on inference, as the Bedrock control
+    /// plane's `PutEnforcedGuardrailConfiguration` installed it
+    /// ([`enforced_guardrail`]). `None` while the account enforces none, which
+    /// is what leaves an invocation unguarded unless its own request asks for a
+    /// guardrail.
+    pub enforced_guardrail: Option<enforced_guardrail::EnforcedGuardrail>,
     /// Monotonic counter mixed into every id this service mints (an async
     /// invocation's, a tool request's).
     pub next_id: u64,
@@ -155,6 +168,7 @@ impl Default for ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
             invocations: VecDeque::new(),
             guardrail_check_evaluations: VecDeque::new(),
             prompt_cache: BTreeMap::new(),
+            enforced_guardrail: None,
             next_id: 0,
         }
     }
@@ -2326,12 +2340,18 @@ pub struct ConverseTurn {
     /// at a configured stop sequence ended on that sequence rather than at the
     /// cap, so this is `false` for it.
     pub truncated: bool,
+    /// Whether a guardrail blocked this turn, which is what makes it stop on
+    /// `guardrail_intervened` and carry the guardrail's blocked messaging as its
+    /// whole content ([`enforced_guardrail::EnforcedGuardrail`]).
+    pub guardrail_intervened: bool,
 }
 
 impl ConverseTurn {
     /// The modelled `StopReason` this turn ended on.
     pub fn stop_reason(&self) -> &'static str {
-        if self.tool_use.is_some() {
+        if self.guardrail_intervened {
+            enforced_guardrail::STOP_REASON_GUARDRAIL_INTERVENED
+        } else if self.tool_use.is_some() {
             "tool_use"
         } else if self.truncated {
             "max_tokens"
@@ -2467,6 +2487,7 @@ pub fn converse_turn(
             output_tokens,
             cache,
             truncated: false,
+            guardrail_intervened: false,
         };
     }
     let max_output_tokens = inference
@@ -2490,6 +2511,7 @@ pub fn converse_turn(
         output_tokens,
         cache,
         truncated: completion.truncated,
+        guardrail_intervened: false,
     }
 }
 

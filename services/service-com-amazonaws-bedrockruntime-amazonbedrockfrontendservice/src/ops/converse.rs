@@ -359,6 +359,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tool_use,
             cache,
         );
+        // The guardrail stage: the account-enforced guardrail is applied to this
+        // request whether or not it asked for a guardrail, and a turn it blocked
+        // carries the guardrail's blocked messaging and ends on
+        // `guardrail_intervened`.
+        let turn = crate::state::enforced_guardrail::guard_converse_turn(
+            &*self.engine,
+            &model,
+            input.system.as_ref(),
+            input.messages.as_ref(),
+            turn,
+        );
 
         let logged = crate::state::InvocationLogEntry {
             model_id: model.model_id.clone(),

@@ -227,6 +227,26 @@ pub fn emulator() -> Emulator {
     Emulator { router, engine }
 }
 
+/// The same emulator with the Bedrock Runtime DATA plane mounted beside this control plane
+/// on the one shared engine, exactly as `core/router` assembles them.
+///
+/// The form a suite drives when its rule spans the two planes — an account-enforced
+/// guardrail this control plane installs and that data plane applies — so the request that
+/// installs a configuration and the invocation that is evaluated against it travel through
+/// ONE emulator. The two services are told apart by the path space their own models
+/// publish, so [`Emulator::call`] reaches either.
+pub fn emulator_with_inference() -> Emulator {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = smithy_server_runtime::MultiServiceRouter::new();
+    router.register_service(bedrock::EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        ::service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    Emulator { router, engine }
+}
+
 impl Emulator {
     /// One request signed for [`REGION`], the region these suites address.
     pub async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {

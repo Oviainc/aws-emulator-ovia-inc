@@ -55,6 +55,9 @@ rustrict = "0.7"
 # Regular-expression engine behind the prompt-attack rules in
 # `state::guardrail_checks`: it matches each published attack form over the
 # submitted messages in linear time, so no message can make one request backtrack.
+# The account-enforced guardrail's word policy (`state::enforced_guardrail`) matches
+# with it too: every word the policy blocks goes into ONE pattern, so a request's
+# text is scanned once in linear time however many words are configured.
 regex = "1.12"
 
 [build-dependencies]

@@ -164,6 +164,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
+/// The INFERENCE plane's account-enforced guardrail: the one home of the enforcement an
+/// installed configuration puts in force, which this control plane writes on the put that
+/// installs it ([`enforced_guardrail_enforcement`]) and the Bedrock Runtime emulator's
+/// invocation surfaces read.
+use ::service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::state::enforced_guardrail as runtime_guardrail;
+
 use crate::ops::types::{
     AdvancedPromptOptimizationInputConfig, AdvancedPromptOptimizationOutputConfig,
     AutomatedReasoningPolicyDefinition, AutomatedReasoningPolicyTestCase,
@@ -186,11 +192,14 @@ use crate::ops::types::{
     GuardrailSensitiveInformationPolicyConfig, GuardrailTopic, GuardrailTopicConfig,
     GuardrailTopicPolicy, GuardrailTopicPolicyConfig, GuardrailTopicsTier,
     GuardrailTopicsTierConfig, GuardrailWord, GuardrailWordConfig, GuardrailWordPolicy,
-    GuardrailWordPolicyConfig, InferenceProfileModel, InferenceProfileSummary, LoggingConfig,
+    GuardrailWordPolicyConfig, InferenceProfileModel, InferenceProfileSummary, LegalTerm,
+    LoggingConfig,
     MarketplaceModelEndpoint,
-    ModelConfiguration, ModelCopyJobSummary, ModelDataSource, ModelEnforcement, OutputDataConfig,
-    PromptRouterSummary, PromptRouterTargetModel,
-    ProvisionedModelSummary, RoutingCriteria, SelectiveContentGuarding, Tag, TrainingDataConfig,
+    ModelConfiguration, ModelCopyJobSummary, ModelDataSource, ModelEnforcement, Offer,
+    OutputDataConfig,
+    PricingTerm, PromptRouterSummary, PromptRouterTargetModel,
+    ProvisionedModelSummary, RoutingCriteria, SelectiveContentGuarding, SupportTerm, Tag,
+    TermDetails, TrainingDataConfig,
     ValidationDataConfig, VpcConfig,
 };
 
@@ -3316,6 +3325,117 @@ pub struct AccountDataRetention {
     pub mode: String,
     /// `updatedAt` — when the last admitted put stored this mode.
     pub updated_at: SystemTime,
+}
+
+/// What this control plane answers when a request addresses an enforced guardrail
+/// configuration this account does not hold: the `configId` names no configuration, which
+/// is the 404 `ResourceNotFoundException` both the put that addresses one and the delete
+/// that removes one answer. Stated once here because two operations make the same refusal
+/// for the same reason and two spellings of it could drift.
+#[must_use]
+pub fn enforced_guardrail_configuration_not_found(config_id: &str) -> String {
+    format!("no enforced guardrail configuration {config_id} exists in this account")
+}
+
+/// Put the account's enforced guardrail configuration IN FORCE on the inference plane:
+/// `config`, enforcing `revision`, becomes the guardrail every covered invocation of this
+/// account is evaluated against. `None` withdraws whatever stood before it.
+///
+/// Answers whether the inference plane's store was reached: an emulator assembled without
+/// the Bedrock Runtime data plane enforces nothing, and this control plane's own record of
+/// the configuration is unaffected either way.
+///
+/// Call it with NO store of this service held, so two services' stores are never locked at
+/// once.
+pub fn enforce_guardrail_on_inference<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    installed: Option<(&EnforcedGuardrailConfiguration, &GuardrailRevision)>,
+) -> bool {
+    runtime_guardrail::install(
+        engine,
+        installed.map(|(config, revision)| enforced_guardrail_enforcement(config, revision)),
+    )
+}
+
+/// The ENFORCEMENT an installed configuration is, as the inference plane applies it.
+///
+/// The configuration this control plane stores is the account's resource — its `configId`,
+/// the principals and the instants a listing reports. What the INFERENCE plane needs is
+/// something else: the policies to evaluate a request against. The two planes keep one
+/// copy of that enforcement, in the inference plane's own store
+/// (`PutEnforcedGuardrailConfiguration` installs it there through
+/// [`enforce_guardrail_on_inference`]),
+/// and this is the projection that fills it: the enforced revision's word policy and
+/// blocked messaging, together with the model enforcement and selective-guarding modes the
+/// put carried.
+///
+/// `revision` is the guardrail revision the configuration enforces — a NUMBERED version,
+/// which is an immutable snapshot of the guardrail's policies, so the enforcement installed
+/// from it stays the revision inference evaluates for as long as the configuration stands.
+fn enforced_guardrail_enforcement(
+    config: &EnforcedGuardrailConfiguration,
+    revision: &GuardrailRevision,
+) -> runtime_guardrail::EnforcedGuardrail {
+    let word_policy = revision.word_policy.as_ref();
+    runtime_guardrail::EnforcedGuardrail {
+        guardrail_id: config.guardrail_id.clone(),
+        guardrail_version: config.guardrail_version.clone(),
+        blocked_input_messaging: revision.blocked_input_messaging.clone(),
+        blocked_outputs_messaging: revision.blocked_outputs_messaging.clone(),
+        words: word_policy
+            .and_then(|policy| policy.words.as_ref())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|word| {
+                runtime_guardrail::BlockedWord::new(
+                    word.text.clone(),
+                    word.input_action.as_deref(),
+                    word.input_enabled,
+                    word.output_action.as_deref(),
+                    word.output_enabled,
+                )
+            })
+            .collect(),
+        managed_word_lists: word_policy
+            .and_then(|policy| policy.managed_word_lists.as_ref())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|list| {
+                runtime_guardrail::ManagedWordList::new(
+                    list.r#type.clone(),
+                    list.input_action.as_deref(),
+                    list.input_enabled,
+                    list.output_action.as_deref(),
+                    list.output_enabled,
+                )
+            })
+            .collect(),
+        // A configuration carrying no `modelEnforcement` is enforced on every model, which
+        // the inference plane reads from an EMPTY included list; one that carries it names
+        // the models to enforce on and the ones to exclude.
+        included_models: config
+            .model_enforcement
+            .as_ref()
+            .map(|enforcement| enforcement.included_models.clone())
+            .unwrap_or_default(),
+        excluded_models: config
+            .model_enforcement
+            .as_ref()
+            .map(|enforcement| enforcement.excluded_models.clone())
+            .unwrap_or_default(),
+        system_guarded_selectively: config
+            .selective_content_guarding
+            .as_ref()
+            .and_then(|guarding| guarding.system.as_deref())
+            .is_some_and(|mode| mode == runtime_guardrail::GUARDING_SELECTIVE),
+        messages_guarded_selectively: config
+            .selective_content_guarding
+            .as_ref()
+            .and_then(|guarding| guarding.messages.as_deref())
+            .is_some_and(|mode| mode == runtime_guardrail::GUARDING_SELECTIVE),
+    }
 }
 
 /// Amazon Bedrock's answer when it is asked to take on a role the caller may not hand it:
@@ -7279,6 +7399,111 @@ pub fn foundation_model_details(model: &FoundationModel, region: &str) -> Founda
         inference_types_supported: summary.inference_types_supported,
         model_lifecycle: summary.model_lifecycle,
     }
+}
+
+// =============================================================================
+// The agreement offers of a published model
+// =============================================================================
+
+/// `OfferType` — every offer associated with the model.
+pub const OFFER_TYPE_ALL: &str = "ALL";
+
+/// `OfferType` — only the offers that are publicly available, as against an offer agreed
+/// privately with a provider.
+pub const OFFER_TYPE_PUBLIC: &str = "PUBLIC";
+
+/// The `providerName` of the models AWS itself publishes.
+///
+/// It is the one provider whose models an account reaches without accepting another
+/// party's terms, which is what [`model_agreement_offers`] reads it for.
+pub const AWS_MODEL_PROVIDER: &str = "Amazon";
+
+/// The offers associated with `model`, narrowed to `offer_type` when the request names one.
+///
+/// A model from a THIRD-PARTY provider is offered under that provider's own end-user
+/// license agreement, which the account accepts — by the `offerToken` of one of these
+/// offers — before it may use the model; the models AWS publishes itself
+/// ([`AWS_MODEL_PROVIDER`]) carry no such agreement, so they expose no offer and the
+/// listing for one is an empty list rather than a refusal.
+///
+/// Every offer here is PUBLIC: this emulator holds no privately agreed offer, so
+/// [`OFFER_TYPE_ALL`] and [`OFFER_TYPE_PUBLIC`] admit the same one offer per model, and a
+/// request naming no `offerType` gets every offer the model has.
+///
+/// The TERMS a model is offered on are the provider's published document, price list and
+/// support policy, none of which this emulator carries — and every member of `LegalTerm`,
+/// `SupportTerm`, `ValidityTerm` and `DimensionalPriceRate` is optional
+/// (`smithy_query(query="shape",shape="TermDetails")`) — so the term structures an offer
+/// carries are present and name no document, price or duration rather than inventing one.
+#[must_use]
+pub fn model_agreement_offers(model: &FoundationModel, offer_type: Option<&str>) -> Vec<Offer> {
+    if model.provider_name == AWS_MODEL_PROVIDER {
+        return Vec::new();
+    }
+    // The one offer a third-party model is published under is PUBLIC, so it is admitted by
+    // either value the filter can carry, and by a request that carries no filter at all.
+    let admitted = offer_type
+        .is_none_or(|wanted| wanted == OFFER_TYPE_ALL || wanted == OFFER_TYPE_PUBLIC);
+    if !admitted {
+        return Vec::new();
+    }
+    let offer_id = model_offer_id(model.model_id);
+    vec![Offer {
+        offer_token: model_offer_token(model.model_id, &offer_id),
+        offer_id: Some(offer_id),
+        term_details: TermDetails {
+            usage_based_pricing_term: PricingTerm {
+                rate_card: Vec::new(),
+            },
+            legal_term: LegalTerm { url: None },
+            support_term: SupportTerm {
+                refund_policy_description: None,
+            },
+            validity_term: None,
+        },
+    }]
+}
+
+/// The `offerId` of the public offer of `model_id`.
+///
+/// Derived from the model the offer is FOR, so the id a listing reports for a model is the
+/// same id every later listing reports for it: an offer is not a resource a request brings
+/// into being, so nothing about it is per-run.
+#[must_use]
+pub fn model_offer_id(model_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "offer-{}",
+        &hex::encode(Sha256::digest(model_id.as_bytes()))[..12]
+    )
+}
+
+/// The `offerToken` of the offer `offer_id` of `model_id`: the opaque token
+/// `CreateFoundationModelAgreement` takes to accept exactly this offer.
+///
+/// Derived from what the offer IS — the model and the offer id — for the reason
+/// [`model_offer_id`] is: the token a listing hands out has to be the token a later
+/// agreement call can be checked against, so it is computed from the offer rather than
+/// minted per run.
+#[must_use]
+pub fn model_offer_token(model_id: &str, offer_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(model_id.as_bytes());
+    digest.update(b":");
+    digest.update(offer_id.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+/// What this control plane answers when a `modelId` names no model in the catalog: the
+/// identifier could not be resolved to a model.
+///
+/// Stated once here because every operation that resolves a `BedrockModelId` against the
+/// published catalog makes the same refusal for the same reason, and two spellings of it
+/// could drift.
+#[must_use]
+pub fn foundation_model_not_found(identifier: &str) -> String {
+    format!("Could not resolve the model from the provided model identifier: {identifier}")
 }
 
 // =============================================================================

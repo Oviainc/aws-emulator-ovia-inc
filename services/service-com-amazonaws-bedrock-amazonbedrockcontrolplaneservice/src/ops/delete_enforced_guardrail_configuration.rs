@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEnforcedGuardrailConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEnforcedGuardrailConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEnforcedGuardrailConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the account's single enforced guardrail configuration.
+//!
+//! The delete addresses that one configuration by its `configId`
+//! ([`crate::state::EnforcedGuardrailConfiguration`]), so an id the account does not hold
+//! — and any id at all while the account holds no configuration — addresses nothing and is
+//! refused 404 `ResourceNotFoundException`, the error this operation models for a resource
+//! that was not found. This `@idempotent` delete is therefore refused the same way when it
+//! is repeated: the configuration it named is no longer there.
+//!
+//! Deleting the configuration also WITHDRAWS the enforcement it put in force on inference
+//! ([`crate::state::enforce_guardrail_on_inference`]): an account that deleted its
+//! configuration is guarded by nothing, so no later invocation is evaluated against the
+//! guardrail it used to enforce.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +149,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEnforcedGuardrailConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEnforcedGuardrailConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEnforcedGuardrailConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteEnforcedGuardrailConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "enforced guardrail configuration state is not available on this \
+                             engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // The delete addresses the ONE configuration the account holds, by its id: a
+        // `configId` the account does not hold addresses no configuration at all, and an
+        // account holding none has nothing for any id to address.
+        let addresses_installed = store
+            .enforced_guardrail_configuration
+            .as_ref()
+            .is_some_and(|stored| stored.config_id == input.config_id);
+        if !addresses_installed {
+            return Err(
+                DeleteEnforcedGuardrailConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::enforced_guardrail_configuration_not_found(
+                                &input.config_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        store.enforced_guardrail_configuration = None;
+        drop(store);
+
+        // The configuration is gone, so the enforcement it put in force on inference is
+        // withdrawn from the inference plane's store too, with no store of this service
+        // held.
+        crate::state::enforce_guardrail_on_inference(&*self.engine, None);
+
+        Ok(DeleteEnforcedGuardrailConfigurationOutput {})
     }
 }

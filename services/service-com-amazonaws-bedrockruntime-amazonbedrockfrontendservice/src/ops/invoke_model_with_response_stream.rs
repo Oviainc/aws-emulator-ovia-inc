@@ -194,6 +194,16 @@ impl<Eng: Send + Sync + 'static> InvokeModelWithResponseStream<Eng> {
         // drift; here the turn is delivered as the model family's own streaming
         // events rather than as the unary response body.
         let turn = crate::state::invoke_turn(&model, family, body);
+        // The guardrail stage `InvokeModel` runs, for the same reason: the
+        // account-enforced guardrail applies to this invocation whether or not
+        // the request asked for one.
+        let (turn, guardrail_action) = crate::state::enforced_guardrail::guard_invoke_turn(
+            &*self.engine,
+            &model,
+            family,
+            body,
+            turn,
+        );
         let first_byte_latency_ms = crate::state::latency_ms(started.elapsed());
 
         let logged = crate::state::InvocationLogEntry {
@@ -219,7 +229,7 @@ impl<Eng: Send + Sync + 'static> InvokeModelWithResponseStream<Eng> {
 
         // One `chunk` event per streaming event of the model's own protocol, in
         // the order the family emits them.
-        let chunks = crate::state::invoke_model_stream_chunks(
+        let mut chunks = crate::state::invoke_model_stream_chunks(
             family,
             &model.model_id,
             &turn,
@@ -230,6 +240,14 @@ impl<Eng: Send + Sync + 'static> InvokeModelWithResponseStream<Eng> {
                 first_byte_latency_ms,
             },
         );
+        // The guardrail action this invocation took, reported on the terminal
+        // chunk beside the service's own accounting — the one place the service
+        // adds its own members to a model's stream.
+        if let Some(action) = guardrail_action {
+            if let Some(last) = chunks.last_mut() {
+                crate::state::enforced_guardrail::report_action(last, action);
+            }
+        }
         let mut frames = Vec::new();
         for chunk in &chunks {
             let payload = serde_json::to_vec(chunk).map_err(|error| {

@@ -201,6 +201,16 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
             tool_use,
             cache,
         );
+        // The guardrail stage `Converse` runs, for the same reason: the
+        // account-enforced guardrail applies to this request whether or not it
+        // asked for a guardrail.
+        let turn = crate::state::enforced_guardrail::guard_converse_turn(
+            &*self.engine,
+            &model,
+            input.system.as_ref(),
+            input.messages.as_ref(),
+            turn,
+        );
 
         let logged = crate::state::InvocationLogEntry {
             model_id: model.model_id.clone(),

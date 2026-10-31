@@ -53,6 +53,8 @@ mod custom_model_source_bucket;
 mod custom_models;
 #[path = "all/enforced_guardrail_configuration.rs"]
 mod enforced_guardrail_configuration;
+#[path = "all/enforced_guardrail_inference.rs"]
+mod enforced_guardrail_inference;
 #[path = "all/enum_value_set_listing.rs"]
 mod enum_value_set_listing;
 #[path = "all/enum_value_set_order.rs"]
@@ -61,6 +63,8 @@ mod enum_value_set_order;
 mod evaluation_job_completion;
 #[path = "all/evaluation_jobs.rs"]
 mod evaluation_jobs;
+#[path = "all/foundation_model_agreement_offers.rs"]
+mod foundation_model_agreement_offers;
 #[path = "all/foundation_models.rs"]
 mod foundation_models;
 #[path = "all/get_foundation_model.rs"]

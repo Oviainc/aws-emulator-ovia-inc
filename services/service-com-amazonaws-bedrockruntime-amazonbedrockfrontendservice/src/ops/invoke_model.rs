@@ -303,9 +303,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The inference itself: the same turn the streaming surface serves, so
         // the payload the two answer for identical input agrees by construction.
         let turn = crate::state::invoke_turn(&model, family, body);
+        // The guardrail stage: the account-enforced guardrail is applied to this
+        // invocation whether or not the request asked for one, and the action it
+        // took is reported on the body the caller gets back.
+        let (turn, guardrail_action) = crate::state::enforced_guardrail::guard_invoke_turn(
+            &*self.engine,
+            &model,
+            family,
+            body,
+            turn,
+        );
         let input_tokens = turn.input_tokens;
         let output_tokens = turn.output_tokens;
-        let body = serde_json::to_vec(&turn.response).map_err(|error| {
+        let mut response = turn.response;
+        if let Some(action) = guardrail_action {
+            crate::state::enforced_guardrail::report_action(&mut response, action);
+        }
+        let body = serde_json::to_vec(&response).map_err(|error| {
             InvokeModelError::from(InvokeModelErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(format!("could not render the inference response: {error}")),

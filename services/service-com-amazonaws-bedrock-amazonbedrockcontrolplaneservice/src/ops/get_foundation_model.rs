@@ -187,9 +187,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(GetFoundationModelErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Could not resolve the model from the provided model identifier: {}",
-                        input.model_identifier
+                    message: Some(crate::state::foundation_model_not_found(
+                        &input.model_identifier,
                     )),
                 },
             )

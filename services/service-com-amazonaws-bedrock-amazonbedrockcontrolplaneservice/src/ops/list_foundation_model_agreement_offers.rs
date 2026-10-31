@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFoundationModelAgreementOffers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFoundationModelAgreementOffers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFoundationModelAgreementOffers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the agreement offers associated with one published foundation model.
+//!
+//! The `modelId` names a row of this account's own published catalog
+//! ([`crate::state::FOUNDATION_MODELS`]), and an id the catalog does not carry resolves to
+//! no model at all: that is refused 404 `ResourceNotFoundException`, the error this
+//! operation models for a resource that was not found, rather than answered with an empty
+//! list.
+//!
+//! A model the catalog DOES carry answers 200 with that model's offers
+//! ([`crate::state::model_agreement_offers`]) — the offer whose `offerToken` feeds
+//! `CreateFoundationModelAgreement` for a model offered under a third-party end-user
+//! license agreement, and no offer for a model AWS publishes itself — narrowed to the
+//! `offerType` the request names.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +158,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFoundationModelAgreementOffers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFoundationModelAgreementOffersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFoundationModelAgreementOffers"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListFoundationModelAgreementOffersErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the foundation model catalog is not available on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let store = state.lock();
+
+        // The offers of a model are the model's own, so the id has to name one this
+        // account's catalog carries. The qualified form of a base model id — the id
+        // followed by the `:`-separated qualifiers `BedrockModelId`'s pattern admits —
+        // names the same published model.
+        let Some(model) = store.foundation_models.qualified_model(&input.model_id) else {
+            return Err(
+                ListFoundationModelAgreementOffersErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::foundation_model_not_found(&input.model_id)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(ListFoundationModelAgreementOffersOutput {
+            // The id the request named, which is the model these offers are for.
+            model_id: input.model_id.clone(),
+            offers: crate::state::model_agreement_offers(model, input.offer_type.as_deref()),
+        })
     }
 }
