@@ -264,7 +264,7 @@ async fn adding_sources_and_outputs_appends_them_to_the_stored_bridge() {
             "case {name_of_case:?}: the answer names the bridge added to, got {added}"
         );
         assert_eq!(
-            added["sources"],
+            crate::bridge_lifecycle::without_output_arns(name_of_case, &added["sources"]),
             json!(sources),
             "case {name_of_case:?}: the answer carries only the sources added, got {added}"
         );
@@ -295,7 +295,7 @@ async fn adding_sources_and_outputs_appends_them_to_the_stored_bridge() {
         let mut expected_outputs = vec![held_output];
         expected_outputs.extend(outputs);
         assert_eq!(
-            bridge["sources"],
+            crate::bridge_lifecycle::without_output_arns(name_of_case, &bridge["sources"]),
             json!(expected_sources),
             "case {name_of_case:?}: expected the held source then the added ones, got {bridge}"
         );
@@ -391,7 +391,7 @@ async fn removing_a_source_or_an_output_takes_it_out_of_the_stored_bridge() {
         let mut expected_outputs = outputs.clone();
         expected_outputs.remove(output_position);
         assert_eq!(
-            bridge["sources"],
+            crate::bridge_lifecycle::without_output_arns(name_of_case, &bridge["sources"]),
             json!(expected_sources),
             "case {name_of_case:?}: the removed source is gone and the rest keep their order, \
              got {bridge}"

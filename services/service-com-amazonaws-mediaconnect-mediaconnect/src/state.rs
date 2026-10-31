@@ -1903,6 +1903,22 @@ pub fn materialise_media_stream_source_configurations(
         .collect()
 }
 
+/// The bridge source an output of a flow was materialised for: the bridge that takes the
+/// flow's content, and the name that bridge addresses the source by.
+///
+/// An output carrying one of these is the service's OWN record of a bridge source, not an
+/// output a request configured — see [`StoredOutput::for_bridge_source`], which mints it,
+/// and [`ComAmazonawsMediaconnectMediaconnectState::sync_bridge_source_flow_outputs`],
+/// which keeps the set of them equal to the bridge flow sources the store holds. The pair
+/// is the identity of that source (a source name "must be unique among sources in this
+/// bridge"), so the reconciliation can tell which output belongs to which source without
+/// depending on the output's own name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeSourceOrigin {
+    pub bridge_arn: String,
+    pub source_name: String,
+}
+
 /// An output of a stored flow.
 #[derive(Debug, Clone, Default)]
 pub struct StoredOutput {
@@ -1935,6 +1951,13 @@ pub struct StoredOutput {
     /// right — see [`ComAmazonawsMediaconnectMediaconnectState::tags_of`]. `Output` itself
     /// carries no tag member, so no flow response reports this map.
     pub tags: BTreeMap<String, String>,
+    /// The bridge source this output exists FOR, when the SERVICE materialised it rather
+    /// than a request configuring it ([`StoredOutput::for_bridge_source`]).
+    /// `Output.BridgeArn` — "the ARN of the bridge added to this output" — is reported from
+    /// it, and
+    /// [`ComAmazonawsMediaconnectMediaconnectState::sync_bridge_source_flow_outputs`] keys
+    /// the reconciliation on it. `None` for every output a request added.
+    pub bridge_source: Option<BridgeSourceOrigin>,
 }
 
 impl StoredOutput {
@@ -2011,6 +2034,49 @@ impl StoredOutput {
             // stored on the output, which is the resource its own ARN addresses.
             tags: tag_map_of(request.output_tags.as_ref()),
             transport,
+            // A request configured this output, so it is not the one the service creates on a
+            // flow a bridge takes as its source ([`Self::for_bridge_source`]).
+            bridge_source: None,
+        }
+    }
+
+    /// Materialise the output the SERVICE creates on a cloud flow because a bridge takes
+    /// that flow as one of its sources.
+    ///
+    /// `BridgeFlowSource$OutputArn` is "the Amazon Resource Number (ARN) of the output" a
+    /// bridge's flow source carries, and `Output$BridgeArn` is "the ARN of the bridge added
+    /// to this output": the two halves of one record, the output through which the cloud
+    /// flow feeds the bridge. No request shape configures it — `AddBridgeFlowSourceRequest`
+    /// carries the flow, a name and a VPC interface attachment and nothing about an output —
+    /// so it is materialised from the bridge sources the store holds instead
+    /// ([`ComAmazonawsMediaconnectMediaconnectState::sync_bridge_source_flow_outputs`]), the
+    /// mirror of the bridge-side [`materialise_bridge_flow_output`].
+    ///
+    /// The `OutputArn` is minted exactly as [`Self::from_add_request`] mints one, so an
+    /// output of a flow has one ARN form whichever side asked for it; `OutputStatus` is "an
+    /// indication of whether the output is transmitting data or not" and this output exists
+    /// to carry the flow to the bridge, so it reports the same [`STATUS_ENABLED`] an added
+    /// output's unspecified status resolves to. Every other member belongs to an output a
+    /// request configures (a destination, a port, a transport, an encryption, media stream
+    /// associations) and stays absent, including `Output$BridgePorts` — "the bridge output
+    /// ports currently in use" — because this emulator moves no content and so holds no port
+    /// in use.
+    pub fn for_bridge_source(
+        origin: BridgeSourceOrigin,
+        name: String,
+        region: &str,
+        suffix: u64,
+    ) -> Self {
+        StoredOutput {
+            output_arn: ::engine::emulator_arn(
+                SERVICE_NAMESPACE,
+                region,
+                &output_resource_fragment(suffix, &name),
+            ),
+            name,
+            output_status: Some(STATUS_ENABLED.to_string()),
+            bridge_source: Some(origin),
+            ..StoredOutput::default()
         }
     }
 
@@ -2033,6 +2099,13 @@ impl StoredOutput {
             vpc_interface_attachment: self.vpc_interface_attachment.clone(),
             transport: self.transport.clone(),
             media_stream_output_configurations: self.media_stream_output_configurations.clone(),
+            // "The ARN of the bridge added to this output": carried by the output the
+            // service created for a bridge source and by no other, so a reader can tell the
+            // output that feeds a bridge from the ones a request configured.
+            bridge_arn: self
+                .bridge_source
+                .as_ref()
+                .map(|origin| origin.bridge_arn.clone()),
             ..Output::default()
         }
     }
@@ -3201,10 +3274,13 @@ pub fn materialise_bridge_source(request: &AddBridgeSourceRequest) -> Option<Bri
                 flow_vpc_interface_attachment: flow_source.flow_vpc_interface_attachment.clone(),
                 name: flow_source.name.clone(),
                 // `BridgeFlowSource$OutputArn` is "the Amazon Resource Number (ARN) of the
-                // output" MediaConnect creates on the cloud flow for this bridge. This
-                // emulator creates no output on the flow a bridge names — the flow's
-                // outputs are what AddFlowOutputs / RemoveFlowOutput own — so the optional
-                // member stays absent rather than carrying an ARN that addresses nothing.
+                // output" MediaConnect creates on the cloud flow for this bridge, so it is
+                // not a member of the request this materialises: it is the ARN of a record
+                // the SERVICE writes once the source is stored, filled in by the one
+                // reconciliation that owns both halves of that relation
+                // ([`ComAmazonawsMediaconnectMediaconnectState::sync_bridge_source_flow_outputs`],
+                // which every path that stores a bridge source runs). Absent here, so no
+                // source is stored carrying an ARN that addresses nothing.
                 output_arn: None,
             }),
             network_source: None,
@@ -3309,6 +3385,19 @@ pub fn resolve_bridge_flow_output_name(source_name: &str, taken: &BTreeSet<Strin
     } else {
         DEFAULT_BRIDGE_FLOW_OUTPUT_NAME
     };
+    next_free_name(base, taken)
+}
+
+/// `base` itself when `taken` does not hold it, else the first `<base>-<n>` (n counting
+/// from 2) that it does not hold.
+///
+/// The one encoding of how this service names a record it MATERIALISES after another record
+/// it already holds, shared by both sides of the bridge/flow relation
+/// ([`resolve_bridge_flow_output_name`] for the output a bridge is given, and
+/// [`ComAmazonawsMediaconnectMediaconnectState::sync_bridge_source_flow_outputs`] for the
+/// output a flow is given), so the two cannot drift apart. The shape is the one a generated
+/// source name has ([`resolve_source_name`]).
+pub fn next_free_name(base: &str, taken: &BTreeSet<String>) -> String {
     if !taken.contains(base) {
         return base.to_string();
     }
@@ -6798,6 +6887,187 @@ impl ComAmazonawsMediaconnectMediaconnectState {
                 .outputs
                 .push(materialise_bridge_flow_output(flow_arn, source_arn, name));
         }
+    }
+
+    /// Make the outputs the stored flows hold for bridges exactly the ones the account's
+    /// bridges ask for: one per bridge flow source that names a flow this store holds, with
+    /// the ARN of that output on the source that asked for it.
+    ///
+    /// A bridge's flow source "originates in MediaConnect as an existing cloud flow"
+    /// (`BridgeFlowSource`), and the stream that flow delivers to the bridge leaves the flow
+    /// through an output of it: `BridgeFlowSource$OutputArn` is "the Amazon Resource Number
+    /// (ARN) of the output" and `Output$BridgeArn` is "the ARN of the bridge added to this
+    /// output", the two ends of that one record. So the output is not a resource a request
+    /// configures — `AddBridgeFlowSourceRequest` carries no output member at all — it is the
+    /// service's own record of the bridge source that named the flow, and it exists exactly
+    /// while that bridge source does.
+    ///
+    /// The mirror of [`Self::sync_bridge_flow_outputs`], which does the same for the output a
+    /// BRIDGE is given when a cloud flow takes it as a source, and reconciled the same way
+    /// rather than written by hand at each call site: every operation that writes a bridge
+    /// source (CreateBridge's `Sources`, AddBridgeSources, UpdateBridgeSource) and every one
+    /// that takes a bridge or a bridge source out of the store (RemoveBridgeSource,
+    /// DeleteBridge) calls it as part of that same write, so one function decides which of a
+    /// flow's outputs exist for a bridge. Nothing else owes the work, so no reporting
+    /// operation performs it.
+    ///
+    /// IDEMPOTENT: an output already materialised for a bridge source keeps the name and the
+    /// ARN it was materialised under, so repeated calls neither duplicate, rename nor remint
+    /// one. An output a request configured is left alone, whichever flow holds it.
+    ///
+    /// An output this drops takes the stored references to it with it: the reconciliation ends
+    /// with the one repair every operation that takes a flow output out of the store performs
+    /// ([`Self::clear_unresolvable_flow_references`]), so a router record connected to the
+    /// output a bridge source asked for is DISCONNECTED when that source stops asking rather
+    /// than left holding an ARN nothing resolves.
+    pub fn sync_bridge_source_flow_outputs(&mut self, region: &str, now: SystemTime) {
+        // What the bridges ask for, read FIRST against the store as it stands — the flows
+        // cannot be rewritten while it is read. The bridges and their sources are walked in
+        // the store's own order, so which name an output materialised in one call takes does
+        // not depend on the order the calls arrived in. A source whose flow this store does
+        // not hold asks for nothing: there is no flow to put an output on.
+        let flows = &self.flows;
+        let requested: Vec<(String, BridgeSourceOrigin)> = self
+            .bridges
+            .values()
+            .flat_map(|bridge| {
+                let bridge_arn = bridge.bridge_arn.clone();
+                bridge.sources.iter().filter_map(move |source| {
+                    let flow_source = source.flow_source.as_ref()?;
+                    flows.contains_key(&flow_source.flow_arn).then(|| {
+                        (
+                            flow_source.flow_arn.clone(),
+                            BridgeSourceOrigin {
+                                bridge_arn: bridge_arn.clone(),
+                                source_name: flow_source.name.clone(),
+                            },
+                        )
+                    })
+                })
+            })
+            .collect();
+
+        // An output no bridge source asks for any more goes with the source that asked for
+        // it: it carries that bridge's ARN and nothing else records why it exists, so an
+        // output that outlived the source would report a bridge the flow no longer feeds.
+        // What the bridges ask for is indexed first, so deciding one output costs a lookup
+        // rather than a walk of every bridge source the account holds.
+        let requested_keys: BTreeSet<(&str, &str, &str)> = requested
+            .iter()
+            .map(|(flow_arn, origin)| {
+                (
+                    flow_arn.as_str(),
+                    origin.bridge_arn.as_str(),
+                    origin.source_name.as_str(),
+                )
+            })
+            .collect();
+        for (flow_arn, flow) in self.flows.iter_mut() {
+            flow.outputs.retain(|output| {
+                let Some(origin) = output.bridge_source.as_ref() else {
+                    return true;
+                };
+                requested_keys.contains(&(
+                    flow_arn.as_str(),
+                    origin.bridge_arn.as_str(),
+                    origin.source_name.as_str(),
+                ))
+            });
+        }
+
+        // And an output a bridge source asks for that its flow has not got yet is
+        // materialised, named after that source and against the names the flow already
+        // addresses its outputs by ("the name of the output … must be unique within the
+        // current flow"). The ARN of each one is kept here, keyed by the source it belongs
+        // to, so the sources can be filled in below without re-walking the flows.
+        let mut minted: BTreeMap<(String, String, String), String> = BTreeMap::new();
+        for (flow_arn, flow) in self.flows.iter() {
+            for output in &flow.outputs {
+                if let Some(origin) = output.bridge_source.as_ref() {
+                    minted.insert(
+                        (
+                            flow_arn.clone(),
+                            origin.bridge_arn.clone(),
+                            origin.source_name.clone(),
+                        ),
+                        output.output_arn.clone(),
+                    );
+                }
+            }
+        }
+        for (flow_arn, origin) in &requested {
+            let key = (
+                flow_arn.clone(),
+                origin.bridge_arn.clone(),
+                origin.source_name.clone(),
+            );
+            if minted.contains_key(&key) {
+                continue;
+            }
+            let suffix = self.next_suffix();
+            let Some(flow) = self.flows.get_mut(flow_arn) else {
+                continue;
+            };
+            let name = next_free_name(&origin.source_name, &flow.output_names());
+            let output = StoredOutput::for_bridge_source(origin.clone(), name, region, suffix);
+            minted.insert(key, output.output_arn.clone());
+            flow.outputs.push(output);
+        }
+
+        // Each bridge flow source then carries the ARN of the output materialised for it,
+        // read back out of the flow that holds it rather than minted a second time — so the
+        // two halves of the record cannot disagree, and a source whose flow this store does
+        // not hold carries no ARN at all.
+        for bridge in self.bridges.values_mut() {
+            let bridge_arn = bridge.bridge_arn.clone();
+            for source in bridge.sources.iter_mut() {
+                if let Some(flow_source) = source.flow_source.as_mut() {
+                    flow_source.output_arn = minted
+                        .get(&(
+                            flow_source.flow_arn.clone(),
+                            bridge_arn.clone(),
+                            flow_source.name.clone(),
+                        ))
+                        .cloned();
+                }
+            }
+        }
+
+        // And a reference held elsewhere in the store to an output this call dropped goes with
+        // that output: a router record may be connected to any output of a flow, and the
+        // connection is an optional member whose absence is the modelled disconnected state.
+        self.clear_unresolvable_flow_references(now);
+    }
+
+    /// Why the output `output_arn` of the flow `flow_arn` cannot be removed by a request, or
+    /// `None` when it can — including when the flow holds no output by that ARN, which is a
+    /// resource the caller is told does not exist instead.
+    ///
+    /// The mirror of [`Self::bridge_flow_output_removal_rejection`], and the same reading: an
+    /// output carrying a bridge's ARN is the service's own record of a bridge source that
+    /// takes this flow ([`Self::sync_bridge_source_flow_outputs`]), and no request shape in
+    /// this model configures one — so a caller that removed it could not ask for it back, and
+    /// the bridge source that asked for it would still be naming the flow. The removal is
+    /// refused and the caller clears the bridge source instead, by removing it, pointing it
+    /// at another flow or deleting the bridge. An output a request DID configure is removable
+    /// by the request that addresses it.
+    pub fn flow_bridge_output_removal_rejection(
+        &self,
+        flow_arn: &str,
+        output_arn: &str,
+    ) -> Option<String> {
+        let flow = self.flows.get(flow_arn)?;
+        let output = flow
+            .outputs
+            .iter()
+            .find(|output| output.output_arn == output_arn)?;
+        let origin = output.bridge_source.as_ref()?;
+        Some(format!(
+            "Output {:?} is the output this flow was given when bridge {} took it as the \
+             source {:?}. A request configures no such output: remove that bridge source, \
+             point it at another flow, or delete the bridge.",
+            output.name, origin.bridge_arn, origin.source_name
+        ))
     }
 
     /// Why the output `output_name` of the bridge `bridge_arn` cannot be removed by a

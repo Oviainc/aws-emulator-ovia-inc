@@ -344,7 +344,7 @@ async fn create_bridge_admits_only_the_sources_and_outputs_the_bridge_s_directio
             );
         }
         assert_eq!(
-            bridge["sources"],
+            crate::bridge_lifecycle::without_output_arns(case, &bridge["sources"]),
             json!(sources),
             "case {case:?}: the stored bridge holds the sources the create named, got {bridge}"
         );

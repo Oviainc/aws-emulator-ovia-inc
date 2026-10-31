@@ -451,6 +451,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         );
 
+        // A flow source of the new bridge takes its content from a cloud flow, and the
+        // output through which that flow delivers it is the service's own record of the
+        // source: it is materialised, and the ARN it minted written onto the source, by the
+        // one reconciliation every path that stores a bridge source runs (see
+        // `crate::state::ComAmazonawsMediaconnectMediaconnectState::sync_bridge_source_flow_outputs`).
+        store.sync_bridge_source_flow_outputs(&region, now);
+
         // The response is the STORED record, read back out of the store, not the request.
         let bridge = store
             .bridges

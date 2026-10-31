@@ -173,6 +173,48 @@ pub(crate) async fn create_bridge(emulator: &Emulator, body: Value) -> (u16, Opt
     emulator.send("POST", "/v1/bridges", Some(body)).await
 }
 
+/// `reported` — a bridge's `Sources` as a response carries them, or one of them — with the
+/// `OutputArn` the service writes onto every flow source taken off, asserted as it is
+/// removed to be the ARN of an output.
+///
+/// `BridgeFlowSource$OutputArn` is "the Amazon Resource Number (ARN) of the output" the
+/// service creates on the cloud flow for the bridge, so no request carries it and no table
+/// row can state its value: its id is minted per call. The suites that compare a stored
+/// source against the source a REQUEST configured therefore compare everything but that
+/// member, and `bridge_source_flow_outputs` is the suite that owns the rule about it.
+pub(crate) fn without_output_arns(case: &str, reported: &Value) -> Value {
+    match reported {
+        Value::Array(sources) => Value::Array(
+            sources
+                .iter()
+                .map(|source| without_output_arns(case, source))
+                .collect(),
+        ),
+        Value::Object(_) => {
+            let mut source = reported.clone();
+            let Some(flow_source) = source
+                .get_mut("flowSource")
+                .and_then(Value::as_object_mut)
+            else {
+                return source;
+            };
+            let output_arn = flow_source.remove("outputArn");
+            let arn = output_arn
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert_eq!(
+                arn.split(':').nth(5),
+                Some("output"),
+                "case {case:?}: a bridge's flow source carries the ARN of the output its \
+                 cloud flow delivers through, got {reported}"
+            );
+            source
+        }
+        _ => reported.clone(),
+    }
+}
+
 pub(crate) async fn describe_bridge(emulator: &Emulator, arn: &str) -> (u16, Option<String>, Value) {
     emulator
         .send("GET", &format!("/v1/bridges/{arn}"), None)
@@ -511,8 +553,11 @@ async fn create_bridge_stores_the_bridge_describe_bridge_reports() {
             ("outputs", &outputs),
             ("sourceFailoverConfig", &source_failover_config),
         ] {
+            // A flow source also carries the `OutputArn` of the output the service created
+            // on its cloud flow, which no row can state: see `without_output_arns`.
+            let reported = without_output_arns(name_of_case, &bridge[member]);
             assert_eq!(
-                &bridge[member], expected,
+                &reported, expected,
                 "case {name_of_case:?}: expected {member} {expected}, got {:?}",
                 bridge[member]
             );

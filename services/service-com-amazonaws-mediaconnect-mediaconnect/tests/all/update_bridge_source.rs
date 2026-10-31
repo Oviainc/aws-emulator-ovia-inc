@@ -7,10 +7,12 @@
 //! bridge — the source that bridge addresses by the requested name. Every setting the
 //! request carries replaces that setting on the stored source, member by member through
 //! the request-only wrapper shape; every setting it omits, and every member of the stored
-//! shape the request shape has no counterpart for (the source's `Name`, a flow source's
-//! `OutputArn`), is left exactly as it was; no other source of the bridge and nothing else
-//! about the bridge moves; and the answer is the stored source, so DescribeBridge
-//! afterwards reports the same source.
+//! shape the request shape has no counterpart for (the source's `Name`) is left exactly as
+//! it was; a flow source's `OutputArn` is the ARN of the output the SERVICE creates on the
+//! cloud flow that source names, so it is reconciled against that flow rather than compared
+//! here (`bridge_source_flow_outputs` is the suite that owns it); no other source of the
+//! bridge and nothing else about the bridge moves; and the answer is the stored source, so
+//! DescribeBridge afterwards reports the same source.
 //!
 //! The rows below vary what that rule generalises over: the KIND of source (flow /
 //! network), WHICH members of the wrapper one request names (one, several, all of them,
@@ -406,7 +408,8 @@ async fn update_bridge_source_applies_the_settings_it_carries_and_keeps_the_rest
             answered["bridgeArn"]
         );
         assert_eq!(
-            answered["source"], expected,
+            crate::bridge_lifecycle::without_output_arns(case, &answered["source"]),
+            expected,
             "case {case:?}: expected the stored source {expected}, got {:?}",
             answered["source"]
         );
@@ -433,7 +436,8 @@ async fn update_bridge_source_applies_the_settings_it_carries_and_keeps_the_rest
             let name = source_name_of(before);
             if name == source_name {
                 assert_eq!(
-                    after, &expected,
+                    crate::bridge_lifecycle::without_output_arns(case, after),
+                    expected,
                     "case {case:?}: DescribeBridge must report the updated source at \
                      position {position}, got {after}"
                 );

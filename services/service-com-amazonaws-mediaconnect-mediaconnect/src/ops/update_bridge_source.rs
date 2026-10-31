@@ -224,10 +224,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing in this operation's answer depends on request metadata: both the bridge
-        // ARN and the source name are `@httpLabel`s the deserializer already put on
-        // `input`, and the response is read back out of the stored bridge.
-        let _ = ctx;
+        // The Region this request was signed for is the one an output a repointed flow
+        // source asks for on its new cloud flow is minted in; nothing else in this
+        // operation's answer depends on request metadata, because both the bridge ARN and the
+        // source name are `@httpLabel`s the deserializer already put on `input` and the
+        // response is read back out of the stored bridge.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateBridgeSourceErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -320,10 +322,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .clone()
                         .or_else(|| stored_flow.flow_vpc_interface_attachment.clone()),
                     // `BridgeFlowSource$Name` is the name the bridge addresses this source
-                    // by — the `@httpLabel` that resolved it — and `OutputArn` is "the
-                    // Amazon Resource Number (ARN) of the output" the service assigns.
-                    // Neither has a counterpart in the request shape, so both are carried
-                    // over untouched.
+                    // by — the `@httpLabel` that resolved it — and it has no counterpart in
+                    // the request shape, so it is carried over untouched. `OutputArn` is
+                    // "the Amazon Resource Number (ARN) of the output" the service creates
+                    // on the cloud flow for this source, so it is not a request member
+                    // either: it is carried over here and then reconciled against the flow
+                    // this source now names, which is what repoints it when the update moves
+                    // the source to another flow (see
+                    // `crate::state::ComAmazonawsMediaconnectMediaconnectState::sync_bridge_source_flow_outputs`).
                     name: stored_flow.name.clone(),
                     output_arn: stored_flow.output_arn.clone(),
                 }),
@@ -391,13 +397,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(&input.source_name));
         };
         *slot = updated;
-        let written = slot.clone();
+
+        // The output a flow source's cloud flow delivers through belongs to the source, so
+        // an update that repoints the source at another flow moves it too: the one
+        // reconciliation every path that stores a bridge source runs drops the output the old
+        // flow held, materialises one on the flow the source now names, and writes its ARN
+        // onto the source.
+        store.sync_bridge_source_flow_outputs(&region, now);
 
         // "The ARN of the updated bridge source" and "the updated bridge source" — both read
         // back out of the STORED bridge rather than echoed from the request, so the answer
         // can only report what this call actually wrote. Updating a source moves nothing
         // else about the bridge: its state is left as it was, because no clock owes a change
         // for an updated source.
+        let Some(bridge) = store.bridges.get(&input.bridge_arn) else {
+            return Err(not_found(&input.bridge_arn));
+        };
+        let Some(written) = bridge.sources.get(position).cloned() else {
+            return Err(not_found(&input.source_name));
+        };
         Ok(UpdateBridgeSourceOutput {
             bridge_arn: Some(bridge.bridge_arn.clone()),
             source: Some(written),

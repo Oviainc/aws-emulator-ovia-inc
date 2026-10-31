@@ -175,10 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing in this operation's answer depends on request metadata: both the bridge
-        // ARN and the source name are `@httpLabel`s the deserializer already put on
-        // `input`, and the response is read back out of the stored bridge.
-        let _ = ctx;
+        // The Region this request was signed for is the one the reconciliation below mints
+        // in; nothing else in this operation's answer depends on request metadata, because
+        // both the bridge ARN and the source name are `@httpLabel`s the deserializer already
+        // put on `input` and the response is read back out of the stored bridge.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(RemoveBridgeSourceErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -191,7 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // The bridge state change the clock already owes is materialised before the bridge
         // is read, exactly as AddBridgeSources and the reporting operations do it.
-        store.settle_due_transitions(::std::time::SystemTime::now());
+        let now = ::std::time::SystemTime::now();
+        store.settle_due_transitions(now);
 
         // This operation removes a source from "a bridge", addressed by the bridge's own
         // ARN.
@@ -238,6 +240,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let removed = bridge.sources.remove(position);
+        let bridge_arn = bridge.bridge_arn.clone();
+
+        // A flow source taken out of the bridge no longer asks for the output its cloud flow
+        // was delivering through, so that output goes with it: the one reconciliation every
+        // path that writes a bridge source runs drops it (see
+        // `crate::state::ComAmazonawsMediaconnectMediaconnectState::sync_bridge_source_flow_outputs`).
+        store.sync_bridge_source_flow_outputs(&region, now);
 
         // "The ARN of the bridge from which the source was removed" and "the name of the
         // bridge source that was removed" — both read out of the STORE rather than echoed
@@ -245,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Removing a source moves nothing else about the bridge: its state is left as it
         // was, because no clock owes a change for a removed source.
         Ok(RemoveBridgeSourceOutput {
-            bridge_arn: Some(bridge.bridge_arn.clone()),
+            bridge_arn: Some(bridge_arn),
             source_name: Some(crate::state::bridge_source_name(&removed).to_string()),
         })
     }

@@ -328,7 +328,7 @@ async fn create_bridge_admits_the_sources_the_bridge_s_direction_and_failover_st
                             .to_string();
                         let bridge = bridge_of(&emulator, &case, &arn).await;
                         assert_eq!(
-                            bridge["sources"],
+                            crate::bridge_lifecycle::without_output_arns(&case, &bridge["sources"]),
                             json!(sources),
                             "case {case:?}: the stored bridge holds the sources the create \
                              named, got {bridge}"
@@ -425,17 +425,24 @@ async fn add_bridge_sources_admits_the_sources_the_stored_bridge_s_direction_and
                              {code:?}: {answered}"
                         );
                         assert_eq!(
-                            answered["sources"],
+                            crate::bridge_lifecycle::without_output_arns(
+                                &case,
+                                &answered["sources"]
+                            ),
                             json!(added),
                             "case {case:?}: the answer carries the sources added, got {answered}"
                         );
-                        let mut expected: Vec<Value> = before["sources"]
+                        let mut expected: Vec<Value> =
+                            crate::bridge_lifecycle::without_output_arns(
+                                &case,
+                                &before["sources"],
+                            )
                             .as_array()
                             .cloned()
                             .unwrap_or_default();
                         expected.extend(added.clone());
                         assert_eq!(
-                            after["sources"],
+                            crate::bridge_lifecycle::without_output_arns(&case, &after["sources"]),
                             json!(expected),
                             "case {case:?}: the bridge holds what it held then what was added, \
                              got {after}"

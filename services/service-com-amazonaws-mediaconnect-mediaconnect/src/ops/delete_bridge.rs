@@ -157,10 +157,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing in this operation's answer depends on request metadata: the bridge is
-        // addressed by an `@httpLabel` the deserializer already put on `input`, and the
-        // response is read out of the record this call removed.
-        let _ = ctx;
+        // The Region this request was signed for is the one the reconciliation below mints
+        // in; nothing else in this operation's answer depends on request metadata, because
+        // the bridge is addressed by an `@httpLabel` the deserializer already put on `input`
+        // and the response is read out of the record this call removed.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteBridgeErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -233,6 +234,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The outputs the deleted bridge's flow sources asked for on their cloud flows go
+        // with the bridge: nothing records why they exist once it is gone, so the one
+        // reconciliation every path that writes a bridge source runs drops them (see
+        // `crate::state::ComAmazonawsMediaconnectMediaconnectState::sync_bridge_source_flow_outputs`).
+        store.sync_bridge_source_flow_outputs(&region, now);
 
         Ok(DeleteBridgeOutput {
             bridge_arn: Some(deleted.bridge_arn),

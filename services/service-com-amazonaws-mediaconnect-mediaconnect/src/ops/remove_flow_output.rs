@@ -12,6 +12,11 @@
 //! addresses nothing that "exist[s] in the system" and is refused with the modelled
 //! `NotFoundException`, exactly as an unknown flow ARN is.
 //!
+//! One output of a flow is NOT one a request configured, and so not one a request removes:
+//! the output the service created because a bridge took this flow as a source (it carries
+//! that bridge's ARN) belongs to the bridge source that asked for it, and the removal is
+//! refused while that source names the flow.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -192,8 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due_transitions(now);
 
         // This operation removes an output from "an existing flow", addressed by its own
-        // ARN.
-        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+        // ARN. The flow is resolved READ-ONLY first, so the output the request addresses is
+        // judged — and a refusal answered — before anything is written.
+        let Some(flow) = store.flows.get(&input.flow_arn) else {
             return Err(not_found(&input.flow_arn));
         };
 
@@ -217,6 +223,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(not_found(&input.output_arn));
         };
+
+        // An output carrying a bridge's ARN is not an output a request configured: it is the
+        // one the service created on this flow because a bridge took the flow as a source,
+        // and it belongs to that bridge source for exactly as long as the source names the
+        // flow. Removing it would strand the source, which no request could restate, so the
+        // removal is refused and the caller clears the bridge source instead — the same
+        // reading as for the mirror output a bridge holds for a flow source (see
+        // `crate::state::ComAmazonawsMediaconnectMediaconnectState::flow_bridge_output_removal_rejection`).
+        // Checked before anything is written, so a refused request leaves the flow exactly
+        // as it was.
+        if let Some(detail) =
+            store.flow_bridge_output_removal_rejection(&input.flow_arn, &input.output_arn)
+        {
+            return Err(RemoveFlowOutputErrorModeled::BadRequestException(BadRequestException {
+                message: crate::state::bad_request_message(&detail),
+            })
+            .into());
+        }
+
+        // Nothing above wrote anything, so a refused request leaves the flow exactly as it
+        // was. The position was resolved on this same flow under this same lock, so it still
+        // addresses the output the request named — and it is resolved against the flow again
+        // rather than indexed, so no arithmetic about the store's shape can reach a panic.
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(not_found(&input.flow_arn));
+        };
+        if position >= flow.outputs.len() {
+            return Err(not_found(&input.output_arn));
+        }
         let removed = flow.outputs.remove(position);
         let flow_arn = flow.flow_arn.clone();
         let removed_output_arn = removed.output_arn;

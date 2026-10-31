@@ -183,10 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing in this operation's answer depends on request metadata: the bridge is
-        // addressed by an `@httpLabel` the deserializer already put on `input`, and the
+        // The Region this request was signed for is the one the output a flow source asks
+        // for on its cloud flow is minted in, exactly as CreateBridge reads it; nothing else
+        // in this operation's answer depends on request metadata, because the bridge is
+        // addressed by an `@httpLabel` the deserializer already put on `input` and the
         // response is read back out of the stored bridge.
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error("the mediaconnect bridge store is unavailable"));
         };
@@ -204,7 +206,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The bridge state change the clock already owes is materialised before the bridge
         // is read, exactly as the reporting operations do it (see
         // `crate::state::TRANSITION_SPAN`).
-        store.settle_due_transitions(::std::time::SystemTime::now());
+        let now = ::std::time::SystemTime::now();
+        store.settle_due_transitions(now);
 
         // This operation adds sources to "an existing bridge", addressed by the bridge's
         // own ARN.
@@ -302,11 +305,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let first_added = bridge.sources.len();
         bridge.sources.extend(added);
 
+        // A flow source added here takes its content from a cloud flow, and the output
+        // through which that flow delivers it is the service's own record of the source: it
+        // is materialised, and the ARN it minted written onto the source, by the one
+        // reconciliation every path that stores a bridge source runs (see
+        // `crate::state::ComAmazonawsMediaconnectMediaconnectState::sync_bridge_source_flow_outputs`).
+        store.sync_bridge_source_flow_outputs(&region, now);
+
         // "The sources that you added to this bridge" — read back out of the STORED bridge
-        // rather than echoed from the request, and only the sources this call appended.
-        // Adding a source moves nothing else about the bridge: its state is left as it was,
-        // because no clock owes a change for an added source.
-        let sources: Vec<BridgeSource> = bridge.sources[first_added..].to_vec();
+        // rather than echoed from the request, and only the sources this call appended, so
+        // the answer carries the `OutputArn` the reconciliation just wrote. Adding a source
+        // moves nothing else about the bridge: its state is left as it was, because no clock
+        // owes a change for an added source.
+        let Some(bridge) = store.bridges.get(&input.bridge_arn) else {
+            return Err(internal_error(
+                "the bridge could not be read back after its sources were stored",
+            ));
+        };
+        let sources: Vec<BridgeSource> = bridge
+            .sources
+            .get(first_added..)
+            .map(<[BridgeSource]>::to_vec)
+            .unwrap_or_default();
         Ok(AddBridgeSourcesOutput {
             bridge_arn: Some(bridge.bridge_arn.clone()),
             sources: Some(sources),

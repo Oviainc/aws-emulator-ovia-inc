@@ -399,10 +399,17 @@ async fn a_flow_source_is_added_only_for_a_flow_the_account_holds() {
              {answered}"
         );
         let after = bridge_of(&emulator, &case, &arn).await;
-        let mut expected: Vec<Value> = before["sources"].as_array().cloned().unwrap_or_default();
+        // Every flow source also carries the `OutputArn` of the output the service created
+        // on its cloud flow for the bridge, which these rows cannot state (see
+        // `crate::bridge_lifecycle::without_output_arns`).
+        let mut expected: Vec<Value> =
+            crate::bridge_lifecycle::without_output_arns(&case, &before["sources"])
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
         expected.extend(added);
         assert_eq!(
-            after["sources"],
+            crate::bridge_lifecycle::without_output_arns(&case, &after["sources"]),
             json!(expected),
             "case {case:?}: the bridge holds what it held then what was added, got {after}"
         );
