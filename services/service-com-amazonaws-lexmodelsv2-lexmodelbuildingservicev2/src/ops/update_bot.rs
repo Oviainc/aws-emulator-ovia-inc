@@ -227,9 +227,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .any(|bot| bot.bot_name == input.bot_name && bot.bot_id != input.bot_id);
         if renaming_to_a_taken_name {
             return Err(UpdateBotErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "A bot with the name {} already exists; choose another name",
-                    input.bot_name
+                message: Some(crate::state::name_already_exists(
+                    crate::state::BOT_RESOURCE_LABEL,
+                    &input.bot_name,
                 )),
             })
             .into());

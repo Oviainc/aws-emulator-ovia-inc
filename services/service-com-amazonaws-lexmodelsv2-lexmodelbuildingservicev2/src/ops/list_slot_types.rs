@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSlotTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSlotTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSlotTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the listing is built from the slot types stored in the bot, bot version
+//! and locale the URI names — filtered, ordered and paged as the request asks — so it
+//! reports the same definitions `DescribeSlotType` reads back. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +169,222 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSlotTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSlotTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSlotTypes"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSlotTypesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        // The sort and filter members carry modelled enums, which the wire renders as
+        // plain strings: refuse a value outside the enum rather than silently ignoring
+        // it, the same way `ListBots` does.
+        let mut attribute = crate::state::SLOT_TYPE_SORT_ATTRIBUTES[0];
+        let mut descending = false;
+        if let Some(sort_by) = &input.sort_by {
+            let Some(named) = crate::state::SLOT_TYPE_SORT_ATTRIBUTES
+                .into_iter()
+                .find(|known| *known == sort_by.attribute)
+            else {
+                return Err(invalid(format!(
+                    "sortBy.attribute must be one of [{}]; received {}",
+                    crate::state::SLOT_TYPE_SORT_ATTRIBUTES.join(", "),
+                    sort_by.attribute
+                )));
+            };
+            if !crate::state::SORT_ORDERS.contains(&sort_by.order.as_str()) {
+                return Err(invalid(format!(
+                    "sortBy.order must be one of [{}]; received {}",
+                    crate::state::SORT_ORDERS.join(", "),
+                    sort_by.order
+                )));
+            }
+            attribute = named;
+            descending = sort_by.order == "Descending";
+        }
+        let filters = input.filters.unwrap_or_default();
+        for filter in &filters {
+            if !crate::state::SLOT_TYPE_FILTER_NAMES.contains(&filter.name.as_str()) {
+                return Err(invalid(format!(
+                    "filters.name must be one of [{}]; received {}",
+                    crate::state::SLOT_TYPE_FILTER_NAMES.join(", "),
+                    filter.name
+                )));
+            }
+            if !crate::state::SLOT_TYPE_FILTER_OPERATORS.contains(&filter.operator.as_str()) {
+                return Err(invalid(format!(
+                    "filters.operator must be one of [{}]; received {}",
+                    crate::state::SLOT_TYPE_FILTER_OPERATORS.join(", "),
+                    filter.operator
+                )));
+            }
+        }
+
+        // `maxResults` carries the modelled range 1..1000. A value outside it is
+        // refused, not reinterpreted; a request that asks for no page size is served the
+        // modelled maximum, which keeps every response bounded.
+        let page_size = match input.max_results {
+            Some(max_results) => {
+                let requested = usize::try_from(max_results)
+                    .ok()
+                    .filter(|size| (1..=crate::state::MAX_LIST_PAGE).contains(size));
+                let Some(page_size) = requested else {
+                    return Err(invalid(format!(
+                        "maxResults must be between 1 and {}; received {max_results}",
+                        crate::state::MAX_LIST_PAGE
+                    )));
+                };
+                page_size
+            }
+            None => crate::state::MAX_LIST_PAGE,
+        };
+
+        let store = state.lock();
+
+        // The listing is scoped to the one locale of the one bot version the URI names,
+        // so a slot type of any other triple is not in it.
+        let mut page: Vec<(String, String, SlotTypeSummary)> = store
+            .slot_types_in_locale(&input.bot_id, &input.bot_version, &input.locale_id)
+            .filter(|slot_type| {
+                filters.iter().all(|filter| {
+                    let field = match filter.name.as_str() {
+                        "SlotTypeName" => Some(slot_type.slot_type_name.as_str()),
+                        // "ExternalSourceType" — the only other modelled filter name.
+                        _ => slot_type.external_source_type(),
+                    };
+                    matches_filter(field, filter)
+                })
+            })
+            .map(|slot_type| {
+                let (key, id) = sort_key(slot_type, attribute);
+                (key, id, slot_type.summary())
+            })
+            .collect();
+
+        // Ordered by the attribute the request asked for, with the `slotTypeId` as the
+        // tiebreak: that keeps the order total, which is what makes `nextToken` paging
+        // stable across calls.
+        page.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+        if descending {
+            page.reverse();
+        }
+
+        // The cursor `nextToken` carries is the sort key of the first entry of the page
+        // it opens, so the remainder is resolved against the same total order: a slot
+        // type deleted between pages does not strand the listing, which resumes at the
+        // first entry at or after the cursor.
+        if let Some(token) = input.next_token.as_deref() {
+            let Some(cursor) = parse_cursor(token) else {
+                return Err(invalid(format!(
+                    "nextToken {token} is not a token this operation issued; restart the listing"
+                )));
+            };
+            let resume_at = page
+                .iter()
+                .position(|entry| at_or_after(entry, &cursor, descending))
+                .unwrap_or(page.len());
+            page.drain(..resume_at);
+        }
+
+        // Whatever is left over is handed back as an opaque token, so the page itself is
+        // always within `page_size`.
+        let next_token = if page.len() > page_size {
+            let remainder = page.split_off(page_size);
+            remainder.first().map(render_cursor)
+        } else {
+            None
+        };
+
+        Ok(ListSlotTypesOutput {
+            bot_id: Some(input.bot_id),
+            bot_version: Some(input.bot_version),
+            locale_id: Some(input.locale_id),
+            slot_type_summaries: Some(
+                page.into_iter().map(|(_, _, summary)| summary).collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// An entry's place in the total order being returned: the value of the attribute the
+/// request sorts by, then the `slotTypeId`.
+///
+/// `LastUpdatedDateTime` is rendered as zero-padded nanoseconds since the epoch, so
+/// comparing the keys as text orders them the way comparing the instants does.
+fn sort_key(slot_type: &crate::state::SlotType, attribute: &str) -> (String, String) {
+    let key = match attribute {
+        "LastUpdatedDateTime" => {
+            let since_epoch = slot_type
+                .last_updated_date_time
+                .duration_since(::std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            format!("{:030}", since_epoch.as_nanos())
+        }
+        // "SlotTypeName" — the only other modelled sort attribute.
+        _ => slot_type.slot_type_name.clone(),
+    };
+    (key, slot_type.slot_type_id.clone())
+}
+
+/// The opaque `nextToken` that resumes a listing at `entry`.
+///
+/// The cursor inside it is the entry's sort key; neither a padded instant nor a
+/// `slotTypeName` nor a `slotTypeId` can contain `/` (the modelled patterns allow only
+/// alphanumerics plus `_` and `-`), so the pair is unambiguous, and
+/// [`crate::state::encode_page_token`] renders it opaque.
+fn render_cursor(entry: &(String, String, SlotTypeSummary)) -> String {
+    crate::state::encode_page_token(&format!("{}/{}", entry.0, entry.1))
+}
+
+/// The sort key a `nextToken` carries, or `None` when it is not a token this operation
+/// issued.
+fn parse_cursor(token: &str) -> Option<(String, String)> {
+    let cursor = crate::state::decode_page_token(token)?;
+    let (key, id) = cursor.split_once('/')?;
+    (!id.is_empty()).then(|| (key.to_string(), id.to_string()))
+}
+
+/// Does this entry sort at or after `cursor` in the order being returned?
+fn at_or_after(
+    entry: &(String, String, SlotTypeSummary),
+    cursor: &(String, String),
+    descending: bool,
+) -> bool {
+    let key = (entry.0.as_str(), entry.1.as_str());
+    let cursor = (cursor.0.as_str(), cursor.1.as_str());
+    if descending {
+        key <= cursor
+    } else {
+        key >= cursor
+    }
+}
+
+/// Refuse the request with the modelled `ValidationException` (HTTP 400).
+fn invalid(message: String) -> ListSlotTypesError {
+    ListSlotTypesErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Does the slot type's value for a filtered field satisfy `filter`?
+///
+/// `EQ` is equality and `CO` containment
+/// (`smithy_query(query="shape",shape="SlotTypeFilterOperator")`, which models no
+/// negated operator). A slot type that does not carry the field at all equals no value
+/// and contains none, so it passes neither.
+fn matches_filter(field: Option<&str>, filter: &SlotTypeFilter) -> bool {
+    match filter.operator.as_str() {
+        "EQ" => filter
+            .values
+            .iter()
+            .any(|value| field == Some(value.as_str())),
+        // "CO" — the only other modelled operator.
+        _ => filter
+            .values
+            .iter()
+            .any(|value| field.is_some_and(|field| field.contains(value.as_str()))),
     }
 }

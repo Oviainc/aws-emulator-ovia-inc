@@ -10,16 +10,16 @@
 //! The locale slice (`CreateBotLocale`, `DescribeBotLocale`) is served the same way out
 //! of `bot_locales`, keyed by the bot, bot version and locale the request names.
 //!
-//! The slot type slice (`CreateSlotType`, `DescribeSlotType`) is served out of
-//! `slot_types`: a custom slot type is defined inside one locale of one bot version, so
-//! every record carries that triple and every read is scoped by it.
+//! The slot type slice (`CreateSlotType`, `DescribeSlotType`, `ListSlotTypes`) is served
+//! out of `slot_types`: a custom slot type is defined inside one locale of one bot
+//! version, so every record carries that triple and every read is scoped by it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     AudioFillerSettings, BotMember, BotSummary, CompositeSlotTypeSetting, DataPrivacy,
-    ErrorLogSettings, ExternalSourceSetting, GenerativeAISettings, SlotTypeValue,
+    ErrorLogSettings, ExternalSourceSetting, GenerativeAISettings, SlotTypeSummary, SlotTypeValue,
     SlotValueSelectionSetting, SpeakerDiarizationSettings, SpeechRecognitionSettings,
     UnifiedSpeechSettings, VoiceSettings,
 };
@@ -115,6 +115,38 @@ pub const BOT_FILTER_NAMES: [&str; 2] = ["BotName", "BotType"];
 /// (`smithy_query(query="shape",shape="BotFilterOperator")`).
 pub const BOT_FILTER_OPERATORS: [&str; 3] = ["CO", "EQ", "NE"];
 
+/// Every member of the modelled `SlotTypeSortAttribute` enum
+/// (`smithy_query(query="shape",shape="SlotTypeSortAttribute")`).
+pub const SLOT_TYPE_SORT_ATTRIBUTES: [&str; 2] = ["SlotTypeName", "LastUpdatedDateTime"];
+
+/// Every member of the modelled `SlotTypeFilterName` enum
+/// (`smithy_query(query="shape",shape="SlotTypeFilterName")`).
+pub const SLOT_TYPE_FILTER_NAMES: [&str; 2] = ["SlotTypeName", "ExternalSourceType"];
+
+/// Every member of the modelled `SlotTypeFilterOperator` enum
+/// (`smithy_query(query="shape",shape="SlotTypeFilterOperator")`), which — unlike
+/// [`BOT_FILTER_OPERATORS`] — carries no `NE`.
+pub const SLOT_TYPE_FILTER_OPERATORS: [&str; 2] = ["CO", "EQ"];
+
+/// Members of the modelled `SlotTypeCategory` enum
+/// (`smithy_query(query="shape",shape="SlotTypeCategory")`): Custom | Extended |
+/// ExternalGrammar | Composite. Which one a stored slot type falls in is
+/// [`SlotType::category`].
+pub const SLOT_TYPE_CATEGORY_CUSTOM: &str = "Custom";
+/// See [`SLOT_TYPE_CATEGORY_CUSTOM`].
+pub const SLOT_TYPE_CATEGORY_EXTENDED: &str = "Extended";
+/// See [`SLOT_TYPE_CATEGORY_CUSTOM`].
+pub const SLOT_TYPE_CATEGORY_EXTERNAL_GRAMMAR: &str = "ExternalGrammar";
+/// See [`SLOT_TYPE_CATEGORY_CUSTOM`].
+pub const SLOT_TYPE_CATEGORY_COMPOSITE: &str = "Composite";
+
+/// The external source a slot type takes its values from, as the `ExternalSourceType`
+/// filter of `ListSlotTypes` names it: the member of the modelled
+/// `ExternalSourceSetting` the slot type carries
+/// (`smithy_query(query="shape",shape="ExternalSourceSetting")` declares exactly one,
+/// `grammarSlotTypeSetting`).
+pub const EXTERNAL_SOURCE_TYPE_GRAMMAR: &str = "GrammarSlotTypeSetting";
+
 /// How long after a create the `Creating` -> settled transition falls due: `Available`
 /// for a bot, `NotBuilt` for a bot locale.
 ///
@@ -145,6 +177,29 @@ pub const BOTS_PER_ACCOUNT_QUOTA: usize = 100;
 /// locale ids of [`SUPPORTED_LOCALES`] times this many records, so a caller cannot grow
 /// that map past it.
 pub const SLOT_TYPES_PER_LOCALE_QUOTA: usize = 1_000;
+
+/// How Amazon Lex V2 names a bot in a message about a name that is already in use.
+/// See [`name_already_exists`].
+pub const BOT_RESOURCE_LABEL: &str = "Bot";
+
+/// How Amazon Lex V2 names a slot type in a message about a name that is already in
+/// use. See [`name_already_exists`].
+pub const SLOT_TYPE_RESOURCE_LABEL: &str = "Slot Type";
+
+/// The message this service answers when the name a request asks for is already in use
+/// where that name has to be unique.
+///
+/// The template names the kind of resource whose name was taken and the name the
+/// request asked for, and carries no other identifier: the scope the name has to be
+/// unique in (an account, a bot version, a locale) is not part of the message, so a
+/// client matching on this refusal sees the same text whatever the scope was.
+///
+/// `resource_label` is how the service names that kind of resource —
+/// [`BOT_RESOURCE_LABEL`], [`SLOT_TYPE_RESOURCE_LABEL`] — and `name` is the requested
+/// name, copied from the request verbatim.
+pub fn name_already_exists(resource_label: &str, name: &str) -> String {
+    format!("{resource_label} with name {name} already exists. Use another name.")
+}
 
 /// The largest page `ListBots` returns, which is the modelled `MaxResults` maximum
 /// (`smithy_query(query="operation",operation="ListBots")`: range 1..1000). It also
@@ -336,6 +391,44 @@ impl SlotType {
     /// list, since the modelled `SlotTypeValues` list has a minimum length of 1.
     pub fn wire_slot_type_values(&self) -> Option<Vec<SlotTypeValue>> {
         (!self.slot_type_values.is_empty()).then(|| self.slot_type_values.clone())
+    }
+
+    /// Which member of the modelled `SlotTypeCategory` enum this slot type falls in,
+    /// read off how it was defined: one composed of sub slot types is `Composite`, one
+    /// whose values come from a source held outside the bot is `ExternalGrammar`, one
+    /// built on a parent signature extends it, and a slot type that enumerates its own
+    /// values is a plain custom one.
+    pub fn category(&self) -> &'static str {
+        if self.composite_slot_type_setting.is_some() {
+            SLOT_TYPE_CATEGORY_COMPOSITE
+        } else if self.external_source_setting.is_some() {
+            SLOT_TYPE_CATEGORY_EXTERNAL_GRAMMAR
+        } else if self.parent_slot_type_signature.is_some() {
+            SLOT_TYPE_CATEGORY_EXTENDED
+        } else {
+            SLOT_TYPE_CATEGORY_CUSTOM
+        }
+    }
+
+    /// The external source this slot type takes its values from, as the
+    /// `ExternalSourceType` filter of `ListSlotTypes` names it, or `None` when its
+    /// values are enumerated in the bot.
+    pub fn external_source_type(&self) -> Option<&'static str> {
+        self.external_source_setting
+            .as_ref()
+            .map(|_| EXTERNAL_SOURCE_TYPE_GRAMMAR)
+    }
+
+    /// This slot type as a `ListSlotTypes` summary entry.
+    pub fn summary(&self) -> SlotTypeSummary {
+        SlotTypeSummary {
+            slot_type_id: Some(self.slot_type_id.clone()),
+            slot_type_name: Some(self.slot_type_name.clone()),
+            description: self.description.clone(),
+            parent_slot_type_signature: self.parent_slot_type_signature.clone(),
+            last_updated_date_time: Some(to_date_time(self.last_updated_date_time)),
+            slot_type_category: Some(self.category().to_string()),
+        }
     }
 }
 

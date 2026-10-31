@@ -234,9 +234,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The bot name must be unique in the account that creates the bot."
         if store.bot_name_taken(&input.bot_name) {
             return Err(CreateBotErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "A bot with the name {} already exists; choose another name",
-                    input.bot_name
+                message: Some(crate::state::name_already_exists(
+                    crate::state::BOT_RESOURCE_LABEL,
+                    &input.bot_name,
                 )),
             })
             .into());

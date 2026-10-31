@@ -285,9 +285,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(CreateSlotTypeErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "A slot type with the name {} already exists in locale {} of bot {} version {}. Choose a different name and try again.",
-                        input.slot_type_name, input.locale_id, input.bot_id, input.bot_version
+                    message: Some(crate::state::name_already_exists(
+                        crate::state::SLOT_TYPE_RESOURCE_LABEL,
+                        &input.slot_type_name,
                     )),
                 },
             )

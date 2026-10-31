@@ -48,7 +48,7 @@ const ECHOED_BY_DESCRIBE: [&str; 6] = [
 
 /// `CreateSlotType`'s URI:
 /// `PUT /bots/{botId}/botversions/{botVersion}/botlocales/{localeId}/slottypes`.
-fn slot_types_uri(bot_id: &str, bot_version: &str, locale_id: &str) -> String {
+pub(crate) fn slot_types_uri(bot_id: &str, bot_version: &str, locale_id: &str) -> String {
     format!("/bots/{bot_id}/botversions/{bot_version}/botlocales/{locale_id}/slottypes")
 }
 
@@ -58,7 +58,7 @@ fn slot_type_uri(bot_id: &str, bot_version: &str, locale_id: &str, slot_type_id:
 }
 
 /// A `CreateSlotType` request body carrying the required `slotTypeName` plus `extra`.
-fn slot_type_body(name: &str, extra: Value) -> Value {
+pub(crate) fn slot_type_body(name: &str, extra: Value) -> Value {
     let mut body = json!({ "slotTypeName": name });
     let object = body.as_object_mut().expect("the body is a JSON object");
     for (key, value) in extra.as_object().expect("extras are a JSON object") {
@@ -87,7 +87,11 @@ fn expected_selection(request: &Value) -> Value {
 }
 
 /// Create a bot and one locale on its `DRAFT` version, and return the minted `botId`.
-async fn host_locale(router: &MultiServiceRouter, bot_name: &str, locale_id: &str) -> String {
+pub(crate) async fn host_locale(
+    router: &MultiServiceRouter,
+    bot_name: &str,
+    locale_id: &str,
+) -> String {
     let bot_id = host_bot(router, bot_name).await;
     let (status, created) = call(
         router,
@@ -104,7 +108,7 @@ async fn host_locale(router: &MultiServiceRouter, bot_name: &str, locale_id: &st
 }
 
 /// Create a slot type, assert it was accepted, and return its minted id.
-async fn create_slot_type(
+pub(crate) async fn create_slot_type(
     router: &MultiServiceRouter,
     bot_id: &str,
     locale_id: &str,
@@ -139,7 +143,7 @@ async fn slot_types_count(router: &MultiServiceRouter, bot_id: &str, locale_id: 
 
 /// A slot type name of exactly `len` characters satisfying the modelled `Name` pattern
 /// `^([0-9a-zA-Z][_-]?){1,100}$`.
-fn name_of_length(len: usize) -> String {
+pub(crate) fn name_of_length(len: usize) -> String {
     "SlotType".chars().cycle().take(len).collect()
 }
 

@@ -15,9 +15,13 @@
 mod bot_lifecycle;
 #[path = "all/bot_locale.rs"]
 mod bot_locale;
+#[path = "all/name_already_exists.rs"]
+mod name_already_exists;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/slot_type.rs"]
 mod slot_type;
+#[path = "all/slot_type_listing.rs"]
+mod slot_type_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
