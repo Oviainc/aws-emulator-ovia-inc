@@ -36,6 +36,10 @@ fn updatable_members() -> Vec<&'static str> {
 /// (`smithy_query(query="shape",shape="TransformerStatus")`).
 const TRANSFORMER_STATUS_VALUES: &[&str] = &["active", "inactive"];
 
+/// The fixed text this service refuses an update of an `active` transformer with: the
+/// whole message, interpolating nothing.
+pub(crate) const ACTIVE_IS_IMMUTABLE: &str = "An active Transformer cannot be updated";
+
 /// Create a transformer from `request` and return its create response.
 async fn created_transformer(
     router: &MultiServiceRouter,
@@ -224,14 +228,18 @@ async fn an_update_writes_the_named_members_and_leaves_the_rest() {
     }
 }
 
-/// RULE: `status` is a plain member of the stored record, so it moves to either value of
-/// the modelled `TransformerStatus` enum as often as a caller asks — including re-setting
-/// the value it already holds — and every read in between reports the value last written.
+/// RULE: a stored transformer moves from `inactive` to `active`, and that is the only
+/// transition a caller can drive — the model documents no other
+/// (`UpdateTransformerRequest$status`: "You can update the state of the transformer from
+/// inactive to active"), so once the record is `active` every further update is refused
+/// with the modelled `ValidationException` (HTTP 400, member `Message`) and the stored
+/// status stays `active`.
 ///
-/// The rows walk a toggle sequence that covers both directions, both no-op re-sets and a
-/// configuration rewrite performed while the record is `inactive`.
+/// The rows are every value of the modelled `TransformerStatus` enum sent against an
+/// active record — including the value it already holds — plus the `inactive` flip the
+/// recorded refusal was taken from.
 #[tokio::test]
-async fn status_toggles_between_every_modelled_value() {
+async fn the_status_moves_to_active_once_and_no_further_update_is_taken() {
     let router = b2bi_router();
     let current = current_members();
     let (transformer_id, created) = created_transformer(
@@ -246,35 +254,48 @@ async fn status_toggles_between_every_modelled_value() {
         "a new transformer rests inactive, got {created}"
     );
 
-    // Every ordered pair of the enum's values, so each direction and each no-op re-set is
-    // exercised: inactive -> active -> active -> inactive -> inactive -> active.
-    let mut sequence: Vec<&str> = Vec::new();
-    for from in TRANSFORMER_STATUS_VALUES {
-        for to in TRANSFORMER_STATUS_VALUES {
-            sequence.push(from);
-            sequence.push(to);
-        }
-    }
+    // The one documented transition, served.
+    let (status, activated) = call(
+        &router,
+        "UpdateTransformer",
+        json!({ "transformerId": transformer_id, "status": "active" }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the inactive -> active move must succeed, got {status} {activated}"
+    );
+    assert_eq!(
+        text(&activated, "status"),
+        "active",
+        "the move must be reported, got {activated}"
+    );
 
-    for (step, target) in sequence.iter().enumerate() {
-        let case = format!("step {step} -> {target}");
-        let (status, updated) = call(
+    // Every status a caller can ask for next, refused.
+    for target in TRANSFORMER_STATUS_VALUES {
+        let case = format!("status -> {target}");
+        let (status, body) = call(
             &router,
             "UpdateTransformer",
             json!({ "transformerId": transformer_id, "status": target }),
         )
         .await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: the status move must succeed, got {status} {updated}"
+            status, 400,
+            "case {case:?}: an active transformer takes no further update, got {status} {body}"
         );
         assert_eq!(
-            text(&updated, "status"),
-            *target,
-            "case {case:?}: expected status {target:?}, got {:?}",
-            updated["status"]
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body}"
+        );
+        assert_eq!(
+            text(&body, "Message"),
+            ACTIVE_IS_IMMUTABLE,
+            "case {case:?}: unexpected refusal text, got {body}"
         );
 
+        // Nothing was written: the record still reports `active` and its configuration.
         let (status, fetched) = call(
             &router,
             "GetTransformer",
@@ -287,142 +308,136 @@ async fn status_toggles_between_every_modelled_value() {
         );
         assert_eq!(
             text(&fetched, "status"),
-            *target,
-            "case {case:?}: the reader must report the status last written, got {:?}",
+            "active",
+            "case {case:?}: the refused update must leave the status active, got {:?}",
             fetched["status"]
         );
         assert_eq!(
             fetched["inputConversion"], created["inputConversion"],
-            "case {case:?}: a status move must not touch the configuration, got {:?}",
+            "case {case:?}: the refused update must not touch the configuration, got {:?}",
             fetched["inputConversion"]
         );
     }
 }
 
-/// RULE: the configuration of a transformer that is currently `active` is immutable — an
-/// update naming any configuration member is refused with the modelled
-/// `ConflictException` (HTTP 409) and writes nothing — while `name` and `status` stay
-/// updatable, so deactivating the transformer makes the same rewrite succeed.
+/// RULE: once a transformer's stored status is `active` it is immutable — EVERY
+/// `UpdateTransformer` against it is refused with the modelled `ValidationException`
+/// (HTTP 400, member `Message`) carrying the service's fixed text, and nothing is written —
+/// while the identical update against the same transformer while it is still `inactive` is
+/// served.
 ///
-/// Source: the recorded AWS behaviour for
-/// `b2bi.update-transformer-immutable-fields-once-active-rejected`. The status and the
-/// error code are the requirement; the message is the one this handler builds from the
-/// request, so the rows assert that it names the member they tried to rewrite.
-///
-/// The rows are every one of the eight configuration members, in both styles.
+/// The rows are every member `UpdateTransformer` can write (the eight configuration
+/// members in both styles, plus `name` and `status`), each asserted twice: served on an
+/// inactive transformer, refused on an active one.
 #[tokio::test]
-async fn the_configuration_of_an_active_transformer_cannot_be_rewritten() {
+async fn an_active_transformer_takes_no_update_at_all() {
     let router = b2bi_router();
     let current = current_members();
-    let (transformer_id, created) = created_transformer(
-        &router,
-        SIGNING_REGION,
-        json!({ "name": "locked", "inputConversion": current[0].1 }),
-    )
-    .await;
 
-    let (status, activated) = call(
-        &router,
-        "UpdateTransformer",
-        json!({ "transformerId": transformer_id, "status": "active" }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "activating the transformer must succeed, got {status} {activated}"
-    );
+    // (member, a value its own shape accepts)
+    let mut members: Vec<(&'static str, Value)> = vec![
+        ("name", json!("renamed_while_inactive")),
+        ("status", json!("active")),
+    ];
+    members.extend(legacy_members());
+    members.extend(current_members());
 
-    for (member, value) in legacy_members().into_iter().chain(current_members()) {
-        let (status, body) = call(
+    for (member, value) in &members {
+        // The positive control: the same write, on a transformer that is still inactive.
+        let (inactive_id, _) = created_transformer(
+            &router,
+            SIGNING_REGION,
+            json!({ "name": "mutable-while-inactive", "fileFormat": "JSON" }),
+        )
+        .await;
+        let (status, served) = call(
             &router,
             "UpdateTransformer",
-            json!({ "transformerId": transformer_id, member: value }),
+            json!({ "transformerId": inactive_id, (*member): value }),
         )
         .await;
         assert_eq!(
-            status, 409,
-            "case {member:?}: rewriting an active transformer's configuration must be \
-             refused, got {status} {body}"
+            status, 200,
+            "case {member:?}: an inactive transformer must take the update, got {status} {served}"
+        );
+        assert_eq!(
+            served[*member], *value,
+            "case {member:?}: the update must be stored, got {:?}",
+            served[*member]
+        );
+
+        // The same write against an ACTIVE transformer, refused.
+        let (active_id, active_created) = created_transformer(
+            &router,
+            SIGNING_REGION,
+            json!({ "name": "locked", "inputConversion": current[0].1 }),
+        )
+        .await;
+        let (status, activated) = call(
+            &router,
+            "UpdateTransformer",
+            json!({ "transformerId": active_id, "status": "active" }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {member:?}: activating the transformer must succeed, got {status} {activated}"
+        );
+
+        let (status, body) = call(
+            &router,
+            "UpdateTransformer",
+            json!({ "transformerId": active_id, (*member): value }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {member:?}: updating an active transformer must be refused, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
-            "ConflictException",
-            "case {member:?}: expected ConflictException, got {body}"
+            "ValidationException",
+            "case {member:?}: expected ValidationException, got {body}"
         );
-        // `ConflictException`'s member is `message` —
-        // `smithy_query(query="shape",shape="ConflictException")`.
-        let message = text(&body, "message");
-        assert!(
-            message.contains(member) && message.contains(&transformer_id),
-            "case {member:?}: the refusal must name the member and the transformer, got \
-             {message:?}"
+        // `ValidationException`'s member is `Message` (capital M) in this service's model —
+        // `smithy_query(query="shape",shape="ValidationException")`.
+        assert_eq!(
+            text(&body, "Message"),
+            ACTIVE_IS_IMMUTABLE,
+            "case {member:?}: unexpected refusal text, got {body}"
         );
 
-        // Nothing was written: the stored record still holds the created configuration.
+        // Nothing was written: the active record still holds what it was activated with.
         let (status, fetched) = call(
             &router,
             "GetTransformer",
-            json!({ "transformerId": transformer_id }),
+            json!({ "transformerId": active_id }),
         )
         .await;
         assert_eq!(
             status, 200,
             "case {member:?}: GetTransformer must succeed, got {status} {fetched}"
         );
+        assert_eq!(
+            text(&fetched, "name"),
+            "locked",
+            "case {member:?}: the refused update must not have renamed the transformer, got \
+             {fetched}"
+        );
+        assert_eq!(
+            fetched["status"],
+            json!("active"),
+            "case {member:?}: the refused update must leave the status active, got {fetched}"
+        );
         for configuration_member in CONFIGURATION_MEMBERS {
             assert_eq!(
-                fetched[*configuration_member], created[*configuration_member],
+                fetched[*configuration_member], active_created[*configuration_member],
                 "case {member:?}: the refused update must not have written \
                  {configuration_member}: got {:?}, created with {:?}",
-                fetched[*configuration_member], created[*configuration_member]
+                fetched[*configuration_member], active_created[*configuration_member]
             );
         }
     }
-
-    // `name` is not configuration, so it is updatable while active.
-    let (status, renamed) = call(
-        &router,
-        "UpdateTransformer",
-        json!({ "transformerId": transformer_id, "name": "locked_but_renamed" }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "renaming an active transformer must succeed, got {status} {renamed}"
-    );
-    assert_eq!(
-        text(&renamed, "name"),
-        "locked_but_renamed",
-        "the rename must be stored, got {renamed}"
-    );
-
-    // Deactivating it releases the configuration: the very rewrite refused above is served.
-    let (status, deactivated) = call(
-        &router,
-        "UpdateTransformer",
-        json!({ "transformerId": transformer_id, "status": "inactive" }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "deactivating the transformer must succeed, got {status} {deactivated}"
-    );
-    let (status, rewritten) = call(
-        &router,
-        "UpdateTransformer",
-        json!({ "transformerId": transformer_id, "mapping": current[1].1 }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "the same rewrite must be served once the transformer is inactive, got \
-         {status} {rewritten}"
-    );
-    assert_eq!(
-        rewritten["mapping"], current[1].1,
-        "the rewrite must be stored, got {:?}",
-        rewritten["mapping"]
-    );
 }
 
 /// RULE: an update naming BOTH a member the model marks `@deprecated` and a member that

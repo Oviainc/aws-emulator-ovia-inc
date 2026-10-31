@@ -77,7 +77,9 @@ pub const TRANSFORMER_STATUS_INACTIVE: &str = "inactive";
 /// The other value of the modelled `TransformerStatus` enum (`active` | `inactive`,
 /// `smithy_query(query="shape",shape="TransformerStatus")`): the state a transformer has
 /// to be in to be used — by a capability, and by a transformer job
-/// (`StartTransformerJob`) — and the state its configuration rests immutable in (see
+/// (`StartTransformerJob`) — and the TERMINAL state of a transformer's own lifecycle: the
+/// model documents the single transition `inactive` -> `active`
+/// (`UpdateTransformerRequest$status`), so an active record takes no further update (see
 /// `UpdateTransformer`).
 pub const TRANSFORMER_STATUS_ACTIVE: &str = "active";
 
@@ -617,11 +619,25 @@ pub fn partnership_not_found(partnership_id: &str) -> String {
     format!("Partnership with partnershipId {partnership_id} not found.")
 }
 
-/// The `ResourceNotFoundException` message for an unknown `transformerId`.
+/// The `ResourceNotFoundException` message for a `transformerId` an operation resolves as
+/// its OWN identifier — `GetTransformer`, `UpdateTransformer`, `DeleteTransformer`,
+/// `StartTransformerJob`.
 ///
-/// The recorded form for a transformer carries no trailing period, unlike the three
-/// above; each template is the one recorded for that resource type.
+/// The recorded form for that path states the fixed phrase first and the id last, unlike
+/// the three above. A transformer has TWO recorded templates, one per path an id arrives
+/// on; the one for a reference another resource holds is
+/// [`transformer_reference_not_found`].
 pub fn transformer_not_found(transformer_id: &str) -> String {
+    format!("Transformer not found with ID {transformer_id}")
+}
+
+/// The `ResourceNotFoundException` message for a `transformerId` ANOTHER resource's
+/// configuration references and this store holds no transformer for — the reference
+/// `CreateCapability` resolves before it mints anything.
+///
+/// The recorded form for that path names the member the reference arrived in, so it is a
+/// different template from [`transformer_not_found`].
+pub fn transformer_reference_not_found(transformer_id: &str) -> String {
     format!("Transformer with transformerId {transformer_id} not found")
 }
 

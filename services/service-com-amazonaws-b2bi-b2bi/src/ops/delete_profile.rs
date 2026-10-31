@@ -206,6 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ConflictException` is modelled for exactly this: "you attempt to delete a
         // resource (such as a profile or a capability) that is being used by other
         // resources". A partnership names the profile it was created under.
+        //
+        // The service states this refusal in fixed text followed by the profile id the
+        // request named, so a client can read the blocked id back out of the message —
+        // the same template `DeleteCapability` states for a blocked capability.
         if state
             .partnerships
             .values()
@@ -213,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(DeleteProfileErrorModeled::ConflictException(ConflictException {
                 message: format!(
-                    "Profile {} is in use by one or more partnerships and cannot be deleted",
+                    "Partnership still exists for profile ID {}",
                     input.profile_id
                 ),
             })

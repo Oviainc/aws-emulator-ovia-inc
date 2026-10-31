@@ -220,7 +220,11 @@ fn store_full() -> CreateCapabilityError {
 /// union (rather than reaching straight into `edi`) means the day the model adds another
 /// configuration variant, its references are resolved too — the match stops compiling
 /// until they are.
-fn referenced_transformers(configuration: &CapabilityConfiguration) -> Vec<&str> {
+///
+/// Shared with `DeleteTransformer`, which asks the opposite question (is this transformer
+/// still referenced?) of the same member, so both see one definition of "a capability
+/// references a transformer".
+pub(crate) fn referenced_transformers(configuration: &CapabilityConfiguration) -> Vec<&str> {
     match configuration {
         CapabilityConfiguration::Edi(edi) => vec![edi.transformer_id.as_str()],
     }
@@ -338,7 +342,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !state.transformers.contains_key(transformer_id) {
                 return Err(CreateCapabilityErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: crate::state::transformer_not_found(transformer_id),
+                        message: crate::state::transformer_reference_not_found(transformer_id),
                     },
                 )
                 .into());

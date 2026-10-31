@@ -129,11 +129,11 @@ async fn a_job_on_an_inactive_transformer_is_refused() {
     given_object(&router, "inbound/job-inactive.edi", X12_850).await;
 
     // Each row: the case, the configuration, and the status the transformer is left in.
-    // A freshly created transformer is `inactive`, and `UpdateTransformer` is the only
-    // thing that moves it.
+    // A freshly created transformer is `inactive`, and `UpdateTransformer`'s one
+    // documented move (`inactive` -> `active`) is the only thing that leaves it.
     let cases: Vec<(&str, Value, Option<&str>)> = vec![
         ("freshly created (inactive)", inbound(Some(json!({ "templateLanguage": "JSONATA", "template": "$" }))), None),
-        ("moved back to inactive", inbound(None), Some("inactive")),
+        ("renamed while inactive", inbound(None), Some("renamed-while-inactive")),
         (
             "legacy configuration, inactive",
             json!({ "fileFormat": "JSON", "mappingTemplate": "$" }),
@@ -141,13 +141,24 @@ async fn a_job_on_an_inactive_transformer_is_refused() {
         ),
     ];
 
-    for (index, (case, configuration, status)) in cases.into_iter().enumerate() {
+    for (index, (case, configuration, rename)) in cases.into_iter().enumerate() {
         let transformer_id =
             given_transformer_with(&router, &format!("inactive-{index}"), configuration).await;
-        if let Some(status) = status {
-            // active first, so the row really does come back DOWN to inactive.
-            set_status(&router, &transformer_id, "active").await;
-            set_status(&router, &transformer_id, status).await;
+        if let Some(name) = rename {
+            // An update that leaves the status alone: the record stays inactive, so the
+            // row really does reach `StartTransformerJob` with an updated, inactive
+            // transformer.
+            let (code, renamed) = call(
+                &router,
+                "UpdateTransformer",
+                json!({ "transformerId": transformer_id.clone(), "name": name }),
+            )
+            .await;
+            assert_eq!(
+                code, 200,
+                "case {case:?}: renaming an inactive transformer must succeed, got {code} \
+                 {renamed}"
+            );
         }
 
         let (code, response) = call(
@@ -734,27 +745,31 @@ async fn one_client_token_names_one_transformer_job() {
 }
 
 /// RULE: the status move `StartTransformerJob` needs is `UpdateTransformer`'s: a stored
-/// transformer moves from `inactive` to `active` and back, the move is what a later
-/// `GetTransformer` reports, and a job's precondition reads that stored status.
+/// transformer moves from `inactive` to `active`, the move is what a later
+/// `GetTransformer` reports, and a job's precondition reads that stored status — which, as
+/// the one-way move leaves it, is terminal.
 ///
 /// `UpdateTransformer`'s own contract — partial update, the configuration styles, the
-/// immutability of an active transformer's configuration — is covered by that operation's
-/// suite (`tests/all/tagging_and_test_harness.rs`); this asserts only the part the
-/// transformer-job slice depends on, over both directions of the move.
+/// immutability of an active transformer — is covered by that operation's suite
+/// (`tests/all/update_transformer.rs`); this asserts only the part the transformer-job
+/// slice depends on, on each side of the move.
 #[tokio::test]
-async fn a_transformers_status_moves_both_ways_and_the_job_reads_the_stored_one() {
+async fn a_transformers_status_move_is_what_the_job_reads() {
     let router = b2bi_router();
     given_object(&router, "inbound/status.edi", X12_850).await;
     let transformer_id = given_transformer_with(&router, "movable", inbound(None)).await;
 
-    // Each row: the status to move to, and whether a job may then run.
-    for (status, job_runs) in [("active", true), ("inactive", false), ("active", true)] {
-        let updated = set_status(&router, &transformer_id, status).await;
-        assert_eq!(
-            updated["status"],
-            json!(status),
-            "moving to {status:?} must be reported, got {updated}"
-        );
+    // Each row: the status the record rests in, and whether a job may then run. The first
+    // row is the status a create leaves it in, the second the one move a caller can drive.
+    for (status, job_runs) in [("inactive", false), ("active", true)] {
+        if status == "active" {
+            let updated = set_status(&router, &transformer_id, status).await;
+            assert_eq!(
+                updated["status"],
+                json!(status),
+                "moving to {status:?} must be reported, got {updated}"
+            );
+        }
         let (code, read_back) = call(
             &router,
             "GetTransformer",

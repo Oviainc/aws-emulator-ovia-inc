@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/authorization.rs"]
 mod authorization;
+#[path = "all/delete_transformer.rs"]
+mod delete_transformer;
 #[path = "all/edi_parsing.rs"]
 mod edi_parsing;
 #[path = "all/generate_mapping.rs"]

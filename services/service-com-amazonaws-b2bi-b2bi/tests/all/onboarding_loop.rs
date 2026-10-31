@@ -1005,18 +1005,25 @@ async fn deleting_a_resource_a_partnership_still_uses_is_a_conflict() {
     let partnership_id =
         given_partnership(&router, &profile_id, &capability_id, "partner-one").await;
 
-    // (case, delete op, id member, id)
-    let cases: &[(&str, &str, &str, &str)] = &[
-        ("profile in use", "DeleteProfile", "profileId", profile_id.as_str()),
+    // (case, delete op, id member, id, the fixed text the refusal opens with)
+    let cases: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            "profile in use",
+            "DeleteProfile",
+            "profileId",
+            profile_id.as_str(),
+            "Partnership still exists for profile ID",
+        ),
         (
             "capability in use",
             "DeleteCapability",
             "capabilityId",
             capability_id.as_str(),
+            "Partnership still exists for capability ID",
         ),
     ];
 
-    for (case, delete_op, id_member, id) in cases {
+    for (case, delete_op, id_member, id, refusal) in cases {
         let (status, body) = call(&router, delete_op, json!({ *id_member: id })).await;
         assert_eq!(
             status, 409,
@@ -1026,6 +1033,12 @@ async fn deleting_a_resource_a_partnership_still_uses_is_a_conflict() {
             error_code(&body),
             "ConflictException",
             "case {case:?}: expected ConflictException, got {body}"
+        );
+        let message = text(&body, "message");
+        assert!(
+            message.starts_with(refusal) && message.contains(id),
+            "case {case:?}: the refusal must open with {refusal:?} and name the blocked \
+             {id}, got {message:?}"
         );
     }
 
@@ -1037,7 +1050,7 @@ async fn deleting_a_resource_a_partnership_still_uses_is_a_conflict() {
     .await;
     assert_eq!(status, 200, "DeletePartnership failed: {status} {body}");
 
-    for (case, delete_op, id_member, id) in cases {
+    for (case, delete_op, id_member, id, _) in cases {
         let (status, body) = call(&router, delete_op, json!({ *id_member: id })).await;
         assert_eq!(
             status, 200,
@@ -1539,14 +1552,7 @@ async fn operations_outside_this_slice_still_answer_501() {
     let router = b2bi_router();
 
     // (case, operation, a request that satisfies the modelled input constraints)
-    let cases: &[(&str, &str, Value)] = &[
-        ("list transformers", "ListTransformers", json!({})),
-        (
-            "delete transformer",
-            "DeleteTransformer",
-            json!({ "transformerId": "t-0123456789abcdef0" }),
-        ),
-    ];
+    let cases: &[(&str, &str, Value)] = &[("list transformers", "ListTransformers", json!({}))];
 
     for (case, operation, request) in cases {
         let (status, body) = call(&router, operation, request.clone()).await;

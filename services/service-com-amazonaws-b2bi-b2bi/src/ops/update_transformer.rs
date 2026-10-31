@@ -13,19 +13,20 @@
 //! (so an unknown `transformerId` is answered for the missing resource) and before
 //! anything is written:
 //!
+//! * ANY update of a transformer whose stored status is already `active` — see
+//!   [`active_transformer_is_immutable`]. A transformer is mutable only while it is
+//!   `inactive`: `inactive` -> `active` is the one transition the model documents ("You
+//!   can update the state of the transformer from inactive to active",
+//!   `UpdateTransformerRequest$status`), so an active record accepts no further write, of
+//!   its status, its name or its configuration;
 //! * one naming BOTH the model's `@deprecated` configuration members and the members that
 //!   replace them — the same `ValidationException` rule `CreateTransformer` enforces, and
 //!   like there it is stated over the REQUEST, since nothing recorded says the service
-//!   refuses an update whose merge with the stored record spans the two styles;
-//! * one rewriting the configuration of a transformer that is currently `active` — the
-//!   modelled `ConflictException`, see [`active_configuration_is_immutable`]. `name` and
-//!   `status` are not configuration, so they stay updatable in either status, which is
-//!   what lets a caller toggle a transformer between `active` and `inactive`.
+//!   refuses an update whose merge with the stored record spans the two styles.
 //!
-//! Moving `status` to `active` is also the precondition `StartTransformerJob` enforces:
-//! "you can update the state of the transformer from inactive to active"
-//! (`UpdateTransformerRequest$status`), and nothing else in this service moves a
-//! transformer there.
+//! Moving `status` to `active` is also the precondition `StartTransformerJob` enforces,
+//! and nothing else in this service moves a transformer there — nor back, since the move
+//! is one-way.
 //!
 //! ## Shape of an operation
 //!
@@ -254,32 +255,20 @@ fn mixed_configuration_styles(
     .into()
 }
 
-/// The modelled refusal for a request that rewrites the CONFIGURATION of a transformer
-/// that is currently `active`: the record's state forbids the change, so the request
-/// conflicts with the resource rather than being malformed — the modelled
-/// `ConflictException` (HTTP 409).
+/// The modelled refusal for an update of a transformer whose stored status is already
+/// `active`: a transformer is mutable only while it is `inactive`, so once it is active
+/// nothing on the record — its status, its name or its configuration — can be written
+/// again, and the request is a permanent caller error rather than a transient conflict
+/// (the modelled `ValidationException`, HTTP 400, member `Message`).
 ///
-/// Source: the recorded AWS behaviour this issue's corpus carries for
-/// `b2bi.update-transformer-immutable-fields-once-active-rejected` — a transformer's
-/// configuration members are immutable once it is active — together with the model's own
-/// error set for this operation, which lists `ConflictException` as its only
-/// resource-state failure (`smithy_query(query="operation",operation="UpdateTransformer")`).
-/// The status and the code are the requirement; the message is built from the REQUEST, so
-/// it names the members this caller tried to rewrite and the status that refused them, and
-/// `status` / `name` are untouched by this rule: a caller deactivates the transformer,
-/// rewrites the configuration, and activates it again.
-fn active_configuration_is_immutable(
-    transformer_id: &str,
-    members: &[&'static str],
-) -> UpdateTransformerError {
-    UpdateTransformerErrorModeled::ConflictException(ConflictException {
-        message: format!(
-            "Transformer with transformerId {transformer_id} is {}: the fields {} cannot be \
-             updated until its status is {}",
-            crate::state::TRANSFORMER_STATUS_ACTIVE,
-            members.join(", "),
-            crate::state::TRANSFORMER_STATUS_INACTIVE,
-        ),
+/// Source: `UpdateTransformerRequest$status` documents exactly one transition ("You can
+/// update the state of the transformer from inactive to active",
+/// `smithy_query(query="doc",shape="UpdateTransformerRequest",member="status")`), and the
+/// service states this refusal in fixed text that interpolates nothing — no id, no member
+/// name — so there is nothing to build from the request.
+fn active_transformer_is_immutable() -> UpdateTransformerError {
+    UpdateTransformerErrorModeled::ValidationException(ValidationException {
+        message: "An active Transformer cannot be updated".to_string(),
     })
     .into()
 }
@@ -379,29 +368,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // One configuration style per request, and a configuration a transformer in this
-        // status will accept: both are checked AFTER the record is resolved, so a request
-        // against an id this account does not hold is answered for the missing resource
-        // rather than for a member it also got wrong, and before anything is written, so
-        // a refused update changes nothing.
+        // A transformer is mutable only while it is INACTIVE: the stored status, not the
+        // request, is what decides, and once it is active no member of the record can be
+        // written again — so the request's own members are never even examined.
+        if transformer.status == crate::state::TRANSFORMER_STATUS_ACTIVE {
+            return Err(active_transformer_is_immutable());
+        }
+
+        // One configuration style per request: checked AFTER the record is resolved, so a
+        // request against an id this account does not hold is answered for the missing
+        // resource rather than for a member it also got wrong, and before anything is
+        // written, so a refused update changes nothing.
         let legacy = legacy_members_present(&input);
         let current = current_members_present(&input);
         if !legacy.is_empty() && !current.is_empty() {
             return Err(mixed_configuration_styles(&legacy, &current));
-        }
-
-        // A transformer's CONFIGURATION is immutable while it is active: the stored
-        // status, not the request, is what decides, so a caller deactivates it first.
-        // `name` and `status` themselves stay updatable in either status.
-        if transformer.status == crate::state::TRANSFORMER_STATUS_ACTIVE {
-            let configuration: Vec<&'static str> =
-                legacy.iter().chain(current.iter()).copied().collect();
-            if !configuration.is_empty() {
-                return Err(active_configuration_is_immutable(
-                    &input.transformer_id,
-                    &configuration,
-                ));
-            }
         }
 
         // Every member the request names is written; one it omits keeps its stored value.

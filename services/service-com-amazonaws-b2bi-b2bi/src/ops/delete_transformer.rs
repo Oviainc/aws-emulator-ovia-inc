@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTransformer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTransformer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes a transformer from the store, so a later `GetTransformer` reports it absent.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTransformer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two requests are refused instead of served, both decided before anything is removed:
+//!
+//! * an unknown `transformerId` — the modelled `ResourceNotFoundException`, stated the one
+//!   way this service states it ([`crate::state::transformer_not_found`]);
+//! * a transformer another resource still points at — the modelled `ConflictException`,
+//!   which is what the model documents it for ("thrown when you attempt to delete a
+//!   resource … that is being used by other resources"). Here that reference is a
+//!   capability's `configuration`, the one place this service stores a `transformerId`
+//!   belonging to another record; the refused call leaves the transformer readable, and
+//!   deleting the referencing capability releases it. See
+//!   [`transformer_is_in_use_by_a_capability`].
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +146,22 @@ impl From<DeleteTransformerErrorModeled> for DeleteTransformerError {
     }
 }
 
+/// The modelled refusal for deleting a transformer a capability's `configuration` still
+/// names: deleting it would leave that capability pointing at nothing, which is exactly
+/// what `ConflictException` (HTTP 409, member `message`) is modelled for — "you attempt to
+/// delete a resource … that is being used by other resources"
+/// (`smithy_query(query="shape",shape="ConflictException")`).
+///
+/// The service states this refusal in fixed text that interpolates nothing — neither the
+/// transformer's id nor the referencing capability's — so there is nothing to build from
+/// the request or from the store.
+fn transformer_is_in_use_by_a_capability() -> DeleteTransformerError {
+    DeleteTransformerErrorModeled::ConflictException(ConflictException {
+        message: "Transformer config is currently in use by a Capability".to_string(),
+    })
+    .into()
+}
+
 /// The `DeleteTransformer` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -178,18 +198,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTransformer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTransformerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTransformer"))
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::resource_arn(
+                &crate::state::request_region(ctx.parts()),
+                "transformer",
+                &input.transformer_id,
+            ),
+        ) {
+            return Err(DeleteTransformerErrorModeled::AccessDeniedException(denied).into());
+        }
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteTransformerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        if !state.transformers.contains_key(&input.transformer_id) {
+            return Err(DeleteTransformerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::transformer_not_found(&input.transformer_id),
+                },
+            )
+            .into());
+        }
+
+        // Dependency order: a capability's `configuration` names the transformer it
+        // processes with, resolved through the same walk `CreateCapability` resolves a
+        // reference with, so both operations agree on what "referenced" means.
+        if state.capabilities.values().any(|capability| {
+            crate::ops::create_capability::referenced_transformers(&capability.configuration)
+                .contains(&input.transformer_id.as_str())
+        }) {
+            return Err(transformer_is_in_use_by_a_capability());
+        }
+
+        state.transformers.remove(&input.transformer_id);
+        state
+            .transformer_order
+            .retain(|id| *id != input.transformer_id);
+        // Release path for the idempotency map: a token that minted this transformer is
+        // worth nothing once the transformer is gone, so it is not kept.
+        state.forget_idempotency_for(&input.transformer_id);
+        Ok(DeleteTransformerOutput)
     }
 }
