@@ -71,6 +71,9 @@ mod composite_component_inherited_declaration;
 #[path = "all/composite_component_stranded_declaration.rs"]
 mod composite_component_stranded_declaration;
 
+#[path = "all/create_entity_untyped_definition_order.rs"]
+mod create_entity_untyped_definition_order;
+
 #[path = "all/entity_component_type_filter.rs"]
 mod entity_component_type_filter;
 
