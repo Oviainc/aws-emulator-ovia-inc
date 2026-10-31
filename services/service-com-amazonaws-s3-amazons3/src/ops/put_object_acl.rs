@@ -218,7 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for PutObjectAcl<Eng>
 {
     type Input = PutObjectAclInput;
-    type Output = PutObjectAclOutput;
+    /// The modelled output, answered with the object version this write set the ACL of in
+    /// `x-amz-version-id`: S3 reports the version every object sub-resource call acted on,
+    /// and this operation's modelled output has no member to carry it (see
+    /// [`crate::service::wire::ActedOnVersion`]). `OUTPUT_SCHEMA` below is the modelled one
+    /// still, so the response's body and status are exactly what they were.
+    type Output = crate::service::wire::ActedOnVersion<PutObjectAclOutput>;
     type Error = PutObjectAclError;
 
     const NAME: &'static str = "PutObjectAcl";
@@ -254,7 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObjectAcl<Eng>
         input: PutObjectAclInput,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         correlation: &crate::state::request_ids::RequestCorrelation,
-    ) -> Result<PutObjectAclOutput, PutObjectAclError> {
+    ) -> Result<crate::service::wire::ActedOnVersion<PutObjectAclOutput>, PutObjectAclError> {
         // Everything this write needs is in its deserialized input: the canned ACL, the
         // five grant headers, the version id and the expected owner all travel as members.
         // `ContentMD5` and `ChecksumAlgorithm` are integrity checks over the RAW request
@@ -373,6 +378,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObjectAcl<Eng>
                 None => PutObjectAclErrorModeled::NoSuchKey(NoSuchKey {}).into(),
             });
         }
+        // The version this write sets the ACL of: the id the store holds for the address
+        // resolved just above, and none for a version that has none (the current object of
+        // a bucket whose versioning was never enabled, and the null version of a suspended
+        // one). Read before the write, which changes no version's id.
+        let acted_on = bucket
+            .addressed_object(&input.key, version_id)
+            .and_then(|object| object.version_id.clone());
 
         // The ACL the request names becomes the object version's ACL in full, whether it
         // had one already or still carried the default. The store reports what the write
@@ -433,11 +445,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObjectAcl<Eng>
         drop(store);
         crate::state::notifications::publish(ctx, pending);
 
-        Ok(PutObjectAclOutput {
-            // "If present, indicates that the requester was successfully charged for the
-            // request" (`PutObjectAclOutput$RequestCharged`): this emulator models no
-            // Requester Pays charge, so nothing is claimed about one.
-            request_charged: None,
+        Ok(crate::service::wire::ActedOnVersion {
+            output: PutObjectAclOutput {
+                // "If present, indicates that the requester was successfully charged for
+                // the request" (`PutObjectAclOutput$RequestCharged`): this emulator models
+                // no Requester Pays charge, so nothing is claimed about one.
+                request_charged: None,
+            },
+            version_id: acted_on,
         })
     }
 }

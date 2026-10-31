@@ -183,7 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for PutObjectRetention<Eng>
 {
     type Input = PutObjectRetentionInput;
-    type Output = PutObjectRetentionOutput;
+    /// The modelled output, answered with the object version this write placed the retention
+    /// on in `x-amz-version-id`: S3 reports the version every object sub-resource call acted
+    /// on, and this operation's modelled output has no member to carry it (see
+    /// [`crate::service::wire::ActedOnVersion`]). `OUTPUT_SCHEMA` below is the modelled one
+    /// still, so the response's body and status are exactly what they were.
+    type Output = crate::service::wire::ActedOnVersion<PutObjectRetentionOutput>;
     type Error = PutObjectRetentionError;
 
     const NAME: &'static str = "PutObjectRetention";
@@ -338,6 +343,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(object) = bucket.addressed_object(&input.key, version_id) else {
             return Err(no_such_object(version_id));
         };
+        // The version this write places the retention on: the id the store holds for the
+        // address resolved just above, and none for a version that has none (the current
+        // object of a bucket whose versioning was never enabled, and the null version of a
+        // suspended one). Read before the write, which changes no version's id.
+        let acted_on = object.version_id.clone();
         // The retention IN FORCE on the addressed version, read out here so the judgement
         // below works over an owned value and the store is free to be written through.
         // A retention whose date has passed has expired and restricts nothing.
@@ -452,11 +462,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this call by.
         correlation.answer();
 
-        Ok(PutObjectRetentionOutput {
-            // "If present, indicates that the requester was successfully charged for the
-            // request" (`PutObjectRetentionOutput$RequestCharged`) — Requester Pays is not
-            // emulated, so nobody was charged and nothing is reported.
-            request_charged: None,
+        Ok(crate::service::wire::ActedOnVersion {
+            output: PutObjectRetentionOutput {
+                // "If present, indicates that the requester was successfully charged for
+                // the request" (`PutObjectRetentionOutput$RequestCharged`) — Requester Pays
+                // is not emulated, so nobody was charged and nothing is reported.
+                request_charged: None,
+            },
+            version_id: acted_on,
         })
     }
 }

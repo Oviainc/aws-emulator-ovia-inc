@@ -240,11 +240,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     value: tag.value.clone(),
                 })
                 .collect(),
-            // "The versionId of the object for which you got the tagging information" —
-            // reported for a versioned bucket, and a `versionId` request is refused
-            // above; this emulator holds no object versions, so no version is named
-            // rather than one being invented.
-            version_id: None,
+            // "The versionId of the object for which you got the tagging information":
+            // the version this read reported the tag set OF, which is the id the store
+            // holds for it. A version that has none — the current object of a bucket whose
+            // versioning was never enabled, and the null version of a suspended one —
+            // names no version, which is how S3 answers one too.
+            version_id: object.version_id.clone(),
         })
     }
 }

@@ -86,6 +86,16 @@
 //! [`without_unbound_body`] is the one place that rule lives, keyed on the output SCHEMA so
 //! every such operation answers the same way; an output with a payload member or a member
 //! written into the envelope keeps the document that IS its response.
+//!
+//! ## A HEADER the API reports and the model declares no member for
+//!
+//! The last thing this module carries is a response header an output shape has nowhere to
+//! put. S3 reports the object version every object sub-resource call acted on in
+//! `x-amz-version-id`, and this model binds a member for it on the three tagging operations
+//! alone — the ACL and Object Lock sub-resources model only `RequestCharged`, so their
+//! generated output shapes cannot carry the version. [`ActedOnVersion`] is the one place
+//! that binding lives: it wraps a modelled output, writes it unchanged, and reports the
+//! version beside it through [`ACTED_ON_VERSION_ID_MEMBER`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -210,6 +220,63 @@ fn root_element_name(schema: &Schema) -> &str {
     match schema.xml_name() {
         Some(name) => name.value(),
         None => schema.shape_id().shape_name(),
+    }
+}
+
+/// `x-amz-version-id`, as an object sub-resource response reports the version it acted on.
+///
+/// S3 answers an object sub-resource call — the tag set, the ACL, the Object Lock legal hold
+/// or retention of one object version — with the id of the version it read or wrote in this
+/// header, and this model binds an output member for it on only three of them
+/// (`smithy_query(query="operation",operation="PutObjectAcl",
+/// model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/com-amazonaws-s3-amazons3.json")`
+/// reports an output of `RequestCharged` alone, and `GetObjectAcl`, `PutObjectLegalHold` and
+/// `PutObjectRetention` the same). The operations whose output shape has nowhere to carry it
+/// bind it HERE instead, through [`ActedOnVersion`]: one member declaration, carrying the
+/// member name and the header every one of them reports the version under.
+///
+/// A member schema is all the HTTP binder needs — it routes a member carrying `@httpHeader`
+/// into the response headers and never into the body — so each of those operations keeps its
+/// modelled output schema, and therefore the body and the status it already answered with.
+/// The member targets `ObjectVersionId`, the shape every modelled `VersionId` member of this
+/// service targets.
+pub static ACTED_ON_VERSION_ID_MEMBER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.s3#ObjectVersionId",
+        "com.amazonaws.s3",
+        "ObjectVersionId",
+    ),
+    ShapeType::String,
+    "VersionId",
+    0,
+)
+.with_http_header("x-amz-version-id");
+
+/// A modelled output, answered with the id of the object version the call acted on.
+///
+/// The wrapped `output` writes its own members exactly as it does unwrapped — body document,
+/// bound headers and status alike — and the version id goes out in
+/// `x-amz-version-id` beside them ([`ACTED_ON_VERSION_ID_MEMBER`]).
+///
+/// `version_id` is the id the store holds for the version the request addressed, and `None`
+/// for a version that has none: a bucket whose versioning was never enabled, and the null
+/// version of a suspended one. S3 reports no version id for those, so the header is then
+/// absent rather than carrying an id nothing minted.
+#[derive(Debug, Clone)]
+pub struct ActedOnVersion<O> {
+    /// The operation's modelled output, serialized first and unchanged.
+    pub output: O,
+    /// The id of the object version this call read or wrote, when that version has one.
+    pub version_id: Option<String>,
+}
+
+impl<O: SerializableStruct> SerializableStruct for ActedOnVersion<O> {
+    fn serialize_members(&self, serializer: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        self.output.serialize_members(serializer)?;
+        if let Some(version_id) = self.version_id.as_deref() {
+            serializer.write_string(&ACTED_ON_VERSION_ID_MEMBER, version_id)?;
+        }
+        Ok(())
     }
 }
 

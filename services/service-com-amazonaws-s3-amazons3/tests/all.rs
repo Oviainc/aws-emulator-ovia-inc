@@ -200,6 +200,8 @@ mod object_restore;
 mod object_select_content;
 #[path = "all/object_storage.rs"]
 mod object_storage;
+#[path = "all/object_subresource_version_id.rs"]
+mod object_subresource_version_id;
 #[path = "all/object_tag_set_removal.rs"]
 mod object_tag_set_removal;
 #[path = "all/object_tagging.rs"]

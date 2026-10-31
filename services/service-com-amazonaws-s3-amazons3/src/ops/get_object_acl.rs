@@ -163,7 +163,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetObjectAcl<Eng>
 {
     type Input = GetObjectAclInput;
-    type Output = GetObjectAclOutput;
+    /// The modelled output, answered with the object version this read reported the ACL of
+    /// in `x-amz-version-id`: S3 reports the version every object sub-resource call acted
+    /// on, and this operation's modelled output has no member to carry it (see
+    /// [`crate::service::wire::ActedOnVersion`]). `OUTPUT_SCHEMA` below is the modelled one
+    /// still, so the `AccessControlPolicy` document is exactly the one it was.
+    type Output = crate::service::wire::ActedOnVersion<GetObjectAclOutput>;
     type Error = GetObjectAclError;
 
     const NAME: &'static str = "GetObjectAcl";
@@ -242,7 +247,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         };
 
-        Ok(GetObjectAclOutput {
+        // The version this read reported the ACL OF: the id the store holds for it, and
+        // none for a version that has none (the current object of a bucket whose
+        // versioning was never enabled, and the null version of a suspended one).
+        let acted_on = object.version_id.clone();
+
+        let reported = GetObjectAclOutput {
             // "Container for the bucket owner's ID" (`GetObjectAclOutput$Owner`): the one
             // account this emulator serves, reported by the canonical user id the store
             // names once — the same id `GetBucketAcl` reports as the owner of the bucket's
@@ -280,6 +290,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // request" (`GetObjectAclOutput$RequestCharged`): this emulator models no
             // Requester Pays charge, so nothing is claimed about one.
             request_charged: None,
+        };
+        Ok(crate::service::wire::ActedOnVersion {
+            output: reported,
+            version_id: acted_on,
         })
     }
 }

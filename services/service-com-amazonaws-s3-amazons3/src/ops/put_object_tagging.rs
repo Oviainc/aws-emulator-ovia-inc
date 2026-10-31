@@ -342,24 +342,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObjectTagging<
             crate::state::notifications::ObjectEventKind::TaggingPut,
             &input.key,
         );
-        let tagged = match store
+        // The version this call wrote the tag set OF, read back under the same lock.
+        let written = store
             .bucket(&input.bucket)
-            .and_then(|bucket| bucket.object(&input.key))
-        {
+            .and_then(|bucket| bucket.object(&input.key));
+        let tagged = match written {
             Some(object) => tagged.of_object(object),
             None => tagged,
         };
+        let acted_on = written.and_then(|object| object.version_id.clone());
         let pending =
             crate::state::notifications::pending(&store, &input.bucket, &[tagged], correlation);
         drop(store);
         crate::state::notifications::publish(ctx, pending);
 
         Ok(PutObjectTaggingOutput {
-            // "The versionId of the object the tag-set was added to" — reported for a
-            // versioned bucket, and a `versionId` request is refused above; this emulator
-            // holds no object versions, so no version is named rather than one being
-            // invented.
-            version_id: None,
+            // "The versionId of the object the tag-set was added to": the version this
+            // write placed the tag set on, which is the id the store holds for it. A
+            // version that has none — the current object of a bucket whose versioning was
+            // never enabled, and the null version of a suspended one — names no version,
+            // which is how S3 answers one too.
+            version_id: acted_on,
         })
     }
 }

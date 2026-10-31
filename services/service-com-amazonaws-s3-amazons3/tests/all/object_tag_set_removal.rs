@@ -45,7 +45,11 @@ const NOT_THE_OWNER: &str = "123456789012";
 
 /// `DELETE /<bucket>/<key>?tagging` — `DeleteObjectTagging`, with whatever extra query
 /// parameters and bound headers the case under test carries.
-async fn delete_object_tagging(
+///
+/// `pub(crate)`: the suite for the version an object sub-resource call reports
+/// ([`super::object_subresource_version_id`]) removes its tag sets through this one helper
+/// rather than spelling the subresource a second time.
+pub(crate) async fn delete_object_tagging(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
@@ -172,8 +176,11 @@ async fn a_removal_takes_an_objects_whole_tag_set_and_leaves_the_object() {
                 "case {case:?}/{attempt}: a 204 carries no body, got {:?}",
                 text(&removed)
             );
-            // This emulator tags the current object, so there is no version to name and
-            // none may be invented.
+            // The bucket here is one whose versioning was never enabled, so its current
+            // object is no version of anything and has no id to report: S3 omits the
+            // header there, and none may be invented. The suite for the version an object
+            // sub-resource call reports ([`super::object_subresource_version_id`]) covers
+            // the versioned buckets, where the id IS reported.
             assert_eq!(
                 removed.header("x-amz-version-id"),
                 None,

@@ -170,7 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for PutObjectLegalHold<Eng>
 {
     type Input = PutObjectLegalHoldInput;
-    type Output = PutObjectLegalHoldOutput;
+    /// The modelled output, answered with the object version this write placed the hold on
+    /// in `x-amz-version-id`: S3 reports the version every object sub-resource call acted
+    /// on, and this operation's modelled output has no member to carry it (see
+    /// [`crate::service::wire::ActedOnVersion`]). `OUTPUT_SCHEMA` below is the modelled one
+    /// still, so the response's body and status are exactly what they were.
+    type Output = crate::service::wire::ActedOnVersion<PutObjectLegalHoldOutput>;
     type Error = PutObjectLegalHoldError;
 
     const NAME: &'static str = "PutObjectLegalHold";
@@ -283,6 +288,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if bucket.addressed_object(&input.key, version_id).is_none() {
             return Err(no_such_object(version_id));
         }
+        // The version this write places the hold on: the id the store holds for the address
+        // resolved just above, and none for a version that has none (the current object of
+        // a bucket whose versioning was never enabled, and the null version of a suspended
+        // one). Read before the write, which changes no version's id.
+        let acted_on = bucket
+            .addressed_object(&input.key, version_id)
+            .and_then(|object| object.version_id.clone());
 
         // A REPLACEMENT of the whole subresource: the status the version carries afterwards
         // is exactly the one this `LegalHold` named. Nothing in force bars it — a hold
@@ -303,11 +315,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        Ok(PutObjectLegalHoldOutput {
-            // "If present, indicates that the requester was successfully charged for the
-            // request" (`PutObjectLegalHoldOutput$RequestCharged`) — Requester Pays is not
-            // emulated, so nobody was charged and nothing is reported.
-            request_charged: None,
+        Ok(crate::service::wire::ActedOnVersion {
+            output: PutObjectLegalHoldOutput {
+                // "If present, indicates that the requester was successfully charged for
+                // the request" (`PutObjectLegalHoldOutput$RequestCharged`) — Requester Pays
+                // is not emulated, so nobody was charged and nothing is reported.
+                request_charged: None,
+            },
+            version_id: acted_on,
         })
     }
 }

@@ -353,24 +353,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjectTaggi
             crate::state::notifications::ObjectEventKind::TaggingDelete,
             &input.key,
         );
-        let untagged = match store
+        // The version this call took the tag set OFF, read back under the same lock.
+        let untagged_object = store
             .bucket(&input.bucket)
-            .and_then(|bucket| bucket.object(&input.key))
-        {
+            .and_then(|bucket| bucket.object(&input.key));
+        let untagged = match untagged_object {
             Some(object) => untagged.of_object(object),
             None => untagged,
         };
+        let acted_on = untagged_object.and_then(|object| object.version_id.clone());
         let pending =
             crate::state::notifications::pending(&store, &input.bucket, &[untagged], correlation);
         drop(store);
         crate::state::notifications::publish(ctx, pending);
 
         Ok(DeleteObjectTaggingNoContent {
-            // "The versionId of the object the tag-set was removed from" — reported for a
-            // versioned bucket, and a `versionId` request is refused above; the tag set
-            // this handler removes is the current object's, so no version is named rather
-            // than one being invented.
-            version_id: None,
+            // "The versionId of the object the tag-set was removed from": the version this
+            // removal took the tag set off, which is the id the store holds for it. A
+            // version that has none — the current object of a bucket whose versioning was
+            // never enabled, and the null version of a suspended one — names no version,
+            // which is how S3 answers one too.
+            version_id: acted_on,
         })
     }
 }

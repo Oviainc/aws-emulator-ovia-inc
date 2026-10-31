@@ -66,7 +66,11 @@ const VERSION_ID_HEADER: &str = "x-amz-version-id";
 
 /// `PUT /<bucket>/<key>?acl<query>` — `PutObjectAcl`, with whatever headers and body the
 /// case names.
-async fn put_object_acl(
+///
+/// `pub(crate)`, like the reader below it: the suite for the version an object sub-resource
+/// call reports ([`super::object_subresource_version_id`]) drives both halves of this
+/// subresource through these rather than standing up a second pair.
+pub(crate) async fn put_object_acl(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
@@ -85,7 +89,7 @@ async fn put_object_acl(
 }
 
 /// `GET /<bucket>/<key>?acl<query>` — `GetObjectAcl`.
-async fn get_object_acl(
+pub(crate) async fn get_object_acl(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
