@@ -593,6 +593,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // one name. Which column a name addresses is its identifier identity and not
                 // its spelling (`crate::state::identifier_identity`), so another casing of an
                 // unquoted name the schema already declares is that same column.
+                //
+                // This scan covers the WHOLE list before any entry's type is resolved
+                // below, the order `CreateTable` and `CreateType` scan the same two
+                // things in: which of the two refusals a request carrying both faults
+                // gets is then decided by the faults it carries, not by where in
+                // `addColumns` each faulty entry sits, so one request shape never gets
+                // two different answers depending on which sibling served it.
                 let mut declared: ::std::collections::BTreeSet<String> = schema
                     .all_columns
                     .iter()
@@ -605,14 +612,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             column.name
                         )));
                     }
-                    // A column added to an existing table declares a type under the same
-                    // rule a created one does: every identifier in it that names neither
-                    // a CQL native type nor a type constructor must name a user-defined
-                    // type of THIS keyspace in status ACTIVE, and any other reference is
-                    // a type "that doesn't exist. The resource might not be specified
-                    // correctly, or its status might not be ACTIVE" — refused here, so no
-                    // schema ever holds a column of a type the service could not have
-                    // created.
+                }
+                // A column added to an existing table declares a type under the same
+                // rule a created one does: every identifier in it that names neither a
+                // CQL native type nor a type constructor must name a user-defined type
+                // of THIS keyspace in status ACTIVE, and any other reference is a type
+                // "that doesn't exist. The resource might not be specified correctly, or
+                // its status might not be ACTIVE" — refused here, so no schema ever
+                // holds a column of a type the service could not have created. A second
+                // pass over the same list, bounded by `MAX_COLUMNS_PER_TABLE` like the
+                // one above, for the same reason `CreateTable` resolves the types of a
+                // created schema only after its duplicate-name scan has passed.
+                for column in &added {
                     if let Some(referenced) = crate::state::unresolvable_type_reference(
                         &column.r#type,
                         &usable_type_names,

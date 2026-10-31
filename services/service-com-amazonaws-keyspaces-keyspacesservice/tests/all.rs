@@ -39,6 +39,8 @@ mod delete_keyspace_lifecycle;
 mod delete_table_in_flight;
 #[path = "all/delete_type.rs"]
 mod delete_type;
+#[path = "all/duplicate_column_precedes_type_resolution.rs"]
+mod duplicate_column_precedes_type_resolution;
 #[path = "all/get_keyspace.rs"]
 mod get_keyspace;
 #[path = "all/get_table_auto_scaling_settings_unconfigured.rs"]
