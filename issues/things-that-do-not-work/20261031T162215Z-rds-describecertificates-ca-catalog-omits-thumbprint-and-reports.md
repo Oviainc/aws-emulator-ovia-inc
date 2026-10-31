@@ -1,0 +1,37 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: rds-catalog-describe-certificates
+Issue-Step: task#1
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: rds-catalog-describe-certificates rds-certificate-management
+Issue-Shape-Id: com.amazonaws.rds#AmazonRDSv19
+Issue-Key: rds|DescribeCertificates|2xx->2xx|$.DescribeCertificatesResponse.DescribeCertificatesResult.Certificates.Certificate[*]
+Issue-Commit: 9d26adc0c38c740a3ba96699fb9df436cbe37637
+
+# RDS DescribeCertificates CA catalog omits Thumbprint and reports placeholder midnight validity timestamps
+
+> _Note: this issue was identified against the code base at commit `9d26adc0c38c740a3ba96699fb9df436cbe37637`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribeCertificates
+
+## Description
+The static CA-certificate catalog the emulator serves from DescribeCertificates is not a faithful projection of the RDS Certificate structure: every entry drops a modeled member, and the validity window of every entry is a synthesized date rather than the certificate's real validity instants. Both show up as 200/200 shape mismatches on the Certificates.Certificate list. Two causes.
+
+Cause 1 of 2: every Certificate element omits the modeled Thumbprint member. AWS: Smithy com.amazonaws.rds#Certificate models Thumbprint (String, "The thumbprint of the certificate.") alongside CertificateIdentifier, CertificateType, ValidFrom, ValidTill, CertificateArn, CustomerOverride and CustomerOverrideValidTill; DescribeCertificates returns the account's CA certificates with their thumbprints, and the recorded responses carry a Thumbprint on each element (e.g. the rds-ca-rsa4096-g1 and rds-ca-rsa2048-g1 elements each carry a 40-hex-character SHA-1 thumbprint). Emulator: each Certificate element it serves has keys CertificateIdentifier, CertificateType, ValidFrom, ValidTill, CertificateArn, CustomerOverride and no Thumbprint key at all, so the replay reports the whole element as missing/extra against the recorded element. Why: a client that pins or verifies the CA it will trust (comparing the thumbprint of the bundle it downloaded against the thumbprint RDS publishes for that CertificateIdentifier) has nothing to compare against, and any caller that reads Certificate.Thumbprint gets an absent member instead of a value. The value itself is per-certificate material, not a per-run value: the requirement is that each catalog entry publish the thumbprint of the certificate that entry names. Fix: the Certificate projection for the static CA catalog backing the DescribeCertificates handler in the RDS state module - the catalog rows must carry, and the serializer must emit, Thumbprint for every entry. Traces: rds-catalog-describe-certificates#task#1, rds-certificate-management#task#3.
+
+Cause 2 of 2: ValidFrom and ValidTill are date-only placeholders truncated to midnight instead of the certificate's real validity instants. AWS: Certificate.ValidFrom ("The starting date from which the certificate is valid") and ValidTill ("The final date that the certificate continues to be valid") are modeled as TStamp timestamps and RDS reports the actual notBefore/notAfter of the published CA, which carries a time of day - the recorded catalog reports rds-ca-rsa4096-g1 as valid from 2021-05-24T22:03:20Z until 2121-05-24T23:03:20Z and rds-ca-rsa2048-g1 as valid from 2021-05-24T21:59:00Z until 2061-05-24T22:59:00Z, i.e. a distinct instant per certificate. Emulator: it emits the same calendar day with the clock zeroed for every entry - rds-ca-rsa4096-g1 as ValidFrom 2021-05-24T00:00:00Z / ValidTill 2121-05-24T00:00:00Z and rds-ca-rsa2048-g1 as ValidFrom 2021-05-24T00:00:00Z / ValidTill 2061-05-24T00:00:00Z - which is a fabricated validity window, not the certificate's. Why: a client that decides when to rotate a CA, or that checks a certificate is currently within its validity window before using it, reads a window whose endpoints are up to an hour off and that is identical for certificates with different real lifetimes; the divergence is in the stored catalog data, not in a per-run clock reading, so it is reproducible and not a timestamp-of-the-run artifact. Fix: the ValidFrom/ValidTill values recorded in the static CA-certificate catalog consumed by the DescribeCertificates handler in the RDS state module. Traces: rds-certificate-management#task#3, rds-catalog-describe-certificates#task#1.
+
+## Evidence
+Cause 1 and 2, fixture rds-catalog-describe-certificates step task#1 (expected 200, actual 200): $.DescribeCertificatesResponse.DescribeCertificatesResult.Certificates.Certificate[1]: missing (expected {'CertificateIdentifier': 'rds-ca-rsa4096-g1', 'ValidTill': '2121-05-24T23:03:20Z', 'CertificateArn': 'arn:aws:rds:us-west-2::cert:rds-ca-rsa4096-g1', 'CustomerOverride': 'false', 'Thumbprint': '19da4f2af579a8ae1f6a0fa77aa5befd874b4cab', 'ValidFrom': '2021-05-24T22:03:20Z', 'CertificateType': 'CA'}, got {'CertificateIdentifier': 'rds-ca-rsa4096-g1', 'CertificateType': 'CA', 'ValidFrom': '2021-05-24T00:00:00Z', 'ValidTill': '2121-05-24T00:00:00Z', 'CertificateArn': 'arn:aws:rds:us-west-2::cert:rds-ca-rsa4096-g1', 'CustomerOverride': 'false'}) - no Thumbprint key, and both timestamps truncated to T00:00:00Z. Same for Certificate[2] (rds-ca-rsa2048-g1: expected Thumbprint '7c40cb42714b6fdb2b296f9bbd0e8bb364436a76', ValidFrom '2021-05-24T21:59:00Z', ValidTill '2061-05-24T22:59:00Z'; got no Thumbprint, ValidFrom '2021-05-24T00:00:00Z', ValidTill '2061-05-24T00:00:00Z'), and the same divergence key also lists Certificate[3].
+
+Fixture rds-certificate-management step task#3 (expected 200, actual 200) reports the identical shape against a recording that leaves the timestamps shaped-not-asserted but still asserts Thumbprint: Certificate[1] expected {'CertificateIdentifier': 'rds-ca-rsa4096-g1', 'Thumbprint': '19da4f2af579a8ae1f6a0fa77aa5befd874b4cab', 'ValidFrom': '<shaped-not-asserted>', 'ValidTill': '<shaped-not-asserted>', ...}, got the same element with no Thumbprint and midnight timestamps; Certificate[2] likewise for rds-ca-rsa2048-g1 (Thumbprint '7c40cb42714b6fdb2b296f9bbd0e8bb364436a76').
+
+There is no status or error-code divergence on either step: both are 200 -> 200 body mismatches. Distinct from the already-open issue 'RDS state and validation fidelity: CA-certificate modification, ...' (20261024T030130Z), which covers ModifyDBInstance CA staging and other operations, not the DescribeCertificates catalog projection.
+
+## Steps to Reproduce
+1. Boot the emulator from this checkout.
+2. Replay fixture rds-catalog-describe-certificates, step task#1: POST the awsQuery form Action=DescribeCertificates&Version=2014-10-31 to the RDS endpoint.
+3. Read DescribeCertificatesResponse.DescribeCertificatesResult.Certificates.Certificate: no element carries a Thumbprint member (cause 1), and every element's ValidFrom/ValidTill are the calendar date with the clock zeroed (T00:00:00Z) rather than the certificate's real notBefore/notAfter instants (cause 2) - e.g. rds-ca-rsa4096-g1 comes back as 2021-05-24T00:00:00Z / 2121-05-24T00:00:00Z.
+4. Replay fixture rds-certificate-management, step task#3 (DescribeCertificates after the certificate-management steps) and observe the same two defects on the same catalog entries.
