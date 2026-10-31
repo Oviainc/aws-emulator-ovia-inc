@@ -3120,6 +3120,22 @@ impl RegionState {
         })
     }
 
+    /// Whether `arn` names a SAP HANA DATABASE this Region holds.
+    ///
+    /// Narrower than [`Self::holds_resource`] on purpose: the resource-permission calls
+    /// are database-scoped, so the ARN they take has to name one of the databases the
+    /// registrations of this Region named ([`Self::resolve_database`], the one resolution
+    /// this crate does for a database named by ARN, which is also what `GetDatabase`
+    /// reads and `ListDatabases` reports) — an application's own ARN or a component's
+    /// resolves nothing here even though this Region holds that resource.
+    ///
+    /// `region` is the Region this partition holds, which is the Region those ARNs embed,
+    /// so a database of another Region resolves to nothing here.
+    pub fn holds_database(&self, region: &str, arn: &str) -> bool {
+        self.resolve_database(region, None, None, None, Some(arn))
+            .is_some()
+    }
+
     /// The SAP HANA database a request names, resolved to the application it belongs to
     /// and the database record itself.
     ///
@@ -4168,12 +4184,15 @@ pub fn settings_update_message(application_id: &str, changes: &[SettingsChange])
 /// The message `UpdateApplicationSettings` reports when the request names NO setting to
 /// change.
 ///
-/// Every settings member the operation takes is optional, so a request carrying none of
-/// them asks for nothing — a fixed diagnostic for a fixed condition, stated in the same
-/// shape as [`MISSING_APPLICATION_IDENTIFIER_MESSAGE`] so a client reads one wording for
-/// the class, and naming the four members that could carry a change.
-pub const MISSING_SETTINGS_MESSAGE: &str = "backint, credentialsToAddOrUpdate, \
-     credentialsToRemove or databaseArn need to be specified";
+/// Every settings member the operation takes is optional
+/// (`smithy_query(query="operation", operation="UpdateApplicationSettings")` marks only
+/// `ApplicationId` `@required`), so a request carrying none of them asks for nothing.
+///
+/// A fixed diagnostic for a fixed condition — the request carries nothing to build it
+/// from — so it is the service's own wording for this refusal verbatim, as the `ssm-sap`
+/// application-control recording shows it: the condition is that NO update option was
+/// named, stated without enumerating the members that could have carried one.
+pub const MISSING_SETTINGS_MESSAGE: &str = "No update option was specified.";
 
 /// The modelled `ValidationException` an operation that models no
 /// `ResourceNotFoundException` is refused with when no registered application answers
@@ -4191,6 +4210,22 @@ pub fn no_registered_application(reference: &str) -> ValidationException {
         "No registered application found for account: {}, and application: {reference}",
         ::engine::emulator_account_id()
     ))
+}
+
+/// The modelled `ValidationException` the operation-inspection listing is refused with
+/// when the `ApplicationId` it requires names no application registered in this account
+/// and Region (`ListOperations`).
+///
+/// The service words this condition PER OPERATION rather than once for the whole API: the
+/// lookup an application-scoped listing of operation records runs states that the
+/// application named does not exist, with the id the request carried quoted and nothing
+/// of the environment the call reached in the text, while the application-lookup calls
+/// state it as [`no_registered_application`] does. `ListOperations` models no
+/// `ResourceNotFoundException` (`smithy_query(query="operation",
+/// operation="ListOperations")`: `ValidationException` 400 and `InternalServerException`
+/// 500 only), so the condition is the 400 it does model.
+pub fn application_does_not_exist(application_id: &str) -> ValidationException {
+    validation(format!("The application '{application_id}' does not exist"))
 }
 
 /// Why a `ComponentId` that names no component of the application it was asked for is
@@ -4295,9 +4330,34 @@ pub fn application_not_found_message(reference: &str) -> String {
 /// Built from the request: the ARN the caller sent is the only variable part, so every
 /// call that resolves a resource by its ARN reports the SAME template around it — the
 /// same construction [`application_not_found_message`] uses for an application named by
-/// its id. It goes with the 404 `ResourceNotFoundException` those operations model.
+/// its id. It goes with the 404 `ResourceNotFoundException` those operations model, which
+/// is the tagging calls: a call whose ARN has to name one KIND of resource states that
+/// instead ([`invalid_database_arn`]).
 pub fn resource_not_found_message(resource_arn: &str) -> String {
     format!("Resource {resource_arn} doesn't exist.")
+}
+
+/// The modelled `ValidationException` (HTTP 400) a resource-permission call is refused
+/// with when its `ResourceArn` does not name a SAP HANA database of this account and
+/// Region ([`RegionState::holds_database`]).
+///
+/// The permissions this service holds are DATABASE-scoped — a restore permission is
+/// granted on the HANA database a backup would be restored into — so the ARN naming
+/// anything else, including a registered application or a component of one, is an input
+/// the caller has to correct rather than a resource that has gone: the refusal states
+/// that the ARN is not a valid database ARN, with the ARN the request carried quoted as
+/// the only variable part, and it is the 400 `ValidationException` every operation of
+/// this service declares rather than the 404 the model also admits.
+///
+/// `member_name` is the input member the refusal attributes the value to, spelled as the
+/// model spells it, for the call whose refusal tags it; `None` for the calls whose
+/// refusal states the condition alone.
+pub fn invalid_database_arn(member_name: Option<&str>, resource_arn: &str) -> ValidationException {
+    let stated = format!("Database ARN '{resource_arn}' is not valid");
+    validation(match member_name {
+        Some(member) => format!("{member}: {stated}"),
+        None => stated,
+    })
 }
 
 /// The message `GetApplication` reports when the request carries NONE of the identifier
@@ -4314,15 +4374,17 @@ pub const MISSING_APPLICATION_IDENTIFIER_MESSAGE: &str =
 
 /// The message `GetDatabase` reports when the request names no database at all.
 ///
-/// A database is identified either by its own ARN or by its `DatabaseId`
-/// (`smithy_query(query="operation", operation="GetDatabase")` gives the operation those
-/// two beside the `ApplicationId`/`ComponentId` that narrow the lookup), so a request
-/// carrying neither names nothing to read. A fixed diagnostic for a fixed condition —
-/// the request carries nothing to build it from — stated in the same shape as
-/// [`MISSING_APPLICATION_IDENTIFIER_MESSAGE`], so a client reads one wording for the
-/// class.
+/// Every member of the operation is optional (`smithy_query(query="operation",
+/// operation="GetDatabase")`: `ApplicationId`, `ComponentId`, `DatabaseId`,
+/// `DatabaseArn`), so which of them NAME a database to read is the service's rule: the
+/// database's own ARN, or the application, component and database ids together. A
+/// request carrying neither names nothing to read, and the diagnostic for that condition
+/// is fixed — the request carries nothing to build it from — so it is the service's own
+/// wording verbatim, as the `ssm-sap` application-lookup recording shows it, naming BOTH
+/// alternatives rather than two of the four members.
 pub const MISSING_DATABASE_IDENTIFIER_MESSAGE: &str =
-    "databaseArn or databaseId need to be specified";
+    "Either database ARN or a combination of applicationId, componentId and databaseId \
+     must be provided";
 
 /// This service's modelled `ConflictException` (HTTP 409) carrying `message`.
 pub fn conflict(message: impl Into<String>) -> ConflictException {

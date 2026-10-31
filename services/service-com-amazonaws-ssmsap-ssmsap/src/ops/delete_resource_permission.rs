@@ -4,13 +4,13 @@
 //! Stops permitting a source resource to take a `PermissionActionType` on a target
 //! resource, and answers the target's resulting policy document.
 //!
-//! The target is a resource this account and Region holds — a registered application
-//! or one of the resources derived from one of its registrations, its SAP HANA
-//! databases and its components
-//! ([`crate::state::RegionState::holds_resource`]) — so an ARN that names no such
-//! resource is refused with the modelled `ResourceNotFoundException`, exactly as the
-//! grant and the read refuse it, rather than reporting a revocation on a resource that
-//! does not exist.
+//! The target is a SAP HANA DATABASE of this account and Region — the permissions this
+//! service holds are database-scoped, so the ARN is resolved as one of the databases this
+//! Region's registrations named ([`crate::state::RegionState::holds_database`]) — and an
+//! ARN naming anything else, including a registered application or a component of one, is
+//! refused with the modelled `ValidationException`
+//! ([`crate::state::invalid_database_arn`]), exactly as the grant and the read refuse it,
+//! rather than reporting a revocation on a database that does not exist.
 //!
 //! `ActionType` and `SourceResourceArn` are both OPTIONAL here (unlike
 //! `PutResourcePermission`, which models both `@required`), so each one NARROWS what
@@ -179,13 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ResourceArn` is modelled `@required` with a `@pattern` and the two optional
         // members carry their own constraints, so reaching here means the request is
-        // well formed. What the model cannot state is whether the TARGET names
-        // anything: the policy being changed is attached TO that resource, so it has to
-        // be one this account and Region holds, resolved the one way this crate resolves
-        // a resource named by ARN ([`crate::state::RegionState::holds_resource`]) — the
-        // same resolution the grant and the read run, so a target that resolves for one
-        // of them resolves for all. Reading the Region first mints no partition for one
-        // that holds nothing (`region`, not `region_entry`).
+        // well formed. What the model cannot state is WHICH resource the target may be:
+        // this service's permissions are database-scoped, so the ARN has to name a SAP
+        // HANA database of one of this Region's registrations, resolved the one way this
+        // crate resolves a database named by ARN
+        // ([`crate::state::RegionState::holds_database`]) — the same resolution the grant
+        // and the read run, so what resolves for one resolves for all. An ARN naming
+        // anything else is an input to correct and is refused as the
+        // `ValidationException` this operation declares. Reading the Region first mints
+        // no partition for one that holds nothing (`region`, not `region_entry`).
         //
         // `SourceResourceArn` is NOT resolved against this store, for the reason
         // `PutResourcePermission` gives: it names the counterparty the grant permitted,
@@ -193,13 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds decides whether it exists.
         if !state
             .region(&region)
-            .holds_resource(&region, &input.resource_arn)
+            .holds_database(&region, &input.resource_arn)
         {
             return Err(
-                DeleteResourcePermissionErrorModeled::ResourceNotFoundException(
-                    crate::state::not_found(crate::state::resource_not_found_message(
-                        &input.resource_arn,
-                    )),
+                DeleteResourcePermissionErrorModeled::ValidationException(
+                    crate::state::invalid_database_arn(None, &input.resource_arn),
                 )
                 .into(),
             );

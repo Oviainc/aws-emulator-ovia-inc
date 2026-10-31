@@ -42,8 +42,8 @@ use crate::application_lifecycle::{
 };
 use crate::list_databases::listed;
 use crate::resource_permissions::{
-    assert_not_found, assert_policy_grants, get as get_permission, policy, put as put_permission,
-    COLON_SEGMENT_DATABASE_ARN,
+    assert_invalid_database_arn, assert_not_found, assert_policy_grants, get as get_permission,
+    policy, put as put_permission, COLON_SEGMENT_DATABASE_ARN, RESOURCE_ARN_MEMBER,
 };
 use crate::resource_tags::{application_arn, database_arn, list_tags, register, registration};
 use crate::tag_resource::{pairs, tag};
@@ -143,14 +143,26 @@ async fn database_arns(emulator: &Emulator, case: &str, application_id: &str) ->
         .collect()
 }
 
-/// Attach the tag set and one grant to `arn`, asserting each write was served and reports
-/// back what it persisted — the state the rule is about the fate of.
-async fn hold(emulator: &Emulator, case: &str, arn: &str) {
+/// Attach the tag set to `arn`, and one grant too when the ARN names a SAP HANA database
+/// — the resource-permission calls are database-scoped, so an ARN of another kind holds
+/// tags and no grant at all. Each write is asserted served and reporting back what it
+/// persisted: the state the rule is about the fate of.
+async fn hold(emulator: &Emulator, case: &str, arn: &str, names_a_database: bool) {
     let reply = tag(emulator, arn, &tags()).await;
     assert_eq!(
         reply.status, 200,
         "case {case:?}: expected 200 from TagResource for {arn}, got {reply:?}"
     );
+    if !names_a_database {
+        // Granting on it is refused rather than held, because the ARN names no database.
+        assert_invalid_database_arn(
+            &put_permission(emulator, arn, action(), SOURCE).await,
+            Some(RESOURCE_ARN_MEMBER),
+            arn,
+            case,
+        );
+        return;
+    }
     let reply = put_permission(emulator, arn, action(), SOURCE).await;
     let document = policy(&reply, case);
     assert_policy_grants(&document, arn, action(), &one_source(), case);
@@ -179,12 +191,15 @@ async fn assert_still_held(emulator: &Emulator, case: &str, arn: &str) {
     assert_policy_grants(&document, arn, action(), &one_source(), case);
 }
 
-/// Assert nothing is held on `arn` any more: both reads refuse it as the modelled
-/// `ResourceNotFoundException`, because the resource it named has stopped existing.
+/// Assert nothing is held on `arn` any more: the tag read refuses it as the modelled
+/// `ResourceNotFoundException` and the permission read as the modelled
+/// `ValidationException` for an ARN that names no database, because the resource it named
+/// has stopped existing.
 async fn assert_gone(emulator: &Emulator, case: &str, arn: &str) {
     assert_not_found(&list_tags(emulator, arn).await, arn, case);
-    assert_not_found(
+    assert_invalid_database_arn(
         &get_permission(emulator, arn, Some(action())).await,
+        None,
         arn,
         case,
     );
@@ -485,9 +500,10 @@ async fn what_is_held_on_a_resource_goes_with_the_registration_that_owns_it() {
     settle().await;
 
     // Everything the rows name is tagged and granted on BEFORE any deregistration, so
-    // what the deregistration does to it is the only thing under test.
+    // what the deregistration does to it is the only thing under test. An ARN that names
+    // no database holds tags alone, since the permission calls refuse it.
     for row in &rows {
-        hold(&emulator, row.name, &(row.arn)(row.owner)).await;
+        hold(&emulator, row.name, &(row.arn)(row.owner), row.survives).await;
     }
 
     for row in &rows {
@@ -581,7 +597,9 @@ async fn a_registration_under_the_same_id_inherits_nothing_held_on_the_previous_
     }
     settle().await;
     for row in &rows {
-        hold(&emulator, row.name, &(row.arn)(row.owner)).await;
+        // Every row's ARN names a resource of another kind than a database (the
+        // application itself, its SAP HANA component), so each holds tags alone.
+        hold(&emulator, row.name, &(row.arn)(row.owner), false).await;
     }
     for row in &rows {
         deregister(&emulator, row.name, row.owner).await;
@@ -619,16 +637,14 @@ async fn a_registration_under_the_same_id_inherits_nothing_held_on_the_previous_
              got {by_get_application:?}"
         );
 
-        let reply = get_permission(&emulator, &arn, Some(action())).await;
-        assert_eq!(
-            reply.status, 200,
-            "case {name:?}: expected 200 from GetResourcePermission for the fresh {arn}, got \
-             {reply:?}"
-        );
-        assert!(
-            reply.member("Policy").is_none(),
-            "case {name:?}: nothing was granted on the fresh {arn}, expected no Policy at \
-             all, got {reply:?}"
+        // The permission calls refuse the fresh ARN for what it is — a resource of another
+        // kind than a database — so nothing of the destroyed resource can be reported for
+        // it either.
+        assert_invalid_database_arn(
+            &get_permission(&emulator, &arn, Some(action())).await,
+            None,
+            &arn,
+            name,
         );
     }
 }

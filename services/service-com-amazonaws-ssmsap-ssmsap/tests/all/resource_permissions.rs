@@ -10,25 +10,26 @@
 //!   granted source, in an order that does not depend on the order the grants arrived,
 //!   absent entirely for a target nobody has granted anything on, and unchanged by
 //!   re-granting a triple already held or by reading it.
-//! * The target is a resource this account and Region HOLDS: a registered SAP
-//!   application, or a SAP HANA database of one of its registrations. An ARN that names
-//!   no such resource is refused with the modelled `ResourceNotFoundException`
-//!   (HTTP 404) naming that ARN, by the grant and by the read alike, and the refusal
-//!   persists nothing. A grant therefore cannot outlive the registration its target came
-//!   from, and a grant made for a Region that holds nothing keeps no partition for it.
+//! * The target is a SAP HANA DATABASE of this account and Region: these permissions are
+//!   database-scoped, so an ARN that names no database discovered here — including the
+//!   ARN of a registered application or of a component of one — is refused with the
+//!   modelled `ValidationException` (HTTP 400) stating that the ARN is not a valid
+//!   database ARN, by the grant and by the read alike, and the refusal persists nothing.
+//!   A grant therefore cannot outlive the registration its target came from, and a grant
+//!   made for a Region that holds nothing keeps no partition for it.
 //!
-//! The tables span what those rules generalise over: the kind of resource the target ARN
-//! names (the application itself, a database its credentials named, a database its
-//! `DatabaseArn` named), the ARN form of the target (both branches of the modelled `Arn`
+//! The tables span what those rules generalise over: how the target database came to be
+//! (named by a registration's credentials, named by its `DatabaseArn`, one of several a
+//! registration named), the ARN form of the target (both branches of the modelled `Arn`
 //! pattern — the colon-segment form and the `.../path` form), the number of sources
 //! granted on one target, the ARN form of a source (a registered database of this Region,
 //! a database of another Region or account, another service's resource), every
 //! `PermissionActionType` the model declares
 //! (`service_com_amazonaws_ssmsap_ssmsap::ops::types::PERMISSION_ACTION_TYPE_VALUES`),
-//! and the ways an ARN can name nothing here (never registered, deregistered, another
-//! Region, a Region holding nothing at all, a database the registration never named,
-//! another service's resource). A single HANA database target with one source — the shape
-//! the issue's reproduction calls — is ONE row.
+//! and the ways an ARN can name no database here (never registered, deregistered, another
+//! Region, a Region holding nothing at all, a database the registration never named, the
+//! application's own ARN, another service's resource). A single HANA database target with
+//! one source — the shape the issue's reproduction calls — is ONE row.
 //!
 //! Every call goes through `MultiServiceRouter::dispatch` (the harness
 //! `tests/all/application_lifecycle.rs` owns), so the restJson1 routing, the boundary
@@ -61,11 +62,18 @@ const REGION: &str = "us-east-1";
 /// registered in.
 const OTHER_REGION: &str = "us-west-2";
 
-/// The modelled error code and status an ARN naming no resource is answered with
-/// (`smithy_query(query="operation", operation="PutResourcePermission")`:
-/// `ResourceNotFoundException` `@httpError 404`, declared for `GetResourcePermission`
-/// too).
+/// The modelled error code and status the ARN-keyed TAGGING calls answer an ARN naming no
+/// resource with (`smithy_query(query="operation", operation="ListTagsForResource")`:
+/// `ResourceNotFoundException` `@httpError 404`), read through [`assert_not_found`] by
+/// the suites that drive those calls beside the permission calls.
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// The input member `PutResourcePermission`'s refusal tags an unresolvable target ARN
+/// with, spelled as the model spells it (`smithy_query(query="operation",
+/// operation="PutResourcePermission")`: `ResourceArn`).
+///
+/// `pub(crate)` because the suites of this target drive ONE permissions harness.
+pub(crate) const RESOURCE_ARN_MEMBER: &str = "ResourceArn";
 
 /// The error code a registration past the store's Region ceiling carries
 /// (`smithy_query(query="operation", operation="RegisterApplication")`:
@@ -113,16 +121,16 @@ fn cases() -> Vec<Case> {
                 "arn:aws:s3:::sap-backint-bucket/backups".to_string(),
             ],
         },
-        // The registered application itself as the target, with an IAM role as a source:
-        // the rule is about what the ARN RESOLVES to here, not about which resource kind
-        // or which service the ARN spells.
+        // Two sources on the SYSTEM database of a registration, one of them an IAM role:
+        // a source is the counterparty a restore is permitted for, so the rule is about
+        // what the TARGET resolves to here and not about which service a source spells.
         Case {
-            label: "two sources on the registered application",
-            registration: registration("perm-app", &[], None),
-            resource: application_arn(REGION, "perm-app"),
+            label: "two sources on the registration's system database",
+            registration: registration("perm-app", &[], Some(&["SYSTEMDB"])),
+            resource: database_arn(REGION, "perm-app", "SYSTEMDB"),
             sources: vec![
                 format!("arn:aws:iam::{ACCOUNT}:role/sap-restore"),
-                database_arn(REGION, "perm-app", "HDB"),
+                database_arn(REGION, "perm-app", "SYSTEMDB"),
             ],
         },
         // A database the registration named by `DatabaseArn`: its ARN is the one the
@@ -357,8 +365,54 @@ pub(crate) fn assert_policy_grants_for_actions(
     );
 }
 
+/// AWS's wording for an ARN that names no SAP HANA database: fixed text around the ARN
+/// the request carried, in single quotes, with the offending input member named ahead of
+/// it by the call whose refusal tags the member (`PutResourcePermission`).
+///
+/// Written out here rather than read off the crate, so the assertion pins the wording
+/// instead of restating whatever the handler happens to build.
+pub(crate) fn invalid_database_arn_message(member: Option<&str>, arn: &str) -> String {
+    let stated = format!("Database ARN '{arn}' is not valid");
+    match member {
+        Some(member) => format!("{member}: {stated}"),
+        None => stated,
+    }
+}
+
+/// Assert the call was refused as the modelled `ValidationException` (HTTP 400) — the code
+/// in the body AND in the `x-amzn-errortype` header a client branches on — stating that
+/// the ARN the request carried is not a valid database ARN.
+pub(crate) fn assert_invalid_database_arn(
+    reply: &Reply,
+    member: Option<&str>,
+    arn: &str,
+    case: &str,
+) {
+    assert_eq!(
+        reply.status, 400,
+        "case {case:?}: expected HTTP 400 for an ARN naming no database, got {reply:?}"
+    );
+    assert_eq!(
+        reply.code(),
+        VALIDATION_EXCEPTION,
+        "case {case:?}: expected {VALIDATION_EXCEPTION}, got {reply:?}"
+    );
+    assert_eq!(
+        reply.error_type_header.as_deref(),
+        Some(VALIDATION_EXCEPTION),
+        "case {case:?}: expected the {VALIDATION_EXCEPTION} error type header, got {reply:?}"
+    );
+    let stated = message(reply);
+    let expected = invalid_database_arn_message(member, arn);
+    assert_eq!(
+        stated, expected,
+        "case {case:?}: expected {expected:?}, got {stated:?}"
+    );
+}
+
 /// Assert the call was refused as the modelled `ResourceNotFoundException`, naming the
-/// ARN the request carried.
+/// ARN the request carried — what the ARN-keyed TAGGING calls answer for an ARN naming no
+/// resource of this account and Region.
 pub(crate) fn assert_not_found(reply: &Reply, arn: &str, case: &str) {
     assert_eq!(
         reply.status, 404,
@@ -466,7 +520,7 @@ async fn a_target_that_exists_with_no_grant_has_no_policy() {
     register(
         &emulator,
         "an ungranted registration",
-        registration("perm-none", &[], Some(&["HDB"])),
+        registration("perm-none", &[], Some(&["HDB", "SYSTEMDB"])),
     )
     .await;
     register(
@@ -476,12 +530,15 @@ async fn a_target_that_exists_with_no_grant_has_no_policy() {
     )
     .await;
 
-    // Rows: the kinds of resource a registration brings with it, each granted nothing.
+    // Rows: the databases a registration brings with it, each granted nothing.
     let ungranted = [
-        ("the application", application_arn(REGION, "perm-none")),
         (
-            "its HANA database",
+            "its tenant database",
             database_arn(REGION, "perm-none", "HDB"),
+        ),
+        (
+            "its system database",
+            database_arn(REGION, "perm-none", "SYSTEMDB"),
         ),
     ];
 
@@ -502,6 +559,16 @@ async fn a_target_that_exists_with_no_grant_has_no_policy() {
         }
     }
 
+    // The APPLICATION the same registration brought with it is no target at all: it is a
+    // resource this Region holds, and still not a database ARN.
+    let application = application_arn(REGION, "perm-none");
+    assert_invalid_database_arn(
+        &get(&emulator, &application, None).await,
+        None,
+        &application,
+        "the registered application's own ARN",
+    );
+
     // A grant on ANOTHER target does not give these ones a policy.
     let other = database_arn(REGION, "perm-other", "HDB");
     let source = database_arn(REGION, "perm-none", "HDB");
@@ -521,11 +588,12 @@ async fn a_target_that_exists_with_no_grant_has_no_policy() {
     }
 }
 
-/// RULE: an ARN that names no resource of this account and Region is refused with the
-/// modelled `ResourceNotFoundException` (HTTP 404) naming that ARN — by the grant and by
-/// the read alike — and the refused grant persists nothing.
+/// RULE: an ARN that names no SAP HANA database of this account and Region is refused
+/// with the modelled `ValidationException` (HTTP 400) stating that the ARN is not a valid
+/// database ARN — by the grant and by the read alike — and the refused grant persists
+/// nothing.
 #[tokio::test]
-async fn an_arn_naming_no_resource_here_is_refused_and_persists_nothing() {
+async fn an_arn_naming_no_database_here_is_refused_and_persists_nothing() {
     let emulator = Emulator::new();
     let action = PERMISSION_ACTION_TYPE_VALUES[0];
 
@@ -568,6 +636,16 @@ async fn an_arn_naming_no_resource_here_is_refused_and_persists_nothing() {
             database_arn(REGION, "perm-never-registered", "HDB"),
         ),
         (
+            "the own ARN of a registered application",
+            REGION,
+            application_arn(REGION, "perm-present"),
+        ),
+        (
+            "a component of a registered application",
+            REGION,
+            format!("arn:aws:ssm-sap:{REGION}:{ACCOUNT}:component/perm-present/HDB-HANA"),
+        ),
+        (
             "an application that was deregistered",
             REGION,
             application_arn(REGION, "perm-gone"),
@@ -606,15 +684,17 @@ async fn an_arn_naming_no_resource_here_is_refused_and_persists_nothing() {
 
     let source = database_arn(REGION, "perm-present", "HDB");
     for (label, region, arn) in rows {
+        // The grant tags the input member its refusal is about; the read states the
+        // condition alone.
         let grant = put_in_region(&emulator, region, &arn, action, &source).await;
-        assert_not_found(&grant, &arn, label);
+        assert_invalid_database_arn(&grant, Some(RESOURCE_ARN_MEMBER), &arn, label);
 
         // The read refuses the same ARN in the same way, rather than reporting an empty
-        // policy for a resource that does not exist.
+        // policy for a database that does not exist.
         let read = get_in_region(&emulator, region, &arn, None).await;
-        assert_not_found(&read, &arn, label);
+        assert_invalid_database_arn(&read, None, &arn, label);
         let narrowed = get_in_region(&emulator, region, &arn, Some(action)).await;
-        assert_not_found(&narrowed, &arn, label);
+        assert_invalid_database_arn(&narrowed, None, &arn, label);
     }
 
     // The resource that does exist was untouched by every refusal: it still carries no
@@ -644,7 +724,7 @@ async fn a_grant_does_not_outlive_the_registration_its_target_came_from() {
     let action = PERMISSION_ACTION_TYPE_VALUES[0];
     let source = format!("arn:aws:ssm-sap:{REGION}:{ACCOUNT}:database/perm-source/HDB");
 
-    // Rows: the kinds of resource a registration brings with it, each granted on.
+    // Rows: the databases the registration brings with it, each granted on.
     let databases: &[&str] = &["HDB", "SYSTEMDB"];
     register(
         &emulator,
@@ -653,12 +733,10 @@ async fn a_grant_does_not_outlive_the_registration_its_target_came_from() {
     )
     .await;
 
-    let mut targets = vec![application_arn(REGION, "perm-lifetime")];
-    targets.extend(
-        databases
-            .iter()
-            .map(|database_id| database_arn(REGION, "perm-lifetime", database_id)),
-    );
+    let targets: Vec<String> = databases
+        .iter()
+        .map(|database_id| database_arn(REGION, "perm-lifetime", database_id))
+        .collect();
     for target in &targets {
         let reply = put(&emulator, target, action, &source).await;
         let expected: BTreeSet<String> = BTreeSet::from([source.clone()]);
@@ -677,12 +755,13 @@ async fn a_grant_does_not_outlive_the_registration_its_target_came_from() {
     );
     settle().await;
 
-    // The resources are gone, so both calls refuse their ARNs.
+    // The databases are gone, so both calls refuse their ARNs.
     for target in &targets {
         let case = format!("{target} after deregistration");
-        assert_not_found(&get(&emulator, target, None).await, target, &case);
-        assert_not_found(
+        assert_invalid_database_arn(&get(&emulator, target, None).await, None, target, &case);
+        assert_invalid_database_arn(
             &put(&emulator, target, action, &source).await,
+            Some(RESOURCE_ARN_MEMBER),
             target,
             &case,
         );
@@ -801,9 +880,9 @@ async fn grants_are_held_per_region() {
             if read_in == granted_in {
                 assert_policy_grants(&policy(&reply, &case), &target, action, &expected, &case);
             } else {
-                // The target is a resource of ANOTHER Region, so this endpoint holds no
-                // such resource at all — it cannot report the grant made there.
-                assert_not_found(&reply, &target, &case);
+                // The target is a database of ANOTHER Region, so this endpoint holds no
+                // such database at all — it cannot report the grant made there.
+                assert_invalid_database_arn(&reply, None, &target, &case);
             }
         }
     }
@@ -829,13 +908,15 @@ async fn a_grant_for_a_region_holding_nothing_keeps_no_partition() {
             MAX_REGIONS + 1
         );
         let target = database_arn(&region, "perm-unregistered", "HDB");
-        assert_not_found(
+        assert_invalid_database_arn(
             &put_in_region(&emulator, &region, &target, action, &source).await,
+            Some(RESOURCE_ARN_MEMBER),
             &target,
             &case,
         );
-        assert_not_found(
+        assert_invalid_database_arn(
             &get_in_region(&emulator, &region, &target, None).await,
+            None,
             &target,
             &case,
         );
@@ -901,15 +982,16 @@ async fn the_region_partition_ceiling_is_enforced_where_a_partition_is_minted() 
         CONFLICT_EXCEPTION,
         "case {case:?}: expected {CONFLICT_EXCEPTION}, got {reply:?}"
     );
-    // The refusal stored nothing, so the Region holds no resource to grant on.
+    // The refusal stored nothing, so the Region holds no database to grant on.
     let target = database_arn(&over, "perm-ceiling", "HDB");
-    assert_not_found(
+    assert_invalid_database_arn(
         &get_in_region(&emulator, &over, &target, None).await,
+        None,
         &target,
         &case,
     );
 
-    // Every Region within the ceiling still holds its own resource, each a target of its
+    // Every Region within the ceiling still holds its own database, each a target of its
     // own.
     let action = PERMISSION_ACTION_TYPE_VALUES[0];
     for index in 0..MAX_REGIONS {

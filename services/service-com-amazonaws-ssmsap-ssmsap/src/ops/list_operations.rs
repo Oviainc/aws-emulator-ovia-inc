@@ -178,10 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // application, which has to be registered in this Region. This operation models
         // no `ResourceNotFoundException`, so a reference no registration answers is the
         // `ValidationException` it does model rather than an empty page, which would
-        // report an application that exists and has had nothing done to it.
+        // report an application that exists and has had nothing done to it. The refusal
+        // is worded as this operation words it
+        // ([`crate::state::application_does_not_exist`]): the id the request carried,
+        // quoted, and nothing of the environment the call reached.
         if !region_state.applications.contains_key(&input.application_id) {
             return Err(ListOperationsErrorModeled::ValidationException(
-                crate::state::no_registered_application(&input.application_id),
+                crate::state::application_does_not_exist(&input.application_id),
             )
             .into());
         }

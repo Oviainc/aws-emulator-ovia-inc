@@ -14,21 +14,24 @@
 //! * The `Policy` the call answers is PROJECTED from the grants that are left, narrowed
 //!   to the `ActionType` the call named — the same projection `GetResourcePermission`
 //!   reports next — and is ABSENT when nothing is left, rather than an empty document.
-//! * The target is a resource this account and Region HOLDS: an ARN naming no such
-//!   resource is refused with the modelled `ResourceNotFoundException` (HTTP 404) naming
-//!   that ARN, exactly as the grant and the read refuse it, and the refusal changes
-//!   nothing. A request outside the modelled constraints is refused with
-//!   `ValidationException` (HTTP 400) and changes nothing either.
+//! * The target is a SAP HANA DATABASE of this account and Region: these permissions are
+//!   database-scoped, so an ARN naming no database discovered here — including a
+//!   registered application's own ARN — is refused with the modelled
+//!   `ValidationException` (HTTP 400) stating that the ARN is not a valid database ARN,
+//!   exactly as the grant and the read refuse it, and the refusal changes nothing. A
+//!   request outside the modelled constraints is refused with `ValidationException`
+//!   (HTTP 400) and changes nothing either.
 //!
 //! The tables span what those rules generalise over: which optional members the delete
 //! request carries (both, each alone, neither), whether the source it names is one the
-//! target holds a grant for, the number of grants held on the target, the kind of
-//! resource the target ARN names (the registered application, a SAP HANA database of
-//! it, a database the registration named by ARN — both branches of the modelled `Arn`
-//! pattern), every `PermissionActionType` the model declares
+//! target holds a grant for, the number of grants held on the target, how the target
+//! database came to be (named by a registration's credentials, named by its `DatabaseArn`
+//! — both branches of the modelled `Arn` pattern), every `PermissionActionType` the model
+//! declares
 //! (`service_com_amazonaws_ssmsap_ssmsap::ops::types::PERMISSION_ACTION_TYPE_VALUES`),
-//! and the ways an ARN can name nothing here (never registered, deregistered, another
-//! Region, a Region holding nothing, another service's resource).
+//! and the ways an ARN can name no database here (never registered, deregistered, the
+//! application's own ARN, another Region, a Region holding nothing, another service's
+//! resource).
 //!
 //! Every call goes through `MultiServiceRouter::dispatch` (the harness
 //! `tests/all/application_lifecycle.rs` owns), so the restJson1 routing, the boundary
@@ -43,8 +46,8 @@ use serde_json::{json, Map, Value};
 
 use crate::application_lifecycle::{settle, Emulator, Reply};
 use crate::resource_permissions::{
-    assert_not_found, assert_policy_grants, get, get_in_region, policy, put, put_in_region,
-    registered_by_arn, COLON_SEGMENT_DATABASE_ARN,
+    assert_invalid_database_arn, assert_policy_grants, get, get_in_region, policy, put,
+    put_in_region, registered_by_arn, COLON_SEGMENT_DATABASE_ARN,
 };
 use crate::resource_tags::{application_arn, database_arn, register, registration};
 use crate::validation_message_rendering::VALIDATION_EXCEPTION;
@@ -100,8 +103,8 @@ struct Target {
     arn: String,
 }
 
-/// The kinds of resource a target ARN can name here, spanning both branches of the
-/// modelled `Arn` pattern.
+/// The kinds of SAP HANA database a target ARN can name here, spanning both branches of
+/// the modelled `Arn` pattern.
 fn targets() -> Vec<Target> {
     vec![
         Target {
@@ -110,9 +113,9 @@ fn targets() -> Vec<Target> {
             arn: database_arn(REGION, "del-hdb", "HDB"),
         },
         Target {
-            label: "the registered application itself",
-            registration: registration("del-app", &[], None),
-            arn: application_arn(REGION, "del-app"),
+            label: "the system database of the registration",
+            registration: registration("del-app", &[], Some(&["SYSTEMDB"])),
+            arn: database_arn(REGION, "del-app", "SYSTEMDB"),
         },
         Target {
             label: "a database the registration named by ARN",
@@ -329,7 +332,7 @@ async fn a_revocation_removes_exactly_the_grants_the_request_names() {
     }
 }
 
-/// RULE: a target that holds no grant at all is still a resource this Region holds, so
+/// RULE: a target that holds no grant at all is still a database this Region holds, so
 /// revoking on it is served with an absent `Policy` rather than refused — and a grant
 /// made after a revocation is held again, so revoking removes the grant and nothing more.
 #[tokio::test]
@@ -410,13 +413,13 @@ async fn a_revocation_reaches_only_the_region_it_was_made_in() {
     for (index, revoked_in) in regions.iter().enumerate() {
         let target = database_arn(revoked_in, "del-regions", "HDB");
         // The target belongs to `revoked_in`, so every OTHER endpoint holds no such
-        // resource and refuses the revocation.
+        // database and refuses the revocation.
         for called_in in regions {
             let case = format!("target of {revoked_in}, revoked in {called_in}");
             if called_in != *revoked_in {
                 let reply =
                     delete_in_region(&emulator, called_in, &target, Some(action), None).await;
-                assert_not_found(&reply, &target, &case);
+                assert_invalid_database_arn(&reply, None, &target, &case);
             }
         }
         // Still granted: the refusals revoked nothing.
@@ -451,11 +454,11 @@ async fn a_revocation_reaches_only_the_region_it_was_made_in() {
     }
 }
 
-/// RULE: an ARN that names no resource of this account and Region is refused with the
-/// modelled `ResourceNotFoundException` (HTTP 404) naming that ARN, and the refusal
-/// changes nothing.
+/// RULE: an ARN that names no SAP HANA database of this account and Region is refused
+/// with the modelled `ValidationException` (HTTP 400) stating that the ARN is not a valid
+/// database ARN, and the refusal changes nothing.
 #[tokio::test]
-async fn an_arn_naming_no_resource_here_is_refused_and_changes_nothing() {
+async fn an_arn_naming_no_database_here_is_refused_and_changes_nothing() {
     let emulator = Emulator::new();
     let action = PERMISSION_ACTION_TYPE_VALUES[0];
 
@@ -506,6 +509,11 @@ async fn an_arn_naming_no_resource_here_is_refused_and_changes_nothing() {
             database_arn(REGION, "del-never-registered", "HDB"),
         ),
         (
+            "the own ARN of a registered application",
+            REGION,
+            application_arn(REGION, "del-present"),
+        ),
+        (
             "an application that was deregistered",
             REGION,
             application_arn(REGION, "del-gone"),
@@ -554,7 +562,7 @@ async fn an_arn_naming_no_resource_here_is_refused_and_changes_nothing() {
         ] {
             let case = format!("{label} / {narrowing}");
             let reply = delete_in_region(&emulator, region, &arn, named_action, named_source).await;
-            assert_not_found(&reply, &arn, &case);
+            assert_invalid_database_arn(&reply, None, &arn, &case);
         }
     }
 

@@ -6,11 +6,13 @@
 //! The rule pinned here: an ARN names a resource of this account and Region exactly when
 //! it is the ARN of a registered application or of one of the resources derived from that
 //! registration — its SAP HANA databases and its components — so every ARN a response of
-//! this service hands a caller is an ARN the ARN-keyed calls accept (`ListTagsForResource`,
-//! `TagResource`, `UntagResource`, `PutResourcePermission`, `GetResourcePermission`), what
-//! is held under it is the same set every read of that resource reports, and only an ARN
-//! naming none of those resources is refused with the modelled `ResourceNotFoundException`
-//! (HTTP 404).
+//! this service hands a caller is an ARN the ARN-keyed TAGGING calls accept
+//! (`ListTagsForResource`, `TagResource`, `UntagResource`), what is held under it is the
+//! same set every read of that resource reports, and only an ARN naming none of those
+//! resources is refused with the modelled `ResourceNotFoundException` (HTTP 404). The
+//! resource-permission calls are narrower — they are database-scoped — so a component ARN
+//! is no target for them whether or not it resolves, which is the other half of the rule
+//! this suite pins.
 //!
 //! The component is the resource kind this suite spans, because it is the one no table
 //! covered: the sibling suites (`tests/all/resource_tags.rs`, `tests/all/tag_resource.rs`,
@@ -38,6 +40,7 @@ use service_com_amazonaws_ssmsap_ssmsap::state::ConditionalMember;
 use crate::application_lifecycle::{
     conditional_value, settle, tag_pairs, valid_registration, Emulator, Reply,
 };
+use crate::resource_permissions::{assert_invalid_database_arn, RESOURCE_ARN_MEMBER};
 use crate::resource_tags::{
     list_tags, list_tags_in_region, register, TAG_KEY_FORMS, TAG_VALUE_MAX_LENGTH,
 };
@@ -57,8 +60,8 @@ const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The modelled error code and status an ARN naming no resource is answered with
 /// (`smithy_query(query="operation", operation="ListTagsForResource")`:
-/// `ResourceNotFoundException` `@httpError 404`, declared for `TagResource`,
-/// `UntagResource`, `PutResourcePermission` and `GetResourcePermission` too).
+/// `ResourceNotFoundException` `@httpError 404`, declared for `TagResource` and
+/// `UntagResource` too).
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
 /// The `ComponentType` of the SAP HANA component of an application's own SAP system: one
@@ -463,10 +466,12 @@ async fn a_component_holds_its_own_tag_set() {
     );
 }
 
-/// RULE: a component ARN is a resource ARN of this service like any other, so it is a
-/// target the resource-permission calls accept and report a policy for.
+/// RULE: the resource-permission calls are database-scoped, so a component ARN is no
+/// target for them — even the ARN of a component this Region does hold is refused with
+/// the modelled `ValidationException` (HTTP 400) stating that it is not a valid database
+/// ARN, and nothing is granted or reported for it.
 #[tokio::test]
-async fn a_component_arn_is_a_resource_permission_target() {
+async fn a_component_arn_is_no_resource_permission_target() {
     let emulator = Emulator::new();
 
     register(
@@ -490,19 +495,11 @@ async fn a_component_arn_is_a_resource_permission_target() {
                 }),
             )
             .await;
-        assert_eq!(
-            granted.status, 200,
-            "case {label:?}: expected 200 from PutResourcePermission, got {granted:?}"
-        );
-        let policy = granted
-            .member("Policy")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        assert!(
-            policy.contains(&source),
-            "case {label:?}: expected the policy to name the granted source {source:?}, got \
-             {policy:?}"
+        assert_invalid_database_arn(
+            &granted,
+            Some(RESOURCE_ARN_MEMBER),
+            &item.arn,
+            &format!("{label} (PutResourcePermission)"),
         );
 
         let read = emulator
@@ -511,19 +508,21 @@ async fn a_component_arn_is_a_resource_permission_target() {
                 json!({"ActionType": RESTORE, "ResourceArn": item.arn}),
             )
             .await;
-        assert_eq!(
-            read.status, 200,
-            "case {label:?}: expected 200 from GetResourcePermission, got {read:?}"
+        assert_invalid_database_arn(
+            &read,
+            None,
+            &item.arn,
+            &format!("{label} (GetResourcePermission)"),
         );
-        let reported = read
-            .member("Policy")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        assert_eq!(
-            reported, policy,
-            "case {label:?}: expected the read to report the policy the grant did \
-             {policy:?}, got {reported:?}"
+
+        // The component itself still resolves for the calls it IS a resource of: the
+        // refusal is about the kind of ARN the permission calls take, not about the
+        // component having stopped existing.
+        let held = tags_held(&emulator, &label, &item.arn).await;
+        assert!(
+            held.is_empty(),
+            "case {label:?}: nothing tagged the component, expected an empty tag set, got \
+             {held:?}"
         );
     }
 }
@@ -622,7 +621,12 @@ async fn a_component_arn_naming_nothing_here_is_refused_as_not_found() {
                 }),
             )
             .await;
-        assert_not_found(&format!("{label} (PutResourcePermission)"), &arn, &granted);
+        assert_invalid_database_arn(
+            &granted,
+            Some(RESOURCE_ARN_MEMBER),
+            &arn,
+            &format!("{label} (PutResourcePermission)"),
+        );
     }
 
     // The component that DOES resolve is served at the Region it was registered in, so

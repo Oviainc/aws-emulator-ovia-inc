@@ -34,7 +34,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::FILTER_OPERATOR_VALUES;
 use service_com_amazonaws_ssmsap_ssmsap::state::{
-    no_registered_application, APPLICATION_RESOURCE_TYPE, MAX_PAGE_SIZE, OPERATION_FILTER_NAMES,
+    APPLICATION_RESOURCE_TYPE, MAX_PAGE_SIZE, OPERATION_FILTER_NAMES,
     OPERATION_STATUS_ERROR, OPERATION_STATUS_INPROGRESS, OPERATION_STATUS_SUCCESS,
     OPERATION_TYPE_DEREGISTER_APPLICATION, OPERATION_TYPE_REGISTER_APPLICATION,
     OPERATION_TYPE_START_APPLICATION, OPERATION_TYPE_START_APPLICATION_REFRESH,
@@ -926,14 +926,15 @@ async fn listing_the_records_changes_nothing_a_later_caller_sees() {
 }
 
 /// What this service reports for an application reference no registration of this account
-/// and Region answers, read off the crate's own wording for it rather than restated here:
-/// `ListOperations` models no `ResourceNotFoundException` (`smithy_query(query="operation",
-/// operation="ListOperations")`: `ValidationException` 400 and `InternalServerException`
-/// 500 only), so that condition is the 400 it does model.
+/// and Region answers: `ListOperations` models no `ResourceNotFoundException`
+/// (`smithy_query(query="operation", operation="ListOperations")`: `ValidationException`
+/// 400 and `InternalServerException` 500 only), so that condition is the 400 it does
+/// model, and its message is this operation's own wording for it — the id the request
+/// carried, quoted, inside fixed text naming nothing of the environment the call reached.
+/// Written out here so the assertion pins the wording;
+/// `tests/all/validation_refusal_wording.rs` spans the rule over more references.
 fn unresolvable_reference_message(reference: &str) -> String {
-    no_registered_application(reference)
-        .message
-        .unwrap_or_default()
+    format!("The application '{reference}' does not exist")
 }
 
 /// A refusal the handler raised: 400, `ValidationException`, and the exact message the

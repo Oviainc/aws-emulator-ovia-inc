@@ -39,8 +39,8 @@ use serde_json::{json, Map, Value};
 use crate::application_lifecycle::{settle, tag_pairs, Emulator, Reply, REGION};
 use crate::list_databases::{credentials, listed};
 use crate::resource_permissions::{
-    assert_not_found, assert_policy_grants, get as get_permission, policy,
-    put as put_permission, COLON_SEGMENT_DATABASE_ARN,
+    assert_invalid_database_arn, assert_not_found, assert_policy_grants, get as get_permission,
+    policy, put as put_permission, COLON_SEGMENT_DATABASE_ARN, RESOURCE_ARN_MEMBER,
 };
 use crate::resource_tags::{database_arn, list_tags, register, registration};
 use crate::tag_resource::{pairs, tag};
@@ -357,22 +357,26 @@ async fn assert_still_held(emulator: &Emulator, case: &str, arn: &str, source: &
     assert_policy_grants(&document, arn, action(), &one_source(source), case);
 }
 
-/// Assert `arn` names NOTHING: every call that takes a resource ARN refuses it as the
-/// modelled `ResourceNotFoundException` — the read and the delete of its tags, and the
-/// read, the grant and the revocation of its permissions.
+/// Assert `arn` names NOTHING: every call that takes a resource ARN refuses it — the read
+/// and the delete of its tags as the modelled `ResourceNotFoundException` the tagging
+/// calls answer, and the read, the grant and the revocation of its permissions as the
+/// modelled `ValidationException` the database-scoped permission calls answer for an ARN
+/// that names no database.
 async fn assert_gone(emulator: &Emulator, case: &str, arn: &str) {
     let label = format!("{case} / {arn}");
     assert_not_found(&list_tags(emulator, arn).await, arn, &label);
     let keys: Vec<String> = tags().into_iter().map(|(key, _)| key).collect();
     assert_not_found(&untag(emulator, arn, &keys).await, arn, &label);
-    assert_not_found(
+    assert_invalid_database_arn(
         &get_permission(emulator, arn, Some(action())).await,
+        None,
         arn,
         &label,
     );
-    assert_not_found(&delete_permission(emulator, arn).await, arn, &label);
-    assert_not_found(
+    assert_invalid_database_arn(&delete_permission(emulator, arn).await, None, arn, &label);
+    assert_invalid_database_arn(
         &put_permission(emulator, arn, action(), &source_arn(0)).await,
+        Some(RESOURCE_ARN_MEMBER),
         arn,
         &label,
     );

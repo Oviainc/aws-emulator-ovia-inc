@@ -7,12 +7,13 @@
 //!
 //! 1. A request naming an application this account and Region holds no registration for
 //!    is refused with a message BUILT FROM THE REQUEST, at the status and error shape
-//!    that operation models. An application-CONTROL call — one that acts on the
-//!    application it names — models `ResourceNotFoundException` and answers
-//!    `Application <ApplicationId> doesn't exist.` with it (404); an operation that
-//!    models no not-found error answers the same condition with the service's
-//!    `ValidationException` wording (400), which
-//!    [`crate::application_lifecycle`] owns for the lookup members.
+//!    that operation models, in the wording that operation words the condition with. An
+//!    application-CONTROL call — one that acts on the application it names — models
+//!    `ResourceNotFoundException` and answers `Application <ApplicationId> doesn't exist.`
+//!    with it (404); an operation that models no not-found error answers the same
+//!    condition with a `ValidationException` (400) — the lookup calls with the wording
+//!    [`crate::application_lifecycle`] owns for the lookup members, and the
+//!    application-scoped listing of operation records with its own.
 //! 2. `GetApplication`'s missing-identifier refusal fires exactly when the request
 //!    carries NONE of the identifier members the model gives it — and a request that
 //!    carries any one of them is never refused for a missing identifier.
@@ -67,6 +68,15 @@ fn control_refusal_message(reference: &str) -> String {
 /// wording is the one `tests/all/application_lifecycle.rs` pins on the lookup members.
 fn validation_refusal_message(reference: &str) -> String {
     format!("No registered application found for account: {ACCOUNT}, and application: {reference}")
+}
+
+/// What the application-scoped listing of operation records reports for the same
+/// condition: this service words it PER OPERATION, and `ListOperations` states that the
+/// application the request named does not exist, the id quoted and nothing of the account
+/// or Region the call reached in the text. `tests/all/validation_refusal_wording.rs` spans
+/// that rule; this row is it beside the other operations that take an `ApplicationId`.
+fn listing_refusal_message(reference: &str) -> String {
+    format!("The application '{reference}' does not exist")
 }
 
 /// The ARN `RegisterApplication` mints for `id`.
@@ -171,13 +181,13 @@ fn id_refusals() -> Vec<Refusal> {
         },
         Refusal {
             // Also models no `ResourceNotFoundException`, so the application-scoped
-            // listing answers the same condition with the same 400 wording.
+            // listing answers the same condition with a 400 — in its OWN wording for it.
             label: "ListOperations",
             path: "/list-operations",
             body: |reference| json!({ "ApplicationId": reference }),
             status: 400,
             code: VALIDATION_EXCEPTION,
-            message: validation_refusal_message,
+            message: listing_refusal_message,
         },
     ]
 }

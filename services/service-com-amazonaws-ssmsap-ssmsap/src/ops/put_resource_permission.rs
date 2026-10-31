@@ -4,12 +4,13 @@
 //! Grants a source resource permission to take a `PermissionActionType` on a target
 //! resource, and answers the target's resulting policy document.
 //!
-//! The target is a resource this account and Region holds — a registered application
-//! or one of the resources derived from one of its registrations, its SAP HANA
-//! databases and its components
-//! ([`crate::state::RegionState::holds_resource`]) — so an ARN that names no such
-//! resource is refused with the modelled `ResourceNotFoundException` rather than
-//! granted a permission nothing could use.
+//! The target is a SAP HANA DATABASE of this account and Region — the permissions this
+//! service holds are database-scoped ("Adds permissions to the target database"), so the
+//! ARN is resolved as one of the databases this Region's registrations named
+//! ([`crate::state::RegionState::holds_database`]) — and an ARN naming anything else,
+//! including a registered application or a component of one, is refused with the modelled
+//! `ValidationException` ([`crate::state::invalid_database_arn`]) rather than granted a
+//! permission nothing could use.
 //!
 //! The grant is the (target resource ARN, action type, source resource ARN) triple
 //! held in [`crate::state::ComAmazonawsSsmsapSsmsapState::resource_permissions`], so
@@ -80,6 +81,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The input member a refusal of this operation attributes an unresolvable target ARN
+/// to, spelled as the model spells it (`smithy_query(query="operation",
+/// operation="PutResourcePermission")`: `ResourceArn`).
+const RESOURCE_ARN_MEMBER: &str = "ResourceArn";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -167,13 +173,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ActionType`, `ResourceArn` and `SourceResourceArn` are all modelled
         // `@required` with their own constraints, so reaching here means each is
-        // present and well formed. What the model cannot state is whether the TARGET
-        // names anything: the policy is attached TO that resource, so it has to be one
-        // this account and Region holds — a registered application or a SAP HANA
-        // database of one of its registrations. The lookup is the one resolution this
-        // crate does for a resource named by ARN
-        // ([`crate::state::RegionState::holds_resource`]), the same one the tagging
-        // calls run, so a target that resolves for one of them resolves for all.
+        // present and well formed. What the model cannot state is WHICH resource the
+        // target may be: the permissions this service holds are database-scoped, so the
+        // ARN has to name a SAP HANA database of one of this Region's registrations
+        // ([`crate::state::RegionState::holds_database`], the one resolution this crate
+        // does for a database named by ARN), and an ARN naming anything else — a
+        // registered application, a component of one, another service's resource — is an
+        // input to correct rather than a resource that has gone, so it is refused as the
+        // `ValidationException` this operation declares, tagged with the input member it
+        // is about.
         //
         // `SourceResourceArn` is NOT resolved against this store: it names the
         // counterparty the grant permits to act on the target, which for a restore
@@ -182,12 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exists.
         if !state
             .region(&region)
-            .holds_resource(&region, &input.resource_arn)
+            .holds_database(&region, &input.resource_arn)
         {
-            return Err(PutResourcePermissionErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::resource_not_found_message(
+            return Err(PutResourcePermissionErrorModeled::ValidationException(
+                crate::state::invalid_database_arn(
+                    Some(RESOURCE_ARN_MEMBER),
                     &input.resource_arn,
-                )),
+                ),
             )
             .into());
         }

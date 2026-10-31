@@ -19,14 +19,14 @@
 //! The rows span what the rule generalises over: the read form (unnarrowed, and narrowed
 //! to each `PermissionActionType` the model declares —
 //! `service_com_amazonaws_ssmsap_ssmsap::ops::types::PERMISSION_ACTION_TYPE_VALUES`), the
-//! kind of target (a registered application's own ARN, a SAP HANA database of a
-//! registration, a database of a registration nobody granted anything on, an ARN naming
-//! nothing here, another service's resource), the endpoint the read reaches (the Region
-//! holding the resource and one that does not), and the number and order of reads (three
-//! rounds, alternately reversed). After every round every reporting call of the
-//! registered slice — `GetApplication`, `ListApplications`, `ListDatabases` and
-//! `GetResourcePermission` itself — must answer exactly what it answered before any read
-//! was made.
+//! kind of target (a granted SAP HANA database of a registration, a database of a
+//! registration nobody granted anything on, a registered application's own ARN — which is
+//! no database ARN — an ARN naming nothing here, another service's resource), the endpoint
+//! the read reaches (the Region holding the database and one that does not), and the
+//! number and order of reads (three rounds, alternately reversed). After every round every
+//! reporting call of the registered slice — `GetApplication`, `ListApplications`,
+//! `ListDatabases` and `GetResourcePermission` itself — must answer exactly what it
+//! answered before any read was made.
 //!
 //! Every call goes through `MultiServiceRouter::dispatch` (the harness
 //! `tests/all/application_lifecycle.rs` owns), so the restJson1 routing, the boundary
@@ -41,7 +41,7 @@ use serde_json::json;
 
 use crate::application_lifecycle::{rendered, settle, Emulator, Reply};
 use crate::resource_permissions::{
-    assert_not_found, assert_policy_grants_for_actions, get, get_in_region, policy, put,
+    assert_invalid_database_arn, assert_policy_grants_for_actions, get, get_in_region, policy, put,
     register_in_region,
 };
 use crate::resource_tags::{application_arn, database_arn, register, registration};
@@ -59,7 +59,7 @@ const REGION: &str = "us-east-1";
 /// registered in.
 const OTHER_REGION: &str = "eu-west-1";
 
-/// The application whose own ARN and whose first HANA database both carry grants.
+/// The application whose first HANA database carries grants.
 const GRANTED_APP: &str = "perm-read-granted";
 
 /// A registered application nobody has granted anything on.
@@ -67,13 +67,6 @@ const BARE_APP: &str = "perm-read-bare";
 
 /// The databases the granted registration brings with it; only the first is granted on.
 const GRANTED_DATABASES: &[&str] = &["HDB", "SYSTEMDB"];
-
-/// The single source granted on the application's own ARN.
-fn application_sources() -> BTreeSet<String> {
-    BTreeSet::from([format!(
-        "arn:aws:ssm-sap:{REGION}:{ACCOUNT}:application/perm-read-source"
-    )])
-}
 
 /// The sources granted on the granted registration's first HANA database: more than one,
 /// and of more than one ARN form, so a read reports a document of several statements.
@@ -91,9 +84,9 @@ enum Expect {
     Granted(BTreeSet<String>),
     /// HTTP 200 with no `Policy` member at all: the target exists and carries no grant.
     NoPolicy,
-    /// The modelled `ResourceNotFoundException` (HTTP 404): the ARN names no resource of
-    /// this account and Region.
-    NotFound,
+    /// The modelled `ValidationException` (HTTP 400): the ARN names no SAP HANA database
+    /// of this account and Region.
+    InvalidDatabaseArn,
 }
 
 /// One read: where it is sent, what it names, how it is narrowed, and what it must
@@ -125,7 +118,7 @@ fn read_forms() -> Vec<Option<&'static str>> {
 }
 
 /// An emulator holding the two registrations, with every declared action type granted on
-/// the granted application's own ARN and on its first HANA database.
+/// the granted application's first HANA database.
 async fn granted_emulator() -> Emulator {
     let emulator = Emulator::new();
     register(
@@ -141,21 +134,15 @@ async fn granted_emulator() -> Emulator {
     )
     .await;
 
-    let application = application_arn(REGION, GRANTED_APP);
     let database = database_arn(REGION, GRANTED_APP, GRANTED_DATABASES[0]);
     for action in PERMISSION_ACTION_TYPE_VALUES {
-        for (target, sources) in [
-            (&application, application_sources()),
-            (&database, database_sources()),
-        ] {
-            for source in &sources {
-                let case = format!("granting {action} on {target} to {source}");
-                let reply = put(&emulator, target, action, source).await;
-                assert_eq!(
-                    reply.status, 200,
-                    "case {case:?}: expected 200 from PutResourcePermission, got {reply:?}"
-                );
-            }
+        for source in &database_sources() {
+            let case = format!("granting {action} on {database} to {source}");
+            let reply = put(&emulator, &database, action, source).await;
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: expected 200 from PutResourcePermission, got {reply:?}"
+            );
         }
     }
 
@@ -166,13 +153,10 @@ async fn granted_emulator() -> Emulator {
     emulator
 }
 
-/// Every target of [`granted_emulator`] that EXISTS, in a stable order.
+/// Every target of [`granted_emulator`] that is a database this Region holds, in a stable
+/// order.
 fn existing_targets() -> Vec<String> {
-    let mut targets = vec![
-        application_arn(REGION, GRANTED_APP),
-        application_arn(REGION, BARE_APP),
-        database_arn(REGION, BARE_APP, "HDB"),
-    ];
+    let mut targets = vec![database_arn(REGION, BARE_APP, "HDB")];
     for database in GRANTED_DATABASES {
         targets.push(database_arn(REGION, GRANTED_APP, database));
     }
@@ -197,12 +181,6 @@ fn probes() -> Vec<Probe> {
             });
         };
         row(
-            "the granted application's own ARN",
-            REGION,
-            application_arn(REGION, GRANTED_APP),
-            Expect::Granted(application_sources()),
-        );
-        row(
             "the granted HANA database",
             REGION,
             database_arn(REGION, GRANTED_APP, GRANTED_DATABASES[0]),
@@ -215,10 +193,16 @@ fn probes() -> Vec<Probe> {
             Expect::NoPolicy,
         );
         row(
+            "the granted application's own ARN",
+            REGION,
+            application_arn(REGION, GRANTED_APP),
+            Expect::InvalidDatabaseArn,
+        );
+        row(
             "the ungranted application's own ARN",
             REGION,
             application_arn(REGION, BARE_APP),
-            Expect::NoPolicy,
+            Expect::InvalidDatabaseArn,
         );
         row(
             "the ungranted application's HANA database",
@@ -230,19 +214,19 @@ fn probes() -> Vec<Probe> {
             "an application that was never registered",
             REGION,
             application_arn(REGION, "perm-read-absent"),
-            Expect::NotFound,
+            Expect::InvalidDatabaseArn,
         );
         row(
             "another service's resource",
             REGION,
             "arn:aws:s3:::sap-backint-bucket/restore".to_string(),
-            Expect::NotFound,
+            Expect::InvalidDatabaseArn,
         );
         row(
             "the granted database at the endpoint of another Region",
             OTHER_REGION,
             database_arn(REGION, GRANTED_APP, GRANTED_DATABASES[0]),
-            Expect::NotFound,
+            Expect::InvalidDatabaseArn,
         );
     }
     rows
@@ -278,7 +262,9 @@ fn assert_probe(reply: &Reply, probe: &Probe, case: &str) {
                 "case {case:?}: a target granted nothing must carry no Policy, got {reply:?}"
             );
         }
-        Expect::NotFound => assert_not_found(reply, &probe.resource, case),
+        Expect::InvalidDatabaseArn => {
+            assert_invalid_database_arn(reply, None, &probe.resource, case)
+        }
     }
 }
 
@@ -372,7 +358,7 @@ async fn reading_at_a_region_holding_nothing_mints_no_partition() {
                 MAX_REGIONS + 1
             );
             let reply = get_in_region(&emulator, &region, &target, action).await;
-            assert_not_found(&reply, &target, &case);
+            assert_invalid_database_arn(&reply, None, &target, &case);
         }
     }
 

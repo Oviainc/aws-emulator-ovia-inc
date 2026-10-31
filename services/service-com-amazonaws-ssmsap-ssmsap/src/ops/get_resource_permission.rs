@@ -7,10 +7,11 @@
 //! A reporting operation: it renders the stored grants through
 //! [`crate::state::ComAmazonawsSsmsapSsmsapState::resource_policy`] and adds no grant
 //! of its own, so reading a resource's policy cannot change what a later caller sees.
-//! A resource nobody has granted anything on carries NO policy, which is an absent
-//! `Policy` member rather than an invented document; an ARN that names no resource of
-//! this account and Region is refused with the modelled `ResourceNotFoundException`
-//! instead, so an empty policy is only ever reported for a resource that exists.
+//! A database nobody has granted anything on carries NO policy, which is an absent
+//! `Policy` member rather than an invented document; an ARN that names no SAP HANA
+//! database of this account and Region is refused with the modelled `ValidationException`
+//! instead ([`crate::state::invalid_database_arn`]), so an empty policy is only ever
+//! reported for a database that exists.
 //!
 //! ## Shape of an operation
 //!
@@ -158,25 +159,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ResourceArn` is modelled `@required` and `ActionType` is an optional enum,
         // so reaching here means the reference is well formed. What the model cannot
-        // state is whether the ARN names anything: the policy reported belongs to a
-        // resource this account and Region holds — a registered application or a SAP
-        // HANA database of one of its registrations — resolved the one way this crate
-        // resolves a resource named by ARN
-        // ([`crate::state::RegionState::holds_resource`]), which is the same resolution
-        // `PutResourcePermission` grants against. Reading a Region that holds nothing
-        // mints no partition for it (`region`, not `region_entry`).
+        // state is WHICH resource it may name: this service's permissions are
+        // database-scoped, so the policy reported belongs to a SAP HANA database of one
+        // of this Region's registrations, resolved the one way this crate resolves a
+        // database named by ARN ([`crate::state::RegionState::holds_database`]) — the
+        // same resolution `PutResourcePermission` grants against, so what resolves for
+        // one resolves for both. An ARN naming anything else is an input to correct, and
+        // is refused as the `ValidationException` this operation declares. Reading a
+        // Region that holds nothing mints no partition for it (`region`, not
+        // `region_entry`).
         let region_state = state.region(&region);
-        if !region_state.holds_resource(&region, &input.resource_arn) {
-            return Err(GetResourcePermissionErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::resource_not_found_message(
-                    &input.resource_arn,
-                )),
+        if !region_state.holds_database(&region, &input.resource_arn) {
+            return Err(GetResourcePermissionErrorModeled::ValidationException(
+                crate::state::invalid_database_arn(None, &input.resource_arn),
             )
             .into());
         }
 
         // An `ActionType` narrows the document to that action's statements; without one
-        // the whole policy held for the resource is reported. A resource that exists but
+        // the whole policy held for the database is reported. A database that exists but
         // has been granted nothing carries no policy, which is an ABSENT `Policy`.
         let policy =
             region_state.resource_policy(&input.resource_arn, input.action_type.as_deref());
