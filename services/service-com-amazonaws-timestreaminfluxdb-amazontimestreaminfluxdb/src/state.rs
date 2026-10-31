@@ -13,7 +13,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DbBackupConfiguration, DbBackupConfigurationOutput, DbInstanceSummary,
-    DbParameterGroupSummary, LogDeliveryConfiguration, MaintenanceSchedule, Parameters,
+    DbParameterGroupSummary, InfluxDBv2Parameters, LogDeliveryConfiguration,
+    MaintenanceSchedule, Parameters,
 };
 
 /// `Status` values this service's records use, each one a member of
@@ -264,7 +265,11 @@ pub struct DbParameterGroup {
     /// uniqueness rule is per region, so later operations read the region from here.
     pub region: String,
     pub description: Option<String>,
-    pub parameters: Option<Parameters>,
+    /// The engine parameter family this group configures, and the tunables overridden
+    /// inside it. NOT optional: a group always belongs to exactly one family, so every
+    /// shape that models `parameters` reports it (see
+    /// [`default_db_parameter_group_parameters`] for the group whose create named none).
+    pub parameters: Parameters,
     /// The tags the create request attached. No parameter-group output shape carries
     /// them, so nothing echoes them back; they are kept for the tagging operations.
     pub tags: BTreeMap<String, String>,
@@ -287,7 +292,7 @@ macro_rules! db_parameter_group_record_projections {
                         name: self.name.clone(),
                         arn: self.arn.clone(),
                         description: self.description.clone(),
-                        parameters: self.parameters.clone(),
+                        parameters: Some(self.parameters.clone()),
                     }
                 }
             )*
@@ -432,6 +437,19 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// The ARN of a DB instance: `arn:aws:timestream-influxdb:<region>:<account>:db-instance/<id>`.
 pub fn db_instance_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("db-instance/{id}"))
+}
+
+/// The engine parameter family a DB parameter group configures when its create request
+/// selects none.
+///
+/// `Parameters` is the union of the engine parameter families a group can configure
+/// (`smithy_query(query="shape", shape="Parameters")`), and a group configures exactly
+/// one of them — so the member is reported for every group, whether or not the request
+/// chose a family. Absent a choice the group gets the family of the default engine,
+/// InfluxDB v2, with no tunable overridden: every member of `InfluxDBv2Parameters` is
+/// optional, so that variant's value object carries none of them.
+pub fn default_db_parameter_group_parameters() -> Parameters {
+    Parameters::InfluxDBv2(InfluxDBv2Parameters::default())
 }
 
 /// The ARN of a DB parameter group:

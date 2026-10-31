@@ -214,7 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name.clone(),
             region: region.clone(),
             description: input.description,
-            parameters: input.parameters,
+            // A group configures exactly one engine parameter family, so a request that
+            // selects none still gets one: the default family, with no tunable
+            // overridden (see `default_db_parameter_group_parameters`).
+            parameters: input
+                .parameters
+                .unwrap_or_else(st::default_db_parameter_group_parameters),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             created_at: now,
         };

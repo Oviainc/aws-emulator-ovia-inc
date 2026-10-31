@@ -17,5 +17,7 @@ mod db_instance_lifecycle;
 mod db_parameter_group;
 #[path = "all/db_parameter_group_listing.rs"]
 mod db_parameter_group_listing;
+#[path = "all/parameters_union_roundtrip.rs"]
+mod parameters_union_roundtrip;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

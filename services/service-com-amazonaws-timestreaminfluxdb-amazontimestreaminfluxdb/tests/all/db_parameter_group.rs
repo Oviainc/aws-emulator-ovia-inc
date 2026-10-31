@@ -10,7 +10,8 @@
 //! The assertions are RULES over a table of inputs, not a replay of one recorded call:
 //! `CreateDbParameterGroup` persists a new group and reports the stored record — a
 //! service-generated `id`, the ARN derived from that id and the request's region, and
-//! every member the input and output shapes share echoed unchanged — a group name is
+//! every member the input and output shapes share echoed unchanged, and the parameter
+//! family the group configures — a group name is
 //! unique per region, and `GetDbParameterGroup` reports that same record by id. The rows
 //! vary the name's length and form, the presence and size of the description, which
 //! `Parameters` union member is supplied (and which union member inside it), the number
@@ -26,7 +27,11 @@ use crate::db_instance_lifecycle::{call, call_in, ok, router, ACCOUNT, REGION};
 /// model, from `smithy_query(query="operation", operation="CreateDbParameterGroup")`. A
 /// value the request supplies for one of these must come back from the stored record
 /// unchanged; `tags` is modelled on the input only, so nothing echoes it.
-const ECHOED_CREATE_MEMBERS: &[&str] = &["description", "name", "parameters"];
+///
+/// `parameters` is modelled on both shapes but is not a plain echo — a group configures
+/// one engine parameter family whether or not the request names one — so it is asserted
+/// separately here and the rule over it lives in `parameters_union_roundtrip`.
+const ECHOED_CREATE_MEMBERS: &[&str] = &["description", "name"];
 
 /// Members of `GetDbParameterGroupOutput`, from
 /// `smithy_query(query="operation", operation="GetDbParameterGroup")`: the same record
@@ -197,6 +202,18 @@ async fn create_reports_the_stored_record_and_get_reads_it_back() {
                 created[*member]
             );
         }
+
+        // The group's parameter family: the one the request selected, or the default
+        // family when it selected none.
+        let expected_parameters = request
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({ "InfluxDBv2": {} }));
+        assert_eq!(
+            created["parameters"], expected_parameters,
+            "case {case:?}: expected the parameter family {expected_parameters}, got {:?}",
+            created["parameters"]
+        );
 
         // `tags` is an input-only member: no parameter-group output shape carries it.
         assert!(
