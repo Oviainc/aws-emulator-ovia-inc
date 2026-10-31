@@ -211,7 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             crate::state::TokenVerdict::Spent(spent_on) => {
-                return Err(token_spent(&region, &spent_on));
+                // The asset that call updated survives the update, so the conflict
+                // names it by the ARN it carries.
+                let arn = store.stored_asset_arn(&region, &spent_on);
+                return Err(token_spent(&spent_on, arn));
             }
             crate::state::TokenVerdict::Serve => {}
         }
@@ -232,7 +235,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // is already in, so it is a no-op rather than a collision.
                 if owner != &id {
                     let owner = owner.clone();
-                    return Err(already_exists(&region, &owner, "externalId"));
+                    let arn = store.stored_asset_arn(&region, &owner);
+                    return Err(already_exists(&owner, arn, "externalId"));
                 }
             } else if let Some(current) = store
                 .assets
@@ -293,13 +297,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
 /// request already spent: the conflict is with the asset that request updated, so
-/// `resourceId`/`resourceArn` name it.
-fn token_spent(region: &str, asset_id: &str) -> UpdateAssetError {
+/// `resourceId`/`resourceArn` name it — `resource_arn` as
+/// [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::stored_asset_arn`]
+/// reads it back, never rebuilt from this request.
+fn token_spent(asset_id: &str, resource_arn: String) -> UpdateAssetError {
     UpdateAssetError::Modeled(UpdateAssetErrorModeled::ConflictingOperationException(
         ConflictingOperationException {
             message: crate::state::already_using_message("asset", "clientToken"),
             resource_id: asset_id.to_string(),
-            resource_arn: crate::state::asset_arn(region, asset_id),
+            resource_arn,
         },
     ))
 }
@@ -319,13 +325,13 @@ fn not_found(label: &str) -> UpdateAssetError {
 /// (here the external id) that another asset already holds; the message names THAT
 /// dimension, as `CreateAsset` does, and `asset_id` is the asset holding it — the
 /// only asset in the exchange that exists — so `resourceId`/`resourceArn` point the
-/// caller at it.
-fn already_exists(region: &str, asset_id: &str, dimension: &str) -> UpdateAssetError {
+/// caller at it, `resource_arn` as that asset carries it.
+fn already_exists(asset_id: &str, resource_arn: String, dimension: &str) -> UpdateAssetError {
     UpdateAssetError::Modeled(UpdateAssetErrorModeled::ResourceAlreadyExistsException(
         ResourceAlreadyExistsException {
             message: crate::state::already_using_message("asset", dimension),
             resource_id: asset_id.to_string(),
-            resource_arn: crate::state::asset_arn(region, asset_id),
+            resource_arn,
         },
     ))
 }

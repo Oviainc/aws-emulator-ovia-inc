@@ -255,7 +255,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             crate::state::TokenVerdict::Spent(spent_on) => {
-                return Err(token_spent(&region, &spent_on));
+                // The asset model that call wrote to survives it, so the conflict
+                // names it by the ARN it carries.
+                let arn = store.stored_asset_model_arn(&region, &spent_on);
+                return Err(token_spent(&spent_on, arn));
             }
             crate::state::TokenVerdict::Serve => {}
         }
@@ -271,6 +274,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .asset_models
             .get(&asset_model_id)
             .ok_or_else(internal_failure)?;
+        // The ARN the refusals below name the model by is the one STORED on the
+        // record, so it is the ARN every other reader of this model reports,
+        // whatever region the refused request was signed for.
+        let arn = record.arn.clone();
         let composite_model_id = record
             .resolve_composite_model_id(&input.asset_model_composite_model_id)
             .ok_or_else(|| {
@@ -299,8 +306,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(expected) = input.if_match.as_deref() {
             if target_e_tag.as_deref() != Some(expected) {
                 return Err(precondition_failed(
-                    &region,
                     &asset_model_id,
+                    arn.clone(),
                     crate::state::precondition_failed_message(
                         crate::state::HEADER_IF_MATCH,
                         input.match_for_version_type.as_deref(),
@@ -315,8 +322,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             && target_e_tag.is_some()
         {
             return Err(precondition_failed(
-                &region,
                 &asset_model_id,
+                arn.clone(),
                 crate::state::precondition_failed_message(
                     crate::state::HEADER_IF_NONE_MATCH,
                     input.match_for_version_type.as_deref(),
@@ -354,8 +361,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .is_some()
                     {
                         return Err(already_exists(
-                            &region,
                             &asset_model_id,
+                            arn.clone(),
                             crate::state::already_using_message("composite model", "externalId"),
                         ));
                     }
@@ -503,34 +510,35 @@ fn not_found(resource: &str, requested: &str) -> UpdateAssetModelCompositeModelE
 
 /// HTTP 409 `ResourceAlreadyExistsException` naming the asset model the update
 /// targeted: the composite model whose external id collided lives on it, so that
-/// is the resource the caller has to look at.
+/// is the resource the caller has to look at, by the ARN it carries.
 fn already_exists(
-    region: &str,
     asset_model_id: &str,
+    resource_arn: String,
     message: String,
 ) -> UpdateAssetModelCompositeModelError {
     UpdateAssetModelCompositeModelErrorModeled::ResourceAlreadyExistsException(
         ResourceAlreadyExistsException {
             message,
             resource_id: asset_model_id.to_string(),
-            resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+            resource_arn,
         },
     )
     .into()
 }
 
 /// HTTP 412 `PreconditionFailedException`: an `If-Match` / `If-None-Match`
-/// precondition on the asset model evaluated to FALSE.
+/// precondition on the asset model evaluated to FALSE. `resource_arn` is the ARN
+/// that model carries.
 fn precondition_failed(
-    region: &str,
     asset_model_id: &str,
+    resource_arn: String,
     message: String,
 ) -> UpdateAssetModelCompositeModelError {
     UpdateAssetModelCompositeModelErrorModeled::PreconditionFailedException(
         PreconditionFailedException {
             message,
             resource_id: asset_model_id.to_string(),
-            resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+            resource_arn,
         },
     )
     .into()
@@ -538,13 +546,17 @@ fn precondition_failed(
 
 /// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
 /// request already spent: the conflict is with the asset model that request
-/// wrote to, so `resourceId`/`resourceArn` name it.
-fn token_spent(region: &str, asset_model_id: &str) -> UpdateAssetModelCompositeModelError {
+/// wrote to, so `resourceId`/`resourceArn` name it — `resource_arn` the ARN that
+/// model carries rather than one rebuilt from this request.
+fn token_spent(
+    asset_model_id: &str,
+    resource_arn: String,
+) -> UpdateAssetModelCompositeModelError {
     UpdateAssetModelCompositeModelErrorModeled::ConflictingOperationException(
         ConflictingOperationException {
             message: crate::state::already_using_message("asset model", "clientToken"),
             resource_id: asset_model_id.to_string(),
-            resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+            resource_arn,
         },
     )
     .into()

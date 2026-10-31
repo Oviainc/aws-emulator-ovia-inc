@@ -7831,6 +7831,39 @@ pub fn asset_arn(region: &str, asset_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("asset/{asset_id}"))
 }
 
+impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
+    /// The ARN a refusal names the stored asset `asset_id` by: the one that
+    /// asset CARRIES, read back from the record.
+    ///
+    /// An ARN is minted once, by the call that created the resource, and stamped
+    /// with the region THAT call was signed for; it is then a member of the
+    /// resource, reported identically to every later reader. So an error whose
+    /// `resourceId`/`resourceArn` point at a resource of this store reports that
+    /// stored ARN rather than one rebuilt from the refused request, which would
+    /// name a resource no reader of this store can find whenever the two calls
+    /// reached it through different regional endpoints.
+    ///
+    /// Only an id this store holds no asset for leaves nothing to read, and then
+    /// the canonical ARN of that id in `region` is the one honest answer — the
+    /// case a refusal naming a resource its own call removed is always in.
+    pub fn stored_asset_arn(&self, region: &str, asset_id: &str) -> String {
+        self.assets
+            .get(asset_id)
+            .map(|asset| asset.arn.clone())
+            .unwrap_or_else(|| asset_arn(region, asset_id))
+    }
+
+    /// [`Self::stored_asset_arn`] for an asset model: the ARN the stored model
+    /// carries, or the canonical one in `region` when this store holds no such
+    /// model.
+    pub fn stored_asset_model_arn(&self, region: &str, asset_model_id: &str) -> String {
+        self.asset_models
+            .get(asset_model_id)
+            .map(|model| model.arn.clone())
+            .unwrap_or_else(|| asset_model_arn(region, asset_model_id))
+    }
+}
+
 /// The resource type and resource id an `AmazonResourceName` names, when the
 /// string is an ARN of THIS service in the `<type>/<id>` resource form every
 /// IoT SiteWise ARN takes (`asset/<assetId>`, `asset-model/<assetModelId>`,

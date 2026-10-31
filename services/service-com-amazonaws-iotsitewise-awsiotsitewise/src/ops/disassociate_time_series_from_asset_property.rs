@@ -223,7 +223,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             crate::state::TokenVerdict::Spent(spent_on) => {
-                return Err(token_spent(&region, &spent_on));
+                // The asset carrying the property that call wrote to survives a
+                // disassociation, so the conflict names it by the ARN it carries.
+                let arn = store.stored_asset_arn(&region, &spent_on);
+                return Err(token_spent(&spent_on, arn));
             }
             crate::state::TokenVerdict::Serve => {}
         }
@@ -302,14 +305,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
 /// request already spent: the conflict is with the asset that request wrote to, so
-/// `resourceId`/`resourceArn` name it.
-fn token_spent(region: &str, asset_id: &str) -> DisassociateTimeSeriesFromAssetPropertyError {
+/// `resourceId`/`resourceArn` name it — `resource_arn` as
+/// [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::stored_asset_arn`]
+/// reads it back, never rebuilt from this request.
+fn token_spent(
+    asset_id: &str,
+    resource_arn: String,
+) -> DisassociateTimeSeriesFromAssetPropertyError {
     DisassociateTimeSeriesFromAssetPropertyError::Modeled(
         DisassociateTimeSeriesFromAssetPropertyErrorModeled::ConflictingOperationException(
             ConflictingOperationException {
                 message: crate::state::already_using_message("asset", "clientToken"),
                 resource_id: asset_id.to_string(),
-                resource_arn: crate::state::asset_arn(region, asset_id),
+                resource_arn,
             },
         ),
     )

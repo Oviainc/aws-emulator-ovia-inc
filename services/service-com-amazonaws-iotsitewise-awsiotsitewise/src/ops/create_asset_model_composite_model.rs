@@ -367,9 +367,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // check spans every stored asset model, not just this one.
         if let Some(requested) = input.asset_model_composite_model_id.as_deref() {
             if store.composite_model_id_taken(requested) {
+                let arn = store.stored_asset_model_arn(&region, &asset_model_id);
                 return Err(already_exists(
-                    &region,
                     &asset_model_id,
+                    arn,
                     crate::state::already_using_message("composite model", "ID"),
                 ));
             }
@@ -379,6 +380,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .asset_models
             .get(&asset_model_id)
             .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+        // The ARN the refusals below name the model by is the one STORED on the
+        // record, so it is the ARN every other reader of this model reports,
+        // whatever region the refused request was signed for.
+        let arn = record.arn.clone();
 
         // The target version the `If-Match` / `If-None-Match` preconditions are
         // evaluated against; [`crate::state::asset_model_target_etag`] is the one
@@ -396,8 +401,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(expected) = input.if_match.as_deref() {
             if target.as_deref() != Some(expected) {
                 return Err(precondition_failed(
-                    &region,
                     &asset_model_id,
+                    arn.clone(),
                     crate::state::precondition_failed_message(
                         crate::state::HEADER_IF_MATCH,
                         input.match_for_version_type.as_deref(),
@@ -410,8 +415,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exist.
         if input.if_none_match.as_deref() == Some(crate::state::SELECT_ALL) && target_exists {
             return Err(precondition_failed(
-                &region,
                 &asset_model_id,
+                arn.clone(),
                 crate::state::precondition_failed_message(
                     crate::state::HEADER_IF_NONE_MATCH,
                     input.match_for_version_type.as_deref(),
@@ -441,8 +446,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .is_some()
             {
                 return Err(already_exists(
-                    &region,
                     &asset_model_id,
+                    arn.clone(),
                     format!(
                         "The asset model {asset_model_id} already has a composite model with \
                          external id {external}."
@@ -612,34 +617,35 @@ fn composite_not_found(label: &str) -> CreateAssetModelCompositeModelError {
 }
 
 /// HTTP 409 `ResourceAlreadyExistsException` naming the asset model the create
-/// targeted.
+/// targeted, by the ARN that model carries.
 fn already_exists(
-    region: &str,
     asset_model_id: &str,
+    resource_arn: String,
     message: String,
 ) -> CreateAssetModelCompositeModelError {
     CreateAssetModelCompositeModelErrorModeled::ResourceAlreadyExistsException(
         ResourceAlreadyExistsException {
             message,
             resource_id: asset_model_id.to_string(),
-            resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+            resource_arn,
         },
     )
     .into()
 }
 
 /// HTTP 412 `PreconditionFailedException`: an `If-Match` / `If-None-Match`
-/// precondition on the asset model evaluated to FALSE.
+/// precondition on the asset model evaluated to FALSE. `resource_arn` is the ARN
+/// that model carries.
 fn precondition_failed(
-    region: &str,
     asset_model_id: &str,
+    resource_arn: String,
     message: String,
 ) -> CreateAssetModelCompositeModelError {
     CreateAssetModelCompositeModelErrorModeled::PreconditionFailedException(
         PreconditionFailedException {
             message,
             resource_id: asset_model_id.to_string(),
-            resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+            resource_arn,
         },
     )
     .into()

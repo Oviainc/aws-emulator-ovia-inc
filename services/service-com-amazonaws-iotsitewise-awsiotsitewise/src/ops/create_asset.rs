@@ -235,7 +235,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             crate::state::TokenVerdict::Spent(spent_on) => {
-                return Err(token_spent(&region, &spent_on));
+                // The asset that call created is the resource the caller has to
+                // look at, named by the ARN it was minted with; one deleted since
+                // leaves only its id to build one from.
+                let arn = store.stored_asset_arn(&region, &spent_on);
+                return Err(token_spent(&spent_on, arn));
             }
             crate::state::TokenVerdict::Serve => {}
         }
@@ -313,7 +317,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let asset_id = match input.asset_id.clone() {
             Some(id) => {
                 if store.assets.contains_key(&id) {
-                    return Err(already_exists(&region, &id, "ID"));
+                    let arn = store.stored_asset_arn(&region, &id);
+                    return Err(already_exists(&id, arn, "ID"));
                 }
                 id
             }
@@ -331,7 +336,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // only asset in the exchange that exists.
         if let Some(external) = input.asset_external_id.as_deref() {
             if let Some(existing) = store.asset_external_ids.get(external).cloned() {
-                return Err(already_exists(&region, &existing, "externalId"));
+                let arn = store.stored_asset_arn(&region, &existing);
+                return Err(already_exists(&existing, arn, "externalId"));
             }
         }
 
@@ -389,26 +395,27 @@ fn invalid_request(message: String) -> CreateAssetError {
 
 /// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
 /// request already spent: the conflict is with the asset that request created, so
-/// `resourceId`/`resourceArn` name it — the asset the caller has to look at.
-fn token_spent(region: &str, asset_id: &str) -> CreateAssetError {
+/// `resourceId`/`resourceArn` name it — the asset the caller has to look at, by
+/// the ARN it carries rather than one rebuilt from this request.
+fn token_spent(asset_id: &str, resource_arn: String) -> CreateAssetError {
     CreateAssetError::Modeled(CreateAssetErrorModeled::ConflictingOperationException(
         ConflictingOperationException {
             message: crate::state::already_using_message("asset", "clientToken"),
             resource_id: asset_id.to_string(),
-            resource_arn: crate::state::asset_arn(region, asset_id),
+            resource_arn,
         },
     ))
 }
 
 /// HTTP 409 `ResourceAlreadyExistsException` for a `dimension` of the request
 /// (`ID`, `externalId`) that an asset already holds; `asset_id` is THAT asset,
-/// the one the caller has to look at.
-fn already_exists(region: &str, asset_id: &str, dimension: &str) -> CreateAssetError {
+/// the one the caller has to look at, and `resource_arn` the ARN it carries.
+fn already_exists(asset_id: &str, resource_arn: String, dimension: &str) -> CreateAssetError {
     CreateAssetError::Modeled(CreateAssetErrorModeled::ResourceAlreadyExistsException(
         ResourceAlreadyExistsException {
             message: crate::state::already_using_message("asset", dimension),
             resource_id: asset_id.to_string(),
-            resource_arn: crate::state::asset_arn(region, asset_id),
+            resource_arn,
         },
     ))
 }

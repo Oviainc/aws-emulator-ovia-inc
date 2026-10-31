@@ -197,8 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        // Read only for the ARN the conflict a reused `clientToken` carries names; no
-        // member of this operation's answer is region-scoped.
+        // Read only as the FALLBACK region for the ARN the conflict a reused
+        // `clientToken` carries names — the stored asset's own ARN is what that
+        // refusal reports; no member of this operation's answer is region-scoped.
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
@@ -224,7 +225,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             crate::state::TokenVerdict::Spent(spent_on) => {
-                return Err(token_spent(&region, &spent_on));
+                // The parent asset that earlier call wrote to survives a
+                // disassociation — it loses one hierarchy edge, not its record —
+                // so the conflict names it by the ARN it carries.
+                let arn = store.stored_asset_arn(&region, &spent_on);
+                return Err(token_spent(&spent_on, arn));
             }
             crate::state::TokenVerdict::Serve => {}
         }
@@ -268,14 +273,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
 /// request already spent: the conflict is with the PARENT asset that request
-/// wrote to, so `resourceId`/`resourceArn` name it.
-fn token_spent(region: &str, asset_id: &str) -> DisassociateAssetsError {
+/// wrote to, so `resourceId`/`resourceArn` name it — `resource_arn` as
+/// [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::stored_asset_arn`]
+/// reads it back, never rebuilt from this request.
+fn token_spent(asset_id: &str, resource_arn: String) -> DisassociateAssetsError {
     DisassociateAssetsError::Modeled(
         DisassociateAssetsErrorModeled::ConflictingOperationException(
             ConflictingOperationException {
                 message: crate::state::already_using_message("asset", "clientToken"),
                 resource_id: asset_id.to_string(),
-                resource_arn: crate::state::asset_arn(region, asset_id),
+                resource_arn,
             },
         ),
     )

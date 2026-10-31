@@ -24,6 +24,13 @@
 #[path = "all/task_delete.rs"]
 mod task_delete;
 
+// `refusal_resource_arn` is declared HERE, beside the suite above, for the reason
+// its note gives: the sorted list and the END of this file are both where every
+// concurrent iotsitewise change puts a declaration of its own. Fold it into the
+// list once the churn settles.
+#[path = "all/refusal_resource_arn.rs"]
+mod refusal_resource_arn;
+
 #[path = "all/query_results.rs"]
 mod query_results;
 

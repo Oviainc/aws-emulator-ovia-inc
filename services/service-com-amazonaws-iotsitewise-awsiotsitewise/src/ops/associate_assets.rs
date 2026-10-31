@@ -226,11 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             crate::state::TokenVerdict::Spent(spent_on) => {
-                let arn = store
-                    .assets
-                    .get(&spent_on)
-                    .map(|asset| asset.arn.clone())
-                    .unwrap_or_else(|| crate::state::asset_arn(&region, &spent_on));
+                let arn = store.stored_asset_arn(&region, &spent_on);
                 return Err(conflicting_operation(
                     crate::state::already_using_message("asset", "clientToken"),
                     &spent_on,
@@ -344,11 +340,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in place.
         match store.association_state(&parent_id, &hierarchy_id, &child_id, now) {
             Some(crate::state::AssociationState::InProgress) => {
-                let parent_arn = store
-                    .assets
-                    .get(&parent_id)
-                    .map(|asset| asset.arn.clone())
-                    .unwrap_or_default();
+                let parent_arn = store.stored_asset_arn(&region, &parent_id);
                 return Err(conflicting_operation(
                     format!(
                         "An operation associating the asset {child_id} with the asset \

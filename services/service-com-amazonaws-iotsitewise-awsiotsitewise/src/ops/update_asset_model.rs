@@ -261,7 +261,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             crate::state::TokenVerdict::Spent(spent_on) => {
-                return Err(token_spent(&region, &spent_on));
+                // The asset model that call wrote to survives it, so the conflict
+                // names it by the ARN it carries.
+                let arn = store.stored_asset_model_arn(&region, &spent_on);
+                return Err(token_spent(&spent_on, arn));
             }
             crate::state::TokenVerdict::Serve => {}
         }
@@ -291,14 +294,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
             )
         };
+        // The ARN every refusal below names the model by is the one the STORED
+        // record carries, so it is the ARN every other reader of this model
+        // reports, whatever region the refused request was signed for.
+        let arn = store.stored_asset_model_arn(&region, &id);
         // `If-Match`: update only if the targeted version's ETag is the one the
         // caller last read. A caller that read a different version — or that
         // targets a version which does not exist — is refused 412.
         if let Some(expected) = input.if_match.as_deref() {
             if target_e_tag.as_deref() != Some(expected) {
                 return Err(precondition_failed(
-                    &region,
                     &id,
+                    arn.clone(),
                     crate::state::precondition_failed_message(
                         crate::state::HEADER_IF_MATCH,
                         input.match_for_version_type.as_deref(),
@@ -313,8 +320,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             && target_e_tag.is_some()
         {
             return Err(precondition_failed(
-                &region,
                 &id,
+                arn.clone(),
                 crate::state::precondition_failed_message(
                     crate::state::HEADER_IF_NONE_MATCH,
                     input.match_for_version_type.as_deref(),
@@ -333,7 +340,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // it is already in, so it is a no-op rather than a collision.
                 if owner != &id {
                     let owner = owner.clone();
-                    return Err(already_exists(&region, &owner, "externalId"));
+                    let owner_arn = store.stored_asset_model_arn(&region, &owner);
+                    return Err(already_exists(&owner, owner_arn, "externalId"));
                 }
             } else if let Some(current) = store
                 .asset_models
@@ -475,7 +483,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // one this model does not hold must be free everywhere.
                     Some(requested_id) => {
                         if store.composite_model_id_taken(&requested_id) {
-                            return Err(already_exists(&region, &id, "assetModelCompositeModelId"));
+                            return Err(already_exists(
+                                &id,
+                                arn.clone(),
+                                "assetModelCompositeModelId",
+                            ));
                         }
                         requested_id
                     }
@@ -598,14 +610,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
 /// request already spent: the conflict is with the asset model that request
-/// updated, so `resourceId`/`resourceArn` name it.
-fn token_spent(region: &str, asset_model_id: &str) -> UpdateAssetModelError {
+/// updated, so `resourceId`/`resourceArn` name it — `resource_arn` the ARN that
+/// model carries rather than one rebuilt from this request.
+fn token_spent(asset_model_id: &str, resource_arn: String) -> UpdateAssetModelError {
     UpdateAssetModelError::Modeled(
         UpdateAssetModelErrorModeled::ConflictingOperationException(
             ConflictingOperationException {
                 message: crate::state::already_using_message("asset model", "clientToken"),
                 resource_id: asset_model_id.to_string(),
-                resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+                resource_arn,
             },
         ),
     )
@@ -637,10 +650,10 @@ fn limit_exceeded(message: String) -> UpdateAssetModelError {
 
 /// HTTP 409 `ResourceAlreadyExistsException` for a `dimension` of the request an
 /// existing resource already uses; `asset_model_id` is the model the caller has to
-/// look at.
+/// look at and `resource_arn` the ARN that model carries.
 fn already_exists(
-    region: &str,
     asset_model_id: &str,
+    resource_arn: String,
     dimension: &str,
 ) -> UpdateAssetModelError {
     UpdateAssetModelError::Modeled(
@@ -648,20 +661,21 @@ fn already_exists(
             ResourceAlreadyExistsException {
                 message: crate::state::already_using_message("asset model", dimension),
                 resource_id: asset_model_id.to_string(),
-                resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+                resource_arn,
             },
         ),
     )
 }
 
 /// HTTP 412 `PreconditionFailedException` for a conditional header that evaluated
-/// to FALSE, naming the resource the precondition was evaluated on.
-fn precondition_failed(region: &str, id: &str, message: String) -> UpdateAssetModelError {
+/// to FALSE, naming the resource the precondition was evaluated on by the ARN that
+/// resource carries.
+fn precondition_failed(id: &str, resource_arn: String, message: String) -> UpdateAssetModelError {
     UpdateAssetModelError::Modeled(UpdateAssetModelErrorModeled::PreconditionFailedException(
         PreconditionFailedException {
             message,
             resource_id: id.to_string(),
-            resource_arn: crate::state::asset_model_arn(region, id),
+            resource_arn,
         },
     ))
 }
