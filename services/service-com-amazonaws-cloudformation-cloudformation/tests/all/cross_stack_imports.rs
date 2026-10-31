@@ -19,7 +19,8 @@
 //! spellings (JSON long form and YAML short form), an import in a resource property and an
 //! import in an output value, an import nested inside another intrinsic, an export name that
 //! is a literal and one composed by an intrinsic function, several imports in one stack, and
-//! an import of a name nothing exports.
+//! an import of a name nothing exports (which belongs to no export's index — that it also
+//! fails its own deployment is pinned by `unresolvable_imports.rs`).
 
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -120,7 +121,7 @@ fn import_cases() -> Vec<ImportCase> {
             expected_output: Some(("Composed", EXPORTS[2].1.to_string())),
         },
         ImportCase {
-            case: "an import of a name nothing exports resolves to nothing and imports nothing",
+            case: "an import of a name nothing exports imports nothing",
             stack_name: "unresolved-importer",
             template: r#"{"Resources":{"Handle":{"Type":"AWS::CloudFormation::WaitConditionHandle"}},
                  "Outputs":{"Missing":{"Value":{"Fn::ImportValue":"no-such-export"}}}}"#

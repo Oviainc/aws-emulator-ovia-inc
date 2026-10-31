@@ -324,6 +324,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &provenance,
                     plan.previous.clone(),
                     &plan.applied,
+                    // A rollback puts back a configuration this stack already deployed, so
+                    // there is nothing for CloudFormation to refuse about it.
+                    None,
                 )
                 .await;
                 let mut store = state.lock();

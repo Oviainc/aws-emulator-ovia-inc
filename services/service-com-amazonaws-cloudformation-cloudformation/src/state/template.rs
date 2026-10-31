@@ -6011,7 +6011,8 @@ pub fn evaluate_outputs(
 }
 
 /// Every export name a template IMPORTS: the resolved argument of each `Fn::ImportValue`
-/// its resources and its outputs name.
+/// its resources and its outputs name, in the order the template declares them and without
+/// repeats.
 ///
 /// This is the stack's half of the cross-stack reference index `ListImports` reports —
 /// "the stacks that are importing an exported output value" — so it is computed where the
@@ -6019,12 +6020,17 @@ pub fn evaluate_outputs(
 /// deployment's own budget like every other pass over a caller-sized body. An argument
 /// that is itself an expression is evaluated, so an import whose name a `Fn::Sub` or a
 /// parameter decides is the export name it really resolved to.
+///
+/// DECLARATION ORDER, because a deployment that cannot resolve an import reports the FIRST
+/// one it could not ([`super::StoredStack::unresolved_import_failure`]), which is the one
+/// the template names first — the index the names also feed is keyed by name, so the order
+/// is nothing to it.
 pub fn imported_export_names(
     template: &Template,
     scope: &Scope<'_>,
     budget: &mut Budget,
-) -> BTreeSet<String> {
-    let mut found = BTreeSet::new();
+) -> Vec<String> {
+    let mut found = Vec::new();
     for resource in &template.resources {
         collect_imports(&resource.declaration, scope, 0, budget, &mut found);
     }
@@ -6039,13 +6045,14 @@ pub fn imported_export_names(
 
 /// Collect every `Fn::ImportValue` argument inside one declaration, bounded by the
 /// deployment's depth limit and its shared budget: ONE pass over the node, whatever the
-/// document carries.
+/// document carries. A name already collected is not collected twice, so the walk answers
+/// each imported name once, at the position it was first named.
 fn collect_imports(
     value: &Value,
     scope: &Scope<'_>,
     depth: usize,
     budget: &mut Budget,
-    found: &mut BTreeSet<String>,
+    found: &mut Vec<String>,
 ) {
     if depth > MAX_INTRINSIC_DEPTH || budget.spend(1).is_none() {
         return;
@@ -6060,7 +6067,9 @@ fn collect_imports(
             for (name, argument) in members {
                 if name == FN_IMPORT_VALUE {
                     if let Some(export_name) = text(argument, scope, depth + 1, budget) {
-                        found.insert(export_name);
+                        if !found.contains(&export_name) {
+                            found.push(export_name);
+                        }
                     }
                 }
                 collect_imports(argument, scope, depth + 1, budget, found);

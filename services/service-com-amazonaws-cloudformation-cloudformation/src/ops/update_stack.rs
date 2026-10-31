@@ -844,7 +844,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The preconditions are re-asserted HERE, under the writing lock, rather than
         // trusted from the read above: between the two, another request may have deleted
         // the stack or started an operation on it, and only one update may be in flight.
-        let (stack_id, region, declared, previous_resources, provenance) = {
+        let (stack_id, region, declared, previous_resources, provenance, refused_deployment) = {
             let mut store = state.lock();
             // What a `Fn::ImportValue` in the submitted template resolves against: the
             // exported output values in force in the Region this request is signed for,
@@ -967,24 +967,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(reason) = cannot_deploy {
                 stack.fail_pending_transition(status::UPDATE_FAILED, reason);
             }
+            // "The intrinsic function Fn::ImportValue returns the value of an output
+            // exported by another stack": an export name no live stack of this account and
+            // Region publishes has no value to import, so CloudFormation refuses the
+            // deployment before anything is asked of the services that own the resources —
+            // the update then fails naming the export and is rolled back below.
+            let refused_deployment = stack.unresolved_import_failure();
             (
                 stack.stack_id.clone(),
                 stack.region.clone(),
                 stack.current_resources().to_vec(),
                 previous_resources,
                 stack.provenance(),
+                refused_deployment,
             )
         };
 
         // The update's resources are reconciled with the ones the stack already had: what
         // the new template declares again is kept, what it declares anew is created in the
-        // service that owns it, and what it no longer declares is deleted there.
+        // service that owns it, and what it no longer declares is deleted there — unless
+        // CLOUDFORMATION itself refused the deployment, in which case nothing is asked of
+        // any of those services at all.
+        let refused_anything = refused_deployment.is_some();
         let materialised = crate::state::provisioning::reconcile(
             ctx,
             &region,
             &provenance,
             declared,
             &previous_resources,
+            refused_deployment,
         )
         .await;
 
@@ -1009,7 +1020,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `RollbackStack` act on.
         let owed = crate::state::OwedRollback {
             previous: previous_resources.clone(),
-            applied: materialised.resources.clone(),
+            // A deployment CloudFormation refused outright changed nothing in any owning
+            // service, so what it APPLIED is the configuration that was already in force:
+            // its rollback has nothing to put back.
+            applied: if refused_anything {
+                previous_resources.clone()
+            } else {
+                materialised.resources.clone()
+            },
         };
         {
             let mut store = state.lock();

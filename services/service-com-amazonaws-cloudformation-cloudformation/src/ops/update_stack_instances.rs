@@ -163,6 +163,10 @@ struct Deployment {
     /// Why this service could not deploy the template at all, for an instance whose update
     /// failed before any owning service was asked for a resource.
     cannot_deploy: Option<String>,
+    /// Why CLOUDFORMATION refused this instance's deployment before anything was asked of
+    /// any owning service: its template imports an export nothing publishes in the
+    /// instance's Region ([`crate::state::StoredStack::unresolved_import_failure`]).
+    refused: Option<String>,
     /// The stack identity and tags CloudFormation gives each resource it provisions.
     provenance: crate::state::provisioning::StackProvenance,
 }
@@ -687,6 +691,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         declared: stack.current_resources(),
                         previous,
                         cannot_deploy,
+                        // "Fn::ImportValue returns the value of an output exported by another
+                        // stack": an export name nothing publishes in the instance's own
+                        // Region has no value to import, so CloudFormation refuses this
+                        // deployment before anything is asked of the owning services.
+                        refused: stack.unresolved_import_failure(),
                         provenance: stack.provenance(),
                     }
                 })
@@ -705,6 +714,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &deployment.provenance,
                 deployment.declared,
                 &deployment.previous,
+                deployment.refused,
             )
             .await;
             let mut store = state.lock();

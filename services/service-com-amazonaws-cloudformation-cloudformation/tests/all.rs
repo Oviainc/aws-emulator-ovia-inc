@@ -311,6 +311,8 @@ mod unimported_exports;
 mod unprovisioned_resources;
 #[path = "all/unrecognized_resource_types.rs"]
 mod unrecognized_resource_types;
+#[path = "all/unresolvable_imports.rs"]
+mod unresolvable_imports;
 #[path = "all/update_after_a_refused_delete.rs"]
 mod update_after_a_refused_delete;
 #[path = "all/update_rollback_of_a_refused_update.rs"]

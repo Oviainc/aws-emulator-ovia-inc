@@ -77,6 +77,10 @@ pub struct Rollout {
     /// Why this service could not deploy the template at all, for an instance whose update
     /// failed before any owning service was asked for a resource.
     pub cannot_deploy: Option<String>,
+    /// Why CLOUDFORMATION refused this redeployment before anything was asked of any owning
+    /// service: the template imports an export nothing publishes in the instance's Region
+    /// ([`super::StoredStack::unresolved_import_failure`]).
+    pub refused: Option<String>,
     /// The stack identity and tags CloudFormation gives each resource it acts on.
     pub provenance: super::provisioning::StackProvenance,
 }
@@ -134,6 +138,11 @@ pub fn redeploy(
         if let Some(reason) = cannot_deploy.clone() {
             stack.fail_pending_transition(status::UPDATE_FAILED, reason);
         }
+        // "Fn::ImportValue returns the value of an output exported by another stack": an
+        // export name nothing publishes in the instance's own Region has no value to
+        // import, so CloudFormation refuses this redeployment before anything is asked of
+        // the services that own the resources.
+        let refused = stack.unresolved_import_failure();
         Some(Rollout {
             account: account.to_string(),
             region: region.to_string(),
@@ -141,6 +150,7 @@ pub fn redeploy(
             declared: stack.current_resources().to_vec(),
             previous,
             cannot_deploy,
+            refused,
             provenance: stack.provenance(),
         })
     });
@@ -179,6 +189,7 @@ pub async fn apply(
             &rollout.provenance,
             rollout.declared,
             &rollout.previous,
+            rollout.refused,
         )
         .await;
         let mut store = state.lock();

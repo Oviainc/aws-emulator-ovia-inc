@@ -351,6 +351,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &provenance,
             declared,
             &against,
+            // A resumed rollback puts back a configuration this stack already deployed, so
+            // there is nothing for CloudFormation to refuse about it.
+            None,
         )
         .await;
 

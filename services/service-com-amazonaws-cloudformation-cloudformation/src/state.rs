@@ -1343,6 +1343,15 @@ pub struct PendingDeployment {
     /// reference index `ListImports` reports, so it takes effect when the deployment
     /// completes, exactly as the resources and outputs beside it do.
     pub imports: BTreeMap<String, String>,
+    /// The export names this deployment's template imports that NOTHING published in the
+    /// account and Region it runs in ([`template::imported_export_names`] minus the names
+    /// `imports` above carries), in the order the template names them.
+    ///
+    /// "The intrinsic function Fn::ImportValue returns the value of an output exported by
+    /// another stack": a name no live stack of that Region exports has no value to return,
+    /// so the deployment cannot be carried out at all — which is what
+    /// [`StoredStack::unresolved_import_failure`] words for the operation driving it.
+    pub unresolved_imports: Vec<String>,
     /// The resource-signal waits the template being deployed declares
     /// ([`wait_conditions::declared`]), each with the resources whose creation waits on
     /// it. Computed where the template is READ, outside the store lock;
@@ -2014,23 +2023,57 @@ impl StoredStack {
         // resources and outputs were: only those names belong on the stack, and they are
         // what makes each exporting stack's export in use.
         let imported = template::imported_export_names(&declared, &scope, &mut budget);
-        let imports: BTreeMap<String, String> = imported
-            .into_iter()
-            .filter_map(|name| {
-                let value = exports.get(&name)?.clone();
-                Some((name, value))
-            })
-            .collect();
+        let mut unresolved_imports = Vec::new();
+        let mut imports = BTreeMap::new();
+        for name in imported {
+            match exports.get(&name) {
+                Some(value) => {
+                    imports.insert(name, value.clone());
+                }
+                // "Fn::ImportValue returns the value of an output exported by another
+                // stack": no live stack of this account and Region exports that name, so
+                // there is no value to import and the deployment cannot be carried out
+                // ([`Self::unresolved_import_failure`]).
+                None => {
+                    unresolved_imports.push(name);
+                }
+            }
+        }
         self.pending_deployment = Some(PendingDeployment {
             resources,
             outputs,
             imports,
+            unresolved_imports,
             wait_conditions,
             // Nothing has been acted on yet: this deployment has not started.
             attempted: BTreeSet::new(),
             dependencies,
         });
         Ok(())
+    }
+
+    /// The reason a deployment whose template names an export NOTHING publishes cannot be
+    /// carried out, or `None` when every `Fn::ImportValue` of the deployment in flight
+    /// resolved.
+    ///
+    /// "The intrinsic function Fn::ImportValue returns the value of an output exported by
+    /// another stack": the import's value is the one that export carries in the account and
+    /// Region the deployment runs in, so a name no live stack of that Region exports leaves
+    /// the declaration carrying it with no value at all. CloudFormation cannot deploy such a
+    /// template — it refuses the deployment before anything is asked of the service that
+    /// owns the resource, which is why the reason is CloudFormation's OWN diagnostic
+    /// ([`provisioning::Materialised::failure`]) and names the export rather than a resource
+    /// that tried and failed.
+    ///
+    /// One name is reported — the FIRST the template names, which is the import the
+    /// deployment could not resolve first.
+    pub fn unresolved_import_failure(&self) -> Option<String> {
+        let name = self
+            .pending_deployment
+            .as_ref()?
+            .unresolved_imports
+            .first()?;
+        Some(no_export_named(name))
     }
 
     /// Redirect the PENDING transition to a FAILURE: the terminal status the operation in
@@ -6541,6 +6584,19 @@ pub fn export_is_not_imported(export_name: &str) -> String {
     format!("Export '{export_name}' is not imported by any stack.")
 }
 
+/// The reason CloudFormation reports a DEPLOYMENT it refused because the template imports
+/// an export name nothing publishes in the account and Region it runs in.
+///
+/// A different sentence from the two reads above, because it answers a different question:
+/// those refuse a request that NAMED the export, while this says why a stack operation
+/// could not be carried out — the export the template's `Fn::ImportValue` names was not
+/// found, so the declaration carrying it has no value. The name is the one the template
+/// imported and the rest is fixed text; a create that is then rolled back reports it with
+/// the rollback clause the service appends ([`rollback_requested`]).
+pub fn no_export_named(export_name: &str) -> String {
+    format!("No export named {export_name} found.")
+}
+
 /// `Some(list)` unless the list is empty, which the wire shapes spell as an absent
 /// member rather than an empty one.
 pub fn non_empty<T>(list: Vec<T>) -> Option<Vec<T>> {
@@ -7118,6 +7174,9 @@ pub async fn settle_due_rollbacks<Eng: Send + Sync + 'static>(
             &owed.provenance,
             outstanding.previous.clone(),
             &outstanding.applied,
+            // A rollback puts back a configuration this stack already deployed, so there is
+            // nothing for CloudFormation to refuse about it.
+            None,
         )
         .await;
         let mut store = state.lock();

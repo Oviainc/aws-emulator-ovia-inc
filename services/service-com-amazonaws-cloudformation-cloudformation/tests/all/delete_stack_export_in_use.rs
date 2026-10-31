@@ -463,6 +463,10 @@ async fn a_delete_nothing_imports_from_completes() {
     deploy(&router, "free-exporter", &exporter_template(&exports)).await;
 
     // A stack importing ANOTHER name is no importer of this export, so it blocks nothing.
+    // That other name is published by a second live stack, since an import of a name
+    // NOTHING exports fails its own deployment (`unresolvable_imports.rs`).
+    let other = [("some-other-export", "some-other-value")];
+    deploy(&router, "other-exporter", &exporter_template(&other)).await;
     deploy(
         &router,
         "unrelated-importer",

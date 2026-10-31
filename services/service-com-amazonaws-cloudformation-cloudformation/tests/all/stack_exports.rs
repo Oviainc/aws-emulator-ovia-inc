@@ -172,7 +172,11 @@ fn export_cases() -> Vec<ExportCase> {
         ExportCase {
             case: "an exported output whose value does not resolve is published without a Value",
             stack_name: "unresolved-value",
-            template: r#"{"Outputs":{"Imported":{"Value":{"Fn::ImportValue":"no-such-export"},
+            // A `Fn::Select` past the end of the list it selects from: an expression that
+            // resolves to no value, leaving the output exported with no `Value`. (An
+            // `Fn::ImportValue` of a name nothing exports is NOT such an expression — it
+            // fails the whole deployment, which `unresolvable_imports.rs` pins.)
+            template: r#"{"Outputs":{"Imported":{"Value":{"Fn::Select":["3",["a","b"]]},
                    "Export":{"Name":"unresolved-value-name"}}}}"#
                 .to_string(),
             parameters: vec![],
@@ -182,7 +186,7 @@ fn export_cases() -> Vec<ExportCase> {
             case: "an output whose Export name does not resolve publishes no export",
             stack_name: "unresolved-name",
             template: r#"{"Outputs":{"Imported":{"Value":"has-a-value",
-                   "Export":{"Name":{"Fn::ImportValue":"no-such-export"}}}}}"#
+                   "Export":{"Name":{"Fn::Select":["3",["a","b"]]}}}}}"#
                 .to_string(),
             parameters: vec![],
             expected: vec![],

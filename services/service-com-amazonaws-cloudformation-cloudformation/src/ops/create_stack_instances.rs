@@ -124,6 +124,23 @@ use crate::state::stack_sets::{
 };
 use crate::state::{status, StoredStack};
 
+/// One instance's stack as the preparation pass left it, with what the write block needs to
+/// record the instance it belongs to.
+struct Prepared {
+    /// The stack the instance deploys, with its deployment already computed.
+    stack: StoredStack,
+    /// The target account the instance belongs to.
+    account: String,
+    /// The target Region the instance's stack lives in.
+    region: String,
+    /// Why this service could not deploy the template at all, for an instance whose create
+    /// failed before any owning service was asked for a resource.
+    cannot_deploy: Option<String>,
+    /// Why CLOUDFORMATION refused this instance's deployment before anything was asked of
+    /// any owning service ([`crate::state::StoredStack::unresolved_import_failure`]).
+    refused: Option<String>,
+}
+
 /// One instance's stack, as the write block hands it to the provisioning walk that creates
 /// its resources in the services that own them.
 struct Deployment {
@@ -138,6 +155,10 @@ struct Deployment {
     /// Why this service could not deploy the template at all, for an instance whose create
     /// failed before any owning service was asked for a resource.
     cannot_deploy: Option<String>,
+    /// Why CLOUDFORMATION refused this instance's deployment before anything was asked of
+    /// any owning service: its template imports an export nothing publishes in the
+    /// instance's Region ([`crate::state::StoredStack::unresolved_import_failure`]).
+    refused: Option<String>,
     /// The stack identity and tags CloudFormation gives each created resource.
     provenance: crate::state::provisioning::StackProvenance,
 }
@@ -512,7 +533,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reason `CreateStack` evaluates its template off it: reading a caller-sized body is
         // work the request paid for, and no other CloudFormation request should wait on it.
         let no_exports = ::std::collections::BTreeMap::new();
-        let mut prepared: Vec<(StoredStack, String, String, Option<String>)> = Vec::new();
+        let mut prepared: Vec<Prepared> = Vec::new();
         for account in &accounts {
             for target_region in &regions {
                 let stack_name = new_instance_stack_name(&stack_set_name);
@@ -539,14 +560,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if let Some(reason) = cannot_deploy.clone() {
                     stack.fail_pending_transition(status::CREATE_FAILED, reason);
                 }
-                prepared.push((stack, account.clone(), target_region.clone(), cannot_deploy));
+                // "Fn::ImportValue returns the value of an output exported by another
+                // stack": an export name nothing publishes in the instance's own Region has
+                // no value to import, so CloudFormation refuses this deployment before
+                // anything is asked of the services that own the resources.
+                let refused = stack.unresolved_import_failure();
+                prepared.push(Prepared {
+                    stack,
+                    account: account.clone(),
+                    region: target_region.clone(),
+                    cannot_deploy,
+                    refused,
+                });
             }
         }
         // What these instances would bring into the account, counted off the deployments
         // themselves: the resources of one instance's template, once per instance.
         let declared_resources: usize = prepared
             .iter()
-            .map(|(stack, _, _, _)| stack.current_resource_count())
+            .map(|entry| entry.stack.current_resource_count())
             .sum();
 
         let mut deployments: Vec<Deployment> = Vec::new();
@@ -585,7 +617,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            for (stack, account, target_region, cannot_deploy) in prepared {
+            for Prepared {
+                stack,
+                account,
+                region: target_region,
+                cannot_deploy,
+                refused,
+            } in prepared
+            {
                 let stack_id = stack.stack_id.clone();
                 let declared = stack.current_resources().to_vec();
                 let provenance = stack.provenance();
@@ -611,6 +650,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     region: target_region,
                     declared,
                     cannot_deploy,
+                    refused,
                     provenance,
                 });
             }
@@ -649,6 +689,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &deployment.provenance,
                 deployment.declared,
                 &[],
+                deployment.refused,
             )
             .await;
             let mut store = state.lock();

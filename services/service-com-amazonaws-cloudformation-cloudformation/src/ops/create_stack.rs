@@ -42,6 +42,12 @@
 //! addresses is read from this emulator's own Amazon S3 and the stack is created from it
 //! exactly as from an inline body ([`crate::state::template_url`]).
 //!
+//! An `Fn::ImportValue` the template carries is resolved against the exported output values
+//! in force in the account and Region the create runs in: a name no live stack of that
+//! Region publishes has no value to import, so the create fails the STACK — nothing is asked
+//! of any owning service, the reason names the export, and the stack rolls back — rather
+//! than deploying a resource configured from a value that does not exist.
+//!
 //! `Capabilities` is WEIGHED against the template's own declarations: a template declaring
 //! an IAM resource the request did not acknowledge is refused with the modelled
 //! `InsufficientCapabilitiesException`, before the stack is created — see
@@ -601,6 +607,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             stack.deploy_template(&exports).err()
         };
+        // "The intrinsic function Fn::ImportValue returns the value of an output exported by
+        // another stack": an export name no live stack of this account and Region publishes
+        // has no value to import, so the declaration naming it cannot be deployed at all.
+        // That is CLOUDFORMATION's own refusal of the deployment, reported the way the other
+        // refusals it makes before asking anybody are — nothing is created, and the create
+        // fails and rolls back naming the export rather than completing a stack whose
+        // resource carries no imported value.
+        let refused_deployment = transform_failure.or_else(|| stack.unresolved_import_failure());
 
         // The store lock is taken for the write and RELEASED at the end of this block:
         // the calls that create the stack's resources run after it, and each of those
@@ -749,23 +763,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // created in the service that owns it, and what that service answered is what the
         // stack records for it. A create has nothing to reconcile against, so the previous
         // set is empty.
-        let materialised = match transform_failure {
-            // Nothing is asked of any owning service for a template that could not be
-            // processed: the failure the stack records is the transform's.
-            Some(reason) => crate::state::provisioning::Materialised {
-                resources: Vec::new(),
-                failure: Some(reason),
-                // No resource was asked of any service, so none transitioned: the stack's
-                // event log carries the transform's failure and nothing else.
-                transitions: Vec::new(),
-                // And nothing was created, so nothing is waiting to be ready.
-                stabilising: Vec::new(),
-            },
-            None => {
-                crate::state::provisioning::reconcile(ctx, &region, &provenance, declared, &[])
-                    .await
-            }
-        };
+        //
+        // A deployment CLOUDFORMATION refused — a template whose transforms could not be
+        // applied, a `Rules` assertion the values in force do not satisfy, or an
+        // `Fn::ImportValue` naming an export nothing publishes — is passed that refusal, so
+        // nothing is asked of any owning service and the stack records CloudFormation's own
+        // diagnostic rather than a summary of resources that tried and failed.
+        let materialised = crate::state::provisioning::reconcile(
+            ctx,
+            &region,
+            &provenance,
+            declared,
+            &[],
+            refused_deployment,
+        )
+        .await;
 
         let output = CreateStackOutput {
             stack_id: Some(stack_id.clone()),

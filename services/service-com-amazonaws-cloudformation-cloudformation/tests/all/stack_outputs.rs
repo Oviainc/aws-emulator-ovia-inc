@@ -1204,13 +1204,17 @@ fn output_cases() -> Vec<OutputCase> {
         OutputCase {
             case: "outputs this service cannot evaluate are reported without a value",
             stack_name: "unresolved",
+            // Two expressions that resolve to no value: a `Fn::Select` past the end of the
+            // list it selects from, and a `Ref` to a parameter the request supplied no value
+            // for. (An `Fn::ImportValue` of a name nothing exports is NOT one of them — it
+            // fails the whole deployment, which `unresolvable_imports.rs` pins.)
             template: r#"{"Parameters":{"Unsupplied":{"Type":"String"}},
-                 "Outputs":{"Imported":{"Value":{"Fn::ImportValue":"other-stack-export"}},
+                 "Outputs":{"Selected":{"Value":{"Fn::Select":["3",["a","b"]]}},
                    "Missing":{"Value":{"Ref":"Unsupplied"}}}}"#
                 .to_string(),
             parameters: vec![],
             expected: vec![
-                ("Imported", Expected::NoValue),
+                ("Selected", Expected::NoValue),
                 ("Missing", Expected::NoValue),
             ],
         },

@@ -463,9 +463,10 @@ const ROWS: &[Row] = &[
                     },
                     "Scope": { "Value": { "Fn::Sub": "${AWS::AccountId}:${AWS::Region}:${AWS::StackName}" } },
                     // An output whose value no intrinsic here can resolve is ABSENT, not
-                    // invented: `Fn::ImportValue` reads another stack's exports, which
-                    // this emulator does not keep.
-                    "Imported": { "Value": { "Fn::ImportValue": "some-other-stacks-export" } }
+                    // invented: a `Fn::Select` past the end of the list it selects from has
+                    // no value to report. (An `Fn::ImportValue` of a name nothing exports is
+                    // not such a value — it fails the whole deployment.)
+                    "Imported": { "Value": { "Fn::Select": ["3", ["a", "b"]] } }
                 }
             })
             .to_string()

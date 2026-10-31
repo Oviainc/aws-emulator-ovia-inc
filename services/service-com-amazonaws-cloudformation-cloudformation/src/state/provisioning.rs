@@ -634,6 +634,13 @@ pub async fn advance_stabilisations(
 /// and [`Materialised::failure`] is the resolver's own diagnostic rather than a summary of
 /// resources that failed.
 ///
+/// `refused` is a refusal CLOUDFORMATION itself reached before this walk — the deployment's
+/// template imports an export nothing publishes
+/// ([`super::StoredStack::unresolved_import_failure`]) — and it is answered exactly as the
+/// gate above answers one of its own: the walk is not entered, nothing is asked of any
+/// owning service, and [`Materialised::failure`] is that diagnostic. `None` is a deployment
+/// CloudFormation has nothing against, which is every rollback and every revert.
+///
 /// The resources are created in the order the template declares them. The first refusal
 /// from an owning service stops the walk and is reported as [`Materialised::failure`]: the
 /// resources created before it are still reported (with their `materialised` flag set), so
@@ -670,8 +677,16 @@ pub async fn reconcile(
     stack: &StackProvenance,
     declared: Vec<StoredResource>,
     previous: &[StoredResource],
+    refused: Option<String>,
 ) -> Materialised {
-    let mut outcome = Materialised::default();
+    let mut outcome = Materialised {
+        // A deployment CLOUDFORMATION itself refused before this walk: nothing is asked of
+        // any owning service for it, and every declaration is recorded as the declaration
+        // left it by the tail below — the same treatment the gate just below gives a
+        // refusal of its own.
+        failure: refused,
+        ..Materialised::default()
+    };
     // The identifiers the owning services MINTED in this walk, each against the stand-in
     // the naming rules had computed for that resource ([`repoint_references`]).
     let mut minted: Vec<Minted> = Vec::new();
@@ -684,17 +699,20 @@ pub async fn reconcile(
     // the resolver's diagnostic (which reference could not be honoured, and why) rather
     // than a summary of resources that tried and failed
     // ([`super::resource_failure_summary`]).
-    let mut resolutions = match super::dynamic_references::resolve_declared(
-        ctx,
-        region,
-        declared.as_slice(),
-    )
-    .await
-    {
-        Ok(resolutions) => resolutions,
-        Err(reason) => {
-            outcome.failure = Some(reason);
-            BTreeMap::new()
+    //
+    // A deployment already refused above is not resolved against any store at all: that
+    // refusal stands, and nothing is read for a deployment nothing will deploy.
+    let mut resolutions = if outcome.failure.is_some() {
+        BTreeMap::new()
+    } else {
+        match super::dynamic_references::resolve_declared(ctx, region, declared.as_slice())
+            .await
+        {
+            Ok(resolutions) => resolutions,
+            Err(reason) => {
+                outcome.failure = Some(reason);
+                BTreeMap::new()
+            }
         }
     };
     // A deployment the gate above refused deploys nothing: the walk is not entered, and
