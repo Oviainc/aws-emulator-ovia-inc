@@ -18,16 +18,29 @@
 //! `smithy_query(query="operation", operation="PutTaxExemption")`) reached both
 //! by one repeated id and by 550 distinct ones.
 //!
-//! Each case installs a capturing `tracing` subscriber scoped to the calling
-//! thread, drives the real router, and reads the record back beside the store the
-//! call wrote. Nothing is written to disk and no global subscriber is installed.
+//! Each case drives the real router and reads the record back beside the store
+//! the call wrote. Nothing is written to disk.
+//!
+//! The records are read through the ONE `tracing` capture this test binary
+//! installs ([`access_records`]), which is GLOBAL rather than scoped to the
+//! calling thread on purpose: `tracing` decides per CALLSITE whether any
+//! subscriber is interested and caches that decision process-wide, and the test
+//! harness runs this binary's suites in parallel, so a thread-scoped capture
+//! (`subscriber::set_default`) sees nothing whenever a sibling test — holding no
+//! subscriber of its own — reached the handler's callsite first. One global
+//! capture plus an interest-cache rebuild removes that ordering dependency.
+//!
+//! What keeps one case's records out of another's assertions — and out of
+//! another's drain, since every suite here runs in parallel over the same
+//! operation — is the exemption type each case submits: a token no other case
+//! and no other suite names ([`case_type`]).
 //!
 //! The harness (`emulator_with_engine`, `call`) lives in
 //! `tax_registration_lifecycle.rs` and the submitted certificate in
 //! `tax_exemptions.rs`; nothing here builds a second copy of either.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{json, Value};
 use tracing::field::{Field, Visit};
@@ -49,18 +62,25 @@ const C: &str = "000000000003";
 const D: &str = "000000000004";
 const E: &str = "000000000005";
 
-/// An entry of the catalog this service publishes, named by its `displayName`
-/// (`tests/all/tax_exemption_types.rs` pins the catalog's wire form).
-const EXEMPTION_TYPE: &str = "501(c)(3)";
-
-/// A second published entry, for the submission that ADDS a record beside the
-/// one an account already holds rather than replacing it.
-const OTHER_EXEMPTION_TYPE: &str = "Reseller";
-
 /// The most `accountIds` entries one submission may name — the published
 /// `@length` maximum of `PutTaxExemption`'s list
 /// (`smithy_query(query="operation", operation="PutTaxExemption")`).
 const MAX_ACCOUNT_IDS: usize = 550;
+
+/// The exemption type one case of one test submits: a token naming them both.
+///
+/// `PutTaxExemptionRequest$exemptionType` is a free-form string the model
+/// constrains only in length (1..200) and by a pattern admitting every character,
+/// and it enumerates no legal values for it
+/// (`smithy_query(query="operation", operation="PutTaxExemption")`), so such a
+/// token is admitted and recorded exactly as a published entry's name is —
+/// `tests/all/exemption_type_admission.rs` pins that rule, and nothing in the
+/// rule under test here is about the type. Submitting a token no other case and
+/// no other suite names is what makes the records a submission left its own in
+/// the capture this whole test binary shares.
+fn case_type(test: &str, case: &str) -> String {
+    format!("{test} / {case}")
+}
 
 /// One captured event: its fields, rendered as strings whatever type they were
 /// recorded as.
@@ -108,33 +128,44 @@ struct Capture {
 }
 
 impl Capture {
-    /// Every captured record for `operation`, oldest first.
-    fn records_for(&self, operation: &str) -> Vec<CapturedEvent> {
-        self.events
-            .lock()
-            .expect("the capture buffer")
-            .iter()
-            .filter(|event| event.field("operation") == Some(operation))
-            .cloned()
-            .collect()
+    /// The `PutTaxExemption` access records naming `exemption_type`, TAKEN from
+    /// the buffer and leaving every other case's and every other suite's records
+    /// in it.
+    ///
+    /// A case submits a type no other case and no other suite submits
+    /// ([`case_type`]), so the records of a sibling running in parallel over the
+    /// same operation are neither counted here nor discarded from under it —
+    /// which is what lets an assertion demand EXACTLY one record per submission.
+    fn drain_records_for(&self, exemption_type: &str) -> Vec<CapturedEvent> {
+        let mut held = self.events.lock().expect("the capture buffer");
+        let (mine, theirs): (Vec<CapturedEvent>, Vec<CapturedEvent>) =
+            std::mem::take(&mut *held).into_iter().partition(|event| {
+                event.field("operation") == Some("PutTaxExemption")
+                    && event.field("exemption_type") == Some(exemption_type)
+            });
+        *held = theirs;
+        mine
     }
 
-    /// The one access record `PutTaxExemption` left, or an explanation of what
-    /// was captured instead.
-    fn the_exemption_record(&self, case: &str) -> CapturedEvent {
-        let matching = self.records_for("PutTaxExemption");
+    /// The one access record the submission of `exemption_type` left, or an
+    /// explanation of what was captured instead.
+    fn the_exemption_record(&self, case: &str, exemption_type: &str) -> CapturedEvent {
+        let matching = self.drain_records_for(exemption_type);
         assert_eq!(
             matching.len(),
             1,
-            "case {case:?}: expected exactly one access record, captured {matching:?}"
+            "case {case:?}: expected exactly one access record for {exemption_type:?}, captured \
+             {matching:?}"
         );
         matching.into_iter().next().expect("the one record")
     }
 }
 
 impl Subscriber for Capture {
-    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
-        true
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        // The access records this suite reads are emitted at INFO; nothing finer
+        // belongs to an assertion here.
+        *metadata.level() <= tracing::Level::INFO
     }
 
     fn new_span(&self, _span: &Attributes<'_>) -> Id {
@@ -161,11 +192,24 @@ impl Subscriber for Capture {
     fn exit(&self, _span: &Id) {}
 }
 
-/// Capture this thread's `tracing` events for the life of the returned guard.
-fn capture_events() -> (Capture, tracing::subscriber::DefaultGuard) {
-    let capture = Capture::default();
-    let guard = tracing::subscriber::set_default(capture.clone());
-    (capture, guard)
+/// The capture for the access records, installed ONCE as this test binary's
+/// global `tracing` subscriber.
+///
+/// A test binary admits exactly one global default, so this module owns it: a
+/// suite that wants captured records calls this rather than installing another,
+/// which `set_global_default` would refuse.
+fn access_records() -> &'static Capture {
+    static CAPTURE: OnceLock<Capture> = OnceLock::new();
+    CAPTURE.get_or_init(|| {
+        let capture = Capture::default();
+        tracing::subscriber::set_global_default(capture.clone())
+            .expect("this module is the only installer of a global tracing subscriber");
+        // Recompute interest for callsites a test running in parallel may
+        // already have reached — and cached as uninteresting — before this
+        // subscriber existed.
+        tracing::callsite::rebuild_interest_cache();
+        capture
+    })
 }
 
 /// One row: the list a submission names, and how many accounts it addresses —
@@ -256,24 +300,27 @@ fn held(engine: &Arc<engine::InMemoryEngine>) -> Vec<(String, usize)> {
 /// of entries the request listed.
 #[tokio::test]
 async fn the_access_record_counts_the_accounts_the_write_addressed() {
+    let capture = access_records();
     for row in rows() {
         let case = row.case.as_str();
+        let exemption_type = case_type(
+            "the_access_record_counts_the_accounts_the_write_addressed",
+            case,
+        );
         let (router, engine) = emulator_with_engine();
-        let (capture, guard) = capture_events();
         let submitted = call(
             &router,
             "PutTaxExemption",
-            &submission(&row.named, EXEMPTION_TYPE),
+            &submission(&row.named, &exemption_type),
         )
         .await;
-        drop(guard);
 
         assert_eq!(
             (submitted.status, submitted.error_code.as_str()),
             (200, ""),
             "case {case:?}: the submission must succeed, got {submitted:?}"
         );
-        let record = capture.the_exemption_record(case);
+        let record = capture.the_exemption_record(case, &exemption_type);
         assert_eq!(
             record.field("outcome"),
             Some("recorded"),
@@ -296,7 +343,7 @@ async fn the_access_record_counts_the_accounts_the_write_addressed() {
         );
         assert_eq!(
             record.field("exemption_type"),
-            Some(EXEMPTION_TYPE),
+            Some(exemption_type.as_str()),
             "case {case:?}: expected the record to name the submitted type, got {record:?}"
         );
 
@@ -321,28 +368,28 @@ async fn the_access_record_counts_the_accounts_the_write_addressed() {
 /// records say it does.
 #[tokio::test]
 async fn every_submission_records_the_accounts_it_addressed() {
+    let capture = access_records();
     for row in rows() {
         let case = row.case.as_str();
+        let exemption_type = case_type("every_submission_records_the_accounts_it_addressed", case);
         let (router, engine) = emulator_with_engine();
 
         // The same exemption submitted twice REPLACES each addressed account's
         // record: the second record reports the same accounts, and the store
         // still holds one record each.
         for attempt in 1..=2 {
-            let (capture, guard) = capture_events();
             let submitted = call(
                 &router,
                 "PutTaxExemption",
-                &submission(&row.named, EXEMPTION_TYPE),
+                &submission(&row.named, &exemption_type),
             )
             .await;
-            drop(guard);
             assert_eq!(
                 (submitted.status, submitted.error_code.as_str()),
                 (200, ""),
                 "case {case:?}: submission {attempt} must succeed, got {submitted:?}"
             );
-            let record = capture.the_exemption_record(case);
+            let record = capture.the_exemption_record(case, &exemption_type);
             assert_eq!(
                 record.field("accounts"),
                 Some(row.addressed.to_string().as_str()),
@@ -364,20 +411,19 @@ async fn every_submission_records_the_accounts_it_addressed() {
         if row.addressed * 2 > MAX_STORED_EXEMPTIONS {
             continue;
         }
-        let (capture, guard) = capture_events();
+        let other_type = format!("{exemption_type} / a second exemption");
         let other = call(
             &router,
             "PutTaxExemption",
-            &submission(&row.named, OTHER_EXEMPTION_TYPE),
+            &submission(&row.named, &other_type),
         )
         .await;
-        drop(guard);
         assert_eq!(
             (other.status, other.error_code.as_str()),
             (200, ""),
             "case {case:?}: the second exemption must succeed, got {other:?}"
         );
-        let record = capture.the_exemption_record(case);
+        let record = capture.the_exemption_record(case, &other_type);
         assert_eq!(
             record.field("accounts"),
             Some(row.addressed.to_string().as_str()),
@@ -396,36 +442,49 @@ async fn every_submission_records_the_accounts_it_addressed() {
 /// it leaves no access record claiming it changed accounts.
 #[tokio::test]
 async fn a_refused_submission_leaves_no_record_of_a_change() {
+    const TEST: &str = "a_refused_submission_leaves_no_record_of_a_change";
+    let capture = access_records();
     let (router, engine) = emulator_with_engine();
 
     // Fill the store to just under the bound this emulator keeps resident, one
     // exemption per account — in submissions of at most the published maximum
-    // number of entries each.
+    // number of entries each. Each applied submission leaves its one record,
+    // which is also what shows the capture these assertions read is live: the
+    // refusal below is read through the same one.
+    let fill_type = case_type(TEST, "filling the store");
     let resident: Vec<String> = (0..MAX_STORED_EXEMPTIONS - 1)
         .map(|index| format!("{:012}", index + 1))
         .collect();
+    let mut applied = 0usize;
+    let mut recorded = 0usize;
     for chunk in resident.chunks(MAX_ACCOUNT_IDS) {
-        let filled = call(&router, "PutTaxExemption", &submission(chunk, EXEMPTION_TYPE)).await;
+        let filled = call(&router, "PutTaxExemption", &submission(chunk, &fill_type)).await;
         assert_eq!(
             (filled.status, filled.error_code.as_str()),
             (200, ""),
             "setup: filling the store must succeed, got {filled:?}"
         );
+        applied += 1;
+        recorded += capture.drain_records_for(&fill_type).len();
     }
+    assert_eq!(
+        recorded, applied,
+        "setup: each of the {applied} applied submissions leaves one access record, captured \
+         {recorded}"
+    );
 
     // Two further accounts: the write would take the store one record past the
     // bound, so it is refused whole.
+    let refused_type = case_type(TEST, "a submission past the resident bound");
     let overflowing: Vec<String> = (0..2)
         .map(|index| format!("{:012}", MAX_STORED_EXEMPTIONS + index + 1))
         .collect();
-    let (capture, guard) = capture_events();
     let refused = call(
         &router,
         "PutTaxExemption",
-        &submission(&overflowing, EXEMPTION_TYPE),
+        &submission(&overflowing, &refused_type),
     )
     .await;
-    drop(guard);
     assert_eq!(
         refused.status, 413,
         "case \"a submission past the resident bound\": expected the modelled refusal, got \
@@ -438,7 +497,7 @@ async fn a_refused_submission_leaves_no_record_of_a_change() {
         "case \"a submission past the resident bound\": expected \
          CaseCreationLimitExceededException, got {refused:?}"
     );
-    let records = capture.records_for("PutTaxExemption");
+    let records = capture.drain_records_for(&refused_type);
     assert!(
         records.is_empty(),
         "case \"a submission past the resident bound\": a refused submission changed nothing, so \
@@ -451,5 +510,64 @@ async fn a_refused_submission_leaves_no_record_of_a_change() {
         "case \"a submission past the resident bound\": a refused submission stores nothing, got \
          {} accounts",
         stored.len()
+    );
+}
+
+/// RULE, on the harness every case above reads its records through: the record a
+/// state-changing call leaves is captured whatever thread the call ran on, so
+/// what a case reads back does not depend on which test in this binary reached
+/// the handler's callsite first — every suite here runs in parallel over the same
+/// operation.
+#[tokio::test]
+async fn an_access_record_is_captured_from_a_call_on_another_thread() {
+    const CASE: &str = "a submission driven from another thread";
+    let capture = access_records();
+    let exemption_type = case_type(
+        "an_access_record_is_captured_from_a_call_on_another_thread",
+        CASE,
+    );
+    // Three entries naming two accounts, so the record reports the accounts the
+    // write addressed on this path too.
+    let named = vec![A.to_string(), B.to_string(), A.to_string()];
+
+    // A thread of its own, driving its own runtime: nothing of this capture is
+    // installed there, and the record it leaves is read back here.
+    let submitting = std::thread::spawn({
+        let exemption_type = exemption_type.clone();
+        move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a runtime for the submitting thread");
+            runtime.block_on(async move {
+                let (router, _engine) = emulator_with_engine();
+                call(
+                    &router,
+                    "PutTaxExemption",
+                    &submission(&named, &exemption_type),
+                )
+                .await
+            })
+        }
+    });
+    let submitted = submitting.join().expect("the submitting thread");
+    assert_eq!(
+        (submitted.status, submitted.error_code.as_str()),
+        (200, ""),
+        "case {CASE:?}: the submission must succeed, got {submitted:?}"
+    );
+
+    let record = capture.the_exemption_record(CASE, &exemption_type);
+    assert_eq!(
+        record.field("accounts"),
+        Some("2"),
+        "case {CASE:?}: expected the record to report the two accounts the three entries \
+         addressed, got {record:?}"
+    );
+    assert_eq!(
+        record.field("case_id"),
+        submitted.get("caseId").as_str(),
+        "case {CASE:?}: expected the record to name the case the submission opened ({:?}), got \
+         {record:?}",
+        submitted.get("caseId")
     );
 }
