@@ -394,7 +394,7 @@ async fn an_unresolvable_instance_id_is_refused_before_the_screen_is_drawn() {
             "i-0123456789abcdef01",
             false,
         ),
-        ("the retired 8-digit short form", "i-0abc1234", false),
+        ("the 8-digit short form, nothing launched for it", "i-0abc1234", true),
         (
             "a digit that is not hexadecimal",
             "i-0z23456789abcdef0",

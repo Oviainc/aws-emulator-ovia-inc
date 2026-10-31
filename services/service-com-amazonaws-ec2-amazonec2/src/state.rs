@@ -7336,9 +7336,9 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// The long form every instance id EC2 issues takes: `i-` and 17 lowercase
     /// hexadecimal digits of a counter that starts at one, so the id is never the null
-    /// id and its leading digit is `0` — the form [`instance_id_is_well_formed`] reads,
-    /// which is what lets an id outside it be answered as malformed rather than looked
-    /// up.
+    /// id and its leading digit is `0` — one of the two forms
+    /// [`instance_id_is_well_formed`] reads, which is what lets an id outside them be
+    /// answered as malformed rather than looked up.
     pub fn mint_instance_id(&mut self) -> String {
         self.next_instance += 1;
         format!("i-{:017x}", self.next_instance)
@@ -9886,54 +9886,68 @@ pub fn validate_tag_size<E>(
 /// seventeen digits.
 pub const LONG_RESOURCE_ID_DIGITS: usize = 17;
 
+/// How many hexadecimal digits the SHORT EC2 resource id form carries — the form EC2
+/// issued resource ids in before the long one and still READS, as the model's own id
+/// patterns spell it (`^vpc-([0-9a-f]{8}|[0-9a-f]{17})$`, quoted on
+/// [`prefixed_id_is_well_formed`]): eight digits.
+pub const SHORT_RESOURCE_ID_DIGITS: usize = 8;
+
 /// Whether `id` is a well-formed EC2 instance id — one EC2 could have ISSUED.
 ///
-/// An instance id is `i-` followed by 17 lowercase hexadecimal digits — "the full
-/// instance ID in the request, in the form `i-xxxxxxxxxxxxxxxxx`", as AWS's
-/// `InvalidInstanceID.Malformed` error-code entry spells the only form it accepts —
-/// of which the leading digit is `0` and not all are `0`. EC2 answers
-/// `InvalidInstanceID.Malformed` for anything else, BEFORE it looks the id up, which
-/// is a different answer from `InvalidInstanceID.NotFound` for a well-formed id
-/// nothing was launched for: a client that cannot tell a typo from a missing instance
-/// goes on polling for an instance that can never appear.
+/// An instance id is `i-` followed by EITHER of the two forms EC2 has issued resource ids
+/// in ([`issued_id_is_well_formed`]): [`SHORT_RESOURCE_ID_DIGITS`] lowercase hexadecimal
+/// digits, or [`LONG_RESOURCE_ID_DIGITS`] of them under a leading `0`; and it is not the
+/// all-zero placeholder. EC2 answers `InvalidInstanceID.Malformed` for anything else,
+/// BEFORE it looks the id up, which is a different answer from
+/// `InvalidInstanceID.NotFound` for a well-formed id nothing was launched for: a client
+/// that cannot tell a typo from a missing instance goes on polling for an instance that
+/// can never appear.
 ///
-/// Three things put an id outside the form EC2 issues, so that it is malformed rather
+/// Two things put an id outside the form EC2 issues, so that it is malformed rather
 /// than missing:
 ///
-/// * The 8-digit SHORT id form. EC2 stopped issuing short resource ids when longer ids
-///   were introduced and the short form was retired for instances, so the only
-///   instance id form left is the 17-digit one AWS's error text names. Other EC2
-///   resource kinds here still read both forms ([`volume_id_is_well_formed`] and the
-///   rest): this is the instance id's own documented form, not a rule about every id.
-/// * A LEADING DIGIT ABOVE ZERO. The long form carries 17 hexadecimal digits — 68 bits
-///   — for a 64-bit internal identifier, so its leading digit is always `0`: every
-///   instance id EC2 issues reads `i-0…`, which is also what this service's own mint
-///   produces ([`ComAmazonawsEc2Amazonec2State::mint_instance_id`]) and what every
-///   instance id seeded elsewhere in this emulator looks like. AWS answers an id whose
-///   leading digit is above zero — the `i-1234567890abcdef0` shape that documentation
-///   examples and hand-written probes use — with `InvalidInstanceID.Malformed`.
+/// * A LEADING DIGIT ABOVE ZERO IN THE LONG FORM. That form carries 17 hexadecimal digits
+///   — 68 bits — for a 64-bit internal identifier, so its leading digit is always `0`:
+///   every long-form instance id EC2 issues reads `i-0…`, which is also what this
+///   service's own mint produces ([`ComAmazonawsEc2Amazonec2State::mint_instance_id`]) and
+///   what every instance id seeded elsewhere in this emulator looks like. AWS answers an
+///   id whose leading digit is above zero — the `i-1234567890abcdef0` shape that
+///   documentation examples and hand-written probes use — with
+///   `InvalidInstanceID.Malformed`. The SHORT form carries no such spare bit, so nothing
+///   constrains its leading digit.
 /// * The ALL-ZERO id, the value every client reaches for as a placeholder: AWS answers
 ///   `i-00000000000000000` with `InvalidInstanceID.Malformed` too, and the mint counts
 ///   from one, so no instance can ever hold the null id.
 ///
-/// The structural part of this is the rule of SOME EC2 id kinds, not of every one
+/// The SHORT form is a form EC2 READS even though it no longer ISSUES it: EC2 stopped
+/// handing out short resource ids when the long form was introduced, which is why nothing
+/// this service mints is in it, but the id parser still accepts it — so a short-form id is
+/// LOOKED UP, and an account holding no instance for it is told `NotFound` rather than that
+/// its id is unreadable. That is the generic EC2 id form the rest of this crate's readers
+/// take ([`prefixed_id_is_well_formed`], whose doc quotes the model's own
+/// `^vpc-([0-9a-f]{8}|[0-9a-f]{17})$`), and the describes of this account's images were
+/// recorded answering a short-form `ami-` id `NotFound` the same way.
+///
+/// The clauses above are the rule of SOME EC2 id kinds, not of every one
 /// ([`issued_long_id_is_well_formed`], which a Capacity Reservation Fleet id reads through
-/// too on its own recorded evidence): the same all-zero suffix on a network interface
-/// (`eni-00000000000000000`) IS answered `NotFound`, so it is not generalised to the other
-/// id readers here.
+/// on its own recorded evidence): the same all-zero suffix on a network interface
+/// (`eni-00000000000000000`) IS answered `NotFound`, so they are not generalised to the
+/// other id readers here.
 ///
 /// ## Where each clause's evidence is, so the rule can be re-checked
 ///
-/// * The 17-digit form: AWS's `InvalidInstanceID.Malformed` error-code entry ("Ensure
-///   that you provide the full instance ID in the request, in the form
-///   `i-xxxxxxxxxxxxxxxxx`").
+/// * The TWO forms: the recorded unit
+///   `cloudtrail__ec2.obs-ec2-3-rejected-ec2-calls-audit-client-error-codes-with-no-response-elements`
+///   refuses `DescribeInstances` for a short-form id that names no instance and asserts
+///   `InvalidInstanceID.NotFound`, so the short form is inside the form EC2 reads; the
+///   long form is AWS's `InvalidInstanceID.Malformed` error-code entry ("Ensure that you
+///   provide the full instance ID in the request, in the form `i-xxxxxxxxxxxxxxxxx`").
+///   `tests/all/instance_id_forms.rs` pins both over a table of forms.
 /// * The LEADING DIGIT: the recorded unit `ec2.op-contract-get-password-data` (run#12,
 ///   `assert code == "InvalidInstanceID.Malformed"`) probes a 17-hexadecimal-digit id
 ///   that is neither the short form nor the null id — an id whose leading digit is
 ///   above zero, the `i-1234567890abcdef0` shape — and AWS answered it
-///   `InvalidInstanceID.Malformed`. With only the two other clauses the replay of that
-///   unit still diverged with `InvalidInstanceID.NotFound`; this clause is what makes
-///   the recorded answer match. The `tests/all/get_password_data.rs` rows "a leading
+///   `InvalidInstanceID.Malformed`. The `tests/all/get_password_data.rs` rows "a leading
 ///   digit above zero" and "every digit above zero" pin it.
 /// * The NULL id: the recorded units behind
 ///   `issues/.../20261022T235108Z-ec2-misclassifies-rejections-and-skips-validation-malformed-ids.md`
@@ -9942,7 +9956,7 @@ pub const LONG_RESOURCE_ID_DIGITS: usize = 17;
 ///   (cause 1, the same id under `DryRun`), whose cause 7 is also where the
 ///   `eni-00000000000000000` -> `NotFound` counter-example comes from.
 pub fn instance_id_is_well_formed(id: &str) -> bool {
-    issued_long_id_is_well_formed("i", id)
+    issued_id_is_well_formed("i", id)
 }
 
 /// Refuse an instance id the request named that this service cannot resolve: a
@@ -17813,8 +17827,8 @@ pub fn invalid_ami_id_malformed<E>(image_id: &str) -> Scaffolded<E> {
 /// `ImageId` a LAUNCH is to run: a value inside the generic id form but outside the one EC2
 /// issues — the `ami-1234567890abcdef0` shape documentation examples and hand-written probes
 /// reach for — is answered `InvalidAMIID.Malformed` before any image is looked up, which is
-/// what the recorded `RunInstances` refusal of that shape shows and what
-/// [`instance_id_is_well_formed`] already reads an instance id the same way for. The
+/// what the recorded `RunInstances` refusal of that shape shows, and the clause a
+/// LONG-form instance id is read under too ([`instance_id_is_well_formed`]). The
 /// describes of the account's images keep the wider [`image_id_is_well_formed`] on their own
 /// recorded evidence (a short-form id there is answered `InvalidAMIID.NotFound`), so which
 /// reading an operation uses is a fact of that operation's validator.
@@ -20336,8 +20350,8 @@ pub fn subnet_limit_exceeded<E>() -> Scaffolded<E> {
 pub const INVALID_GROUP_DUPLICATE: &str = "InvalidGroup.Duplicate";
 
 /// Whether `id` is a well-formed security group id: `sg-` followed by 8 or 17 lowercase
-/// hexadecimal digits — the short and the long id form, exactly as
-/// [`instance_id_is_well_formed`] reads an instance id.
+/// hexadecimal digits — the short and the long id form, the two
+/// [`prefixed_id_is_well_formed`] reads.
 pub fn security_group_id_is_well_formed(id: &str) -> bool {
     let Some(suffix) = id.strip_prefix(SECURITY_GROUP_ID_PREFIX) else {
         return false;
@@ -30948,10 +30962,12 @@ pub fn prefixed_id_is_well_formed(prefix: &str, id: &str) -> bool {
     else {
         return false;
     };
-    matches!(suffix.len(), 8 | 17)
-        && suffix
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    matches!(
+        suffix.len(),
+        SHORT_RESOURCE_ID_DIGITS | LONG_RESOURCE_ID_DIGITS
+    ) && suffix
+        .bytes()
+        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The most characters of a refused resource id that [`invalid_id_message`] repeats back.
@@ -31016,9 +31032,10 @@ fn id_is_not_the_null_id(prefix: &str, id: &str) -> bool {
 /// mint counting from one can never produce).
 ///
 /// Which resource kinds read ids this way is a fact about each kind, not about every EC2 id:
-/// [`instance_id_is_well_formed`] and [`capacity_reservation_fleet_id_is_well_formed`] do,
-/// each on the evidence recorded with it, while a network interface id answers `NotFound`
-/// for the same all-zero suffix and so reads ids through
+/// [`capacity_reservation_fleet_id_is_well_formed`] and the launch path's
+/// [`issued_image_id_is_well_formed`] do, each on the evidence recorded with it, while an
+/// instance id is read in the short form too ([`issued_id_is_well_formed`]) and a network
+/// interface id answers `NotFound` for the same all-zero suffix and so reads ids through
 /// [`prefixed_id_is_well_formed`] instead.
 pub fn issued_long_id_is_well_formed(prefix: &str, id: &str) -> bool {
     let Some(suffix) = id
@@ -31033,6 +31050,38 @@ pub fn issued_long_id_is_well_formed(prefix: &str, id: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
         && suffix.starts_with('0')
         && id_is_not_the_null_id(prefix, id)
+}
+
+/// Whether `id` is a well-formed EC2 resource id of the kind `prefix` names that EC2 could
+/// have ISSUED, in EITHER of the two forms it has issued ids in.
+///
+/// [`prefixed_id_is_well_formed`]'s two forms with [`issued_long_id_is_well_formed`]'s
+/// clauses on the LONG one: the id reads in one of the two published forms, it is not the
+/// all-zero placeholder the mint counting from one can never produce
+/// ([`id_is_not_the_null_id`]), and where it carries the long form its leading digit is `0`
+/// (that form carries 68 bits for a 64-bit identifier, so an issued long id always reads
+/// `<prefix>-0…`, which is what [`ComAmazonawsEc2Amazonec2State::next_id`] mints). The two
+/// published forms and the hexadecimal alphabet are read through
+/// [`prefixed_id_is_well_formed`] and the placeholder through [`id_is_not_the_null_id`], so
+/// those keep one definition; only the long form's leading digit is read here, because
+/// [`issued_long_id_is_well_formed`] cannot be reused for it without also refusing the
+/// short form this reader accepts.
+///
+/// The reading of the kinds recorded answering `NotFound` for a SHORT-form id that names
+/// nothing while answering `Invalid<Kind>.Malformed` for a long-form id outside the issued
+/// form ([`instance_id_is_well_formed`], where that evidence is cited). Which reading a
+/// kind takes is a fact about that kind: a kind recorded refusing anything but the long
+/// form reads [`issued_long_id_is_well_formed`], and one that puts no clause on the digits
+/// at all reads [`prefixed_id_is_well_formed`].
+pub fn issued_id_is_well_formed(prefix: &str, id: &str) -> bool {
+    prefixed_id_is_well_formed(prefix, id)
+        && id_is_not_the_null_id(prefix, id)
+        && id
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|suffix| {
+                suffix.len() != LONG_RESOURCE_ID_DIGITS || suffix.starts_with('0')
+            })
 }
 
 /// Whether `id` is a well-formed VPC ENDPOINT id, as opposed to an id of one of the two

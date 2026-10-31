@@ -317,9 +317,9 @@ async fn an_unresolvable_instance_id_is_refused_before_the_password_data_is_read
             "InvalidInstanceID.Malformed",
         ),
         (
-            "the retired 8-digit short form",
+            "the 8-digit short form, nothing launched for it",
             "i-0abc1234",
-            "InvalidInstanceID.Malformed",
+            "InvalidInstanceID.NotFound",
         ),
         (
             "a digit that is not hexadecimal",

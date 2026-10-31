@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The two forms an instance id is read in before any lookup, and the two answers a value
+// inside and outside them gets, across a describe, a password read and a mutation. Declared
+// beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood and
+// the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/instance_id_forms.rs"]
+mod instance_id_forms;
 // What `CreateImageUsageReport` computes one AMI usage report from — the image, resource
 // types, scope options, accounts and tags the request names — the `pending` -> `available`
 // move the clock owes it, the 30-day deletion it carries, its `ClientToken` idempotency and

@@ -531,8 +531,9 @@ async fn only_a_running_instance_can_be_reported_on() {
 
 /// Rule 4: an instance id this service cannot resolve is refused — malformed before
 /// unknown — and the refusal is the answer however else the request is formed. The rows
-/// span the forms a bad id takes: not an id at all, a short legacy id, the null long id,
-/// an id of another resource kind, and a well-formed id naming no instance.
+/// span the forms a bad id takes: not an id at all, the null long id, a long id outside the
+/// form EC2 issues, an id of another resource kind, and a well-formed id of either form
+/// naming no instance.
 #[tokio::test]
 async fn an_instance_id_this_account_cannot_resolve_is_refused() {
     let ec2 = Ec2::new();
@@ -542,13 +543,22 @@ async fn an_instance_id_this_account_cannot_resolve_is_refused() {
     let running = ec2.running_instance("seed").await;
 
     // (case, the id the request names, the expected <Code>)
-    let rows: [(&str, &str, &str); 5] = [
+    let rows: [(&str, &str, &str); 6] = [
         (
             "not an id at all",
             "not-an-instance",
             "InvalidInstanceID.Malformed",
         ),
-        ("a short legacy id", "i-12345678", "InvalidInstanceID.Malformed"),
+        (
+            "a short-form id nothing was launched under",
+            "i-12345678",
+            "InvalidInstanceID.NotFound",
+        ),
+        (
+            "a long id whose leading digit is above zero",
+            "i-1234567890abcdef0",
+            "InvalidInstanceID.Malformed",
+        ),
         (
             "the null long id",
             "i-00000000000000000",

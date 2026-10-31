@@ -725,12 +725,12 @@ fn refusals() -> Vec<Refusal> {
             message: malformed(EXAMPLE_ID),
         },
         Refusal {
-            label: "the retired short id form",
+            label: "the 8-digit short form, no instance of the account under it",
             ids: vec![Some("i-1a2b3c4d")],
             dry_run: false,
             status: 400,
-            code: "InvalidInstanceID.Malformed",
-            message: malformed("i-1a2b3c4d"),
+            code: "InvalidInstanceID.NotFound",
+            message: Some("The instance ID 'i-1a2b3c4d' does not exist".to_string()),
         },
         Refusal {
             label: "the all-zero id",
