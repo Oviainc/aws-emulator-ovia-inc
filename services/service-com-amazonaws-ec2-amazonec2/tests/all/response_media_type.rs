@@ -27,15 +27,23 @@
 //!   the same media type;
 //! * WHICH OPERATION answered — nine reporting operations that need no input, two that need
 //!   input of their own, three mutations (an account setting, a delete, a terminate) and the
-//!   reads that confirm what those mutations did.
+//!   reads that confirm what those mutations did, beside the ten operations the recorded
+//!   corpus reports this media type for whose clusters showed nothing else
+//!   ([`corpus_rows`]);
+//! * WHAT THE DECLARED CHARSET MEANS — the parameter is a statement about the BYTES, so a
+//!   response reporting text outside US-ASCII carries it back in the encoding it declares:
+//!   a tag key, a tag value and an error message holding non-ASCII text each read back as
+//!   the caller wrote them, which is what a client decoding by the declared charset gets
+//!   and what a client guessing a default would not ([`NON_ASCII_TEXT`]).
 //!
 //! Each refusal row also pins that the error envelope names the request it answers exactly
 //! ONCE, whichever layer rendered it: the envelope is finished in one place, so a response
 //! that passes that place cannot collect a second `<RequestID>`.
 
+use service_com_amazonaws_ec2_amazonec2::state::availability_zones_in_region;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call_with_content_type, element, error_code};
+use super::ec2_query::{call_with_content_type, element, error_code, error_message};
 // The rule's media type and the id that resolves to nothing, from the suite that owns the
 // rule over the operations it scripts.
 use super::ec2_query_envelope::{RESPONSE_CONTENT_TYPE, UNKNOWN_VPC_ID};
@@ -124,6 +132,208 @@ async fn every_reporting_operation_declares_the_media_type_with_its_charset() {
     for action in REPORTING_ACTIONS {
         let answered = answer(&router, action, &[]).await;
         assert_media_type(action, &answered, 200);
+    }
+}
+
+/// One row of the corpus table: the operation that answered and the form fields it carried.
+struct Row {
+    case: &'static str,
+    action: &'static str,
+    params: Vec<Param>,
+}
+
+/// One volume of the account, as the id `CreateVolume` reported for it — the source the copy
+/// row copies.
+///
+/// The zone it sits in comes from the service's own zone catalog for the SIGNED Region (the
+/// one `DescribeAvailabilityZones` reports out of, and the one
+/// [`super::volume_lifecycle`] names its zones from), so the row names a zone this Region
+/// actually has rather than a literal written here.
+async fn created_volume(router: &MultiServiceRouter) -> String {
+    let zone = availability_zones_in_region(REGION)
+        .first()
+        .unwrap_or_else(|| panic!("{REGION} must have an Availability Zone"))
+        .zone_name
+        .clone();
+    let answered = answer(
+        router,
+        "CreateVolume",
+        &[param("AvailabilityZone", &zone), param("Size", "8")],
+    )
+    .await;
+    assert_media_type("a volume for the row that copies one", &answered, 200);
+    element(&answered.body, "volumeId").unwrap_or_else(|| {
+        panic!(
+            "CreateVolume must report the volume it minted: {}",
+            answered.body
+        )
+    })
+}
+
+/// The operations the recorded corpus reports this media type for whose own clusters showed
+/// NOTHING ELSE — so each is an operation that is otherwise wire-correct and whose whole
+/// divergence was the media type. Read off that record rather than chosen here, and carrying
+/// whatever each needs to be ANSWERED rather than refused.
+///
+/// They span what an EC2 operation can be: one that mints a resource and reports it
+/// (`CreateVpc`), one that mints one from another (`CopyVolumes`), one that hands out an
+/// address, reads narrowed to a resource the account holds, reads over an empty collection,
+/// and a read of a per-account catalog that is answered out of no stored resource at all
+/// (`DescribeInstanceTypeOfferings`). Beside them sit the reads whose own suites already
+/// cover the rule for the operations [`REPORTING_ACTIONS`] names.
+fn corpus_rows(vpc_id: &str, volume_id: &str) -> Vec<Row> {
+    vec![
+        Row {
+            case: "an address allocated for use in a VPC",
+            action: "AllocateAddress",
+            params: vec![param("Domain", "vpc")],
+        },
+        Row {
+            case: "a VPC created",
+            action: "CreateVpc",
+            params: vec![param("CidrBlock", "10.1.0.0/16")],
+        },
+        Row {
+            case: "every VPC of the account",
+            action: "DescribeVpcs",
+            params: Vec::new(),
+        },
+        Row {
+            case: "one attribute of one VPC",
+            action: "DescribeVpcAttribute",
+            params: vec![
+                param("VpcId", vpc_id),
+                param("Attribute", "enableDnsSupport"),
+            ],
+        },
+        Row {
+            case: "every address of the account",
+            action: "DescribeAddresses",
+            params: Vec::new(),
+        },
+        Row {
+            case: "the capacity blocks of the account",
+            action: "DescribeCapacityBlocks",
+            params: Vec::new(),
+        },
+        Row {
+            case: "the instance types this Region offers",
+            action: "DescribeInstanceTypeOfferings",
+            params: Vec::new(),
+        },
+        Row {
+            case: "the security groups of the account",
+            action: "DescribeSecurityGroups",
+            params: Vec::new(),
+        },
+        Row {
+            case: "the customer-owned IP pools of the account",
+            action: "DescribeCoipPools",
+            params: Vec::new(),
+        },
+        Row {
+            case: "a volume copied from another",
+            action: "CopyVolumes",
+            params: vec![param("SourceVolumeId", volume_id)],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn every_recorded_operation_declares_the_media_type_with_its_charset() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let vpc_id = created_vpc(&router).await;
+    let volume_id = created_volume(&router).await;
+    for row in corpus_rows(&vpc_id, &volume_id) {
+        let answered = answer(&router, row.action, &row.params).await;
+        assert_media_type(row.case, &answered, 200);
+    }
+}
+
+/// Text outside US-ASCII, as a caller writes it into a tag and into a value the service
+/// reports back inside a refusal.
+///
+/// The rows span the UTF-8 sequence LENGTHS a code point is written in — two bytes (Latin-1
+/// Supplement and Greek), three (CJK), four (an astral-plane symbol) — and combine them, so
+/// a response that reached the client in any other encoding reads back differently from
+/// every row rather than from one.
+const NON_ASCII_TEXT: [(&str, &str); 4] = [
+    ("équipe", "café"),
+    ("Ωμέγα", "μ-service"),
+    ("環境", "本番"),
+    ("rocket", "🚀 launch"),
+];
+
+/// The code point a UTF-8 decoder substitutes for bytes it could not read: a response whose
+/// declared charset and actual encoding disagree is read back carrying one.
+const REPLACEMENT: char = '\u{FFFD}';
+
+/// A refusal's `<Message>` reports the value the request carried, so a non-ASCII value
+/// reaches the client through the error envelope too. `vpc-` plus text that is no id makes
+/// the id unreadable, which is what gets the value echoed.
+fn unreadable_id(text: &str) -> String {
+    format!("vpc-{text}")
+}
+
+/// The charset the header declares is the encoding the BYTES are written in: text a caller
+/// stored, and text the service echoes inside a refusal, read back exactly as it was sent.
+///
+/// This is what the parameter is FOR — a client that decodes by the declared charset gets
+/// the caller's own text back, where one guessing a default does not — so the rows are
+/// asserted on the TEXT as well as on the header: every tag key and value round-trips
+/// through a stored resource, every refusal names the value it could not read, and no
+/// response carries the replacement code point a mis-decoded byte becomes.
+#[tokio::test]
+async fn the_declared_charset_is_the_encoding_the_reported_text_is_written_in() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let vpc_id = created_vpc(&router).await;
+
+    let mut tags = vec![param("ResourceId.1", &vpc_id)];
+    for (index, (key, value)) in NON_ASCII_TEXT.iter().enumerate() {
+        tags.push(param(&format!("Tag.{}.Key", index + 1), key));
+        tags.push(param(&format!("Tag.{}.Value", index + 1), value));
+    }
+    let answered = answer(&router, "CreateTags", &tags).await;
+    assert_media_type("non-ASCII tags written", &answered, 200);
+
+    let case = "non-ASCII tags read back";
+    let answered = answer(&router, "DescribeVpcs", &[param("VpcId.1", &vpc_id)]).await;
+    assert_media_type(case, &answered, 200);
+    let reported = super::wire::vpc_tags(case, &answered.body);
+    for (key, value) in NON_ASCII_TEXT {
+        assert!(
+            reported
+                .iter()
+                .any(|(stored, held)| stored == key && held == value),
+            "case {case:?}: expected the tag {key:?}={value:?} back as it was written, got \
+             {reported:?}"
+        );
+    }
+    assert!(
+        !answered.body.contains(REPLACEMENT),
+        "case {case:?}: a body written in the declared charset carries no {REPLACEMENT:?}, \
+         got {}",
+        answered.body
+    );
+
+    for (key, value) in NON_ASCII_TEXT {
+        for text in [key, value] {
+            let id = unreadable_id(text);
+            let case = format!("a refusal naming the unreadable id {id:?}");
+            let answered = answer(&router, "DescribeVpcs", &[param("VpcId.1", &id)]).await;
+            assert_media_type(&case, &answered, 400);
+            let message = error_message(&answered.body);
+            assert!(
+                message.contains(text),
+                "case {case:?}: expected the refusal to name {text:?}, got {message:?}"
+            );
+            assert!(
+                !answered.body.contains(REPLACEMENT),
+                "case {case:?}: a body written in the declared charset carries no \
+                 {REPLACEMENT:?}, got {}",
+                answered.body
+            );
+        }
     }
 }
 
