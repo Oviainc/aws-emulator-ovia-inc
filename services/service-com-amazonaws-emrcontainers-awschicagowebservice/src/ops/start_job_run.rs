@@ -273,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     apply_job_template(
                         template_id,
                         &data,
-                        input.job_template_parameters.as_ref(),
+                        crate::state::supplied(input.job_template_parameters.as_ref()),
                     )
                     .map_err(|message| {
                         StartJobRunErrorModeled::ValidationException(ValidationException {
@@ -284,9 +284,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => {
                 // `jobTemplateParameters` only has meaning as the parameters OF a job
-                // template, so parameters without one are refused rather than quietly
-                // dropped: there is nothing for them to be substituted into.
-                if input.job_template_parameters.is_some() {
+                // template, so a parameter supplied without one is refused rather than
+                // quietly dropped: there is nothing for it to be substituted into. A
+                // member carrying NO parameter supplies nothing to drop, and is the same
+                // request as one that omitted it ([`crate::state::supplied`]), so it is
+                // accepted on the same terms.
+                if crate::state::supplied(input.job_template_parameters.as_ref()).is_some() {
                     return Err(StartJobRunErrorModeled::ValidationException(
                         ValidationException {
                             message: Some(

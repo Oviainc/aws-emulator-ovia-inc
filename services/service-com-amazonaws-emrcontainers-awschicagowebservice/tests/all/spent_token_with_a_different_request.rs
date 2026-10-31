@@ -30,13 +30,17 @@ use crate::virtual_cluster_job_run_loop::{field, text, Emr};
 
 /// One operation under the rule: where its create POSTs, and where what it persisted is
 /// listed, so a refused call can be shown to have persisted NOTHING.
-struct Operation {
+///
+/// `pub(crate)` because the suite beside this one asserts the same request-identity rule —
+/// that two spellings of one request are one request — through the same three paths
+/// ([`crate::empty_collection_member`]).
+pub(crate) struct Operation {
     /// The `POST` path the create is addressed to.
-    create_path: String,
+    pub(crate) create_path: String,
     /// The `GET` path listing what this operation persisted.
-    list_path: String,
+    pub(crate) list_path: String,
     /// The JSON pointer to the array in that listing's answer.
-    list_pointer: &'static str,
+    pub(crate) list_pointer: &'static str,
 }
 
 /// The ids this operation has persisted, in the order its listing reports them.
@@ -103,7 +107,9 @@ async fn assert_conflict_refused(
 
 /// Drive one equivalence row: `equivalent` spells the SAME request as `base`, so it is a
 /// replay — it answers with the first resource and persists nothing new.
-async fn assert_equivalent_replays(
+///
+/// `pub(crate)` for the same reason [`Operation`] is.
+pub(crate) async fn assert_equivalent_replays(
     emr: &Emr,
     operation: &Operation,
     case: &str,

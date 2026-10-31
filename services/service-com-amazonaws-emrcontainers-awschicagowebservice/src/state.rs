@@ -642,18 +642,49 @@ pub fn within_created_bounds(
         && created_after.is_none_or(|bound| created_at_millis > millis_of(bound))
 }
 
+/// A collection a request can carry in a structure member — a map or a list — seen only
+/// as "does it carry an entry", which is all [`supplied`] has to ask of it.
+pub trait RequestCollection {
+    /// Whether this collection carries no entry at all.
+    fn carries_no_entry(&self) -> bool;
+}
+
+impl<V> RequestCollection for HashMap<String, V> {
+    fn carries_no_entry(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl<T> RequestCollection for [T] {
+    fn carries_no_entry(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+/// What a collection sitting in a request MEMBER actually supplies: `Some` only where the
+/// request carried an entry in it.
+///
+/// A collection a request omitted and one it sent EMPTY are the same request — that is
+/// what [`request_fingerprint`] digests alike — so a handler cannot read a meaning into
+/// the mere PRESENCE of such a member: one carrying no entry supplies no value, names no
+/// filter and asks for nothing, so the request has to be answered exactly as the one that
+/// left the member out is. Every branch in this service that asks whether a collection was
+/// supplied asks it HERE, so the two spellings of one request cannot come to mean the same
+/// thing in one operation and different things in another.
+pub fn supplied<C: RequestCollection + ?Sized>(collection: Option<&C>) -> Option<&C> {
+    collection.filter(|collection| !collection.carries_no_entry())
+}
+
 /// The `states` rule every list in this service that carries one applies to a record's
 /// stored state: the record is kept when its state is one of the states the request
 /// listed. A filter the request omitted constrains nothing, and nor does one that lists no
-/// state at all — an empty list names no state to keep out.
+/// state at all — an empty list names no state to keep out ([`supplied`]).
 ///
 /// One rule for every listing that filters by state, beside [`within_created_bounds`], so
 /// an empty list cannot come to mean "keep nothing" in one listing and "keep everything"
 /// in another.
 pub fn within_listed_states(state: &str, states: Option<&[String]>) -> bool {
-    states
-        .filter(|states| !states.is_empty())
-        .is_none_or(|states| states.iter().any(|listed| listed == state))
+    supplied(states).is_none_or(|states| states.iter().any(|listed| listed == state))
 }
 
 /// `arn:aws:emr-containers:{region}:{account}:/virtualclusters/{id}` — the

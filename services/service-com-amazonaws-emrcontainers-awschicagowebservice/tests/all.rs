@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/created_metadata_wire_form.rs"]
 mod created_metadata_wire_form;
+#[path = "all/empty_collection_member.rs"]
+mod empty_collection_member;
 #[path = "all/job_driver_exactly_one.rs"]
 mod job_driver_exactly_one;
 #[path = "all/job_run_outcome.rs"]

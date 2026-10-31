@@ -88,8 +88,10 @@ fn matches_filters(
         return false;
     }
     // `types` is the same, over the endpoint's `type`: an `EndpointType` is a free-form
-    // string in the model, so a row matches exactly rather than by pattern.
-    if let Some(types) = input.types.as_ref().filter(|types| !types.is_empty()) {
+    // string in the model, so a row matches exactly rather than by pattern. A list the
+    // request sent empty names no type to keep out, exactly as an omitted one does
+    // ([`crate::state::supplied`]).
+    if let Some(types) = crate::state::supplied(input.types.as_deref()) {
         if !types.contains(&record.endpoint_type) {
             return false;
         }
