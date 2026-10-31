@@ -194,7 +194,11 @@ fn dangling_bridge_flow_references(emulator: &Emulator) -> Vec<(String, String)>
 
 /// Assert the invariant this whole suite is about: no stored bridge names a flow the store
 /// does not hold.
-fn assert_no_dangling_references(emulator: &Emulator, case: &str) {
+///
+/// `pub(crate)` because the write-path suite
+/// (`crate::flow_delete_and_bridge_source_writes_agree`) asserts the same invariant, so there
+/// is one reading of it for the whole test crate rather than one per suite.
+pub(crate) fn assert_no_dangling_references(emulator: &Emulator, case: &str) {
     let dangling = dangling_bridge_flow_references(emulator);
     assert!(
         dangling.is_empty(),

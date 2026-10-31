@@ -227,3 +227,5 @@ mod required_query_parameters;
 mod gateway_deletion_counts_placed_bridges;
 #[path = "all/entitlement_fee_percent.rs"]
 mod entitlement_fee_percent;
+#[path = "all/flow_delete_and_bridge_source_writes_agree.rs"]
+mod flow_delete_and_bridge_source_writes_agree;
