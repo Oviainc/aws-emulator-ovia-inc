@@ -15,7 +15,10 @@
 //! The data store must have settled into `ACTIVE` first — the model opens this
 //! operation's documentation with "Start importing bulk data into an ACTIVE data store"
 //! — so a store still `CREATING`, or already `DELETING`, is refused with the modeled
-//! `ConflictException` ([`crate::state::Datastore::is_active`]).
+//! `ConflictException` ([`crate::state::Datastore::is_active`]). That refusal governs a
+//! SUBMISSION only: the `clientToken` ledger is consulted first, so a replay of a job
+//! this service already accepted reports that job rather than being refused by a
+//! condition that changed after the first call was answered.
 //!
 //! ---
 //!
@@ -188,20 +191,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // "Start importing bulk data into an ACTIVE data store": a store the clock has
-        // not yet settled — still `CREATING`, or already `DELETING` — cannot take an
-        // import, which is what the modelled `ConflictException` (HTTP 409) reports
-        // ([`crate::state::Datastore::is_active`]).
-        if !datastore_is_active {
-            return Err(StartDICOMImportJobErrorModeled::ConflictException(ConflictException {
-                message: crate::state::DATASTORE_NOT_ACTIVE_MESSAGE.to_string(),
-            })
-            .into());
-        }
-
         // `@idempotencyToken`, scoped to the data store the job runs against: a token
         // already in the ledger names the job it submitted, so the repeat call reports
         // that job's CURRENT status rather than submitting a second one.
+        //
+        // Resolved BEFORE this operation's refusals, exactly as the sibling idempotent
+        // writer [`crate::ops::create_datastore`] resolves its own ledger: a replay
+        // submits nothing, so no precondition on submitting — the store's status, the
+        // per-store job cap — governs it, and a condition that changed after the first
+        // call was answered cannot turn the retry into a failure.
         let token_key = crate::state::client_token_key(
             &region,
             &format!("StartDICOMImportJob/{}", input.datastore_id),
@@ -219,6 +217,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     submitted_at: crate::state::to_date_time(existing.submitted_at),
                 });
             }
+        }
+
+        // "Start importing bulk data into an ACTIVE data store": a store the clock has
+        // not yet settled — still `CREATING`, or already `DELETING` — cannot take an
+        // import, which is what the modelled `ConflictException` (HTTP 409) reports
+        // ([`crate::state::Datastore::is_active`]). This governs a SUBMISSION, which is
+        // all that reaches it now that a replay has already been answered above.
+        if !datastore_is_active {
+            return Err(StartDICOMImportJobErrorModeled::ConflictException(ConflictException {
+                message: crate::state::DATASTORE_NOT_ACTIVE_MESSAGE.to_string(),
+            })
+            .into());
         }
 
         // Bound the memory one caller can make this emulator hold, per data store, so

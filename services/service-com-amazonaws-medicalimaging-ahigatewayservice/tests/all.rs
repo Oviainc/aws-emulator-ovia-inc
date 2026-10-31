@@ -63,6 +63,8 @@ mod image_set_series_attributes;
 mod image_set_tombstone_content;
 #[path = "all/image_set_version_listing.rs"]
 mod image_set_version_listing;
+#[path = "all/import_job_idempotent_replay.rs"]
+mod import_job_idempotent_replay;
 #[path = "all/import_job_listing.rs"]
 mod import_job_listing;
 #[path = "all/list_element_refusal_paths.rs"]
