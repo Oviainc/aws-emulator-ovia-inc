@@ -4,9 +4,13 @@
 //! Enumerates the approval sessions of ONE team, in initiation order, out of
 //! [`crate::state`].
 //!
-//! Every member of a reported entry is read off the [`crate::state::Session`] record
+//! Every member of a reported entry is read off the record the model documents it
+//! against. All but one are the [`crate::state::Session`] record
 //! `StartApprovalTeamBaseline` wrote, so a listed session can never disagree with what
-//! `GetSession` reports for the same ARN.
+//! `GetSession` reports for the same ARN. The exception is `Description`: this shape's
+//! member is documented "Description for the team.", where `GetSession`'s is
+//! "Description for the session.", so it carries the description of the team the listing
+//! is scoped to — the value `GetApprovalTeam` and `ListApprovalTeams` report.
 //!
 //! `ApprovalTeamArn` names the team whose sessions are asked for, so this read is
 //! ARN-addressed like every other of this service: an ARN outside the caller's account is
@@ -242,15 +246,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.materialize_due(::std::time::SystemTime::now());
 
-        if state.team(&input.approval_team_arn).is_none() {
-            // The one message this service answers every resource lookup that resolves
-            // to nothing with: a service constant that names neither the operation nor
-            // the ARN asked for (`crate::state::resource_not_found`).
-            return Err(ListSessionsErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(),
-            )
-            .into());
-        }
+        // Resolving the team here serves two purposes: a team this store does not hold
+        // is not found, and the team record carries the description a listed entry
+        // reports (see `entry`).
+        let team_description = match state.team(&input.approval_team_arn) {
+            Some(team) => team.description.clone(),
+            None => {
+                // The one message this service answers every resource lookup that
+                // resolves to nothing with: a service constant that names neither the
+                // operation nor the ARN asked for (`crate::state::resource_not_found`).
+                return Err(ListSessionsErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(),
+                )
+                .into());
+            }
+        };
 
         // The sessions this request asks for, in initiation order, cut into a page by
         // the one paging rule this service's record listings share — which refuses a
@@ -274,15 +284,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(ListSessionsErrorModeled::ValidationException)?;
 
         Ok(ListSessionsOutput {
-            sessions: Some(page.records.iter().copied().map(entry).collect()),
+            sessions: Some(
+                page.records
+                    .iter()
+                    .copied()
+                    .map(|session| entry(session, &team_description))
+                    .collect(),
+            ),
             next_token: page.next_token,
         })
     }
 }
 
 /// One `ListSessions` entry for a stored session, read member by member off the record
-/// `GetSession` reports from, so the two reads cannot disagree.
-fn entry(session: &crate::state::Session) -> ListSessionsResponseSession {
+/// `GetSession` reports from, so the two reads cannot disagree — except for the one
+/// member this shape documents against ANOTHER record: `Description`, which the model
+/// states is the approval team's, passed in as `team_description`.
+fn entry(
+    session: &crate::state::Session,
+    team_description: &str,
+) -> ListSessionsResponseSession {
     ListSessionsResponseSession {
         session_arn: Some(session.arn.clone()),
         approval_team_name: Some(session.approval_team_name.clone()),
@@ -292,9 +313,13 @@ fn entry(session: &crate::state::Session) -> ListSessionsResponseSession {
         completion_time: session
             .completion_time
             .map(::aws_smithy_types::DateTime::from),
-        // `Description` is `length(min: 1, …)`, so a session that recorded none reports
-        // none rather than an empty string.
-        description: session.description.clone(),
+        // `ListSessionsResponseSession$Description` is documented "Description for the
+        // team.", NOT "Description for the session." like `GetSessionResponse$Description`
+        // is: this member carries the description of the team whose sessions are listed —
+        // reported exactly as the two team reads report it (`GetApprovalTeam`,
+        // `ListApprovalTeams`). A team always has one: it is required when the team is
+        // created and `Description` is `length(min: 1, …)`.
+        description: Some(team_description.to_string()),
         // The action the session approves is fixed by what it was started FOR
         // (`crate::state::SessionKind`), not by anything in this request.
         action_name: Some(session.kind.action_name().to_string()),

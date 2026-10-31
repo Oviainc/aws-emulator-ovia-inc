@@ -77,6 +77,9 @@ fn policy_arn() -> String {
     "arn:aws:mpa:::aws:policy/IdentityCenter/MPAApprovalTeamPolicy/$DEFAULT".to_string()
 }
 
+/// The `Description` a team these tables create carries when the caller names none.
+pub(crate) const TABLE_TEAM_DESCRIPTION: &str = "session table";
+
 /// `POST /approval-teams` — `CreateApprovalTeam`.
 async fn create_team(
     harness: &Harness,
@@ -84,9 +87,28 @@ async fn create_team(
     approvers: usize,
     min_approvals: i64,
 ) -> (u16, Value) {
+    create_described_team(
+        harness,
+        name,
+        approvers,
+        min_approvals,
+        TABLE_TEAM_DESCRIPTION,
+    )
+    .await
+}
+
+/// `POST /approval-teams` — `CreateApprovalTeam`, with the team `Description` the caller
+/// names (`CreateApprovalTeam$Description` is `@required`).
+pub(crate) async fn create_described_team(
+    harness: &Harness,
+    name: &str,
+    approvers: usize,
+    min_approvals: i64,
+    description: &str,
+) -> (u16, Value) {
     let body = json!({
         "Name": name,
-        "Description": "session table",
+        "Description": description,
         "ApprovalStrategy": { "MofN": { "MinApprovalsRequired": min_approvals } },
         "Approvers": (1..=approvers)
             .map(approver)
@@ -225,7 +247,26 @@ pub(crate) async fn active_team(
     approvers: usize,
     min_approvals: i64,
 ) -> String {
-    let (status, created) = create_team(harness, name, approvers, min_approvals).await;
+    active_described_team(
+        harness,
+        name,
+        approvers,
+        min_approvals,
+        TABLE_TEAM_DESCRIPTION,
+    )
+    .await
+}
+
+/// A team made ACTIVE, carrying the `Description` the caller names.
+pub(crate) async fn active_described_team(
+    harness: &Harness,
+    name: &str,
+    approvers: usize,
+    min_approvals: i64,
+    description: &str,
+) -> String {
+    let (status, created) =
+        create_described_team(harness, name, approvers, min_approvals, description).await;
     assert_eq!(status, 200, "case {name}: create returned {created:?}");
     wait_for_the_clock(state::INVITATION_RESPONSE_DELAY);
     let arn = text(&created, "Arn");

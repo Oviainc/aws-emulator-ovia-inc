@@ -95,6 +95,8 @@ mod session_cancellation;
 mod session_filter_value_bound;
 #[path = "all/session_listing.rs"]
 mod session_listing;
+#[path = "all/session_listing_team_description.rs"]
+mod session_listing_team_description;
 #[path = "all/session_store_ceiling.rs"]
 mod session_store_ceiling;
 #[path = "all/state_roundtrip.rs"]

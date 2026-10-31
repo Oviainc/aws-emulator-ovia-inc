@@ -59,7 +59,7 @@ const DEFAULT_PAGE_SIZE: i64 = 20;
 
 /// `POST /approval-teams/{ApprovalTeamArn}/sessions/?List` — `ListSessions`. Every other
 /// input member is bound to the body.
-async fn list_sessions(harness: &Harness, team_arn: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn list_sessions(harness: &Harness, team_arn: &str, body: Value) -> (u16, Value) {
     harness
         .call(
             "POST",
@@ -81,7 +81,7 @@ fn listed_arns(page: &Value) -> Vec<String> {
 }
 
 /// The `Sessions` a page reports.
-fn entries(page: &Value) -> Vec<Value> {
+pub(crate) fn entries(page: &Value) -> Vec<Value> {
     page.get("Sessions")
         .and_then(Value::as_array)
         .cloned()
@@ -118,7 +118,12 @@ fn set_initiation_time(harness: &Harness, session_arn: &str, initiated: SystemTi
 /// baseline session per approver and a listing fixture needs more sessions on one team
 /// than a team may have approvers. That is deliberately MORE outstanding sessions than the
 /// API can mint for one team: it is a paging fixture, not the shape the service supports.
-async fn start_sessions(harness: &Harness, team_arn: &str, count: usize, case: &str) -> Vec<String> {
+pub(crate) async fn start_sessions(
+    harness: &Harness,
+    team_arn: &str,
+    count: usize,
+    case: &str,
+) -> Vec<String> {
     let mut arns = Vec::with_capacity(count);
     if count == 0 {
         return arns;
@@ -178,7 +183,7 @@ fn page_cases() -> Vec<PageCase> {
 
 /// Page through a team's sessions with `page_size`, returning every entry in the order
 /// the pages reported them.
-async fn page_through(
+pub(crate) async fn page_through(
     harness: &Harness,
     team_arn: &str,
     page_size: Option<i64>,
