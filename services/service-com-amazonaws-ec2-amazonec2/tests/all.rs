@@ -24,6 +24,13 @@ mod prefix_lists;
 // inserts its lines.
 #[path = "all/describe_addresses_attribute.rs"]
 mod describe_addresses_attribute;
+// What `CancelConversionTask` cancels — the form it judges a conversion task id by, the
+// states that admit a cancel, the `cancelling` -> `cancelled` move the clock owes an
+// admitted one, and what `DryRun` answers. Declared beside `prefix_lists` for the reason the
+// note above gives: the sorted neighbourhood and the tail of this file are where every new
+// ec2 suite inserts its lines.
+#[path = "all/conversion_task_cancellation.rs"]
+mod conversion_task_cancellation;
 // The two forms an instance id is read in before any lookup, and the two answers a value
 // inside and outside them gets, across a describe, a password read and a mutation. Declared
 // beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood and

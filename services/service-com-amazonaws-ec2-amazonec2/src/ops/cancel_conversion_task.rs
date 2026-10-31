@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelConversionTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelConversionTask`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: cancels the conversion task the request names in [`crate::state`]. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelConversionTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Cancels an ACTIVE conversion task … If the conversion is complete or is in the process
+//! of transferring the final disk image, the command fails and returns an exception"
+//! (`CancelConversionTask`): a task that is not converting any more has nothing left to
+//! cancel, so it is refused `IncorrectState` naming the state it IS in, and only an `active`
+//! task is cancelled. A cancel that is admitted puts the task into the non-terminal
+//! `cancelling` state and the clock owes it `cancelled`
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::start_conversion_task_cancellation`]), so
+//! a caller reading straight after the call still sees the task working through it.
+//!
+//! `ConversionTaskId` carries no modelled pattern, so the id form is the one the operations
+//! that MINT a conversion task id use — `import-i-<hex>` for the import of an instance and
+//! `import-vol-<hex>` for the import of a volume, the two kinds this operation documents
+//! ("the task can be the import of an instance or volume") — read through the crate's one
+//! reader of that form ([`crate::state::conversion_task_id_is_well_formed`]). A value
+//! outside both forms is no conversion task id at all, so it is refused
+//! [`crate::state::invalid_conversion_task_id_format`] BEFORE any lookup, and only an id EC2
+//! could have issued that resolves to nothing is answered
+//! [`crate::state::invalid_conversion_task_id_not_found`] — both under
+//! [`crate::state::INVALID_CONVERSION_TASK_ID`], the code this service answers for a
+//! conversion task id it cannot resolve.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +166,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelConversionTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelConversionTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelConversionTask"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CONVERSION_TASK_STATE_ACTIVE, CONVERSION_TASK_STATE_CANCELLING,
+            MAX_IMPORT_TASK_CANCEL_REASON_CHARS, conversion_task_id_is_well_formed,
+            dry_run_operation, incorrect_state_of, invalid_conversion_task_id_format,
+            invalid_conversion_task_id_not_found, invalid_parameter_value, missing_parameter,
+            require_service_state,
+        };
+
+        // A conversion task carries no Region member of its own (it has no ARN and the zone
+        // it imports into is the task's, not the request's), so nothing here depends on the
+        // Region the request was signed for.
+        let _ = ctx;
+
+        let conversion_task_id = input.conversion_task_id.as_str();
+        // "The ID of the conversion task" is `@required` AND `@clientOptional`, so a request
+        // that sends the field empty — which an ec2Query body cannot tell from absent —
+        // reaches this handler rather than the boundary's refusal, and names no task to
+        // cancel. EC2 answers that with `MissingParameter`, which is a different claim from
+        // "no such task", and names the member in its own casing where the refusal of a
+        // value outside the id form names the parameter
+        // ([`crate::state::CONVERSION_TASK_ID_PARAMETER`]).
+        if conversion_task_id.is_empty() {
+            return Err(missing_parameter(
+                "The request must contain the parameter conversionTaskId",
+            ));
+        }
+
+        // An id that is not one EC2 issues for a conversion task of either kind names no
+        // resource to look up, so the FORM is judged before the store is reached.
+        if !conversion_task_id_is_well_formed(conversion_task_id) {
+            return Err(invalid_conversion_task_id_format(conversion_task_id));
+        }
+
+        // The reason is retained on the task it cancels for the process's lifetime, and the
+        // model bounds its length nowhere, so the bound is enforced here — before anything
+        // is read or written.
+        if input
+            .reason_message
+            .as_ref()
+            .is_some_and(|reason| reason.chars().count() > MAX_IMPORT_TASK_CANCEL_REASON_CHARS)
+        {
+            return Err(invalid_parameter_value(format!(
+                "reasonMessage accepts at most {MAX_IMPORT_TASK_CANCEL_REASON_CHARS} characters"
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let now = ::std::time::Instant::now();
+        // Every clock-owed move is applied before the task's state is read, so the cancel is
+        // judged against the state the caller would be shown: a cancellation already working
+        // through has reached `cancelled` here once its own instant has passed. It was owed
+        // at this instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        let Some(current_state) = store.conversion_task_state(conversion_task_id) else {
+            return Err(invalid_conversion_task_id_not_found(conversion_task_id));
+        };
+        // Only a task that is still converting can be cancelled: one already cancelling,
+        // cancelled or completed is refused with the state it is in, worded the one way this
+        // crate words a refusal for the state of the resource the request names
+        // ([`crate::state::incorrect_state_of`]).
+        if current_state != CONVERSION_TASK_STATE_ACTIVE {
+            return Err(incorrect_state_of(
+                "Conversion task",
+                conversion_task_id,
+                &current_state,
+            ));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        store.start_conversion_task_cancellation(
+            conversion_task_id,
+            now,
+            input.reason_message.as_deref(),
+        );
+        // Read the state back OUT of the store, so a success means the state a later report
+        // of this task will carry rather than what this handler meant to write.
+        let state_now = store.conversion_task_state(conversion_task_id);
+        if state_now.as_deref() != Some(CONVERSION_TASK_STATE_CANCELLING) {
+            return Err(Scaffolded::internal_error(format!(
+                "conversion task '{conversion_task_id}' was not cancelled by this request"
+            )));
+        }
+
+        // The operation's modelled output shape is `Unit`, so a success carries nothing
+        // beyond the status and the envelope's own success flag.
+        Ok(CancelConversionTaskOutput)
     }
 }

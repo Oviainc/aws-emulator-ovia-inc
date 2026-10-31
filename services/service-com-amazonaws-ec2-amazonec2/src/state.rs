@@ -1484,6 +1484,18 @@
 //! [`ComAmazonawsEc2Amazonec2State::import_task_deleted_at`] — neither modelled task shape
 //! carrying a member for it.
 //!
+//! [`ComAmazonawsEc2Amazonec2State::conversion_tasks`] holds the CONVERSION tasks of the
+//! older VM import path — "the import of an instance or volume"
+//! (`CancelConversionTask`) — as the modelled [`ConversionTask`] shape
+//! `DescribeConversionTasks` reports, keyed by `ConversionTaskId`. Which resource a task
+//! converts is told by which detail member it carries, and that fixes the prefix of its
+//! id ([`IMPORT_INSTANCE_CONVERSION_TASK_ID_PREFIX`],
+//! [`IMPORT_VOLUME_CONVERSION_TASK_ID_PREFIX`]). `CancelConversionTask` reads the state it
+//! acts on through [`ComAmazonawsEc2Amazonec2State::conversion_task_state`] and moves it
+//! through [`ComAmazonawsEc2Amazonec2State::start_conversion_task_cancellation`], with the
+//! instant the clock owes a cancelled task its `cancelling` -> `cancelled` move in
+//! [`ComAmazonawsEc2Amazonec2State::conversion_task_cancelled_at`].
+//!
 //! ## Root volume replacement tasks
 //!
 //! [`ComAmazonawsEc2Amazonec2State::replace_root_volume_tasks`] holds the root volume
@@ -4139,6 +4151,22 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// ([`Self::delete_due_cancelled_import_tasks`]), so this holds exactly the
     /// cancellations still owed.
     pub import_task_deleted_at: BTreeMap<String, Instant>,
+    /// Every conversion task the account has started, by `ConversionTaskId`: the import of
+    /// an instance or of a volume, stored as the modelled [`ConversionTask`] shape
+    /// `DescribeConversionTasks` and both import operations report, so a member a writer
+    /// sets round-trips without a field-by-field copy that can silently drop one. Ordered by
+    /// id, the same stable order the other stores are kept in.
+    pub conversion_tasks: BTreeMap<String, ConversionTask>,
+    /// When a cancelled conversion task's `cancelling` -> `cancelled` move falls due, by
+    /// `ConversionTaskId` — the conversion-task counterpart of
+    /// [`Self::import_task_deleted_at`], and beside the store for the same reason: a task is
+    /// stored as the modelled shape its describe reports, and that shape carries no member
+    /// for the instant. Monotonic ([`Instant`]), because it is only ever compared against
+    /// the clock and never reported, so a wall-clock adjustment cannot move a task back to
+    /// `cancelling`. An entry is dropped as soon as the move has been applied
+    /// ([`Self::cancel_due_conversion_tasks`]), so this holds exactly the cancellations
+    /// still owed.
+    pub conversion_task_cancelled_at: BTreeMap<String, Instant>,
     /// Every NAT gateway the account holds, by `NatGatewayId`, as the modelled
     /// [`NatGateway`] shape itself — so a member a writer sets round-trips through
     /// `DescribeNatGateways` without a field-by-field copy that can silently drop one. The
@@ -4589,6 +4617,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // A fresh account has cancelled no import task, so the clock owes none of them
             // its `deleted` state.
             import_task_deleted_at: BTreeMap::new(),
+            // A fresh account has started no conversion task, so it has none to cancel and
+            // the clock owes none of them its `cancelled` state.
+            conversion_tasks: BTreeMap::new(),
+            conversion_task_cancelled_at: BTreeMap::new(),
             nat_gateways: BTreeMap::new(),
             nat_gateway_address_transitions: BTreeMap::new(),
             capacity_reservation_fleets: BTreeMap::new(),
@@ -8896,6 +8928,10 @@ impl ComAmazonawsEc2Amazonec2State {
         // never be owed on one task at once, and applying the completions first means a
         // cancelled task's `deleted` is written over nothing.
         self.delete_due_cancelled_import_tasks(now);
+        // The same move for a VM import CONVERSION task: a cancel left it `cancelling` and
+        // the clock owes it `cancelled`, which was owed at that instant whether or not
+        // anybody called again.
+        self.cancel_due_conversion_tasks(now);
         self.materialize_due_capacity_reservation_fleet_moves(now);
         self.materialize_due_spot_instance_requests(now);
         // AFTER the Spot Instance requests a Spot Fleet placed: the capacity a fleet reports
@@ -22114,6 +22150,10 @@ impl ComAmazonawsEc2Amazonec2State {
 /// publishes no `@length`, and the text is retained on the stored task for the process's
 /// lifetime, so a reason past the width EC2 gives its other free-text members is refused
 /// rather than stored.
+///
+/// ONE bound for every reason a cancel of a VM import task keeps, whichever member carries
+/// it: `CancelConversionRequest$ReasonMessage` is the same unbounded free text on the same
+/// kind of stored record, so it is held to the same width rather than to a second number.
 pub const MAX_IMPORT_TASK_CANCEL_REASON_CHARS: usize = 255;
 
 /// Refuse a request naming an import task id EC2 could have issued that this account holds
@@ -22124,6 +22164,11 @@ pub const MAX_IMPORT_TASK_CANCEL_REASON_CHARS: usize = 255;
 /// for an id that is not an import task id at all: an operation acting on ONE named task
 /// cannot act on a task that is not there, where an import-task describe reports "a list of
 /// zero or more" tasks and so answers such an id with no row instead of an error.
+///
+/// ONE wording for every task of the VM import family a request names and this account does
+/// not hold, whichever operation names it: the CONVERSION tasks of
+/// [`ComAmazonawsEc2Amazonec2State::conversion_tasks`] are answered through it too, whose
+/// own malformed half is [`invalid_conversion_task_id_format`].
 pub fn invalid_conversion_task_id_not_found<E>(import_task_id: &str) -> Scaffolded<E> {
     id_not_found(
         INVALID_CONVERSION_TASK_ID,
@@ -22241,6 +22286,377 @@ impl ComAmazonawsEc2Amazonec2State {
             // The move is applied once; nothing is owed on this task any more.
             false
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VM Import/Export conversion tasks
+// ---------------------------------------------------------------------------
+//
+// A conversion task is the record of ONE import of a whole machine or of a bare disk —
+// "the task can be the import of an instance or volume" (`CancelConversionTask`) — which
+// `ImportInstance` and `ImportVolume` start and `DescribeConversionTasks` reports. It is
+// stored as the modelled `ConversionTask` shape
+// ([`ComAmazonawsEc2Amazonec2State::conversion_tasks`]) for the same reason an import
+// snapshot task is stored as an `ImportSnapshotTask`: every reader of a task reports what
+// a writer stored, so no two of them can disagree about one task.
+//
+// WHICH resource a task converts is told by which detail member it carries
+// (`ConversionTask$ImportInstance` or `ConversionTask$ImportVolume`), and that is also
+// what fixes the prefix of its id. Its state is its own `ConversionTask$State`, out of the
+// closed `ConversionTaskState` catalog, which is the only place any reader takes it from —
+// so the cancel reads and writes THAT member rather than a second copy of it.
+
+// The modelled shapes this slice reads, named HERE rather than in the module's shared
+// `use crate::ops::types::{..}` list at the top, for the reason the import image task
+// store gives where it names its own.
+use crate::ops::types::{
+    ConversionTask, DiskImageDescription, DiskImageVolumeDescription, ImportInstanceTaskDetails,
+    ImportVolumeTaskDetails,
+};
+
+/// The id prefix of the conversion task an INSTANCE import creates.
+///
+/// `ConversionTaskId` publishes no `@pattern`
+/// (`smithy_query(query="shape",shape="ConversionTaskId")`), so the form is the one VM
+/// Import/Export issues: the kind of resource being imported is part of the id — `import-i`
+/// here and [`IMPORT_VOLUME_CONVERSION_TASK_ID_PREFIX`] for a volume — in front of the 8-
+/// or 17-hex-digit suffix every EC2 resource id takes ([`prefixed_id_is_well_formed`]).
+/// `import-` and a suffix alone is therefore NOT a conversion task id, which is what the
+/// recorded refusal of one shows.
+pub const IMPORT_INSTANCE_CONVERSION_TASK_ID_PREFIX: &str = "import-i";
+
+/// The id prefix of the conversion task a VOLUME import creates — the volume counterpart of
+/// [`IMPORT_INSTANCE_CONVERSION_TASK_ID_PREFIX`], whose documentation gives the form.
+pub const IMPORT_VOLUME_CONVERSION_TASK_ID_PREFIX: &str = "import-vol";
+
+/// Every prefix a conversion task id is minted under, which is also the catalog an id from
+/// a request is read against: the ONE place the two kinds are enumerated, so a kind added
+/// to the store is recognised by every reader of an id at once.
+pub const CONVERSION_TASK_ID_PREFIXES: [&str; 2] = [
+    IMPORT_INSTANCE_CONVERSION_TASK_ID_PREFIX,
+    IMPORT_VOLUME_CONVERSION_TASK_ID_PREFIX,
+];
+
+/// The name a refusal of a conversion task id calls that parameter by.
+///
+/// EC2 names it in the hyphenated form rather than in the member's own casing, which is
+/// what the recorded refusal of a value outside the id form carries — the same service
+/// that spells the member `conversionTaskId` where it reports a parameter MISSING.
+pub const CONVERSION_TASK_ID_PARAMETER: &str = "conversion-task-id";
+
+/// The state of a conversion task whose import is still running: the `ConversionTaskState`
+/// enum's `active` member — this and the three below are that enum's whole value list
+/// (`smithy_query(query="shape",shape="ConversionTaskState")`).
+pub const CONVERSION_TASK_STATE_ACTIVE: &str = "active";
+
+/// The state of a conversion task a cancel is working through: that enum's `cancelling`.
+pub const CONVERSION_TASK_STATE_CANCELLING: &str = "cancelling";
+
+/// The state of a conversion task a cancel has finished with: that enum's `cancelled`.
+pub const CONVERSION_TASK_STATE_CANCELLED: &str = "cancelled";
+
+/// The state of a conversion task whose import finished: that enum's `completed`.
+pub const CONVERSION_TASK_STATE_COMPLETED: &str = "completed";
+
+/// Every state a conversion task reports, in the order the `ConversionTaskState` enum
+/// declares them.
+pub const CONVERSION_TASK_STATES: [&str; 4] = [
+    CONVERSION_TASK_STATE_ACTIVE,
+    CONVERSION_TASK_STATE_CANCELLING,
+    CONVERSION_TASK_STATE_CANCELLED,
+    CONVERSION_TASK_STATE_COMPLETED,
+];
+
+/// The most conversion tasks this in-memory store holds at once.
+///
+/// A capacity bound in the same style as [`MAX_STORED_IMPORT_SNAPSHOT_TASKS`], not an AWS
+/// quota: each task is a record in this process's memory, so the number a caller can create
+/// has to be finite. [`ComAmazonawsEc2Amazonec2State::has_conversion_task_capacity`] is the
+/// predicate a writer asks first, and
+/// [`ComAmazonawsEc2Amazonec2State::insert_conversion_task`] refuses past it so no path can
+/// grow the store without bound even if a writer forgets to ask.
+pub const MAX_STORED_CONVERSION_TASKS: usize = 1_000;
+
+/// Which resource a conversion task converts its disk image into, with the progress of that
+/// conversion as the model shapes it.
+///
+/// A task carries exactly one of the two detail members, so the writer supplies one of these
+/// rather than a pair of options that could be both or neither.
+#[derive(Debug, Clone)]
+pub enum ConversionTaskDetail {
+    /// A whole machine, as `ImportInstance` imports one:
+    /// `ConversionTask$ImportInstance`.
+    Instance(ImportInstanceTaskDetails),
+    /// A bare disk, as `ImportVolume` imports one: `ConversionTask$ImportVolume`.
+    Volume(ImportVolumeTaskDetails),
+}
+
+impl ConversionTaskDetail {
+    /// The id prefix a task carrying this detail is minted under — the ONE place the kind of
+    /// import and the id form are tied together.
+    pub fn id_prefix(&self) -> &'static str {
+        match self {
+            Self::Instance(_) => IMPORT_INSTANCE_CONVERSION_TASK_ID_PREFIX,
+            Self::Volume(_) => IMPORT_VOLUME_CONVERSION_TASK_ID_PREFIX,
+        }
+    }
+}
+
+/// What a writer of a conversion task supplies: everything the task carries that comes from
+/// the REQUEST, with the task's own id left to
+/// [`ComAmazonawsEc2Amazonec2State::insert_conversion_task`] to mint and its state to that
+/// writer to set, a task AWS hands back being `active`.
+#[derive(Debug, Clone)]
+pub struct ConversionTaskSpec {
+    /// The resource being imported and how far that has got.
+    pub detail: ConversionTaskDetail,
+    /// "The time when the task expires. If the upload isn't complete before the expiration
+    /// time, we automatically cancel the task" (`ConversionTask$ExpirationTime`) — a
+    /// STRING on the modelled shape, so the operation that mints a task renders it and this
+    /// store keeps what it rendered.
+    pub expiration_time: Option<String>,
+    /// "Any tags assigned to the task" (`ConversionTask$Tags`).
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored conversion task holds: the descriptions, the disk
+/// image's checksum, format and manifest URL, the ids of the resources being produced, the
+/// expiration it reports, its status message and its tags. Everything else on the record —
+/// the sizes, the byte counts and the states — is derived or drawn from a closed catalog, so
+/// it is fixed-size.
+///
+/// Each volume of an instance import is charged [`IMPORT_TASK_ELEMENT_OVERHEAD_BYTES`]
+/// beyond the strings it carries, for the reason [`import_image_task_payload_bytes`] charges
+/// a disk of an import image task that way: a record of empty strings is still a record.
+pub fn conversion_task_payload_bytes(task: &ConversionTask) -> usize {
+    let text = |value: Option<&String>| value.map_or(0, String::len);
+    let image_bytes = |image: Option<&DiskImageDescription>| {
+        image.map_or(0, |image| {
+            text(image.checksum.as_ref())
+                .saturating_add(text(image.format.as_ref()))
+                .saturating_add(text(image.import_manifest_url.as_ref()))
+        })
+    };
+    let volume_bytes = |volume: Option<&DiskImageVolumeDescription>| {
+        volume.map_or(0, |volume| text(volume.id.as_ref()))
+    };
+    let instance_bytes = task.import_instance.as_ref().map_or(0, |detail| {
+        let volumes: usize = detail
+            .volumes
+            .iter()
+            .flatten()
+            .map(|item| {
+                IMPORT_TASK_ELEMENT_OVERHEAD_BYTES
+                    .saturating_add(text(item.availability_zone.as_ref()))
+                    .saturating_add(text(item.availability_zone_id.as_ref()))
+                    .saturating_add(text(item.description.as_ref()))
+                    .saturating_add(text(item.status.as_ref()))
+                    .saturating_add(text(item.status_message.as_ref()))
+                    .saturating_add(image_bytes(item.image.as_ref()))
+                    .saturating_add(volume_bytes(item.volume.as_ref()))
+            })
+            .sum();
+        text(detail.description.as_ref())
+            .saturating_add(text(detail.instance_id.as_ref()))
+            .saturating_add(text(detail.platform.as_ref()))
+            .saturating_add(volumes)
+    });
+    let volume_import_bytes = task.import_volume.as_ref().map_or(0, |detail| {
+        text(detail.availability_zone.as_ref())
+            .saturating_add(text(detail.availability_zone_id.as_ref()))
+            .saturating_add(text(detail.description.as_ref()))
+            .saturating_add(image_bytes(detail.image.as_ref()))
+            .saturating_add(volume_bytes(detail.volume.as_ref()))
+    });
+    tag_list_bytes(task.tags.as_deref().unwrap_or_default())
+        .saturating_add(IMPORT_TASK_ELEMENT_OVERHEAD_BYTES)
+        .saturating_add(text(task.expiration_time.as_ref()))
+        .saturating_add(text(task.status_message.as_ref()))
+        .saturating_add(instance_bytes)
+        .saturating_add(volume_import_bytes)
+}
+
+/// Whether `id` is a well-formed conversion task id: an id of either kind
+/// [`CONVERSION_TASK_ID_PREFIXES`] names, read through the crate's one reader of an EC2
+/// resource id's form.
+///
+/// The ONE reader of that form, so every operation naming a conversion task judges an id
+/// the same way.
+pub fn conversion_task_id_is_well_formed(id: &str) -> bool {
+    CONVERSION_TASK_ID_PREFIXES
+        .iter()
+        .any(|prefix| prefixed_id_is_well_formed(prefix, id))
+}
+
+/// The sentence EC2 refuses a parameter whose value it cannot read as the format that
+/// parameter takes with: the parameter's own name, then the offending value from the REQUEST
+/// in ROUND brackets.
+///
+/// A second template beside [`invalid_id_message`] because the service words the two
+/// differently, and this is the one its recorded refusal of a conversion task id carries.
+/// Only the first [`MAX_ECHOED_RESOURCE_ID_CHARS`] characters of the value are named, the
+/// same bound every refusal that quotes a caller's value holds to.
+pub fn invalid_parameter_format_message(parameter: &str, value: &str) -> String {
+    format!(
+        "Parameter {parameter} ({}) has an invalid format.",
+        echoed_resource_id(value)
+    )
+}
+
+/// Refuse a request whose conversion task id is not one EC2 could have issued: HTTP 400
+/// [`INVALID_CONVERSION_TASK_ID`], with the format wording above.
+///
+/// The counterpart of [`invalid_conversion_task_id_not_found`], which answers the same code
+/// for an id of the right form that names no task: the service asks "is this an id of this
+/// kind" before "is there such a task", so a value outside the form is never reported as a
+/// task that does not exist.
+pub fn invalid_conversion_task_id_format<E>(conversion_task_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CONVERSION_TASK_ID,
+        400,
+        invalid_parameter_format_message(CONVERSION_TASK_ID_PARAMETER, conversion_task_id),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another conversion task fits inside the store's ceiling
+    /// ([`MAX_STORED_CONVERSION_TASKS`]).
+    ///
+    /// The same contract as [`Self::has_import_snapshot_task_capacity`]: a writer asks first
+    /// and refuses rather than growing the store past its ceiling.
+    pub fn has_conversion_task_capacity(&self) -> bool {
+        self.conversion_tasks.len() < MAX_STORED_CONVERSION_TASKS
+    }
+
+    /// Store a conversion task, and answer the `ConversionTaskId` it was given — or `None`
+    /// when the store already holds [`MAX_STORED_CONVERSION_TASKS`] of them, in which case
+    /// NOTHING is stored and no bytes are charged.
+    ///
+    /// The ceiling is enforced here as well as asked about through
+    /// [`Self::has_conversion_task_capacity`], for the reason
+    /// [`Self::insert_import_snapshot_task`] enforces its own: the count is the only thing
+    /// bounding this store's growth.
+    ///
+    /// The id is minted here rather than taken from the caller, so a task never shares an id
+    /// with another resource of this store, and its prefix comes from the detail the spec
+    /// carries ([`ConversionTaskDetail::id_prefix`]) — the kind of import being part of a
+    /// conversion task id. The state is [`CONVERSION_TASK_STATE_ACTIVE`], the state a task
+    /// AWS hands back is in: "cancels an ACTIVE conversion task" (`CancelConversionTask`) is
+    /// what there is to cancel. The caller-chosen bytes are charged against the store's byte
+    /// budget HERE rather than by each writer, the way [`Self::insert_import_snapshot_task`]
+    /// charges a snapshot import's.
+    pub fn insert_conversion_task(&mut self, spec: ConversionTaskSpec) -> Option<String> {
+        if !self.has_conversion_task_capacity() {
+            return None;
+        }
+        let conversion_task_id = self.next_id(spec.detail.id_prefix());
+        let (import_instance, import_volume) = match spec.detail {
+            ConversionTaskDetail::Instance(detail) => (Some(detail), None),
+            ConversionTaskDetail::Volume(detail) => (None, Some(detail)),
+        };
+        let task = ConversionTask {
+            conversion_task_id: Some(conversion_task_id.clone()),
+            expiration_time: spec.expiration_time,
+            import_instance,
+            import_volume,
+            state: Some(CONVERSION_TASK_STATE_ACTIVE.to_string()),
+            // Nothing has gone wrong with an import that has just started, and
+            // `StatusMessage` is "the status message related to the conversion task", so
+            // there is none to report until something changes it.
+            status_message: None,
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(conversion_task_payload_bytes(&task));
+        self.conversion_tasks
+            .insert(conversion_task_id.clone(), task);
+        Some(conversion_task_id)
+    }
+
+    /// The state the conversion task `conversion_task_id` reports, or `None` when this
+    /// account holds no conversion task under that id.
+    ///
+    /// The state is the task's own `ConversionTask$State`. A stored task carrying none at
+    /// all reports none (the empty string), which is no state of
+    /// [`CONVERSION_TASK_STATES`] and so admits no cancel — every writer of a task sets one.
+    pub fn conversion_task_state(&self, conversion_task_id: &str) -> Option<String> {
+        let task = self.conversion_tasks.get(conversion_task_id)?;
+        Some(task.state.clone().unwrap_or_default())
+    }
+
+    /// Start the cancellation of the conversion task `conversion_task_id`, answering whether
+    /// this account holds one under that id — it does nothing at all when it does not.
+    ///
+    /// The task moves to [`CONVERSION_TASK_STATE_CANCELLING`] now and the clock owes it
+    /// [`CONVERSION_TASK_STATE_CANCELLED`] one [`TRANSITION_DELAY`] later
+    /// ([`Self::cancel_due_conversion_tasks`]), so a caller reading straight after the
+    /// cancel still sees the task working through it. `reason` — "the reason for canceling
+    /// the conversion task" (`CancelConversionRequest$ReasonMessage`) — is written onto
+    /// `StatusMessage`, the member the task carries for "the status message related to the
+    /// conversion task", so a later report says why the task ended instead of dropping it;
+    /// its bytes are caller-chosen text on a stored record, so they are charged against the
+    /// store's byte budget the way a tag write is, and the message it replaces is given no
+    /// refund, because [`conversion_task_payload_bytes`] charges a writer for the one it
+    /// stored.
+    ///
+    /// Each volume of an instance import stops where the task did: its
+    /// `ImportInstanceVolumeDetailItem$Status` is "the status of the import of this
+    /// particular disk image", which is this import, the same way a disk of an import image
+    /// task follows that task ([`Self::start_import_task_cancellation`]).
+    pub fn start_conversion_task_cancellation(
+        &mut self,
+        conversion_task_id: &str,
+        now: Instant,
+        reason: Option<&str>,
+    ) -> bool {
+        let message = reason.map(str::to_string);
+        let Some(task) = self.conversion_tasks.get_mut(conversion_task_id) else {
+            return false;
+        };
+        task.state = Some(CONVERSION_TASK_STATE_CANCELLING.to_string());
+        task.status_message = message.clone();
+        for item in task
+            .import_instance
+            .iter_mut()
+            .flat_map(|detail| detail.volumes.iter_mut().flatten())
+        {
+            item.status = Some(CONVERSION_TASK_STATE_CANCELLING.to_string());
+            item.status_message = message.clone();
+        }
+        self.add_stored_bytes(message.map_or(0, |text| text.len()));
+        self.conversion_task_cancelled_at
+            .insert(conversion_task_id.to_string(), now + TRANSITION_DELAY);
+        true
+    }
+
+    /// Finish every conversion task cancellation the clock owed by `now`: a task a cancel
+    /// left [`CONVERSION_TASK_STATE_CANCELLING`] is [`CONVERSION_TASK_STATE_CANCELLED`] once
+    /// its instant has passed.
+    ///
+    /// Reached only through [`Self::materialize_due_transitions`], so a reporting operation
+    /// observes the move without having caused it: it was owed at this instant whether or
+    /// not anybody called. The record itself stays in the store — a state is only reportable
+    /// while the task it belongs to is there.
+    pub fn cancel_due_conversion_tasks(&mut self, now: Instant) {
+        let tasks = &mut self.conversion_tasks;
+        self.conversion_task_cancelled_at
+            .retain(|conversion_task_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(task) = tasks.get_mut(conversion_task_id) {
+                    task.state = Some(CONVERSION_TASK_STATE_CANCELLED.to_string());
+                    for item in task
+                        .import_instance
+                        .iter_mut()
+                        .flat_map(|detail| detail.volumes.iter_mut().flatten())
+                    {
+                        item.status = Some(CONVERSION_TASK_STATE_CANCELLED.to_string());
+                    }
+                }
+                // The move is applied once; nothing is owed on this task any more.
+                false
+            });
     }
 }
 
