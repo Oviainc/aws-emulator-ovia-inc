@@ -27,5 +27,7 @@ mod stream_data_retention_projection;
 mod stream_deletion_state;
 #[path = "all/stream_lifecycle.rs"]
 mod stream_lifecycle;
+#[path = "all/stream_record_state_model.rs"]
+mod stream_record_state_model;
 #[path = "all/stream_tags.rs"]
 mod stream_tags;

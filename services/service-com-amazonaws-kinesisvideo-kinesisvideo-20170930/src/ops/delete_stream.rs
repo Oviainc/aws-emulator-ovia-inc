@@ -12,10 +12,12 @@
 //!   ([`crate::state::STREAM_DELETION_SPAN`]), which
 //!   [`crate::state::ComAmazonawsKinesisvideoKinesisvideo20170930State::settle_clock`]
 //!   then performs.
-//! * A stream that is present but not `ACTIVE` — one still `CREATING`, or one already
-//!   marked for deletion — cannot be deleted: that is the case
-//!   `ResourceInUseException` (400) is modeled for, while `ResourceNotFoundException`
-//!   (404) is reserved for a `StreamARN` no stored record answers to.
+//! * A stream whose creation `CreateStream` has acknowledged is deletable from that
+//!   moment, `CREATING` or `ACTIVE`: the delete the caller makes on the ARN the create
+//!   returned is served. The one state that refuses it is a deletion already under
+//!   way, which is the case `ResourceInUseException` (400) is modeled for, while
+//!   `ResourceNotFoundException` (404) is reserved for a `StreamARN` no stored record
+//!   answers to.
 //! * An optional `CurrentVersion` is the optimistic-concurrency guard, checked once
 //!   the stream's status allows the delete at all.
 //!
@@ -196,12 +198,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
-        // The state gate, before the version guard: a stream that is not `ACTIVE`
-        // cannot be deleted under ANY version, and that is the condition
+        // The state gate, before the version guard: the ONE state that blocks marking a
+        // stream for deletion is a deletion already under way, and that is the condition
         // `ResourceInUseException` names ("if the provided input StreamARN or ChannelARN
         // is not in Active status … The DescribeStream … API to determine the status of
-        // the resource"). 404 stays reserved for the ARN that resolved to nothing.
-        if stream.status != crate::state::STATUS_ACTIVE {
+        // the resource") — a status the caller cannot act its way out of, since the
+        // record is on its way out of the store. A stream whose creation `CreateStream`
+        // has already acknowledged is deletable from that moment, whether or not the
+        // clock has settled its move to `ACTIVE` yet: AWS hands back the stream's ARN
+        // and then serves the delete addressed to it. 404 stays reserved for the ARN
+        // that resolved to nothing.
+        if stream.status == crate::state::STATUS_DELETING {
             return Err(DeleteStreamErrorModeled::ResourceInUseException(
                 ResourceInUseException {
                     message: Some(crate::state::STREAM_NOT_ACTIVE_MESSAGE.to_string()),
@@ -228,10 +235,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "This method marks the stream for deletion": the record stays, in the
         // non-terminal `DELETING` status, and the clock owes its removal. The `Version`
         // is left as it was, so a caller polling `DescribeStream` reads the stream it
-        // deleted rather than a re-identified one. The activation instant is already
-        // clear — the gate above let only an `ACTIVE` stream through, and the clock
-        // clears it when it sets that status.
+        // deleted rather than a re-identified one. Any activation the clock still owed
+        // is dropped with the same write: `DELETING` is where this record goes next, so
+        // a pending promotion to `ACTIVE` must not undo the mark.
         stream.status = crate::state::STATUS_DELETING.to_string();
+        stream.activates_at = None;
         stream.deletes_at =
             Some(::std::time::Instant::now() + crate::state::STREAM_DELETION_SPAN);
 

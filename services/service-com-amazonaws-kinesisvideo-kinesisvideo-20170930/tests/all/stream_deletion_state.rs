@@ -8,9 +8,13 @@
 //! RULE under test: `DeleteStream` "marks the stream for deletion" rather than
 //! removing it, so the record keeps every member it had and only its `Status` moves,
 //! to `DELETING`, until the clock owes its removal; a delete addressed to a stream
-//! that IS stored but is not in `ACTIVE` status is the modeled
-//! `ResourceInUseException` (HTTP 400), and `ResourceNotFoundException` (HTTP 404)
-//! is reserved for an identifier no stored stream answers to.
+//! whose removal is ALREADY under way is the modeled `ResourceInUseException`
+//! (HTTP 400), and `ResourceNotFoundException` (HTTP 404) is reserved for an
+//! identifier no stored stream answers to.
+//!
+//! The companion rule — that a stream whose creation the service has acknowledged is
+//! deletable straight away, inside its creation window — is the sibling
+//! `stream_record_state_model` suite's.
 //!
 //! Every case drives the real request walk (route -> deserialize -> validate ->
 //! handle -> serialize) through `MultiServiceRouter::dispatch`, so a response here
@@ -196,17 +200,16 @@ async fn a_delete_marks_the_stream_for_deletion_and_describe_projects_the_marked
     );
 }
 
-/// A delete addressed to a stream that is STORED but not `ACTIVE` is refused as in
+/// A delete addressed to a stream whose removal is already under way is refused as in
 /// use (HTTP 400, `ResourceInUseException`, "The requested stream is not active."),
 /// whatever `CurrentVersion` it carries, and the stream it named is left as it was.
 /// An identifier no stored stream answers to is the other refusal: HTTP 404,
 /// `ResourceNotFoundException`.
 ///
-/// The rows differ along which non-`ACTIVE` status the delete meets (`CREATING`, from
-/// a create inside its activation span; `DELETING`, from a stream already marked) and
-/// along the `CurrentVersion` the request carries (the stored one, a stale one, none).
+/// The rows differ along the `CurrentVersion` the second delete carries (the stored
+/// one, a stale one, none): none of the three gets past the state of the record.
 #[tokio::test]
-async fn deleting_a_stream_that_is_not_active_is_refused_as_in_use() {
+async fn deleting_a_stream_whose_removal_is_under_way_is_refused_as_in_use() {
     /// What the service says when the stream a delete names is not `ACTIVE`.
     const NOT_ACTIVE: &str = "The requested stream is not active.";
 
@@ -221,10 +224,11 @@ async fn deleting_a_stream_that_is_not_active_is_refused_as_in_use() {
         None,
     }
     let rows: Vec<(&str, &str, Guard)> = vec![
-        ("creating, with the stored version", "CREATING", Guard::Stored),
-        ("creating, with a stale version", "CREATING", Guard::Stale),
-        ("creating, with no version", "CREATING", Guard::None),
-        ("deleting, with the stored version", "DELETING", Guard::Stored),
+        (
+            "deleting, with the stored version",
+            "DELETING",
+            Guard::Stored,
+        ),
         ("deleting, with a stale version", "DELETING", Guard::Stale),
         ("deleting, with no version", "DELETING", Guard::None),
     ];
@@ -287,21 +291,6 @@ async fn deleting_a_stream_that_is_not_active_is_refused_as_in_use() {
 
     for (index, (case, status_when_deleted, guard)) in rows.iter().enumerate() {
         let name = format!("gate-{index}");
-        if *status_when_deleted == "CREATING" {
-            // A `CREATING` row is created HERE, immediately before its delete, so the
-            // delete lands inside the activation span.
-            let (status, body) = call(
-                &router,
-                "/createStream",
-                serde_json::json!({ "StreamName": name }),
-            )
-            .await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: CreateStream failed with {body:?}"
-            );
-        }
-
         let (_, info) = describe(&router, &name).await;
         assert_eq!(
             info.get("Status").and_then(serde_json::Value::as_str),

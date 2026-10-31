@@ -445,7 +445,9 @@ pub struct ComAmazonawsKinesisvideoKinesisvideo20170930State {
     /// `ChannelARN` -> `ChannelName`, so every operation that accepts a channel ARN
     /// resolves to the same record the name form does.
     pub channel_arn_index: BTreeMap<String, String>,
-    /// Bumped on every mutation, so a re-minted `Version` never repeats.
+    /// Bumped on every mutation, and mixed into the draw [`mint_version_token`] makes,
+    /// so two mints never ask the same question of the entropy source. It is NOT part
+    /// of the token it helps mint.
     pub version_seq: u64,
 }
 
@@ -525,15 +527,18 @@ impl ComAmazonawsKinesisvideoKinesisvideo20170930State {
         items
     }
 
-    /// A fresh opaque `Version` token: alphanumeric, 1..64 characters, per
-    /// `smithy_query(query="shape", shape="Version")`.
+    /// A fresh opaque `Version` token for ONE record: alphanumeric, 1..64 characters,
+    /// per `smithy_query(query="shape", shape="Version")`.
+    ///
+    /// The token is what a caller hands straight back as `CurrentVersion`, so the only
+    /// thing it has to support is equality with the stored one. It therefore carries
+    /// nothing a caller can read: [`mint_version_token`] draws it, and the store's
+    /// mint count only varies that draw rather than appearing in the token, so one
+    /// record's version reveals neither how many mutations the store has seen nor what
+    /// the next token will be.
     pub fn mint_version(&mut self) -> String {
         self.version_seq = self.version_seq.wrapping_add(1);
-        format!(
-            "{}{}",
-            base36(u128::from(self.version_seq)),
-            base36(now_nanos())
-        )
+        mint_version_token(self.version_seq)
     }
 
     /// The stored stream a `StreamName`/`StreamARN` pair names.
@@ -672,28 +677,48 @@ pub fn now_millis() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
-/// Unix epoch nanoseconds now.
-fn now_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_nanos())
-        .unwrap_or_default()
-}
+/// The symbols a `Version` token is written in: the whole alphanumeric set the modeled
+/// `@pattern` `^[a-zA-Z0-9]+$` admits, both cases included.
+const VERSION_TOKEN_ALPHABET: &[u8; 62] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-/// Base-36 (`0-9a-z`) rendering of `value`, so a token built from it satisfies an
-/// alphanumeric-only `@pattern`.
-fn base36(mut value: u128) -> String {
-    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    if value == 0 {
-        return "0".to_string();
+/// How many of [`VERSION_TOKEN_ALPHABET`]'s symbols a minted `Version` carries.
+///
+/// The model bounds `Version` only by its `@length` 1..64 and that `@pattern`, and AWS
+/// publishes no width, so this one is CHOSEN: fixed, so every record's token is the
+/// same width whatever the store has done, and wide enough (20 symbols out of 62,
+/// about 119 bits) that two draws never collide.
+const VERSION_TOKEN_LENGTH: usize = 20;
+
+/// [`VERSION_TOKEN_ALPHABET`]'s symbol count, as the radix a drawn token is written in.
+const VERSION_TOKEN_RADIX: u128 = VERSION_TOKEN_ALPHABET.len() as u128;
+
+/// One opaque `Version` token.
+///
+/// The bits come from the standard library's [`std::collections::hash_map::RandomState`],
+/// whose SipHash keys the host seeds, and which draws its own keys per instance — so two
+/// draws of the same `sequence` yield independent tokens. Neither the sequence nor the
+/// clock is rendered into the result: the token is a drawn identifier, so it orders
+/// nothing, reveals no store-wide count, and shares no run-local prefix or suffix with
+/// any other record's token.
+fn mint_version_token(sequence: u64) -> String {
+    use ::std::collections::hash_map::RandomState;
+    use ::std::hash::BuildHasher;
+
+    // Two independently keyed draws, so the rendered width is backed by more bits than
+    // it spends: one `u64` would run out after 10 of the 20 symbols.
+    let high = RandomState::new().hash_one(sequence);
+    let low = RandomState::new().hash_one(!sequence);
+    let mut drawn = (u128::from(high) << 64) | u128::from(low);
+
+    let mut token = Vec::with_capacity(VERSION_TOKEN_LENGTH);
+    for _ in 0..VERSION_TOKEN_LENGTH {
+        let symbol = usize::try_from(drawn % VERSION_TOKEN_RADIX).unwrap_or(0);
+        token.push(VERSION_TOKEN_ALPHABET[symbol]);
+        drawn /= VERSION_TOKEN_RADIX;
     }
-    let mut out = Vec::new();
-    while value > 0 {
-        out.push(DIGITS[usize::try_from(value % 36).unwrap_or(0)]);
-        value /= 36;
-    }
-    out.reverse();
-    String::from_utf8(out).unwrap_or_else(|_| "0".to_string())
+    // The alphabet is ASCII, so the bytes are valid UTF-8 by construction.
+    String::from_utf8(token).unwrap_or_else(|_| "0".repeat(VERSION_TOKEN_LENGTH))
 }
 
 /// The `StreamARN` of a stream, in the one form the modeled `@pattern`
