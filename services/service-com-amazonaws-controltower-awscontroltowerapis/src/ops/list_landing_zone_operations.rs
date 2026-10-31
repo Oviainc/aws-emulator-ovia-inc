@@ -119,13 +119,6 @@ impl From<ListLandingZoneOperationsErrorModeled> for ListLandingZoneOperationsEr
     }
 }
 
-/// How far back a listing reaches.
-///
-/// From this operation's own docs — it "lists all landing zone operations from the past 90
-/// days" — so an older record is not listed, even while `GetLandingZoneOperation` still
-/// resolves it by identifier for as long as the log retains it.
-const LISTED_WINDOW: ::std::time::Duration = ::std::time::Duration::from_secs(90 * 24 * 60 * 60);
-
 /// The summary one log record reports.
 fn summary(record: &crate::state::LandingZoneOperation) -> LandingZoneOperationSummary {
     LandingZoneOperationSummary {
@@ -191,14 +184,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let statuses = filter_set(filter.statuses.as_ref());
 
         let now = ::std::time::SystemTime::now();
-        // A record that started before this instant is outside the documented window. A
-        // clock so far back that the window would predate the epoch leaves every record
-        // inside it, which is what `None` means here.
-        let earliest_listed = now.checked_sub(LISTED_WINDOW);
 
         let mut store = state.lock();
-        // Only materialises transitions the clock already owed; this operation is
-        // `@readonly` and writes nothing else.
+        // Only materialises what the clock already owed — the transitions due, and the
+        // records whose details have stopped being available. This listing reaches back
+        // over the window it documents ("all landing zone operations from the past 90
+        // days") because that window is the log's own retention
+        // (`crate::state::OPERATION_DETAILS_AVAILABLE_FOR`), applied here rather than
+        // tested again below, so the listing and `GetLandingZoneOperation` cannot answer
+        // differently about one record. This operation is `@readonly` and writes nothing
+        // else.
         store.settle(now);
 
         // Most recently started first, as the operation documents, and the identifier
@@ -211,7 +206,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|record| {
                 selected(&types, record.operation_type.as_wire())
                     && selected(&statuses, record.status.as_wire())
-                    && earliest_listed.is_none_or(|earliest| record.start_time >= earliest)
             })
             .collect();
         records.sort_by(|left, right| {

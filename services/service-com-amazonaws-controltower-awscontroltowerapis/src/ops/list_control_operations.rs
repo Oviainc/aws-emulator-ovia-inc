@@ -191,8 +191,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let operation_types = filter_set(filter.control_operation_types.as_ref());
 
         let mut store = state.lock();
-        // Only materialises transitions the clock already owed; this operation is
-        // `@readonly` and writes nothing else.
+        // Only materialises what the clock already owed — the transitions due, and the
+        // records whose details have stopped being available
+        // (`crate::state::OPERATION_DETAILS_AVAILABLE_FOR`, the window
+        // `GetControlOperation` documents over the same records), so this listing and that
+        // read cannot answer differently about one record. This operation is `@readonly`
+        // and writes nothing else.
         store.settle(::std::time::SystemTime::now());
 
         // Most recently started first, and the identifier breaks a tie so the order is

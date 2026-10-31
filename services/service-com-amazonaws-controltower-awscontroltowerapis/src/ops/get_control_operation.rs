@@ -169,14 +169,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        // Only materialises transitions the clock already owed; this operation is
+        // Only materialises what the clock already owed — the transitions due, and the
+        // records whose details have stopped being available. This operation is
         // `@readonly` and writes nothing else.
         store.settle(::std::time::SystemTime::now());
 
         // The control operation log is its own store: an identifier a landing zone or a
         // baseline call returned is not a control operation, so it does not resolve here.
         // A record outlives the enablement it acted on, so the identifier a teardown
-        // returned still resolves once that resource is gone.
+        // returned still resolves once that resource is gone — for as long as its details
+        // are available: the window this operation documents ("Details for an operation
+        // are available for 90 days") is the log's own retention
+        // (`crate::state::OPERATION_DETAILS_AVAILABLE_FOR`), so a record past it is no
+        // longer in the store and is as unresolvable here as an identifier no call
+        // returned.
         let Some(operation) = store.control_operations.get(&input.operation_identifier) else {
             return Err(GetControlOperationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

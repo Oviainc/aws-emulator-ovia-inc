@@ -119,6 +119,8 @@ mod minted_arn_region_segment;
 mod non_canonical_page_token_spellings;
 #[path = "all/one_enabled_control_per_target.rs"]
 mod one_enabled_control_per_target;
+#[path = "all/operation_detail_availability_window.rs"]
+mod operation_detail_availability_window;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_identifier_form.rs"]

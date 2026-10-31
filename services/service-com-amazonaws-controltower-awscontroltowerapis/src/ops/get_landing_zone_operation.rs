@@ -4,7 +4,9 @@
 //!
 //! Looks an `operationIdentifier` up in the persisted landing zone operation log and
 //! reports that record. The log is append-only, so an identifier a `DeleteLandingZone`
-//! returned still resolves after the landing zone is gone.
+//! returned still resolves after the landing zone is gone — for as long as the record's
+//! details are available, which this operation documents as a 90-day window and the store
+//! applies as that log's retention.
 //!
 //! Implemented: this operation no longer answers HTTP 501.
 //!
@@ -160,10 +162,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        // Only materialises transitions the clock already owed; this operation is
+        // Only materialises what the clock already owed — the transitions due, and the
+        // records whose details have stopped being available. This operation is
         // `@readonly` and writes nothing else.
         store.settle(::std::time::SystemTime::now());
 
+        // A record resolves for as long as its details are available: the window this
+        // operation documents ("Details for an operation are available for 90 days") is
+        // the log's own retention (`crate::state::OPERATION_DETAILS_AVAILABLE_FOR`), so a
+        // record past it is no longer in the store and an identifier naming one is as
+        // unresolvable here as one no call ever returned.
         let Some(operation) = store
             .landing_zone_operations
             .get(&input.operation_identifier)

@@ -48,6 +48,12 @@
 //!   [`MAX_LANDING_ZONE_OPERATIONS`] / [`MAX_BASELINE_OPERATIONS`] /
 //!   [`MAX_CONTROL_OPERATIONS`] records and evicting the oldest TERMINAL record to make
 //!   room (see [`enforce_log_bound`]);
+//!
+//! A log whose operations document how long an operation's details stay available is
+//! bounded by that window as well, and the window is the stronger rule: a record older
+//! than [`OPERATION_DETAILS_AVAILABLE_FOR`] is dropped by [`settle`], so every call that
+//! reports one — the by-identifier read and the listing alike — answers the same way
+//! about the same record rather than each handler testing the age itself.
 //! * `enabled_baselines` holds at most [`MAX_ENABLED_BASELINES`] enablements, and
 //!   `EnableBaseline` is REFUSED past that cap rather than growing the store (see
 //!   [`record_enablement`]), because an enablement is a resource a caller must tear down
@@ -124,14 +130,32 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// returns before it elapses.
 pub const OPERATION_SETTLE_AFTER: Duration = Duration::from_millis(500);
 
+/// How long an asynchronous operation's details stay available, after which the record is
+/// no longer reported at all.
+///
+/// Documented by the operations that report a record: `GetLandingZoneOperation` and
+/// `GetControlOperation` both state that "Details for an operation are available for 90
+/// days", and `ListLandingZoneOperations` lists "all landing zone operations from the past
+/// 90 days" — one window over the same records. It is measured from the instant the
+/// operation STARTED, which is what the listing's own wording ("from the past 90 days")
+/// dates a record by, so a record leaves the window once that instant is this far back.
+///
+/// Applied in [`settle`], so it bounds the store itself rather than one reader: a
+/// by-identifier read and a listing cannot answer differently about one record.
+///
+/// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+pub const OPERATION_DETAILS_AVAILABLE_FOR: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
 /// The most landing zone operation records the log retains.
 ///
-/// A record stays resolvable through `GetLandingZoneOperation` until the log is full, at
-/// which point the OLDEST terminal record is evicted to make room. Without this cap a
-/// caller repeating create/delete would grow the store, and the `settle` scan held under
-/// the state lock, without limit. AWS documents no retention for this log, so the value
-/// is CHOSEN: large enough that no lifecycle an emulator client drives reaches it, small
-/// enough to bound the store.
+/// A record stays resolvable through `GetLandingZoneOperation` until its details stop
+/// being available ([`OPERATION_DETAILS_AVAILABLE_FOR`]) or the log is full, whichever
+/// comes first; when the log is full the OLDEST terminal record is evicted to make room.
+/// This cap is a STORE bound, not the documented retention: without it a caller repeating
+/// create/delete inside the availability window would grow the store, and the `settle`
+/// scan held under the state lock, without limit. AWS publishes no count for this log, so
+/// the value is CHOSEN: large enough that no lifecycle an emulator client drives reaches
+/// it, small enough to bound the store.
 pub const MAX_LANDING_ZONE_OPERATIONS: usize = 1024;
 
 /// The most enabled controls this account's store holds.
@@ -161,8 +185,10 @@ pub const MAX_ENABLED_CONTROL_PARAMETER_BYTES: usize = 64 * 1024;
 /// The most control operation records the log retains.
 ///
 /// Same reasoning, and the same CHOSEN size, as [`MAX_LANDING_ZONE_OPERATIONS`]: a record
-/// stays resolvable through `GetControlOperation`/`ListControlOperations` until the log is
-/// full, at which point the oldest terminal record is evicted. Counted separately because
+/// stays resolvable through `GetControlOperation`/`ListControlOperations` until its details
+/// stop being available ([`OPERATION_DETAILS_AVAILABLE_FOR`], which `GetControlOperation`
+/// documents too) or the log is full, at which point the oldest terminal record is
+/// evicted. Counted separately because
 /// the three logs are separate stores, so a busy control caller cannot evict landing zone
 /// or baseline history.
 pub const MAX_CONTROL_OPERATIONS: usize = 1024;
@@ -173,6 +199,10 @@ pub const MAX_CONTROL_OPERATIONS: usize = 1024;
 /// stays resolvable through `GetBaselineOperation` until the log is full, at which point
 /// the oldest terminal record is evicted. Counted separately because the two logs are
 /// separate stores, so a busy baseline caller cannot evict landing zone history.
+///
+/// This log is bounded by the COUNT only: `GetBaselineOperation` is the one reporting call
+/// of the three logs whose docs state no availability window for the details it reports,
+/// so nothing times a baseline operation record out.
 pub const MAX_BASELINE_OPERATIONS: usize = 1024;
 
 /// The most `EnabledBaseline` resources this account may hold at once.
@@ -1348,6 +1378,12 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     /// unless the operation that queued it FAILED, in which case it deployed nothing.
     /// Call this first in every handler so reporting and mutating operations agree on the
     /// clock.
+    ///
+    /// An operation record whose availability window has run out is dropped here for the
+    /// same reason: it stopped being available at the instant the window closed, whether
+    /// or not anybody called (see [`expire_operation_logs`]).
+    ///
+    /// [`expire_operation_logs`]: Self::expire_operation_logs
     pub fn settle(&mut self, now: SystemTime) {
         for op in self.landing_zone_operations.values_mut() {
             if op.status == LandingZoneOperationStatus::InProgress && now >= op.due_at {
@@ -1656,6 +1692,32 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
                     Some(EnabledBaselineDriftStatus::InSync);
             }
         }
+
+        // Done LAST, so every transition a record still owed has been applied from it
+        // before it goes: a record only leaves the store once nothing reads it any more.
+        self.expire_operation_logs(now);
+    }
+
+    /// Drop every operation record whose details have stopped being available.
+    ///
+    /// A record's details are available for [`OPERATION_DETAILS_AVAILABLE_FOR`] after the
+    /// operation started, so one that started longer ago than that is gone whether or not
+    /// anybody called — which is why [`settle`] materialises it rather than each reader
+    /// testing the age of the record it found. Applied to the logs whose reporting
+    /// operations document the window (landing zone and control operations); the baseline
+    /// log's does not, so nothing times its records out (see
+    /// [`MAX_BASELINE_OPERATIONS`]).
+    ///
+    /// A clock so far back that the window would predate the epoch leaves every record
+    /// inside it, which is what the absent instant means here.
+    ///
+    /// [`settle`]: Self::settle
+    fn expire_operation_logs(&mut self, now: SystemTime) {
+        let Some(earliest_available) = now.checked_sub(OPERATION_DETAILS_AVAILABLE_FOR) else {
+            return;
+        };
+        expire_log(&mut self.landing_zone_operations, earliest_available);
+        expire_log(&mut self.control_operations, earliest_available);
     }
 
     /// Remove every control and baseline enablement this account holds, together with the
@@ -2761,6 +2823,15 @@ fn enforce_log_bound<R: OperationLogRecord>(log: &mut HashMap<String, R>, max_re
         };
         log.remove(&evicted);
     }
+}
+
+/// Drop every record of `log` that started before `earliest_available`.
+///
+/// The age bound a reporting operation's documented availability window is, written once
+/// for every log that carries one: the logs hold different record shapes but date a record
+/// by the same `start_time`.
+fn expire_log<R: OperationLogRecord>(log: &mut HashMap<String, R>, earliest_available: SystemTime) {
+    log.retain(|_, record| record.start_time() >= earliest_available);
 }
 
 /// Whether any operation in `operations` against `arn` is still `IN_PROGRESS`.

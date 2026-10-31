@@ -21,8 +21,8 @@
 //!   `maxResults`/`nextToken`, so a walk returns each record exactly once in that order,
 //!   and a token the service never handed out is refused rather than read as the first
 //!   page;
-//! * the listing reaches back over the window the operation documents and no further,
-//!   while a record outside it still resolves by identifier;
+//! * the listing reaches back over the window the operation documents and no further, and
+//!   the by-identifier read agrees: a record past that window has stopped being available;
 //! * reading the log never changes it, and the log holds landing zone operations only.
 //!
 //! Every value set and bound written out by hand here names its source.
@@ -40,7 +40,7 @@
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_controltower_awscontroltowerapis::state::{
-    service_state, LandingZoneOperationType,
+    service_state, LandingZoneOperationType, OPERATION_DETAILS_AVAILABLE_FOR,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -62,8 +62,12 @@ const DELETE: &str = "/delete-landingzone";
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How far back the listing reaches: `ListLandingZoneOperations` lists "all landing zone
-/// operations from the past 90 days" (the operation's model docs).
-const LISTED_WINDOW: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+/// operations from the past 90 days" (the operation's model docs), which is the window the
+/// log retains a record's details for. Read off the crate's own constant rather than
+/// retyped here, so this table cannot drift from the rule the store applies;
+/// `tests/all/operation_detail_availability_window.rs` pins that constant's documented
+/// length.
+const LISTED_WINDOW: Duration = OPERATION_DETAILS_AVAILABLE_FOR;
 
 /// Every value of the modelled `LandingZoneOperationType`, with the wire value each
 /// serializes as.
@@ -684,8 +688,9 @@ async fn a_paginated_walk_returns_each_record_exactly_once_newest_first() {
 }
 
 /// RULE: the listing reaches back over the window the operation documents and no further —
-/// a record that started inside it is listed, an older one is not, while
-/// `GetLandingZoneOperation` still resolves the older record by identifier.
+/// a record that started inside it is listed, an older one is not, and the by-identifier
+/// read agrees: a record past the window has stopped being available, so it resolves no
+/// more than one the listing reports.
 ///
 /// The rows are the ages: inside the window at both ends, just inside its published bound,
 /// and just, a day and a month past it.
@@ -735,11 +740,13 @@ async fn the_listing_reaches_back_over_the_documented_window_only() {
              {:?}",
             listed.body
         );
-        // The window narrows the LISTING, not the log: the record is still there.
-        assert!(
+        // One window over one log: a record the listing no longer reaches is a record
+        // whose details have stopped being available, so it does not resolve either.
+        assert_eq!(
             resolves(&router, operation).await,
-            "case {case:?} ({age:?} old): expected get-landingzone-operation to still \
-             resolve {operation}"
+            *inside,
+            "case {case:?} ({age:?} old): expected get-landingzone-operation to resolve \
+             {operation}: {inside}"
         );
     }
 
