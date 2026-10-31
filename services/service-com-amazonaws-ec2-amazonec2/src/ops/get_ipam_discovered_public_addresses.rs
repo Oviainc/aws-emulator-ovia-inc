@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIpamDiscoveredPublicAddresses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIpamDiscoveredPublicAddresses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIpamDiscoveredPublicAddresses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the public IP addresses one of the account's IPAM resource
+//! discoveries finds in a Region, DERIVED from [`crate::state`] — every Elastic IP address
+//! the account holds whose network border group is that Region's, each reported with the
+//! resource holding it, narrowed by the request's `Filters` and answered one
+//! `MaxResults`-sized page at a time. A reporting operation: it stores nothing of its own,
+//! and the only write it makes is to materialise the state transitions the clock has
+//! ALREADY made due (an IPAM resource discovery's `create-in-progress` ->
+//! `create-complete`), which were owed at the same instant whether or not anybody called.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +145,595 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIpamDiscoveredPublicAddresses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIpamDiscoveredPublicAddressesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIpamDiscoveredPublicAddresses"))
+        // `ctx` carries request metadata only, and this operation reads none of it: the
+        // Region whose addresses are sampled is the one the request's own `AddressRegion`
+        // member names, not the one its credential scope was signed for. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state::{
+            CompiledFilter, MatchBudget, PageTokenRule, MAX_FILTERS, MAX_FILTER_MATCH_STEPS,
+            MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE,
+        };
+
+        // "The token for the next page of results"
+        // (`GetIpamDiscoveredPublicAddressesRequest$NextToken`) — anything else is refused
+        // rather than read as a position, and it is refused before any other member is
+        // looked at, so whether a bogus token is caught never depends on the rest of the
+        // request.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // "An IPAM resource discovery ID"
+        // (`GetIpamDiscoveredPublicAddressesRequest$IpamResourceDiscoveryId`, required):
+        // something that is not an id of that kind at all is a fact about the request, so it
+        // is refused before the account's own discoveries are looked at.
+        crate::state::require_well_formed_ipam_resource_discovery_id(
+            &input.ipam_resource_discovery_id,
+        )?;
+
+        // "The Amazon Web Services Region for the IP address"
+        // (`GetIpamDiscoveredPublicAddressesRequest$AddressRegion`, required): the Region
+        // whose sample this call reports, so a value that names no Region at all names no
+        // sample either.
+        if input.address_region.is_empty() {
+            return Err(crate::state::missing_parameter(
+                "The request must contain the parameter AddressRegion",
+            ));
+        }
+
+        // Matching cost is filters x values x held values x sampled addresses and the model
+        // bounds none of them (`Filters` is a plain `FilterList`), so the request-controlled
+        // factors are capped here, before any work proportional to them is done — and their
+        // PRODUCT is charged to one [`MatchBudget`] below, which is the bound the per-factor
+        // caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not resolve is refused whether or not any
+        // address would have matched it, so an unsupported filter can never read as "no
+        // results". Each filter's values are parsed into their wildcard patterns ONCE here,
+        // not once per candidate.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "A check for whether you have the required permissions for the action without
+        // actually making the request"
+        // (`GetIpamDiscoveredPublicAddressesRequest$DryRun`). Every caller of this emulator
+        // is permitted, so a dry run reports that outcome and reads nothing. It sits AFTER
+        // every parameter has been validated: the flag asks whether the request WOULD have
+        // succeeded, so one that would have been refused is refused with that reason
+        // instead.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The clock-owed transitions this read is allowed to apply — the same call
+        // `DescribeIpamScopes` makes: a resource discovery answered as `create-in-progress`
+        // is `create-complete` once its due instant has passed, whether or not anybody
+        // called, so applying it here changes nothing a later caller would not have seen
+        // anyway.
+        store.materialize_due_transitions();
+
+        // A discovery id the account holds no resource discovery for is an error, not an
+        // empty sample: there is no discovery to report a sample of.
+        let Some(discovery) = store
+            .ipam_resource_discoveries
+            .get(&input.ipam_resource_discovery_id)
+        else {
+            return Err(crate::state::invalid_ipam_resource_discovery_id_not_found(
+                &input.ipam_resource_discovery_id,
+            ));
+        };
+        // "The operating Regions for the resource discovery"
+        // (`IpamResourceDiscovery$OperatingRegions`): a discovery monitors the Regions it
+        // operates in, so a Region it does not operate in has no sample of its own — which
+        // is an empty report of that Region rather than a refusal of the request.
+        let monitors_region = discovery
+            .operating_regions
+            .iter()
+            .flatten()
+            .any(|operating| operating.region_name.as_deref() == Some(&*input.address_region));
+
+        // The sample this call reports. The discovery monitors the Region's public addresses
+        // as they stand, so "the last successful resource discovery time"
+        // (`IpamDiscoveredPublicAddress$SampleTime`) is the instant this sample was taken.
+        let sample_time = crate::state::system_time_to_date_time(::std::time::SystemTime::now());
+        // Which addresses are the Region's: an Elastic IP address is advertised from the one
+        // network border group its Region has
+        // ([`crate::state::network_border_group_of_region`]), which is what the stored
+        // address records its Region as.
+        let border_group = crate::state::network_border_group_of_region(&input.address_region);
+
+        // Every public address of the Region, with every filter then holding ("If you
+        // specify multiple filters, the filters are joined with an AND" — `Filter`). Every
+        // comparison is charged to ONE budget, so the PRODUCT of sampled addresses, filters,
+        // values, held values and value length is bounded however the caller combines them —
+        // which is also what bounds how long this holds the state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<IpamDiscoveredPublicAddress> = Vec::new();
+        if monitors_region {
+            for address in store.addresses.values() {
+                if budget.exhausted() {
+                    break;
+                }
+                if address.network_border_group.as_deref() != Some(border_group.as_str()) {
+                    continue;
+                }
+                // "The IP address" (`IpamDiscoveredPublicAddress$Address`) is what a
+                // discovered public address IS, so an allocation holding none is not one the
+                // discovery can report — and leaving it out is also what keeps the address a
+                // total order over the sample for the cursor below.
+                if address.public_ip.is_none() {
+                    continue;
+                }
+                let discovered = discovered_public_address(
+                    &store,
+                    &input.ipam_resource_discovery_id,
+                    &input.address_region,
+                    address,
+                    sample_time,
+                );
+                if crate::state::matches_every_filter(&selectors, &mut budget, &|name| {
+                    filter_values(&discovered, name)
+                }) {
+                    selected.push(discovered);
+                }
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // Page in address order. Every address in the sample carries one, and one public IP
+        // address is held by at most one allocation of the account, so the address is a total
+        // order over the sample and the cursor below always advances.
+        selected.sort_by(|left, right| left.address.cmp(&right.address));
+
+        // "The oldest successful resource discovery time"
+        // (`GetIpamDiscoveredPublicAddressesResult$OldestSampleTime`): the oldest sample
+        // among the addresses this discovery reports for the Region — read off the whole
+        // selected set rather than the page, because it is a fact of the discovery and not
+        // of one page of it. A Region holding no sampled address has no such time.
+        let oldest_sample_time = selected
+            .iter()
+            .filter_map(|discovered| discovered.sample_time)
+            .min_by_key(|at| crate::state::date_time_key(*at));
+
+        // "The maximum number of IPAM discovered public addresses to return in one page of
+        // results" (`GetIpamDiscoveredPublicAddressesRequest$MaxResults`). A request that
+        // names none gets the largest page this service serves, so the `NextToken` path
+        // below behaves the same whether or not a page size was asked for. The model's
+        // `range 5..1000` has already refused anything outside it, so the only value that
+        // cannot convert is one the boundary validator would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .min(MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more results to return"
+        // (`GetIpamDiscoveredPublicAddressesResult$NextToken`): a token only when an address
+        // follows this page.
+        let (page, next_token) = crate::state::page_from_cursor(
+            &selected,
+            cursor.as_deref(),
+            Some(limit),
+            PageTokenRule::WhenAnotherItemFollows,
+            |discovered| discovered.address.as_deref().unwrap_or_default(),
+        );
+
+        Ok(GetIpamDiscoveredPublicAddressesOutput {
+            ipam_discovered_public_addresses: Some(page.to_vec()),
+            oldest_sample_time,
+            next_token,
+        })
     }
 }
+
+/// The `IpamPublicAddressAssociationStatus` of an address a resource of the account holds,
+/// from the modelled catalog
+/// (`crate::ops::types::IPAM_PUBLIC_ADDRESS_ASSOCIATION_STATUS_VALUES`).
+const ASSOCIATION_STATUS_ASSOCIATED: &str = "associated";
+
+/// The `IpamPublicAddressAssociationStatus` of an address no resource holds (same catalog).
+const ASSOCIATION_STATUS_DISASSOCIATED: &str = "disassociated";
+
+/// The `IpamPublicAddressType` of an Elastic IP address drawn from Amazon's own pool, from
+/// the modelled catalog (`crate::ops::types::IPAM_PUBLIC_ADDRESS_TYPE_VALUES`).
+const ADDRESS_TYPE_AMAZON_OWNED_EIP: &str = "amazon-owned-eip";
+
+/// The `IpamPublicAddressType` of an Elastic IP address drawn from a pool of the account's
+/// OWN advertised range (same catalog).
+const ADDRESS_TYPE_BYOIP: &str = "byoip";
+
+/// The `IpamPublicAddressAwsService` a NAT gateway's address reports, from the modelled
+/// catalog (`crate::ops::types::IPAM_PUBLIC_ADDRESS_AWS_SERVICE_VALUES`).
+const SERVICE_NAT_GATEWAY: &str = "nat-gateway";
+
+/// The IPAM-discovered report of ONE Elastic IP address of the account.
+///
+/// Every member is read off the STORED address and the stored resource holding it, so what
+/// this discovery reports about an address and what `DescribeAddresses` reports about it
+/// cannot disagree. `sample_time` is passed in rather than read here, so every address of one
+/// sample carries the one instant that sample was taken at.
+fn discovered_public_address(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    discovery_id: &str,
+    address_region: &str,
+    address: &Address,
+    sample_time: ::aws_smithy_types::DateTime,
+) -> IpamDiscoveredPublicAddress {
+    let holder = address_holder(store, address);
+    IpamDiscoveredPublicAddress {
+        ipam_resource_discovery_id: Some(discovery_id.to_string()),
+        address_region: Some(address_region.to_string()),
+        address: address.public_ip.clone(),
+        // "The ID of the owner of the resource the IP address is assigned to"
+        // (`IpamDiscoveredPublicAddress$AddressOwnerId`): every resource this emulator holds
+        // belongs to the one account it emulates.
+        address_owner_id: Some(::engine::emulator_account_id().to_string()),
+        address_allocation_id: address.allocation_id.clone(),
+        // The association is stored as the `AssociationId` the service minted for it, which
+        // every writer of an association sets and `detach_elastic_ip` clears, so one record
+        // decides this.
+        association_status: Some(
+            if address.association_id.is_some() {
+                ASSOCIATION_STATUS_ASSOCIATED
+            } else {
+                ASSOCIATION_STATUS_DISASSOCIATED
+            }
+            .to_string(),
+        ),
+        address_type: Some(address_type_of(address).to_string()),
+        service: holder.service.map(str::to_string),
+        service_resource: holder.service_resource,
+        vpc_id: holder.vpc_id,
+        subnet_id: holder.subnet_id,
+        // "The ID of the public IPv4 pool that the resource with the assigned IP address is
+        // from" (`IpamDiscoveredPublicAddress$PublicIpv4PoolId`): a pool of the account. An
+        // address out of Amazon's pool is from no such pool — `Address$PublicIpv4Pool` names
+        // that source [`crate::state::AMAZON_ADDRESS_POOL`] rather than a pool id — and its
+        // source is reported by `AddressType` instead.
+        public_ipv4_pool_id: address
+            .public_ipv4_pool
+            .clone()
+            .filter(|pool| pool != crate::state::AMAZON_ADDRESS_POOL),
+        network_interface_id: holder.network_interface_id,
+        network_interface_description: holder.network_interface_description,
+        instance_id: address.instance_id.clone(),
+        // "Tags for an Elastic IP address" (`IpamPublicAddressTags$EipTags`): the tags the
+        // allocation itself carries, which is the only tag set an address has.
+        tags: Some(IpamPublicAddressTags {
+            eip_tags: Some(
+                address
+                    .tags
+                    .iter()
+                    .flatten()
+                    .map(|tag| IpamPublicAddressTag {
+                        key: tag.key.clone(),
+                        value: tag.value.clone(),
+                    })
+                    .collect(),
+            ),
+        }),
+        network_border_group: address.network_border_group.clone(),
+        security_groups: Some(holder.security_groups),
+        sample_time: Some(sample_time),
+    }
+}
+
+/// What the resource HOLDING an Elastic IP address contributes to the address's discovered
+/// report: the network interface the address is on, where that interface sits, the groups
+/// around it, and the Amazon Web Services service that has it.
+///
+/// Every field is absent for an address no resource holds, which is what a disassociated
+/// address reports.
+#[derive(Debug, Default)]
+struct AddressHolder {
+    network_interface_id: Option<String>,
+    network_interface_description: Option<String>,
+    vpc_id: Option<String>,
+    subnet_id: Option<String>,
+    security_groups: Vec<IpamPublicAddressSecurityGroup>,
+    service: Option<&'static str>,
+    service_resource: Option<String>,
+}
+
+/// Resolve the resource holding `address` out of the store.
+///
+/// An address associated with an INSTANCE is read through the one reading of that instance's
+/// network facts ([`crate::state::ComAmazonawsEc2Amazonec2State::instance_vpc_id`] and the
+/// helpers beside it), so this report, `DescribeInstances` and `DescribeNetworkInterfaces`
+/// cannot disagree about where the instance sits or which groups surround it. An address a
+/// writer put straight onto a network INTERFACE (what `AssociateNatGatewayAddress` records)
+/// is read off that interface, and the service holding it off the resource that holds the
+/// allocation.
+fn address_holder(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    address: &Address,
+) -> AddressHolder {
+    let mut holder = AddressHolder::default();
+
+    if let Some(instance) = address
+        .instance_id
+        .as_deref()
+        .and_then(|instance_id| store.instances.get(instance_id))
+    {
+        holder.vpc_id = store.instance_vpc_id(instance);
+        holder.subnet_id = store.instance_subnet_id(instance);
+        holder.security_groups = store
+            .instance_security_groups(instance)
+            .into_iter()
+            .map(discovered_security_group)
+            .collect();
+        // The interfaces are answered in device-index order, so the first is the instance's
+        // PRIMARY interface — the one a public address is reached through.
+        if let Some(primary) = store
+            .instance_network_interfaces(&instance.instance_id)
+            .into_iter()
+            .next()
+        {
+            holder.network_interface_id = primary.network_interface_id;
+            holder.network_interface_description = primary.description;
+        }
+    }
+
+    if let Some(interface_id) = address.network_interface_id.as_deref() {
+        holder.network_interface_id = Some(interface_id.to_string());
+        if let Some(interface) = store.network_interfaces.get(interface_id) {
+            holder.network_interface_description = interface.description.clone();
+            holder.vpc_id = interface.vpc_id.clone();
+            holder.subnet_id = interface.subnet_id.clone();
+            holder.security_groups = interface
+                .groups
+                .iter()
+                .flatten()
+                .cloned()
+                .map(discovered_security_group)
+                .collect();
+        }
+    }
+
+    // "The Amazon Web Services service associated with the IP address"
+    // (`IpamDiscoveredPublicAddress$Service`) and "the resource ARN or ID"
+    // (`ServiceResource`): a NAT gateway of the account holding this allocation is the
+    // service that has the address, and the gateway's own network is where the address sits
+    // when the store holds no record of its interface.
+    if let Some(gateway) = nat_gateway_holding(store, address) {
+        holder.service = Some(SERVICE_NAT_GATEWAY);
+        holder.service_resource = gateway.nat_gateway_id.clone();
+        holder.vpc_id = holder.vpc_id.or_else(|| gateway.vpc_id.clone());
+        holder.subnet_id = holder.subnet_id.or_else(|| gateway.subnet_id.clone());
+    }
+
+    holder
+}
+
+/// The NAT gateway of the account holding `address`, or `None` when no gateway does.
+///
+/// "[Public NAT gateway only] The allocation ID of the Elastic IP address"
+/// (`NatGatewayAddress$AllocationId`) is where that link is stored, so it is read off the
+/// gateway records themselves rather than from a second copy on the address.
+fn nat_gateway_holding<'a>(
+    store: &'a crate::state::ComAmazonawsEc2Amazonec2State,
+    address: &Address,
+) -> Option<&'a NatGateway> {
+    let allocation_id = address.allocation_id.as_deref()?;
+    store.nat_gateways.values().find(|gateway| {
+        gateway
+            .nat_gateway_addresses
+            .iter()
+            .flatten()
+            .any(|held| held.allocation_id.as_deref() == Some(allocation_id))
+    })
+}
+
+/// One security group around the resource an address is assigned to, as this report names it.
+fn discovered_security_group(group: GroupIdentifier) -> IpamPublicAddressSecurityGroup {
+    IpamPublicAddressSecurityGroup {
+        group_id: group.group_id,
+        group_name: group.group_name,
+    }
+}
+
+/// The `IpamPublicAddressType` of one Elastic IP address of the account.
+///
+/// "You can allocate an Elastic IP address from one of the following address pools"
+/// (`AllocateAddress`): an address out of Amazon's own pool
+/// ([`crate::state::AMAZON_ADDRESS_POOL`], which is what `Address$PublicIpv4Pool` names that
+/// source) is an Amazon-owned EIP, and one drawn from a pool of a range the ACCOUNT brought
+/// is a BYOIP address. Both members come from the modelled catalog
+/// (`crate::ops::types::IPAM_PUBLIC_ADDRESS_TYPE_VALUES`).
+fn address_type_of(address: &Address) -> &'static str {
+    if address
+        .public_ipv4_pool
+        .as_deref()
+        .is_none_or(|pool| pool == crate::state::AMAZON_ADDRESS_POOL)
+    {
+        ADDRESS_TYPE_AMAZON_OWNED_EIP
+    } else {
+        ADDRESS_TYPE_BYOIP
+    }
+}
+
+/// The filter names this operation resolves.
+///
+/// `GetIpamDiscoveredPublicAddressesRequest$Filters` documents no list of its own — "Filters"
+/// is all of it
+/// (`smithy_query(query="doc",shape="GetIpamDiscoveredPublicAddressesRequest",member="Filters")`)
+/// — so the names are the ones EC2's filtering convention gives: each member of the resource
+/// the operation reports, spelled in kebab-case. This list is therefore derived mechanically
+/// from the `IpamDiscoveredPublicAddress` shape
+/// (`smithy_query(query="shape",shape="IpamDiscoveredPublicAddress")`), one entry per SCALAR
+/// member, plus the `tag-key` / `tag-value` / `tag:<key>` set every EC2 describe accepts, read
+/// here against the address's own Elastic IP tags. `SecurityGroups` is a list of STRUCTURES,
+/// which has no single value to compare a filter value against, so its own two members are
+/// named instead. Every entry must be answered by [`filter_values`].
+const IPAM_DISCOVERED_PUBLIC_ADDRESS_FILTERS: [&str; 21] = [
+    "address",
+    "address-allocation-id",
+    "address-owner-id",
+    "address-region",
+    "address-type",
+    "association-status",
+    "instance-id",
+    "ipam-resource-discovery-id",
+    "network-border-group",
+    "network-interface-description",
+    "network-interface-id",
+    "public-ipv4-pool-id",
+    "sample-time",
+    "security-group-id",
+    "security-group-name",
+    "service",
+    "service-resource",
+    "subnet-id",
+    "tag-key",
+    "tag-value",
+    "vpc-id",
+];
+
+/// Is `name` a filter this operation resolves? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no
+/// tag, so it is as unresolvable as any other misspelling.
+fn is_documented_filter(name: &str) -> bool {
+    name.strip_prefix(crate::state::TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || IPAM_DISCOVERED_PUBLIC_ADDRESS_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against one discovered address.
+///
+/// A filter naming an attribute this address does not carry compares against NO values, so it
+/// selects nothing — the same answer AWS gives for, say, `instance-id` on an address nothing
+/// holds. A timestamp is compared as the wire spells it
+/// ([`crate::state::filter_timestamp_values`]), which is how a client would send the filter
+/// value.
+fn filter_values<'a>(
+    discovered: &'a IpamDiscoveredPublicAddress,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(crate::state::TAG_FILTER_PREFIX) {
+        return eip_tags(discovered)
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "address" => text(discovered.address.as_deref()),
+        "address-allocation-id" => text(discovered.address_allocation_id.as_deref()),
+        "address-owner-id" => text(discovered.address_owner_id.as_deref()),
+        "address-region" => text(discovered.address_region.as_deref()),
+        "address-type" => text(discovered.address_type.as_deref()),
+        "association-status" => text(discovered.association_status.as_deref()),
+        "instance-id" => text(discovered.instance_id.as_deref()),
+        "ipam-resource-discovery-id" => text(discovered.ipam_resource_discovery_id.as_deref()),
+        "network-border-group" => text(discovered.network_border_group.as_deref()),
+        "network-interface-description" => {
+            text(discovered.network_interface_description.as_deref())
+        }
+        "network-interface-id" => text(discovered.network_interface_id.as_deref()),
+        "public-ipv4-pool-id" => text(discovered.public_ipv4_pool_id.as_deref()),
+        "sample-time" => crate::state::filter_timestamp_values(discovered.sample_time),
+        "security-group-id" => discovered
+            .security_groups
+            .iter()
+            .flatten()
+            .filter_map(|group| group.group_id.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "security-group-name" => discovered
+            .security_groups
+            .iter()
+            .flatten()
+            .filter_map(|group| group.group_name.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "service" => text(discovered.service.as_deref()),
+        "service-resource" => text(discovered.service_resource.as_deref()),
+        "subnet-id" => text(discovered.subnet_id.as_deref()),
+        "tag-key" => eip_tags(discovered)
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "tag-value" => eip_tags(discovered)
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "vpc-id" => text(discovered.vpc_id.as_deref()),
+        // Unreachable: `is_documented_filter` has already refused every other name. An
+        // unresolvable name compares against nothing, so it could never widen a result even
+        // if that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// The Elastic IP tags of one discovered address, as the tag filters above read them.
+fn eip_tags(
+    discovered: &IpamDiscoveredPublicAddress,
+) -> impl Iterator<Item = &IpamPublicAddressTag> {
+    discovered
+        .tags
+        .iter()
+        .flat_map(|tags| tags.eip_tags.iter().flatten())
+}
+
+// The AND/OR evaluation of the whole `Filters` member is
+// `crate::state::matches_every_filter`, the one place this crate defines it: "if you specify
+// multiple filters, the filters are joined with an AND" (`Filter`), and within one filter "if
+// you specify multiple values for a filter, the values are joined with an OR"
+// (`Filter$Values`), each value matched case-sensitively with EC2's `*`/`?` wildcards and
+// every comparison charged to the call's one `crate::state::MatchBudget`. Only the
+// per-operation lookup differs, which is `filter_values` above.

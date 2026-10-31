@@ -673,6 +673,11 @@ mod ipam_byoasn_associations;
 mod interruptible_capacity_reservation_allocations;
 #[path = "all/ipam_lifecycle.rs"]
 mod ipam_lifecycle;
+// What an IPAM resource discovery samples as a Region's public addresses: which Elastic IP
+// addresses of the account are in the sample, what the resource holding one contributes to it,
+// how `Filters` narrow it and how `MaxResults` pages it.
+#[path = "all/ipam_discovered_public_addresses.rs"]
+mod ipam_discovered_public_addresses;
 // Deleting the association between an IPAM and a Regional Internet Registry.
 #[path = "all/ipam_internet_registry_associations.rs"]
 mod ipam_internet_registry_associations;
