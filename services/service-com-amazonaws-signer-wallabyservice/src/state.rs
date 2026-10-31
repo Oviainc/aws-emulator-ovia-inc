@@ -477,6 +477,10 @@ pub struct SigningJobRecord {
     pub completion_due: Option<SystemTime>,
     pub requested_by: Option<String>,
     pub job_owner: String,
+    /// The AWS account that invoked this job — the account whose credentials made
+    /// the call that started it, which `jobInvoker` reports and the job listing's
+    /// invoker filter is compared against. `None` only for a job no credential
+    /// was resolved for.
     pub job_invoker: Option<String>,
     pub client_request_token: String,
     /// The revocation of the signature this job produced, once somebody has
@@ -2044,8 +2048,8 @@ pub struct JobListing {
     /// The `requestedBy` filter — the IAM principal that requested the job — or
     /// `None` when the call filters on no principal.
     pub requested_by: Option<String>,
-    /// The `jobInvoker` filter — the account that initiated the job on another
-    /// account's profile — or `None` when the call filters on no invoker.
+    /// The `jobInvoker` filter — the account that invoked the job — or `None`
+    /// when the call filters on no invoker.
     pub job_invoker: Option<String>,
     /// Whether the listing is narrowed to the jobs whose signature has been
     /// revoked, from `isRevoked`.
@@ -2322,6 +2326,19 @@ const CALLER_USER_NAME: &str = "emulator";
 pub fn caller_principal_arn(parts: &::http::request::Parts) -> Option<String> {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|_| ::engine::emulator_arn("iam", "", &format!("user/{CALLER_USER_NAME}")))
+}
+
+/// The AWS ACCOUNT the request's credentials belong to — the account AWS reports
+/// as having invoked an operation (a signing job's `jobInvoker`).
+///
+/// This emulator presents exactly ONE account, and every credential it accepts
+/// belongs to that account, so a signed request resolves to it. `None` for an
+/// unsigned request, which presents no credential and so names no account at
+/// all — the same split [`caller_principal_arn`] makes, because the two answer
+/// the same question about the same credential.
+pub fn caller_account_id(parts: &::http::request::Parts) -> Option<String> {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|_| ::engine::emulator_account_id().to_string())
 }
 
 /// `time` as the wire timestamp.

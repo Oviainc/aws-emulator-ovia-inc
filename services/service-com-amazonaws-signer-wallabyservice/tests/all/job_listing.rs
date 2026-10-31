@@ -434,11 +434,23 @@ async fn a_job_listing_reports_the_jobs_the_filters_the_call_named_select() {
             Vec::new(),
         ),
         (
-            // No seeded job was started on another account's profile, so none
-            // records an invoking account.
-            "an account that invoked no job",
+            // Every seeded job was started by this account's credentials, so
+            // every one records it as its invoker.
+            "the account that invoked every seeded job",
             format!("?jobInvoker={ACCOUNT_ID}"),
+            expected(None, false),
+        ),
+        (
+            // A well-formed account id (`AccountId` is 12 digits) that invoked
+            // none of them.
+            "an account that invoked no job",
+            "?jobInvoker=210987654321".to_string(),
             Vec::new(),
+        ),
+        (
+            "the invoking account crossed with a platform",
+            format!("?jobInvoker={ACCOUNT_ID}&platformId={PLATFORM_ID}"),
+            expected(Some(PLATFORM_ID), false),
         ),
     ];
 

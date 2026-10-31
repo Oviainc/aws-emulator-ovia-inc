@@ -20,8 +20,14 @@ mod cancel_profile_status_transitions;
 #[path = "all/error_responses.rs"]
 mod error_responses;
 
+#[path = "all/job_invoker_is_recorded.rs"]
+mod job_invoker_is_recorded;
+
 #[path = "all/job_listing.rs"]
 mod job_listing;
+
+#[path = "all/modelled_bound_refusal_wording.rs"]
+mod modelled_bound_refusal_wording;
 
 #[path = "all/next_token_refusal_wording.rs"]
 mod next_token_refusal_wording;

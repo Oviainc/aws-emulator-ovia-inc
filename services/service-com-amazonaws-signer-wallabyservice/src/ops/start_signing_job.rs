@@ -238,6 +238,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // identity this emulator resolves a caller as (`None` for an unsigned
         // request).
         let requested_by = crate::state::caller_principal_arn(ctx.parts());
+        // `jobInvoker` is "The AWS account ID of the job invoker": the account
+        // whose credentials made this call, which is the account a listing
+        // narrowed to the entity that initiated its jobs
+        // (`ListSigningJobs$jobInvoker`) is compared against. It is recorded for
+        // EVERY job, including one on this account's own profile — a job is
+        // invoked by somebody whether or not the profile belongs to somebody
+        // else, and `jobOwner` is the separate member that says whose profile it
+        // was.
+        let job_invoker = crate::state::caller_account_id(ctx.parts());
         // Signer is regional: a job signs with a profile of the region whose
         // endpoint started it, and the job belongs to that region too.
         let region = crate::state::request_region(ctx.parts());
@@ -331,10 +340,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             completion_due: Some(now + crate::state::JOB_COMPLETION_SPAN),
             requested_by,
             job_owner: ::engine::emulator_account_id().to_string(),
-            // `jobInvoker` is the entity that initiated a job on ANOTHER
-            // account's profile; a job on this one account's own profile has
-            // none.
-            job_invoker: None,
+            job_invoker,
             client_request_token: input.client_request_token.clone(),
             // A freshly started job's signature is trusted: the revocation record
             // is what `RevokeSignature` writes, and only when it is called.

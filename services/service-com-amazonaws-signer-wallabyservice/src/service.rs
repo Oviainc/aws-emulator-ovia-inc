@@ -24,10 +24,12 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. This service rewords ONE class — an input member
-//!   the model binds a LIST to the query string, for which the request supplied
-//!   nothing — and keeps the framework's wording for every other refusal. See
-//!   the inline note on that method.
+//!   before any handler ran. This service rewords the classes AWS Signer states
+//!   a rule of its own for — an input member the model binds a LIST to the query
+//!   string, for which the request supplied nothing; a signing-profile name
+//!   outside the character class its shape admits; a payload outside the byte
+//!   window its blob declares — and keeps the framework's wording for every
+//!   other refusal. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -49,7 +51,9 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
-use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+use aws_smithy_schema_server::constraints::{
+    LengthTrait, PatternTrait, Violation, ViolationKind,
+};
 use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
@@ -396,10 +400,10 @@ pub fn missing_list_member_constraint(member_name: &str) -> String {
 /// member the request supplied nothing for: one clause per member, in the order
 /// the violations arrive (the model's member order), each naming the member.
 ///
-/// `None` for every other refusal, which keeps the framework's own wording: a
-/// single-value member that is absent really was null, and a value present but
-/// outside a declared bound is already described accurately, with the offending
-/// value echoed.
+/// `None` for every other refusal, which is then offered to
+/// [`service_stated_constraint_refusal`] and, failing that, keeps the
+/// framework's own wording: a single-value member that is absent really was
+/// null.
 fn missing_list_member_refusal(violations: &[Violation]) -> Option<Refused> {
     if violations.is_empty() {
         return None;
@@ -416,6 +420,163 @@ fn missing_list_member_refusal(violations: &[Violation]) -> Option<Refused> {
     Some(Refused {
         code: VALIDATION_EXCEPTION_CODE.to_string(),
         message: clauses.join("; "),
+    })
+}
+
+/// How Signer states a signing-profile NAME outside the character class the
+/// modelled name shape admits.
+///
+/// The whole sentence is fixed: it carries nothing from the request — not the
+/// rejected name, and not the anchored expression the walk matched against —
+/// because what a caller can act on is the RULE a name has to meet, and the
+/// value it just sent is already in its own hands.
+const PROFILE_NAME_CHARACTER_CLASS: &str =
+    "Profile name must contain only alphanumeric characters and underscore.";
+
+/// How Signer states a blob whose size falls outside the window its modelled
+/// `@length` declares: what the member is, then the admissible RANGE in bytes,
+/// built from `bounds`.
+///
+/// The subject is the MEMBER's own name rather than a word per member
+/// ([`stated_subject`]), and both bounds are stated — the floor as much as the
+/// ceiling, which is what tells a caller an empty value is refused too. The size
+/// the request actually carried is not stated, because the window is the
+/// requirement and the measurement is not. `None` when the model declares only
+/// one of the two, since half a range is not a range: such a refusal keeps the
+/// framework's wording.
+fn blob_size_requirements(path: &str, bounds: LengthTrait) -> Option<String> {
+    let (min, max) = (bounds.min?, bounds.max?);
+    let subject = stated_subject(path)?;
+    Some(format!(
+        "{subject} does not meet size requirements: [{min}B - {max}B]"
+    ))
+}
+
+/// The member at `path` as a sentence names it: its own name with the first
+/// character upper-cased, the member path being lowerCamel. `None` for a path
+/// that names no single member (a nested or collection path), which has no
+/// subject to state.
+fn stated_subject(path: &str) -> Option<String> {
+    if path.contains('.') {
+        return None;
+    }
+    let mut characters = path.chars();
+    let first = characters.next()?;
+    Some(first.to_uppercase().chain(characters).collect())
+}
+
+/// The `@pattern` a signing-profile name is admitted by, as this model declares
+/// it — or `None` when it declares none.
+///
+/// Read off the generated input schema of the operation that CREATES a profile,
+/// whose one `@httpLabel` member IS that name (its route is
+/// `/signing-profiles/{profileName}`), so the expression here is the one the
+/// validating walk enforces and no member name has to be written out. Every other
+/// operation reaches the same name through the same modelled shape, and so
+/// declares the same expression — which is why matching on the EXPRESSION covers
+/// every one of them without naming an operation either.
+///
+/// EXACTLY one label is required: a route binding a second one would make "the
+/// label" ambiguous, and nothing is reworded rather than the wrong bound being
+/// reworded.
+fn profile_name_pattern() -> Option<&'static str> {
+    let mut labels = crate::ops::types::PUT_SIGNING_PROFILE_INPUT_SCHEMA
+        .members()
+        .iter()
+        .filter(|member| member.http_label().is_some());
+    let member = labels.next()?;
+    if labels.next().is_some() {
+        return None;
+    }
+    let declared = member.traits()?.get(&PatternTrait::TRAIT_ID)?;
+    Some(declared.as_any().downcast_ref::<PatternTrait>()?.regex)
+}
+
+/// The `@length` bounds this model declares for the input member whose violation
+/// path is `path`, where that member is a BLOB — the byte window a payload the
+/// service is handed has to fit.
+///
+/// Resolved by member path across every operation input ([`OPERATION_INPUTS`]),
+/// because `override_refusal` is handed the violations and not the operation they
+/// came from (`Refusal::Invalid` carries no schema). A path two inputs declare as
+/// a blob with DIFFERENT bounds is declined rather than guessed at, so no refusal
+/// can state a window the operation being called does not enforce.
+fn declared_blob_length(path: &str) -> Option<LengthTrait> {
+    let mut resolved: Option<LengthTrait> = None;
+    for (_, input) in OPERATION_INPUTS {
+        for member in input.members() {
+            if !matches!(member.shape_type(), ::aws_smithy_schema::ShapeType::Blob) {
+                continue;
+            }
+            if member.member_name().map(member_path).as_deref() != Some(path) {
+                continue;
+            }
+            let Some(declared) = member
+                .traits()
+                .and_then(|traits| traits.get(&LengthTrait::TRAIT_ID))
+                .and_then(|found| found.as_any().downcast_ref::<LengthTrait>())
+            else {
+                continue;
+            };
+            match resolved {
+                Some(first) if first != *declared => return None,
+                _ => resolved = Some(*declared),
+            }
+        }
+    }
+    resolved
+}
+
+/// A member's name as a violation's path spells it — the one spelling the
+/// validating walk writes, so a lookup here cannot drift from what it reported.
+fn member_path(member_name: &str) -> String {
+    ::aws_smithy_schema_server::constraints::path::member(member_name)
+}
+
+/// How this service words a refusal of ONE value the model bounds, for the two
+/// bounds AWS Signer publishes a rule of its own for: the character class a
+/// signing-profile name is admitted by, and the byte window a blob has to fit.
+///
+/// Both are stated from the MODEL — the expression a name is matched against and
+/// the bounds a blob declares — and neither echoes the request, which is what the
+/// framework's generic clause does instead.
+///
+/// `None` for every other refusal, and for a refusal carrying more than one
+/// violation: Signer's sentences each state ONE rule, so a request that broke
+/// several keeps the framework's enumerating envelope rather than being reported
+/// as though only one rule applied.
+///
+/// A size refusal also has to be about the member the window was read off: the
+/// bound the walk REPORTED is checked against the one that member declares, so a
+/// path resolving to anything else states nothing rather than a rule the refused
+/// value was never judged by.
+fn service_stated_constraint_refusal(violations: &[Violation]) -> Option<Refused> {
+    let [violation] = violations else {
+        return None;
+    };
+    let message = match &violation.kind {
+        ViolationKind::Pattern(violated) if profile_name_pattern() == Some(violated.as_str()) => {
+            PROFILE_NAME_CHARACTER_CLASS.to_string()
+        }
+        ViolationKind::MinLength(reported) => {
+            let bounds = declared_blob_length(&violation.path)?;
+            if bounds.min != Some(*reported) {
+                return None;
+            }
+            blob_size_requirements(&violation.path, bounds)?
+        }
+        ViolationKind::MaxLength(reported) => {
+            let bounds = declared_blob_length(&violation.path)?;
+            if bounds.max != Some(*reported) {
+                return None;
+            }
+            blob_size_requirements(&violation.path, bounds)?
+        }
+        _ => return None,
+    };
+    Some(Refused {
+        code: VALIDATION_EXCEPTION_CODE.to_string(),
+        message,
     })
 }
 
@@ -563,12 +724,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // list that is ABSENT and one that is EMPTY are the same request (an SDK
         // serializing an empty list emits no parameter at all). This service
         // states instead that such a member must carry something, naming it (see
-        // [`missing_list_member_constraint`]), and leaves every other refusal —
-        // a single-value member that really was absent, a value present but
-        // outside a declared bound — to the framework's own wording, which is
-        // accurate for those.
+        // [`missing_list_member_constraint`]).
+        //
+        // Two further classes are reworded, and for the same reason: AWS Signer
+        // publishes a rule of its own for them, so the generic clause — which
+        // quotes the caller's value and the raw model expression and states the
+        // requirement as a schema fact — is not how this service's refusal reads.
+        // A signing-profile name outside the class its shape admits is answered
+        // with that class, and a payload outside the byte window its blob
+        // declares with that window (see
+        // [`service_stated_constraint_refusal`]).
+        //
+        // Every other refusal keeps the framework's own wording — a single-value
+        // member that really was absent, a value outside a bound this service
+        // publishes no sentence for — which is accurate for those.
         match refusal {
-            Refusal::Invalid(violations) => missing_list_member_refusal(violations),
+            Refusal::Invalid(violations) => missing_list_member_refusal(violations)
+                .or_else(|| service_stated_constraint_refusal(violations)),
             _ => None,
         }
     }
