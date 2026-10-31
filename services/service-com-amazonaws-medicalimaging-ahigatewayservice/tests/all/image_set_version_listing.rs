@@ -63,7 +63,10 @@ fn unheld_id() -> String {
 /// `POST /datastore/{datastoreId}/imageSet/{imageSetId}/listImageSetVersions` with the
 /// query string `query`
 /// (`smithy_query(query="operation",operation="ListImageSetVersions")`).
-async fn list_versions(
+///
+/// `pub(crate)` because `crate::image_set_lock_visibility` reads the same listing while a
+/// write holds the image set, which is that suite's rule rather than this one's.
+pub(crate) async fn list_versions(
     emulator: &Emulator,
     datastore_id: &str,
     image_set_id: &str,
@@ -91,7 +94,9 @@ async fn get_image_set(
 }
 
 /// The `imageSetPropertiesList` of one answer, as JSON objects.
-fn properties(answer: &Answer) -> Vec<Value> {
+///
+/// `pub(crate)` for the reason [`list_versions`] is.
+pub(crate) fn properties(answer: &Answer) -> Vec<Value> {
     answer
         .field(&["imageSetPropertiesList"])
         .as_array()
@@ -100,7 +105,9 @@ fn properties(answer: &Answer) -> Vec<Value> {
 }
 
 /// The `versionId` of every entry in one answer, in the order served.
-fn listed_versions(answer: &Answer) -> Vec<String> {
+///
+/// `pub(crate)` for the reason [`list_versions`] is.
+pub(crate) fn listed_versions(answer: &Answer) -> Vec<String> {
     properties(answer)
         .iter()
         .map(|entry| entry["versionId"].as_str().unwrap_or_default().to_string())

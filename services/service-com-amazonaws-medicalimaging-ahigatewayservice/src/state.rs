@@ -1552,6 +1552,10 @@ impl ImageSet {
     /// INSTANT ([`ImageSetVersion::superseded_attributes`]): whatever content the new
     /// version goes on to carry, the version it replaced still reports the content it
     /// was serving, which is what a revert to that version restores.
+    ///
+    /// `image_set_state` is the state the IMAGE SET is in from this instant, so it reaches
+    /// every version ([`ImageSet::set_state_on_every_version`]); `workflow_status` — what
+    /// last happened — is recorded on the new version alone.
     pub fn push_version(
         &mut self,
         image_set_state: ImageSetState,
@@ -1575,6 +1579,10 @@ impl ImageSet {
         );
         superseded.superseded_attributes = Some(superseded_attributes);
         self.earlier_versions.push(superseded);
+        // The one writer of the member, so the version just built and the versions behind
+        // it cannot disagree about the state the image set is in. (`ImageSetVersion` names
+        // the member as required, so the literal above has to carry it too.)
+        self.set_state_on_every_version(image_set_state);
         version_id
     }
 
@@ -1644,9 +1652,10 @@ impl ImageSet {
 
     /// Put EVERY version of this image set into `image_set_state`.
     ///
-    /// Used where a change concerns the whole image set rather than one snapshot of it —
-    /// its retirement — so that no version is left reporting a state the image set no
-    /// longer has.
+    /// `ImageSetState` is whether the image set can be read and written, which is a
+    /// property of the image set rather than of one snapshot of it, so every change of it
+    /// — the lock a write in flight takes, the release of that lock, a retirement — goes
+    /// through here and no version is left reporting a state the image set no longer has.
     pub fn set_state_on_every_version(&mut self, image_set_state: ImageSetState) {
         self.latest_version.image_set_state = image_set_state;
         for version in &mut self.earlier_versions {
@@ -1662,7 +1671,11 @@ impl ImageSet {
         if now < pending.due_at {
             return;
         }
-        self.latest_version.image_set_state = pending.image_set_state;
+        // The state the transition lands reaches EVERY version, by the rule every other
+        // writer of it follows ([`ImageSet::set_state_on_every_version`]): it is the state
+        // the image set is in, not one version's. The workflow status — what last happened
+        // — stays on the version it happened to.
+        self.set_state_on_every_version(pending.image_set_state);
         self.latest_version.workflow_status = pending.workflow_status;
         // The due instant, not `now`: `updatedAt` must not move between reads.
         self.latest_version.updated_at = pending.due_at;
@@ -1697,12 +1710,6 @@ impl ImageSet {
         if pending.retires_image_set {
             self.deleted_at = Some(pending.due_at);
             self.release_content();
-            // Retiring the image set reaches EVERY version of it. `ImageSetState` is
-            // whether the image set can be read and written, which is a property of the
-            // image set rather than of one snapshot of it, so no version of a retired
-            // image set is left reporting a state it no longer has; the workflow status
-            // — what last happened — stays on the version it happened to.
-            self.set_state_on_every_version(pending.image_set_state);
         }
         self.pending = None;
     }

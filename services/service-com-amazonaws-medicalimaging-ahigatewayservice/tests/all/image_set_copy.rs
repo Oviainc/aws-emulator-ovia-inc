@@ -61,11 +61,18 @@ fn unheld_id() -> String {
 /// The workflow status a seeded image set carries going in: `IMPORTED`, which is what a
 /// DICOM import leaves behind, and the status the source must be back on once the copy
 /// it took part in has completed.
-const SEEDED_WORKFLOW_STATUS: ImageSetWorkflowStatus = ImageSetWorkflowStatus::Imported;
+///
+/// `pub(crate)` because `crate::image_set_lock_visibility` asserts what a seeded version
+/// still reports while a write holds the image set, so its expectation is tied to what
+/// this seeder writes rather than spelled again.
+pub(crate) const SEEDED_WORKFLOW_STATUS: ImageSetWorkflowStatus = ImageSetWorkflowStatus::Imported;
 
 /// The workflow status a seeded image set's LATER versions carry, so a case that reads
 /// an earlier version back can tell the versions apart.
-const SEEDED_LATER_WORKFLOW_STATUS: ImageSetWorkflowStatus = ImageSetWorkflowStatus::Updated;
+///
+/// `pub(crate)` for the reason [`SEEDED_WORKFLOW_STATUS`] is.
+pub(crate) const SEEDED_LATER_WORKFLOW_STATUS: ImageSetWorkflowStatus =
+    ImageSetWorkflowStatus::Updated;
 
 /// Seed one `ACTIVE` image set with `versions` versions into a data store the emulator
 /// already holds, and answer its identifier. The image set is seeded OUTSIDE the primary

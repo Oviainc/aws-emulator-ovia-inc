@@ -845,7 +845,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .to_string(),
                 })
             })?;
-        source.latest_version.image_set_state = ImageSetState::Locked;
+        // The lock reaches every version: it is the state the image set is in while the
+        // copy runs, not the state of one snapshot of it, so no version is left reporting
+        // `ACTIVE` for an image set every writer refuses
+        // ([`crate::state::ImageSet::set_state_on_every_version`]). The workflow status —
+        // what last happened — is recorded on the latest version.
+        source.set_state_on_every_version(ImageSetState::Locked);
         source.latest_version.workflow_status = ImageSetWorkflowStatus::CopyingWithReadOnlyAccess;
         source.latest_version.updated_at = now;
         // The copy READ this source's pixel data and DICOM attributes just above, so the

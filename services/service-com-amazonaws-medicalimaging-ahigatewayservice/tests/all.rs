@@ -43,6 +43,8 @@ mod image_set_copy_subsets;
 mod image_set_copy_tombstones;
 #[path = "all/image_set_deletion.rs"]
 mod image_set_deletion;
+#[path = "all/image_set_lock_visibility.rs"]
+mod image_set_lock_visibility;
 #[path = "all/image_set_metadata.rs"]
 mod image_set_metadata;
 #[path = "all/image_set_metadata_updates.rs"]

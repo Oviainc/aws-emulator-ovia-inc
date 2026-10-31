@@ -126,7 +126,10 @@ fn seed_frames(
 /// retirement mid-flight ([`HELD`]) or make it fall due without sleeping, instead of
 /// racing a 500 ms span. The suite below this one drives the same rule through the REAL
 /// clock with no write at all.
-fn move_due_instant(
+///
+/// `pub(crate)` because `crate::image_set_lock_visibility` holds a COPY and a metadata
+/// update mid-flight the same way, which is that suite's rule rather than this one's.
+pub(crate) fn move_due_instant(
     emulator: &Emulator,
     case: &str,
     datastore_id: &str,
