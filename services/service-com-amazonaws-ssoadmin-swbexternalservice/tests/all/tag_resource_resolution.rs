@@ -15,9 +15,11 @@
 //!    ARN names, scoped by that `InstanceArn` — never created, already deleted, gone with
 //!    its instance or held under another instance is the same answer either way, the
 //!    modelled `ResourceNotFoundException`;
-//! 3. and for the two WRITES only, a resource whose holding instance is still being
-//!    created is refused with the modelled `ConflictException`, while the REPORT of its
-//!    tags is served.
+//! 3. and a resource whose holding instance is still being created is refused by all
+//!    three, on the channel each one's model carries: the modelled `ConflictException`
+//!    (HTTP 400) for the two writes, and the modelled `AccessDeniedException` (HTTP 403)
+//!    for the report, whose model declares no `ConflictException` — one window, one
+//!    message, since that window serves only the instance's own describe and delete.
 //!
 //! One detail of the refusal is NOT shared: a tag WRITE names the resource kind and the id
 //! it was asked for, while the REPORT words a missing APPLICATION as the application's own
@@ -179,9 +181,25 @@ fn assert_refusal(
     status: u16,
     body: &Value,
 ) {
+    assert_refusal_with_status(case, what, 400, expected_code, expected_message, status, body);
+}
+
+/// The same assertion for a refusal whose error shape carries an HTTP status of its own —
+/// the `AccessDeniedException` (403) the report answers the creation window on, beside the
+/// `ConflictException` (400) the two writes answer the SAME window on.
+#[allow(clippy::too_many_arguments)]
+fn assert_refusal_with_status(
+    case: &str,
+    what: &str,
+    expected_status: u16,
+    expected_code: &str,
+    expected_message: &str,
+    status: u16,
+    body: &Value,
+) {
     assert_eq!(
-        status, 400,
-        "case {case:?}: {what} must be refused 400, got {status} {body}"
+        status, expected_status,
+        "case {case:?}: {what} must be refused {expected_status}, got {status} {body}"
     );
     assert_eq!(
         error_code(body),
@@ -495,15 +513,15 @@ fn hold_creation_window(engine: &Arc<engine::InMemoryEngine>, due_at: SystemTime
     });
 }
 
-/// Step 3, which only the two WRITES take: while the instance holding the resource is
-/// still being created, both writes are refused with the modelled `ConflictException` and
-/// store nothing, while the REPORT of the same resource's tags is served — and once the
-/// activation falls due the same writes are served.
+/// Step 3, which all three operations take: while the instance holding the resource is
+/// still being created, every tag call on it is refused with the SAME message on the
+/// channel its own model carries — the two writes store nothing and the report serves
+/// nothing — and once the activation falls due the same calls are served.
 #[tokio::test]
-async fn only_the_writes_withhold_a_resource_whose_instance_is_still_being_created() {
+async fn every_tag_operation_withholds_a_resource_whose_instance_is_still_being_created() {
     let fixture = fixture("creating").await;
     hold_creation_window(&fixture.engine, SystemTime::now() + Duration::from_secs(3_600));
-    let conflict = state::instance_creation_in_progress_message(&fixture.instance_arn);
+    let refusal = state::instance_creation_in_progress_message(&fixture.instance_arn);
 
     for (kind, resource_arn, _) in &fixture.resources {
         let case = format!("{kind} held under an instance still being created");
@@ -519,7 +537,7 @@ async fn only_the_writes_withhold_a_resource_whose_instance_is_still_being_creat
             &case,
             "TagResource",
             "ConflictException",
-            &conflict,
+            &refusal,
             status,
             &body,
         );
@@ -535,30 +553,44 @@ async fn only_the_writes_withhold_a_resource_whose_instance_is_still_being_creat
             &case,
             "UntagResource",
             "ConflictException",
-            &conflict,
+            &refusal,
             status,
             &body,
         );
 
-        // The report is served throughout, and it shows both writes stored nothing.
+        // The report is withheld in that window too — it is neither the instance's own
+        // describe nor its own delete — and it says so on the channel ITS model carries.
+        let (status, listed) =
+            list_tags(&fixture.router, Some(&fixture.instance_arn), resource_arn).await;
+        assert_refusal_with_status(
+            &case,
+            "ListTagsForResource",
+            403,
+            "AccessDeniedException",
+            &refusal,
+            status,
+            &listed,
+        );
+    }
+
+    // Once the clock makes the activation due, the SAME calls are served: the refusals
+    // above came from the instance's status and from nothing else — and the report shows
+    // the refused writes stored nothing.
+    hold_activation(&fixture.engine, SystemTime::now() - Duration::from_secs(60));
+    for (kind, resource_arn, _) in &fixture.resources {
+        let case = format!("{kind} once the activation has fallen due");
+
         let (status, listed) =
             list_tags(&fixture.router, Some(&fixture.instance_arn), resource_arn).await;
         assert_eq!(
             status, 200,
-            "case {case:?}: ListTagsForResource must still answer 200, got {status} {listed}"
+            "case {case:?}: ListTagsForResource must be served, got {status} {listed}"
         );
         assert_eq!(
             reported(&listed),
             seed_pairs(),
-            "case {case:?}: a refused write must leave the stored set alone, got {listed}"
+            "case {case:?}: the writes refused in the window stored nothing, got {listed}"
         );
-    }
-
-    // Once the clock makes the activation due, the SAME writes are served: the refusals
-    // above came from the instance's status and from nothing else.
-    hold_activation(&fixture.engine, SystemTime::now() - Duration::from_secs(60));
-    for (kind, resource_arn, _) in &fixture.resources {
-        let case = format!("{kind} once the activation has fallen due");
 
         let (status, body) = tag_resource(
             &fixture.router,

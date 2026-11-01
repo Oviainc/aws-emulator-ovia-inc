@@ -13,12 +13,20 @@
 //!
 //! Every call goes through `MultiServiceRouter::dispatch`, so the modelled constraints,
 //! the `awsJson1_1` envelope and the `X-Amz-Target` routing are exercised rather than
-//! bypassed. The harness is the one `ssoadmin_permission_sets.rs` owns.
+//! bypassed. The harness is the one `ssoadmin_permission_sets.rs` owns. The instance row
+//! moves the activation instant its `CreateInstance` fixed into the past before reading,
+//! because the tag report — like every call but the instance's own describe and delete — is
+//! withheld while the creation is in flight (`instance_create_in_progress_reads.rs`); that
+//! is the clock's business, not the wire's, and the transition itself is still applied by
+//! the service's own `materialize_due`.
+
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ssoadmin_permission_sets::{call, empty_account_router, organization_router};
+use crate::instance_create::{empty_account_router, hold_activation};
+use crate::ssoadmin_permission_sets::{call, organization_router};
 
 /// The provider a customer managed application is created under: the `custom` entry of
 /// the published catalog (`state::BUILT_IN_APPLICATION_PROVIDERS`), the one
@@ -327,8 +335,12 @@ async fn a_created_instance_reports_the_tag_set_its_create_persisted() {
     for set in tag_sets() {
         // An account holds ONE instance, so each row gets its own account: the shared
         // harness's "this account holds none" setup.
-        let router = empty_account_router();
+        let (router, engine) = empty_account_router();
         let instance_arn = create_instance(&router, set.request_tags()).await;
+        // The create owes the instance an activation, and until it falls due the instance
+        // serves only its own describe and delete; this row's subject is the stored tag
+        // set, so the owed instant is moved into the past before the report is asked for.
+        hold_activation(&engine, SystemTime::now() - Duration::from_secs(60));
         let case = format!("{} of an instance", set.label);
         let body = tags_of(&router, &case, &instance_arn).await;
         assert_eq!(

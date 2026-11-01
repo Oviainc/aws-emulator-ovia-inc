@@ -291,7 +291,7 @@ pub fn permission_set_not_found_message(permission_set_arn: &str) -> String {
 /// [`ComAmazonawsSsoadminSwbexternalserviceState::permission_set_target_mut`].
 ///
 /// Each operation declares its own error enum, so the resolution answers the refusal and
-/// the handler maps it onto the variant its model carries — the division [`TagWriteRefusal`]
+/// the handler maps it onto the variant its model carries — the division [`TagRefusal`]
 /// already keeps for the tag surface. The error shape a handler builds from it carries this
 /// message and no `reason`: the model's `ValidationExceptionReason` and
 /// `ResourceNotFoundExceptionReason` enums carry only KMS key states, none of which these
@@ -944,23 +944,28 @@ pub fn tag_report_not_found_message(resource_arn: &str) -> String {
     taggable_resource_not_found_message(resource_arn)
 }
 
-/// Why a tag WRITE could not reach the resource its `ResourceArn` named, as resolved by
+/// Why a tag call could not reach the resource its `ResourceArn` named, as resolved by
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::tag_target`] and
 /// [`ComAmazonawsSsoadminSwbexternalserviceState::tag_target_mut`].
 ///
 /// Each operation declares its own error enum, so the resolution answers the refusal and
 /// the handler maps it onto the variant its model carries — the division
 /// [`ComAmazonawsSsoadminSwbexternalserviceState::add_region`] and [`cursor_after`]
-/// already keep. The reporting side needs no such enum: its only refusal is the
-/// not-found, so [`ComAmazonawsSsoadminSwbexternalserviceState::tag_target`] answers that
-/// message directly.
+/// already keep. BOTH sides of the tag surface answer the same two refusals, because both
+/// resolve the resource the same way and both are withheld while the instance holding it
+/// is still being created; only the channel each one lands on differs, and that is the
+/// handler's business.
 #[derive(Debug)]
-pub enum TagWriteRefusal {
+pub enum TagRefusal {
     /// Nothing the request could tag is held under the ARNs it named: the operation's
     /// modelled `ResourceNotFoundException` carries this message.
     NotFound(String),
-    /// The instance holding the resource is still being created, so the write is the
-    /// conflict with that `CreateInstance`: the operation's modelled `ConflictException`
-    /// carries this message.
+    /// The instance holding the resource is still being created, so this call is not one
+    /// that window serves ([`instance_creation_in_progress_message`]): the two writes
+    /// carry this message on their modelled `ConflictException`, and the report — whose
+    /// model declares no `ConflictException` — on its modelled `AccessDeniedException`,
+    /// the channel every instance-scoped read of this service answers an instance it may
+    /// not act on with.
     Conflict(String),
 }
 
@@ -2995,11 +3000,12 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     }
 
     /// Whether the instance `instance_arn` names is still being CREATED
-    /// ([`Instance::creation_in_progress`]) — what every operation that MUTATES an
-    /// instance, or a resource held under it, asks before it writes: only the instance's
-    /// own describe and delete are available in that window, so everything else is
-    /// refused on its modelled conflict channel
-    /// ([`instance_creation_in_progress_message`]).
+    /// ([`Instance::creation_in_progress`]) — what every operation OTHER than that
+    /// instance's own describe and delete asks about the instance it resolves, whether
+    /// that operation reports or writes: only those two are available in that window, so
+    /// every other call on the instance, or on a resource held under it, is refused with
+    /// [`instance_creation_in_progress_message`] on the channel its own model carries
+    /// (see [`Self::instance_creation_in_progress_gate`]).
     ///
     /// `false` for an ARN this account holds no instance for: that request is a missing
     /// resource, which each operation answers on its own not-found channel — the same
@@ -3007,6 +3013,29 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     pub fn instance_creation_in_progress(&self, instance_arn: &str) -> bool {
         self.instance(instance_arn)
             .is_some_and(Instance::creation_in_progress)
+    }
+
+    /// That window as the REFUSAL it earns, so every operation it withholds states the
+    /// rule once: `Err` carrying [`instance_creation_in_progress_message`] while the
+    /// instance `instance_arn` names is still being created, `Ok(())` otherwise.
+    ///
+    /// Asked by every operation but the instance's own describe and delete, once the
+    /// instance itself is resolved and before anything finer the request names, because
+    /// the window withholds the call whatever else it asks for. `Ok(())` for an ARN this
+    /// account holds no instance for, exactly as
+    /// [`Self::instance_creation_in_progress`] answers `false` for it: that request is a
+    /// missing resource, reported on each operation's own not-found channel.
+    ///
+    /// The CHANNEL is the caller's, as it is for every refusal this module words: the
+    /// operations whose model declares a `ConflictException` answer there, and the
+    /// instance-scoped reads, whose models declare none, on their modelled
+    /// `AccessDeniedException` — the same channel each of them already answers an
+    /// instance this account does not hold on ([`instance_not_found_message`]).
+    pub fn instance_creation_in_progress_gate(&self, instance_arn: &str) -> Result<(), String> {
+        if self.instance_creation_in_progress(instance_arn) {
+            return Err(instance_creation_in_progress_message(instance_arn));
+        }
+        Ok(())
     }
 
     /// Apply every transition the CLOCK already owes: see [`Instance::materialize_due`],
@@ -3520,10 +3549,10 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// holding the mapping is resolved).
     ///
     /// This step has ONE refusal, so it answers that message directly and needs no refusal
-    /// enum — the division [`TagWriteRefusal`] keeps for the reporting side of the tag
-    /// surface. The same rule either way: [`Self::permission_set_surface`] asks exactly
-    /// this first, so the gate has one implementation and an operation that takes both
-    /// steps together cannot answer it differently from one that takes them apart.
+    /// enum — the division [`TagRefusal`] keeps for the tag surface, whose calls can be
+    /// refused two ways. The same rule either way: [`Self::permission_set_surface`] asks
+    /// exactly this first, so the gate has one implementation and an operation that takes
+    /// both steps together cannot answer it differently from one that takes them apart.
     pub fn permission_set_surface_gate(&self, instance_arn: &str) -> Result<(), String> {
         if self.permission_set_surface_withdrawn(instance_arn) {
             return Err(ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string());
@@ -3685,9 +3714,9 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// The INSTANCE that holds the taggable resource `resource_arn` names, or `None` for
     /// an ARN this account holds no resource under.
     ///
-    /// What [`Self::tag_target_mut`] asks to reach the status of the instance the resource
-    /// lives under ([`Self::instance_creation_in_progress`]): an instance is itself
-    /// taggable, so
+    /// What [`Self::tag_holder_ready`] asks to reach the status of the instance the
+    /// resource lives under ([`Self::instance_creation_in_progress`]): an instance is
+    /// itself taggable, so
     /// this answers the instance's own ARN for it and the holding instance's for a
     /// permission set, an application or a trusted token issuer.
     fn taggable_resource_instance(&self, resource_arn: &str) -> Option<&str> {
@@ -3736,8 +3765,7 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     }
 
     /// THE resolution the whole tag surface shares, for an operation that REPORTS the tag
-    /// set: the tags of the resource a tag request names, or the message of the
-    /// not-found its caller models.
+    /// set: the tags of the resource a tag request names, or the refusal it earns instead.
     ///
     /// `instance_arn` is the request's optional `InstanceArn`. When a caller sends one it
     /// names the instance the resource is expected to live under, so an ARN this account
@@ -3747,34 +3775,40 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// its instance, or held elsewhere — the same answer either way
     /// ([`taggable_resource_not_found_message`]). A resource that exists and carries no
     /// tag is an EMPTY set, which is a different answer from that refusal.
+    ///
+    /// And the instance that HOLDS the resource decides whether this call is available at
+    /// all, exactly as it does for the two writes below ([`Self::tag_holder_ready`]): an
+    /// instance still being created serves only its own describe and delete, and a tag
+    /// report is neither.
     pub fn tag_target(
         &self,
         instance_arn: Option<&str>,
         resource_arn: &str,
-    ) -> Result<&Vec<Tag>, String> {
-        self.tag_request_instance_scope(instance_arn)?;
+    ) -> Result<&Vec<Tag>, TagRefusal> {
+        self.tag_request_instance_scope(instance_arn)
+            .map_err(TagRefusal::NotFound)?;
+        self.tag_holder_ready(resource_arn)
+            .map_err(TagRefusal::Conflict)?;
         self.taggable_resource_tags(instance_arn, resource_arn)
-            .ok_or_else(|| tag_report_not_found_message(resource_arn))
+            .ok_or_else(|| TagRefusal::NotFound(tag_report_not_found_message(resource_arn)))
     }
 
-    /// The same resolution for an operation that CHANGES the tag set, which withholds one
-    /// thing more: the instance that HOLDS the resource decides whether the write is
-    /// available at all, since an instance still being created serves only its own
-    /// describe and delete, so a tag write on it — or on anything under it — is the
-    /// conflict with the `CreateInstance` still in flight
-    /// ([`Self::instance_creation_in_progress`]).
+    /// The same resolution for an operation that CHANGES the tag set. Takes exactly the
+    /// steps the report takes, in the same order, so a write and a report of the same ARNs
+    /// never disagree about which resource they name or about whether the instance holding
+    /// it serves them at all.
     pub fn tag_target_mut(
         &mut self,
         instance_arn: Option<&str>,
         resource_arn: &str,
-    ) -> Result<&mut Vec<Tag>, TagWriteRefusal> {
+    ) -> Result<&mut Vec<Tag>, TagRefusal> {
         self.tag_request_instance_scope(instance_arn)
-            .map_err(TagWriteRefusal::NotFound)?;
-        self.tag_write_holder_ready(resource_arn)
-            .map_err(TagWriteRefusal::Conflict)?;
+            .map_err(TagRefusal::NotFound)?;
+        self.tag_holder_ready(resource_arn)
+            .map_err(TagRefusal::Conflict)?;
         self.taggable_resource_tags_mut(instance_arn, resource_arn)
             .ok_or_else(|| {
-                TagWriteRefusal::NotFound(taggable_resource_not_found_message(resource_arn))
+                TagRefusal::NotFound(taggable_resource_not_found_message(resource_arn))
             })
     }
 
@@ -3788,14 +3822,18 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         }
     }
 
-    /// Whether the instance holding the named resource is far enough along to take a tag
-    /// write, as the `Err` message of the conflict it earns while it is not.
-    fn tag_write_holder_ready(&self, resource_arn: &str) -> Result<(), String> {
-        match self
-            .taggable_resource_instance(resource_arn)
-            .filter(|holder| self.instance_creation_in_progress(holder))
-        {
-            Some(holder) => Err(instance_creation_in_progress_message(holder)),
+    /// Whether the instance holding the named resource is far enough along to serve a tag
+    /// call at all, as the `Err` message of the refusal it earns while it is not.
+    ///
+    /// The instance's `CREATE_IN_PROGRESS` window, asked through the gate every
+    /// instance-scoped operation of this service asks
+    /// ([`Self::instance_creation_in_progress_gate`]) and about the HOLDER rather than
+    /// about the request's optional `InstanceArn`: a resource is withheld by the instance
+    /// it really lives under, whether or not the caller named it. An instance is itself
+    /// taggable, so for an instance ARN the holder is the instance itself.
+    fn tag_holder_ready(&self, resource_arn: &str) -> Result<(), String> {
+        match self.taggable_resource_instance(resource_arn) {
+            Some(holder) => self.instance_creation_in_progress_gate(holder),
             None => Ok(()),
         }
     }

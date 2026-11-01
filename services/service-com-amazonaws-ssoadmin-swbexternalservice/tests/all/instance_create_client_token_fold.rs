@@ -29,9 +29,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_ssoadmin_swbexternalservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ssoadmin_permission_sets::{
-    assert_refused, call, empty_account_router, is_instance_arn,
-};
+use crate::ssoadmin_permission_sets::{assert_refused, call, is_instance_arn};
 
 /// One `CreateInstance` request of a row, minus the `ClientToken` every call of the row
 /// shares: the `Name` it carries (`None` for no member at all) and the `Tags` it carries
@@ -338,7 +336,7 @@ async fn reported_tags(router: &MultiServiceRouter, resource_arn: &str) -> Vec<(
 #[tokio::test]
 async fn a_reused_client_token_replays_only_the_same_name_and_tag_multiset() {
     for (index, row) in rows().into_iter().enumerate() {
-        let router = empty_account_router();
+        let (router, engine) = crate::instance_create::empty_account_router();
         let token = format!("c0ffee00-0000-4000-8000-00000000{index:04}");
 
         let (status, created) = call(&router, "CreateInstance", &body(&token, &row.first)).await;
@@ -355,6 +353,15 @@ async fn a_reused_client_token_replays_only_the_same_name_and_tag_multiset() {
             is_instance_arn(&instance_arn),
             "case {:?}: expected a modelled InstanceArn, got {instance_arn:?}",
             row.label
+        );
+        // The create owes the instance an activation, and until it falls due the instance
+        // serves only its own describe and delete, the tag report among the calls it
+        // withholds (`instance_create_in_progress_reads.rs`). This suite's subject is the
+        // tag MULTISET a token belongs to, so the owed instant is moved into the past —
+        // the clock's business, not the wire's — before any report is asked for.
+        crate::instance_create::hold_activation(
+            &engine,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60),
         );
         let after_create = reported_tags(&router, &instance_arn).await;
 

@@ -13,12 +13,14 @@
 //! order, which is also the order the pagination cursor resumes in. An ARN this account
 //! holds nothing under, or holds under an instance other than the `InstanceArn` the
 //! request carried, is refused with the modelled `ResourceNotFoundException` rather than
-//! answered with an empty tag list; a `NextToken` this enumeration did not issue is
-//! refused with the modelled `ValidationException`. The operation models no `MaxResults`
-//! and a resource carries at most [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, fewer
-//! than this service's default page size, so today one page holds every tag a resource
-//! can carry: the cursor is here because the model declares the operation `@paginated`,
-//! not because a page is expected to truncate.
+//! answered with an empty tag list; a resource whose holding instance is still being
+//! created is refused with the modelled `AccessDeniedException`, since that window serves
+//! only the instance's own describe and delete; and a `NextToken` this enumeration did not
+//! issue is refused with the modelled `ValidationException`. The operation models no
+//! `MaxResults` and a resource carries at most [`crate::state::MAX_TAGS_PER_RESOURCE`]
+//! tags, fewer than this service's default page size, so today one page holds every tag a
+//! resource can carry: the cursor is here because the model declares the operation
+//! `@paginated`, not because a page is expected to truncate.
 //!
 //! ## Shape of an operation
 //!
@@ -196,21 +198,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the account's ambient instance if nothing has enabled one yet.
         store.on_request(&region, ::std::time::SystemTime::now());
 
-        // The resource a tag request names is resolved by the ONE rule the whole tag
-        // surface shares (`crate::state::...::tag_target`); this handler only maps the
-        // refusal it answers onto the not-found THIS operation models. A resource that
-        // exists and carries no tag is an EMPTY list, which is a different answer from
-        // that refusal.
+        // The resource a tag request names — and whether the instance holding it serves
+        // this call at all — is resolved by the ONE rule the whole tag surface shares
+        // (`crate::state::...::tag_target`); this handler only maps the refusal it answers
+        // onto the errors THIS operation models. A resource that exists and carries no tag
+        // is an EMPTY list, which is a different answer from either refusal.
         let ordered = store
             .tag_target(input.instance_arn.as_deref(), &input.resource_arn)
             .map(|tags| crate::state::tags_in_key_order(tags))
-            .map_err(|message| {
-                ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(message),
-                        reason: None,
-                    },
-                )
+            .map_err(|refusal| match refusal {
+                crate::state::TagRefusal::NotFound(message) => {
+                    ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
+                // The instance holding the resource is still being created, a window that
+                // serves only that instance's own describe and delete — which this report
+                // is neither. The model declares no `ConflictException` here, the channel
+                // the two tag writes answer it on, so it goes on the modelled
+                // `AccessDeniedException`: the same channel this service's instance-scoped
+                // reads answer an instance the caller may not act on with.
+                crate::state::TagRefusal::Conflict(message) => {
+                    ListTagsForResourceErrorModeled::AccessDeniedException(
+                        AccessDeniedException {
+                            message: Some(message),
+                            reason: None,
+                        },
+                    )
+                }
             })?;
 
         // The operation models no `MaxResults`, so the page size is this service's own

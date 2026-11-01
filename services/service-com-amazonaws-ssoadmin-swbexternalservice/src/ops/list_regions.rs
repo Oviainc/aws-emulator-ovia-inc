@@ -8,7 +8,10 @@
 //! A pure read — every record the instance holds, whatever its `RegionStatus` ("including
 //! those that are being added or removed … ACTIVE, ADDING, or REMOVING") — in `RegionName`
 //! order, paged by `MaxResults` with a `NextToken` that resumes after the name the
-//! previous page ended on and is absent on the last page.
+//! previous page ended on and is absent on the last page. An `InstanceArn` this account
+//! holds no instance for, and an instance whose creation has not finished — a window that
+//! serves only that instance's own describe and delete — are both refused with the
+//! modelled `AccessDeniedException`, this operation's only such channel.
 //!
 //! ## Shape of an operation
 //!
@@ -201,6 +204,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
+            // An instance whose own CREATION has not finished serves only its own describe
+            // and delete ("While the instance is in the CREATE_IN_PROGRESS state, you can
+            // call only DescribeInstance and DeleteInstance operations"), so its Regions
+            // are not enumerated here yet — asked through the gate every instance-scoped
+            // operation of this service asks
+            // (`crate::state::...::instance_creation_in_progress_gate`). This operation
+            // models no `ConflictException`, the channel the instance's writes answer that
+            // window on, so the refusal joins the not-found above on the modelled
+            // `AccessDeniedException` channel.
+            if let Err(message) = store.instance_creation_in_progress_gate(&input.instance_arn) {
+                return Err(ListRegionsErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(message),
+                        reason: None,
+                    },
+                )
+                .into());
+            }
             // Every Region record the instance holds, whatever its status — the operation
             // "returns Regions with ACTIVE, ADDING, or REMOVING status" — keyed by the
             // `RegionName`, which is unique on one instance and is both the page order and

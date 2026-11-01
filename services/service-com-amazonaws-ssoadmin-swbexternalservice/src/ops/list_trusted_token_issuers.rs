@@ -8,7 +8,10 @@
 //!
 //! A REPORT: it writes nothing of its own. The only change it lets the store make is what
 //! the CLOCK already owes — an instance whose deletion instant has passed is gone, and the
-//! trusted token issuers held inside it with it.
+//! trusted token issuers held inside it with it. An `InstanceArn` this account holds no
+//! instance for, and an instance whose creation has not finished — a window that serves
+//! only that instance's own describe and delete — are both refused with the modelled
+//! `AccessDeniedException`, this operation's only such channel.
 //!
 //! ## Shape of an operation
 //!
@@ -214,6 +217,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(crate::state::instance_not_found_message(
                             &input.instance_arn,
                         )),
+                        reason: None,
+                    },
+                )
+                .into());
+            }
+            // An instance whose own CREATION has not finished serves only its own describe
+            // and delete ("While the instance is in the CREATE_IN_PROGRESS state, you can
+            // call only DescribeInstance and DeleteInstance operations"), so nothing held
+            // under it is enumerated here yet — asked through the gate every
+            // instance-scoped operation of this service asks
+            // (`crate::state::...::instance_creation_in_progress_gate`). This operation
+            // models no `ConflictException`, the channel the instance's writes answer that
+            // window on, so the refusal joins the not-found above on the modelled
+            // `AccessDeniedException` channel.
+            if let Err(message) = store.instance_creation_in_progress_gate(&input.instance_arn) {
+                return Err(ListTrustedTokenIssuersErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(message),
                         reason: None,
                     },
                 )

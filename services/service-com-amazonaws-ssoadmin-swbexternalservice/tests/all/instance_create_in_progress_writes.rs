@@ -14,6 +14,10 @@
 //! refused for a reason of its OWN, which is what shows the refusal in the window came
 //! from the status and from nothing else).
 //!
+//! The sentence withholds the instance-scoped READS of that window too, each on the
+//! channel its own model carries; `instance_create_in_progress_reads.rs` is the suite that
+//! pins those.
+//!
 //! The table spans the class the rule generalises over rather than one operation: each
 //! member `UpdateInstance` can write, both creates that hold a resource under an instance,
 //! both tagging writes, and both Region workflows — including two rows whose request is
@@ -62,7 +66,10 @@ const OTHER_REGION: &str = "eu-west-1";
 
 /// The tag key the created instance carries, so the untag row names a key that is really
 /// there and the tag row re-values one.
-const SEED_TAG_KEY: &str = "Owner";
+pub(crate) const SEED_TAG_KEY: &str = "Owner";
+
+/// The value that tag carries, so a refused write can be shown to have left it alone.
+pub(crate) const SEED_TAG_VALUE: &str = "platform";
 
 /// One row of the table: a request made against an instance whose creation has not
 /// finished.
@@ -196,14 +203,15 @@ const ROWS: &[Row] = &[
 /// A router over an account that holds no instance, the engine behind it, and an instance
 /// `CreateInstance` just minted whose activation instant is held open: the
 /// `CREATE_IN_PROGRESS` window the model declares.
-async fn creating_instance() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>, String) {
+pub(crate) async fn creating_instance() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>, String)
+{
     let (router, engine) = empty_account_router();
     let (status, created) = call(
         &router,
         "CreateInstance",
         &json!({
             "Name": "WhileCreating",
-            "Tags": [{"Key": SEED_TAG_KEY, "Value": "platform"}],
+            "Tags": [{"Key": SEED_TAG_KEY, "Value": SEED_TAG_VALUE}],
         }),
     )
     .await;
@@ -229,7 +237,10 @@ async fn describe(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
     body
 }
 
-/// The tags `ListTagsForResource` reports for `arn`, as a 200 body.
+/// The tags `ListTagsForResource` reports for `arn`, as a 200 body. The report is itself
+/// one of the calls the creation window withholds
+/// (`instance_create_in_progress_reads.rs`), so this is asked only once the activation has
+/// fallen due.
 async fn tags_of(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
     let (status, body) = call(router, "ListTagsForResource", &json!({"ResourceArn": arn})).await;
     assert_eq!(
@@ -259,7 +270,6 @@ async fn a_write_is_refused_while_the_instance_is_being_created() {
             "case {case:?}: the fixture must be in the creation window, got {:?}",
             before["Status"]
         );
-        let tags_before = tags_of(&router, case, &instance_arn).await;
 
         let (status, refused) = call(&router, row.operation, &request).await;
         assert_eq!(
@@ -280,18 +290,12 @@ async fn a_write_is_refused_while_the_instance_is_being_created() {
              got {message:?}"
         );
 
-        // And it wrote NOTHING: both readers answer exactly what they answered before.
+        // And it wrote NOTHING: the describe answers exactly what it answered before.
         let after = describe(&router, case, &instance_arn).await;
         assert_eq!(
             after, before,
             "case {case:?}: a refused write must change nothing a later caller sees, got \
              {after} vs {before}"
-        );
-        let tags_after = tags_of(&router, case, &instance_arn).await;
-        assert_eq!(
-            tags_after, tags_before,
-            "case {case:?}: a refused write must leave the tag set alone, got \
-             {tags_after} vs {tags_before}"
         );
 
         // Once the clock makes the activation due, the SAME request is answered on its own
@@ -303,6 +307,14 @@ async fn a_write_is_refused_while_the_instance_is_being_created() {
             Some("ACTIVE"),
             "case {case:?}: the activation was due, got {:?}",
             active["Status"]
+        );
+        // The tag set is readable now, and it shows the refused write stored nothing: the
+        // one tag the create was given, still carrying the value it was given.
+        let tags = tags_of(&router, case, &instance_arn).await;
+        assert_eq!(
+            tags,
+            json!([{"Key": SEED_TAG_KEY, "Value": SEED_TAG_VALUE}]),
+            "case {case:?}: a refused write must leave the tag set alone, got {tags}"
         );
         let (status, answer) = call(&router, row.operation, &request).await;
         if row.once_active.is_empty() {

@@ -9,6 +9,10 @@
 //! `ApplicationArn` the previous page ended on, and absent on the last page. Each listed
 //! assignment is projected from the stored `state::ApplicationAssignmentRecord` — the same
 //! row `CreateApplicationAssignment` wrote and `DescribeApplicationAssignment` reports.
+//! An `InstanceArn` this account holds no instance for, and a filter naming an application
+//! the instance does not hold, are the modelled `ResourceNotFoundException`; an instance
+//! whose creation has not finished — a window that serves only that instance's own describe
+//! and delete — is the modelled `AccessDeniedException`.
 //!
 //! ## Shape of an operation
 //!
@@ -244,6 +248,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             )),
                             // The model's `ResourceNotFoundExceptionReason` enum carries
                             // only KMS key states, none of which this refusal is.
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // An instance whose own CREATION has not finished serves only its own describe
+            // and delete ("While the instance is in the CREATE_IN_PROGRESS state, you can
+            // call only DescribeInstance and DeleteInstance operations"), so nothing held
+            // under it is enumerated here yet — asked through the gate every
+            // instance-scoped operation of this service asks
+            // (`crate::state::...::instance_creation_in_progress_gate`), and before the
+            // filter below, because the window withholds the call whatever that filter
+            // names. This operation models no `ConflictException`, the channel the
+            // instance's writes answer that window on, so the refusal goes on the modelled
+            // `AccessDeniedException`: an instance the caller may not act on yet is not a
+            // missing resource.
+            if let Err(message) = store.instance_creation_in_progress_gate(&input.instance_arn) {
+                return Err(
+                    ListApplicationAssignmentsForPrincipalErrorModeled::AccessDeniedException(
+                        AccessDeniedException {
+                            message: Some(message),
                             reason: None,
                         },
                     )

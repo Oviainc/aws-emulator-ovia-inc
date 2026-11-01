@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = store
             .tag_target_mut(input.instance_arn.as_deref(), &input.resource_arn)
             .map_err(|refusal| match refusal {
-                crate::state::TagWriteRefusal::NotFound(message) => {
+                crate::state::TagRefusal::NotFound(message) => {
                     TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                         message: Some(message),
                         // The model's `ResourceNotFoundExceptionReason` enum carries only
@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         reason: None,
                     })
                 }
-                crate::state::TagWriteRefusal::Conflict(message) => {
+                crate::state::TagRefusal::Conflict(message) => {
                     TagResourceErrorModeled::ConflictException(ConflictException {
                         message: Some(message),
                     })

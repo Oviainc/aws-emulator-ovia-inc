@@ -16,6 +16,8 @@
 //!
 //! * an `InstanceArn` this account holds no instance for, and a `RegionName` the instance
 //!   is not enabled in, are the modelled `ResourceNotFoundException`;
+//! * an instance whose creation has not finished — a window that serves only that
+//!   instance's own describe and delete — is the modelled `AccessDeniedException`;
 //! * "The request must be made from one of the enabled Regions of the IAM Identity Center
 //!   instance" is the modelled `ValidationException`.
 //!
@@ -127,6 +129,19 @@ fn validation(message: impl Into<String>) -> DescribeRegionError {
     .into()
 }
 
+/// The modelled refusal for an instance the caller may not act on: one whose creation has
+/// not finished, which serves only its own describe and delete. This operation declares no
+/// `ConflictException`, the channel the instance's own writes answer that window on, so it
+/// is reported here as the access this instance does not yet grant. `Reason` is absent for
+/// the same reason as above.
+fn access_denied(message: impl Into<String>) -> DescribeRegionError {
+    DescribeRegionErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(message.into()),
+        reason: None,
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -224,6 +239,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let instance = store.instance(&input.instance_arn).ok_or_else(|| {
             not_found(crate::state::instance_not_found_message(&input.instance_arn))
         })?;
+
+        // An instance whose own CREATION has not finished serves only its own describe and
+        // delete ("While the instance is in the CREATE_IN_PROGRESS state, you can call only
+        // DescribeInstance and DeleteInstance operations"), so nothing of it is reported
+        // here yet — asked through the gate every instance-scoped operation of this service
+        // asks (`crate::state::...::instance_creation_in_progress_gate`), and before
+        // anything about the Region the request named, because the window withholds the
+        // call whichever Region that is. This operation models no `ConflictException`, the
+        // channel the instance's writes answer that window on, so the refusal goes on the
+        // modelled `AccessDeniedException`.
+        store
+            .instance_creation_in_progress_gate(&input.instance_arn)
+            .map_err(access_denied)?;
 
         // "The request must be made from one of the enabled Regions of the IAM Identity
         // Center instance" — any Region the instance currently holds a record for, in
