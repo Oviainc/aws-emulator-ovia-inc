@@ -22,6 +22,7 @@
 //! `tests/all/test_parsing.rs`; the transformer job's by `tests/all/transformer_jobs.rs`.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 
 use crate::onboarding_loop::{b2bi_router, call, error_code, s3, SIGNING_REGION};
 
@@ -284,11 +285,11 @@ async fn one_reader_answers_for_every_operation_that_reads_an_edi_document() {
     }
 }
 
-/// RULE: a sample that genuinely does not resolve is `ResourceNotFoundException` (404) —
+/// RULE: a sample that genuinely does not resolve is `ResourceNotFoundException` —
 /// the error that operation's model declares for a resource that cannot be found — and is
-/// told apart from a sample that resolves and holds no interchange (400, above) and from
-/// a request that names no sample at all (which generates the template from
-/// `templateDetails`).
+/// told apart from a sample that resolves and holds no interchange (`ValidationException`,
+/// above) and from a request that names no sample at all (which generates the template
+/// from `templateDetails`).
 #[tokio::test]
 async fn a_sample_that_does_not_resolve_is_told_from_one_that_does_not_parse() {
     let router = b2bi_router();
@@ -302,8 +303,8 @@ async fn a_sample_that_does_not_resolve_is_told_from_one_that_does_not_parse() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "a sample that does not resolve must be a 404, got {status} {response}"
+        status, NOT_FOUND_STATUS,
+        "a sample that does not resolve must be refused as not found, got {status} {response}"
     );
     assert_eq!(
         error_code(&response),

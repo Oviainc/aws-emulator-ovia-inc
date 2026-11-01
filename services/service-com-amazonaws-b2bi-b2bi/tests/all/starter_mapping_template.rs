@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 // it asserts on; `MAPPING_TYPE_VALUES` is the model's own member list.
 use service_com_amazonaws_b2bi_b2bi::ops::create_starter_mapping_template::PLACEHOLDER;
 use service_com_amazonaws_b2bi_b2bi::ops::types::MAPPING_TYPE_VALUES;
+use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 
 // The wire harness this test target shares: one b2bi service on one shared engine, a
 // signed awsJson1_0 call, and the `__type` of an error body.
@@ -671,7 +672,7 @@ async fn a_request_the_model_does_not_declare_is_refused() {
 }
 
 /// RULE: `outputSampleLocation` is resolved through Amazon S3, and only a sample that
-/// genuinely does not resolve is the modelled `ResourceNotFoundException` (404): a missing
+/// genuinely does not resolve is the modelled `ResourceNotFoundException`: a missing
 /// bucket and a missing key both are. A location that names no object at all — no bucket,
 /// or no key — is instead the caller's own `ValidationException` (400), because it
 /// addresses nothing to look for.
@@ -701,13 +702,13 @@ async fn a_sample_edi_file_that_cannot_be_read_is_refused_as_not_found() {
         (
             "a key that bucket does not hold",
             json!({ "bucketName": "edi-samples", "key": "outbound/850.edi" }),
-            404,
+            NOT_FOUND_STATUS,
             "ResourceNotFoundException",
         ),
         (
             "a bucket that does not exist",
             json!({ "bucketName": "no-such-samples", "key": "outbound/850.edi" }),
-            404,
+            NOT_FOUND_STATUS,
             "ResourceNotFoundException",
         ),
         (

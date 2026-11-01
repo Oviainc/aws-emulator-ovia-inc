@@ -680,8 +680,8 @@ pub fn idempotency_key(resource_type: &str, client_token: &str) -> String {
 ///
 /// This is a SYNTAX test only, and the tagging operations keep it separate from the
 /// lookup on purpose: a candidate that is not an ARN at all is a client-side mistake
-/// (400 `ValidationException`), which is a different answer from a well-formed ARN
-/// that names no resource this service holds (404 `ResourceNotFoundException`).
+/// (`ValidationException`), which is a different answer from a well-formed ARN
+/// that names no resource this service holds (`ResourceNotFoundException`).
 pub fn is_arn(candidate: &str) -> bool {
     let fields: Vec<&str> = candidate.splitn(6, ':').collect();
     fields.len() == 6
@@ -967,8 +967,9 @@ pub fn s3_client(
 
 /// Why an `S3Location` could not be read, split the way the modelled errors are: a
 /// location that is not a location at all, or an object this service will not read, is the
-/// caller's mistake (400), an object that is not there is the 404 every one of these
-/// operations models, and a call that failed is a fault of this service (500).
+/// caller's mistake (`ValidationException`), an object that is not there is the
+/// `ResourceNotFoundException` every one of these operations models, and a call that failed
+/// is a fault of this service (500).
 #[derive(Debug, Clone)]
 pub enum ObjectError {
     /// The location names no bucket or no key, so it addresses no object.

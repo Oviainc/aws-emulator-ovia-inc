@@ -167,8 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Syntax first, and without touching the store: something that is not an ARN at
-        // all cannot name a resource, so it is a client-side mistake (400) rather than a
-        // resource that is missing (404). The modelled `len 1..1011` bound on
+        // all cannot name a resource, so it is a client-side mistake
+        // (`ValidationException`) rather than a resource that is missing
+        // (`ResourceNotFoundException`). The modelled `len 1..1011` bound on
         // `ResourceARN` is already enforced before this handler runs; the grammar is not.
         if !crate::state::is_arn(&input.resource_arn) {
             return Err(ListTagsForResourceErrorModeled::ValidationException(

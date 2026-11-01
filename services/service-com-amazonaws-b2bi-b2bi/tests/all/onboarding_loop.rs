@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region most requests below are signed for. Deliberately NOT the emulator's
@@ -554,10 +555,11 @@ async fn a_created_capability_round_trips_its_configuration_and_instructions_doc
 }
 
 /// RULE: a create that names another resource by id resolves that id in the store, and
-/// answers the modelled `ResourceNotFoundException` (HTTP 404) when it is absent —
-/// never a success. Rows span several well-formed but unknown profile ids.
+/// answers the modelled `ResourceNotFoundException` at this service's not-found status
+/// when it is absent — never a success. Rows span several well-formed but unknown profile
+/// ids.
 #[tokio::test]
-async fn creating_a_partnership_under_an_unknown_profile_is_a_404() {
+async fn creating_a_partnership_under_an_unknown_profile_is_refused_as_not_found() {
     let router = b2bi_router();
     let capability_id = given_capability(&router, "edi-850").await;
 
@@ -582,8 +584,9 @@ async fn creating_a_partnership_under_an_unknown_profile_is_a_404() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: an unknown profileId must be 404, got {status} {body}"
+            status,
+            NOT_FOUND_STATUS,
+            "case {case:?}: an unknown profileId must be {NOT_FOUND_STATUS}, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -910,8 +913,8 @@ async fn list_partnerships_reports_only_the_named_profiles_partnerships() {
 }
 
 /// RULE: a delete removes the record, so a later get for that id is the modelled
-/// `ResourceNotFoundException` (404) and the listing no longer carries it; deleting an
-/// id that is not stored is itself a 404. Rows span all three resource kinds.
+/// `ResourceNotFoundException` and the listing no longer carries it; deleting an
+/// id that is not stored is itself that refusal. Rows span all three resource kinds.
 #[tokio::test]
 async fn a_deleted_resource_is_gone_from_both_get_and_list() {
     let router = b2bi_router();
@@ -959,8 +962,10 @@ async fn a_deleted_resource_is_gone_from_both_get_and_list() {
 
         let (status, body) = call(&router, get_op, json!({ *id_member: id })).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: {get_op} after the delete must be 404, got {status} {body}"
+            status,
+            NOT_FOUND_STATUS,
+            "case {case:?}: {get_op} after the delete must be {NOT_FOUND_STATUS}, got {status} \
+             {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -980,11 +985,13 @@ async fn a_deleted_resource_is_gone_from_both_get_and_list() {
             "case {case:?}: {list_op} still reports the deleted {id}: {body}"
         );
 
-        // Deleting it a second time is a 404: the record really is gone.
+        // Deleting it a second time is refused: the record really is gone.
         let (status, body) = call(&router, delete_op, json!({ *id_member: id })).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: a repeated {delete_op} must be 404, got {status} {body}"
+            status,
+            NOT_FOUND_STATUS,
+            "case {case:?}: a repeated {delete_op} must be {NOT_FOUND_STATUS}, got {status} \
+             {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -1205,7 +1212,7 @@ type UpdateCase<'a> = (&'a str, Value, Vec<(&'a str, Value)>);
 /// RULE: `UpdateProfile` applies ONLY the members a request names — every other member
 /// keeps the value the store holds — reports the stored record (so a later `GetProfile`
 /// agrees with it), and refuses a `profileId` that does not resolve with
-/// `ResourceNotFoundException` (404), which is the same verdict `GetProfile` gives for it.
+/// `ResourceNotFoundException`, which is the same verdict `GetProfile` gives for it.
 ///
 /// The rows differ along which members the update names: one, several, and none at all.
 #[tokio::test]
@@ -1339,8 +1346,10 @@ async fn updating_a_profile_applies_only_the_members_it_names() {
             }
             let (status, response) = call(&router, operation, body).await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: {operation} must answer 404, got {status} {response}"
+                status,
+                NOT_FOUND_STATUS,
+                "case {case:?}: {operation} must answer {NOT_FOUND_STATUS}, got {status} \
+                 {response}"
             );
             assert_eq!(
                 error_code(&response),

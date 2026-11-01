@@ -5,7 +5,7 @@
 //! Four rules, each asserted over a table of inputs rather than one recorded request:
 //!
 //! * a create that references another resource by id resolves every id it names in the
-//!   store first, and refuses an unresolvable one with `ResourceNotFoundException` (404)
+//!   store first, and refuses an unresolvable one with `ResourceNotFoundException`
 //!   without persisting anything;
 //! * a `ResourceNotFoundException` message is built from the request's own identifier,
 //!   with the template this service states for that resource type;
@@ -19,6 +19,7 @@
 //! b2bi + CloudWatch Logs pair on one shared engine.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::onboarding_loop::{
@@ -82,9 +83,9 @@ async fn describe_log_groups(router: &MultiServiceRouter, prefix: &str) -> Vec<S
 
 /// RULE: `CreateCapability` resolves `configuration.edi.transformerId` in the store
 /// before minting anything — an id no transformer carries is the modelled
-/// `ResourceNotFoundException` (404) and no capability is created.
+/// `ResourceNotFoundException` and no capability is created.
 #[tokio::test]
-async fn creating_a_capability_for_an_unknown_transformer_is_a_404() {
+async fn creating_a_capability_for_an_unknown_transformer_is_refused_as_not_found() {
     let router = b2bi_router();
     // A transformer a client really created, so the positive row below is the same
     // request as the refused ones with one id changed.
@@ -109,7 +110,8 @@ async fn creating_a_capability_for_an_unknown_transformer_is_a_404() {
         .await;
 
         assert_eq!(
-            status, 404,
+            status,
+            NOT_FOUND_STATUS,
             "case {case:?}: a capability naming transformer {unknown:?} must be refused, \
              got {status} {body}"
         );
@@ -166,9 +168,9 @@ async fn creating_a_capability_for_an_unknown_transformer_is_a_404() {
 
 /// RULE: `CreatePartnership` resolves EVERY element of the required `capabilities` list
 /// (and the `profileId`) in the store before minting anything; the first unresolvable id
-/// is the modelled `ResourceNotFoundException` (404).
+/// is the modelled `ResourceNotFoundException`.
 #[tokio::test]
-async fn creating_a_partnership_with_an_unknown_capability_is_a_404() {
+async fn creating_a_partnership_with_an_unknown_capability_is_refused_as_not_found() {
     let router = b2bi_router();
     let profile_id = given_profile(&router, "acme").await;
     let real = given_capability(&router, "edi-850").await;
@@ -216,7 +218,8 @@ async fn creating_a_partnership_with_an_unknown_capability_is_a_404() {
         )
         .await;
         assert_eq!(
-            status, 404,
+            status,
+            NOT_FOUND_STATUS,
             "case {case:?}: a partnership naming {capabilities:?} must be refused, \
              got {status} {body}"
         );
@@ -292,8 +295,9 @@ async fn a_not_found_message_names_the_requested_id_in_the_services_own_template
                 let (status, body) =
                     call(&router, operation, json!({ *member: unknown })).await;
                 assert_eq!(
-                    status, 404,
-                    "case {case:?}: expected 404, got {status} {body}"
+                    status,
+                    NOT_FOUND_STATUS,
+                    "case {case:?}: expected {NOT_FOUND_STATUS}, got {status} {body}"
                 );
                 assert_eq!(
                     error_code(&body),

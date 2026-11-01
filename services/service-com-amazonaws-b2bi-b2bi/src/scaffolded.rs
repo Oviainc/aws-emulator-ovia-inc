@@ -177,13 +177,49 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The HTTP status this service puts on the wire for every modelled refusal that says
+/// the resource a request names does not exist.
+///
+/// This service speaks `awsJson1_0` (see `OPERATIONS.md`), an RPC envelope that
+/// discriminates a failure by the error TYPE in the body (`__type`) and not by the
+/// transport status, and whose 404 belongs to the transport: an `awsJson` endpoint
+/// answers 404 to a request that addressed no operation at all. So a modelled
+/// "no such resource" refusal of this service travels with the ordinary client-error
+/// status instead — the status its recorded responses carry for such a refusal, and the
+/// one its boundary validator already refuses a malformed request with, so a
+/// handler-returned client error and a boundary refusal agree.
+pub const NOT_FOUND_STATUS: u16 = 400;
+
+/// The `@httpError` status this model annotates its not-found shape with
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")` reports 404) — the
+/// one status [`wire_status`] restates.
+const MODELLED_NOT_FOUND_STATUS: u16 = 404;
+
+/// The status a modeled error travels with on this service's wire, given the `@httpError`
+/// status its shape is annotated with.
+///
+/// A refusal annotated [`MODELLED_NOT_FOUND_STATUS`] collapses onto
+/// [`NOT_FOUND_STATUS`]. Every other status is left exactly as the model annotates it, so
+/// a throttle keeps its own, a state conflict and a quota refusal keep theirs, and a 5xx
+/// server fault keeps its — a retry classifier still tells a server fault from a client
+/// one.
+pub fn wire_status(modeled_status: u16) -> u16 {
+    if modeled_status == MODELLED_NOT_FOUND_STATUS {
+        NOT_FOUND_STATUS
+    } else {
+        modeled_status
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status [`wire_status`]
+    /// gives it: this service's [`NOT_FOUND_STATUS`] for a not-found refusal, the
+    /// model's own status for every other shape.
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -278,14 +314,16 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         }
     }
 
-    /// 501 for the scaffold signal.
+    /// 501 for the scaffold signal, and [`wire_status`] for a modeled error.
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
-    /// retryable, so a client would retry an operation that can never succeed.
+    /// retryable, so a client would retry an operation that can never succeed. A modeled
+    /// error goes through [`wire_status`], which puts a not-found refusal on this
+    /// service's own [`NOT_FOUND_STATUS`]; every other modelled status is the model's.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => wire_status(e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

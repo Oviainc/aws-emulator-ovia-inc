@@ -9,7 +9,7 @@
 //! carry is ignored, and every other tag on that resource, and every other resource, is
 //! left as it was. An ARN that does not satisfy the ARN grammar is refused with the
 //! modelled `ValidationException` (400); a well-formed ARN naming no resource this service
-//! holds is the modelled `ResourceNotFoundException` (404); and neither refusal removes
+//! holds is the modelled `ResourceNotFoundException`; and neither refusal removes
 //! anything.
 //!
 //! Each test asserts that rule over a TABLE of inputs rather than one recorded request:
@@ -17,6 +17,7 @@
 //! spelling of the keys removed, and whether those keys are present at all.
 
 use serde_json::json;
+use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 use smithy_server_runtime::MultiServiceRouter;
 
 // One copy of the wire harness and of the tagging fixtures, shared with the other suites.
@@ -265,7 +266,7 @@ async fn untag_resource_removes_only_from_the_resource_its_arn_names() {
 
 /// RULE: a `ResourceARN` that is not an ARN at all is the modelled `ValidationException`
 /// (400) and a well-formed ARN naming nothing stored is the modelled
-/// `ResourceNotFoundException` (404) — the same split the other tagging operations make —
+/// `ResourceNotFoundException` — the same split the other tagging operations make —
 /// and neither refusal removes a tag.
 ///
 /// The rows span malformed candidates (no colons, truncated at each field count, an empty
@@ -349,43 +350,43 @@ async fn untag_resource_refuses_an_arn_it_cannot_resolve() {
         (
             "unknown profile id",
             format!("arn:aws:b2bi:{SIGNING_REGION}:{ACCOUNT}:profile/p-0123456789abcdef0"),
-            404,
+            NOT_FOUND_STATUS,
             "ResourceNotFoundException",
         ),
         (
             "unknown capability id",
             format!("arn:aws:b2bi:{SIGNING_REGION}:{ACCOUNT}:capability/ca-0123456789abcdef0"),
-            404,
+            NOT_FOUND_STATUS,
             "ResourceNotFoundException",
         ),
         (
             "unknown transformer id",
             format!("arn:aws:b2bi:{SIGNING_REGION}:{ACCOUNT}:transformer/tr-0123456789abcdef0"),
-            404,
+            NOT_FOUND_STATUS,
             "ResourceNotFoundException",
         ),
         (
             "another service's ARN",
             format!("arn:aws:s3:{SIGNING_REGION}:{ACCOUNT}:bucket/not-a-b2bi-resource"),
-            404,
+            NOT_FOUND_STATUS,
             "ResourceNotFoundException",
         ),
         (
             "a stored ARN with the region rewritten",
             live.replacen(SIGNING_REGION, "eu-central-1", 1),
-            404,
+            NOT_FOUND_STATUS,
             "ResourceNotFoundException",
         ),
         (
             "a stored ARN with the account rewritten",
             live.replacen(ACCOUNT, "123456789012", 1),
-            404,
+            NOT_FOUND_STATUS,
             "ResourceNotFoundException",
         ),
         (
             "a deleted profile's ARN",
             doomed_arn.clone(),
-            404,
+            NOT_FOUND_STATUS,
             "ResourceNotFoundException",
         ),
     ];

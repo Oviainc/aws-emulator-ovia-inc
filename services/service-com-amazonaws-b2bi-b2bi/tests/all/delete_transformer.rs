@@ -13,6 +13,7 @@
 //! builders are reused from the sibling suites rather than copied.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::onboarding_loop::{
@@ -174,8 +175,10 @@ async fn a_deleted_transformer_is_gone_from_every_reader() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: GetTransformer after the delete must be 404, got {status} {fetched}"
+            status,
+            NOT_FOUND_STATUS,
+            "case {case:?}: GetTransformer after the delete must be {NOT_FOUND_STATUS}, got \
+             {status} {fetched}"
         );
         assert_eq!(
             error_code(&fetched),
@@ -196,8 +199,9 @@ async fn a_deleted_transformer_is_gone_from_every_reader() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: a repeated delete must be 404, got {status} {repeated}"
+            status,
+            NOT_FOUND_STATUS,
+            "case {case:?}: a repeated delete must be {NOT_FOUND_STATUS}, got {status} {repeated}"
         );
         assert_eq!(
             error_code(&repeated),
@@ -319,20 +323,21 @@ async fn a_transformer_a_capability_uses_cannot_be_deleted() {
         )
         .await;
         assert_eq!(
-            status, 404,
+            status,
+            NOT_FOUND_STATUS,
             "case {case:?}: the deleted transformer must be gone, got {status} {fetched}"
         );
     }
 }
 
 /// RULE: `DeleteTransformer` for an id this account's store holds no transformer for is
-/// the modelled `ResourceNotFoundException` (HTTP 404) naming that id — never an empty
-/// success — whatever the id looks like, including an id another b2bi resource kind really
-/// does hold.
+/// the modelled `ResourceNotFoundException` at this service's not-found status, naming
+/// that id — never an empty success — whatever the id looks like, including an id another
+/// b2bi resource kind really does hold.
 #[tokio::test]
-async fn deleting_an_unknown_transformer_is_a_404() {
+async fn deleting_an_unknown_transformer_is_refused_as_not_found() {
     let router = b2bi_router();
-    let profile_id = given_profile(&router, "delete-transformer-404").await;
+    let profile_id = given_profile(&router, "delete-transformer-unknown").await;
     let kept = given_transformer(&router, "kept").await;
 
     // (case, a transformerId satisfying the modelled len 1..64 / ^[a-zA-Z0-9_-]+$)
@@ -352,8 +357,10 @@ async fn deleting_an_unknown_transformer_is_a_404() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404 for {transformer_id:?}, got {status} {body}"
+            status,
+            NOT_FOUND_STATUS,
+            "case {case:?}: expected {NOT_FOUND_STATUS} for {transformer_id:?}, got {status} \
+             {body}"
         );
         assert_eq!(
             error_code(&body),

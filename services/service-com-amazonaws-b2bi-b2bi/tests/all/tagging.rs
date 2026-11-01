@@ -8,13 +8,14 @@
 //! holds, and whatever the size of that list, an untagged resource included. An ARN
 //! that does not satisfy the ARN grammar is a client-side mistake, refused with the
 //! modelled `ValidationException` (400); a well-formed ARN naming no resource this
-//! service holds is the modelled `ResourceNotFoundException` (404).
+//! service holds is the modelled `ResourceNotFoundException`.
 //!
 //! Each test asserts that rule over a TABLE of inputs rather than one recorded
 //! request: the rows differ along the resource kind, the number of tags, the tag
 //! key/value spellings, the ARN's shape and the signing region.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 use smithy_server_runtime::MultiServiceRouter;
 
 // The request harness is shared with the onboarding suite — same router, same signing.
@@ -312,7 +313,7 @@ async fn list_tags_reports_the_tags_each_resource_was_created_with() {
 /// RULE: a `ResourceARN` that does not satisfy the ARN grammar
 /// `arn:<partition>:<service>:<region>:<account-id>:<resource>` is refused with the
 /// modelled `ValidationException` (HTTP 400) — a client-side syntax error, answered
-/// without any lookup, so it is NOT the 404 a well-formed ARN gets.
+/// without any lookup, so it is NOT the not-found refusal a well-formed ARN gets.
 ///
 /// The rows span a value with no colons at all, a truncated ARN at each field count
 /// the grammar needs, an empty partition / service / resource field, the `arn` prefix
@@ -384,7 +385,7 @@ async fn a_resource_arn_that_is_not_an_arn_is_a_validation_exception() {
 }
 
 /// RULE: a well-formed ARN that names no resource this service holds is the modelled
-/// `ResourceNotFoundException` (HTTP 404) — including a stored resource's own ARN once
+/// `ResourceNotFoundException` — including a stored resource's own ARN once
 /// that resource is deleted, and an ARN that differs from a stored one only in the
 /// region or the account it names (AWS: "the resource exists in a region other than the
 /// region specified in the API call").
@@ -393,7 +394,7 @@ async fn a_resource_arn_that_is_not_an_arn_is_a_validation_exception() {
 /// ARN with the region and account fields empty, a different partition, a rewritten
 /// region, a rewritten account, and a deleted profile's ARN.
 #[tokio::test]
-async fn a_well_formed_arn_naming_nothing_stored_is_a_404() {
+async fn a_well_formed_arn_naming_nothing_stored_is_refused_as_not_found() {
     let router = b2bi_router();
     let live = given_tagged_resource(
         &router,
@@ -421,7 +422,7 @@ async fn a_well_formed_arn_naming_nothing_stored_is_a_404() {
     let doomed_arn = text(&created, "profileArn");
     let doomed_id = text(&created, "profileId");
 
-    // Its tags ARE visible while it exists — the 404 below is about the delete, not
+    // Its tags ARE visible while it exists — the refusal below is about the delete, not
     // about this ARN being unreadable.
     let (status, body) = list_tags(&router, &doomed_arn).await;
     assert_eq!(status, 200, "the doomed profile's tags must be readable: {body}");
@@ -471,8 +472,10 @@ async fn a_well_formed_arn_naming_nothing_stored_is_a_404() {
     for (case, candidate) in cases {
         let (status, body) = list_tags(&router, candidate).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: ListTagsForResource({candidate}) must be 404, got {status} {body}"
+            status,
+            NOT_FOUND_STATUS,
+            "case {case:?}: ListTagsForResource({candidate}) must be {NOT_FOUND_STATUS}, got \
+             {status} {body}"
         );
         assert_eq!(
             error_code(&body),

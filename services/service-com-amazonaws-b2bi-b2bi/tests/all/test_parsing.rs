@@ -23,6 +23,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 use smithy_server_runtime::MultiServiceRouter;
 
 // The wire harness this test target shares: a signed awsJson1_0 call and the `__type` of
@@ -1027,19 +1028,20 @@ async fn an_input_file_that_names_no_stored_object_is_refused_as_not_found() {
     stage(&router, "in/present.edi", staged.as_bytes()).await;
 
     // Each row: the case, the `inputFile`, and the expected status. A location that names
-    // no object is not-found (404); a location that names no object AT ALL — an absent
-    // bucket name or key — is a bad request (400), which a client fixes differently.
+    // no object is not-found; a location that names no object AT ALL — an absent
+    // bucket name or key — is a bad request (`ValidationException`), which a client fixes
+    // differently.
     let cases: Vec<(&str, Value, u16, &str)> = vec![
         (
             "a key the bucket does not hold",
             json!({ "bucketName": BUCKET, "key": "in/absent.edi" }),
-            404,
+            NOT_FOUND_STATUS,
             "ResourceNotFoundException",
         ),
         (
             "a bucket this emulator does not hold",
             json!({ "bucketName": "no-such-bucket-here", "key": "in/present.edi" }),
-            404,
+            NOT_FOUND_STATUS,
             "ResourceNotFoundException",
         ),
         (

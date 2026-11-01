@@ -13,6 +13,7 @@
 //! fixtures are reused from the sibling suites rather than copied.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::onboarding_loop::{
@@ -44,9 +45,10 @@ async fn get_partnership(router: &MultiServiceRouter, partnership_id: &str) -> V
 
 /// RULE: every id in an update's reference list is resolved against the service's stored
 /// resources BEFORE any member is written, so an update naming an id that resolves to
-/// nothing is refused whole with the modelled `ResourceNotFoundException` (HTTP 404)
-/// naming the FIRST such id, and the stored record is left exactly as it was — no partial
-/// write of the ids that did resolve, and no `modifiedAt` stamp.
+/// nothing is refused whole with the modelled `ResourceNotFoundException` at this
+/// service's not-found status, naming the FIRST such id, and the stored record is left
+/// exactly as it was — no partial write of the ids that did resolve, and no `modifiedAt`
+/// stamp.
 ///
 /// The rows span the position of the unresolvable id in the list (only, first, middle,
 /// last), the number of unresolvable ids (one, two — the first is the one named), the list
@@ -151,7 +153,8 @@ async fn an_update_naming_an_unresolvable_capability_is_refused_and_writes_nothi
         )
         .await;
         assert_eq!(
-            status, 404,
+            status,
+            NOT_FOUND_STATUS,
             "case {case:?}: an unresolvable capability must be refused, got {status} {body}"
         );
         assert_eq!(
@@ -364,14 +367,15 @@ async fn an_update_replaces_the_named_members_and_leaves_the_rest() {
 
 /// RULE: the resource an update addresses is resolved before the references it carries, so
 /// an update for a `partnershipId` this account's store does not hold is the modelled
-/// `ResourceNotFoundException` (HTTP 404) naming that id — never a minted partnership, and
-/// never a refusal about the capabilities list, however that list looks.
+/// `ResourceNotFoundException` at this service's not-found status, naming that id — never
+/// a minted partnership, and never a refusal about the capabilities list, however that
+/// list looks.
 ///
 /// The rows span a never-minted id, ids at both ends of the modelled `PartnershipId`
 /// length (`len 1..64`, `^[a-zA-Z0-9_-]+$`), an id another b2bi resource kind really does
 /// hold, and an unknown partnership whose request also names an unknown capability.
 #[tokio::test]
-async fn updating_an_unknown_partnership_is_a_404() {
+async fn updating_an_unknown_partnership_is_refused_as_not_found() {
     let router = b2bi_router();
     let profile_id = given_profile(&router, "acme").await;
     let capability_id = given_capability(&router, "edi-850").await;
@@ -410,8 +414,10 @@ async fn updating_an_unknown_partnership_is_a_404() {
         request["partnershipId"] = json!(partnership_id);
         let (status, body) = call(&router, "UpdatePartnership", request).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404 for {partnership_id:?}, got {status} {body}"
+            status,
+            NOT_FOUND_STATUS,
+            "case {case:?}: expected {NOT_FOUND_STATUS} for {partnership_id:?}, got {status} \
+             {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -432,7 +438,8 @@ async fn updating_an_unknown_partnership_is_a_404() {
         )
         .await;
         assert_eq!(
-            status, 404,
+            status,
+            NOT_FOUND_STATUS,
             "case {case:?}: the refused update must not have created a partnership, got \
              {status} {fetched}"
         );

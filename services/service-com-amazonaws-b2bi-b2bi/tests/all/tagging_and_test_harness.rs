@@ -21,6 +21,7 @@
 //! one `onboarding_loop` already drives the emulator through.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::onboarding_loop::{
@@ -147,8 +148,9 @@ async fn tags_written_by_tag_resource_are_merged_onto_the_resource_and_read_back
 /// RULE: `TagResource` stores nothing for a `ResourceARN` it cannot resolve to a live
 /// resource of this service, and refuses it with the modelled `ValidationException`
 /// (HTTP 400) — the ARN is the parameter it validates before it writes. The reporting
-/// `ListTagsForResource` keeps the two-way split for the same ARNs: 400 only when the
-/// value is not an ARN at all, 404 when it is a well-formed ARN naming nothing.
+/// `ListTagsForResource` keeps the two-way split for the same ARNs: `ValidationException`
+/// only when the value is not an ARN at all, `ResourceNotFoundException` when it is a
+/// well-formed ARN naming nothing — both at this service's client-error status.
 ///
 /// The rows span both classes: strings that fail the ARN grammar (no colons, a
 /// truncated ARN, an empty partition / service / resource field, the prefix mis-cased)
@@ -224,10 +226,11 @@ async fn an_arn_tag_resource_cannot_resolve_is_refused_and_stores_nothing() {
             "case {case:?}: expected ValidationException, got {body}"
         );
 
-        // The same ARN through the reporting operation: 400 only when it is not an ARN.
+        // The same ARN through the reporting operation: `ValidationException` only when it
+        // is not an ARN at all, and the not-found refusal when it is.
         let (status, body) = list_tags(&router, arn).await;
         let (expected_status, expected_code) = if *is_an_arn {
-            (404, "ResourceNotFoundException")
+            (NOT_FOUND_STATUS, "ResourceNotFoundException")
         } else {
             (400, "ValidationException")
         };

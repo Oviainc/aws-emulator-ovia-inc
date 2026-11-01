@@ -19,6 +19,8 @@ mod delete_transformer;
 mod edi_parsing;
 #[path = "all/generate_mapping.rs"]
 mod generate_mapping;
+#[path = "all/not_found_status.rs"]
+mod not_found_status;
 #[path = "all/onboarding_loop.rs"]
 mod onboarding_loop;
 #[path = "all/references_logging_and_quota.rs"]

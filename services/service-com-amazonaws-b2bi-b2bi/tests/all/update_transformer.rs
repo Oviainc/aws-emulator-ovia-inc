@@ -13,6 +13,7 @@
 //! configuration-member tables are reused from the sibling suites rather than copied.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::onboarding_loop::{
@@ -511,16 +512,17 @@ async fn mixing_the_deprecated_and_current_configuration_members_is_refused() {
 }
 
 /// RULE: `UpdateTransformer` for an id this account's store does not hold is the modelled
-/// `ResourceNotFoundException` (HTTP 404) naming that id — never an empty success and
-/// never a minted transformer — whatever the id looks like, including an id another b2bi
-/// resource kind really does hold, and whatever else the request gets wrong: the resource
-/// is resolved before the request's own members are judged.
+/// `ResourceNotFoundException` at this service's not-found status, naming that id — never
+/// an empty success and never a minted transformer — whatever the id looks like, including
+/// an id another b2bi resource kind really does hold, and whatever else the request gets
+/// wrong: the resource is resolved before the request's own members are judged.
 #[tokio::test]
-async fn updating_an_unknown_transformer_is_a_404() {
+async fn updating_an_unknown_transformer_is_refused_as_not_found() {
     let router = b2bi_router();
     let current = current_members();
     let legacy = legacy_members();
-    let profile_id = crate::onboarding_loop::given_profile(&router, "update-transformer-404").await;
+    let profile_id =
+        crate::onboarding_loop::given_profile(&router, "update-transformer-unknown").await;
 
     // (case, a transformerId satisfying the modelled len 1..64 / ^[a-zA-Z0-9_-]+$, the
     // members the update names beside it)
@@ -543,7 +545,7 @@ async fn updating_an_unknown_transformer_is_a_404() {
         ),
         (
             // The missing resource is answered BEFORE the request's members are judged,
-            // so a mixed-style update against an unknown id is still a 404.
+            // so a mixed-style update against an unknown id is still not-found.
             "an unknown id with a mixed-style configuration",
             "t-fedcba98765432100".to_string(),
             json!({ "fileFormat": legacy[1].1, "inputConversion": current[0].1 }),
@@ -560,8 +562,10 @@ async fn updating_an_unknown_transformer_is_a_404() {
         request["transformerId"] = json!(transformer_id);
         let (status, body) = call(&router, "UpdateTransformer", request).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404 for {transformer_id:?}, got {status} {body}"
+            status,
+            NOT_FOUND_STATUS,
+            "case {case:?}: expected {NOT_FOUND_STATUS} for {transformer_id:?}, got {status} \
+             {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -582,7 +586,8 @@ async fn updating_an_unknown_transformer_is_a_404() {
         )
         .await;
         assert_eq!(
-            status, 404,
+            status,
+            NOT_FOUND_STATUS,
             "case {case:?}: the refused update must not have created a transformer, got \
              {status} {fetched}"
         );

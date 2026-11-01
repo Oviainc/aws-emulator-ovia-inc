@@ -12,7 +12,7 @@
 //! does not satisfy the ARN grammar and a well-formed ARN naming no resource this service
 //! holds, which is the answer RECORDED against AWS for this operation (trace
 //! `b2bi.tag-resource-nonexistent-arn-not-found`). The reporting `ListTagsForResource`
-//! keeps the 404 for that second class (see `tagging.rs`).
+//! keeps `ResourceNotFoundException` for that second class (see `tagging.rs`).
 //!
 //! Each test asserts that rule over a TABLE of inputs rather than one recorded request:
 //! the rows differ along the resource kind, the tags the resource already carries, the
@@ -370,13 +370,13 @@ async fn an_arn_that_is_not_an_arn_is_refused_with_validation_exception() {
 /// (AWS: "the resource exists in a region other than the region specified in the API
 /// call").
 ///
-/// 400 rather than 404 is the RECORDED answer for this operation: trace
-/// `b2bi.tag-resource-nonexistent-arn-not-found`, in
+/// `ValidationException` rather than `ResourceNotFoundException` is the RECORDED answer
+/// for this operation: trace `b2bi.tag-resource-nonexistent-arn-not-found`, in
 /// `issues/things-that-now-work/20261022T031134Z-b2bi-tagging-test-harness-and-transformer-operations-answer.md`
 /// (cause 1), asserts `ValidationException` for tagging a deleted profile's well-formed
 /// ARN — this write validates `ResourceARN` as the request parameter it is. The REPORTING
-/// `ListTagsForResource` keeps the 404 for the same class of ARN (see `tagging.rs`), which
-/// is the split the recordings show.
+/// `ListTagsForResource` keeps `ResourceNotFoundException` for the same class of ARN (see
+/// `tagging.rs`), which is the split the recordings show.
 ///
 /// The rows span an unknown id of each resource kind, another service's ARN, a global ARN
 /// with the region and account fields empty, a rewritten partition / region / account, and

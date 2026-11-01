@@ -14,6 +14,7 @@
 use std::collections::HashSet;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 
 use crate::onboarding_loop::{
     b2bi_router, call, call_signed_for, error_code, given_transformer, is_generated_id, text,
@@ -466,10 +467,11 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_transfor
 }
 
 /// RULE: `GetTransformer` for an id this account's store does not hold is the modelled
-/// `ResourceNotFoundException` (HTTP 404) — never an empty success — whatever the id looks
-/// like, including an id another b2bi resource kind really does hold.
+/// `ResourceNotFoundException` at this service's not-found status — never an empty
+/// success — whatever the id looks like, including an id another b2bi resource kind really
+/// does hold.
 #[tokio::test]
-async fn getting_an_unknown_transformer_is_a_404() {
+async fn getting_an_unknown_transformer_is_refused_as_not_found() {
     let router = b2bi_router();
 
     // The capability this test borrows an id from needs a transformer to name, so one is
@@ -517,8 +519,10 @@ async fn getting_an_unknown_transformer_is_a_404() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404 for {transformer_id:?}, got {status} {body}"
+            status,
+            NOT_FOUND_STATUS,
+            "case {case:?}: expected {NOT_FOUND_STATUS} for {transformer_id:?}, got {status} \
+             {body}"
         );
         assert_eq!(
             error_code(&body),

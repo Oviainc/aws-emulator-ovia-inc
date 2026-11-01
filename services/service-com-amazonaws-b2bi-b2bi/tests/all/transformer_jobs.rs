@@ -20,6 +20,7 @@
 //! * `GetTransformerJob` resolves a job only under the transformer it ran.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 
 use crate::edi_parsing::{given_object, BUCKET, X12_850};
 use crate::onboarding_loop::{b2bi_router, call, error_code, s3};
@@ -505,7 +506,7 @@ async fn a_mapping_that_runs_away_fails_its_job() {
 }
 
 /// RULE: a job is reported only under the transformer that ran it, and only while this
-/// service holds it: every other pair of ids is `ResourceNotFoundException` (404).
+/// service holds it: every other pair of ids is `ResourceNotFoundException`.
 #[tokio::test]
 async fn a_job_resolves_only_under_its_own_transformer() {
     let router = b2bi_router();
@@ -525,18 +526,18 @@ async fn a_job_resolves_only_under_its_own_transformer() {
     // Each row: the case, the transformerId and transformerJobId to ask for, the status.
     let cases: Vec<(&str, String, String, u16)> = vec![
         ("the job under its own transformer", transformer_id.clone(), job_id.clone(), 200),
-        ("the job under another transformer", other_id, job_id.clone(), 404),
+        ("the job under another transformer", other_id, job_id.clone(), NOT_FOUND_STATUS),
         (
             "an unknown job under a known transformer",
             transformer_id.clone(),
             "0123456789abcdef012345678".to_string(),
-            404,
+            NOT_FOUND_STATUS,
         ),
         (
             "a job under an unknown transformer",
             "t-00000000000000000".to_string(),
             job_id,
-            404,
+            NOT_FOUND_STATUS,
         ),
     ];
 
@@ -551,7 +552,7 @@ async fn a_job_resolves_only_under_its_own_transformer() {
             status, expected,
             "case {case:?}: expected HTTP {expected}, got {status} {response}"
         );
-        if expected == 404 {
+        if expected == NOT_FOUND_STATUS {
             assert_eq!(
                 error_code(&response),
                 "ResourceNotFoundException",
@@ -562,7 +563,7 @@ async fn a_job_resolves_only_under_its_own_transformer() {
 }
 
 /// RULE: `StartTransformerJob` resolves `transformerId` against this service's store: an
-/// id it does not hold is `ResourceNotFoundException` (404), and a location naming no
+/// id it does not hold is `ResourceNotFoundException`, and a location naming no
 /// bucket is `ValidationException` (400).
 #[tokio::test]
 async fn starting_a_job_resolves_its_transformer_and_its_locations() {
@@ -576,7 +577,7 @@ async fn starting_a_job_resolves_its_transformer_and_its_locations() {
         (
             "an unknown transformerId",
             start_request("t-00000000000000000", "inbound/guard.edi"),
-            404,
+            NOT_FOUND_STATUS,
             "ResourceNotFoundException",
         ),
         (
