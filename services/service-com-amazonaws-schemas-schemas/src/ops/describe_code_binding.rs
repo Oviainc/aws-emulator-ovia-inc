@@ -193,7 +193,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // `SchemaVersion` "limits the results to only this schema version"; absent, the
         // latest stored version answers, which is the version a put with no
-        // `SchemaVersion` generated against.
+        // `SchemaVersion` generated against. A value with nothing in it limits the read
+        // to no version at all, so it is read as absent too.
         let crate::state::ResolvedSchemaVersion { schema, version, .. } = state
             .readable_schema_version(
                 &input.registry_name,

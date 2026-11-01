@@ -237,6 +237,12 @@ impl ComAmazonawsSchemasSchemasState {
     /// in that order, is what keeps a handler from answering one step's refusal for
     /// another step's failure.
     ///
+    /// `SchemaVersion` is an OPTIONAL member that limits the read to one version, so a
+    /// request that sends it with no characters in it limits the read to no version at
+    /// all and is served as the request that omits it ([`specified`]): the latest
+    /// stored version answers, and a refusal this resolution does reach names no
+    /// version either.
+    ///
     /// The refusals are RETURNED rather than worded here, because each operation answers
     /// them through its own modelled error enum; the sentences are the service's
     /// constants ([`ReadResolutionError::not_found`]), so every call site words them
@@ -247,6 +253,7 @@ impl ComAmazonawsSchemasSchemasState {
         schema_name: &str,
         requested: Option<&str>,
     ) -> Result<ResolvedSchemaVersion<'_>, ReadResolutionError> {
+        let requested = specified(requested);
         let (registry, schema) = self.readable_schema(registry_name, schema_name)?;
         let version = schema.version_for(requested).ok_or_else(|| {
             ReadResolutionError::NoSuchSchemaVersion {
@@ -1366,36 +1373,57 @@ impl CodeBinding {
     }
 }
 
+/// The value an OPTIONAL request member specifies, if it specifies anything at all.
+///
+/// A member present with no characters in it specifies nothing, exactly as the member
+/// left out specifies nothing: a value is what a member says, and a value with nothing
+/// in it says nothing. The models of these members admit the empty string
+/// (`@length(min: 0)`, or no length constraint at all), and a present-but-empty query
+/// parameter reaches a handler as `Some("")` rather than `None`, so a request may
+/// legitimately carry one and the reading has to be decided here rather than refused
+/// at the boundary.
+///
+/// What "nothing specified" then MEANS is each member's own documented default and not
+/// something decided here. For the members whose value SELECTS what the answer is drawn
+/// from, nothing specified selects nothing, so nothing is narrowed: an empty
+/// `SchemaVersion` limits a read to no version and the latest stored version answers
+/// ([`ComAmazonawsSchemasSchemasState::readable_schema_version`]), as an empty
+/// `NextToken` names no position and the first page answers ([`page_by_key`]) and an
+/// empty `Keywords` or name prefix narrows no listing. For the member that NAMES the
+/// call carrying it, nothing specified names no call ([`idempotency_token`]).
+///
+/// A REQUIRED member never comes here: a value it must carry is read as given, which is
+/// why an empty `SchemaVersion` in the delete's URI label still names no version
+/// ([`Schema::version_number`]).
+pub fn specified(sent: Option<&str>) -> Option<&str> {
+    sent.filter(|value| !value.is_empty())
+}
+
 /// The call a request's idempotency-token member NAMES, if it names one at all.
 ///
 /// A member the request left out and one it sent with nothing in it are the same
-/// thing: the token is the identity of the call carrying it, and a value with no
-/// characters in it is no identity, so such a request is served exactly as the one
-/// that omits the member — it resolves to no earlier call, and the call it makes is
-/// recorded under no token. Were the empty value read as an identity, two unrelated
-/// calls that both left the member empty would be retries of each other and the
-/// second one's writes would be dropped with a success status.
-///
-/// This is the same reading the rest of this service already gives a value that
-/// specifies nothing: an empty `NextToken` names no position ([`page_by_key`]), an
-/// empty `Keywords` limits nothing, an empty `Tags` map is no tags
-/// ([`tags_from_input`]) and an empty version label names no version
-/// ([`Schema::version_number`]). The models of these members admit the empty string
-/// (`@length(min: 0)`, or no length constraint at all), so a request may legitimately
-/// carry one and the reading has to be decided here rather than refused at the
-/// boundary.
+/// thing ([`specified`]): the token is the identity of the call carrying it, and a
+/// value with no characters in it is no identity, so such a request is served exactly
+/// as the one that omits the member — it resolves to no earlier call, and the call it
+/// makes is recorded under no token. Were the empty value read as an identity, two
+/// unrelated calls that both left the member empty would be retries of each other and
+/// the second one's writes would be dropped with a success status.
 pub fn idempotency_token(sent: Option<&str>) -> Option<&str> {
-    sent.filter(|token| !token.is_empty())
+    specified(sent)
 }
 
 impl Schema {
-    /// The version a request asked for: `SchemaVersion` when given, else the latest.
+    /// The version a request asked for: `SchemaVersion` when it specifies one, else the
+    /// latest.
     ///
     /// `None` means the request named a version this schema does not hold — including
     /// a value that is not a decimal version number at all, which no stored version
     /// can match. The raw label is read as given, by [`Schema::version_number`]: only
     /// a version's own decimal rendering names it, so a spelling that merely parses
-    /// as that number (surrounding space, a sign, zero padding) names nothing.
+    /// as that number (surrounding space, a sign, zero padding) names nothing. Whether
+    /// an optional member SPECIFIES a label at all is settled before this, by
+    /// [`specified`], so a request that sent it with nothing in it arrives here as
+    /// `None` and is answered the latest.
     pub fn version_for(&self, requested: Option<&str>) -> Option<&SchemaVersion> {
         match requested {
             // The newest version the schema still HOLDS: a deleted version is gone
@@ -1414,7 +1442,10 @@ impl Schema {
     /// exactly how this service RENDERS that version — the decimal digits of the
     /// number and nothing else — so any other spelling (surrounding space, a sign,
     /// zero padding, a decimal point, a word, a number too large to be a version)
-    /// names no version at all.
+    /// names no version at all. A label with nothing in it is no rendering of any
+    /// number and so names nothing either — which is what the delete's REQUIRED URI
+    /// label does with it; an OPTIONAL member sent empty specifies no label at all and
+    /// never reaches here ([`specified`]).
     fn version_number(requested: &str) -> Option<u64> {
         // Screen the spelling before handing the digits to `u64: FromStr`, which on its
         // own accepts a leading `+` and so would let a signed label name a version.

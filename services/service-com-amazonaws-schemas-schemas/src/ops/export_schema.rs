@@ -191,8 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answering its own refusal. See `crate::state::readable_schema_version`.
         //
         // "Specifying this limits the results to only this schema version"; absent,
-        // the latest stored version answers. A version this schema does not hold is as
-        // absent as a schema that was never created.
+        // the latest stored version answers, and a value with nothing in it limits the
+        // read to no version at all, so it is read as absent too. A version this schema
+        // does not hold is as absent as a schema that was never created.
         let crate::state::ResolvedSchemaVersion {
             registry,
             schema,

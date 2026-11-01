@@ -190,7 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolves it and hands the schema back for the binding this put attaches.
         //
         // `SchemaVersion` "limits the results to only this schema version"; absent, the
-        // latest stored version is the one generation runs against. The number is
+        // latest stored version is the one generation runs against, and a value with
+        // nothing in it limits the read to no version at all, so it is read as absent
+        // too. The number is
         // resolved HERE and stored on the binding, so a later version of the schema
         // does not silently re-point a binding that was generated from this one.
         //

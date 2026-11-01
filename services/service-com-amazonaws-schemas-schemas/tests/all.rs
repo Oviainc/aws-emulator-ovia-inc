@@ -49,6 +49,8 @@ mod empty_next_token;
 mod empty_response_framing;
 #[path = "all/empty_result_statuses.rs"]
 mod empty_result_statuses;
+#[path = "all/empty_schema_version.rs"]
+mod empty_schema_version;
 #[path = "all/error_body_codes.rs"]
 mod error_body_codes;
 #[path = "all/export_reads_the_stored_schema.rs"]
