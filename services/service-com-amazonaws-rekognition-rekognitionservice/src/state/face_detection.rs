@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Finding the FACES in a submitted image: the pixel side of `DetectFaces`.
+//! Finding the FACES in a submitted image, and measuring what one face looks like: the
+//! pixel side of `DetectFaces` and of `CompareFaces`.
 //!
 //! `DetectFaces` "detects faces within an image that is provided as input" and, for each
 //! face, returns "a bounding box of the face, a confidence value (that the bounding box
@@ -82,6 +83,32 @@
 //! image that carries no such structure — which is the honest answer for an image with no
 //! face in it.
 //!
+//! ## Telling two detected faces apart
+//!
+//! `CompareFaces` needs one more measurement than a detection: how ALIKE the face in one
+//! image and a face in another look. [`FaceAppearance`] is that measurement, and it is a
+//! measurement of the pixels inside a detected face's own box and of nothing else — not of
+//! the request, not of a digest of the bytes, and not of a recorded answer:
+//!
+//! 1. the box is divided into an [`APPEARANCE_GRID`] x [`APPEARANCE_GRID`] grid and each
+//!    cell is reduced to the mean intensity of the pixels in it (through the same
+//!    summed-area table every region mean reads), so the measurement is the face's own
+//!    layout of light and dark at a resolution that survives a change of scale;
+//! 2. the grid is centred on its own mean and scaled to unit length, which is what makes
+//!    two pictures of one face taken at different exposures measure alike: a shift of
+//!    brightness and a change of contrast are divided out;
+//! 3. [`FaceAppearance::similarity_to`] is then the correlation of two such grids, on the
+//!    0..100 scale a `Similarity` carries. The same pixels correlate perfectly and score
+//!    100; two faces laid out differently correlate little and score near zero.
+//!
+//! This is a normalised template correlation, the oldest of the appearance-based face
+//! comparisons (M. Turk and A. Pentland, 1991, build their eigenface space from exactly
+//! these normalised patches), and it is the strongest claim this process can honestly
+//! make: it measures RESEMBLANCE of two face patches and never identity, since nothing
+//! here holds a trained model of who a face belongs to. A `Similarity` it reports is
+//! therefore its own measured correlation, not a graded identity score, and the module
+//! reports no value nothing measured either way.
+//!
 //! ## Where it runs
 //!
 //! Every step is bounded, but all of it is CPU-bound over an image whose size the caller
@@ -155,6 +182,25 @@ pub const MIN_CONFIDENCE: f32 = 50.0;
 /// How much of an already accepted face's box a later candidate may share, as the
 /// intersection over the union of the two, before it is taken for the same face.
 pub const MAX_OVERLAP: f32 = 0.3;
+
+/// How many cells on a side the appearance of a face is measured on: fine enough to carry
+/// where that face's own features sit inside its box, coarse enough that one cell still
+/// averages many pixels for a small face.
+pub const APPEARANCE_GRID: usize = 8;
+
+/// The `Quality.Sharpness` a detected face must measure to be compared at each
+/// `QualityFilter` level (`smithy_query(query="shape",shape="QualityFilter")`: NONE | AUTO
+/// | LOW | MEDIUM | HIGH), on the measured percentage scale [`sharpness`] reports.
+///
+/// AWS publishes no number for its own quality bar — "the quality bar is based on a variety
+/// of common use cases" — so these are the EMULATOR's bars on the one quality this process
+/// measures: how sharp the face's own pixels are, which is what tells a face that is too
+/// blurry to compare from one that is not. `NONE` filters nothing, which is the documented
+/// default, and `AUTO`, where "Amazon Rekognition chooses the quality bar", is this
+/// emulator choosing the lowest bar that still filters.
+pub const QUALITY_BAR_LOW: f32 = 1.0;
+pub const QUALITY_BAR_MEDIUM: f32 = 3.0;
+pub const QUALITY_BAR_HIGH: f32 = 6.0;
 
 /// The radius of the averaging window the feature mask and every region mean read through.
 const SMOOTH_RADIUS: usize = 1;
@@ -238,8 +284,22 @@ pub async fn faces_in_submitted_image(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     image: &Image,
 ) -> Result<Vec<FaceDetail>, UnreadableImage> {
+    Ok(measured_faces_in_submitted_image(ctx, image)
+        .await?
+        .into_iter()
+        .map(|face| face.detail)
+        .collect())
+}
+
+/// The faces in the image a request submitted, each with the appearance that lets it be
+/// compared with a face of another image. The same detection as
+/// [`faces_in_submitted_image`], which is what an operation that only REPORTS faces uses.
+pub async fn measured_faces_in_submitted_image(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    image: &Image,
+) -> Result<Vec<MeasuredFace>, UnreadableImage> {
     let bytes = image_source::image_bytes(ctx, image).await?;
-    match ::tokio::task::spawn_blocking(move || faces_in_image(&bytes)).await {
+    match ::tokio::task::spawn_blocking(move || measured_faces_in_image(&bytes)).await {
         Ok(detected) => detected,
         Err(error) => {
             ::tracing::error!(error = %error, "detecting the faces in an image did not complete");
@@ -255,6 +315,17 @@ pub async fn faces_in_submitted_image(
 /// CPU-bound: a request path reaches it through [`faces_in_submitted_image`], which runs it
 /// on the blocking pool.
 pub fn faces_in_image(bytes: &[u8]) -> Result<Vec<FaceDetail>, UnreadableImage> {
+    Ok(measured_faces_in_image(bytes)?
+        .into_iter()
+        .map(|face| face.detail)
+        .collect())
+}
+
+/// The faces in one image's bytes, each with its measured appearance.
+///
+/// CPU-bound: a request path reaches it through [`measured_faces_in_submitted_image`],
+/// which runs it on the blocking pool.
+pub fn measured_faces_in_image(bytes: &[u8]) -> Result<Vec<MeasuredFace>, UnreadableImage> {
     let Some(format) = image_format(bytes) else {
         return Err(UnreadableImage::invalid_format());
     };
@@ -559,7 +630,7 @@ struct Candidate {
 }
 
 /// Every face in one decoded image, largest first and cut to [`MAX_FACES`].
-fn faces(pixels: &Pixels) -> Vec<FaceDetail> {
+fn faces(pixels: &Pixels) -> Vec<MeasuredFace> {
     let blobs = feature_blobs(pixels);
     let mut found: Vec<Candidate> = Vec::new();
     for first in 0..blobs.len() {
@@ -583,7 +654,128 @@ fn faces(pixels: &Pixels) -> Vec<FaceDetail> {
     }
     kept.sort_by(|left, right| right.rect.area().total_cmp(&left.rect.area()));
     kept.truncate(MAX_FACES);
-    kept.iter().map(|face| detail(pixels, face)).collect()
+    kept.iter()
+        .map(|face| MeasuredFace {
+            detail: detail(pixels, face),
+            appearance: appearance(pixels, &face.rect),
+        })
+        .collect()
+}
+
+/// One detected face: what it REPORTS (the members this detector measured) and what it is
+/// COMPARED by (the appearance of its own pixels). Both come off the same detection, so a
+/// face reported and a face compared are the same face.
+#[derive(Debug, Clone)]
+pub struct MeasuredFace {
+    pub detail: FaceDetail,
+    pub appearance: FaceAppearance,
+}
+
+impl MeasuredFace {
+    /// Whether this face is sharp enough to be compared at `bar`, the
+    /// `Quality.Sharpness` floor a `QualityFilter` level sets: see [`quality_bar`].
+    pub fn meets_quality_bar(&self, bar: f32) -> bool {
+        self.sharpness() >= bar
+    }
+
+    /// The `Quality.Sharpness` measured for this face's own pixels.
+    fn sharpness(&self) -> f32 {
+        self.detail
+            .quality
+            .as_ref()
+            .and_then(|quality| quality.sharpness)
+            .unwrap_or_default()
+    }
+}
+
+/// The `Quality.Sharpness` floor a `QualityFilter` sets, which is none at all for the
+/// `NONE` the member documents as its default and for a request that sends no filter.
+pub fn quality_bar(filter: Option<&str>) -> f32 {
+    match filter.unwrap_or("NONE") {
+        "LOW" | "AUTO" => QUALITY_BAR_LOW,
+        "MEDIUM" => QUALITY_BAR_MEDIUM,
+        "HIGH" => QUALITY_BAR_HIGH,
+        // `NONE` filters nothing. A value the enum does not name cannot reach here: the
+        // model's own enum constraint refuses it before the handler runs.
+        _ => 0.0,
+    }
+}
+
+/// What one detected face LOOKS LIKE: the mean intensity of each cell of a grid over its
+/// own box, centred and scaled to unit length so a shift of brightness or a change of
+/// contrast between two pictures of one face is divided out. See this module's docs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FaceAppearance {
+    cells: Vec<f32>,
+}
+
+impl FaceAppearance {
+    /// How alike two faces look, as the correlation of their two grids on the 0..100 scale
+    /// a `Similarity` carries: 100 for two faces whose cells rise and fall together
+    /// exactly, and 0 for two that do not resemble each other at all.
+    ///
+    /// Both grids are unit-length, so their dot product IS that correlation and cannot
+    /// leave -1..1. A negative correlation is no resemblance rather than an anti-face, so
+    /// the scale starts at zero.
+    pub fn similarity_to(&self, other: &Self) -> f32 {
+        let correlation: f32 = self
+            .cells
+            .iter()
+            .zip(other.cells.iter())
+            .map(|(own, their)| own * their)
+            .sum();
+        (correlation * 100.0).clamp(0.0, 100.0)
+    }
+}
+
+/// The appearance of the face at `rect`: its box resampled onto an
+/// [`APPEARANCE_GRID`]-square grid of region means, then centred and normalised.
+///
+/// Resampling makes the measurement independent of how large the face is in the image: the
+/// same face photographed closer fills more pixels but the same grid. A cell with no pixel
+/// inside the frame — the part of a face at the edge of the image that was not
+/// photographed — takes the mean of the face's own box, the one value that adds nothing to
+/// the comparison, because nothing measured that cell.
+fn appearance(pixels: &Pixels, rect: &FaceRect) -> FaceAppearance {
+    let whole = pixels.integral.mean(pixels.rect(rect.bounds()));
+    let span = APPEARANCE_GRID as f32;
+    let mut cells = Vec::with_capacity(APPEARANCE_GRID * APPEARANCE_GRID);
+    for row in 0..APPEARANCE_GRID {
+        for column in 0..APPEARANCE_GRID {
+            let cell = pixels.rect((
+                rect.left + rect.width * column as f32 / span,
+                rect.top + rect.height * row as f32 / span,
+                rect.left + rect.width * (column + 1) as f32 / span,
+                rect.top + rect.height * (row + 1) as f32 / span,
+            ));
+            cells.push(
+                pixels
+                    .integral
+                    .mean(cell)
+                    .or(whole)
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    normalised(cells)
+}
+
+/// `cells` centred on their own mean and scaled to unit length: the form two appearances
+/// are correlated in. A grid whose cells are all the same value carries no variation to
+/// correlate — it is a flat patch, not a layout of features — so it stays at zero and
+/// resembles nothing, including itself.
+fn normalised(mut cells: Vec<f32>) -> FaceAppearance {
+    let mean = cells.iter().sum::<f32>() / cells.len().max(1) as f32;
+    for cell in &mut cells {
+        *cell -= mean;
+    }
+    let length = cells.iter().map(|cell| cell * cell).sum::<f32>().sqrt();
+    if length > 0.0 {
+        for cell in &mut cells {
+            *cell /= length;
+        }
+    }
+    FaceAppearance { cells }
 }
 
 /// The feature components of an image: the pixels darker than their surroundings, grouped,

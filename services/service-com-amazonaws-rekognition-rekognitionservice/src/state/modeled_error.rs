@@ -96,6 +96,13 @@ pub const FACE_ID_NOT_IN_COLLECTION_MESSAGE: &str = "faceId was not found in the
 /// no position in them.
 pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str = "Invalid pagination token";
 
+/// The fixed text an analysis that needs a face to work on is refused with when the
+/// image it was given carries none — `CompareFaces` "returns an InvalidParameterException
+/// error" when "no faces are detected in the source or target images". It is AWS's
+/// wording for that class and interpolates nothing: neither which of the two images it
+/// was nor anything else from the request, both of which the caller already knows.
+pub const NO_FACE_IN_IMAGE_MESSAGE: &str = "Request has invalid parameters";
+
 /// The server fault a handler answers with when this service's store cannot be reached.
 pub fn store_unavailable() -> InternalServerError {
     InternalServerError::with_message(STORE_UNAVAILABLE_MESSAGE)
@@ -128,4 +135,10 @@ pub fn face_id_not_in_collection() -> InvalidParameterException {
 /// A `NextToken` no list of this service minted.
 pub fn invalid_pagination_token() -> InvalidPaginationTokenException {
     InvalidPaginationTokenException::with_message(INVALID_PAGINATION_TOKEN_MESSAGE)
+}
+
+/// A submitted image in which the analysis found no face to work on; see
+/// [`NO_FACE_IN_IMAGE_MESSAGE`].
+pub fn no_face_in_image() -> InvalidParameterException {
+    InvalidParameterException::with_message(NO_FACE_IN_IMAGE_MESSAGE)
 }

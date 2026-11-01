@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CompareFaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CompareFaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Compares the largest face of the SOURCE image with each face of the TARGET image and
+//! reports, per target face, how alike the two look.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CompareFaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Both sides of the comparison are pixels this request supplied, so both are measured:
+//! the faces come from the geometric detector in [`crate::state::face_detection`], and the
+//! `Similarity` of a pair is the correlation that module measures between the two faces'
+//! own appearances — normalised so a difference in exposure or in how large the face is in
+//! its image does not change it. It is a measured RESEMBLANCE and not an identity: no
+//! trained model of who a face belongs to exists in this process, which is why no stored
+//! face, no digest of the bytes and no recorded answer takes part in it.
+//!
+//! A target face below the `SimilarityThreshold` is reported as an unmatched face rather
+//! than dropped, matches come back in descending order of similarity, and every member a
+//! classifier would have had to judge (`Emotions`, `Smile`) is absent from a reported
+//! face, as is the orientation correction the model documents as always null. The
+//! operation is stateless — "data returned by this operation doesn't persist" — so it
+//! reads and writes nothing of this service's store.
 //!
 //! ## Shape of an operation
 //!
@@ -162,6 +170,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Every modelled error this handler answers with is built through this trait, so each
+// one carries its `Code` member beside its `Message`.
+use crate::state::modeled_error::ModeledError;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -237,18 +249,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CompareFaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CompareFacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CompareFaces"))
+        // Stateless: "this is a stateless API operation. That is, data returned by this
+        // operation doesn't persist", and the whole answer is measured off the two images
+        // the request submitted, so there is no stored resource to read or write and the
+        // engine this operation was constructed with goes unused. `ctx` is what an
+        // S3-sourced read of either image goes through.
+        let _ = &self.engine;
+
+        // "Filtered faces aren't compared": the bar applies to both images, since the
+        // source face is one side of every comparison.
+        let bar = crate::state::face_detection::quality_bar(input.quality_filter.as_deref());
+        let source = comparable_faces(ctx, &input.source_image, bar).await?;
+        let target = comparable_faces(ctx, &input.target_image, bar).await?;
+
+        // "If the source image contains multiple faces, the service detects the largest
+        // face and compares it with each face detected in the target image" — the detector
+        // reports faces largest first, so the source face is the first of them.
+        let Some(source_face) = source.into_iter().next() else {
+            return Err(no_face_in_image());
+        };
+        if target.is_empty() {
+            return Err(no_face_in_image());
+        }
+
+        let threshold = input
+            .similarity_threshold
+            .unwrap_or(crate::state::DEFAULT_SIMILARITY_THRESHOLD);
+        let mut matches: Vec<CompareFacesMatch> = Vec::new();
+        let mut unmatched: Vec<ComparedFace> = Vec::new();
+        for face in &target {
+            let similarity = source_face.appearance.similarity_to(&face.appearance);
+            if similarity >= threshold {
+                matches.push(CompareFacesMatch {
+                    similarity: Some(similarity),
+                    face: Some(compared_face(&face.detail)),
+                });
+            } else {
+                // "CompareFaces also returns an array of faces that don't match the source
+                // image face": a target face below the threshold is reported there rather
+                // than left out of the answer altogether.
+                unmatched.push(compared_face(&face.detail));
+            }
+        }
+        // "In response, the operation returns an array of face matches ordered by
+        // similarity score in descending order."
+        matches.sort_by(|left, right| {
+            right
+                .similarity
+                .unwrap_or_default()
+                .total_cmp(&left.similarity.unwrap_or_default())
+        });
+
+        Ok(CompareFacesOutput {
+            // "The response also provides information about the face in the source image,
+            // including the bounding box of the face and confidence value" — the two
+            // members the shape carries, both measured off the source image.
+            source_image_face: Some(ComparedSourceImageFace {
+                bounding_box: source_face.detail.bounding_box.clone(),
+                confidence: source_face.detail.confidence,
+            }),
+            face_matches: Some(matches),
+            unmatched_faces: Some(unmatched),
+            // "The value of SourceImageOrientationCorrection is always null", and the same
+            // is documented for the target image's.
+            source_image_orientation_correction: None,
+            target_image_orientation_correction: None,
+        })
     }
+}
+
+/// The faces of one submitted image that are sharp enough to be compared at `bar`,
+/// largest first.
+async fn comparable_faces(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    image: &Image,
+    bar: f32,
+) -> Result<Vec<crate::state::face_detection::MeasuredFace>, CompareFacesError> {
+    let mut faces = crate::state::face_detection::measured_faces_in_submitted_image(ctx, image)
+        .await
+        .map_err(unreadable_error)?;
+    faces.retain(|face| face.meets_quality_bar(bar));
+    Ok(faces)
+}
+
+/// A detected face as the `ComparedFace` this operation reports it as: the members the
+/// detector measured, carried across unchanged. `Emotions` and `Smile` are a classifier's
+/// judgement and no classifier runs here, so they stay absent rather than being filled in.
+fn compared_face(detail: &FaceDetail) -> ComparedFace {
+    ComparedFace {
+        bounding_box: detail.bounding_box.clone(),
+        confidence: detail.confidence,
+        landmarks: detail.landmarks.clone(),
+        pose: detail.pose.clone(),
+        quality: detail.quality.clone(),
+        emotions: None,
+        smile: None,
+    }
+}
+
+/// The refusal for an image this operation found no comparable face in: "if no faces are
+/// detected in the source or target images, CompareFaces returns an
+/// InvalidParameterException error". An image whose every face the `QualityFilter` bar
+/// removed leaves nothing to compare either, so it is answered the same way.
+fn no_face_in_image() -> CompareFacesError {
+    CompareFacesErrorModeled::InvalidParameterException(
+        crate::state::modeled_error::no_face_in_image(),
+    )
+    .into()
+}
+
+/// The modelled answer for an image whose faces could not be detected: one modelled error
+/// per reason, each carrying the reason's own message. The reason type and its wording are
+/// shared (`crate::state::image_source`); the mapping is written per operation because each
+/// operation's error enum is its own type, generated from the errors the model declares for
+/// it, so there is no one enum for a shared function to return.
+fn unreadable_error(reason: crate::state::image_source::UnreadableImage) -> CompareFacesError {
+    use crate::state::image_source::UnreadableImage;
+
+    let message = reason.message().to_string();
+    match reason {
+        UnreadableImage::InvalidFormat(_) => CompareFacesErrorModeled::InvalidImageFormatException(
+            InvalidImageFormatException::with_message(message),
+        ),
+        UnreadableImage::TooLarge(_) => CompareFacesErrorModeled::ImageTooLargeException(
+            ImageTooLargeException::with_message(message),
+        ),
+        UnreadableImage::S3Unreadable(_) => CompareFacesErrorModeled::InvalidS3ObjectException(
+            InvalidS3ObjectException::with_message(message),
+        ),
+        UnreadableImage::InvalidParameter(_) => CompareFacesErrorModeled::InvalidParameterException(
+            InvalidParameterException::with_message(message),
+        ),
+        // Nothing was established about the image itself, so this is the server fault it
+        // is rather than anything about the request.
+        UnreadableImage::NotAnalysed(_) => CompareFacesErrorModeled::InternalServerError(
+            InternalServerError::with_message(message),
+        ),
+    }
+    .into()
 }

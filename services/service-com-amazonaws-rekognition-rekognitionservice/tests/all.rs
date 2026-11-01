@@ -15,6 +15,8 @@
 mod error_bodies;
 #[path = "all/face_collections.rs"]
 mod face_collections;
+#[path = "all/face_comparison.rs"]
+mod face_comparison;
 #[path = "all/face_detection.rs"]
 mod face_detection;
 #[path = "all/image_content_refusal.rs"]

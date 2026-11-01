@@ -14,8 +14,9 @@
 //! the request carried.
 //!
 //! The table spans what the rule generalises over: which image operation is called
-//! (`DetectFaces`, `IndexFaces` — the operations of this service that take an `Image` and
-//! are implemented) and what else the request carries beside the image (nothing, and each
+//! (`DetectFaces`, `IndexFaces` — the operations of this service that take ONE `Image` and
+//! are implemented; `CompareFaces`, which takes two, is covered the same way in the
+//! comparison suite) and what else the request carries beside the image (nothing, and each
 //! operation's own optional members at several values). A contrast table pins the other
 //! side of the rule: an image that DOES identify content is never answered with this
 //! refusal, whether that content turns out to be readable, to violate the model's own

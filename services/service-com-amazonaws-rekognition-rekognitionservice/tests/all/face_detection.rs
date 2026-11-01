@@ -28,6 +28,10 @@
 //! of cases from the pinned [`SWEEP_SEED`] through a three-line xorshift rather than pulling
 //! in a generator crate: the cases are enumerated deterministically, so a failure names the
 //! seed and the case index and reproduces exactly.
+//!
+//! The portraits, the blur, the encoder and the object-store harness below are what every
+//! suite of this crate that needs a drawn image uses, so one picture is drawn one way
+//! whichever operation is being exercised.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -51,7 +55,7 @@ const S3_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=0000";
 
 /// The bucket the staged images below live in, and a bucket nothing here creates.
-const BUCKET: &str = "rekognition-images";
+pub(crate) const BUCKET: &str = "rekognition-images";
 const ABSENT_BUCKET: &str = "rekognition-images-missing";
 
 /// The seed the generated-case sweep starts from, and how many cases it runs.
@@ -98,7 +102,7 @@ type ReportedBox = (f64, f64, f64, f64);
 /// One face as the TEST draws it: where its eyes are, how far apart, how far the eye line
 /// is rotated clockwise in the image, and whether its features are drawn at all.
 #[derive(Debug, Clone, Copy)]
-struct DrawnFace {
+pub(crate) struct DrawnFace {
     eyes_x: f32,
     eyes_y: f32,
     eye_span: f32,
@@ -109,7 +113,7 @@ struct DrawnFace {
 
 impl DrawnFace {
     /// A whole face: a head, two eyes `eye_span` apart and a mouth below them.
-    fn new(eyes_x: f32, eyes_y: f32, eye_span: f32) -> Self {
+    pub(crate) fn new(eyes_x: f32, eyes_y: f32, eye_span: f32) -> Self {
         Self {
             eyes_x,
             eyes_y,
@@ -120,7 +124,7 @@ impl DrawnFace {
         }
     }
 
-    fn rolled(mut self, roll: f32) -> Self {
+    pub(crate) fn rolled(mut self, roll: f32) -> Self {
         self.roll = roll;
         self
     }
@@ -182,9 +186,9 @@ impl DrawnFace {
 
 /// One synthetic image: its size, its three tones and the faces drawn on it.
 #[derive(Debug, Clone)]
-struct Portrait {
-    width: u32,
-    height: u32,
+pub(crate) struct Portrait {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     background: u8,
     skin: u8,
     feature: u8,
@@ -193,7 +197,7 @@ struct Portrait {
 
 impl Portrait {
     /// One centred face on a 320x320 image, which is the base every case varies from.
-    fn one_face() -> Self {
+    pub(crate) fn one_face() -> Self {
         Self {
             width: 320,
             height: 320,
@@ -205,7 +209,7 @@ impl Portrait {
     }
 
     /// An image with no face on it at all.
-    fn blank(width: u32, height: u32, tone: u8) -> Self {
+    pub(crate) fn blank(width: u32, height: u32, tone: u8) -> Self {
         Self {
             width,
             height,
@@ -216,26 +220,26 @@ impl Portrait {
         }
     }
 
-    fn with_faces(mut self, faces: Vec<DrawnFace>) -> Self {
+    pub(crate) fn with_faces(mut self, faces: Vec<DrawnFace>) -> Self {
         self.faces = faces;
         self
     }
 
-    fn with_tones(mut self, background: u8, skin: u8, feature: u8) -> Self {
+    pub(crate) fn with_tones(mut self, background: u8, skin: u8, feature: u8) -> Self {
         self.background = background;
         self.skin = skin;
         self.feature = feature;
         self
     }
 
-    fn with_size(mut self, width: u32, height: u32) -> Self {
+    pub(crate) fn with_size(mut self, width: u32, height: u32) -> Self {
         self.width = width;
         self.height = height;
         self
     }
 
     /// The pixels of this portrait.
-    fn render(&self) -> GrayImage {
+    pub(crate) fn render(&self) -> GrayImage {
         let mut image = GrayImage::from_pixel(self.width, self.height, Luma([self.background]));
         for face in &self.faces {
             let (cx, cy, rx, ry) = face.head();
@@ -266,7 +270,7 @@ impl Portrait {
     }
 
     /// This portrait as PNG bytes, which is how most cases submit it.
-    fn png(&self) -> Vec<u8> {
+    pub(crate) fn png(&self) -> Vec<u8> {
         encode(&self.render(), ImageFormat::Png)
     }
 }
@@ -290,7 +294,7 @@ fn fill_ellipse(image: &mut GrayImage, cx: f32, cy: f32, rx: f32, ry: f32, tone:
 }
 
 /// `image` encoded in `format`: the bytes a client would submit.
-fn encode(image: &GrayImage, format: ImageFormat) -> Vec<u8> {
+pub(crate) fn encode(image: &GrayImage, format: ImageFormat) -> Vec<u8> {
     let mut bytes = Cursor::new(Vec::new());
     DynamicImage::ImageLuma8(image.clone())
         .write_to(&mut bytes, format)
@@ -299,7 +303,7 @@ fn encode(image: &GrayImage, format: ImageFormat) -> Vec<u8> {
 }
 
 /// `image` averaged over a 3x3 window, `passes` times: the same picture, less sharp.
-fn blurred(image: &GrayImage, passes: usize) -> GrayImage {
+pub(crate) fn blurred(image: &GrayImage, passes: usize) -> GrayImage {
     let mut current = image.clone();
     for _ in 0..passes {
         let mut next = current.clone();
@@ -333,7 +337,7 @@ fn harness() -> MultiServiceRouter {
 
 /// The emulator with this service and the emulator's own Amazon S3 on ONE engine — what the
 /// assembled emulator runs, narrowed to the two services an S3-sourced image needs.
-fn harness_with_object_store() -> MultiServiceRouter {
+pub(crate) fn harness_with_object_store() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -345,7 +349,7 @@ fn harness_with_object_store() -> MultiServiceRouter {
 }
 
 /// One path-style request to the emulator's Amazon S3 front door.
-async fn s3(router: &MultiServiceRouter, path: &str, body: &[u8]) -> u16 {
+pub(crate) async fn s3(router: &MultiServiceRouter, path: &str, body: &[u8]) -> u16 {
     let request = http::Request::builder()
         .method("PUT")
         .uri(format!("https://s3.{REGION}.amazonaws.com{path}"))
@@ -397,7 +401,7 @@ fn faces_of(case: &str, reply: &Reply) -> Vec<Value> {
 }
 
 /// A float member of a JSON object, by path.
-fn number(value: &Value, path: &[&str]) -> f64 {
+pub(crate) fn number(value: &Value, path: &[&str]) -> f64 {
     let mut current = value;
     for step in path {
         current = current

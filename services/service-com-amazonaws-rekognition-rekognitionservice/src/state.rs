@@ -13,20 +13,25 @@
 //!
 //! Rekognition's face operations are backed by a face detector and a face
 //! recogniser. The RECOGNISER does not exist in this process: nothing here maps a face
-//! to an identity, so no image is matched against another image's face. What IS real is
+//! to an IDENTITY, so no face is tied to the person it belongs to. What IS real is
 //! the collection store — a collection, the faces indexed into it, their minted ids, and
 //! the counts, filters, pages and lookups computed from them — and, for the operations
-//! that analyse one submitted image, the geometric face DETECTOR in
+//! that analyse a submitted image, the geometric face DETECTOR in
 //! [`face_detection`]: it decodes the image and measures the faces it finds in the
 //! pixels, reporting a box, a confidence, landmarks, a roll and a quality it measured
-//! and leaving every classifier's judgement (an age, a gender, an emotion) absent.
+//! and leaving every classifier's judgement (an age, a gender, an emotion) absent. Two
+//! faces the detector found in two SUBMITTED images can also be compared, because both
+//! sides of that comparison are pixels this process holds: `CompareFaces` reports the
+//! resemblance [`face_detection::FaceAppearance`] measures between them, which is a
+//! measured correlation of two faces and still not an identity.
 //!
 //! Nothing here reports a value nothing measured. A STORED face therefore carries its
 //! identity and nothing else: no bounding box, no confidence, no landmarks, pose or
 //! quality, no demographic attribute and no orientation correction — `IndexFaces` records
-//! what the collection holds, and the recogniser that would tie a stored face to an image
-//! is what is missing, so the recogniser-backed operations (`CompareFaces`,
-//! `SearchFacesByImage`, `RecognizeCelebrities`, …) stay unimplemented 501s.
+//! what the collection holds, and the pixels of a stored face are not among them, so the
+//! operations that would match a submitted image against the faces a collection holds
+//! (`SearchFacesByImage`, `SearchUsersByImage`, `RecognizeCelebrities`, …) stay
+//! unimplemented 501s.
 //!
 //! The one comparison this emulator can make about stored faces is IDENTITY:
 //! [`image_signature`] digests what an image is, so two indexed faces can be told to have
@@ -74,6 +79,13 @@ pub const DEFAULT_MAX_FACES: usize = 4096;
 /// (`smithy_query(query="doc",shape="SearchFacesRequest",member="FaceMatchThreshold")`:
 /// "The default value is 80%").
 pub const DEFAULT_FACE_MATCH_THRESHOLD: f32 = 80.0;
+
+/// The `CompareFaces` match floor used when the caller sends no `SimilarityThreshold`.
+/// Documented on the operation itself
+/// (`smithy_query(query="doc",shape="CompareFaces")`: "By default, only faces with a
+/// similarity score of greater than or equal to 80% are returned in the response. You can
+/// change this value by specifying the SimilarityThreshold parameter").
+pub const DEFAULT_SIMILARITY_THRESHOLD: f32 = 80.0;
 
 /// The `Similarity` `SearchFaces` reports for the only match this emulator can
 /// establish: a face indexed from the same image content as the searched one. It is
