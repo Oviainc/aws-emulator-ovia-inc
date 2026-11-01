@@ -1353,11 +1353,7 @@ impl RegionalState {
         ) {
             return None;
         }
-        Some(crate::ops::types::ResourceNotFoundException {
-            message: WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
-            resource_id: workspace_id_of_arn(workspace_arn).to_string(),
-            resource_type: WORKSPACE_RESOURCE_TYPE.to_string(),
-        })
+        Some(workspace_not_found(workspace_id_of_arn(workspace_arn)))
     }
 
     /// The tag map the resource `resource_arn` names CARRIES, for a reader to report —
@@ -1764,6 +1760,36 @@ pub fn reserved_tag_key_requirement() -> String {
 /// error enum so each returns it through its own error channel.
 pub fn arn_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::not_found(RESOURCE_NOT_FOUND_MESSAGE)
+}
+
+/// The refusal every operation addressed by `/workspaces/{workspaceId}` shares for a
+/// `workspaceId` that resolves to no workspace this account holds in the Region the
+/// request was signed for: the modelled `ResourceNotFoundException` carrying
+/// [`WORKSPACE_NOT_FOUND_MESSAGE`], the unresolved id in `resourceId` and the parent's
+/// AWS type name ([`WORKSPACE_RESOURCE_TYPE`]) in `resourceType`.
+///
+/// ONE composition for all of them, for the reason [`arn_not_found`] is one for the three
+/// ARN-addressed tagging operations: the `resourceType` reported, and what `resourceId`
+/// names, are decided here once, so no two handlers can drift apart. It hands back the
+/// modelled SHAPE rather than an operation's error channel, because each operation wraps
+/// it in its own modelled error enum and answers it through its own channel.
+pub fn workspace_not_found(workspace_id: &str) -> crate::ops::types::ResourceNotFoundException {
+    workspace_not_found_worded(WORKSPACE_NOT_FOUND_MESSAGE, workspace_id)
+}
+
+/// [`workspace_not_found`] under an operation's OWN sentence, for the one operation whose
+/// recorded wording differs — `DescribeWorkspace`, which answers
+/// [`DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE`]. The two members that IDENTIFY the missing
+/// workspace are still composed in one place, whichever sentence reports it.
+pub fn workspace_not_found_worded(
+    message: &str,
+    workspace_id: &str,
+) -> crate::ops::types::ResourceNotFoundException {
+    crate::ops::types::ResourceNotFoundException {
+        message: message.to_string(),
+        resource_id: workspace_id.to_string(),
+        resource_type: WORKSPACE_RESOURCE_TYPE.to_string(),
+    }
 }
 
 /// How a `revisionId` that does not name the policy's current revision is refused: the

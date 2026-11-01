@@ -424,18 +424,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The modelled `ResourceNotFoundException` for a `workspaceId` that resolves to no
-/// workspace this account holds — the parent of the detector this call stores.
+/// workspace this account holds — the parent of the detector this call stores — answered
+/// through THIS operation's error channel.
 ///
-/// One composition shared with every other workspace-scoped operation: the service's
-/// fixed sentence in `message`, the unresolved id in `resourceId` (which is what that
-/// `@required` member is for, so the message echoes nothing from the request) and the
-/// parent's AWS type in `resourceType`.
+/// The exception itself is composed by [`crate::state::workspace_not_found`], the one
+/// place every workspace-addressed operation of this crate builds it, so this handler
+/// only chooses the channel it travels on.
 fn workspace_not_found(workspace_id: &str) -> PutAnomalyDetectorError {
-    PutAnomalyDetectorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
-        resource_id: workspace_id.to_string(),
-        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
-    })
+    PutAnomalyDetectorErrorModeled::ResourceNotFoundException(crate::state::workspace_not_found(
+        workspace_id,
+    ))
     .into()
 }
 

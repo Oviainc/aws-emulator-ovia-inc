@@ -196,11 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // answers the same not-found the missing workspace does, below.
             None => {
                 return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
-                        resource_id: input.workspace_id.clone(),
-                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
-                    },
+                        crate::state::workspace_not_found(&input.workspace_id),
                 )
                 .into())
             }
@@ -210,11 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an unknown workspace is the missing resource — ResourceNotFoundException (404).
         let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
             return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_id: input.workspace_id.clone(),
-                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::workspace_not_found(&input.workspace_id),
             )
             .into());
         };

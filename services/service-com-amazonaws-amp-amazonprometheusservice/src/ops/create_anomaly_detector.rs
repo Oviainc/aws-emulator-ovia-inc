@@ -387,18 +387,16 @@ fn field_validation(field: &str, requirement: &str) -> CreateAnomalyDetectorErro
 }
 
 /// The modelled `ResourceNotFoundException` for a `workspaceId` that resolves to no
-/// workspace this account holds — the parent of the detector this call would create.
+/// workspace this account holds — the parent of the detector this call would create —
+/// answered through THIS operation's error channel.
 ///
-/// One composition shared with every other workspace-scoped operation: the constant
-/// sentence in `message`, the unresolved id in `resourceId` (which is what that
-/// `@required` member is for, so the message echoes nothing from the request) and the
-/// parent's AWS type name in `resourceType`.
+/// The exception itself is composed by [`crate::state::workspace_not_found`], the one
+/// place every workspace-addressed operation of this crate builds it, so this handler
+/// only chooses the channel it travels on.
 fn workspace_not_found(workspace_id: &str) -> CreateAnomalyDetectorError {
-    CreateAnomalyDetectorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
-        resource_id: workspace_id.to_string(),
-        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
-    })
+    CreateAnomalyDetectorErrorModeled::ResourceNotFoundException(
+        crate::state::workspace_not_found(workspace_id),
+    )
     .into()
 }
 

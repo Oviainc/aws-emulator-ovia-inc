@@ -218,11 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(
                 UpdateWorkspaceConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
-                        resource_id: input.workspace_id.clone(),
-                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
-                    },
+                    crate::state::workspace_not_found(&input.workspace_id),
                 )
                 .into(),
             );

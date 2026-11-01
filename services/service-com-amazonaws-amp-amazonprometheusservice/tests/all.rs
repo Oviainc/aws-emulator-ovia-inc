@@ -101,5 +101,7 @@ mod workspace_alias_publication;
 mod workspace_configuration;
 #[path = "all/workspace_lifecycle.rs"]
 mod workspace_lifecycle;
+#[path = "all/workspace_not_found_composition.rs"]
+mod workspace_not_found_composition;
 #[path = "all/workspace_rename.rs"]
 mod workspace_rename;

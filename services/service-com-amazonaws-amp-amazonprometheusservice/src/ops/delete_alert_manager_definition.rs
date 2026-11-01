@@ -194,13 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|store| store.workspaces.get_mut(&input.workspace_id))
         else {
             return Err(DeleteAlertManagerDefinitionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    // The one constant sentence every per-workspace refusal in this crate
-                    // reports; the id the caller named rides in `resourceId`.
-                    message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_id: input.workspace_id.clone(),
-                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
-                },
+                // The one constant sentence every per-workspace refusal in this crate
+                // reports; the id the caller named rides in `resourceId`.
+                crate::state::workspace_not_found(&input.workspace_id),
             )
             .into());
         };

@@ -168,14 +168,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
             return Err(DescribeWorkspaceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    // This OPERATION's own recorded sentence, which is
-                    // `crate::state::WORKSPACE_NOT_FOUND_MESSAGE` without the trailing
-                    // period — see the constant for why the two spellings are not one.
-                    message: crate::state::DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_id: input.workspace_id.clone(),
-                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
-                },
+                // This OPERATION's own recorded sentence, which is
+                // `crate::state::WORKSPACE_NOT_FOUND_MESSAGE` without the trailing
+                // period — see the constant for why the two spellings are not one.
+                crate::state::workspace_not_found_worded(
+                    crate::state::DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE,
+                    &input.workspace_id,
+                ),
             )
             .into());
         };
