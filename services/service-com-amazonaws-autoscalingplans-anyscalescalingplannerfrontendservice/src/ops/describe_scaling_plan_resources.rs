@@ -12,7 +12,8 @@
 //! Each reported resource carries the target tracking scaling policies its own
 //! instruction calls for — "AWS Auto Scaling creates target tracking scaling policies
 //! based on the scaling instructions" — together with the narrative of its scaling
-//! status, both derived from the plan record.
+//! status, both derived from the plan record AND that same instruction, so the two
+//! halves of one resource's report cannot disagree about the policies it carries.
 //!
 //! Both input members are required and together name ONE plan, but this operation binds
 //! no not-found error at all, so a `ScalingPlanName` naming no stored plan is not a client
@@ -207,7 +208,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => (Vec::new(), None),
                 Some(plan) => {
                     let scaling_status_code = plan.scaling_status_code();
-                    let scaling_status_message = plan.scaling_status_message();
 
                     // Every resource the plan covers, ordered by the identity that
                     // addresses it, so that ordering is fixed by the resources themselves
@@ -241,7 +241,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             // "AWS Auto Scaling creates target tracking scaling policies
                             // based on the scaling instructions" — so the policies on a
                             // resource are those its own instruction calls for, reported
-                            // once the plan's configuration has reached it.
+                            // once the plan's configuration has reached it, and the
+                            // narrative beside them is the one for the resource THIS
+                            // instruction describes, so it cannot claim policies the
+                            // same read reports the resource as not carrying.
                             let policies = plan.applied_policies(instruction);
                             ScalingPlanResource {
                                 scaling_plan_name: plan.name.clone(),
@@ -251,7 +254,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 scalable_dimension: instruction.scalable_dimension.clone(),
                                 scaling_policies: (!policies.is_empty()).then_some(policies),
                                 scaling_status_code: scaling_status_code.to_string(),
-                                scaling_status_message: Some(scaling_status_message.to_string()),
+                                scaling_status_message: Some(
+                                    plan.scaling_status_message(instruction).to_string(),
+                                ),
                             }
                         })
                         .collect();

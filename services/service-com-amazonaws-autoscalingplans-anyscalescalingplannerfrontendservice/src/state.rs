@@ -83,6 +83,13 @@ pub const SCALING_STATUS_PARTIALLY_ACTIVE: &str = "PartiallyActive";
 // One row per `ScalingPlanStatusCode` this emulator puts a plan in, so the scaling
 // status a resource reports and the two narratives that explain the pair cannot
 // disagree about one status, and a status added later has to bring its row.
+//
+// A resource's narrative also has to account for the one thing an instruction changes
+// about whether target tracking scaling policies reach its resource at all
+// ([`configures_dynamic_scaling`]), so each row carries the sentence for a resource
+// that CARRIES such policies and the sentence for one that carries none: the narrative
+// of a resource with no policy speaks of the scaling configuration the status code
+// itself speaks of, never of policies that resource does not have.
 // ---------------------------------------------------------------------------
 
 /// What a plan in one `ScalingPlanStatusCode` reports, on both describe envelopes.
@@ -92,8 +99,17 @@ pub struct ReportedStatus {
     pub status_message: &'static str,
     /// The `ScalingStatusCode` every resource of such a plan reports.
     pub scaling_status_code: &'static str,
-    /// `ScalingPlanResource$ScalingStatusMessage`.
+    /// `ScalingPlanResource$ScalingStatusMessage` of a resource whose instruction
+    /// configures dynamic scaling, so target tracking scaling policies are what the
+    /// plan applies to, updates on or removes from it.
     pub scaling_status_message: &'static str,
+    /// `ScalingPlanResource$ScalingStatusMessage` of a resource whose instruction turned
+    /// dynamic scaling off: no target tracking scaling policy ever reaches it, so what
+    /// this status says the service did or is doing is said of the resource's scaling
+    /// configuration instead — the subject the `ScalingStatusCode` doc itself uses ("The
+    /// scaling configuration is active", "is not active because the scaling plan is being
+    /// created").
+    pub scaling_status_message_without_policies: &'static str,
 }
 
 /// What a plan whose configuration is applied to its resources reports.
@@ -101,6 +117,9 @@ const APPLIED_STATUS: ReportedStatus = ReportedStatus {
     status_message: "Scaling plan has been created and applied to all resources.",
     scaling_status_code: SCALING_STATUS_ACTIVE,
     scaling_status_message: "Target tracking scaling policies have been applied to the resource.",
+    scaling_status_message_without_policies: "The scaling configuration has been applied to the \
+                                              resource, which has no target tracking scaling \
+                                              policies because dynamic scaling is disabled.",
 };
 
 /// What a plan reports in a status this emulator never sets.
@@ -118,6 +137,8 @@ const UNAPPLIED_STATUS: ReportedStatus = ReportedStatus {
     scaling_status_code: SCALING_STATUS_PARTIALLY_ACTIVE,
     scaling_status_message: "Target tracking scaling policies could not be fully applied to the \
                              resource.",
+    scaling_status_message_without_policies: "The scaling configuration could not be fully \
+                                              applied to the resource.",
 };
 
 /// Every status this emulator puts a plan in, with what each one reports.
@@ -131,6 +152,9 @@ const REPORTED_STATUS: &[(&str, ReportedStatus)] = &[
             scaling_status_code: SCALING_STATUS_INACTIVE,
             scaling_status_message: "Target tracking scaling policies have not been applied to \
                                      the resource yet because the scaling plan is being created.",
+            scaling_status_message_without_policies: "The scaling configuration has not been \
+                                                      applied to the resource yet because the \
+                                                      scaling plan is being created.",
         },
     ),
     (
@@ -140,6 +164,8 @@ const REPORTED_STATUS: &[(&str, ReportedStatus)] = &[
             scaling_status_code: SCALING_STATUS_PARTIALLY_ACTIVE,
             scaling_status_message: "Target tracking scaling policies are being updated on the \
                                      resource.",
+            scaling_status_message_without_policies: "The scaling configuration is being updated \
+                                                      on the resource.",
         },
     ),
     (
@@ -149,6 +175,8 @@ const REPORTED_STATUS: &[(&str, ReportedStatus)] = &[
             scaling_status_code: SCALING_STATUS_PARTIALLY_ACTIVE,
             scaling_status_message: "Target tracking scaling policies are being removed from the \
                                      resource.",
+            scaling_status_message_without_policies: "The scaling configuration is being removed \
+                                                      from the resource.",
         },
     ),
 ];
@@ -250,11 +278,24 @@ impl ScalingPlanRecord {
         self.reported().status_message
     }
 
-    /// `ScalingStatusMessage`: the narrative of the scaling status every resource of
-    /// this plan reports, derived — like the status code itself — from what the plan is
-    /// doing to the policies on its resources.
-    pub fn scaling_status_message(&self) -> &'static str {
-        self.reported().scaling_status_message
+    /// `ScalingStatusMessage`: the narrative of the scaling status the resource that
+    /// `instruction` applies to reports, derived — like the status code itself — from
+    /// what the plan is doing to that resource, and from whether the instruction in
+    /// force puts target tracking scaling policies on it at all.
+    ///
+    /// The narrative and [`Self::applied_policies`] read ONE predicate about that,
+    /// [`configures_dynamic_scaling`], so a resource whose instruction turned dynamic
+    /// scaling off cannot be told that policies have been applied to, are being updated
+    /// on, or are being removed from it while the very same read reports it carrying
+    /// none; what such a resource reports is what the plan did to its scaling
+    /// configuration.
+    pub fn scaling_status_message(&self, instruction: &ScalingInstruction) -> &'static str {
+        let reported = self.reported();
+        if configures_dynamic_scaling(instruction) {
+            reported.scaling_status_message
+        } else {
+            reported.scaling_status_message_without_policies
+        }
     }
 
     /// The row of [`REPORTED_STATUS`] for the status this plan is in.
@@ -284,6 +325,10 @@ impl ScalingPlanRecord {
     ///
     /// Empty while the plan is still being created: no policy has reached the resource
     /// yet, which is exactly what its `Inactive` scaling status reports.
+    ///
+    /// [`Self::scaling_status_message`] reads the same predicate about the instruction,
+    /// so the narrative reported beside this list never speaks of policies this list
+    /// does not hold.
     ///
     /// A policy is named after the IDENTITIES its state gives it — the resource
     /// `instruction` applies to and the metric each configuration tracks — so a rewrite

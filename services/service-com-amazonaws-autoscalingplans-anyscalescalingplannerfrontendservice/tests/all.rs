@@ -57,6 +57,8 @@ mod resource_id_identifies_a_resource;
 mod resource_identity_definition;
 #[path = "all/resource_label_format.rs"]
 mod resource_label_format;
+#[path = "all/resource_narrative_matches_its_policies.rs"]
+mod resource_narrative_matches_its_policies;
 #[path = "all/scaling_instruction_validation.rs"]
 mod scaling_instruction_validation;
 #[path = "all/scaling_mode_conditional_members.rs"]
