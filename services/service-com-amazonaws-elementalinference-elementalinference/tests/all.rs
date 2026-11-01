@@ -15,6 +15,8 @@
 mod append_output_name_conflict;
 #[path = "all/associate_feed_reference_integrity.rs"]
 mod associate_feed_reference_integrity;
+#[path = "all/claim_without_supplied_outputs.rs"]
+mod claim_without_supplied_outputs;
 #[path = "all/completed_deletion.rs"]
 mod completed_deletion;
 #[path = "all/create_replay_is_idempotent.rs"]
