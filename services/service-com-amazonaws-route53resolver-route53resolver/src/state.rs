@@ -834,10 +834,19 @@ pub fn rslvr_message_sentences(code: &str, sentences: &[&str]) -> String {
 /// that cannot address a resource learns nothing else about it — which is what
 /// makes a resource it may not write indistinguishable from one that does not
 /// exist.
-pub fn resource_not_found_message(resource_id: &str) -> String {
+///
+/// The sentence names the resource by its ID, so `resource` is reduced to the
+/// id it names ([`arn_resource_id`]) whatever the request addressed the resource
+/// by: an operation that takes an ARN and one that takes the bare id report the
+/// one sentence, with the bare id inside it. An argument that is already an id
+/// carries no `/` and so passes through unchanged.
+pub fn resource_not_found_message(resource: &str) -> String {
     rslvr_message(
         RSLVR_CODE_RESOURCE_NOT_FOUND,
-        &format!("Can’t find the resource with ID \"{resource_id}\""),
+        &format!(
+            "Can’t find the resource with ID \"{}\"",
+            arn_resource_id(resource)
+        ),
     )
 }
 
@@ -2056,9 +2065,13 @@ pub fn state_transition_conflict() -> ConflictException {
 /// service a caller names but cannot address
 /// ([`resource_not_found_message`]), with the rule group's modelled shape name
 /// as the resource type.
-pub fn firewall_rule_group_not_found(firewall_rule_group_id: &str) -> ResourceNotFoundException {
+///
+/// `firewall_rule_group` is how the request addressed the group — its
+/// `FirewallRuleGroupId`, or the `Arn` the policy operations take — and the
+/// sentence names the bare id either way.
+pub fn firewall_rule_group_not_found(firewall_rule_group: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(resource_not_found_message(firewall_rule_group_id)),
+        message: Some(resource_not_found_message(firewall_rule_group)),
         resource_type: Some(RESOURCE_TYPE_FIREWALL_RULE_GROUP.to_string()),
     }
 }
@@ -5151,11 +5164,11 @@ pub fn arn_resource_id(resource_arn: &str) -> &str {
 ///
 /// Built here so `TagResource`, `UntagResource` and `ListTagsForResource`
 /// cannot drift apart: all of them report the RSLVR-coded message, which names
-/// the resource by the id its ARN carries, and the resource type the model asks
-/// for.
+/// the resource by the id its ARN carries ([`resource_not_found_message`]), and
+/// the resource type the model asks for.
 pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(resource_not_found_message(arn_resource_id(resource_arn))),
+        message: Some(resource_not_found_message(resource_arn)),
         resource_type: arn_resource_type(resource_arn).map(str::to_string),
     }
 }

@@ -113,6 +113,8 @@ mod resolver_rule_tokens_and_refusal_sentences;
 mod resolver_rule_updates;
 #[path = "all/resolver_rules.rs"]
 mod resolver_rules;
+#[path = "all/resource_not_found_identifier.rs"]
+mod resource_not_found_identifier;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

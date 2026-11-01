@@ -161,6 +161,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policy held on that group's record, so nothing about it changes for
         // the next caller. A group that is shared with nobody holds no policy,
         // and reports the document that grants nothing rather than no document.
+        // The refusal names the group by the id its ARN carries, which is how
+        // the service identifies a resource it cannot address whichever member
+        // the request addressed it by (`crate::state::resource_not_found_message`).
         let store = state.lock();
         let Some(record) = store.firewall_rule_group_by_arn(&input.arn) else {
             return Err(

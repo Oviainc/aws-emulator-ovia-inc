@@ -25,6 +25,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_route53resolver_route53resolver::state::{
     EMPTY_POLICY_DOCUMENT, RESOURCE_TYPE_FIREWALL_RULE_GROUP, RSLVR_CODE_INVALID_IAM_POLICY,
+    RSLVR_CODE_RESOURCE_NOT_FOUND,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -435,8 +436,9 @@ async fn an_arn_naming_no_rule_group_is_refused() {
             "ResourceNotFoundException",
         )
         .await;
-        // The refusal names the ARN that was asked for and the type of resource
-        // the service found nothing of.
+        // The refusal names the resource by the id the ARN carries — never the
+        // ARN as submitted — and the type of resource the service found nothing
+        // of.
         let (_, refusal) = call(
             &router,
             "GetFirewallRuleGroupPolicy",
@@ -444,9 +446,14 @@ async fn an_arn_naming_no_rule_group_is_refused() {
         )
         .await;
         let message = string_member(&refusal, "Message");
-        assert!(
-            message.contains(&arn),
-            "case {case:?}: the refusal must name the ARN {arn:?}, got {message:?} ({})",
+        let expected = format!(
+            "[{RSLVR_CODE_RESOURCE_NOT_FOUND}] Can’t find the resource with ID \"{}\".",
+            arn.rsplit_once('/').map_or(arn.as_str(), |(_, id)| id)
+        );
+        assert_eq!(
+            message,
+            expected,
+            "case {case:?}: the refusal must name the rule group id, got {message:?} ({})",
             error_type(&refusal)
         );
         assert_eq!(

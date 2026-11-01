@@ -176,6 +176,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policy for sharing the rule group": the document is attached to the
         // group the `Arn` names, so a read of that group's policy reports
         // exactly this document, and a second write replaces it.
+        // As for the read, the refusal for an `Arn` no group is stored under
+        // names the group by the id that ARN carries
+        // (`crate::state::resource_not_found_message`).
         let mut store = state.lock();
         let Some(record) = store.firewall_rule_group_by_arn_mut(&input.arn) else {
             return Err(
