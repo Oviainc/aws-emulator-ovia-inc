@@ -23,6 +23,8 @@ mod minted_arn_region_segment;
 mod refusal_echoes_no_request_value;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/store_unavailable_refusal.rs"]
+mod store_unavailable_refusal;
 #[path = "all/support.rs"]
 mod support;
 #[path = "all/tag_key_refusal.rs"]

@@ -168,16 +168,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(GetDataAutomationStatusErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some(
-                        "the data automation runtime store is unavailable on this engine".into(),
-                    ),
-                },
-            )
-            .into());
-        };
+        // Reached through the store's own reach-or-refuse step, so this operation and its
+        // siblings answer an engine holding no store of this service's type identically
+        // (`crate::state::store_or_unavailable_refusal`).
+        let state = crate::state::store_or_unavailable_refusal(
+            &*self.engine,
+            GetDataAutomationStatusErrorModeled::InternalServerException,
+        )?;
 
         // The modelled `@pattern` and `@length` on `invocationArn` are refused before
         // this handler runs, so an ARN that reaches here is well formed; one naming no

@@ -249,16 +249,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(InvokeDataAutomationAsyncErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some(
-                        "the data automation runtime store is unavailable on this engine".into(),
-                    ),
-                },
-            )
-            .into());
-        };
+        // Reached through the store's own reach-or-refuse step, so this operation and its
+        // siblings answer an engine holding no store of this service's type identically
+        // (`crate::state::store_or_unavailable_refusal`).
+        let state = crate::state::store_or_unavailable_refusal(
+            &*self.engine,
+            InvokeDataAutomationAsyncErrorModeled::InternalServerException,
+        )?;
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();

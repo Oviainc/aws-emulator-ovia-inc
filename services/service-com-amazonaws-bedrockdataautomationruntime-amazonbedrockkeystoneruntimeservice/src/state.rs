@@ -22,8 +22,8 @@ use service_com_amazonaws_bedrockdataautomation_amazonbedrockkeystonebuildtimese
 
 use crate::ops::types::{
     AssetProcessingConfiguration, Blueprint, DataAutomationConfiguration, EncryptionConfiguration,
-    NotificationConfiguration, ResourceNotFoundException, Tag, TimestampSegment,
-    VideoSegmentConfiguration,
+    InternalServerException, NotificationConfiguration, ResourceNotFoundException, Tag,
+    TimestampSegment, VideoSegmentConfiguration,
 };
 
 /// The region every ARN this service mints falls back to when the request carries no
@@ -933,11 +933,50 @@ pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
-/// Answer `None` with a modelled server error, never with a fresh engine.
+/// Answer `None` with a modelled server error, never with a fresh engine — which is what
+/// [`store_or_unavailable_refusal`] does, so a handler reaches for that rather than for
+/// this directly.
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeserviceState>> {
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeserviceState>)
+}
+
+/// What this service answers when the engine it is mounted on holds no store of this
+/// service's type — the one message behind `InternalServerException` for every operation
+/// here.
+///
+/// It is the service's own fixed string and carries NOTHING from the request: the failure
+/// is about the engine, not about anything the caller sent. Kept in one place so the five
+/// handlers cannot drift apart — through [`store_or_unavailable_refusal`], which is the
+/// only thing that reads it.
+pub const STORE_UNAVAILABLE_MESSAGE: &str =
+    "the data automation runtime store is unavailable on this engine";
+
+/// This service's store, or the whole refusal its absence earns: the
+/// `InternalServerException` shape carrying [`STORE_UNAVAILABLE_MESSAGE`], answered with
+/// the status that shape's own `smithy.api#httpError` trait declares
+/// ([`crate::scaffolded::Scaffolded::Modeled`]).
+///
+/// `internal_error` is the calling operation's own `InternalServerException` variant — the
+/// shape itself is the one generated struct every operation here shares, so the variant
+/// constructor is all that differs between callers. EVERYTHING else about the refusal
+/// lives here once: the shape, the message and the status. That is the same reason the
+/// ARN resolution refusal is single-homed in [`unknown_invocation_refusal`]: the
+/// operations that reach this service's store cannot come to disagree about what one
+/// engine holding no such store answers.
+pub fn store_or_unavailable_refusal<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    internal_error: impl FnOnce(InternalServerException) -> E,
+) -> Result<
+    ::engine::ServiceState<ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeserviceState>,
+    crate::scaffolded::Scaffolded<E>,
+> {
+    service_state(engine).ok_or_else(|| {
+        crate::scaffolded::Scaffolded::Modeled(internal_error(InternalServerException {
+            message: Some(STORE_UNAVAILABLE_MESSAGE.to_string()),
+        }))
+    })
 }
