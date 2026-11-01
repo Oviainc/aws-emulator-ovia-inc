@@ -220,6 +220,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialised BEFORE this action is removed, rather than being lost with it.
         crate::state::apply_due_scheduled_actions(&mut state, ::std::time::SystemTime::now());
 
+        // A scheduled action is a sub-resource of its scalable target, and this call depends
+        // on that target existing: "for any operation that depends on the existence of a
+        // scalable target, this exception is thrown if the scalable target with the specified
+        // service namespace, resource ID, and scalable dimension does not exist". So the
+        // target is resolved first — which is also where the identifier the refusal below
+        // names the target by comes from.
+        let Some(target) = state.targets.get(&key.target) else {
+            return Err(DeleteScheduledActionErrorModeled::ObjectNotFoundException(
+                ObjectNotFoundException {
+                    message: Some(crate::state::target_not_registered_message(&key.target)),
+                },
+            )
+            .into());
+        };
+        let scalable_target_id = crate::state::scalable_target_id(&target.arn);
+
         // Deleting a scheduled action that is not there is a failure, not a quiet success:
         // "For any operation that deletes or deregisters a resource, this exception is
         // thrown if the resource cannot be found." The caller has to be able to tell "it is
@@ -227,7 +243,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.scheduled_actions.remove(&key).is_none() {
             return Err(DeleteScheduledActionErrorModeled::ObjectNotFoundException(
                 ObjectNotFoundException {
-                    message: Some(crate::state::scheduled_action_not_registered_message(&key)),
+                    message: Some(crate::state::scheduled_action_not_found_message(
+                        &key.target.service_namespace,
+                        &scalable_target_id,
+                        &key.scheduled_action_name,
+                    )),
                 },
             )
             .into());

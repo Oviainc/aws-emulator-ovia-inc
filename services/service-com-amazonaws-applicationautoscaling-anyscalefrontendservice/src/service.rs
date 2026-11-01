@@ -23,7 +23,8 @@
 //! - `override_operation` — EDITED HERE: the key and the handler stay the generated
 //!   table's, but each operation is served through [`WithSubmittedValues`], so a request
 //!   refused before the handler runs echoes the value the CALLER submitted — including a
-//!   list-valued member, which the framework's walk can only summarise as `<n> items`.
+//!   list-valued member, which the framework's walk can only summarise as `<n> items` — and
+//!   quotes a `@pattern` requirement as the expression this service publishes.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -129,6 +130,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// it is handed the violations alone, never the request they came from — so the restoring
 /// step happens here, per operation, where the input can be re-read.
 ///
+/// The other difference this wrapper restores is in the REQUIREMENT half, and is about the
+/// member's constraint rather than about the request: a `@pattern` is quoted as the service
+/// publishes the expression ([`as_published`]).
+///
 /// Nothing else is re-implemented, and no check is repeated with different words: the
 /// violations come from the framework's own machinery (the protocol's deserializer and
 /// `constraints::validate` over the built input), the sentence from the framework's own
@@ -140,6 +145,27 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// hands no already-built input to an operation.
 struct WithSubmittedValues<O> {
     operation: O,
+}
+
+/// `violation` with a `@pattern` requirement quoting the expression this service PUBLISHES,
+/// and every other violation unchanged.
+///
+/// A Smithy `@pattern` is a find, so a model that requires the whole value to match writes
+/// the expression with `^` and `$` around it; those anchors are the model's wrapping and not
+/// part of the grammar a value has to satisfy, so a refusal quotes the expression without
+/// them ([`service_common::validation::unanchored`], which is where that one reading lives).
+/// The CHECK is still against the pattern as the model declares it: only the rendering
+/// changes, and it changes for EVERY `@pattern` member of this service rather than for one
+/// operation's.
+fn as_published(violation: &constraints::Violation) -> constraints::Violation {
+    let constraints::ViolationKind::Pattern(declared) = &violation.kind else {
+        return violation.clone();
+    };
+    constraints::Violation {
+        path: violation.path.clone(),
+        kind: constraints::ViolationKind::Pattern(service_common::validation::unanchored(declared)),
+        value: violation.value.clone(),
+    }
 }
 
 impl<O> WithSubmittedValues<O> {
@@ -167,6 +193,8 @@ where
                 svc.definition().protocol(),
                 req,
             );
+            let refused: Vec<constraints::Violation> =
+                refused.iter().map(as_published).collect();
             if let Some(message) = constraints::envelope(&refused) {
                 return svc.definition().refusal_response(
                     ProtocolError::Invalid(refused),

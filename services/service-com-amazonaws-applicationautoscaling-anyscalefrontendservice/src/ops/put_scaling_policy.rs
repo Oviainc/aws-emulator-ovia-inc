@@ -498,8 +498,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// ALBRequestCountPerTarget", which is also the one metric type that cannot be resolved
 /// without one: the request count per target is counted per target group.
 ///
-/// Each refusal states that rule, in the model's own words rather than in the boundary
-/// validator's constraint template.
+/// Each refusal states that rule in the SERVICE's own sentence for it — not in the boundary
+/// validator's constraint template, and not in the model's documentation prose, which
+/// explains a member to a reader of the API reference rather than answering a request.
 fn check_target_tracking_config(
     config: &TargetTrackingScalingPolicyConfiguration,
 ) -> Result<(), PutScalingPolicyError> {
@@ -510,11 +511,7 @@ fn check_target_tracking_config(
         config.predefined_metric_specification.as_ref(),
         config.customized_metric_specification.as_ref(),
     ) {
-        (Some(_), Some(_)) => {
-            return Err(validation(
-                "You can specify either a predefined metric or a customized metric, but not both",
-            ))
-        }
+        (Some(_), Some(_)) => return Err(validation(ONE_METRIC_SPECIFICATION)),
         (None, None) => {
             return Err(validation(
                 "You must specify either a predefined metric or a customized metric",
@@ -634,12 +631,13 @@ fn check_tracked_metric(
 
 /// Refuse a step-scaling configuration whose steps cannot be evaluated.
 ///
-/// Every rule is the model's own, and the refusal is the model's own sentence for each:
-/// "At least one step adjustment is required if you are adding a new step scaling policy
-/// configuration", and of a step adjustment's bounds, "the upper and lower bound can't be
-/// null in the same step adjustment" with "at most one step adjustment can have a null lower
-/// bound" and the same for the upper bound — and "the ranges of your step adjustments can't
-/// overlap or have a gap".
+/// Every rule is the model's own — "at least one step adjustment is required if you are
+/// adding a new step scaling policy configuration", and of a step adjustment's bounds, "the
+/// upper and lower bound can't be null in the same step adjustment" with "at most one step
+/// adjustment can have a null lower bound" and the same for the upper bound, and "the ranges
+/// of your step adjustments can't overlap or have a gap" — and each refusal states that rule
+/// in the SERVICE's own sentence for it rather than in the documentation's prose about the
+/// member.
 ///
 /// A step adjustment's range is an interval of the difference between the metric and the
 /// alarm threshold, "the lower bound is inclusive […] the upper bound is exclusive", with a
@@ -664,10 +662,7 @@ fn check_step_config(
     }
     let adjustments = config.step_adjustments.as_deref().unwrap_or(&[]);
     if adjustments.is_empty() {
-        return Err(validation(
-            "At least one step adjustment is required if you are adding a new step scaling \
-             policy configuration",
-        ));
+        return Err(validation(AT_LEAST_ONE_STEP_ADJUSTMENT));
     }
     let mut unbounded_below = 0usize;
     let mut unbounded_above = 0usize;
@@ -676,11 +671,7 @@ fn check_step_config(
             adjustment.metric_interval_lower_bound,
             adjustment.metric_interval_upper_bound,
         ) {
-            (None, None) => {
-                return Err(validation(
-                    "The upper and lower bound can't be null in the same step adjustment",
-                ))
-            }
+            (None, None) => return Err(validation(STEP_ADJUSTMENT_WITHOUT_A_BOUND)),
             (None, Some(_)) => unbounded_below += 1,
             (Some(_), None) => unbounded_above += 1,
             (Some(_), Some(_)) => {}
@@ -778,6 +769,28 @@ fn check_predictive_config(
     }
     Ok(())
 }
+
+/// A target-tracking configuration carrying BOTH metric specifications.
+///
+/// "A predefined metric. You can specify either a predefined metric or a customized metric"
+/// — either, so a configuration naming both describes two metrics to track. One fixed
+/// sentence, naming the two MODELLED members between which exactly one may be set, so a
+/// caller is told which field to drop.
+const ONE_METRIC_SPECIFICATION: &str = "Only one of PredefinedMetricSpecification or \
+                                        CustomizedMetricSpecification can be set for target \
+                                        tracking scaling.";
+
+/// A step-scaling configuration whose step adjustments are empty, so no breach selects an
+/// adjustment: "at least one step adjustment is required if you are adding a new step scaling
+/// policy configuration" (`StepScalingPolicyConfiguration$StepAdjustments`), stated as the
+/// one fixed sentence the service refuses it with.
+const AT_LEAST_ONE_STEP_ADJUSTMENT: &str = "There must be at least one step adjustment";
+
+/// One step adjustment with neither bound, whose range is every metric-to-threshold
+/// difference there is: "the upper and lower bound can't be null in the same step adjustment"
+/// (`StepAdjustment`), stated as the one fixed sentence the service refuses it with.
+const STEP_ADJUSTMENT_WITHOUT_A_BOUND: &str =
+    "Both lower and upper bounds of a step adjustment cannot be left unspecified";
 
 /// How this service states a second target-tracking policy on a metric one of the
 /// target's policies already tracks.

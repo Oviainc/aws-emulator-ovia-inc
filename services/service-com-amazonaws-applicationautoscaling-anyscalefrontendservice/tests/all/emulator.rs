@@ -586,6 +586,41 @@ impl Emulator {
         status == 200 && body["services"].as_array().is_some_and(|found| !found.is_empty())
     }
 
+    /// The `ScalableTargetARN` this service minted for `target`, read back over the wire the
+    /// way a client that kept the registration's answer holds it.
+    ///
+    /// `target` is the three identity members [`Emulator::given_target`] answers, and the ARN
+    /// is the one reported for exactly that identity — not for whichever target the namespace
+    /// happens to list first.
+    pub async fn target_arn(&self, target: &Value) -> String {
+        let (status, body) = self
+            .call(
+                "DescribeScalableTargets",
+                json!({"ServiceNamespace": target["ServiceNamespace"]}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {target:?}: expected DescribeScalableTargets to answer 200, got {status} \
+             {body:?}"
+        );
+        let reported = body["ScalableTargets"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|reported| {
+                reported["ResourceId"] == target["ResourceId"]
+                    && reported["ScalableDimension"] == target["ScalableDimension"]
+            });
+        let reported = reported
+            .unwrap_or_else(|| panic!("case {target:?}: expected the target to be reported"));
+        reported["ScalableTargetARN"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {target:?}: expected a ScalableTargetARN"))
+            .to_string()
+    }
+
     /// Every alarm CloudWatch holds under the `TargetTracking` prefix, by alarm name.
     pub async fn target_tracking_alarms(&self) -> Vec<Value> {
         let (status, body) = self
@@ -783,4 +818,32 @@ pub fn error_message(body: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// How many hexadecimal digits a scalable target's own identifier carries.
+const TARGET_ID_HEX_DIGITS: usize = 32;
+
+/// The identifier of the scalable target `scalable_target_arn` names, as a refusal about one
+/// of its sub-resources states it: the hexadecimal digits the ARN ends with, grouped
+/// `8-4-4-4-12`.
+///
+/// Derived HERE from the ARN a registration handed back, so a suite asserts the refusal names
+/// the target the caller holds an ARN for rather than a string this file spells out.
+pub fn scalable_target_id(scalable_target_arn: &str) -> String {
+    let digits: Vec<char> = scalable_target_arn.chars().collect();
+    assert!(
+        digits.len() >= TARGET_ID_HEX_DIGITS,
+        "case {scalable_target_arn:?}: expected an ARN ending in {TARGET_ID_HEX_DIGITS} \
+         hexadecimal digits"
+    );
+    let digits = &digits[digits.len() - TARGET_ID_HEX_DIGITS..];
+    let group = |range: std::ops::Range<usize>| digits[range].iter().collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        group(0..8),
+        group(8..12),
+        group(12..16),
+        group(16..20),
+        group(20..TARGET_ID_HEX_DIGITS),
+    )
 }

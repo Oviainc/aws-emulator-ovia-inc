@@ -420,6 +420,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The `\uXXXX` escapes are part of the expression's own text, which is why this is a raw
 /// string: a caller comparing the refusal against the published constraint reads the
 /// expression, not the control characters it denotes.
+///
+/// The CHECK is against the expression as declared; what a refusal QUOTES is the expression
+/// without the whole-value anchors the model wraps it in
+/// ([`service_common::validation::unanchored`]), which is how AWS states a `@pattern`
+/// requirement.
 const SCHEDULED_ACTION_NAME_PATTERN: &str =
     r"^(?!((^[ ]+.*)|(.*([\u0000-\u001f]|[\u007f-\u009f]|[:/|])+.*)|(.*[ ]+$))).+$";
 
@@ -432,7 +437,10 @@ const SCHEDULED_ACTION_NAME_PATH: &str = "scheduledActionName";
 ///
 /// [`SCHEDULED_ACTION_NAME_PATTERN`] is a MODELLED constraint, so what refuses it is the
 /// standard constraint-violation message built from the request — the clause naming the
-/// member path, echoing the submitted value and quoting the expression it has to satisfy.
+/// member path, echoing the submitted value and quoting the expression it has to satisfy,
+/// which is the expression AWS publishes rather than the model's anchored wrapping of it
+/// ([`service_common::validation::unanchored`], the same rendering every `@pattern` member of
+/// this service is refused with).
 /// The check runs here rather than at the protocol boundary only because the expression is a
 /// negative lookahead, which the framework's constraint walk cannot compile and therefore
 /// passes over; the sentence it would have written is the one written here, through the
@@ -462,7 +470,9 @@ fn check_scheduled_action_name(name: &str) -> Result<(), String> {
     }
     let violations = [Violation {
         path: SCHEDULED_ACTION_NAME_PATH.to_string(),
-        kind: ViolationKind::Pattern(SCHEDULED_ACTION_NAME_PATTERN.to_string()),
+        kind: ViolationKind::Pattern(::service_common::validation::unanchored(
+            SCHEDULED_ACTION_NAME_PATTERN,
+        )),
         value: Some(name.to_string()),
     }];
     // `envelope` answers `None` only for an empty set of violations, which this is not.

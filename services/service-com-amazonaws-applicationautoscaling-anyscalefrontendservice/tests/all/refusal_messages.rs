@@ -339,8 +339,8 @@ const SCHEDULE_SYNTAX: &str = "Invalid schedule expression. Details: Schedule ex
                                rate(<number>\\s?(minutes?|hours?|days?)), \
                                cron(<cron_expression>) or at(yyyy-MM-dd'T'HH:mm:ss).";
 
-/// One cron expression that does not parse, with the character POSITION in the expression the
-/// parse stopped at and the TOKEN it stopped on.
+/// One cron expression that does not parse, with the character POSITION in the cron BODY the
+/// parse stopped at, counted from zero, and the TOKEN it stopped on as the parser reads it.
 struct CronRow {
     case: &'static str,
     schedule: &'static str,
@@ -348,44 +348,45 @@ struct CronRow {
     token: &'static str,
 }
 
-/// The catalog: a broken token in each of several fields, too few fields and too many, so
-/// what is pinned is "the position and the token", not one expression.
+/// The catalog: a broken token in each of several fields, so what is pinned is "the position
+/// and the token", not one expression. The `aws_worded_client_errors` suite pins the whole
+/// sentence the two are stated in.
 const CRON_ROWS: &[CronRow] = &[
     CronRow {
         case: "a minutes field that is not a minute",
         schedule: "cron(not a cron)",
-        position: 6,
-        token: "not",
+        position: 0,
+        token: "NOT",
     },
     CronRow {
         case: "a named minutes field",
         schedule: "cron(sixty 10 * * ? *)",
-        position: 6,
-        token: "sixty",
+        position: 0,
+        token: "SIXTY",
     },
     CronRow {
         case: "an hours field out of range",
         schedule: "cron(0 99 * * ? *)",
-        position: 8,
+        position: 2,
         token: "99",
     },
     CronRow {
         case: "a month that is not a month",
         schedule: "cron(0 10 * SMARCH ? *)",
-        position: 13,
+        position: 7,
         token: "SMARCH",
     },
     CronRow {
         case: "a day of week that is not a day",
         schedule: "cron(0 10 ? * FUNDAY *)",
-        position: 15,
+        position: 9,
         token: "FUNDAY",
     },
     CronRow {
         case: "a year that is not a year",
         schedule: "cron(0 10 * * ? someday)",
-        position: 17,
-        token: "someday",
+        position: 11,
+        token: "SOMEDAY",
     },
 ];
 
@@ -432,11 +433,11 @@ async fn an_unparseable_cron_expression_reports_the_position_and_the_token() {
 }
 
 /// A cron expression carrying the wrong NUMBER of fields: the parse stops where the field
-/// that cannot be read is, and the message names the layout.
+/// that cannot be read is, counted from zero in the cron body.
 const CRON_FIELD_COUNT_ROWS: &[(&str, &str, usize)] = &[
-    ("five fields, so no year", "cron(0 10 * * ?)", 16),
-    ("no fields at all", "cron()", 6),
-    ("seven fields", "cron(0 0 10 * * ? *)", 17),
+    ("five fields, so no year", "cron(0 10 * * ?)", 10),
+    ("no fields at all", "cron()", 0),
+    ("seven fields", "cron(0 0 10 * * ? *)", 11),
 ];
 
 #[tokio::test]
@@ -595,12 +596,13 @@ struct PolicyRow {
     expected: &'static str,
 }
 
-/// The catalog. Each `expected` is the model's own sentence for the rule: "You can specify
-/// either a predefined metric or a customized metric", "You can't specify a resource label
-/// unless the metric type is ALBRequestCountPerTarget", "At least one step adjustment is
-/// required if you are adding a new step scaling policy configuration", "The upper and lower
-/// bound can't be null in the same step adjustment", "At most one step adjustment can have a
-/// null lower bound" and the same for the upper bound.
+/// The catalog. Each `expected` is the service's own sentence for the rule the configuration
+/// breaks — the rules themselves being the model's: "you can specify either a predefined
+/// metric or a customized metric", "you can't specify a resource label unless the metric type
+/// is ALBRequestCountPerTarget", "at least one step adjustment is required if you are adding a
+/// new step scaling policy configuration", "the upper and lower bound can't be null in the
+/// same step adjustment", "at most one step adjustment can have a null lower bound" and the
+/// same for the upper bound.
 const POLICY_ROWS: &[PolicyRow] = &[
     PolicyRow {
         case: "a request-count policy with no resource label",
@@ -638,8 +640,8 @@ const POLICY_ROWS: &[PolicyRow] = &[
                    "CustomizedMetricSpecification": {
                        "MetricName": "Backlog", "Namespace": "Mine", "Statistic": "Average"}})
         },
-        expected: "You can specify either a predefined metric or a customized metric, but not \
-                   both",
+        expected: "Only one of PredefinedMetricSpecification or CustomizedMetricSpecification \
+                   can be set for target tracking scaling.",
     },
     PolicyRow {
         case: "neither metric specification",
@@ -653,8 +655,7 @@ const POLICY_ROWS: &[PolicyRow] = &[
         dimension: "dynamodb:table:ReadCapacityUnits",
         policy_type: "StepScaling",
         configuration: || json!({"AdjustmentType": "ChangeInCapacity", "StepAdjustments": []}),
-        expected: "At least one step adjustment is required if you are adding a new step \
-                   scaling policy configuration",
+        expected: "There must be at least one step adjustment",
     },
     PolicyRow {
         case: "a step adjustment with neither bound",
@@ -664,7 +665,7 @@ const POLICY_ROWS: &[PolicyRow] = &[
             json!({"AdjustmentType": "ChangeInCapacity",
                    "StepAdjustments": [{"ScalingAdjustment": 1}]})
         },
-        expected: "The upper and lower bound can't be null in the same step adjustment",
+        expected: "Both lower and upper bounds of a step adjustment cannot be left unspecified",
     },
     PolicyRow {
         case: "two step adjustments with a null lower bound",

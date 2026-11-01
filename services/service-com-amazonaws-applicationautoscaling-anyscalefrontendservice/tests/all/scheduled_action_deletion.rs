@@ -237,6 +237,16 @@ async fn an_action_name_is_scoped_to_one_scalable_target() {
     }
 }
 
+/// What a refusal of a delete REPORTS, which follows which resource is missing: an action its
+/// target does not hold, or the scalable target itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reports {
+    /// The action asked for, by name, beside the target's own identifier.
+    TheAction,
+    /// The scalable target, by the triple the request addressed it with.
+    TheTarget,
+}
+
 /// How a request can name an action the store does not hold, beyond simply never having
 /// stored it: every row is one identity member off a stored action, so each asserts that
 /// that member is part of the action's identity.
@@ -255,23 +265,31 @@ async fn deleting_an_action_the_store_does_not_hold_is_refused() {
     // Only the first target carries an action.
     put(&emulator, &target, "nightly", "rate(5 minutes)", "missing").await;
 
-    let rows: Vec<(&str, Value)> = vec![
-        ("a name that was never stored", request(&target, "weekly")),
+    let rows: Vec<(&str, Value, Reports)> = vec![
+        (
+            "a name that was never stored",
+            request(&target, "weekly"),
+            Reports::TheAction,
+        ),
         (
             "the stored name on another resource id",
             request(&other_resource, "nightly"),
+            Reports::TheAction,
         ),
         (
             "the stored name on another dimension of the same resource",
             request(&other_dimension, "nightly"),
+            Reports::TheAction,
         ),
         (
             "the stored name in another letter case",
             request(&target, "Nightly"),
+            Reports::TheAction,
         ),
         (
             "the stored name with a trailing space",
             request(&target, "nightly "),
+            Reports::TheAction,
         ),
         (
             "a name on a target that was never registered",
@@ -281,10 +299,11 @@ async fn deleting_an_action_the_store_does_not_hold_is_refused() {
                 "ScalableDimension": "dynamodb:table:ReadCapacityUnits",
                 "ScheduledActionName": "nightly",
             }),
+            Reports::TheTarget,
         ),
     ];
 
-    for (case, body) in &rows {
+    for (case, body, reports) in &rows {
         let (status, response) = emulator
             .call("DeleteScheduledAction", body.clone())
             .await;
@@ -297,15 +316,19 @@ async fn deleting_an_action_the_store_does_not_hold_is_refused() {
             "ObjectNotFoundException",
             "case {case:?}: expected an ObjectNotFoundException, got {response:?}"
         );
+        // A request whose scalable target IS registered is told about the action, by the name
+        // it asked for; one whose target is not registered is told about the target, by the
+        // triple that addressed it. The `aws_worded_client_errors` suite pins both sentences
+        // in full.
         let message = error_message(&response);
-        for member in ["ResourceId", "ScheduledActionName"] {
-            let value = body[member].as_str().unwrap_or_default();
-            assert!(
-                message.contains(value),
-                "case {case:?}: expected the message to name {member} ({value:?}), got \
-                 {message:?}"
-            );
-        }
+        let named = match reports {
+            Reports::TheAction => body["ScheduledActionName"].as_str().unwrap_or_default(),
+            Reports::TheTarget => body["ResourceId"].as_str().unwrap_or_default(),
+        };
+        assert!(
+            message.contains(named),
+            "case {case:?}: expected the message to name {named:?}, got {message:?}"
+        );
     }
 
     // None of those refusals removed the action they named one member off.

@@ -660,14 +660,44 @@ pub fn scaling_activity_id(sequence: u64, key: &TargetKey) -> String {
 /// The 8-4-4-4-12 identifier that sits inside an `autoscaling` sub-resource ARN,
 /// derived from `seed` so it is reproducible rather than per-run.
 fn uuid_shaped_id(seed: &str) -> String {
-    let digest = opaque_id(seed, 32);
+    hyphenated(&opaque_id(seed, ID_HEX_DIGITS))
+}
+
+/// How many hexadecimal digits an identifier of this service carries, and the grouping they
+/// are written in: `8-4-4-4-12`, which is the 32 of them [`hyphenated`] reads.
+const ID_HEX_DIGITS: usize = 32;
+
+/// The identity of the scalable target itself, as a refusal about one of its sub-resources
+/// names it: the identifier its own `ScalableTargetARN` ends with, in the grouping every
+/// identifier of this service is written in.
+///
+/// Read off the ARN the target HOLDS rather than derived a second time, so the id a refusal
+/// states is the one the caller already has: deregistering an identity and registering it
+/// again retires one scalable target and mints another ([`scalable_target_arn`]), and the id
+/// follows that resource rather than the triple it was registered under.
+pub fn scalable_target_id(scalable_target_arn: &str) -> String {
+    hyphenated(scalable_target_arn)
+}
+
+/// The last [`ID_HEX_DIGITS`] characters of `id` in the `8-4-4-4-12` grouping, or `id` itself
+/// when it carries fewer than that many.
+fn hyphenated(id: &str) -> String {
+    let characters: Vec<char> = id.chars().collect();
+    let Some(digits) = characters
+        .len()
+        .checked_sub(ID_HEX_DIGITS)
+        .map(|from| &characters[from..])
+    else {
+        return id.to_string();
+    };
+    let group = |range: ::std::ops::Range<usize>| digits[range].iter().collect::<String>();
     format!(
         "{}-{}-{}-{}-{}",
-        &digest[0..8],
-        &digest[8..12],
-        &digest[12..16],
-        &digest[16..20],
-        &digest[20..32],
+        group(0..8),
+        group(8..12),
+        group(12..16),
+        group(16..20),
+        group(20..ID_HEX_DIGITS),
     )
 }
 
@@ -902,19 +932,24 @@ pub fn target_not_found_message(target: &TargetKey) -> String {
     missing_target_message(target, "found")
 }
 
-/// The refusal of an operation addressed at a scheduled action no scalable target holds.
+/// The refusal of an operation addressed at a scheduled action its scalable target does not
+/// hold.
 ///
-/// The scheduled-action form of [`target_not_registered_message`], and the same template: a
-/// scheduled action's identity is its target's triple plus its own name, so the sentence names
-/// all four, built from the request.
-pub fn scheduled_action_not_registered_message(key: &ScheduledActionKey) -> String {
+/// A scheduled action is a sub-resource OF a scalable target, so the sentence identifies the
+/// target by the TARGET's own identifier ([`scalable_target_id`]) rather than by the triple
+/// the request addressed it with, beside the namespace the request named and the action's own
+/// name. An operation resolves the target before the action it holds, so an identity nothing
+/// registered a target for is reported as the missing TARGET
+/// ([`target_not_registered_message`]) — that refusal has a triple to name and this one has
+/// no target to read an identifier off.
+pub fn scheduled_action_not_found_message(
+    service_namespace: &str,
+    scalable_target_id: &str,
+    scheduled_action_name: &str,
+) -> String {
     format!(
-        "No scheduled action registered for service namespace: {}, resource ID: {}, scalable \
-         dimension: {}, scheduled action name: {}",
-        key.target.service_namespace,
-        key.target.resource_id,
-        key.target.scalable_dimension,
-        key.scheduled_action_name
+        "No scheduled action found for service namespace: {service_namespace}, scalable \
+         target ID: {scalable_target_id}, scheduled action name: {scheduled_action_name}"
     )
 }
 
@@ -3508,10 +3543,11 @@ pub const START_TIME_BEFORE_END_TIME: &str = "StartTime must be before EndTime";
 /// The three forms are the model's own ("At expressions - at(yyyy-mm-ddThh:mm:ss), Rate
 /// expressions - rate(value unit), Cron expressions - cron(fields)"), and the service states
 /// them back as the syntax a schedule expression has to have: a caller whose expression is
-/// not a schedule at all is told the grammar, not which member failed which constraint.
+/// not a schedule at all is told the grammar, not which member failed which constraint. A
+/// detail is a sentence of its own, so it carries its own full stop ([`refuse_schedule`]).
 pub const SCHEDULE_SYNTAX_DETAIL: &str = "Schedule expressions must have the following syntax: \
      rate(<number>\\s?(minutes?|hours?|days?)), cron(<cron_expression>) or \
-     at(yyyy-MM-dd'T'HH:mm:ss)";
+     at(yyyy-MM-dd'T'HH:mm:ss).";
 
 /// The six cron fields, in the order the service documents them, as one phrase \u2014 what a
 /// refusal names when the expression does not carry that many.
@@ -3531,8 +3567,12 @@ pub const CRON_FIELD_NAMES: [&str; CRON_FIELDS] = [
 /// Wrap one parse detail as the `ValidationException` message a schedule expression is
 /// refused with: the service's own sentence for "this is not a schedule", with the detail of
 /// what stopped the parse.
+///
+/// The detail is a statement in its own right and carries its own punctuation, so the
+/// envelope adds none: a cron body the parser refused is stated as the parser states it
+/// ([`cron_parse_failure`]), down to the quoted token it ends on.
 fn refuse_schedule(detail: &str) -> String {
-    format!("Invalid schedule expression. Details: {detail}.")
+    format!("Invalid schedule expression. Details: {detail}")
 }
 
 /// Parse a `Schedule`, or the `ValidationException` message for one that is not a schedule.
@@ -3542,17 +3582,14 @@ pub fn parse_schedule(schedule: &str) -> Result<Schedule, String> {
             .strip_prefix(keyword)
             .and_then(|rest| rest.strip_prefix('('))
             .and_then(|rest| rest.strip_suffix(')'))
-            // Where the body starts, in characters, so a parse detail can report the
-            // position of the token it stopped on within the whole expression.
-            .map(|body| (body, keyword.chars().count() + 1))
     };
 
-    if let Some((instant, _)) = body("at") {
+    if let Some(instant) = body("at") {
         let parsed = ::chrono::NaiveDateTime::parse_from_str(instant.trim(), "%Y-%m-%dT%H:%M:%S")
             .map_err(|_| refuse_schedule(SCHEDULE_SYNTAX_DETAIL))?;
         return Ok(Schedule::At(parsed));
     }
-    if let Some((rate, _)) = body("rate") {
+    if let Some(rate) = body("rate") {
         let mut parts = rate.split_whitespace();
         let (Some(value), Some(unit), None) = (parts.next(), parts.next(), parts.next()) else {
             return Err(refuse_schedule(SCHEDULE_SYNTAX_DETAIL));
@@ -3575,14 +3612,14 @@ pub fn parse_schedule(schedule: &str) -> Result<Schedule, String> {
             .filter(|total| *total <= MAX_RATE_SECS)
             .ok_or_else(|| {
                 refuse_schedule(&format!(
-                    "the schedule interval must not exceed {MAX_RATE_SECS} seconds"
+                    "the schedule interval must not exceed {MAX_RATE_SECS} seconds."
                 ))
             })?;
         return Ok(Schedule::Rate(::std::time::Duration::from_secs(total)));
     }
-    if let Some((fields, offset)) = body("cron") {
+    if let Some(fields) = body("cron") {
         return Ok(Schedule::Cron(Box::new(
-            parse_cron(fields, offset).map_err(|detail| refuse_schedule(&detail))?,
+            parse_cron(fields).map_err(|detail| refuse_schedule(&detail))?,
         )));
     }
     Err(refuse_schedule(SCHEDULE_SYNTAX_DETAIL))
@@ -3613,38 +3650,37 @@ pub fn schedule_timezone(timezone: Option<&str>) -> Result<::chrono_tz::Tz, Stri
 /// same statement as `*` in the grammar the crate parses; `?` in any OTHER field states
 /// nothing, so it is a token that stops the parse.
 ///
-/// `offset` is where `fields` starts within the whole `Schedule` expression, in characters,
-/// so a refusal reports the position of the token it stopped on as the caller wrote it.
-///
-/// A refusal names that POSITION and that TOKEN: each field is parsed in its own place (the
-/// other five held at `*`, which every field accepts), so the field that stopped the parse is
-/// the one reported rather than the whole expression.
-fn parse_cron(fields: &str, offset: usize) -> Result<::cron::Schedule, String> {
-    let body = fields;
+/// Every refusal is the parser's own statement inside the envelope a refused cron body is
+/// reported in ([`cron_parse_failure`]), and every POSITION it names is an offset into the
+/// `cron(…)` body. Which token stopped the parse is decided field by field: each field is
+/// parsed in its own place (the other five held at `*`, which every field accepts), so the
+/// field that cannot be read is the one reported rather than the whole expression.
+fn parse_cron(body: &str) -> Result<::cron::Schedule, String> {
     let fields = whitespace_fields(body);
     for (index, (at, field)) in fields.iter().enumerate().take(CRON_FIELDS) {
         if !cron_field_parses(index, field) {
-            return Err(format!(
-                "parse error at position {}: unexpected token '{field}' in the {} field",
-                offset + at + 1,
-                CRON_FIELD_NAMES[index]
-            ));
+            return Err(cron_parse_failure(*at, &illegal_characters(field)));
         }
     }
     if let Some((at, field)) = fields.get(CRON_FIELDS) {
-        return Err(format!(
-            "parse error at position {}: unexpected token '{field}' after the {} field, the \
-             cron format consists of {CRON_FIELDS} fields ({CRON_FIELD_LAYOUT})",
-            offset + at + 1,
-            CRON_FIELD_NAMES[CRON_FIELDS - 1]
+        return Err(cron_parse_failure(
+            *at,
+            &format!(
+                "Unexpected token '{}' after the {} field, the CRON format consists of \
+                 {CRON_FIELDS} fields ({CRON_FIELD_LAYOUT}).",
+                field.to_uppercase(),
+                CRON_FIELD_NAMES[CRON_FIELDS - 1]
+            ),
         ));
     }
     if fields.len() < CRON_FIELDS {
-        return Err(format!(
-            "parse error at position {}: unexpected end of expression, the {} field is missing, \
-             the cron format consists of {CRON_FIELDS} fields ({CRON_FIELD_LAYOUT})",
-            offset + body.chars().count() + 1,
-            CRON_FIELD_NAMES[fields.len()]
+        return Err(cron_parse_failure(
+            body.chars().count(),
+            &format!(
+                "Unexpected end of expression, the {} field is missing, the CRON format \
+                 consists of {CRON_FIELDS} fields ({CRON_FIELD_LAYOUT}).",
+                CRON_FIELD_NAMES[fields.len()]
+            ),
         ));
     }
     let normalised: Vec<String> = ::std::iter::once("0".to_string())
@@ -3655,16 +3691,39 @@ fn parse_cron(fields: &str, offset: usize) -> Result<::cron::Schedule, String> {
                 .map(|(index, (_, field))| normalised_cron_field(index, field).to_string()),
         )
         .collect();
-    // Every field parses in its own place, so what is left is a combination the grammar does
-    // not allow; the expression itself is the token that stopped the parse.
-    normalised.join(" ").parse::<::cron::Schedule>().map_err(|error| {
-        format!(
-            "parse error at position {}: unexpected token '{body}', not a cron expression \
-             ({error})",
-            offset + 1
-        )
-    })
+    // Every field parses in its own place, so what is left is a combination of fields the
+    // grammar does not allow, which belongs to no single token: the parse stops where the
+    // expression begins.
+    normalised
+        .join(" ")
+        .parse::<::cron::Schedule>()
+        .map_err(|_| cron_parse_failure(0, UNSUPPORTED_CRON_COMBINATION))
 }
+
+/// How the parser states where a refused `cron(…)` body stopped it: the offset into that
+/// BODY, counted from zero, and its own statement of what stopped it.
+///
+/// One envelope for every cron refusal, so a caller that surfaces or parses the detail reads
+/// the same two parts whichever field was at fault.
+fn cron_parse_failure(position: usize, detail: &str) -> String {
+    format!("Invalid CRON expression: error at position {position}, details: {detail}")
+}
+
+/// The parser's statement about a token it cannot read where that token stands.
+///
+/// The expression is read in UPPER CASE — a named month or day of week is one of a fixed set
+/// of names, matched whatever case it was written in — so the token is quoted as the parser
+/// saw it rather than as the caller typed it.
+fn illegal_characters(token: &str) -> String {
+    format!(
+        "Illegal characters for this position: '{}'",
+        token.to_uppercase()
+    )
+}
+
+/// The parser's statement about six fields that each parse where they stand but do not
+/// combine into one expression, which belongs to no single token of the body.
+const UNSUPPORTED_CRON_COMBINATION: &str = "Unsupported combination of CRON fields.";
 
 /// The whitespace-separated fields of `text`, each with the CHARACTER position it starts at \u2014
 /// the position a parse refusal reports, which `split_whitespace` alone does not carry.

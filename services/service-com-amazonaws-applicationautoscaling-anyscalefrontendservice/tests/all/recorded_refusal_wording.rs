@@ -16,14 +16,15 @@
 //!   envelope and the reason it cannot; and a predefined metric whose series cannot be
 //!   resolved without a resource label says which metric type needs one;
 //! * an operation addressed at something no scalable target holds reports it as absent: the
-//!   `ObjectNotFoundException` template naming the triple (plus the action's name, for a
-//!   scheduled action) for an identity nothing registered; and, for an ARN, the answer follows
-//!   what that ARN NAMES — one this service minted whose target is gone is the modelled
-//!   `ResourceNotFoundException` (a 404), one it never minted is a write it cannot resolve.
+//!   `ObjectNotFoundException` template naming the triple for an identity nothing registered,
+//!   and the one naming the TARGET's own identifier for a scheduled action a registered target
+//!   does not hold; and, for an ARN, the answer follows what that ARN NAMES — one this service
+//!   minted whose target is gone is the modelled `ResourceNotFoundException` (a 404), one it
+//!   never minted is a write it cannot resolve.
 
 use serde_json::{json, Value};
 
-use super::emulator::{error_code, error_message, Emulator, ACCOUNT, REGION};
+use super::emulator::{error_code, error_message, scalable_target_id, Emulator, ACCOUNT, REGION};
 
 /// The `@pattern` the model declares on `ScheduledActionName`, as the MODEL declares it
 /// (`smithy_query(query="shape",shape="com.amazonaws.applicationautoscaling#ScheduledActionName")`).
@@ -31,6 +32,15 @@ use super::emulator::{error_code, error_message, Emulator, ACCOUNT, REGION};
 /// published constraint.
 const NAME_PATTERN: &str =
     r"^(?!((^[ ]+.*)|(.*([\u0000-\u001f]|[\u007f-\u009f]|[:/|])+.*)|(.*[ ]+$))).+$";
+
+/// The expression a refusal QUOTES for [`NAME_PATTERN`]: the declared one without the `^` and
+/// `$` the model wraps it in to turn Smithy's find into a whole-value match, which is the
+/// expression the service publishes. Computed from the declared text rather than spelled out a
+/// second time; the `aws_worded_client_errors` suite asserts the same rendering over every
+/// member of this service that declares a `@pattern`.
+fn published_name_pattern() -> String {
+    NAME_PATTERN[1..NAME_PATTERN.len() - 1].to_string()
+}
 
 /// The published bounds of `ScheduledActionName`: `@length(min: 1, max: 256)`, same source.
 const MAX_NAME_CHARS: usize = 256;
@@ -69,7 +79,8 @@ async fn a_scheduled_action_name_outside_its_pattern_carries_the_modelled_constr
         );
         let expected = format!(
             "1 validation error detected: Value '{name}' at 'scheduledActionName' failed to \
-             satisfy constraint: Member must satisfy regular expression pattern: {NAME_PATTERN}"
+             satisfy constraint: Member must satisfy regular expression pattern: {}",
+            published_name_pattern()
         );
         let message = error_message(&body);
         assert_eq!(
@@ -336,9 +347,9 @@ async fn an_identity_nothing_registered_is_reported_as_not_registered() {
         &target_not_registered(NAMESPACE, RESOURCE_ID, OTHER_DIMENSION),
     );
 
-    // And a scheduled action the target does not hold is reported the same way, with its own
-    // name beside the triple — over a stored action's name misspelled as well as a name
-    // nothing ever stored.
+    // And a scheduled action the target DOES hold a registration for, but not that action, is
+    // reported as the missing action: the TARGET's own identifier beside the action's name,
+    // over a stored action's name misspelled as well as a name nothing ever stored.
     let mut stored = target.clone();
     stored["ScheduledActionName"] = json!("nightly");
     stored["Schedule"] = json!("rate(5 minutes)");
@@ -347,6 +358,7 @@ async fn an_identity_nothing_registered_is_reported_as_not_registered() {
         status, 200,
         "case \"the stored action\": expected 200, got {status} {body:?}"
     );
+    let target_id = scalable_target_id(&emulator.target_arn(&target).await);
     for (case, name) in [
         ("a name nothing stored", "weekly"),
         ("the stored name misspelled", "Nightly"),
@@ -359,9 +371,8 @@ async fn an_identity_nothing_registered_is_reported_as_not_registered() {
             status,
             &body,
             &format!(
-                "No scheduled action registered for service namespace: {NAMESPACE}, resource \
-                 ID: {RESOURCE_ID}, scalable dimension: {DIMENSION}, scheduled action name: \
-                 {name}"
+                "No scheduled action found for service namespace: {NAMESPACE}, scalable target \
+                 ID: {target_id}, scheduled action name: {name}"
             ),
         );
     }
