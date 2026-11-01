@@ -79,3 +79,5 @@ mod state_roundtrip;
 mod update_app_authorization_contract;
 #[path = "all/user_access_tasks.rs"]
 mod user_access_tasks;
+#[path = "all/validation_refusal_shape.rs"]
+mod validation_refusal_shape;

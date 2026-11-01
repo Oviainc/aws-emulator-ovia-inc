@@ -39,11 +39,22 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## How this service states a refused REQUEST
+//!
+//! Through [`request_validation`], which every modelled operation of this service is
+//! served behind: a refusal of the request is answered in the modelled
+//! `ValidationException`, whose `reason` the model requires and the framework's generic
+//! refusal body cannot carry. The wording of each clause still lives in this file (see
+//! [`constraint_clause`]), so one place decides how a violation reads and one place
+//! decides which members the answer carries.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+pub mod request_validation;
 
 /// The error code this service answers an input-constraint violation with: the
 /// modelled `ValidationException` (`@httpError 400`,
@@ -111,6 +122,9 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// States a refused request of ANY of this service's operations in the modelled
+    /// `ValidationException`; see [`request_validation`].
+    request_validation: request_validation::RequestValidation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -120,6 +134,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            request_validation: request_validation::RequestValidation::new::<Eng>(),
         }
     }
 }
@@ -146,12 +161,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every modelled operation is served behind the request validator, so that a
+        // refusal of the REQUEST — an absent required member, a value outside a
+        // declared constraint, a body the codec cannot read — is stated in the modelled
+        // `ValidationException` with the `reason` the model requires, instead of the
+        // framework's generic refusal body, which carries a message alone. See
+        // [`request_validation`] for why that cannot be done from inside `handle` or
+        // from `override_refusal`. The validator delegates to the operation the routing
+        // table names, so a request with nothing to fault is served exactly as before;
+        // a request the table cannot serve at all is left to the framework's own
+        // routing refusal.
+        request_validation::RequestValidation::serves(&self.entry, req)
+            .then_some(&self.request_validation as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -169,6 +190,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure.
+        //
+        // An input-constraint refusal of a modelled operation no longer reaches this
+        // seam at all: `request_validation` answers it in the modelled shape BEFORE the
+        // framework renders it, because the words are not the whole problem — `Refused`
+        // is a code and a message, so the body it renders cannot carry the REQUIRED
+        // `reason`. The wording below still decides how each clause reads (the
+        // restatement builds its message from `constraint_envelope`), and still stands
+        // for a refusal raised where no operation was named.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),

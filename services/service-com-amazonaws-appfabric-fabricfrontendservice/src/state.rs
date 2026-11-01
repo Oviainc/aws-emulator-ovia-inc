@@ -1705,6 +1705,24 @@ pub fn app_authorization_listing(bundle_id: &str) -> String {
     format!("appauthorizations-{bundle_id}")
 }
 
+/// The `reason` a `ValidationException` carries when a NAMED member of the
+/// request is at fault, from the model's own `ValidationExceptionReason` value
+/// set (`VALIDATION_EXCEPTION_REASON_VALUES` in the generated types:
+/// `cannotParse` | `fieldValidationFailed` | `other` | `unknownOperation`).
+///
+/// Named here, beside the other modelled values this crate writes, so every
+/// refusal of this class — a handler's own and one the request validator in
+/// front of the handlers raises — spells it the same way.
+pub const VALIDATION_REASON_FIELD: &str = "fieldValidationFailed";
+
+/// The `reason` for a request this service could not READ at all, from the same
+/// value set: nothing about it became a member value, so no member is named.
+pub const VALIDATION_REASON_CANNOT_PARSE: &str = "cannotParse";
+
+/// The `reason` for a refusal that faults no member of the request, from the
+/// same value set — the state of the STORED resource forbids the call.
+pub const VALIDATION_REASON_OTHER: &str = "other";
+
 /// A modelled `ValidationException` refusing the call because the STORED
 /// resource is not in the state the operation documents as its precondition.
 ///
@@ -1715,20 +1733,51 @@ pub fn app_authorization_listing(bundle_id: &str) -> String {
 pub fn precondition_not_met(message: String) -> ValidationException {
     ValidationException {
         message,
-        reason: "other".to_string(),
+        reason: VALIDATION_REASON_OTHER.to_string(),
         field_list: None,
     }
 }
 
 /// A modelled `ValidationException` refusing one member by name.
 pub fn field_validation_failed(member: &str, message: &str) -> ValidationException {
-    ValidationException {
-        message: message.to_string(),
-        reason: "fieldValidationFailed".to_string(),
-        field_list: Some(vec![ValidationExceptionField {
+    fields_not_valid(
+        message.to_string(),
+        vec![ValidationExceptionField {
             name: member.to_string(),
             message: message.to_string(),
-        }]),
+        }],
+    )
+}
+
+/// A modelled `ValidationException` refusing the members `fields` names, with
+/// `message` stating the refusal as a whole.
+///
+/// The general form of [`field_validation_failed`], which is this with one
+/// field: one request can fault SEVERAL members at once (the request validator
+/// in front of the handlers walks every declared constraint before it answers),
+/// and `fieldList` is the member a client reads to learn which.
+pub fn fields_not_valid(
+    message: String,
+    fields: Vec<ValidationExceptionField>,
+) -> ValidationException {
+    ValidationException {
+        message,
+        reason: VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(fields),
+    }
+}
+
+/// A modelled `ValidationException` refusing a request this service could not
+/// READ: a member carrying a value of the wrong type, or a body that is not the
+/// operation's input at all.
+///
+/// No `fieldList`: a request the codec could not read yields no member value to
+/// fault, and the model leaves that member optional where it requires `reason`.
+pub fn cannot_parse(message: String) -> ValidationException {
+    ValidationException {
+        message,
+        reason: VALIDATION_REASON_CANNOT_PARSE.to_string(),
+        field_list: None,
     }
 }
 
