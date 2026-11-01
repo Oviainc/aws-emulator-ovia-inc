@@ -923,9 +923,10 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
     // --- controls ----------------------------------------------------------
     //
     // ONE pass over the published control table, which carries one row per published
-    // control: its identity, the surface that implements it, the parameters that
-    // surface takes, and the common control and framework items it is published
-    // against. The ARN is minted from the row's slug, exactly as the ontology's are.
+    // control: its identity, the surface that implements it, the control parameters a
+    // caller supplies when enabling it, and the common control and framework items it
+    // is published against. The ARN is minted from the row's slug, exactly as the
+    // ontology's are.
     //
     // Timestamps are positional and fixed (see CATALOG_EPOCH), so the catalog a client
     // reads is identical in every process and on every run.

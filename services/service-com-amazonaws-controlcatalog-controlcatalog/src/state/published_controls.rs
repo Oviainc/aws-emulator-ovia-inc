@@ -30,8 +30,13 @@
 //!   `^[a-zA-Z0-9_\.-]+$` (`smithy_query(query="shape", shape="ImplementationType")`).
 //! * `control_tower_identifier` is the `AWS-GR_…` identifier Amazon Web Services Control
 //!   Tower publishes for the control, where it publishes one.
-//! * `parameters` are the implementing rule's own parameters; the modeled
-//!   `ParameterRequirementSummary` is DERIVED from them (see
+//! * `parameters` are the CONTROL parameters the control supports: the values a caller
+//!   supplies when it ENABLES the control, named as the modeled `ControlParameter`
+//!   documents them and never otherwise (see [`ALLOWED_REGIONS`] and the names beside
+//!   it). A setting of the AWS Config rule, Security Hub control, policy or hook that
+//!   implements the control is configuration of that surface, not a control parameter,
+//!   so a control whose implementing surface is the only thing configurable supports
+//!   none. The modeled `ParameterRequirementSummary` is DERIVED from the list (see
 //!   [`parameter_requirement_summary`]) rather than written per row, because it is
 //!   defined as a summary of exactly that list.
 //! * `aliases` are DERIVED for the two designators that are functions of an identifier
@@ -52,6 +57,25 @@
 pub(super) const REQUIRED: &str = "REQUIRED";
 /// `ControlParameterRequirement`: a parameter the caller may supply.
 pub(super) const OPTIONAL: &str = "OPTIONAL";
+
+// The control parameters a published control can support, spelled as the modeled
+// `ControlParameter` spells them. That shape's documentation is the whole vocabulary —
+// "Five types of control parameters are supported": `AllowedRegions`,
+// `ExemptedActions`, `ExemptedPrincipalArns`, `ExemptedResourceArns` and
+// `ExemptAssumeRoot`, each a value supplied when the control is enabled
+// (`smithy_query(query="doc", shape="ControlParameter",
+// model_path="services/service-com-amazonaws-controlcatalog-controlcatalog/smithy-model/com-amazonaws-controlcatalog-controlcatalog.json")`)
+// — so a row names one of those five or supports no parameter at all. Only the names
+// the controls in this table support are declared here; the other two apply to
+// controls this catalog does not publish (`ExemptAssumeRoot` "applies only to the
+// `AWS-GR_RESTRICT_ROOT_USER` control").
+
+/// Regions exempted from the control.
+const ALLOWED_REGIONS: &str = "AllowedRegions";
+/// IAM principal ARNs exempted from the control.
+const EXEMPTED_PRINCIPAL_ARNS: &str = "ExemptedPrincipalArns";
+/// Resource ARNs exempted from the control.
+const EXEMPTED_RESOURCE_ARNS: &str = "ExemptedResourceArns";
 
 /// `ControlBehavior`: the control reports on resources that already exist.
 const DETECTIVE: &str = "DETECTIVE";
@@ -104,7 +128,8 @@ const US_REGIONS: &[&str] = &["us-east-1", "us-west-2"];
 /// A GLOBAL control deploys to no Region of its own.
 const NO_REGIONS: &[&str] = &[];
 
-/// A control that supports no parameters.
+/// A control that supports no control parameter: nothing is supplied when it is
+/// enabled, so its `ParameterRequirementSummary` is `NONE`.
 const NO_PARAMETERS: &[(&str, &str)] = &[];
 
 /// A control that is published under no catalog designator of its own (its aliases,
@@ -187,7 +212,10 @@ pub(super) struct ControlSeed {
     pub(super) scope: &'static str,
     /// Empty for a GLOBAL control: `DeployableRegions` does not apply to it.
     pub(super) deployable_regions: &'static [&'static str],
-    /// `(name, ControlParameterRequirement)` for each parameter the control supports.
+    /// `(name, ControlParameterRequirement)` for each CONTROL parameter the control
+    /// supports: a value supplied when the control is enabled, named from the modeled
+    /// vocabulary ([`ALLOWED_REGIONS`] and the names beside it) and never after a
+    /// setting of the surface that implements the control.
     pub(super) parameters: &'static [(&'static str, &'static str)],
     pub(super) governed_resources: &'static [&'static str],
     pub(super) governed_providers: &'static [&'static str],
@@ -294,15 +322,9 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         designators: &["CONFIG.CLOUDTRAIL.DT.10"],
         scope: REGIONAL,
         deployable_regions: BROAD_REGIONS,
-        // The Config rule's own parameters, all optional — which is what makes this
-        // control's ParameterRequirementSummary OPTIONAL.
-        parameters: &[
-            ("s3BucketName", OPTIONAL),
-            ("snsTopicArn", OPTIONAL),
-            ("cloudWatchLogsLogGroupArn", OPTIONAL),
-            ("includeManagementEvents", OPTIONAL),
-            ("readWriteType", OPTIONAL),
-        ],
+        // The trail settings this control checks are the Config rule's own
+        // configuration, not values a caller supplies when enabling the control.
+        parameters: NO_PARAMETERS,
         governed_resources: &["AWS::CloudTrail::Trail"],
         governed_providers: AWS,
         implements: "enable-centralized-logging",
@@ -486,8 +508,8 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "access-keys-rotated",
         name: "Checks whether an IAM access key is rotated within the required number of days",
-        description: "Reports an active IAM access key older than the age the control's \
-                      parameter sets.",
+        description: "Reports an active IAM access key older than the maximum age the \
+                      implementing rule allows.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
@@ -496,9 +518,9 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         designators: NO_DESIGNATORS,
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
-        // The Config rule's own parameter, which it has no default for: supplying it is
-        // what makes this control's ParameterRequirementSummary REQUIRED.
-        parameters: &[("maxAccessKeyAge", REQUIRED)],
+        // The key age this control checks against is the Config rule's own parameter,
+        // not a control parameter a caller supplies when enabling the control.
+        parameters: NO_PARAMETERS,
         governed_resources: &["AWS::IAM::AccessKey"],
         governed_providers: AWS,
         implements: "credential-rotation",
@@ -513,7 +535,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         slug: "iam-password-policy",
         name: "Checks whether the account password policy meets the required strength",
         description: "Reports an account whose IAM password policy is weaker than the \
-                      control's parameters require.",
+                      implementing rule requires.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
@@ -522,12 +544,8 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         designators: NO_DESIGNATORS,
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
-        parameters: &[
-            ("MinimumPasswordLength", OPTIONAL),
-            ("RequireUppercaseCharacters", OPTIONAL),
-            ("RequireNumbers", OPTIONAL),
-            ("MaxPasswordAge", OPTIONAL),
-        ],
+        // The strength thresholds are the Config rule's own parameters.
+        parameters: NO_PARAMETERS,
         // The account's password policy has no resource type of its own.
         governed_resources: NO_GOVERNED_RESOURCES,
         governed_providers: AWS,
@@ -552,7 +570,9 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
         deployable_regions: BROAD_REGIONS,
-        parameters: &[("kmsId", OPTIONAL)],
+        // The KMS key the rule checks volumes against is the Config rule's own
+        // parameter.
+        parameters: NO_PARAMETERS,
         governed_resources: &["AWS::EC2::Volume"],
         governed_providers: AWS,
         implements: "encrypt-data-at-rest-in-storage-services",
@@ -576,7 +596,9 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
         deployable_regions: CORE_REGIONS,
-        parameters: &[("trafficType", OPTIONAL)],
+        // The traffic type the rule requires flow logs to capture is the Config rule's
+        // own parameter.
+        parameters: NO_PARAMETERS,
         governed_resources: &["AWS::EC2::VPC"],
         governed_providers: AWS,
         implements: "data-egress-monitoring",
@@ -849,7 +871,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         // A control implemented by a service control policy governs every Region.
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
-        parameters: &[("ExemptedPrincipalArns", OPTIONAL)],
+        parameters: &[(EXEMPTED_PRINCIPAL_ARNS, OPTIONAL)],
         governed_resources: &["AWS::IAM::AccessKey"],
         governed_providers: AWS,
         implements: "privileged-access-approval",
@@ -949,8 +971,8 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         scope: REGIONAL,
         deployable_regions: &["eu-central-1", "us-east-1"],
         parameters: &[
-            ("AllowedRegions", REQUIRED),
-            ("ExemptedResourceArns", OPTIONAL),
+            (ALLOWED_REGIONS, REQUIRED),
+            (EXEMPTED_RESOURCE_ARNS, OPTIONAL),
         ],
         governed_resources: &["AWS::EC2::Volume", "AWS::EC2::Instance"],
         governed_providers: AWS,

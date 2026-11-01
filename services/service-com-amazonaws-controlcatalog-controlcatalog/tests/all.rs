@@ -23,6 +23,8 @@ mod control_catalog;
 mod control_mapping_filter_identity;
 #[path = "all/control_mappings.rs"]
 mod control_mappings;
+#[path = "all/control_parameters.rs"]
+mod control_parameters;
 #[path = "all/filter_arn_reading.rs"]
 mod filter_arn_reading;
 #[path = "all/framework_cross_walk.rs"]
