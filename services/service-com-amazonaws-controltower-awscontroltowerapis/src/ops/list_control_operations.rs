@@ -190,6 +190,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let statuses = filter_set(filter.statuses.as_ref());
         let operation_types = filter_set(filter.control_operation_types.as_ref());
 
+        // Every member above narrows WHAT this call lists, so a `nextToken` minted below
+        // is bound to all of them: a position in this selection is a position in no other.
+        let listing_key = crate::state::ListingKey::new()
+            .filter("filter.controlIdentifiers", &control_identifiers)
+            .filter("filter.targetIdentifiers", &target_identifiers)
+            .filter(
+                "filter.enabledControlIdentifiers",
+                &enabled_control_identifiers,
+            )
+            .filter("filter.statuses", &statuses)
+            .filter("filter.controlOperationTypes", &operation_types);
+
         let mut store = state.lock();
         // Only materialises what the clock already owed — the transitions due, and the
         // records whose details have stopped being available
@@ -229,13 +241,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
 
         // The page the call asks for, cut out by this crate's one pagination rule: the
-        // token is the index of the next unreturned record, so it is only meaningful
-        // against a call carrying the same filter, which is what `nextToken` is documented
-        // to require. `maxResults` is modelled `range 1..100`, so the front door has
-        // already refused anything outside it.
+        // token is a position in the listing above, bound to the parameters that narrowed
+        // it, so it resumes only a call carrying the same filter — which is what
+        // `nextToken` is documented to require. `maxResults` is modelled `range 1..100`,
+        // so the front door has already refused anything outside it.
         let (page, next_token) = crate::state::page(
             Self::NAME,
-            crate::state::TokenScope::SameParameters,
+            crate::state::TokenScope::SameParameters(&listing_key),
             input.next_token.as_deref(),
             input.max_results,
             &records,

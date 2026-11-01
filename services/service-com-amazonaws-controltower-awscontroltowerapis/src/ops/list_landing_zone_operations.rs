@@ -183,6 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let types = filter_set(filter.types.as_ref());
         let statuses = filter_set(filter.statuses.as_ref());
 
+        // Both members narrow WHAT this call lists, so a `nextToken` minted below is bound
+        // to them: a position in this selection is a position in no other.
+        let listing_key = crate::state::ListingKey::new()
+            .filter("filter.types", &types)
+            .filter("filter.statuses", &statuses);
+
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
@@ -216,13 +222,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
 
         // The page the call asks for, cut out by this crate's one pagination rule: the
-        // token is the index of the next unreturned record, so it is only meaningful
-        // against a call carrying the same filter, which is what `nextToken` is documented
-        // to require. `maxResults` is modelled `range 1..100`, so the front door has
-        // already refused anything outside it.
+        // token is a position in the listing above, bound to the parameters that narrowed
+        // it, so it resumes only a call carrying the same filter — which is what
+        // `nextToken` is documented to require. `maxResults` is modelled `range 1..100`,
+        // so the front door has already refused anything outside it.
         let (page, next_token) = crate::state::page(
             Self::NAME,
-            crate::state::TokenScope::SameParameters,
+            crate::state::TokenScope::SameParameters(&listing_key),
             input.next_token.as_deref(),
             input.max_results,
             &records,

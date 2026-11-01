@@ -210,6 +210,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let statuses = filter_set(filter.statuses.as_ref());
         let inheritance_drift_statuses = filter_set(filter.inheritance_drift_statuses.as_ref());
 
+        // Every member that narrows WHAT this call lists, so a `nextToken` minted below is
+        // bound to all of them: a position in this selection is a position in no other.
+        // `includeChildren` is one of them, because it decides whether the enablements
+        // that inherited their configuration are listed at all.
+        let listing_key = crate::state::ListingKey::new()
+            .flag("includeChildren", input.include_children)
+            .filter("filter.targetIdentifiers", &target_identifiers)
+            .filter("filter.baselineIdentifiers", &baseline_identifiers)
+            .filter("filter.parentIdentifiers", &parent_identifiers)
+            .filter("filter.statuses", &statuses)
+            .filter(
+                "filter.inheritanceDriftStatuses",
+                &inheritance_drift_statuses,
+            );
+
         let mut store = state.lock();
         // Only materialises transitions the clock already owed; this operation is
         // `@readonly` and writes nothing else.
@@ -256,16 +271,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         enabled.sort_by(|left, right| left.arn.cmp(&right.arn));
 
         // The page the call asks for, cut out by this crate's one pagination rule: the
-        // token is the index of the next unreturned entry, so it is only meaningful
-        // against a call carrying the same filter — which is what `nextToken` is
-        // documented to require. `ListEnabledBaselinesNextToken` is modelled
-        // `pattern \S+`, so the front door has already refused an empty token and only an
-        // absent one reaches here; both mean "start at the beginning". `maxResults` is
-        // modelled `range 5..100`, so the front door has already refused anything outside
-        // it.
+        // token is a position in the listing above, bound to the parameters that narrowed
+        // it, so it resumes only a call carrying the same filter — which is what
+        // `nextToken` is documented to require. `ListEnabledBaselinesNextToken` is
+        // modelled `pattern \S+`, so the front door has already refused an empty token and
+        // only an absent one reaches here; both mean "start at the beginning".
+        // `maxResults` is modelled `range 5..100`, so the front door has already refused
+        // anything outside it.
         let (page, next_token) = crate::state::page(
             Self::NAME,
-            crate::state::TokenScope::SameParameters,
+            crate::state::TokenScope::SameParameters(&listing_key),
             input.next_token.as_deref(),
             input.max_results,
             &enabled,

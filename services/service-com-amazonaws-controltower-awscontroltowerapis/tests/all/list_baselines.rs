@@ -329,9 +329,10 @@ async fn a_token_the_service_never_handed_out_is_refused() {
 
 /// RULE (the other side of the token rule): the empty token, which `nextToken`'s plain
 /// `String` type admits through the front door, lists from the start — as an absent token
-/// does; and the index of the last page's end lists an empty final page.
+/// does; and an index the caller wrote itself is not a token, so the index of the end of
+/// the catalog resumes nothing.
 #[tokio::test]
-async fn an_empty_token_lists_from_the_start_and_the_end_index_lists_nothing() {
+async fn an_empty_token_lists_from_the_start_and_an_index_is_not_a_token() {
     let router = emulator();
 
     let from_empty = list_baselines(&router, serde_json::json!({ "nextToken": "" })).await;
@@ -344,13 +345,20 @@ async fn an_empty_token_lists_from_the_start_and_the_end_index_lists_nothing() {
     );
 
     let at_end = BASELINE_CATALOG.len().to_string();
-    let exhausted = list_baselines(&router, serde_json::json!({ "nextToken": at_end })).await;
-    let entries = page_entries("the index just past the last entry", &exhausted);
-    assert!(
-        entries.is_empty() && exhausted.body.get("nextToken").is_none(),
-        "case {:?}: expected an empty, untokened page, got {:?}",
+    let refused = list_baselines(&router, serde_json::json!({ "nextToken": at_end })).await;
+    assert_eq!(
+        (refused.status, refused.error_code.as_deref()),
+        (400, Some("ValidationException")),
+        "case {:?}: expected 400 ValidationException for {at_end:?}, got {:?} body {:?}",
         "the index just past the last entry",
-        exhausted.body
+        (refused.status, refused.error_code.as_deref()),
+        refused.body
+    );
+    assert!(
+        refused.body.get("baselines").is_none(),
+        "case {:?}: a refusal must report no baselines, got {:?}",
+        "the index just past the last entry",
+        refused.body
     );
 }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ONE index-token pagination rule this service's listings cut their pages by, driven
-//! end to end over HTTP through every listing that shares it.
+//! The ONE pagination rule this service's listings cut their pages by, driven end to end
+//! over HTTP through every listing that shares it.
 //!
 //! `ListLandingZones`, `ListLandingZoneOperations`, `ListControlOperations`,
 //! `ListEnabledControls`, `ListEnabledBaselines` and `ListBaselines` all answer
@@ -16,14 +16,17 @@
 //! The rule, asserted over a TABLE of page sizes and tokens rather than one case:
 //!
 //! * a call that sends no pagination member reports the whole listing and no `nextToken`;
-//! * a token is the index of the first record the previous page did not return, so walking
-//!   the pages for ANY page size yields the listing exactly once, in the same order the
-//!   unpaginated call reports, each page holding at most `maxResults` records;
-//! * the response carries a `nextToken` exactly while records remain after the page, so the
-//!   index just past the last record lists an empty, untokened page;
-//! * a token that is not an index into the listing is the operation's own modeled
+//! * a token marks the first record the previous page did not return, so walking the pages
+//!   for ANY page size yields the listing exactly once, in the same order the unpaginated
+//!   call reports, each page holding at most `maxResults` records;
+//! * the response carries a `nextToken` exactly while records remain after the page;
+//! * a token no page of the listing handed out — an index the caller wrote itself included,
+//!   since a token is not a bare index — is the operation's own modeled
 //!   `ValidationException` (400), in the one wording every listing refuses it with;
 //! * the empty token lists from the start wherever the model's `nextToken` type admits one.
+//!
+//! Which listing a token resumes — and the parameters a narrowed one binds its token to —
+//! is the sibling suite `page_token_listing_scope`.
 //!
 //! The bounds written out by hand name their source: each listing's `maxResults` range and
 //! the `nextToken` type that decides whether an empty token reaches the handler come from
@@ -311,18 +314,6 @@ async fn the_rule_holds_over(router: &MultiServiceRouter, listing: Listing) {
         );
     }
 
-    // A token is an index into the listing, so the index just past the last record lists an
-    // empty page and ends the walk.
-    let at_end = population.len().to_string();
-    let exhausted = list(router, listing, page_body(None, Some(&at_end))).await;
-    assert!(
-        identities(listing, &exhausted).is_empty() && reported_token(&exhausted).is_none(),
-        "case {:?} on {}: expected an empty, untokened page, got {:?}",
-        "the index just past the last record",
-        listing.path,
-        exhausted.body
-    );
-
     // The empty token, where the model's `nextToken` type admits one, means the same as an
     // absent one; where its pattern does not, the front door refuses it before the rule.
     if listing.empty_token_reaches_the_handler {
@@ -366,9 +357,11 @@ pub(crate) fn unhandled_token_refusal(listing: Listing, token: &str) -> String {
     )
 }
 
-/// Assert the refusal side of the rule over one listing: a token that is not an index into
-/// a listing of `total` records is the operation's own `ValidationException`, worded the one
-/// way every listing words it.
+/// Assert the refusal side of the rule over one listing: a token no page of a listing of
+/// `total` records handed out is the operation's own `ValidationException`, worded the one
+/// way every listing words it. An index the caller wrote itself is one of those tokens: a
+/// token is not a bare index, so a number can never be read as a position in a listing the
+/// caller may not even have paged.
 async fn an_unhandled_token_is_refused(router: &MultiServiceRouter, listing: Listing, total: usize) {
     let cases: Vec<(String, String)> = vec![
         (
@@ -377,6 +370,14 @@ async fn an_unhandled_token_is_refused(router: &MultiServiceRouter, listing: Lis
         ),
         ("a negative index".to_string(), "-1".to_string()),
         ("a fractional index".to_string(), "1.5".to_string()),
+        (
+            "the index of the listing's first record".to_string(),
+            "0".to_string(),
+        ),
+        (
+            format!("the index just past the {total} records listed"),
+            total.to_string(),
+        ),
         (
             format!("an index past the {total} records listed"),
             (total + 1).to_string(),
@@ -502,11 +503,11 @@ pub(crate) async fn seed(router: &MultiServiceRouter) {
     tokio::time::sleep(past_the_settle_span()).await;
 }
 
-/// RULE: every listing of this service pages by the one shared index-token rule — a token is
-/// the index of the first record the previous page did not return, `maxResults` is how many
-/// records a page holds, and a token is reported exactly while records remain.
+/// RULE: every listing of this service pages by the one shared rule — a token marks the
+/// first record the previous page did not return, `maxResults` is how many records a page
+/// holds, and a token is reported exactly while records remain.
 #[tokio::test]
-async fn every_listing_pages_by_the_one_shared_index_token_rule() {
+async fn every_listing_pages_by_the_one_shared_page_token_rule() {
     let router = emulator();
     seed(&router).await;
 

@@ -200,6 +200,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let inheritance_drift_statuses = filter_set(filter.inheritance_drift_statuses.as_ref());
         let resource_drift_statuses = filter_set(filter.resource_drift_statuses.as_ref());
 
+        // Every member that narrows WHAT this call lists, so a `nextToken` minted below is
+        // bound to all of them: a position in this selection is a position in no other.
+        // `includeChildren` is one of the parameters a resuming call must repeat even
+        // though it widens nothing here (see the module header: this service stores no
+        // hierarchy for it to reach into).
+        let listing_key = crate::state::ListingKey::new()
+            .value("targetIdentifier", input.target_identifier.as_deref())
+            .flag("includeChildren", input.include_children)
+            .filter("filter.controlIdentifiers", &control_identifiers)
+            .filter("filter.parentIdentifiers", &parent_identifiers)
+            .filter("filter.statuses", &statuses)
+            .filter("filter.driftStatuses", &drift_statuses)
+            .filter(
+                "filter.inheritanceDriftStatuses",
+                &inheritance_drift_statuses,
+            )
+            .filter("filter.resourceDriftStatuses", &resource_drift_statuses);
+
         let mut store = state.lock();
         // Only materialises transitions the clock already owed; this operation is
         // `@readonly` and writes nothing else.
@@ -243,13 +261,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         controls.sort_by(|left, right| left.arn.cmp(&right.arn));
 
         // The page the call asks for, cut out by this crate's one pagination rule: the
-        // token is the index of the next unreturned entry, so it is only meaningful
-        // against a call carrying the same target and filter — which is what `nextToken`
-        // is documented to require. `maxResults` is modelled `range 1..200`, so the front
-        // door has already refused anything outside it.
+        // token is a position in the listing above, bound to the parameters that narrowed
+        // it, so it resumes only a call carrying the same target and filter — which is
+        // what `nextToken` is documented to require ("the token to continue the list from
+        // a previous API call with the same parameters"). `maxResults` is modelled
+        // `range 1..200`, so the front door has already refused anything outside it.
         let (page, next_token) = crate::state::page(
             Self::NAME,
-            crate::state::TokenScope::SameParameters,
+            crate::state::TokenScope::SameParameters(&listing_key),
             input.next_token.as_deref(),
             input.max_results,
             &controls,

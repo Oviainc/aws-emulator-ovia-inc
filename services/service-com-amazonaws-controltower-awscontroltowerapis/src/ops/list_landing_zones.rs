@@ -170,8 +170,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         arns.sort();
 
         // The page the call asks for, cut out by this crate's one pagination rule: the
-        // token is the index of the next unreturned entry, and this operation lists the
-        // whole collection, so the token means the same to every call.
+        // token is a position in the next unreturned entry's listing, and this operation
+        // lists the whole collection, so the token means the same to every call of it.
         // `maxResults` is modelled `range 1..1`, so the boundary validator has already
         // refused anything else.
         let (page, next_token) = crate::state::page(

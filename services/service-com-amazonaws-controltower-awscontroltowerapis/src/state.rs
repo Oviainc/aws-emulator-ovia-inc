@@ -79,9 +79,11 @@
 //! They all PAGINATE the listing they narrowed the same way as well, so that rule lives
 //! here once for the same reason: [`page`] cuts out the page a `nextToken`/`maxResults`
 //! pair asks for and hands back the token that resumes the listing after it, and
-//! [`TokenScope`] says how far a token one listing handed out reaches. Every list
-//! operation of this crate reaches the rule through [`page`], so a page boundary — and
-//! the refusal of a token no page handed out — cannot drift between them either.
+//! [`TokenScope`] says how far a token one listing handed out reaches — a listing the
+//! request narrows carries the parameters it was narrowed by ([`ListingKey`]), so its
+//! token resumes only a call that repeats them. Every list operation of this crate
+//! reaches the rule through [`page`], so a page boundary — and the refusal of a token no
+//! page of that listing handed out — cannot drift between them either.
 //!
 //! A resource reported by BOTH a Get and a List operation projects its stored drift onto
 //! the modelled drift summary here once, for the same reason: [`EnabledBaseline::drift_status_summary`]
@@ -98,7 +100,10 @@
 //! [`record_enablement`]: ComAmazonawsControltowerAwscontroltowerapisState::record_enablement
 //! [`apply_governance_controls`]: ComAmazonawsControltowerAwscontroltowerapisState::apply_governance_controls
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, SystemTime};
 
 // The modelled drift-summary shapes the projections below build, so a reported drift
@@ -4214,19 +4219,91 @@ pub fn selected_resolved<Entry: PartialEq>(
         .any(|value| resolve(value).as_ref() == Some(&actual))
 }
 
-/// How far a `nextToken` one list operation handed out reaches, which is what its refusal
-/// tells a caller that sent a token it cannot resume.
+/// The parameters a list call narrowed its listing by, in the canonical form the
+/// `nextToken` minted from that listing is bound to.
 ///
-/// A token is an index into the listing the call that handed it out was looking at, so a
+/// A token is a position in the listing the call that handed it out was looking at, so it
+/// resumes nothing in a listing selected differently: the position it names would be a
+/// position in a DIFFERENT sequence of records, and reading it as one would serve a page
+/// out of the middle of that sequence and never serve the records before it. A handler
+/// therefore states here every request member that narrows what it lists, and [`page`]
+/// binds the token it mints to them — which is what `nextToken` is documented to require
+/// ("the token to continue the list from a previous API call with the same parameters").
+///
+/// The rendering is INJECTIVE: each member writes its name and each value with its byte
+/// length, and a member the caller omitted is distinguished from one they sent no value
+/// for, so no two different narrowings render alike. The values of a list-valued member
+/// are written as the SET a handler matches against ([`Filter`]), so repeating one value
+/// or sending the same values in another order carries the same key — those calls list the
+/// same records in the same order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListingKey {
+    rendered: String,
+}
+
+impl ListingKey {
+    /// The key of a call that has narrowed its listing by nothing yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one list-valued narrowing member — a `filter` member — under `member`.
+    pub fn filter(mut self, member: &str, values: &Filter<'_>) -> Self {
+        self.push_member(member);
+        match values.as_ref() {
+            None => self.rendered.push('-'),
+            Some(values) => {
+                for value in values {
+                    self.push_value(value);
+                }
+            }
+        }
+        self.rendered.push(';');
+        self
+    }
+
+    /// Record one single-valued narrowing member under `member`: an absent value narrows
+    /// nothing, and is not the same key as any value the caller could have sent.
+    pub fn value(mut self, member: &str, value: Option<&str>) -> Self {
+        self.push_member(member);
+        match value {
+            None => self.rendered.push('-'),
+            Some(value) => self.push_value(value),
+        }
+        self.rendered.push(';');
+        self
+    }
+
+    /// Record one boolean narrowing member under `member`. A modelled default makes the
+    /// member present whether or not the caller sent it, so an omitted member and the
+    /// default written out carry the same key.
+    pub fn flag(self, member: &str, value: bool) -> Self {
+        self.value(member, Some(if value { "true" } else { "false" }))
+    }
+
+    fn push_member(&mut self, member: &str) {
+        let _ = write!(self.rendered, "{}:{member}=", member.len());
+    }
+
+    fn push_value(&mut self, value: &str) {
+        let _ = write!(self.rendered, "{}:{value},", value.len());
+    }
+}
+
+/// How far a `nextToken` one list operation handed out reaches, which is both what the
+/// token is bound to and what its refusal tells a caller that sent a token it cannot
+/// resume.
+///
+/// A token names a position in the listing the call that handed it out was looking at, so a
 /// listing the request narrows (by a `filter` member, by a target) only resumes for a call
 /// that repeats those members — which is what `nextToken` is documented to require.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenScope {
+pub enum TokenScope<'params> {
     /// The operation lists ONE whole collection, so its token means the same to every call.
     WholeListing,
     /// The operation narrows its listing from the request, so its token is only meaningful
-    /// to a call that sent the same parameters.
-    SameParameters,
+    /// to a call that sent the same parameters — the ones the handler states here.
+    SameParameters(&'params ListingKey),
 }
 
 /// The page of `listing` a list call asks for and the `nextToken` to report with it, or
@@ -4234,49 +4311,98 @@ pub enum TokenScope {
 ///
 /// The ONE place every list operation of this service cuts a page out of its listing, so a
 /// page boundary cannot drift between them. The rule: an absent or empty token starts at
-/// the beginning, any other token is the index of the first entry the previous page did
-/// not return and resumes there — in the one spelling a page hands an index out in
-/// ([`index_token`]) — and is refused when it is not an index into this
-/// listing; `maxResults` is how many entries the page holds, every remaining entry when
-/// the caller sent none; and the response carries a token exactly while entries remain
-/// after the page. `operation` and `scope` are what the refusal names (see [`TokenScope`]).
+/// the beginning, any other token resumes at the first entry the previous page did not
+/// return — but only a token THIS listing handed out does ([`ListingCursor`]), so a token
+/// minted by another operation, or by a call that narrowed its listing differently, is
+/// refused rather than read as a position in a listing it names no position in;
+/// `maxResults` is how many entries the page holds, every remaining entry when the caller
+/// sent none; and the response carries a token exactly while entries remain after the
+/// page. `operation` and `scope` are what the token is bound to and what the refusal names
+/// (see [`TokenScope`]).
 ///
 /// The floor of 1 on `maxResults` keeps a page from being empty-but-tokened should a
 /// model's range ever admit a smaller value than the front door refuses today, and the
 /// saturating addition keeps a page size near the integer's maximum from wrapping.
 pub fn page<'entries, Entry>(
     operation: &str,
-    scope: TokenScope,
+    scope: TokenScope<'_>,
     next_token: Option<&str>,
     max_results: Option<i32>,
     listing: &'entries [Entry],
 ) -> Result<(&'entries [Entry], Option<String>), String> {
+    let cursor = ListingCursor::of(operation, scope);
     let len = listing.len();
     let start = match next_token {
         None | Some("") => 0usize,
-        Some(token) => match index_token(token) {
+        Some(token) => match cursor.position(token) {
             Some(index) if index <= len => index,
             _ => return Err(unhandled_next_token_message(operation, scope, token)),
         },
     };
     let limit = max_results.map_or(len, |max| max.max(1) as usize);
     let end = start.saturating_add(limit).min(len);
-    Ok((&listing[start..end], (end < len).then(|| end.to_string())))
+    Ok((&listing[start..end], (end < len).then(|| cursor.token(end))))
 }
 
-/// The index `token` names, and `None` when it is not a spelling a page of this service
-/// ever handed out.
+/// The separator between the two parts of a minted token, chosen outside the digits an
+/// index is written with so the parts cannot run together.
+const TOKEN_PART_SEPARATOR: char = '.';
+
+/// The listing a `nextToken` names a position in: mints the token a page reports and reads
+/// back only a token minted for THIS listing.
 ///
-/// A token resumes a listing only AS THE STRING a previous page returned, and the one place
-/// a token is minted writes an index's canonical decimal (`end.to_string()`: no sign, no
-/// leading zeros). `usize::from_str` by itself admits more than that — a leading `+` and any
-/// number of leading zeros — so the parse is confirmed by rendering the index back and
-/// requiring the token to be exactly what the minting site would have written. Anything
-/// else is a token no call of this service issued, which is what its refusal says, so it is
-/// refused rather than silently read as a position (which would skip the records before it).
-fn index_token(token: &str) -> Option<usize> {
-    let index: usize = token.parse().ok()?;
-    (token == index.to_string()).then_some(index)
+/// A token names a position in a SEQUENCE of records, so it means something only against
+/// the sequence it was minted from: the operation that listed it and, for a listing the
+/// request narrows, the parameters it was narrowed by. Both are folded into the
+/// fingerprint a token carries beside its position, so a token minted elsewhere does not
+/// read back as a position here and is refused — the caller is told the token resumes
+/// nothing rather than served a page cut out of the middle of a listing it never asked to
+/// resume, which would silently drop every record before that position.
+///
+/// The fingerprint is a hash, not the parameters themselves, so a token stays short
+/// whatever a caller filters by and carries none of the request back out. It identifies a
+/// listing for as long as the state the token indexes lives — the process — which is
+/// exactly as long as any token of this emulator resumes anything.
+struct ListingCursor {
+    fingerprint: u64,
+}
+
+impl ListingCursor {
+    /// The cursor for the listing `operation` reports under `scope`.
+    fn of(operation: &str, scope: TokenScope<'_>) -> Self {
+        let mut hasher = DefaultHasher::new();
+        operation.hash(&mut hasher);
+        match scope {
+            TokenScope::WholeListing => "".hash(&mut hasher),
+            TokenScope::SameParameters(key) => key.rendered.hash(&mut hasher),
+        }
+        Self {
+            fingerprint: hasher.finish(),
+        }
+    }
+
+    /// The token a page ending just before `index` reports.
+    fn token(&self, index: usize) -> String {
+        format!("{:016x}{TOKEN_PART_SEPARATOR}{index}", self.fingerprint)
+    }
+
+    /// The position `token` names in this listing, and `None` when it is not a token this
+    /// listing handed out.
+    ///
+    /// A token resumes AS THE STRING a page returned: its fingerprint must be this
+    /// listing's, and its position must be written the way [`Self::token`] writes one (a
+    /// `usize`'s canonical decimal — no sign, no leading zeros). `usize::from_str` by
+    /// itself admits more than that — a leading `+` and any number of leading zeros — so
+    /// the parse is confirmed by rendering the position back and requiring the token to be
+    /// exactly what the minting site would have written.
+    fn position(&self, token: &str) -> Option<usize> {
+        let (fingerprint, position) = token.split_once(TOKEN_PART_SEPARATOR)?;
+        if fingerprint != format!("{:016x}", self.fingerprint) {
+            return None;
+        }
+        let index: usize = position.parse().ok()?;
+        (position == index.to_string()).then_some(index)
+    }
 }
 
 /// Why `token` resumes no page of `operation`'s listing.
@@ -4285,12 +4411,12 @@ fn index_token(token: &str) -> Option<usize> {
 /// no page handed out in the same words, and the message is built from the request and the
 /// operation's own [`TokenScope`] so it tells the caller what a token it may send came
 /// from.
-fn unhandled_next_token_message(operation: &str, scope: TokenScope, token: &str) -> String {
+fn unhandled_next_token_message(operation: &str, scope: TokenScope<'_>, token: &str) -> String {
     match scope {
         TokenScope::WholeListing => {
             format!("nextToken {token} was not returned by a previous {operation} call")
         }
-        TokenScope::SameParameters => format!(
+        TokenScope::SameParameters(_) => format!(
             "nextToken {token} was not returned by a previous {operation} call with these \
              parameters"
         ),

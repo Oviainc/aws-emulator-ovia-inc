@@ -171,10 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let catalog = crate::state::BASELINE_CATALOG;
 
         // The page the call asks for, cut out by this crate's one pagination rule: the
-        // token is the index of the first entry the previous page did not return, over the
-        // catalog's published order — the one order this operation lists in, so the token
-        // means the same to every call. `maxResults` is modelled `range 4..100`, so the
-        // front door has already refused anything outside it.
+        // token is a position in the catalog's published order — the one order this
+        // operation lists in, so the token means the same to every call of it.
+        // `maxResults` is modelled `range 4..100`, so the front door has already refused
+        // anything outside it.
         let (page, next_token) = crate::state::page(
             Self::NAME,
             crate::state::TokenScope::WholeListing,
