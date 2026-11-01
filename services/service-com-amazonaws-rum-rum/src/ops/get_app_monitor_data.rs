@@ -165,13 +165,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The region this request was signed for: the monitor the `Name` names is
+        // resolved among the monitors of THAT region, so the region is part of what a
+        // token is scoped to as well.
+        let region = crate::state::request_region(ctx.parts());
+
         // No token starts at the beginning of the matching events; a token resumes after
         // the ones the pages before it already returned. A token this operation never
-        // issued — or issued for ANOTHER app monitor's query — is refused rather than
-        // read as some other resume point.
+        // issued — or issued for ANOTHER app monitor's query, at another region's
+        // endpoint — is refused rather than read as some other resume point.
         let already_returned = match input.next_token.as_deref() {
             None => 0,
-            Some(token) => decode_next_token(&input.name, token).ok_or_else(|| {
+            Some(token) => decode_next_token(&region, &input.name, token).ok_or_else(|| {
                 GetAppMonitorDataErrorModeled::ValidationException(ValidationException {
                     message: format!(
                         "NextToken {token} is not a pagination token this service issued \
@@ -205,7 +210,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every other operation's, with the monitor and the policy in force read under a
         // SHORT lock ([`crate::state::authorization`]). The `Name` names a monitor of the
         // region this request was signed for: a monitor of another region is not found.
-        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, held_policy) = {
             let store = state.lock();
             let Some(record) = store.app_monitor(&region, &input.name) else {
@@ -280,7 +284,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A token is emitted only when something is actually left to return, so the last
         // page carries none.
         let next_token = matching.next().is_some().then(|| {
-            encode_next_token(&input.name, already_returned.saturating_add(events.len()))
+            encode_next_token(
+                &region,
+                &input.name,
+                already_returned.saturating_add(events.len()),
+            )
         });
 
         Ok(GetAppMonitorDataOutput {
@@ -318,21 +326,23 @@ const TOKEN_MARKER: &str = "GetAppMonitorData/1/";
 /// An opaque continuation token for a query of `app_monitor_name` that has returned
 /// `already_returned` matching events so far.
 ///
-/// The app monitor the query is scoped to is part of the key, so a token is only honoured
-/// by the monitor it was issued for: events are per-monitor, and two monitors' queries
+/// The app monitor the query is scoped to — and, through the shared codec, the region the
+/// query ran in — is part of the key, so a token is only honoured by the monitor it was
+/// issued for: events are per-monitor, a monitor is per-region, and two monitors' queries
 /// have counts in common.
-fn encode_next_token(app_monitor_name: &str, already_returned: usize) -> String {
+fn encode_next_token(region: &str, app_monitor_name: &str, already_returned: usize) -> String {
     crate::state::encode_pagination_token(
         TOKEN_MARKER,
+        region,
         &[app_monitor_name, &already_returned.to_string()],
     )
 }
 
-/// How many matching events a token issued by [`encode_next_token`] for
-/// `app_monitor_name` resumes after, or `None` for any value this operation never issued
-/// for that monitor.
-fn decode_next_token(app_monitor_name: &str, token: &str) -> Option<usize> {
-    let key = crate::state::decode_pagination_token(TOKEN_MARKER, token, 2)?;
+/// How many matching events a token issued by [`encode_next_token`] for the
+/// `app_monitor_name` of `region` resumes after, or `None` for any value this operation
+/// never issued for that monitor.
+fn decode_next_token(region: &str, app_monitor_name: &str, token: &str) -> Option<usize> {
+    let key = crate::state::decode_pagination_token(TOKEN_MARKER, region, token, 2)?;
     let [issued_for, already_returned] = <[String; 2]>::try_from(key).ok()?;
     (issued_for == app_monitor_name).then_some(())?;
     already_returned.parse().ok()

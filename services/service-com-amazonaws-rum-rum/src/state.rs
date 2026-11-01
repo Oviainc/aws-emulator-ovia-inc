@@ -3453,35 +3453,47 @@ pub const JSON_CONTENT_TYPE: &str = "application/json";
 /// one of two words). The LAST component needs no such guarantee, because
 /// [`decode_pagination_token`] splits at most `components - 1` times and hands whatever
 /// follows back whole — which matters for a `DestinationArn`, whose
-/// `arn:[^:]*:[^:]*:[^:]*:[^:]*:.*` pattern ends in an unconstrained `.*`.
+/// `arn:[^:]*:[^:]*:[^:]*:[^:]*:.*` pattern ends in an unconstrained `.*`. The region the
+/// token carries ahead of the key needs no such guarantee either, because the decoder
+/// knows which region is asking and matches that whole string as a literal prefix.
 const PAGINATION_TOKEN_SEPARATOR: char = '\u{1f}';
 
-/// An opaque continuation token for the last entry a page returned: `marker` followed by
-/// the components of that entry's key.
+/// An opaque continuation token for the last entry a page returned: `marker`, the region
+/// the issuing request was signed for, then the components of that entry's key.
 ///
 /// ONE codec for every paginated operation of this service (`ListAppMonitors`,
-/// `ListRumMetricsDestinations`), so their token formats cannot drift. Hex keeps the
-/// token printable and opaque to a client — `NextToken` is an unconstrained `String`, so
-/// a client must pass back what it was handed rather than construct one — while staying
-/// decodable by the next call. `marker` is the issuing operation's own (see
-/// [`decode_pagination_token`]).
-pub fn encode_pagination_token(marker: &str, resume_after: &[&str]) -> String {
+/// `ListRumMetricsDestinations`, `BatchGetRumMetricDefinitions`, `GetAppMonitorData`), so
+/// their token formats cannot drift. Hex keeps the token printable and opaque to a
+/// client — `NextToken` is an unconstrained `String`, so a client must pass back what it
+/// was handed rather than construct one — while staying decodable by the next call.
+/// `marker` is the issuing operation's own (see [`decode_pagination_token`]).
+///
+/// `region` is in every token because the collection a token indexes is a REGION's: this
+/// service's resources belong to the region the request that created them was signed for
+/// ([`AppMonitorRecord::region`]), so the same name denotes an independent resource at
+/// each regional endpoint and two of them hold keys in common.
+pub fn encode_pagination_token(marker: &str, region: &str, resume_after: &[&str]) -> String {
     let key = resume_after.join(&PAGINATION_TOKEN_SEPARATOR.to_string());
-    hex::encode(format!("{marker}{key}"))
+    hex::encode(format!("{marker}{region}{PAGINATION_TOKEN_SEPARATOR}{key}"))
 }
 
 /// The `components` of the key a token issued by [`encode_pagination_token`] under
-/// `marker` resumes after, or `None` for any value that operation never issued.
+/// `marker` for `region` resumes after, or `None` for any value that operation never
+/// issued at that region's endpoint.
 ///
 /// The marker is what makes a token the ISSUING operation's: without it any
 /// hex-decodable string would be read as a continuation, and one list's token would
-/// resume another's. A listing scoped to a parent resource puts that parent's name in
-/// the key, so the caller can also check a token was issued for the resource it is
-/// resuming. The value is read in the exact spelling [`encode_pagination_token`] writes
-/// and no other: a token is opaque, so a client passes back what it was handed rather
-/// than a value of its own that happens to carry the same bytes.
+/// resume another's. The region is what makes it the issuing ENDPOINT's: a listing walks
+/// the resources of the region its request was signed for, so a token presented at
+/// another region's endpoint names a position in a collection that listing never walked.
+/// A listing scoped to a parent resource puts that parent's name in the key as well, so
+/// the caller can also check a token was issued for the resource it is resuming. The
+/// value is read in the exact spelling [`encode_pagination_token`] writes and no other: a
+/// token is opaque, so a client passes back what it was handed rather than a value of its
+/// own that happens to carry the same bytes.
 pub fn decode_pagination_token(
     marker: &str,
+    region: &str,
     token: &str,
     components: usize,
 ) -> Option<Vec<String>> {
@@ -3496,7 +3508,12 @@ pub fn decode_pagination_token(
     let bytes = hex::decode(token).ok()?;
     (hex::encode(&bytes) == token).then_some(())?;
     let decoded = String::from_utf8(bytes).ok()?;
-    let resume_after = decoded.strip_prefix(marker)?;
+    // The region is stripped as ONE literal prefix rather than split off, so a region
+    // string carrying the separator itself is still matched whole instead of being read
+    // as the first component of another region's key.
+    let scoped = decoded.strip_prefix(marker)?;
+    let resume_after =
+        scoped.strip_prefix(&format!("{region}{PAGINATION_TOKEN_SEPARATOR}"))?;
     // `splitn` so only the components BEFORE the last one are delimited: the last
     // component keeps any separator it contains, rather than inflating the arity and
     // making this refuse a token the service itself issued.

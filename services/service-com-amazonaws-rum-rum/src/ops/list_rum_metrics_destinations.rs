@@ -161,14 +161,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The region this request was signed for: the monitor the `AppMonitorName` names
+        // is resolved among the monitors of THAT region, and the destinations a token
+        // resumes are that monitor's, so the region is part of what the token is scoped
+        // to as well.
+        let region = crate::state::request_region(ctx.parts());
+
         // No token starts at the beginning; a token resumes strictly after the last
         // destination the page that produced it returned. A token this operation never
-        // issued — or issued for ANOTHER app monitor's listing — is refused rather than
-        // read as some other resume point.
+        // issued — or issued for ANOTHER app monitor's listing, at another region's
+        // endpoint — is refused rather than read as some other resume point.
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                decode_next_token(&input.app_monitor_name, token).ok_or_else(|| {
+                decode_next_token(&region, &input.app_monitor_name, token).ok_or_else(|| {
                     ListRumMetricsDestinationsErrorModeled::ValidationException(
                         ValidationException {
                             message: format!(
@@ -191,7 +197,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // like every other operation's, with the monitor and the policy in force read
         // under a SHORT lock ([`crate::state::authorization`]). The `AppMonitorName`
         // names a monitor of the region this request was signed for.
-        let region = crate::state::request_region(ctx.parts());
         let (resource_arn, held_policy) = {
             let store = state.lock();
             let Some(record) = store.app_monitor(&region, &input.app_monitor_name) else {
@@ -256,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // last page carries none.
         let next_token = match last_key {
             Some(last) if remaining.next().is_some() => {
-                Some(encode_next_token(&input.app_monitor_name, &last))
+                Some(encode_next_token(&region, &input.app_monitor_name, &last))
             }
             _ => None,
         };
@@ -276,27 +281,32 @@ const TOKEN_MARKER: &str = "ListRumMetricsDestinations/1/";
 
 /// An opaque continuation token for the last destination of a page.
 ///
-/// The app monitor the listing is scoped to is part of the key, so a token is only
-/// honoured by the listing that issued it: destinations are per-monitor, and two
+/// The app monitor the listing is scoped to — and, through the shared codec, the region
+/// the listing ran in — is part of the key, so a token is only honoured by the listing
+/// that issued it: destinations are per-monitor, a monitor is per-region, and two
 /// monitors' maps have keys in common.
 fn encode_next_token(
+    region: &str,
     app_monitor_name: &str,
     last_returned: &crate::state::MetricDestinationKey,
 ) -> String {
     let (destination, destination_arn) = last_returned;
     crate::state::encode_pagination_token(
         TOKEN_MARKER,
+        region,
         &[app_monitor_name, destination, destination_arn],
     )
 }
 
-/// The destination key a token issued by [`encode_next_token`] for `app_monitor_name`
-/// resumes after, or `None` for any value this operation never issued for that monitor.
+/// The destination key a token issued by [`encode_next_token`] for the `app_monitor_name`
+/// of `region` resumes after, or `None` for any value this operation never issued for
+/// that monitor.
 fn decode_next_token(
+    region: &str,
     app_monitor_name: &str,
     token: &str,
 ) -> Option<crate::state::MetricDestinationKey> {
-    let key = crate::state::decode_pagination_token(TOKEN_MARKER, token, 3)?;
+    let key = crate::state::decode_pagination_token(TOKEN_MARKER, region, token, 3)?;
     let [issued_for, destination, destination_arn] = <[String; 3]>::try_from(key).ok()?;
     (issued_for == app_monitor_name).then_some((destination, destination_arn))
 }

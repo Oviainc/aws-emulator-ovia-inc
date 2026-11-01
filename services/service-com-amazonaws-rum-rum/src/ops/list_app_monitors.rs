@@ -150,16 +150,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The region this request was signed for: a listing reports the monitors THAT
+        // region owns, so it is part of what a token is scoped to as well. Read off the
+        // request alone, like the token check below.
+        let region = crate::state::request_region(ctx.parts());
+
         // No token starts at the beginning; a token resumes strictly after the last
         // summary the page that produced it returned. A token this operation never
-        // issued is refused rather than read as some other resume point. Judged FIRST,
+        // issued — or issued at another region's endpoint — is refused rather than read
+        // as some other resume point. Judged FIRST,
         // like every other handler's checks on the request's OWN members, because they
         // stand in for constraints the boundary walk cannot apply and that walk runs in
         // front of everything a handler judges — this check reads neither the store nor
         // the caller's identity, so it does not wait on the authorization decision below.
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(decode_next_token(token).ok_or_else(|| {
+            Some(token) => Some(decode_next_token(&region, token).ok_or_else(|| {
                 ListAppMonitorsErrorModeled::ValidationException(ValidationException {
                     message: format!(
                         "NextToken {token} is not a pagination token this service issued."
@@ -171,7 +177,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // May this caller list the account's app monitors? The action is taken on the
         // account's whole collection rather than on one monitor, so there is no resource
         // policy to consult and the resource is the collection's ARN.
-        let region = crate::state::request_region(ctx.parts());
         if let Err(denial) = crate::state::authorization::authorize_identity(
             &*self.engine,
             ctx,
@@ -205,7 +210,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A token is emitted only when something is actually left to return, so the
         // last page carries none.
         let next_token = match app_monitor_summaries.last().and_then(|last| last.name.as_deref()) {
-            Some(last_name) if remaining.next().is_some() => Some(encode_next_token(last_name)),
+            Some(last_name) if remaining.next().is_some() => {
+                Some(encode_next_token(&region, last_name))
+            }
             _ => None,
         };
 
@@ -222,14 +229,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 const TOKEN_MARKER: &str = "ListAppMonitors/1/";
 
 /// An opaque continuation token for the last app monitor of a page.
-fn encode_next_token(last_returned_name: &str) -> String {
-    crate::state::encode_pagination_token(TOKEN_MARKER, &[last_returned_name])
+///
+/// The region the listing ran in is part of the key (the shared codec puts it there), so
+/// a token is only honoured by the listing that issued it: a monitor belongs to one
+/// region, a name is only unique within it, and two regions' collections have names in
+/// common.
+fn encode_next_token(region: &str, last_returned_name: &str) -> String {
+    crate::state::encode_pagination_token(TOKEN_MARKER, region, &[last_returned_name])
 }
 
-/// The app-monitor name a token issued by [`encode_next_token`] resumes after, or `None`
-/// for any value this operation never issued.
-fn decode_next_token(token: &str) -> Option<String> {
-    crate::state::decode_pagination_token(TOKEN_MARKER, token, 1)?
+/// The app-monitor name a token issued by [`encode_next_token`] for `region` resumes
+/// after, or `None` for any value this operation never issued at that region's endpoint.
+fn decode_next_token(region: &str, token: &str) -> Option<String> {
+    crate::state::decode_pagination_token(TOKEN_MARKER, region, token, 1)?
         .into_iter()
         .next()
 }

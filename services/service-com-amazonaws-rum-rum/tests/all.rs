@@ -81,6 +81,8 @@ mod nested_configuration_defaults;
 mod not_found_and_conflict_bodies;
 #[path = "all/pagination_token_check_precedence.rs"]
 mod pagination_token_check_precedence;
+#[path = "all/pagination_token_region_scope.rs"]
+mod pagination_token_region_scope;
 #[path = "all/pagination_token_spelling.rs"]
 mod pagination_token_spelling;
 #[path = "all/platform_domain_authority.rs"]
