@@ -23,6 +23,8 @@ mod error_resource_identity;
 mod maintenance_and_restore;
 #[path = "all/not_found_wording.rs"]
 mod not_found_wording;
+#[path = "all/pending_maintenance_reads.rs"]
+mod pending_maintenance_reads;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/resource_tag_writes.rs"]
