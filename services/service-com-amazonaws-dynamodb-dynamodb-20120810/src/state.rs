@@ -6281,6 +6281,21 @@ pub fn index_not_found(table: &str, index: &str) -> RequestError {
     ))
 }
 
+/// The `ResourceNotFoundException` message a VECTOR index the addressed table does not
+/// carry is refused with.
+///
+/// Same rule as [`index_not_found`] — "the operation tried to access a nonexistent table
+/// or index" (the `ResourceNotFoundException` doc), named by both the index and the table
+/// it was looked for in — and a different SENTENCE, because the surface that changes a
+/// table's vector indexes words it with the index name first and the table after it. One
+/// sentence per surface rather than one shared one: a message is part of each surface's
+/// contract, so the surfaces that answer the other wording keep it.
+pub fn vector_index_not_found(table: &str, index: &str) -> RequestError {
+    RequestError::NotFound(format!(
+        "Requested resource not found: Index {index} for table {table}"
+    ))
+}
+
 /// The `ResourceNotFoundException` message an ARN-ADDRESSED operation answers with.
 ///
 /// The tagging surface and the resource-policy surface carry no `TableName`: the

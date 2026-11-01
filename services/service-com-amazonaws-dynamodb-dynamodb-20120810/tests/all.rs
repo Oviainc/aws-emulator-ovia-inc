@@ -197,6 +197,9 @@ mod validation_message_wording;
 #[path = "all/value_rules_and_resource_policy.rs"]
 mod value_rules_and_resource_policy;
 
+#[path = "all/vector_index_updates.rs"]
+mod vector_index_updates;
+
 #[path = "all/vector_indexes.rs"]
 mod vector_indexes;
 

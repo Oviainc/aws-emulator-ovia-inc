@@ -35,9 +35,18 @@
 //! table that already has a stream, or ... disable a stream on a table that doesn't
 //! have a stream") are `ResourceInUseException`.
 //!
+//! A `VectorIndexUpdates` entry addresses one of the table's VECTOR indexes as the
+//! resource it changes. A `Delete` removes the index it names, so a name the table
+//! carries no vector index for is refused with `ResourceNotFoundException` — the modelled
+//! answer for "the operation tried to access a nonexistent table or index" — before
+//! anything is written, which leaves every stored index where it was; a name it does
+//! carry is removed, its siblings keep serving `SearchVectors`, and the removal is index
+//! lifecycle work, so the table is left `UPDATING` for the span below like any other.
+//!
 //! Members this slice does not store (SSE, replicas, witnesses, on-demand
-//! throughput, a PER-INDEX warm throughput, multi-region consistency and vector
-//! indexes) are refused with the scaffold's 501 and are their own gap issues.
+//! throughput, a PER-INDEX warm throughput, multi-region consistency and a
+//! `VectorIndexUpdates` CREATE) are refused with the scaffold's 501 and are their own
+//! gap issues.
 //!
 //! ## Shape of an operation
 //!
@@ -296,6 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         let index_updates = validated_index_updates(&input).map_err(lift)?;
+        let vector_index_updates = validated_vector_index_updates(&input).map_err(lift)?;
         // "You can create or delete only one global secondary index per UpdateTable
         // operation" (`UpdateTable$GlobalSecondaryIndexUpdates`). That is a LIMIT on
         // the work one call may ask for rather than a malformed request, so it is
@@ -409,6 +419,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let declared = merged_definitions(table, &declared_definitions);
         let indexes = resolve_indexes(table, &billing_mode, &declared, &index_updates, now)
             .map_err(lift)?;
+        // The table's vector indexes after the update, resolved against the STORED ones:
+        // a `Delete` naming an index the table does not carry refuses the whole update
+        // here, before anything is written.
+        let vector_indexes = resolve_vector_indexes(table, &vector_index_updates).map_err(lift)?;
         // The projection budget is summed across EVERY secondary index the table would
         // carry after this update, the table's local indexes included: an index added
         // here spends from the same budget as the ones created with the table.
@@ -424,8 +438,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only the attribute definitions some key schema still uses are kept, so a
         // repeated UpdateTable cannot grow the stored list, and a definition the
         // request declares for no key at all is refused the way CreateTable refuses it.
-        let definitions =
-            retained_definitions(declared, table, &indexes, &declared_definitions).map_err(lift)?;
+        let definitions = retained_definitions(
+            declared,
+            table,
+            &indexes,
+            &vector_indexes,
+            &declared_definitions,
+        )
+        .map_err(lift)?;
         // What this request asks of the table's stream, decided against the STORED
         // stream: "You receive a ResourceInUseException if you try to enable a stream
         // on a table that already has a stream, or if you try to disable a stream on
@@ -520,6 +540,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         table.warm_throughput = warm_throughput;
         table.attribute_definitions = definitions;
         table.global_secondary_indexes = indexes;
+        table.vector_indexes = vector_indexes;
         table.stream = stream;
         if let Some(table_class) = input.table_class.clone() {
             // "The date and time at which the table class was last updated"
@@ -536,8 +557,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
 
+        let description = table.describe(now);
+        // The audit record for a state-changing call: who asked, what the table carries
+        // after the change and that it succeeded. Never a credential — only the access
+        // key id the caller presented.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %name,
+            table_status = %description.table_status.clone().unwrap_or_default(),
+            global_secondary_indexes = description
+                .global_secondary_indexes
+                .as_ref()
+                .map_or(0, Vec::len),
+            vector_indexes = description.vector_indexes.as_ref().map_or(0, Vec::len),
+            outcome = "updated",
+            "table updated"
+        );
+
         Ok(UpdateTableOutput {
-            table_description: Some(table.describe(now)),
+            table_description: Some(description),
         })
     }
 }
@@ -734,8 +773,9 @@ fn empty_update_message() -> String {
 /// Two kinds of change are that work. One MOVES CAPACITY: the table's capacity mode and
 /// provisioned throughput, the warm throughput it keeps ready ("the minimum provisioned
 /// capacity maintained for immediate data access" — the `TableWarmThroughputDescription`
-/// doc), its table class and its secondary indexes are all backed by provisioned
-/// capacity or stored data. The other RE-PLUMBS THE TABLE'S CHANGE FEED: a
+/// doc), its table class and its indexes — secondary and vector alike — are all backed
+/// by provisioned capacity or stored data, and an index removed from the table releases
+/// what it was holding. The other RE-PLUMBS THE TABLE'S CHANGE FEED: a
 /// `StreamSpecification` starts or stops a DynamoDB Streams stream, a resource with its
 /// own lifecycle in the streams service (a stream being turned off is `DISABLING` before
 /// it is `DISABLED`), so that too is settled after the call returns.
@@ -750,6 +790,7 @@ fn asks_for_asynchronous_work(input: &UpdateTableInput) -> bool {
         || input.table_class.is_some()
         || input.stream_specification.is_some()
         || list_named(input.global_secondary_index_updates.as_ref())
+        || list_named(input.vector_index_updates.as_ref())
 }
 
 /// Every on-demand capacity ceiling this request names: the table's own, and the one
@@ -803,12 +844,15 @@ fn unsupported_member(input: &UpdateTableInput) -> Option<&'static str> {
     {
         return Some("GlobalTableWitnessUpdates");
     }
+    // A vector index DELETE is applied by this handler; a CREATE would have to store an
+    // index configuration this slice does not write yet, so only that action is refused.
     if input
         .vector_index_updates
-        .as_ref()
-        .is_some_and(|updates| !updates.is_empty())
+        .iter()
+        .flatten()
+        .any(|update| update.create.is_some())
     {
-        return Some("VectorIndexUpdates");
+        return Some("VectorIndexUpdates carrying Create");
     }
     if input.on_demand_throughput.is_some() {
         return Some("OnDemandThroughput");
@@ -933,6 +977,52 @@ fn index_lifecycle_actions_over_limit(updates: &[GlobalSecondaryIndexUpdate]) ->
     ))
 }
 
+/// The vector-index actions one request asks for, each index named at most once.
+///
+/// The caller-chosen list is CLAMPED before anything walks it: a table carries at most
+/// [`crate::state::MAX_VECTOR_INDEXES`] vector indexes, so a longer list names an index
+/// twice or an index that cannot exist and is already invalid. Duplicate detection then
+/// costs one hash per entry rather than a scan, and each entry has to ask for exactly
+/// one of the two actions the model gives it — an entry that asks for both, or for
+/// neither, names no single change the table could apply.
+fn validated_vector_index_updates(
+    input: &UpdateTableInput,
+) -> Result<Vec<VectorIndexUpdate>, crate::state::RequestError> {
+    let updates = input.vector_index_updates.clone().unwrap_or_default();
+    if updates.len() > crate::state::MAX_VECTOR_INDEXES {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid VectorIndexUpdates: a table carries at most {} vector indexes, so a request \
+             cannot name {} of them",
+            crate::state::MAX_VECTOR_INDEXES,
+            updates.len()
+        )));
+    }
+    let mut named: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+    for update in &updates {
+        // The name the entry changes, which exists only when the entry asks for exactly
+        // one of the two actions; an entry that asks for both, or for neither, names no
+        // single change and is refused with the count it did ask for. Matched rather than
+        // counted-then-unwrapped, so this stays total for every entry a request can send.
+        let index_name = match (&update.create, &update.delete) {
+            (Some(create), None) => create.index_name.as_str(),
+            (None, Some(delete)) => delete.index_name.as_str(),
+            (create, delete) => {
+                let actions = usize::from(create.is_some()) + usize::from(delete.is_some());
+                return Err(crate::state::RequestError::Validation(format!(
+                    "Invalid VectorIndexUpdates: each entry must request exactly one of Create \
+                     or Delete, got {actions}"
+                )));
+            }
+        };
+        if !named.insert(index_name) {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid VectorIndexUpdates: index {index_name} is named more than once"
+            )));
+        }
+    }
+    Ok(updates)
+}
+
 /// The table's provisioned throughput after the update: "When switching from
 /// pay-per-request to provisioned capacity, initial provisioned capacity values must be
 /// set" (`UpdateTable$BillingMode`), and a `PAY_PER_REQUEST` table carries none.
@@ -1032,7 +1122,8 @@ fn merged_definitions(
 
 /// The definitions the updated table keeps: exactly those a schema of the table still
 /// uses — its own key, the key of one of the indexes it carries after the update, or the
-/// vector attribute or search schema of one of its vector indexes.
+/// vector attribute or search schema of one of the VECTOR indexes it carries after the
+/// update.
 ///
 /// This is what bounds the stored list: it can never hold more entries than those
 /// schemas name, however many `UpdateTable` calls declare definitions. A definition the
@@ -1047,6 +1138,7 @@ fn retained_definitions(
     declared: Vec<AttributeDefinition>,
     table: &crate::state::Table,
     indexes: &[crate::state::GlobalSecondaryIndex],
+    vector_indexes: &[crate::state::VectorIndex],
     requested: &[AttributeDefinition],
 ) -> Result<Vec<AttributeDefinition>, crate::state::RequestError> {
     let used: ::std::collections::HashSet<&str> = table
@@ -1061,8 +1153,7 @@ fn retained_definitions(
         )
         .map(|element| element.attribute_name.as_str())
         .chain(
-            table
-                .vector_indexes
+            vector_indexes
                 .iter()
                 .flat_map(crate::state::VectorIndex::consumed_attributes),
         )
@@ -1225,6 +1316,39 @@ fn resolve_indexes(
                     index.name
                 )));
             }
+        }
+    }
+    Ok(indexes)
+}
+
+/// The table's vector indexes after the update: every one a `Delete` names is gone.
+///
+/// A `Delete` addresses the index AS THE RESOURCE it changes, so a name the table carries
+/// no vector index for is a lookup miss rather than a malformed request: it is refused
+/// with the control plane's not-found sentence over both names
+/// ([`crate::state::vector_index_not_found`]), and because this resolves the whole list
+/// before `handle` writes anything, the stored indexes are left exactly as they were.
+///
+/// An index removed from a table is removed outright, by the same rule a secondary index
+/// delete follows ([`resolve_indexes`]): the model's `IndexStatus` has no terminal
+/// `DELETING` for a description to report it in, and nothing can be searched through it
+/// again.
+///
+/// A `Create` is refused ahead of this with the scaffold's 501
+/// ([`unsupported_member`]), so only the removals reach here.
+fn resolve_vector_indexes(
+    table: &crate::state::Table,
+    updates: &[VectorIndexUpdate],
+) -> Result<Vec<crate::state::VectorIndex>, crate::state::RequestError> {
+    let mut indexes = table.vector_indexes.clone();
+    for delete in updates.iter().filter_map(|update| update.delete.as_ref()) {
+        let before = indexes.len();
+        indexes.retain(|index| index.name != delete.index_name);
+        if indexes.len() == before {
+            return Err(crate::state::vector_index_not_found(
+                &table.name,
+                &delete.index_name,
+            ));
         }
     }
     Ok(indexes)
