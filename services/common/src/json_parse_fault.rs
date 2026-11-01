@@ -5,16 +5,19 @@
 //! Several AWS services take a JSON document as an opaque string member — an IAM policy
 //! document, a message filter policy — and refuse one they cannot parse with their JSON
 //! parser's own diagnostic rather than with a restatement of the member's type. Those
-//! diagnostics all say the same three things: what the parse stopped ON, what a value could
-//! have been there instead, and the line and column it stopped at. The SENTENCE each service
+//! diagnostics all say the same things: what the parse stopped ON, what a value could have
+//! been there instead, the line and column it stopped at, and — for a document that ran out
+//! of input inside a collection — where that collection opened. The SENTENCE each service
 //! frames them in is its own (the services differ in what they prefix and in which fault
-//! classes they report), but the three readings are the same question about the same
-//! document, so they are stated once here: two services handed the same document cannot
-//! disagree about where it went wrong.
+//! classes they report), but the readings are the same question about the same document, so
+//! they are stated once here: two services handed the same document cannot disagree about
+//! where it went wrong.
 //!
 //! Everything here derives from [`serde_json::Error`], which is the parse that actually ran:
-//! `line()` and `column()` are where it stopped, and its rendered cause is why. Nothing
-//! re-scans the document looking for a likely fault.
+//! `line()` and `column()` are where it stopped, and its rendered cause is why. The one
+//! reading the parse does not carry — the mark of the container it was still inside — is
+//! read off the document itself ([`unclosed_container_start`]), for the fault class the
+//! parse has already named; nothing re-scans a document looking for a likely fault.
 //!
 //! The reported position is ONE-based, and a column counts BYTES from the start of its line,
 //! which is the convention the parser reports in.
@@ -217,16 +220,130 @@ pub fn render_character(character: char) -> String {
     }
 }
 
+/// The SOURCE a location clause names where the document is not echoed into it.
+///
+/// A submitted document can be sensitive, so a service that keeps it out of its refusals
+/// reports the source as redacted and names the feature that would have put it there —
+/// which is what tells a caller the position is real and the document was withheld on
+/// purpose.
+pub const REDACTED_SOURCE: &str = "REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` \
+                                   disabled)";
+
+/// One location clause: the `source` the parse was reading, and the position in it.
+///
+/// Stated once because a diagnostic carries the SAME clause in more than one place — where
+/// the parse stopped, and where the container it was inside opened — and because the source
+/// is the caller's choice: [`REDACTED_SOURCE`] where the document is withheld, and the
+/// document itself where a service is recorded echoing it.
+#[must_use]
+pub fn location_clause(source: &str, line: usize, column: usize) -> String {
+    format!("[Source: {source}; line: {line}, column: {column}]")
+}
+
 /// Where the parse stopped, as a diagnostic's location clause reports it.
 ///
 /// The clause names the line and the column but NOT the document: a service does not echo a
 /// submitted document back in its refusal, so the source is reported as redacted.
 #[must_use]
 pub fn source_location(line: usize, column: usize) -> String {
-    format!(
-        "\n at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` \
-         disabled); line: {line}, column: {column}]"
-    )
+    format!("\n at {}", location_clause(REDACTED_SOURCE, line, column))
+}
+
+/// The position the parse stopped at, as a location clause reports it.
+///
+/// A parse that ran out of input stopped one past the document's last character — there is
+/// no character there, so the position named is where the next one would have gone, which
+/// is what the parser's own clause reports and what a caller appending to its payload needs.
+/// Every other fault stopped ON a character, which is the position the parse itself reports.
+#[must_use]
+pub fn stopped_at(document: &str, error: &serde_json::Error) -> (usize, usize) {
+    if ran_out_of_input(&cause(error)) {
+        return position_of(document, document.len());
+    }
+    (error.line(), error.column())
+}
+
+/// Whether `cause` is a parse that ended because the document did.
+fn ran_out_of_input(cause: &str) -> bool {
+    cause.starts_with("EOF while parsing")
+}
+
+/// The most still-open containers the reading below tracks.
+///
+/// A parse nesting deeper than the parser's own recursion limit (128 for `serde_json`) fails
+/// for THAT and never for the end of its input, so a document with more open marks than this
+/// carries a different fault than the one this reading answers.
+const MAX_UNCLOSED_CONTAINERS: usize = 128;
+
+/// Where the container the parse was STILL INSIDE when the document ended was OPENED — the
+/// line and column of its `{` or `[` — and `None` for every other fault.
+///
+/// A parse that runs out of input inside a collection reports where that collection opened as
+/// well as where the input ended, because the opening mark is what the caller has left
+/// unmatched: the two readings together say WHICH object or array was not closed, which a
+/// document built by templating or concatenation cannot be read off the end position alone.
+///
+/// The mark is found by walking the document once and keeping the marks that are still open —
+/// a string carries no structure, so what it contains, escapes included, is skipped — and
+/// taking the innermost one left at the end, which is the context the parse was in.
+///
+/// `None` covers every fault that is not a container left open, and a document carrying more
+/// open marks than [`MAX_UNCLOSED_CONTAINERS`].
+#[must_use]
+pub fn unclosed_container_start(
+    document: &str,
+    error: &serde_json::Error,
+) -> Option<(usize, usize)> {
+    let opening = match cause(error).as_str() {
+        "EOF while parsing an object" => b'{',
+        "EOF while parsing a list" => b'[',
+        _ => return None,
+    };
+    let (mark, line, column) = *unclosed_containers(document)?.last()?;
+    (mark == opening).then_some((line, column))
+}
+
+/// Every container mark of `document` that is still open at its end, outermost first, each
+/// with the one-based line and the one-based column in BYTES it sits at — or `None` when
+/// there are more of them than [`MAX_UNCLOSED_CONTAINERS`].
+fn unclosed_containers(document: &str) -> Option<Vec<(u8, usize, usize)>> {
+    let mut open: Vec<(u8, usize, usize)> = Vec::new();
+    let mut line = 1;
+    let mut column = 1;
+    let mut inside_string = false;
+    let mut escaped = false;
+    for &byte in document.as_bytes() {
+        if inside_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                inside_string = false;
+            }
+        } else {
+            match byte {
+                b'"' => inside_string = true,
+                b'{' | b'[' => {
+                    if open.len() == MAX_UNCLOSED_CONTAINERS {
+                        return None;
+                    }
+                    open.push((byte, line, column));
+                }
+                b'}' | b']' => {
+                    open.pop();
+                }
+                _ => {}
+            }
+        }
+        if byte == b'\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    Some(open)
 }
 
 #[cfg(test)]
@@ -355,6 +472,109 @@ mod tests {
         assert!(
             VALUE_POSITION.contains(VALUE_CLASSES),
             "the clause {VALUE_POSITION:?} must list {VALUE_CLASSES:?}"
+        );
+    }
+
+    /// One row: what a failing assertion calls it, the document, and the position the
+    /// container it ran out of input inside opens at (`None` when the fault names none).
+    type ContainerRow = (&'static str, &'static str, Option<(usize, usize)>);
+
+    /// The container left open is read for the fault class that names one, and for no other.
+    ///
+    /// The rows differ along which collection was left open, how deeply it nests, whether a
+    /// mark inside a string could be mistaken for one, which line it opens on, and which
+    /// other fault class the document carries.
+    #[test]
+    fn the_container_a_parse_ran_out_of_input_inside_is_read_at_its_opening_mark() {
+        let rows: [ContainerRow; 10] = [
+            ("an object left open", r#"{"a": 1"#, Some((1, 1))),
+            ("an array left open", "[1, 2", Some((1, 1))),
+            // The innermost context is the one the parse was in.
+            ("an inner object left open", r#"{"a": {"b": 1"#, Some((1, 7))),
+            // Every closed collection is matched off, so the mark left over is the outer
+            // one even though inner ones opened after it.
+            (
+                "an outer object left open past closed inner ones",
+                r#"{"a": {"b": 1}, "c": [2]"#,
+                Some((1, 1)),
+            ),
+            (
+                "an array left open inside an object",
+                r#"{"a": [1, 2"#,
+                Some((1, 7)),
+            ),
+            // A brace inside a string is text, not structure.
+            (
+                "a brace inside a string value",
+                r#"{"a": "{{{""#,
+                Some((1, 1)),
+            ),
+            (
+                "an escaped quote inside a string value",
+                r#"{"a": "x\"y""#,
+                Some((1, 1)),
+            ),
+            ("an object left open on a later line", "{\n  \"a\": {\n", Some((2, 8))),
+            // Faults that are not a container left open.
+            ("a string left open", r#"{"a": "text"#, None),
+            ("a bare word where a value belongs", "nope", None),
+        ];
+
+        for (case, document, expected) in rows {
+            let error = failure(document);
+            let actual = unclosed_container_start(document, &error);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?} (the parse stopped at \
+                 line {}, column {}: {})",
+                error.line(),
+                error.column(),
+                cause(&error)
+            );
+        }
+    }
+
+    /// The position reported is one past the end for a parse that ran out of input, and the
+    /// parse's own otherwise.
+    ///
+    /// The rows differ along whether the document ended early at all, how long it is, and
+    /// whether it carries more than one line.
+    #[test]
+    fn the_position_a_parse_stopped_at_is_one_past_the_end_when_the_input_ran_out() {
+        // (case, the document, the position a location clause names)
+        let rows: [(&str, &str, (usize, usize)); 5] = [
+            ("an object left open", r#"{"a": 1"#, (1, 8)),
+            ("the empty document", "", (1, 1)),
+            ("a document that ends on its second line", "{\n  \"a\": 1", (2, 9)),
+            // A fault that stopped ON a character keeps the parse's own position.
+            ("an unquoted field name", r#"{event: 1}"#, (1, 2)),
+            ("a missing comma between members", r#"{"a": 1 "b": 2}"#, (1, 9)),
+        ];
+
+        for (case, document, expected) in rows {
+            let error = failure(document);
+            let actual = stopped_at(document, &error);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?} ({})",
+                cause(&error)
+            );
+        }
+    }
+
+    /// A location clause names the source it was given and the position in it, and the
+    /// redacted form is that clause with the source withheld.
+    #[test]
+    fn a_location_clause_names_its_source_and_position() {
+        let clause = location_clause("(String)\"{}\"", 3, 4);
+        assert_eq!(
+            clause, "[Source: (String)\"{}\"; line: 3, column: 4]",
+            "the clause must name the source it was given, got {clause:?}"
+        );
+        assert_eq!(
+            source_location(2, 7),
+            format!("\n at {}", location_clause(REDACTED_SOURCE, 2, 7)),
+            "the redacted clause must be the same clause with the source withheld"
         );
     }
 }

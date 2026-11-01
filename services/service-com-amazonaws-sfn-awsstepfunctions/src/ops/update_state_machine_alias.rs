@@ -172,17 +172,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region is a defect in the REQUEST, which `InvalidArn` reports, and not an
         // alias that is absent.
         let endpoint_region = crate::state::request_region(ctx.parts());
-        if let Err(message) = crate::state::read_state_machine_alias_arn(
+        // The ARN names the state machine the alias qualifies as well as the alias
+        // name, and which of the two the store cannot resolve is what the refusal
+        // below is worded for.
+        let (named_state_machine_arn, _) = match crate::state::read_state_machine_alias_arn(
             &input.state_machine_alias_arn,
             &endpoint_region,
         ) {
-            return Err(
-                UpdateStateMachineAliasErrorModeled::InvalidArn(InvalidArn {
-                    message: Some(message),
-                })
-                .into(),
-            );
-        }
+            Ok(named) => named,
+            Err(message) => {
+                return Err(
+                    UpdateStateMachineAliasErrorModeled::InvalidArn(InvalidArn {
+                        message: Some(message),
+                    })
+                    .into(),
+                )
+            }
+        };
 
         // "You must specify at least one of the description or routingConfiguration
         // parameters to update a state machine alias": a request that names neither
@@ -213,10 +219,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(UpdateStateMachineAliasErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    // This operation states the condition as a sentence of its own
-                    // and names the alias in `resourceName` rather than in the
-                    // message — see `crate::state::RESOURCE_DOES_NOT_EXIST`.
-                    message: Some(crate::state::RESOURCE_DOES_NOT_EXIST.to_string()),
+                    // Which resource the ARN resolved nothing for decides the
+                    // wording: the state machine deleted under a live alias is
+                    // reported by the ARN the request named, and an alias gone from a
+                    // state machine still held is the condition stated as a sentence
+                    // of its own — see
+                    // `crate::state::ComAmazonawsSfnAwsstepfunctionsState::missing_alias_message`.
+                    // Either way the alias travels in `resourceName`.
+                    message: Some(store.missing_alias_message(
+                        &input.state_machine_alias_arn,
+                        &named_state_machine_arn,
+                    )),
                     resource_name: Some(input.state_machine_alias_arn.clone()),
                 },
             )
@@ -309,7 +322,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(crate::state::AliasUpdateRejection::NotFound) => {
                 Err(UpdateStateMachineAliasErrorModeled::ResourceNotFound(
                     ResourceNotFound {
-                        message: Some(crate::state::RESOURCE_DOES_NOT_EXIST.to_string()),
+                        message: Some(store.missing_alias_message(
+                            &input.state_machine_alias_arn,
+                            &named_state_machine_arn,
+                        )),
                         resource_name: Some(input.state_machine_alias_arn.clone()),
                     },
                 )

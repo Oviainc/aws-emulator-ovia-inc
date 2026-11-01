@@ -3426,6 +3426,28 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         Some(alias)
     }
 
+    /// What the modelled `ResourceNotFound` says when an alias MUTATION resolves no
+    /// alias under `alias_arn`, worded for WHICH resource the ARN resolved nothing
+    /// for.
+    ///
+    /// An alias ARN names two resources — the state machine it qualifies, and the
+    /// alias name inside it ([`state_machine_alias_arn`]) — so resolving one is two
+    /// steps, and the refusal states the step that failed. A state machine this store
+    /// does not hold resolves nothing at all, and the mutation reports the ARN the
+    /// request named, exactly as the alias's own readers do
+    /// ([`resource_not_found_message`]): that ARN is what identifies the alias left
+    /// dangling by a state machine that was deleted under it. A state machine that IS
+    /// held and carries no such alias is the fixed sentence
+    /// ([`RESOURCE_DOES_NOT_EXIST`]), which is what the alias itself being gone is
+    /// RECORDED answering.
+    pub fn missing_alias_message(&self, alias_arn: &str, state_machine_arn: &str) -> String {
+        if self.state_machines.contains_key(state_machine_arn) {
+            RESOURCE_DOES_NOT_EXIST.to_string()
+        } else {
+            resource_not_found_message(alias_arn)
+        }
+    }
+
     /// The aliases of one state machine, in ARN order — which is alias-name order,
     /// since every one of those ARNs differs only in the name.
     ///
@@ -4879,13 +4901,14 @@ pub fn resource_not_found_message(resource_arn: &str) -> String {
 /// as a SENTENCE OF ITS OWN instead of naming the ARN: the resource the request
 /// referenced is not there.
 ///
-/// RECORDED text: `UpdateStateMachineAlias` answers this fixed sentence for an alias
-/// the store does not hold, where the alias's own readers
-/// (`DescribeStateMachineAlias`, `DeleteStateMachineAlias`) quote the ARN through
-/// [`resource_not_found_message`]. No value of the request appears in it — the ARN
-/// travels in the shape's `resourceName` member, which every raiser of this error
-/// fills — so a caller reads the refused resource from there rather than out of the
-/// sentence.
+/// RECORDED text: `UpdateStateMachineAlias` answers this fixed sentence for an ALIAS
+/// that is gone from a state machine the store still holds, where the alias's own
+/// readers (`DescribeStateMachineAlias`, `DeleteStateMachineAlias`) quote the ARN
+/// through [`resource_not_found_message`] — see
+/// [`ComAmazonawsSfnAwsstepfunctionsState::missing_alias_message`] for which of the
+/// two the mutation states. No value of the request appears in it — the ARN travels
+/// in the shape's `resourceName` member, which every raiser of this error fills — so
+/// a caller reads the refused resource from there rather than out of the sentence.
 pub const RESOURCE_DOES_NOT_EXIST: &str = "Request references a resource that does not exist.";
 
 /// What the modelled `ValidationException` says when the weights of a routing
@@ -5130,13 +5153,19 @@ pub const INVALID_STATE_MACHINE_EXECUTION_INPUT: &str = "Invalid State Machine E
 /// messages — and so there is one name for it rather than two.
 pub use json_diagnostic::diagnostic as json_parse_diagnostic;
 
-/// What `TestState`'s refusal about the input a state is tested on quotes: the same
-/// reading, with the parser's own SOURCE LOCATION clause after it.
+/// What a refusal about a state machine DEFINITION quotes: the same reading, with the
+/// definition the parse was reading quoted in each of its clauses and the position
+/// the parse ended at stated after the sentence.
 ///
-/// Framed in [`json_diagnostic`] beside the clause-less construction above, and
-/// re-exported here for the same reason: one name for it, reached where every other
-/// message of this service is reached.
-pub use json_diagnostic::diagnostic_with_source as json_parse_diagnostic_with_source;
+/// Framed in [`json_diagnostic`] beside the construction above, and re-exported here
+/// for the same reason: one name for it, reached where every other message of this
+/// service is reached.
+pub use json_diagnostic::definition_diagnostic as json_parse_definition_diagnostic;
+
+/// WHERE a refused definition stopped parsing, as the `location` of the diagnostic
+/// that reports it — the clause [`json_parse_definition_diagnostic`] also states
+/// after its sentence.
+pub use json_diagnostic::definition_source_location as json_parse_definition_location;
 
 /// What `StateMachineTypeNotSupported` says, whatever operation raises it and
 /// whatever state machine it was raised for.
@@ -6150,6 +6179,18 @@ fn is_kms_key_id(value: &str) -> bool {
 /// `destinations` member's own documentation: "Limited to size 1."
 pub const MAX_LOG_DESTINATIONS: usize = 1;
 
+/// What the modelled `InvalidLoggingConfiguration` says about a `logGroupArn` that is
+/// not the ARN of a CloudWatch Logs log group as the member documents one ("The ARN
+/// must end with `:*`").
+///
+/// RECORDED text, and ENTIRELY FIXED: the service states the RULE the ARN broke —
+/// the qualifier a log group ARN is given with — and carries no value of the request,
+/// so neither the submitted ARN, the log group nor the state machine appears in it.
+/// The rule is what the caller has to act on, and it is the same sentence whichever
+/// ARN was sent.
+pub const LOG_GROUP_ARN_NEEDS_QUALIFIER: &str =
+    "Invalid Logging Configuration: Log Group ARN must be provided with '*' qualifier.";
+
 /// Why `configuration` is not a logging configuration this service accepts, or
 /// `None` when it is — the modelled `InvalidLoggingConfiguration`.
 ///
@@ -6161,7 +6202,7 @@ pub const MAX_LOG_DESTINATIONS: usize = 1;
 /// * a destination describes a CloudWatch log group, so one that names no log group
 ///   describes nothing;
 /// * `logGroupArn` is the ARN of a CloudWatch Logs log group and "must end with
-///   `:*`".
+///   `:*`" ([`LOG_GROUP_ARN_NEEDS_QUALIFIER`]).
 ///
 /// `level` is a modelled enum, so the centralized walk has already refused a value
 /// outside it. Every operation that accepts a `loggingConfiguration` reads this, so
@@ -6188,10 +6229,7 @@ pub fn invalid_logging_reason(configuration: &LoggingConfiguration) -> Option<St
             );
         };
         if !names_log_group(log_group_arn) {
-            return Some(format!(
-                "Invalid Logging Configuration: '{log_group_arn}' is not the ARN of a CloudWatch \
-                 Logs log group ending with ':*'."
-            ));
+            return Some(LOG_GROUP_ARN_NEEDS_QUALIFIER.to_string());
         }
     }
     None

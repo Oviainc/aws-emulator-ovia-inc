@@ -1125,10 +1125,15 @@ const MAX_DIAGNOSTICS: usize = DEFAULT_MAX_DIAGNOSTICS + 1;
 /// be ([`MAX_STATE_NAME_CHARS`]), so a value inside the language's own bounds is
 /// quoted in full and only one past them is clipped.
 const MAX_ECHOED_CHARS: usize = MAX_STATE_NAME_CHARS;
-/// The most characters one diagnostic's `location` carries, and the most any path
-/// the walk builds carries: the path to a state nests a caller-chosen name per
-/// level, so it is clipped AS IT IS BUILT ([`nested_at`]) rather than only where it
-/// is reported.
+/// The most characters one diagnostic's `location` carries where that location is a
+/// PATH into the definition, and the most any path the walk builds carries: the path
+/// to a state nests a caller-chosen name per level, so it is clipped AS IT IS BUILT
+/// ([`nested_at`]) rather than only where it is reported.
+///
+/// ONE diagnostic is located somewhere else: a definition that is not JSON at all has
+/// no path into it, so it is located at the position the parse ended at
+/// ([`crate::state::json_parse_definition_location`]), whose own quoting of the
+/// document is what bounds it.
 pub const MAX_LOCATION_CHARS: usize = 256;
 
 /// `value` as a diagnostic echoes it: itself when it is short, and its first
@@ -1493,15 +1498,14 @@ fn collect(definition: &str, mut found: Diagnosis) -> Diagnosis {
     match serde_json::from_str::<Value>(definition) {
         Ok(document) => diagnose_machine(&document, "", JSONPATH, 1, false, &mut found),
         // The diagnostic is the service's own, naming where the definition stopped
-        // parsing and what was expected there — the one construction every document
-        // this service reads is reported through.
+        // parsing, the mark it left unmatched and what was expected there — the one
+        // construction every document this service reads is reported through — and
+        // it is LOCATED at the position in the definition the parse ended at, which
+        // is where a client has to look.
         Err(why) => found.push(error(
             INVALID_JSON_DESCRIPTION,
-            None,
-            format!(
-                "the definition is not valid JSON: {}",
-                crate::state::json_parse_diagnostic(definition, &why)
-            ),
+            Some(crate::state::json_parse_definition_location(definition, &why)),
+            crate::state::json_parse_definition_diagnostic(definition, &why),
         )),
     }
     found

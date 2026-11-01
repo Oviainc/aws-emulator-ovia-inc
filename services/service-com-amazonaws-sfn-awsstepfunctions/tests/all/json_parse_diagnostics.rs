@@ -13,12 +13,15 @@
 //! > a refusal about a document the request carried names WHERE that document
 //! > stopped parsing — the unquoted word the parse stopped on where a value belongs,
 //! > together with the classes a value could have begun with, or else the character
-//! > it stopped on, or the end of the input, and what was expected there — never the
-//! > position a parser's cursor stopped at, which names none of those.
+//! > it stopped on, or the end of the input, and what was expected there, and for a
+//! > document that ran out of input inside a container the mark that opened it —
+//! > never the position a parser's cursor stopped at on its own, which names none of
+//! > those.
 //!
-//! `TestState`'s refusal about the input a state is tested on is the ONE recorded
-//! exception: it states the same reading and then the parser's own source-location
-//! clause, which `refusal_vocabulary` owns.
+//! The document those clauses were read from is WITHHELD from a refusal about an
+//! `input`, whose member the model marks `@sensitive`, and quoted by the one refusal
+//! recorded quoting it: the state machine `definition`'s, which `refusal_vocabulary`
+//! and `refusal_message_fidelity` own.
 //!
 //! The rows differ along the KIND of fault — a bare word, a non-ASCII word, an
 //! unquoted field name, a missing colon, a missing comma in each container, a missing
@@ -38,7 +41,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
-    json_parse_diagnostic, INVALID_STATE_MACHINE_DEFINITION, INVALID_STATE_MACHINE_EXECUTION_INPUT,
+    json_parse_definition_diagnostic, json_parse_definition_location, json_parse_diagnostic,
+    INVALID_STATE_MACHINE_DEFINITION, INVALID_STATE_MACHINE_EXECUTION_INPUT,
 };
 
 use crate::error_messages::failure;
@@ -57,6 +61,12 @@ const PASS_STATE: &str = r#"{"Type":"Pass","Result":{"ok":true},"End":true}"#;
 /// (JSON String, Number, Array, Object or token 'null', 'true' or 'false')'`, so
 /// this suite fails if the list is reworded.
 const VALUE_CLASSES: &str = "JSON String, Number, Array, Object or token 'null', 'true' or 'false'";
+
+/// The source a location clause names where the document it read is WITHHELD.
+///
+/// Spelled literally here for the same reason as the classes above: this is the
+/// recorded text, so the suite fails if it is reworded.
+const REDACTED_SOURCE: &str = "REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled)";
 
 /// What a row requires of the diagnostic.
 enum Expected {
@@ -91,6 +101,15 @@ fn unexpected(character: char, expected: &str) -> Expected {
 /// The diagnostic for a document that ended before it was complete.
 fn ended_early(expected: &str) -> Expected {
     Expected::Exact(format!("Unexpected end-of-input: {expected}"))
+}
+
+/// The diagnostic for a document that ran out of input inside a container, which
+/// names the mark that opened it and withholds the document the parse was reading.
+fn left_open(container: &str, line: usize, column: usize) -> Expected {
+    Expected::Exact(format!(
+        "Unexpected end-of-input: expected close marker for {container} (start marker at \
+         [Source: {REDACTED_SOURCE}; line: {line}, column: {column}])"
+    ))
 }
 
 /// How a diagnostic names one character: the character and its character code.
@@ -156,13 +175,9 @@ fn faults() -> Vec<(&'static str, &'static str, Expected)> {
         (
             "a truncated object",
             r#"{"a":1"#,
-            ended_early("expected close marker for Object"),
+            left_open("Object", 1, 1),
         ),
-        (
-            "a truncated array",
-            "[1,2",
-            ended_early("expected close marker for Array"),
-        ),
+        ("a truncated array", "[1,2", left_open("Array", 1, 1)),
         (
             "a truncated string",
             r#"{"a":"text"#,
@@ -239,14 +254,19 @@ fn quoted_value<'a>(case: &str, message: &'a str, condition: &str) -> &'a str {
         })
 }
 
-/// A parser's CURSOR — the position it stopped at — names neither where the document
-/// stopped nor what was expected there, so no message may carry one.
-fn assert_no_cursor(case: &str, message: &str) {
-    for cursor in ["line ", "column "] {
+/// A parser's CURSOR on its own — the bare position it stopped at, as the parse
+/// renders it (`at line L column C`) — names neither where the document stopped nor
+/// what was expected there, so no message may carry one.
+///
+/// A position stated inside a LOCATION clause is a different thing, and is what the
+/// definition's refusal is recorded carrying; the rows that assert the whole
+/// diagnostic are what pin those.
+fn assert_no_bare_cursor(case: &str, message: &str) {
+    for cursor in [" at line ", " column "] {
         assert!(
             !message.contains(cursor),
             "case {case:?}: expected the diagnostic to name where the document stopped rather \
-             than a parser cursor, got {message:?} (carrying {cursor:?})"
+             than a bare parser cursor, got {message:?} (carrying {cursor:?})"
         );
     }
 }
@@ -254,9 +274,24 @@ fn assert_no_cursor(case: &str, message: &str) {
 /// The diagnostic `document` must carry, as this service's ONE constructor words it
 /// from the parse that refuses the document.
 fn constructed(case: &str, document: &str) -> String {
-    let error = serde_json::from_str::<Value>(document)
-        .expect_err(&format!("case {case:?}: the document must not parse"));
-    json_parse_diagnostic(document, &error)
+    json_parse_diagnostic(document, &refusal(case, document))
+}
+
+/// The same, as the DEFINITION's own constructor words it: the document quoted in
+/// each clause, and the position the parse ended at after the sentence.
+fn constructed_definition(case: &str, document: &str) -> String {
+    json_parse_definition_diagnostic(document, &refusal(case, document))
+}
+
+/// WHERE the refused definition stopped, as the clause its diagnostic is located at.
+fn constructed_location(case: &str, document: &str) -> String {
+    json_parse_definition_location(document, &refusal(case, document))
+}
+
+/// The parse that refuses `document`, or a panic when it parses.
+fn refusal(case: &str, document: &str) -> serde_json::Error {
+    serde_json::from_str::<Value>(document)
+        .expect_err(&format!("case {case:?}: the document must not parse"))
 }
 
 /// Judge one diagnostic against what its row requires.
@@ -309,15 +344,14 @@ async fn a_refused_input_names_where_the_document_stopped_parsing() {
             "case {case:?}: expected 400 InvalidExecutionInput, got {status} {code} with message \
              {message:?}"
         );
-        assert_no_cursor(&case, &message);
+        assert_no_bare_cursor(&case, &message);
         let detail = quoted_value(&case, &message, INVALID_STATE_MACHINE_EXECUTION_INPUT);
         assert_diagnostic(&case, document, &expected, detail);
 
         // `TestState` reads a caller's document as the input a state is tested on,
-        // and reports the same reading of where it stopped — with the parser's own
-        // SOURCE LOCATION after it, which is what this ONE refusal of the service
-        // is recorded carrying (the issue this suite's row was widened for records
-        // `[Source: (String)"…"; line: L, column: C]` for it).
+        // and reports the SAME reading of where it stopped: the `input` member is
+        // `@sensitive` on every operation that takes one, so none of them quotes the
+        // document it could not read.
         let case = format!("TestState with {kind} as its input");
         let (status, code, message) = failure(
             &emulator,
@@ -332,19 +366,12 @@ async fn a_refused_input_names_where_the_document_stopped_parsing() {
             "case {case:?}: expected 400 InvalidExecutionInput, got {status} {code} with message \
              {message:?}"
         );
+        assert_no_bare_cursor(&case, &message);
         let detail = quoted_value(&case, &message, INVALID_STATE_MACHINE_EXECUTION_INPUT);
-        let (reading, located) = detail.split_once('\n').unwrap_or_else(|| {
-            panic!(
-                "case {case:?}: expected the diagnostic to carry a source-location clause, got \
-                 {detail:?}"
-            )
-        });
-        assert_diagnostic(&case, document, &expected, reading);
-        let source = format!(" at [Source: (String)\"{document}\"; line: ");
+        assert_diagnostic(&case, document, &expected, detail);
         assert!(
-            located.starts_with(&source) && located.ends_with(']'),
-            "case {case:?}: expected the clause to name the source and the position as \
-             {source:?}, got {located:?}"
+            !detail.contains("(String)"),
+            "case {case:?}: expected the refusal to withhold the input it read, got {detail:?}"
         );
 
         // `StartSyncExecution` reads the same member of the same API, and refuses
@@ -363,14 +390,15 @@ async fn a_refused_input_names_where_the_document_stopped_parsing() {
             "case {case:?}: expected 400 InvalidExecutionInput, got {status} {code} with message \
              {message:?}"
         );
-        assert_no_cursor(&case, &message);
+        assert_no_bare_cursor(&case, &message);
         let detail = quoted_value(&case, &message, INVALID_STATE_MACHINE_EXECUTION_INPUT);
         assert_diagnostic(&case, document, &expected, detail);
     }
 }
 
-/// A state machine `definition` that is not JSON carries the SAME diagnostic, on
-/// both operations that refuse one and in the validation report.
+/// A state machine `definition` that is not JSON carries the SAME reading, QUOTED
+/// against the definition the parse was reading and located at the position it ended
+/// at, on both operations that refuse one and in the validation report.
 #[tokio::test]
 async fn a_refused_definition_carries_the_same_diagnostic() {
     let emulator = Emulator::new();
@@ -383,7 +411,8 @@ async fn a_refused_definition_carries_the_same_diagnostic() {
         if document.trim().is_empty() {
             continue;
         }
-        let diagnostic = constructed(kind, document);
+        let diagnostic = constructed_definition(kind, document);
+        let location = constructed_location(kind, document);
 
         for (operation, body) in [
             (
@@ -407,12 +436,12 @@ async fn a_refused_definition_carries_the_same_diagnostic() {
                 "case {case:?}: expected 400 InvalidDefinition, got {status} {code} with message \
                  {message:?}"
             );
-            assert_no_cursor(&case, &message);
+            assert_no_bare_cursor(&case, &message);
             let detail = quoted_value(&case, &message, INVALID_STATE_MACHINE_DEFINITION);
             assert!(
-                detail.ends_with(&diagnostic),
-                "case {case:?}: expected the diagnostic to end with {diagnostic:?}, got \
-                 {detail:?}"
+                detail.ends_with(&format!("{diagnostic} at {location}")),
+                "case {case:?}: expected the diagnostic {diagnostic:?} located at {location:?}, \
+                 got {detail:?}"
             );
         }
 
@@ -442,8 +471,16 @@ async fn a_refused_definition_carries_the_same_diagnostic() {
             found.iter().any(|message| message.ends_with(&diagnostic)),
             "case {case:?}: expected a diagnostic ending with {diagnostic:?}, got {found:?}"
         );
+        let located: Vec<&str> = diagnostics
+            .iter()
+            .filter_map(|reported| reported.get("location").and_then(Value::as_str))
+            .collect();
+        assert!(
+            located.contains(&location.as_str()),
+            "case {case:?}: expected a diagnostic located at {location:?}, got {located:?}"
+        );
         for message in found {
-            assert_no_cursor(&case, message);
+            assert_no_bare_cursor(&case, message);
         }
     }
 }
@@ -496,7 +533,7 @@ async fn the_diagnostic_stays_bounded_for_a_hostile_document() {
             "case {case:?}: expected the refusal to stay bounded, got {} characters: {message:?}",
             message.len()
         );
-        assert_no_cursor(case, &message);
+        assert_no_bare_cursor(case, &message);
     }
 }
 

@@ -364,13 +364,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Err(error) = serde_json::from_str::<Value>(&state_input) {
             return Err(TestStateErrorModeled::InvalidExecutionInput(
                 InvalidExecutionInput {
-                    // This operation's refusal about the input carries the POSITION
-                    // the parse reached after the diagnostic, which the operations
-                    // that start an execution with an input do not: see
-                    // `crate::state::json_parse_diagnostic_with_source`.
+                    // The input is `@sensitive`, so the refusal about it quotes
+                    // nothing of the document: it names where the parse stopped and
+                    // the mark it left unmatched, with the source of each clause
+                    // withheld, which is what this service is recorded answering for
+                    // an input it could not read — see
+                    // `crate::state::json_parse_diagnostic`.
                     message: Some(crate::state::resource_error_message(
                         crate::state::INVALID_STATE_MACHINE_EXECUTION_INPUT,
-                        &crate::state::json_parse_diagnostic_with_source(&state_input, &error),
+                        &crate::state::json_parse_diagnostic(&state_input, &error),
                     )),
                 },
             )

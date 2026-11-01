@@ -83,6 +83,8 @@ mod map_run_updates;
 mod map_runs;
 #[path = "all/nested_type_discriminator.rs"]
 mod nested_type_discriminator;
+#[path = "all/refusal_message_fidelity.rs"]
+mod refusal_message_fidelity;
 #[path = "all/refusal_message_wording.rs"]
 mod refusal_message_wording;
 #[path = "all/refusal_vocabulary.rs"]

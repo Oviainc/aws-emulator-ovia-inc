@@ -29,12 +29,13 @@
 //!    not declare is reported as unsupported at the object;
 //! 6. `TestState` words the defects of its OWN members: a `definition` that is
 //!    not JSON in one fixed sentence about the state definition, and an `input`
-//!    that is not JSON with the parser's own source location after the
-//!    diagnostic;
+//!    that is not JSON in the parse diagnostic alone, which withholds the
+//!    `@sensitive` document it was reading;
 //! 7. `UpdateStateMachine` refuses only a request that names NO member that would
 //!    change the state machine, and states the alternatives it accepts;
-//! 8. `UpdateStateMachineAlias` states the resource-absent condition as a sentence
-//!    of its own and names the alias in `resourceName`.
+//! 8. `UpdateStateMachineAlias` words the resource-absent condition for WHICH
+//!    resource its ARN resolved nothing for, and names the alias in `resourceName`
+//!    either way.
 //!
 //! The harness (`Emulator`, `create_machine`, `string`, `error_code`) is the one
 //! `state_machine_lifecycle` builds, `failure` and `MODEL` are `error_messages`'
@@ -45,8 +46,9 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
-    missing_version_qualifier_message, pattern_violation_message, routing_weight_sum_message,
-    ALIAS_NAME_PATTERN, RESOURCE_DOES_NOT_EXIST, UPDATE_NAMES_NO_MEMBER,
+    missing_version_qualifier_message, pattern_violation_message, resource_not_found_message,
+    routing_weight_sum_message, ALIAS_NAME_PATTERN, RESOURCE_DOES_NOT_EXIST,
+    UPDATE_NAMES_NO_MEMBER,
 };
 
 use crate::error_messages::{failure, MODEL};
@@ -768,36 +770,59 @@ async fn test_state_refuses_a_definition_that_is_not_json_in_one_sentence() {
 }
 
 /// `TestState`'s refusal about the input a state is tested on names where the parse
-/// stopped AND the source it was reading: the document as submitted, and the line
-/// and column the parse reached in it — the form the issue records for this error
-/// class (`[Source: (String)"…"; line: L, column: C]`).
+/// stopped and, for a document that ran out of input inside a container, the START
+/// MARKER of that container — and withholds the document itself, whose member the
+/// model marks `@sensitive`, from every clause it states.
 ///
-/// The rows differ along the fault class — a document that ends early, a character
-/// where something else was expected, an unquoted word, a fault on a later line, the
-/// empty document — and end with documents long enough that quoting one whole would
-/// amplify the request, which the clause must not do.
+/// RECORDED text: the service answers `Unexpected end-of-input: expected close marker
+/// for Object (start marker at [Source: REDACTED (…); line: 1, column: 1])` for an
+/// input that ends inside an object, and the unquoted-word reading alone, with no
+/// clause after it, for an input that opens on a bare word.
+///
+/// The rows differ along the fault class — a document that ends inside each kind of
+/// container, a container opened on a later line, a character where something else
+/// was expected, an unquoted word, the empty document — and end with documents long
+/// enough that quoting one whole would amplify the request, which no clause may do.
 #[tokio::test]
-async fn test_state_names_where_the_input_stopped_and_the_source_it_read() {
+async fn test_state_names_where_the_input_stopped_and_withholds_the_input() {
     let emulator = Emulator::new();
     let pass_state = r#"{"Type":"Pass","End":true}"#;
 
-    // (case, the input, the reading, the line, the column)
-    let cases: Vec<(&str, String, String, usize, usize)> = vec![
+    /// The source a clause names where the document is withheld. Spelled out here
+    /// rather than read off the service: this is the recorded text, so the suite
+    /// fails if it is reworded.
+    const REDACTED: &str = "REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled)";
+
+    /// The clause for a container left open at `line`:`column`.
+    fn left_open(container: &str, line: usize, column: usize) -> String {
+        format!(
+            "Unexpected end-of-input: expected close marker for {container} (start marker at \
+             [Source: {REDACTED}; line: {line}, column: {column}])"
+        )
+    }
+
+    // (case, the input, the whole diagnostic the refusal quotes)
+    let cases: Vec<(&str, String, String)> = vec![
         (
-            // The recorded row: a document that ends inside an object stopped at
-            // its last byte.
+            // The recorded row: an object left open names the mark that opened it.
             "an object that ends early",
             r#"{"probe": 1"#.to_string(),
-            "Unexpected end-of-input: expected close marker for Object".to_string(),
-            1,
-            11,
+            left_open("Object", 1, 1),
         ),
         (
             "an array that ends early",
             "[1,2".to_string(),
-            "Unexpected end-of-input: expected close marker for Array".to_string(),
-            1,
-            4,
+            left_open("Array", 1, 1),
+        ),
+        (
+            "an inner object that ends early",
+            r#"{"a": {"b": 1"#.to_string(),
+            left_open("Object", 1, 7),
+        ),
+        (
+            "an object opened on the second line",
+            "{\n  \"a\": [1".to_string(),
+            left_open("Array", 2, 8),
         ),
         (
             "a character where a colon was expected",
@@ -805,38 +830,23 @@ async fn test_state_names_where_the_input_stopped_and_the_source_it_read() {
             "Unexpected character ('1' (code 49)): was expecting a colon to separate field name \
              and value"
                 .to_string(),
-            1,
-            6,
         ),
         (
-            // A word is named WHOLE, so the position is where it begins.
+            // The recorded row: a word is named WHOLE, and no clause follows it.
             "an unquoted word where a value belongs",
             "not-json".to_string(),
             "Unrecognized token 'not': was expecting (JSON String, Number, Array, Object or \
              token 'null', 'true' or 'false')"
                 .to_string(),
-            1,
-            1,
-        ),
-        (
-            "a fault on the second line",
-            "{\n\"a\": }".to_string(),
-            "Unexpected character ('}' (code 125)): was expecting a valid value (JSON String, \
-             Number, Array, Object or token 'null', 'true' or 'false')"
-                .to_string(),
-            2,
-            6,
         ),
         (
             "the empty document",
             String::new(),
             "Unexpected end-of-input: expected a value".to_string(),
-            1,
-            0,
         ),
     ];
 
-    for (case, document, reading, line, column) in &cases {
+    for (case, document, diagnostic) in &cases {
         let (status, code, message) = failure(
             &emulator,
             case,
@@ -850,59 +860,47 @@ async fn test_state_names_where_the_input_stopped_and_the_source_it_read() {
             "case {case:?}: expected 400 InvalidExecutionInput, got {status} {code} with message \
              {message:?}"
         );
-        let expected = format!(
-            "Invalid State Machine Execution Input: '{reading}\n at [Source: \
-             (String)\"{document}\"; line: {line}, column: {column}]'"
-        );
+        let expected = format!("Invalid State Machine Execution Input: '{diagnostic}'");
         assert_eq!(
             message, expected,
             "case {case:?}: expected the message {expected:?}, got {message:?}"
         );
     }
 
-    // A document longer than the clause quotes is CLIPPED, with the characters it
-    // dropped counted after it, so a refusal cannot be made much larger than the
-    // request however long the document is.
+    // The input is `@sensitive`: no clause quotes the document the parse was reading,
+    // so however long the input is the refusal cannot be made to grow with it or to
+    // leak it into a log. The one caller value a reading does name — the unquoted
+    // word the parse stopped on — is clipped, which is what keeps it bounded.
     for characters in [600_usize, 60_000] {
-        let document = "a".repeat(characters);
-        let case = format!("a document of {characters} characters");
-        let (_, code, message) = failure(
-            &emulator,
-            &case,
-            "TestState",
-            &json!({ "definition": pass_state, "input": &document }),
-        )
-        .await;
-        assert_eq!(
-            code, "InvalidExecutionInput",
-            "case {case:?}: expected InvalidExecutionInput, got {code} with {message:?}"
-        );
-        let quoted = message
-            .split_once("(String)\"")
-            .and_then(|(_, rest)| rest.split_once("\"[truncated "))
-            .unwrap_or_else(|| {
-                panic!(
-                    "case {case:?}: expected the clause to quote a clipped source, got a message \
-                     of {} characters",
-                    message.len()
-                )
-            });
-        assert_eq!(
-            quoted.0.chars().count(),
-            500,
-            "case {case:?}: expected the clause to quote 500 characters of the document"
-        );
-        assert_eq!(
-            quoted.1,
-            format!("{} chars]; line: 1, column: 1]'", characters - 500),
-            "case {case:?}: expected the clause to count what it dropped and name where the \
-             word the parse stopped on begins"
-        );
-        assert!(
-            message.len() < 900,
-            "case {case:?}: expected the refusal to stay bounded, got {} characters",
-            message.len()
-        );
+        for (shape, document) in [
+            ("a bare word", "a".repeat(characters)),
+            (
+                "an object left open",
+                format!("{{\"a\": \"{}\"", "a".repeat(characters)),
+            ),
+        ] {
+            let case = format!("{shape} of {characters} characters");
+            let (_, code, message) = failure(
+                &emulator,
+                &case,
+                "TestState",
+                &json!({ "definition": pass_state, "input": &document }),
+            )
+            .await;
+            assert_eq!(
+                code, "InvalidExecutionInput",
+                "case {case:?}: expected InvalidExecutionInput, got {code} with {message:?}"
+            );
+            assert!(
+                !message.contains("[Source: (String)"),
+                "case {case:?}: expected no clause to quote the input it read, got {message:?}"
+            );
+            assert!(
+                message.len() < 300,
+                "case {case:?}: expected the refusal to stay bounded, got {} characters",
+                message.len()
+            );
+        }
     }
 
     // The control: an input that IS JSON is read.
@@ -1005,40 +1003,59 @@ async fn an_update_naming_one_member_it_can_change_is_served() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 8: the alias update's resource-absent sentence
+// Rule 8: the alias update's resource-absent wording
 // ---------------------------------------------------------------------------
 
-/// `UpdateStateMachineAlias` on an alias the store does not hold states the
-/// condition as a sentence of its own and names the alias in `resourceName`.
+/// `UpdateStateMachineAlias` on an alias the store does not hold words the condition
+/// for WHICH resource its ARN resolved nothing for — the state machine it qualifies,
+/// or the alias name inside it — and names the alias in `resourceName` either way.
 ///
-/// The rows differ along whether the alias's state machine exists, along which
-/// member the update names, and along the alias name — none of which appears in the
+/// An alias ARN resolves in two steps, so a request that resolves neither is told the
+/// step that failed: a state machine the store does not hold is reported by the ARN
+/// the request named, and a state machine that IS held but carries no such alias is
+/// the condition stated as a sentence of its own, which carries no value of the
+/// request at all.
+///
+/// The rows differ along whether the alias's state machine exists, along which member
+/// the update names, and along the alias name — none of which appears in the fixed
 /// sentence, which is what shows nothing is interpolated into it.
 #[tokio::test]
-async fn an_update_of_an_absent_alias_states_the_resource_sentence() {
+async fn an_update_of_an_absent_alias_words_which_resource_was_not_found() {
     let emulator = Emulator::new();
     let machine = machine_with_versions(&emulator, "absent-alias", 1).await;
     let absent_machine = format!("arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:never-created");
 
-    let cases: Vec<(&str, String, Value)> = vec![
+    // (case, the alias ARN, the member the update names, the message it earns)
+    let cases: Vec<(&str, String, Value, String)> = vec![
         (
             "an alias of an existing state machine, repointed",
             format!("{machine}:BETA"),
             json!({ "routingConfiguration": [route(&format!("{machine}:1"), 100)] }),
+            RESOURCE_DOES_NOT_EXIST.to_string(),
         ),
         (
             "an alias of an existing state machine, re-described",
             format!("{machine}:PROD"),
             json!({ "description": "new" }),
+            RESOURCE_DOES_NOT_EXIST.to_string(),
         ),
         (
+            // The state machine resolves nothing, so the ARN the request named is
+            // what the refusal reports — the ARN that identifies the dangling alias.
             "an alias of a state machine that does not exist either",
             format!("{absent_machine}:PROD"),
             json!({ "description": "new" }),
+            format!("Resource not found: '{absent_machine}:PROD'"),
+        ),
+        (
+            "an alias of a state machine that does not exist, repointed",
+            format!("{absent_machine}:BETA"),
+            json!({ "routingConfiguration": [route(&format!("{absent_machine}:1"), 100)] }),
+            format!("Resource not found: '{absent_machine}:BETA'"),
         ),
     ];
 
-    for (case, arn, member) in &cases {
+    for (case, arn, member, expected) in &cases {
         let mut body = json!({ "stateMachineAliasArn": arn });
         for (name, value) in member.as_object().expect("a member object") {
             body[name] = value.clone();
@@ -1053,8 +1070,8 @@ async fn an_update_of_an_absent_alias_states_the_resource_sentence() {
         );
         assert_eq!(
             parsed.get("message").and_then(Value::as_str),
-            Some(RESOURCE_DOES_NOT_EXIST),
-            "case {case:?}: expected the message {RESOURCE_DOES_NOT_EXIST:?}, got {parsed:?}"
+            Some(expected.as_str()),
+            "case {case:?}: expected the message {expected:?}, got {parsed:?}"
         );
         assert_eq!(
             parsed.get("resourceName").and_then(Value::as_str),
@@ -1063,4 +1080,12 @@ async fn an_update_of_an_absent_alias_states_the_resource_sentence() {
              {parsed:?}"
         );
     }
+
+    // The wording of the ARN-naming row is the ONE construction every refusal about
+    // an ARN the store resolves nothing for reads, so the two cannot drift apart.
+    assert_eq!(
+        resource_not_found_message(&format!("{absent_machine}:PROD")),
+        format!("Resource not found: '{absent_machine}:PROD'"),
+        "the ARN-naming refusal is the service's one construction for it"
+    );
 }
