@@ -162,6 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| internal_failure("the IoT SiteWise store is unavailable".to_string()))?;
         let _ = ctx;
+        let now = ::std::time::SystemTime::now();
 
         // A read: every member reported below is read off the stored segment, or off
         // the stored time series it covers, so this listing writes nothing and the
@@ -201,6 +202,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| not_found(crate::state::RESOURCE_DATASET, &input.dataset_id))?;
         let dataset_id = dataset.id.clone();
 
+        // The enrichment jobs that name this dataset, gathered ONCE for the
+        // whole listing: every segment summarised below reports its enrichment
+        // from the same jobs, so the store's jobs are walked once rather than
+        // once per segment.
+        let enrichment_jobs: Vec<&crate::state::EnrichmentJobRecord> =
+            store.enrichment_jobs_of_dataset(&dataset_id).collect();
+
         // Every segment the dataset holds, each one summarised from the record plus
         // the time series it covers. A dataset holding no segment at all lists none,
         // which is the empty page a dataset that exists answers with.
@@ -210,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(Vec::as_slice)
             .unwrap_or_default()
             .iter()
-            .map(|record| summary(&store, record))
+            .map(|record| summary(&store, &enrichment_jobs, record, now))
             .collect();
 
         // A stable total order is what makes `nextToken` resumable, and a segment's
@@ -259,7 +267,9 @@ const DEFAULT_MAX_RESULTS: i32 = 50;
 /// exactly as the dataset reads report a description nobody gave.
 fn summary(
     store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    enrichment_jobs: &[&crate::state::EnrichmentJobRecord],
     record: &crate::state::DataSegmentRecord,
+    now: ::std::time::SystemTime,
 ) -> DataSegmentSummary {
     let series = store.series_by_time_series_id(&record.time_series_id);
     let alias = series
@@ -278,11 +288,13 @@ fn summary(
         end_timestamp: record.end_timestamp.clone(),
         alias,
         data_type,
-        // Nothing in this emulator enriches a data segment: `CreateEnrichmentJob`
-        // records the job and the lifecycle the clock owes it, but no data is
-        // analysed, so no enrichment is reported — the same way `DescribeDataset`
-        // and `ListDatasets` report no dataset enrichment status.
-        enrichment: None,
+        // The enrichment the store knows about for this segment, derived from
+        // the enrichment jobs that name the dataset holding it: a segment a
+        // completed job analysed reports when it was enriched, and one no
+        // completed job has analysed reports that it is not. A segment of a
+        // dataset no job names reports none, the same way `DescribeDataset` and
+        // `ListDatasets` report no enrichment status for that dataset.
+        enrichment: store.data_segment_enrichment(enrichment_jobs, record, now),
     }
 }
 

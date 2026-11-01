@@ -502,7 +502,7 @@ async fn every_summary_is_read_off_the_stored_segment_and_the_series_it_covers()
         "a listing that reported everything issues no token, got {body}"
     );
 
-    // Nothing in this emulator enriches a data segment, so no summary claims an
+    // No enrichment job names this dataset, so no summary claims an
     // enrichment it was never given.
     for summary in segments(&body) {
         assert!(

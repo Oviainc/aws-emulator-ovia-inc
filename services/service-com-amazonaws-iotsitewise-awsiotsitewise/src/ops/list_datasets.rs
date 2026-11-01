@@ -236,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ListDatasetsOutput {
             dataset_summaries: matching[page.start..page.end]
                 .iter()
-                .map(|record| summary(record, now))
+                .map(|record| summary(&store, record, now))
                 .collect(),
             next_token: page.next_token,
             // The workspace this listing was scoped to, for a request that named
@@ -256,7 +256,11 @@ const DEFAULT_MAX_RESULTS: i32 = 50;
 /// One stored dataset as the summary this operation reports, read straight off the
 /// record `CreateDataset` persisted and `UpdateDataset` rewrites — so a listed
 /// dataset and a described one never disagree.
-fn summary(record: &crate::state::DatasetRecord, now: ::std::time::SystemTime) -> DatasetSummary {
+fn summary(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    record: &crate::state::DatasetRecord,
+    now: ::std::time::SystemTime,
+) -> DatasetSummary {
     DatasetSummary {
         id: record.id.clone(),
         arn: record.arn.clone(),
@@ -274,9 +278,11 @@ fn summary(record: &crate::state::DatasetRecord, now: ::std::time::SystemTime) -
         creation_date: crate::state::to_date_time(record.creation_date),
         last_update_date: crate::state::to_date_time(record.last_update_date),
         status: record.status(now),
-        // Nothing in this emulator enriches a dataset, so no enrichment status is
-        // reported; `DescribeDataset` answers the same way.
-        enrichment_status: None,
+        // The enrichment the store knows about for this dataset, derived from
+        // the enrichment jobs that name it; `DescribeDataset` reports it from
+        // the same derivation, so a listed dataset and a described one never
+        // disagree about it, and a dataset no job names reports none.
+        enrichment_status: store.dataset_enrichment(&record.id, now),
     }
 }
 

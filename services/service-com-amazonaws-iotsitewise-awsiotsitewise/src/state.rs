@@ -110,7 +110,8 @@ use crate::ops::types::{
     AssetPropertyValue, AssetStatus, AssetSummary, ComputationModelConfiguration,
     ComputationModelDataBindingValue, ComputationModelStatus, ComputeNode,
     ComputeNodeExecutionDetails,
-    ComputeNodeExecutionStatus, ConfigurationStatus, CustomerManagedS3Storage, DatasetConfig,
+    ComputeNodeExecutionStatus, ConfigurationStatus, CustomerManagedS3Storage,
+    DataSegmentEnrichment, DatasetConfig, DatasetEnrichment, DatasetEnrichmentEntry,
     DatasetSource, DatasetStatus, EnrichmentJobConfiguration, EnrichmentJobSummary,
     ErrorReportLocation,
     ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
@@ -5664,6 +5665,166 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         })
     }
 
+    /// The enrichment jobs of this store whose configuration names
+    /// `dataset_id`, in no particular order.
+    ///
+    /// A job names "the IoT SiteWise dataset ID containing the video
+    /// time-series data to analyze" ([`EnrichmentJobRecord::dataset_id`]), and
+    /// `CreateEnrichmentJob` refuses one for a dataset this store does not
+    /// hold, so that id is the link between a job and the dataset it analyses —
+    /// the one every reader of a dataset's enrichment walks.
+    pub fn enrichment_jobs_of_dataset<'a>(
+        &'a self,
+        dataset_id: &'a str,
+    ) -> impl Iterator<Item = &'a EnrichmentJobRecord> + 'a {
+        self.enrichment_jobs
+            .values()
+            .filter(move |record| record.dataset_id() == dataset_id)
+    }
+
+    /// Whether `job` analyses the time series `time_series_id` names.
+    ///
+    /// `EventDetection` identifies the video it analyses by "exactly one
+    /// time-series identifier (timeSeriesId OR propertyAlias)", and both
+    /// members are optional: an alias is resolved through the same stream
+    /// registry every alias-addressed read of this store goes through, so one
+    /// naming no stream this store holds names no series of the dataset either,
+    /// and a configuration naming neither identifier analyses the dataset's
+    /// video by the trim window alone — every series of it.
+    fn enrichment_job_analyses_series(
+        &self,
+        job: &EnrichmentJobRecord,
+        time_series_id: &str,
+    ) -> bool {
+        if let Some(named) = job.time_series_id() {
+            return named == time_series_id;
+        }
+        if let Some(alias) = job.property_alias() {
+            return self
+                .resolve_alias_series(alias)
+                .and_then(|key| self.series_time_series_id(&key))
+                .is_some_and(|resolved| resolved == time_series_id);
+        }
+        true
+    }
+
+    /// When the enrichment of `segment`, a data segment of the dataset whose
+    /// enrichment `jobs` are, completed as of `now` — and `None` while nothing
+    /// has enriched it.
+    ///
+    /// A segment is enriched by an enrichment job of its dataset that has
+    /// reached `COMPLETED`, analyses the segment's time series and whose trim
+    /// window contains the segment's span WHOLE: "Trim settings retrieve fully
+    /// contained data segments within the specified time range", so a segment
+    /// reaching outside the window is not one that job analysed. Of several such
+    /// jobs the LATEST completion is the instant reported, which is the
+    /// `lastEnrichedAt` of "the date the data was last enriched".
+    ///
+    /// The dataset's jobs are taken as a slice the caller gathered, so a dataset
+    /// with many segments walks the store's jobs ONCE rather than once per
+    /// segment it holds.
+    fn segment_enriched_at(
+        &self,
+        jobs: &[&EnrichmentJobRecord],
+        segment: &DataSegmentRecord,
+        now: SystemTime,
+    ) -> Option<SystemTime> {
+        jobs.iter()
+            .filter(|job| self.enrichment_job_analyses_series(job, &segment.time_series_id))
+            .filter(|job| job.analyses_span(&segment.start_timestamp, &segment.end_timestamp))
+            .filter_map(|job| job.completed_at(now))
+            .max()
+    }
+
+    /// The `enrichment` a data segment of the dataset whose enrichment jobs
+    /// `jobs` are reports at `now`, and `None` when that slice is empty — the
+    /// dataset no enrichment job names.
+    ///
+    /// `DataSegmentSummary$enrichment` is optional, so a segment of a dataset
+    /// nothing was ever asked to enrich reports none at all. Everything else is
+    /// DERIVED, like every other fact an enrichment job's own reads report: a
+    /// segment a completed job analysed reports `ENRICHED` at the instant that
+    /// job completed, and one no completed job has analysed yet reports
+    /// `NOT_ENRICHED` and no instant — there is no date it was last enriched.
+    ///
+    /// The dataset's jobs are taken as a slice the caller gathered with
+    /// [`Self::enrichment_jobs_of_dataset`], so a listing summarising many
+    /// segments of one dataset walks the store's jobs ONCE rather than once per
+    /// segment.
+    pub fn data_segment_enrichment(
+        &self,
+        jobs: &[&EnrichmentJobRecord],
+        segment: &DataSegmentRecord,
+        now: SystemTime,
+    ) -> Option<DataSegmentEnrichment> {
+        if jobs.is_empty() {
+            return None;
+        }
+        let enriched_at = self.segment_enriched_at(jobs, segment, now);
+        Some(DataSegmentEnrichment {
+            status: match enriched_at {
+                Some(_) => ENRICHMENT_ENRICHED,
+                None => ENRICHMENT_NOT_ENRICHED,
+            }
+            .to_string(),
+            last_enriched_at: enriched_at.map(to_date_time),
+        })
+    }
+
+    /// The `enrichmentStatus` the dataset `dataset_id` reports at `now`, and
+    /// `None` for a dataset no enrichment job names — `enrichmentStatus` is
+    /// optional, and a dataset nothing was ever asked to enrich has no
+    /// enrichment to report.
+    ///
+    /// The entry aggregates exactly the per-segment statuses the dataset's own
+    /// segments report ([`Self::data_segment_enrichment`]), so a dataset and its
+    /// segments cannot disagree: `FULLY_ENRICHED` when every segment it holds is
+    /// enriched, `PARTIALLY_ENRICHED` when only some are, `NOT_ENRICHED` when
+    /// none is — which is also what a dataset holding no segment at all reports,
+    /// since no enriched data of it is observable. `lastEnrichedAt` is the
+    /// latest of those segments' enrichment instants, and absent while none is
+    /// enriched.
+    ///
+    /// It is reported under `video` because the enrichment this API models —
+    /// event detection — is the analysis of "video time-series data"; no other
+    /// member of `DatasetEnrichment` has an enrichment job to derive it from.
+    ///
+    /// The dataset's own jobs are gathered here, once for the whole dataset,
+    /// because a reader of a dataset asks about that dataset alone.
+    pub fn dataset_enrichment(
+        &self,
+        dataset_id: &str,
+        now: SystemTime,
+    ) -> Option<DatasetEnrichment> {
+        let jobs: Vec<&EnrichmentJobRecord> =
+            self.enrichment_jobs_of_dataset(dataset_id).collect();
+        if jobs.is_empty() {
+            return None;
+        }
+        let held = self
+            .dataset_data_segments
+            .get(dataset_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let enriched: Vec<SystemTime> = held
+            .iter()
+            .filter_map(|segment| self.segment_enriched_at(&jobs, segment, now))
+            .collect();
+        let status = if enriched.is_empty() {
+            DATASET_NOT_ENRICHED
+        } else if enriched.len() == held.len() {
+            DATASET_FULLY_ENRICHED
+        } else {
+            DATASET_PARTIALLY_ENRICHED
+        };
+        Some(DatasetEnrichment {
+            video: Some(DatasetEnrichmentEntry {
+                status: status.to_string(),
+                last_enriched_at: enriched.iter().max().copied().map(to_date_time),
+            }),
+        })
+    }
+
     /// Store `segment` on the capture source `(workspace_name, time_series_id)`
     /// names, creating the source on first write.
     ///
@@ -10088,11 +10249,18 @@ impl BulkImportJobRecord {
 //
 // What a record does NOT hold is an embedding of any video: nothing in this
 // emulator analyses a time series, and no operation of this API answers an
-// embedding. The job's identity, the configuration it was created from and
-// where the lifecycle that create owed has got to are the whole of what a
-// client of this API can observe. An operation that comes to answer the
-// semantic search a completed job enables must derive its answer from the
-// store, never synthesise one to match the status reached here.
+// embedding. An operation that comes to answer the semantic search a completed
+// job enables must derive its answer from the store, never synthesise one to
+// match the status reached here.
+//
+// The enrichment STATUS is not an embedding, so it is derived rather than left
+// absent: a record names the dataset, the time series and the trim window one
+// job analyses, so the dataset that job names and the data segments of it that
+// window contains report where that enrichment stands — see
+// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::dataset_enrichment`] and
+// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::data_segment_enrichment`],
+// which the dataset reads answer from, so what a job reports about itself and
+// what the resource it was performed on reports cannot disagree.
 // ---------------------------------------------------------------------------
 
 /// The `EnrichmentJobStatus` a job reports from the instant it is created:
@@ -10115,6 +10283,23 @@ pub const ENRICHMENT_JOB_CANCELLED: &str = "CANCELLED";
 /// "derived from the job configuration union member", so it is derived here
 /// rather than stored beside the configuration.
 pub const JOB_TYPE_EVENT_DETECTION: &str = "EVENT_DETECTION";
+
+/// The `EnrichmentStatus` a data segment a completed enrichment job analysed
+/// reports (`crate::ops::types::ENRICHMENT_STATUS_VALUES`).
+pub const ENRICHMENT_ENRICHED: &str = "ENRICHED";
+
+/// The value a data segment no completed enrichment job has analysed reports.
+pub const ENRICHMENT_NOT_ENRICHED: &str = "NOT_ENRICHED";
+
+/// The `DatasetEnrichmentStatus` a dataset every data segment of which is
+/// enriched reports (`crate::ops::types::DATASET_ENRICHMENT_STATUS_VALUES`).
+pub const DATASET_FULLY_ENRICHED: &str = "FULLY_ENRICHED";
+
+/// The value a dataset only some of whose data segments are enriched reports.
+pub const DATASET_PARTIALLY_ENRICHED: &str = "PARTIALLY_ENRICHED";
+
+/// The value a dataset none of whose data segments is enriched reports.
+pub const DATASET_NOT_ENRICHED: &str = "NOT_ENRICHED";
 
 /// How long each step of an enrichment job's lifecycle takes: a created job
 /// stays `PENDING` for this long, then reports `RUNNING` for this long, then is
@@ -10241,6 +10426,19 @@ impl EnrichmentJobRecord {
             .or_else(|| (now >= runs_at).then_some(runs_at))
     }
 
+    /// Whether the trim window this job analyses contains the half-open span
+    /// `[start, end)` WHOLE.
+    ///
+    /// "Trim settings retrieve fully contained data segments within the
+    /// specified time range", so a segment reaching outside the window — before
+    /// its `startTime` or past its `endTime` — is not one this job analysed,
+    /// however much of it the window covers.
+    pub fn analyses_span(&self, start: &TimeInNanos, end: &TimeInNanos) -> bool {
+        let (window_start, window_end) = enrichment_job_window(&self.configuration);
+        timestamp_key(window_start) <= timestamp_key(start)
+            && timestamp_key(end) <= timestamp_key(window_end)
+    }
+
     /// Whether the status this job reports at `now` is one it can still move
     /// out of — what the duplicate-job rule reads, and what decides whether a
     /// cancel may still be recorded on the job.
@@ -10297,6 +10495,20 @@ pub fn enrichment_job_target(
             detection.property_alias.as_deref(),
             detection.time_series_id.as_deref(),
             JOB_TYPE_EVENT_DETECTION,
+        ),
+    }
+}
+
+/// The trim window one enrichment job analyses: the `EnrichmentTrimSettings`
+/// its configuration carries, read off that configuration rather than copied
+/// beside it, exactly as [`enrichment_job_target`] reads the work it does.
+pub fn enrichment_job_window(
+    configuration: &EnrichmentJobConfiguration,
+) -> (&TimeInNanos, &TimeInNanos) {
+    match configuration {
+        EnrichmentJobConfiguration::eventDetection(detection) => (
+            &detection.trim_settings.start_time,
+            &detection.trim_settings.end_time,
         ),
     }
 }

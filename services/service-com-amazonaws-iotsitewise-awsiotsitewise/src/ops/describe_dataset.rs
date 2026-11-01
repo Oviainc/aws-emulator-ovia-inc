@@ -238,11 +238,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             dataset_creation_date: crate::state::to_date_time(dataset.creation_date),
             dataset_last_update_date: crate::state::to_date_time(dataset.last_update_date),
             dataset_version: Some(dataset.version_label()),
-            // Nothing in this emulator enriches a dataset: `CreateEnrichmentJob`
-            // records the job and the lifecycle the clock owes it, but no video is
-            // analysed and no embedding is produced, so no enrichment status is
-            // reported.
-            enrichment_status: None,
+            // The enrichment the store knows about for this dataset, derived
+            // from the enrichment jobs that name it the same way an enrichment
+            // job's own reads derive its status and completion instant from the
+            // record `CreateEnrichmentJob` persisted. A dataset no job names has
+            // no enrichment to report, so this member stays absent for it.
+            enrichment_status: store.dataset_enrichment(&dataset.id, now),
         })
     }
 }
