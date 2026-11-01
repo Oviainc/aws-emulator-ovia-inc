@@ -32,6 +32,14 @@
 //! and the token is the receipt that caller holds. No SigV4 signature is attached: this
 //! emulator does not sign documents and does not fabricate a signature it did not compute.
 //!
+//! Minting that export persists a resource, so the call is ATTRIBUTABLE on the same terms as
+//! this crate's other state changes: this handler leaves exactly one structured record naming
+//! the caller (the access-key id and the credential-scope region the request presented), what
+//! the call addressed and the outcome — on the refusal paths as much as on the success one,
+//! since a state-changing call that changed nothing is still attributable. Never the URL,
+//! whose `PresignedUrl` shape is `@sensitive`, nor the download token it carries, nor the
+//! inquiry's name, content or queries.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -172,7 +180,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Nothing in the request metadata shapes the document this renders; the request's
+        // credential scope is read only to ATTRIBUTE the mint below, exactly as the
+        // account-wide write and the tag writes read it.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            // A state-changing call that changed nothing is still attributable, so the
+            // failure path records its outcome rather than passing silently.
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "ExportComplianceInquiry",
+                akid = %akid,
+                region = %region,
+                compliance_inquiry_id = %input.compliance_inquiry_id,
+                outcome = "unavailable",
+                "state-changing operation"
+            );
             return Err(ExportComplianceInquiryErrorModeled::InternalServerException(
                 InternalServerException {
                     message: "the artifact compliance inquiry store is unavailable".to_string(),
@@ -195,6 +220,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // modelled 404, which would confirm the resource's absence. The same answer
             // `GetComplianceInquiryMetadata` and `ListComplianceInquiryQueries` give for
             // the same id.
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "ExportComplianceInquiry",
+                akid = %akid,
+                region = %region,
+                compliance_inquiry_id = %input.compliance_inquiry_id,
+                outcome = "refused",
+                reason = "complianceInquiryId names no inquiry this account holds",
+                "state-changing operation"
+            );
             return Err(crate::scaffolded::Scaffolded::unauthorized());
         };
 
@@ -216,11 +251,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `PutComplianceInquiryFeedback` refuses its `queryIdentifier` against.
                 if requested.iter().any(|id| !inquiry.owns_query(*id)) {
                     ::tracing::info!(
+                        target: "emulator::audit",
                         operation = "ExportComplianceInquiry",
+                        akid = %akid,
+                        region = %region,
                         compliance_inquiry_id = %input.compliance_inquiry_id,
                         outcome = "refused",
                         reason = "queryIdentifiers name a query the inquiry does not own",
-                        "refused a compliance inquiry export"
+                        "state-changing operation"
                     );
                     return Err(ExportComplianceInquiryErrorModeled::ValidationException(
                         crate::state::unknown_query_identifiers("queryIdentifiers"),
@@ -247,17 +285,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         );
 
-        // Attributable: the inquiry exported and the export minted for it. NEVER the
+        // Attributable: the caller's access key id (a public identifier, never a secret),
+        // the scope's region, the inquiry exported and the export minted for it. NEVER the
         // inquiry's name, content or queries — all `@sensitive` in the model — and never
         // the URL, whose `PresignedUrl` shape is `@sensitive` too, nor the download token
         // that URL carries, which is what authorises the fetch.
         ::tracing::info!(
+            target: "emulator::audit",
             operation = "ExportComplianceInquiry",
+            akid = %akid,
+            region = %region,
             compliance_inquiry_id = %input.compliance_inquiry_id,
             export_id = %minted.id,
             include_citations,
             outcome = "exported",
-            "exported a compliance inquiry"
+            "state-changing operation"
         );
 
         Ok(ExportComplianceInquiryOutput {

@@ -41,6 +41,13 @@
 //! What the call records is observable: the document `ExportComplianceInquiry` renders
 //! reports the feedback held for the queries it covers.
 //!
+//! The submission changes persisted state, so it is ATTRIBUTABLE on the same terms as this
+//! crate's other state changes: this handler leaves exactly one structured record naming the
+//! caller (the access-key id and the credential-scope region the request presented), what the
+//! call addressed and the outcome — on the refusal and replay paths as much as on the success
+//! one, since a state-changing call that changed nothing is still attributable. Never the
+//! `comment`, nor the inquiry's name, content or queries, all `@sensitive` in the model.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -192,9 +199,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Nothing in the request metadata shapes the feedback this records; the request's
+        // credential scope is read only to ATTRIBUTE the change below, exactly as the
+        // account-wide write and the tag writes read it.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            // A state-changing call that changed nothing is still attributable, so the
+            // failure path records its outcome rather than passing silently.
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "PutComplianceInquiryFeedback",
+                akid = %akid,
+                region = %region,
+                compliance_inquiry_id = %input.compliance_inquiry_id,
+                outcome = "unavailable",
+                "state-changing operation"
+            );
             return Err(
                 PutComplianceInquiryFeedbackErrorModeled::InternalServerException(
                     InternalServerException {
@@ -235,6 +259,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // caller can tell: a well-formed id this account holds no inquiry for names no
             // inquiry it may rate, so the front door's refusal is what it sees — not the
             // modelled 404, which would confirm the resource's absence.
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "PutComplianceInquiryFeedback",
+                akid = %akid,
+                region = %region,
+                compliance_inquiry_id = %input.compliance_inquiry_id,
+                outcome = "refused",
+                reason = "complianceInquiryId names no inquiry this account holds",
+                "state-changing operation"
+            );
             return Err(crate::scaffolded::Scaffolded::unauthorized());
         };
 
@@ -249,11 +283,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(identifier) = input.query_identifier {
             if !inquiry.owns_query(identifier) {
                 ::tracing::info!(
+                    target: "emulator::audit",
                     operation = "PutComplianceInquiryFeedback",
+                    akid = %akid,
+                    region = %region,
                     compliance_inquiry_id = %input.compliance_inquiry_id,
+                    query_identifier = input.query_identifier,
                     outcome = "refused",
                     reason = "queryIdentifier names a query the inquiry does not own",
-                    "refused a compliance inquiry feedback submission"
+                    "state-changing operation"
                 );
                 return Err(PutComplianceInquiryFeedbackErrorModeled::ValidationException(
                     crate::state::unknown_query_identifiers("queryIdentifier"),
@@ -268,7 +306,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // request, but does not return an error": nothing further is recorded and
                 // the answer is the one the first call gave, read off the remembered
                 // record. The replay is checked BEFORE the state rule below, because the
-                // record the repeat would conflict with is the one it already made.
+                // record the repeat would conflict with is the one it already made. The
+                // repeat is still a call on a state-changing operation, so it is
+                // attributable: it recorded nothing further, which is its outcome.
+                ::tracing::info!(
+                    target: "emulator::audit",
+                    operation = "PutComplianceInquiryFeedback",
+                    akid = %akid,
+                    region = %region,
+                    compliance_inquiry_id = %input.compliance_inquiry_id,
+                    query_identifier = input.query_identifier,
+                    response_revision_id = input.response_revision_id,
+                    outcome = "replayed",
+                    "state-changing operation"
+                );
                 return Ok(PutComplianceInquiryFeedbackOutput {
                     submitted_at: ::aws_smithy_types::DateTime::from(record.submitted_at),
                 });
@@ -284,13 +335,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (input.query_identifier, input.response_revision_id);
         if inquiry.feedback_for(target).is_some() {
             ::tracing::info!(
+                target: "emulator::audit",
                 operation = "PutComplianceInquiryFeedback",
+                akid = %akid,
+                region = %region,
                 compliance_inquiry_id = %input.compliance_inquiry_id,
                 query_identifier = input.query_identifier,
                 response_revision_id = input.response_revision_id,
                 outcome = "refused",
                 reason = "the response version already carries feedback",
-                "refused a compliance inquiry feedback submission"
+                "state-changing operation"
             );
             return Err(PutComplianceInquiryFeedbackErrorModeled::ConflictException(
                 crate::state::feedback_already_submitted(&input.compliance_inquiry_id),
@@ -303,11 +357,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answer with another one's timestamp.
         if let Some(record) = &remembered {
             ::tracing::info!(
+                target: "emulator::audit",
                 operation = "PutComplianceInquiryFeedback",
+                akid = %akid,
+                region = %region,
                 compliance_inquiry_id = %input.compliance_inquiry_id,
+                query_identifier = input.query_identifier,
+                response_revision_id = input.response_revision_id,
                 outcome = "refused",
                 reason = "the clientToken was replayed on a different request",
-                "refused a compliance inquiry feedback submission"
+                "state-changing operation"
             );
             return Err(PutComplianceInquiryFeedbackErrorModeled::ConflictException(
                 crate::state::feedback_token_mismatch(&record.inquiry_id),
@@ -320,6 +379,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // submissions cannot grow the emulator's memory without end. Nothing is evicted — a
         // forgotten record would let a rated response version be rated again.
         if !inquiry.accepts_another_feedback() {
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "PutComplianceInquiryFeedback",
+                akid = %akid,
+                region = %region,
+                compliance_inquiry_id = %input.compliance_inquiry_id,
+                query_identifier = input.query_identifier,
+                response_revision_id = input.response_revision_id,
+                outcome = "refused",
+                reason = "the inquiry holds as many feedback records as it may",
+                "state-changing operation"
+            );
             return Err(PutComplianceInquiryFeedbackErrorModeled::ThrottlingException(
                 ThrottlingException {
                     message: format!(
@@ -354,17 +425,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Attributable: the inquiry rated, which query, and how. NEVER the `comment` —
-        // `@sensitive` in the model — nor the inquiry's name, content or queries.
+        // Attributable: the caller's access key id (a public identifier, never a secret),
+        // the scope's region, the inquiry rated, which query, and how. NEVER the `comment`
+        // — `@sensitive` in the model — nor the inquiry's name, content or queries.
         ::tracing::info!(
+            target: "emulator::audit",
             operation = "PutComplianceInquiryFeedback",
+            akid = %akid,
+            region = %region,
             compliance_inquiry_id = %input.compliance_inquiry_id,
             query_identifier = input.query_identifier,
             response_revision_id = input.response_revision_id,
             rating = %input.rating,
             reason_code_count,
             outcome = "recorded",
-            "recorded feedback on a compliance inquiry"
+            "state-changing operation"
         );
 
         Ok(PutComplianceInquiryFeedbackOutput {

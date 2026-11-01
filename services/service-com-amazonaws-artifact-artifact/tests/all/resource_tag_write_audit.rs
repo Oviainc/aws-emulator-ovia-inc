@@ -353,6 +353,10 @@ async fn every_tag_write_emits_exactly_one_attributable_audit_record() {
         "arn:aws:artifact:{REGION}:{}:compliance-inquiry/compliance-inquiry-0000000000000000",
         engine::emulator_account_id()
     );
+    // The fixture creates are state-changing calls of this suite's own, so each leaves an
+    // attributable record too (`inquiry_write_audit.rs` is what pins those). They are cleared
+    // once here, so from now on the capture holds exactly what the row under test left.
+    let _ = captured.drain_for(AUDIT_AKID);
 
     // The keys that fill a resource to the modelled ceiling, written in ONE call.
     let ceiling_tags: Vec<(String, String)> = (0..TAG_CEILING)

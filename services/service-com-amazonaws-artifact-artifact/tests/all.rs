@@ -57,6 +57,8 @@ mod inquiry_query_identifier_rules;
 mod inquiry_tags_reporting;
 #[path = "all/inquiry_terminal_status_rule.rs"]
 mod inquiry_terminal_status_rule;
+#[path = "all/inquiry_write_audit.rs"]
+mod inquiry_write_audit;
 #[path = "all/minted_store_ids.rs"]
 mod minted_store_ids;
 #[path = "all/pagination_page_walk.rs"]

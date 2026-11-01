@@ -62,6 +62,13 @@
 //!   no query, which is a limit of what can be REPORTED and not a processing failure, so
 //!   it leaves the inquiry's terminal status alone.
 //!
+//! The create persists a resource, so it is ATTRIBUTABLE on the same terms as this crate's
+//! other state changes: this handler leaves exactly one structured record naming the caller
+//! (the access-key id and the credential-scope region the request presented), what the call
+//! addressed and the outcome — on the refusal and replay paths as much as on the success one,
+//! since a state-changing call that changed nothing is still attributable. Never the
+//! inquiry's name or content, both `@sensitive` in the model.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -205,7 +212,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Nothing in the request metadata shapes the inquiry's content; the request's
+        // credential scope names the region the minted ARN lives in AND attributes the
+        // creation below, exactly as the account-wide write and the tag writes read it.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            // A state-changing call that changed nothing is still attributable, so the
+            // failure path records its outcome rather than passing silently.
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "CreateComplianceInquiry",
+                akid = %akid,
+                region = %region,
+                outcome = "unavailable",
+                "state-changing operation"
+            );
             return Err(CreateComplianceInquiryErrorModeled::InternalServerException(
                 InternalServerException {
                     message: "the artifact compliance inquiry store is unavailable".to_string(),
@@ -215,10 +238,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
         let content = content_record(input.inquiry_content);
+        // WHICH form the submission took, which is a label this API itself reports
+        // (`InquirySummary$inputSource`) and not caller content.
+        let input_source = content.input_source();
         // `supportMode` is "[o]nly supported for file upload mode. Defaults to AI_ONLY if
         // not specified." (`CreateComplianceInquiryRequest$supportMode`), so BOTH
         // sentences apply: a mode the submitted content cannot be processed under is
@@ -228,6 +253,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // mode is processed under the documented default.
         let support_mode = match input.support_mode {
             Some(mode) if !crate::state::support_mode_available_for(&mode, &content) => {
+                ::tracing::info!(
+                    target: "emulator::audit",
+                    operation = "CreateComplianceInquiry",
+                    akid = %akid,
+                    region = %region,
+                    input_source,
+                    outcome = "refused",
+                    reason = "supportMode is not available for the submitted content",
+                    "state-changing operation"
+                );
                 return Err(CreateComplianceInquiryErrorModeled::ValidationException(
                     crate::state::unsupported_support_mode(),
                 )
@@ -243,6 +278,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through this path either, so the inquiry is not minted and the request is refused
         // as a field validation failure naming the member that carried the key.
         if crate::state::reserved_tag_key(tags.keys().map(String::as_str)).is_some() {
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "CreateComplianceInquiry",
+                akid = %akid,
+                region = %region,
+                input_source,
+                outcome = "refused",
+                reason = "tags name a key in the reserved namespace",
+                "state-changing operation"
+            );
             return Err(CreateComplianceInquiryErrorModeled::ValidationException(
                 crate::state::reserved_tag_keys("tags"),
             )
@@ -259,6 +304,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             if let Some(record) = store.inquiry_create_tokens.get(token).cloned() {
                 if record.fingerprint != fingerprint {
+                    ::tracing::info!(
+                        target: "emulator::audit",
+                        operation = "CreateComplianceInquiry",
+                        akid = %akid,
+                        region = %region,
+                        input_source,
+                        outcome = "refused",
+                        reason = "the clientToken was replayed on a different request",
+                        "state-changing operation"
+                    );
                     return Err(CreateComplianceInquiryErrorModeled::ConflictException(
                         crate::state::inquiry_token_mismatch(&record.inquiry_id),
                     )
@@ -268,7 +323,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // A replay reports the inquiry as it stands now, including any
                     // transition the clock owed it since the first call.
                     inquiry.materialise(now);
-                    return Ok(created(inquiry));
+                    let response = created(inquiry);
+                    // The repeat is still a call on a state-changing operation, so it is
+                    // attributable: it created nothing further, which is its outcome.
+                    ::tracing::info!(
+                        target: "emulator::audit",
+                        operation = "CreateComplianceInquiry",
+                        akid = %akid,
+                        region = %region,
+                        compliance_inquiry_id = %record.inquiry_id,
+                        input_source,
+                        outcome = "replayed",
+                        "state-changing operation"
+                    );
+                    return Ok(response);
                 }
             }
         }
@@ -276,6 +344,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Residency bound: this store holds at most `INQUIRY_CAPACITY` inquiries, so
         // repeated creates cannot grow the emulator's memory without end.
         if !store.accepts_another_inquiry() {
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "CreateComplianceInquiry",
+                akid = %akid,
+                region = %region,
+                input_source,
+                outcome = "refused",
+                reason = "the account holds as many compliance inquiries as it may",
+                "state-changing operation"
+            );
             return Err(CreateComplianceInquiryErrorModeled::ThrottlingException(
                 ThrottlingException {
                     message: format!(
@@ -316,20 +394,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let response = created(&inquiry);
-        let input_source = inquiry.content.input_source();
         store.inquiries.insert(id.clone(), inquiry);
         if let Some(token) = input.client_token {
             store.record_inquiry_create(token, &id, &fingerprint);
         }
 
-        // Attributable: the resource created and how it was submitted. NEVER the
+        // Attributable: the caller's access key id (a public identifier, never a secret),
+        // the scope's region, the resource created and how it was submitted. NEVER the
         // inquiry's content or name — both are `@sensitive` in the model.
         ::tracing::info!(
+            target: "emulator::audit",
             operation = "CreateComplianceInquiry",
+            akid = %akid,
+            region = %region,
             compliance_inquiry_id = %id,
             input_source,
             outcome = "created",
-            "created a compliance inquiry"
+            "state-changing operation"
         );
 
         Ok(response)

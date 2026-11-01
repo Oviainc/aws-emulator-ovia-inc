@@ -29,6 +29,14 @@
 //! door's 401 `UnauthorizedException` (`crate::scaffolded::FrontDoorRefusal`) and never
 //! with the modelled 404 — and, as before, leaves no grant behind.
 //!
+//! Minting that grant persists a resource, so the call is ATTRIBUTABLE on the same terms as
+//! this crate's other state changes: this handler leaves exactly one structured record naming
+//! the caller (the access-key id and the credential-scope region the request presented), what
+//! the call addressed and the outcome — on the refusal paths as much as on the success one,
+//! since a state-changing call that changed nothing is still attributable. Never the
+//! `termToken` itself, nor the URL that carries it: the token is the receipt of this one
+//! acceptance.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -172,7 +180,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Nothing in the request metadata shapes the grant this mints; the request's
+        // credential scope names the endpoint's region AND attributes the acceptance below,
+        // exactly as the account-wide write and the tag writes read it.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            // A state-changing call that changed nothing is still attributable, so the
+            // failure path records its outcome rather than passing silently.
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "GetTermForReport",
+                akid = %akid,
+                region = %region,
+                report_id = %input.report_id,
+                report_version = input.report_version,
+                outcome = "unavailable",
+                "state-changing operation"
+            );
             return Err(GetTermForReportErrorModeled::InternalServerException(
                 InternalServerException {
                     message: "the artifact report catalog is unavailable".to_string(),
@@ -193,11 +219,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request that resolves no report version gets is the service's one rule, decided
         // in `crate::state`; this handler only lifts it into its own modelled not-found
         // variant.
-        let (report, version) = store
-            .report_version(&input.report_id, input.report_version)
-            .map_err(|refusal| {
-                refusal.lift(GetTermForReportErrorModeled::ResourceNotFoundException)
-            })?;
+        let (report, version) = match store.report_version(&input.report_id, input.report_version)
+        {
+            Ok(resolved) => resolved,
+            Err(refusal) => {
+                // WHY nothing was minted: a report the catalog does not hold, or a version
+                // a reachable report never published — the one distinction
+                // [`crate::state::ReportRefusal`] draws.
+                let reason = match &refusal {
+                    crate::state::ReportRefusal::FrontDoor(_) => {
+                        "reportId names no report this account holds"
+                    }
+                    crate::state::ReportRefusal::VersionNotFound(_) => {
+                        "the report never published the version asked for"
+                    }
+                };
+                ::tracing::info!(
+                    target: "emulator::audit",
+                    operation = "GetTermForReport",
+                    akid = %akid,
+                    region = %region,
+                    report_id = %input.report_id,
+                    report_version = input.report_version,
+                    outcome = "refused",
+                    reason,
+                    "state-changing operation"
+                );
+                return Err(
+                    refusal.lift(GetTermForReportErrorModeled::ResourceNotFoundException)
+                );
+            }
+        };
         let resolved_version = version.version;
         let report = report.clone();
 
@@ -205,14 +257,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let document_presigned_url =
             crate::state::term_document_url(&host, &report, resolved_version, &term_token);
 
-        // The acceptance is a state change, so it is attributable: the report version
-        // accepted, never the token itself.
+        // The acceptance is a state change, so it is attributable: the caller's access key
+        // id (a public identifier, never a secret), the scope's region and the report
+        // version accepted — never the token itself.
         ::tracing::info!(
+            target: "emulator::audit",
             operation = "GetTermForReport",
+            akid = %akid,
+            region = %region,
             report_id = %report.id,
             report_version = resolved_version,
             outcome = "issued",
-            "issued a term grant"
+            "state-changing operation"
         );
 
         Ok(GetTermForReportOutput {
