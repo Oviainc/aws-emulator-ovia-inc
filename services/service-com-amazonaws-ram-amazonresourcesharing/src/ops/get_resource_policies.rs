@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the resource-based policy documents [`crate::state`] holds for the shared
+//! resources a request names, one `@paginated` page at a time, and refuses a resource
+//! no live share of this account shares.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read: the only thing it writes is the association move the clock already owed,
+//! which is due whether or not anybody calls — and which is what decides whether a
+//! share still shares a resource.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +172,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicies"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetResourcePoliciesErrorModeled::ServerInternalException(ServerInternalException {
+                message: "the resource share store is unavailable".to_string(),
+            })
+        })?;
+
+        // The number of resources one call may ask about is bounded, so a request
+        // cannot make this read walk a list of its own choosing: the same cap this
+        // service puts on the entities one call names, rendered as the plain
+        // parameter refusal this operation models.
+        if let Some(why) =
+            crate::state::entity_count_rejection("resourceArns", input.resource_arns.len())
+        {
+            return Err(GetResourcePoliciesErrorModeled::InvalidParameterException(
+                InvalidParameterException { message: why },
+            )
+            .into());
+        }
+
+        // The resources this read is about, in the order the request named them and
+        // each of them once: naming a resource twice asks about one resource.
+        let mut seen = ::std::collections::BTreeSet::new();
+        let resources: Vec<String> = input
+            .resource_arns
+            .iter()
+            .filter(|arn| seen.insert(arn.as_str()))
+            .cloned()
+            .collect();
+
+        // The model constrains neither member, so both rules are applied here, each
+        // rendered as the modelled error RAM words that refusal with.
+        if resources.is_empty() {
+            return Err(GetResourcePoliciesErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: "resourceArns must name at least one resource".to_string(),
+                },
+            )
+            .into());
+        }
+        if let Some(why) = crate::state::resource_arn_rejection("resourceArns", &resources) {
+            return Err(GetResourcePoliciesErrorModeled::MalformedArnException(
+                MalformedArnException { message: why },
+            )
+            .into());
+        }
+        if let Some(why) = input
+            .principal
+            .as_ref()
+            .map(::std::slice::from_ref)
+            .and_then(|principal| crate::state::entity_value_rejection("principal", principal))
+        {
+            return Err(GetResourcePoliciesErrorModeled::InvalidParameterException(
+                InvalidParameterException { message: why },
+            )
+            .into());
+        }
+
+        // A `nextToken` names the resource the next page starts at, which is one of
+        // the resources THIS request names: a token issued for another resource list
+        // is not a token for this read.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_resource_cursor(token)
+                .and_then(|arn| resources.iter().position(|resource| *resource == arn))
+                .ok_or_else(|| {
+                    GetResourcePoliciesErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: "nextToken is not a pagination token issued by \
+                                      GetResourcePolicies for these resources"
+                                .to_string(),
+                        },
+                    )
+                })?,
+        };
+        let page_size = crate::state::page_size(input.max_results);
+
+        let mut store = state.lock();
+        let now = store.tick();
+        // A teardown the clock already owed has stopped a share sharing its resource
+        // whether or not anybody asked, so what is due is materialised before this
+        // read decides which resources are shared.
+        store.settle_due_associations(now);
+
+        // Every resource the request names has to be one this account shares, not
+        // only the ones this page reports: the request is refused over a resource
+        // that cannot be placed, whichever page it would have fallen on.
+        let mut per_resource: Vec<Vec<String>> = Vec::new();
+        for resource_arn in &resources {
+            per_resource.push(
+                store
+                    .resource_policies(resource_arn, input.principal.as_deref())
+                    .ok_or_else(|| {
+                        GetResourcePoliciesErrorModeled::ResourceArnNotFoundException(
+                            ResourceArnNotFoundException {
+                                message: crate::state::unknown_resource_arn_message(resource_arn),
+                            },
+                        )
+                    })?,
+            );
+        }
+
+        let mut policies: Vec<String> = Vec::new();
+        let mut next_token = None;
+        for (index, documents) in per_resource.into_iter().enumerate().skip(start) {
+            // The first resource whose documents no longer fit becomes the next
+            // page's start, and only then is a `nextToken` reported. A resource's own
+            // documents are never split across pages, so one resource holding more of
+            // them than a page reports them together.
+            if !policies.is_empty() && policies.len() + documents.len() > page_size {
+                next_token = Some(crate::state::encode_arn_cursor(&resources[index]));
+                break;
+            }
+            policies.extend(documents);
+        }
+
+        Ok(GetResourcePoliciesOutput {
+            // A resource with no policy document reports an empty list, so a caller
+            // can tell "no policies" from "policies not reported".
+            policies: Some(policies),
+            next_token,
+        })
     }
 }

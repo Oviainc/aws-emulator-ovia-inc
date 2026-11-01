@@ -19,6 +19,8 @@ mod invitation_reads;
 mod mutation_reports;
 #[path = "all/pending_invitation_resources.rs"]
 mod pending_invitation_resources;
+#[path = "all/resource_policies.rs"]
+mod resource_policies;
 #[path = "all/resource_shares.rs"]
 mod resource_shares;
 #[path = "all/response_payload_fidelity.rs"]

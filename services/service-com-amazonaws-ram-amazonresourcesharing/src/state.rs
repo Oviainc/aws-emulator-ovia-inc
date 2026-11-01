@@ -271,6 +271,23 @@ pub const MAX_PAGE_SIZE: usize = 500;
 /// The tag-key prefix AWS reserves for its own tags; a caller may not set one.
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// The IAM policy language version an instantiated resource policy is written in:
+/// the current one, which the policies RAM writes today carry.
+pub const POLICY_LANGUAGE_VERSION: &str = "2012-10-17";
+
+/// The `Effect` an instantiated resource policy's statement carries.
+///
+/// The statement RAM instantiates is a managed permission's template, whose
+/// "Effect: must be set to ALLOW" (`CreatePermission$policyTemplate`'s own
+/// documentation), so a share's statement only ever allows.
+pub const POLICY_EFFECT_ALLOW: &str = "Allow";
+
+/// The action part of an instantiated statement's `Action`: every action of the
+/// service namespace the statement names. The statement names a namespace rather
+/// than a list of actions because this service holds no managed permission to read
+/// an action list from; `instantiated_policy` says so where it builds the document.
+pub const POLICY_ACTION_WILDCARD: &str = "*";
+
 /// Separates the fields of a composite page cursor or fingerprint input. A control
 /// character, so it cannot occur inside an ARN, a name or a principal id.
 const FIELD_SEPARATOR: char = '\u{1}';
@@ -613,6 +630,137 @@ impl ComAmazonawsRamAmazonresourcesharingState {
             .count()
     }
 
+    /// Whether the share `share_arn` currently associates `entity` under
+    /// `association_type`: the association exists and is on the attach path
+    /// ([`association_is_attaching`]).
+    pub fn associates(&self, share_arn: &str, association_type: &str, entity: &str) -> bool {
+        self.associations
+            .get(&(
+                share_arn.to_string(),
+                association_type.to_string(),
+                entity.to_string(),
+            ))
+            .is_some_and(|record| association_is_attaching(&record.status))
+    }
+
+    /// Every live share that currently shares the resource `resource_arn`, in share
+    /// ARN order.
+    ///
+    /// A share shares a resource while its resource association is on the attach
+    /// path ([`association_is_attaching`]). An association that was torn down shares
+    /// nothing, and neither does a share `DeleteResourceShare` has removed, so
+    /// neither is reported.
+    pub fn shares_sharing_resource(&self, resource_arn: &str) -> Vec<&ShareRecord> {
+        self.associations
+            .values()
+            .filter(|record| {
+                record.association_type == ASSOCIATION_TYPE_RESOURCE
+                    && record.associated_entity == resource_arn
+                    && association_is_attaching(&record.status)
+            })
+            .filter_map(|record| self.live_share(&record.resource_share_arn))
+            .collect()
+    }
+
+    /// The resource-based policy documents to report for the shared resource
+    /// `resource_arn`, narrowed to the shares that share it with `principal` when a
+    /// read names one — or `None` when no live share shares that resource at all,
+    /// which is the case a read refuses: policies are reported only for the
+    /// resources the caller "own[s] and ha[s] shared".
+    ///
+    /// RAM keeps no policy document of its own. One document per share that shares
+    /// the resource, in share ARN order: RAM instantiates the policy on each shared
+    /// resource from the share that shares it ([`Self::instantiated_policy`]), so a
+    /// resource two shares share carries one document from each, and a share that
+    /// grants no identity outside the owner's organization contributes none.
+    pub fn resource_policies(
+        &self,
+        resource_arn: &str,
+        principal: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let shares = self.shares_sharing_resource(resource_arn);
+        if shares.is_empty() {
+            return None;
+        }
+        Some(
+            shares
+                .into_iter()
+                .filter(|share| {
+                    // A read that names a principal asks for the policy that
+                    // principal has on the resource, so only a share that shares the
+                    // resource WITH it can contribute one.
+                    principal.is_none_or(|principal| {
+                        self.associates(&share.arn, ASSOCIATION_TYPE_PRINCIPAL, principal)
+                    })
+                })
+                .filter_map(|share| self.instantiated_policy(share, resource_arn))
+                .collect(),
+        )
+    }
+
+    /// The document the managed permission attached to `share` instantiates on the
+    /// resource `resource_arn`, or `None` when the share names no identity that a
+    /// resource policy has to grant.
+    ///
+    /// RAM keeps no policy document of its own: the policy on a shared resource is
+    /// the INSTANTIATION of the managed permission attached to the share, and RAM
+    /// fills in the two elements the permission's template may not carry —
+    /// `Resource` "comes from the ARN of the specific resource that you are sharing"
+    /// and `Principal` "comes from the list of identities added to the resource
+    /// share" (`CreatePermission$policyTemplate`'s own documentation), the template
+    /// supplying the allow `Effect` and the actions.
+    ///
+    /// Only an identity OUTSIDE the owning account's organization needs such a
+    /// grant: one inside it reaches the resource through Organizations, so a share
+    /// that adds none leaves its resources carrying no policy at all — which is what
+    /// a share without an external principal reports.
+    ///
+    /// The statement's actions are the ones the managed permission allows. This
+    /// service stores the ARNs of a share's permissions and nothing about the
+    /// permissions themselves, so the statement names the service namespace those
+    /// actions are drawn from — the shared resource's own, read off its ARN — rather
+    /// than a list of actions nothing told it about.
+    fn instantiated_policy(&self, share: &ShareRecord, resource_arn: &str) -> Option<String> {
+        let principals = self.external_principals(&share.arn);
+        if principals.is_empty() {
+            return None;
+        }
+        let service = arn_service(resource_arn)?;
+        Some(
+            ::serde_json::json!({
+                "Version": POLICY_LANGUAGE_VERSION,
+                "Statement": [{
+                    "Effect": POLICY_EFFECT_ALLOW,
+                    "Principal": {"AWS": principals},
+                    "Action": format!("{service}:{POLICY_ACTION_WILDCARD}"),
+                    "Resource": resource_arn,
+                }],
+            })
+            .to_string(),
+        )
+    }
+
+    /// The identities outside the owning account's organization that the share
+    /// `share_arn` is shared with, in association order and each of them once.
+    ///
+    /// `ResourceShareAssociation$external` "indicates whether the principal belongs
+    /// to the same organization in Organizations as the Amazon Web Services account
+    /// that owns the resource share", and [`entity_is_external`] is what decided it
+    /// when the association was stored, so this reads the stored flag rather than
+    /// deciding it again.
+    pub fn external_principals(&self, share_arn: &str) -> Vec<String> {
+        self.associations
+            .values()
+            .filter(|record| {
+                record.resource_share_arn == share_arn
+                    && record.association_type == ASSOCIATION_TYPE_PRINCIPAL
+                    && record.external
+                    && association_is_attaching(&record.status)
+            })
+            .map(|record| record.associated_entity.clone())
+            .collect()
+    }
+
     /// Associate `entity` with the share under `association_type`, returning the
     /// record as it now stands.
     ///
@@ -642,10 +790,7 @@ impl ComAmazonawsRamAmazonresourcesharingState {
             association_type.to_string(),
             entity.to_string(),
         );
-        let attaching = |record: &AssociationRecord| {
-            record.status == ASSOCIATION_STATUS_ASSOCIATING
-                || record.status == ASSOCIATION_STATUS_ASSOCIATED
-        };
+        let attaching = |record: &AssociationRecord| association_is_attaching(&record.status);
         // Whether THIS call is what starts the attach, which is what decides whether
         // a principal is being invited now or was already on its way in.
         let started = self
@@ -979,6 +1124,16 @@ pub fn unknown_share_message(arn: &str) -> String {
     format!("ResourceShare {arn} could not be found.")
 }
 
+/// The message of the `ResourceArnNotFoundException` a read of a resource's policies
+/// renders when no live share of this account shares the resource the ARN names.
+///
+/// Worded like [`unknown_share_message`]: the error code says what is wrong with the
+/// ARN and the message says which resource it was, so a caller can read the ARN it
+/// named back out of the message.
+pub fn unknown_resource_arn_message(arn: &str) -> String {
+    format!("Resource {arn} could not be found.")
+}
+
 /// The message RAM reports with every error that refuses a
 /// `resourceShareInvitationArn`: the ARN itself.
 ///
@@ -1078,6 +1233,19 @@ pub fn resource_view(record: &AssociationRecord) -> Resource {
 pub fn associating_status_message(association_type: &str) -> Option<&'static str> {
     (association_type == ASSOCIATION_TYPE_PRINCIPAL)
         .then_some(ASSOCIATING_PRINCIPAL_STATUS_MESSAGE)
+}
+
+/// Whether an association status is one on the ATTACH path: the association is being
+/// made (`ASSOCIATING`) or has been made (`ASSOCIATED`).
+///
+/// This is what "the share shares this entity" means: an association that was torn
+/// down (`DISASSOCIATING`, `DISASSOCIATED`) or that failed shares nothing, and
+/// re-associating an entity on this path changes nothing.
+pub fn association_is_attaching(status: &str) -> bool {
+    matches!(
+        status,
+        ASSOCIATION_STATUS_ASSOCIATING | ASSOCIATION_STATUS_ASSOCIATED
+    )
 }
 
 /// Whether an association status is TERMINAL: one no further move is owed from.
@@ -1428,13 +1596,16 @@ pub fn not_an_arn_message(member: &str, value: &str) -> String {
     )
 }
 
-/// Why a list of entities to associate is too long for one call, or `None`.
+/// Why a list of entities one call names is too long for it, or `None`.
 ///
-/// Rendered as `ResourceShareLimitExceededException`.
+/// One template for every member that takes a list of entities, whichever modelled
+/// error the operation renders it as: `ResourceShareLimitExceededException` where a
+/// mutation refuses the list it was asked to associate, and
+/// `InvalidParameterException` where a read refuses the list it was asked about.
 pub fn entity_count_rejection(member: &str, count: usize) -> Option<String> {
     (count > MAX_ENTITIES_PER_CALL).then(|| {
         format!(
-            "{member} names {count} entities, more than the {MAX_ENTITIES_PER_CALL} this service associates in one call"
+            "{member} names {count} entities, more than the {MAX_ENTITIES_PER_CALL} this service accepts in one call"
         )
     })
 }
@@ -1497,11 +1668,15 @@ pub fn page_size(max_results: Option<i32>) -> usize {
     })
 }
 
-/// A `nextToken` naming the resource share the next page starts at.
+/// A `nextToken` naming the ARN the next page starts at: a resource share, an
+/// invitation or a shared resource, whichever that read pages over.
 ///
 /// `nextToken` is modelled opaque, so the ARN is hex-encoded rather than handed
-/// back in the clear — opaque to a caller, not secret.
-pub fn encode_share_cursor(arn: &str) -> String {
+/// back in the clear — opaque to a caller, not secret. One encoder serves every
+/// read that pages over an ARN; what differs between them is which ARN a token is
+/// allowed to name, which is the decoder's job ([`decode_share_cursor`],
+/// [`decode_invitation_cursor`], [`decode_resource_cursor`]).
+pub fn encode_arn_cursor(arn: &str) -> String {
     hex::encode(arn)
 }
 
@@ -1544,9 +1719,10 @@ pub fn decode_association_cursor(token: &str) -> Option<AssociationKey> {
     ))
 }
 
-/// A `nextToken` naming the invitation the next page starts at.
-pub fn encode_invitation_cursor(arn: &str) -> String {
-    hex::encode(arn)
+/// The resource ARN a `nextToken` names, or `None` when the token is not one this
+/// service issued — the `InvalidNextTokenException` case.
+pub fn decode_resource_cursor(token: &str) -> Option<String> {
+    decode_cursor(token).filter(|arn| is_arn(arn))
 }
 
 /// The invitation ARN a `nextToken` names, or `None` when the token is not one this

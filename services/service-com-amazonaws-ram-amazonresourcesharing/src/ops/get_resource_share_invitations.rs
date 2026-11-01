@@ -282,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The first invitation that does not fit becomes the next page's start,
             // and only then is a `nextToken` emitted.
             if resource_share_invitations.len() == page_size {
-                next_token = Some(crate::state::encode_invitation_cursor(arn));
+                next_token = Some(crate::state::encode_arn_cursor(arn));
                 break;
             }
             resource_share_invitations.push(invitation.view());

@@ -315,7 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The first share that does not fit becomes the next page's start, and
             // only then is a `nextToken` emitted - the last page carries none.
             if resource_shares.len() == page_size {
-                next_token = Some(crate::state::encode_share_cursor(arn));
+                next_token = Some(crate::state::encode_arn_cursor(arn));
                 break;
             }
             resource_shares.push(share.view());
