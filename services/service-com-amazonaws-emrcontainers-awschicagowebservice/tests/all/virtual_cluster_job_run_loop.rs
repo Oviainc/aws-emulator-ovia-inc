@@ -875,8 +875,8 @@ async fn an_unresolvable_resource_is_refused_with_the_modelled_error() {
             .refused(label, 400, "ResourceNotFoundException");
     }
 
-    // DescribeVirtualCluster models not-found; Delete and Cancel and List do not, so
-    // they refuse an unresolvable id as an invalid request.
+    // DescribeVirtualCluster models not-found; Delete and Cancel do not, so they refuse
+    // an unresolvable id as an invalid request.
     emr.describe_cluster("doesnotexist1")
         .await
         .refused("describing an unknown cluster", 400, "ResourceNotFoundException");
@@ -889,9 +889,18 @@ async fn an_unresolvable_resource_is_refused_with_the_modelled_error() {
     emr.cancel_job(&other, &job)
         .await
         .refused("cancelling a run under the wrong cluster", 400, "ValidationException");
-    emr.list_jobs("doesnotexist1", "")
-        .await
-        .refused("listing an unknown cluster", 400, "ValidationException");
+    // ListJobRuns resolves no resource at all: the cluster id SCOPES its collection, so an
+    // id naming no cluster selects no run and the listing answers an empty page
+    // (`crate::cluster_scoped_listing_scope` holds that rule over both cluster-scoped
+    // listings).
+    let case = "listing an unknown cluster";
+    let listed = emr.list_jobs("doesnotexist1", "").await;
+    assert_eq!(
+        listed.ok(case).pointer("/jobRuns").and_then(Value::as_array),
+        Some(&Vec::new()),
+        "case {case:?}: expected an empty page, got {}",
+        listed.body
+    );
 }
 
 /// RULE 5: `ListJobRuns` pages the runs this cluster actually holds, newest first, with

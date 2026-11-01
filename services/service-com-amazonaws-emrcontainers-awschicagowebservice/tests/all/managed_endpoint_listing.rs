@@ -828,13 +828,19 @@ async fn unanswerable_managed_endpoint_requests_are_refused() {
     let other = emr.cluster("endpoint-refusals-2", "vc-ep-refusals-2").await;
     let stored = create_many(&emr, &cluster, "JUPYTER_ENTERPRISE_GATEWAY", "refuse", 2).await;
 
-    // A cluster this store does not hold cannot be listed: `ListManagedEndpoints` models
-    // no not-found error, so it is refused as an invalid request.
-    list_endpoints(&emr, "nosuchcluster", "")
-        .await
-        .refused("listing an unknown virtual cluster", 400, "ValidationException");
-    // The same cluster cannot host an endpoint either — and THAT operation models the
-    // not-found error, so it uses it.
+    // A cluster this store does not hold SCOPES the listing to no endpoint rather than
+    // making the request an error, so it answers an empty page — the rule
+    // `crate::cluster_scoped_listing_scope` holds over both cluster-scoped listings.
+    let unknown = list_endpoints(&emr, "nosuchcluster", "").await;
+    assert_eq!(
+        listed(unknown.ok("listing an unknown virtual cluster"), "listing an unknown virtual cluster"),
+        Vec::<Value>::new(),
+        "case {:?}: expected an empty page, got {}",
+        "listing an unknown virtual cluster",
+        unknown.body
+    );
+    // That same cluster cannot host an endpoint — and THAT operation models the not-found
+    // error, so it uses it.
     create_endpoint(
         &emr,
         "nosuchcluster",

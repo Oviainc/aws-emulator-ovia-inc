@@ -17,14 +17,17 @@
 //!
 //! The tables span what that rule generalises over: which resource is missing (a virtual
 //! cluster, a job run, a managed endpoint, a job template, a security configuration),
-//! which operation reports it (a read, a write, a delete, a list, a create that resolves a
+//! which operation reports it (a read, a write, a delete, a create that resolves a
 //! reference), how the request named it (a bare id, the resource's own ARN, an ARN in a
 //! tagging call), and the form of the identifier (both published length bounds of
 //! `ResourceIdString`, an all-digit value, a plausible minted one, and the id of a resource
 //! that was deleted).
 //!
 //! It also pins the rule's BOUNDARY: a resource that exists but cannot take the request is
-//! not reported as one that does not exist.
+//! not reported as one that does not exist. An operation that resolves NO resource is
+//! outside the rule altogether — the two listings scoped to a virtual cluster by a path
+//! label answer an empty page for an id that names none, which
+//! [`crate::cluster_scoped_listing_scope`] holds.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_emrcontainers_awschicagowebservice::state;
@@ -131,6 +134,9 @@ fn session_body() -> Value {
 /// that resolve a job run or a managed endpoint UNDER the `host` cluster that really
 /// exists, and the ones that resolve a job template or a security configuration a request
 /// references.
+///
+/// A listing whose path label SCOPES its collection resolves no resource, so it is not one
+/// of these: see the module docs.
 fn probes_for(absent: &str, label: &str, host: &str, index: usize) -> Vec<Probe> {
     vec![
         probe(
@@ -157,24 +163,6 @@ fn probes_for(absent: &str, label: &str, host: &str, index: usize) -> Vec<Probe>
             absent,
             "DELETE",
             format!("/virtualclusters/{absent}"),
-            None,
-            INVALID_REQUEST,
-        ),
-        probe(
-            format!("ListJobRuns, {label}"),
-            VIRTUAL_CLUSTER,
-            absent,
-            "GET",
-            format!("/virtualclusters/{absent}/jobruns"),
-            None,
-            INVALID_REQUEST,
-        ),
-        probe(
-            format!("ListManagedEndpoints, {label}"),
-            VIRTUAL_CLUSTER,
-            absent,
-            "GET",
-            format!("/virtualclusters/{absent}/endpoints"),
             None,
             INVALID_REQUEST,
         ),
@@ -320,8 +308,8 @@ async fn an_absent_resource_is_refused_with_the_services_one_not_found_message()
         }
     }
 
-    // None of the refusals touched the store: the host cluster still reads back, and the
-    // listings that were refused for an absent cluster answer for this one.
+    // None of the refusals touched the store: the host cluster still reads back, and its
+    // own listing answers for it.
     let described = emr.describe_cluster(&host).await;
     assert_eq!(
         text(described.ok("the host cluster"), "/virtualCluster/id", "the host cluster"),

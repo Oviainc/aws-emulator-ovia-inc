@@ -316,9 +316,9 @@ fn listed_ids(body: &Value, pointer: &str, case: &str) -> Vec<String> {
 
 /// RULE, listing: a listing reports the resources of the region it is signed for and no
 /// others, so two regions holding resources of the same class answer disjoint sets; and a
-/// listing scoped to a virtual cluster of another region refuses the request with the
-/// modelled `ValidationException` (HTTP 400), because that cluster does not exist at this
-/// endpoint.
+/// listing scoped to a virtual cluster of another region selects none of that cluster's
+/// records here, so it answers an empty page — the cluster id scopes the collection and
+/// resolves no resource ([`crate::cluster_scoped_listing_scope`]).
 #[tokio::test]
 async fn a_listing_reports_only_the_resources_of_the_region_it_is_signed_for() {
     for (home, other) in REGION_PAIRS {
@@ -362,8 +362,8 @@ async fn a_listing_reports_only_the_resources_of_the_region_it_is_signed_for() {
             );
         }
 
-        // The listings scoped to a virtual cluster: the cluster itself has to exist in the
-        // region the request is signed for.
+        // The listings scoped to a virtual cluster: the records a cluster holds are the
+        // ones of the region the request is signed for, and no others.
         let nested = [
             ("ListJobRuns", "jobruns", "/jobRuns", here.job_run.clone()),
             (
@@ -383,9 +383,13 @@ async fn a_listing_reports_only_the_resources_of_the_region_it_is_signed_for() {
                 "case {label:?}: {home} must list the cluster's own record"
             );
 
-            emr.send_in(other, "GET", &path, None)
-                .await
-                .refused(&label, 400, "ValidationException");
+            let at_other = emr.send_in(other, "GET", &path, None).await;
+            let crossed = listed_ids(at_other.ok(&label), pointer, &label);
+            assert!(
+                crossed.is_empty(),
+                "case {label:?}: {other} must report no record of a {home} cluster, got \
+                 {crossed:?}"
+            );
         }
     }
 }

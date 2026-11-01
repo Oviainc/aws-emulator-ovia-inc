@@ -7,6 +7,10 @@
 //! `@paginated` (`maxResults` + `nextToken`), and filtered by `states`, `types` and the
 //! `createdAfter` / `createdBefore` bounds; a filter the request omits constrains nothing.
 //!
+//! The `virtualClusterId` path label SCOPES that collection rather than naming a resource
+//! the request asks for, so a well-formed id this endpoint holds no cluster for lists
+//! nothing: the answer is the ordinary page with an empty `endpoints`, not a refusal.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -189,27 +193,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // CREATING -> ACTIVE step was due at that instant whether or not anybody listed.
         state.settle();
 
-        // This operation models no not-found error, so an unknown virtual cluster is
-        // refused as an invalid request. A cluster that exists in any state still lists
-        // its endpoints, including a terminated one — but only at the endpoint of the
-        // region it was created in.
-        if state
-            .virtual_cluster(&region, &input.virtual_cluster_id)
-            .is_none()
-        {
-            return Err(ListManagedEndpointsErrorModeled::ValidationException(
-                ValidationException {
-                    // This service's wording for a missing resource reported in THIS error
-                    // class ([`crate::state::ResourceKind`]), about the requested cluster.
-                    message: Some(
-                        crate::state::ResourceKind::VirtualCluster
-                            .validation_not_found_message(&input.virtual_cluster_id),
-                    ),
-                },
-            )
-            .into());
-        }
-
+        // The `virtualClusterId` path label SCOPES the collection this listing reports; it
+        // is not a resource the request asks for, and this operation binds no not-found
+        // error, so resolving it never gates the answer: an id that names no cluster at
+        // this endpoint scopes the listing to no records and the ordinary page comes back
+        // empty. The records are read through the one place that knows which endpoints a
+        // cluster holds in this region
+        // ([`crate::state::ComAmazonawsEmrcontainersAwschicagowebserviceState::cluster_managed_endpoints`]),
+        // which reports none for an id nothing is stored under — so a cluster that exists
+        // in any state, a terminated one included, still lists its own endpoints, and
+        // another region's cluster id lists nothing here. The label's own `@length` /
+        // `@pattern` constraint is enforced before `handle` runs, so an id the model does
+        // not admit is still refused.
+        //
         // The page itself — the `maxResults` bound, the newest-first order, the cursor
         // position and the `nextToken` — is the one rule every paginated list in this
         // service shares ([`crate::state::page_of`]), applied here to the endpoints this
