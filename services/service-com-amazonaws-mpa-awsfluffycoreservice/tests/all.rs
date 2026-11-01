@@ -85,6 +85,8 @@ mod rejection_wording;
 mod reserved_tag_namespace;
 #[path = "all/resource_arn_reads.rs"]
 mod resource_arn_reads;
+#[path = "all/resource_scoped_listing_refusal_order.rs"]
+mod resource_scoped_listing_refusal_order;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/resource_tags.rs"]

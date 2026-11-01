@@ -37,7 +37,7 @@ const NARROWEST_PAGE: i64 = 1;
 
 /// `MaxResults`' modelled maximum, which is also its modelled `default`: wide enough that
 /// one page reports every record each fixture below holds.
-const WIDEST_PAGE: i64 = 20;
+pub(crate) const WIDEST_PAGE: i64 = 20;
 
 /// How many records each per-resource fixture holds, so every listing hands out a token
 /// and has a record left after the one its first page reports.
@@ -45,7 +45,7 @@ const RECORDS: usize = 3;
 
 /// Which operation a row drives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     ApprovalTeams,
     IdentitySources,
     Sessions,
@@ -56,17 +56,17 @@ enum Kind {
 
 /// One listing CALL: the operation, and the resource it pages over where it pages over
 /// one.
-struct Listing {
-    kind: Kind,
+pub(crate) struct Listing {
+    pub(crate) kind: Kind,
     /// The resource whose records are paged: the team for `ListSessions`, the resource
     /// for `ListResourcePolicies`, the policy for `ListPolicyVersions`. Empty for the
     /// listings that name no resource.
-    scope_arn: String,
+    pub(crate) scope_arn: String,
 }
 
 impl Listing {
     /// The operation and resource this listing is, for an assertion message.
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self.kind {
             Kind::ApprovalTeams => "ListApprovalTeams".to_string(),
             Kind::IdentitySources => "ListIdentitySources".to_string(),
@@ -78,7 +78,7 @@ impl Listing {
     }
 
     /// The output member the page's records live in.
-    fn member(&self) -> &'static str {
+    pub(crate) fn member(&self) -> &'static str {
         match self.kind {
             Kind::ApprovalTeams => "ApprovalTeams",
             Kind::IdentitySources => "IdentitySources",
@@ -107,7 +107,7 @@ impl Listing {
     }
 
     /// This listing, as the token grammar names it.
-    fn token_listing(&self) -> state::Listing<'_> {
+    pub(crate) fn token_listing(&self) -> state::Listing<'_> {
         match self.kind {
             Kind::ApprovalTeams => state::Listing::ApprovalTeams,
             Kind::IdentitySources => state::Listing::IdentitySources,
@@ -126,7 +126,12 @@ impl Listing {
 
     /// One page, with `MaxResults` and `NextToken` bound the way this operation binds
     /// them: to the query string, except `ListSessions`, which binds them to the body.
-    async fn page(&self, harness: &Harness, max_results: i64, token: Option<&str>) -> (u16, Value) {
+    pub(crate) async fn page(
+        &self,
+        harness: &Harness,
+        max_results: i64,
+        token: Option<&str>,
+    ) -> (u16, Value) {
         let label = encode_label(&self.scope_arn);
         let mut query = format!("MaxResults={max_results}");
         if let Some(next) = token {
@@ -179,7 +184,7 @@ impl Listing {
     }
 
     /// The records one page reports, by identity.
-    fn reported(&self, page: &Value) -> Vec<String> {
+    pub(crate) fn reported(&self, page: &Value) -> Vec<String> {
         page.get(self.member())
             .and_then(Value::as_array)
             .cloned()
@@ -240,7 +245,7 @@ impl Listing {
 ///
 /// The bare decimal rows are what a client that counted records — or that replayed a
 /// token of an emulator which handed its positions out in the clear — would send.
-fn never_a_token() -> Vec<(&'static str, String)> {
+pub(crate) fn never_a_token() -> Vec<(&'static str, String)> {
     vec![
         ("text that is no token at all", "not-a-token".to_string()),
         ("a bare position", "1".to_string()),
@@ -400,7 +405,7 @@ async fn fixtures() -> (Harness, Vec<Listing>) {
 
 /// The refusal every token that was never handed out earns: 400 `ValidationException`
 /// with the one sentence this service states for the class.
-fn assert_refused(case: &str, status: u16, body: &Value) {
+pub(crate) fn assert_refused(case: &str, status: u16, body: &Value) {
     assert_eq!(
         status, 400,
         "case {case:?}: a token this listing did not hand out must be refused, got {status} \

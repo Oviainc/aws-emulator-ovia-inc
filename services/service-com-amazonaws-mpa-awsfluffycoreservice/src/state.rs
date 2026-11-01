@@ -606,6 +606,30 @@ pub fn token_position(
     }
 }
 
+/// The ordering key `listing` resumes AFTER, read out of the request's `NextToken` in the
+/// type the store's map is keyed by — `None` when the request carries no token: [`token_key`]
+/// parsed as that key, the counterpart of [`token_position`] for a listing that pages over a
+/// key the store orders by.
+///
+/// This is the GRAMMAR half of the token rule, and it needs none of the records: a token
+/// naming another listing (or the same listing of another resource), and one whose key is
+/// not a key of this map's type at all, is refused with [`foreign_next_token`] here. That
+/// the key was also HANDED OUT is decided against the records themselves, by
+/// [`page_after_key`]. So a listing scoped to one named resource can read its token with
+/// the rest of the request's shape, before it decides whether that resource exists.
+pub fn token_map_key<K>(
+    listing: Listing<'_>,
+    next_token: Option<&str>,
+) -> Result<Option<K>, ValidationException>
+where
+    K: ::std::str::FromStr,
+{
+    match token_key(listing, next_token)? {
+        None => Ok(None),
+        Some(key) => key.parse::<K>().map(Some).map_err(|_| foreign_next_token()),
+    }
+}
+
 /// One page cut out of `ordered`, and the token for the page after it.
 ///
 /// This is the ONE place a page of this service is CUT, so the slice width and the
@@ -815,9 +839,9 @@ where
 }
 
 /// One page of `ordered`, the page width and the resume key read off the request's
-/// `MaxResults` and `NextToken`: [`token_key`] then [`page_after_key`], the whole
+/// `MaxResults` and `NextToken`: [`token_map_key`] then [`page_after_key`], the whole
 /// key-token paging rule in one call for a listing that pages over a key the store
-/// orders by.
+/// orders by and decides nothing between reading the token and cutting the page.
 ///
 /// The key is read back in the type the map is keyed by, so a token whose key is not a
 /// key of this map at all — one that does not parse, or one the map does not hold — is
@@ -832,10 +856,7 @@ pub fn page_by_key_token<'a, K, T>(
 where
     K: Ord + ::std::fmt::Display + ::std::str::FromStr,
 {
-    let after = match token_key(listing, next_token)? {
-        None => None,
-        Some(key) => Some(key.parse::<K>().map_err(|_| foreign_next_token())?),
-    };
+    let after = token_map_key::<K>(listing, next_token)?;
     page_after_key(listing, ordered, after.as_ref(), max_results)
 }
 

@@ -22,6 +22,11 @@
 //! one it cannot read, one another listing (or another policy's versions) issued, or one
 //! naming a version id this policy does not hold — earns `ValidationException` (400).
 //!
+//! The token's GRAMMAR is read before the policy is resolved, as in this crate's other
+//! two listings of one named resource's records: the request's own shape is judged first,
+//! then whether the named resource exists, so a request that is bad in both ways is
+//! answered 400 by every listing of the family rather than 400 by some and 404 by others.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -178,6 +183,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // there is no per-resource authorization to decide here; `ctx` carries nothing
         // this answer depends on.
         let _ = ctx;
+        let listing = crate::state::Listing::PolicyVersions {
+            policy_arn: &input.policy_arn,
+        };
+
+        // The token is this service's own: it names THIS listing — this operation, for
+        // this policy — and the version id of the last version the previous page
+        // reported. Its grammar is read here, with the request's other shape, because it
+        // needs no record of the policy's at all; that the version id was handed out is
+        // decided below, against the policy's own versions
+        // ([`crate::state::page_after_key`]). The order matches this crate's two other
+        // listings of ONE named resource's records: the request's own shape (its token)
+        // first, then whether the resource exists — so one and the same doubly-bad
+        // request is classified the same way across the family.
+        let after = crate::state::token_map_key::<i32>(listing, input.next_token.as_deref())
+            .map_err(ListPolicyVersionsErrorModeled::ValidationException)?;
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListPolicyVersionsError::Modeled(
                 ListPolicyVersionsErrorModeled::InternalServerException(
@@ -199,22 +220,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The whole paging rule of a listing that pages over a key the store itself
-        // orders by, from the one place this service states it
-        // ([`crate::state::page_by_key_token`], which cuts the page with the one cut
-        // every listing of this service is cut by): the token names THIS listing — this
-        // operation, for this policy — and the version id of the last version the
-        // previous page reported, the page is the versions ordered after it — at most
-        // what one `MaxResults` asks for — and the next token names the last version
-        // reported exactly while versions remain. A token this listing cannot read, or
-        // one naming a version id this policy does not hold, never came from here.
-        let listing = crate::state::Listing::PolicyVersions {
-            policy_arn: &input.policy_arn,
-        };
-        let page = crate::state::page_by_key_token(
+        // The rest of the paging rule of a listing that pages over a key the store
+        // itself orders by, from the one place this service states it
+        // ([`crate::state::page_after_key`], which cuts the page with the one cut every
+        // listing of this service is cut by): the page is the versions ordered after the
+        // one the token named — at most what one `MaxResults` asks for — and the next
+        // token names the last version reported exactly while versions remain. A token
+        // naming a version id this policy does not hold never came from here.
+        let page = crate::state::page_after_key(
             listing,
             &policy.versions,
-            input.next_token.as_deref(),
+            after.as_ref(),
             input.max_results,
         )
         .map_err(ListPolicyVersionsErrorModeled::ValidationException)?;
