@@ -17,6 +17,8 @@ mod entities_detection_v2;
 mod icd10_cm_inference;
 #[path = "all/phi_detection.rs"]
 mod phi_detection;
+#[path = "all/phi_detection_job_describe.rs"]
+mod phi_detection_job_describe;
 #[path = "all/phi_detection_jobs.rs"]
 mod phi_detection_jobs;
 #[path = "all/refusal_messages.rs"]
