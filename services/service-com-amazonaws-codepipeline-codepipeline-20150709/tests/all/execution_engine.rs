@@ -60,6 +60,10 @@ pub(crate) const WAIT: Duration = Duration::from_secs(20);
 /// in-process callback, so both have to be there.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The one engine both mounted services were built from, so a suite can read a store
+    /// they SHARE — the account's management-event log, which the service that serves a
+    /// call writes and CloudTrail reads.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -73,9 +77,14 @@ impl Emulator {
             ),
         );
         router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
-            engine,
+            Arc::clone(&engine),
         ));
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// The shared engine this emulator's services were built from.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// Call one CodePipeline operation.

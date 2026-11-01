@@ -49,6 +49,11 @@ mod ses_raw_send_under_a_shared_domain_identity;
 // are both regions concurrently landing suites add their line to.
 #[path = "all/codepipeline_execution_controls.rs"]
 mod codepipeline_execution_controls;
+// Declared in this same head region, for the reason the entry above records: the appended
+// tail and the sorted `c…` span (where every codepipeline suite would land) are both regions
+// concurrently landing suites add their line to.
+#[path = "all/codepipeline_management_events.rs"]
+mod codepipeline_management_events;
 // Declared here, at the head, for the reason the entries below record: the appended tail
 // and the sorted `i…` span are both regions concurrently landing suites add their line to.
 #[path = "all/iam_management_events.rs"]

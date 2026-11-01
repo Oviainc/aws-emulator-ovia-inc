@@ -4756,6 +4756,47 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsCodepipelineCodepipeline20150709State>)
 }
 
+/// The account's MANAGEMENT-EVENT (audit) log in the SAME shared engine — the one store
+/// CloudTrail's `LookupEvents` reads: call it with `&*engine`.
+///
+/// A SHARED type ([`::service_common::management_events::ManagementEventLog`]) and not a
+/// field of this service's own state, because the service that SERVES a call is the one
+/// that knows the call happened while the service that REPORTS it is CloudTrail; the engine
+/// keys state by TYPE, so a copy of its own here would be invisible to that reader.
+///
+/// Answer `None` by leaving the call unrecorded: the record is the account's audit trail,
+/// never part of this operation's own answer, so an engine carrying no log still serves the
+/// call.
+pub fn management_event_log<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::management_events::ManagementEventLog>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::management_events::ManagementEventLog,
+            >,
+        )
+}
+
+/// The account's SESSION directory in that same shared engine: the sessions STS minted,
+/// each keyed by the access key id it was minted under, which is what lets a record of a
+/// call made with one name the session it was made by and the role that issued it.
+///
+/// A SHARED type, for the same reason as the log above: the service that MINTS a session
+/// and the services that record the calls made WITH it are not the same service.
+pub fn session_audit_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::management_events::SessionAuditDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::management_events::SessionAuditDirectory,
+            >,
+        )
+}
+
 /// The store, or the refusal a handler answers when this service was mounted on an
 /// engine whose state it cannot share.
 ///

@@ -39,9 +39,19 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! One thing about that entry IS this file's: the routing table it answers with is the
+//! AUDITED one ([`management_events`]), so every call this service serves is recorded in
+//! the account's event history where CloudTrail's `LookupEvents` reports it. Recording is
+//! a property of serving a call rather than of any one operation, which is why it is wired
+//! here once instead of in 44 handlers.
 
+pub mod management_events;
+
+use service_common::audited_operation::AuditedDefinition;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service, Violation,
+    ViolationKind,
 };
 use std::sync::Arc;
 
@@ -318,7 +328,12 @@ pub(crate) fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, routing through this service's AUDITED operations: every call
+    /// it serves is a management event of this service, recorded in the account's event
+    /// history where CloudTrail's `LookupEvents` reads it (see [`management_events`]).
+    /// Identity, the protocol and every framework error renderer stay the generated
+    /// entry's.
+    entry: AuditedDefinition<crate::ServiceDefinition<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -326,8 +341,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        // Every modelled operation of this service, constructed from the same shared
+        // engine and served behind the audit recorder, so no request reaches a handler by
+        // a path that records nothing (see [`management_events::audited_table`]).
+        let audited = management_events::audited_table(&engine);
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: AuditedDefinition::new(crate::ServiceDefinition::new(engine), audited),
         }
     }
 }
