@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeScheduledInstanceAvailability
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeScheduledInstanceAvailability`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: answers the Scheduled Instance schedules the Region the request was signed
+//! for has capacity set aside for — one per block of capacity the request's filters leave,
+//! each carrying the schedule the request's recurrence and slot bounds resolve to — paged by
+//! `MaxResults`/`NextToken`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeScheduledInstanceAvailability::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What a search is answered from
+//!
+//! A schedule is NOT a stored resource: it is computed, per block of stored capacity, from
+//! the request. The capacity is [`crate::state::ComAmazonawsEc2Amazonec2State::scheduled_instance_capacity`]
+//! — which zone, instance type and platform have instances set aside for term purchase, how
+//! many are left and what an hour of one costs — and the schedule laid over it is the
+//! request's: the first slot starts at the earliest instant the caller allows that has not
+//! already passed, the slot is the shortest one that still meets the documented minimum of
+//! 1,200 hours per year for the recurrence asked for ([`crate::state::scheduled_instance_minimum_slot_hours`]),
+//! and the term's hours follow from the two. So two searches of one account report one block
+//! identically, and this operation writes nothing at all.
+//!
+//! Nothing in the EC2 API sets Scheduled Instance capacity aside — AWS does that itself, as
+//! it racks the Outpost behind `DescribeLocalGateways` — so an account whose Region holds
+//! none is answered HTTP 200 with an EMPTY `scheduledInstanceAvailabilitySet` and no token,
+//! which is what the recorded response for this operation carries. That is a report of an
+//! empty inventory, not a refusal, and the same answer is given wherever the SEARCH ITSELF
+//! selects nothing: a window that has closed or opens beyond the three months a search can
+//! see, or slot bounds that leave no room for a slot meeting the term's minimum hours. What IS
+//! refused is a request no schedule could be described by — a filter this operation does not
+//! document, a frequency outside the three AWS offers, a day outside the published range of
+//! its period, a duration of no hours, a maximum slot at or above the published limit or not
+//! above the minimum asked for, a token this service did not mint — and `DryRun` is
+//! answered `DryRunOperation`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +178,593 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeScheduledInstanceAvailability` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeScheduledInstanceAvailabilityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeScheduledInstanceAvailability"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MatchBudget, availability_zones_in_region, decode_scoped_page_token,
+            encode_scoped_page_token, invalid_pagination_token_for, request_region,
+            require_service_state, system_time_to_date_time,
+        };
+
+        // Narrowing cost is filters x values x value length x stored blocks of capacity, and
+        // the model bounds none of them, so the request-controlled factors are capped here,
+        // before any work proportional to them is done — the caps every other describe of
+        // this crate applies — and their PRODUCT is charged to one [`MatchBudget`] below.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            // A filter name this operation does not document is refused whether or not any
+            // block would have matched it, so a misspelled filter can never read as "no
+            // schedules" — the answer every other describe of this crate gives.
+            if !DOCUMENTED_FILTERS.contains(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token for the next set of results" — anything else is refused rather than read
+        // as a cursor, and it is refused before any member that selects what to report is
+        // looked at, so whether a bogus token is caught never depends on the rest of the
+        // request. The token is SCOPED to the search it was minted for
+        // ([`search_fingerprint`]), so one presented back against a different search is
+        // refused rather than resuming inside a set it never described.
+        let fingerprint = search_fingerprint(&input);
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                decode_scoped_page_token(token, &fingerprint)
+                    .ok_or_else(|| invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        let now_secs = system_time_to_date_time(::std::time::SystemTime::now()).secs();
+        let recurrence = validate_recurrence(&input.recurrence)?;
+        validate_slot_duration_bounds(&input)?;
+
+        // DryRun sits AFTER every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused with
+        // that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The schedule the request asks for, resolved once: it is a function of the
+        // recurrence, the window and the slot bounds, not of any one block of capacity, so
+        // every block the search reports carries the same one. `None` is a request no
+        // schedule can satisfy — a window that has already passed, or slot bounds no slot
+        // meeting the 1,200-hour minimum fits in — which is an empty report rather than a
+        // refusal: the search was well formed, nothing on offer fits it.
+        let schedule = resolved_schedule(&input, &recurrence, now_secs);
+
+        // EC2 is a regional service reached through a regional endpoint: the Region the caller
+        // signed for is the Region whose set-aside capacity it is asking about.
+        let region = request_region(ctx.parts());
+        let zones = availability_zones_in_region(&region);
+
+        // "The maximum number of results to return in a single call. This value can be
+        // between 5 and 300. The default value is 300" — the modelled `@range` has already
+        // refused anything outside those bounds, so a request that names no page size gets
+        // the documented default.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_RESULTS_DEFAULT)
+            .clamp(1, MAX_RESULTS_DEFAULT);
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // The store is keyed by [`crate::state::scheduled_instance_capacity_key`], so its own
+        // order IS the order a page is reported and resumed in: a cursor names the block the
+        // next page starts at, and the walk resumes there instead of re-reading the blocks
+        // already answered.
+        let lower = match &start_at {
+            Some(cursor) => ::std::ops::Bound::Included(cursor.clone()),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut availability_set: Vec<ScheduledInstanceAvailability> = Vec::new();
+        let mut next_token: Option<String> = None;
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        if let Some(schedule) = &schedule {
+            for (key, record) in store
+                .scheduled_instance_capacity
+                .range((lower, ::std::ops::Bound::Unbounded))
+            {
+                if budget.exhausted() {
+                    break;
+                }
+                // Capacity sits in an Availability Zone, so a block in a zone this Region does
+                // not have is none of this request's business — read off the zone before any
+                // filter is matched, so a block of another Region costs no comparison.
+                if !zones
+                    .iter()
+                    .any(|zone| zone.zone_name == record.availability_zone)
+                {
+                    continue;
+                }
+                if !matches_every_filter(record, &selectors, &mut budget) {
+                    continue;
+                }
+                let Some(availability) = availability_of(record, schedule) else {
+                    continue;
+                };
+                // "This value is null when there are no more results to return"
+                // (`DescribeScheduledInstanceAvailabilityResult$NextToken`): a token only when
+                // a further schedule follows this page, naming the block it starts at.
+                if availability_set.len() >= limit {
+                    next_token = Some(encode_scoped_page_token(&fingerprint, key));
+                    break;
+                }
+                availability_set.push(availability);
+            }
+        }
+        // A scan that ran out of budget answers an INCOMPLETE set, which is not something to
+        // report as a result: the request asked for more filtering than one call will do, and
+        // is told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        Ok(DescribeScheduledInstanceAvailabilityOutput {
+            scheduled_instance_availability_set: Some(availability_set),
+            next_token,
+        })
     }
+}
+
+/// Every filter name `DescribeScheduledInstanceAvailabilityRequest$Filters` documents, in the
+/// order the member lists them:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeScheduledInstanceAvailabilityRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// Each one compares against one field of a block of capacity — see [`filter_values`].
+const DOCUMENTED_FILTERS: [&str; 3] = ["availability-zone", "instance-type", "platform"];
+
+/// The page size a request that names none gets, which is also the largest this operation
+/// serves: "The maximum number of results to return in a single call. This value can be
+/// between 5 and 300. The default value is 300"
+/// (`DescribeScheduledInstanceAvailabilityRequest$MaxResults`), whose modelled `@range` the
+/// boundary validator has already enforced.
+const MAX_RESULTS_DEFAULT: usize = 300;
+
+/// The seconds in one hour, the unit a slot's duration is given in.
+const SECONDS_PER_HOUR: i64 = 60 * 60;
+
+/// The seconds in one day, the unit the search horizon is given in.
+const SECONDS_PER_DAY: i64 = 24 * SECONDS_PER_HOUR;
+
+/// How far ahead a search can find a schedule, in seconds: "You can search for an available
+/// schedule no more than 3 months in advance" (`DescribeScheduledInstanceAvailability`), which
+/// `SlotDateTimeRangeRequest$LatestTime` states as "at most three months in the future".
+///
+/// A HORIZON rather than a refusal: the sentence says how far a search can SEE, so a window
+/// that opens beyond it holds no schedule to report — and the recorded response for this
+/// operation is a served search answered with an empty availability set, not a refusal of the
+/// window it named. Three months is read as the LONGEST three consecutive calendar months, so
+/// a window AWS would still look in is never cut short by a shorter three.
+const SEARCH_HORIZON_SECONDS: i64 = 3 * 31 * SECONDS_PER_DAY;
+
+/// The recurrence a request asks a schedule to repeat on, once every rule the model states
+/// about it holds.
+///
+/// Kept as resolved values rather than as the request's own members, because the schedule's
+/// arithmetic and the recurrence the response reports both read the SAME resolved interval
+/// and days: a request that names no interval asks for every period, which is an interval of
+/// one, and a daily schedule has no days at all whatever the request carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedRecurrence {
+    /// `Daily`, `Weekly` or `Monthly`.
+    frequency: String,
+    /// "The interval quantity. The interval unit depends on the value of `frequency`"
+    /// (`ScheduledInstanceRecurrence$Interval`) — one when the request named none.
+    interval: i32,
+    /// The occurrence days the request named, in the order it named them; empty for a daily
+    /// schedule, which has none.
+    occurrence_days: Vec<i32>,
+    /// "Indicates whether the occurrence is relative to the end of the specified week or
+    /// month" (`ScheduledInstanceRecurrence$OccurrenceRelativeToEnd`).
+    occurrence_relative_to_end: bool,
+    /// `DayOfWeek` or `DayOfMonth`, for a schedule whose days are counted in one of them.
+    occurrence_unit: Option<String>,
+}
+
+/// Refuse a recurrence no schedule could be described by, and resolve the one a search asks
+/// for.
+///
+/// What is REFUSED is a value that describes no schedule at all, each stated by the member it
+/// is about
+/// (`smithy_query(query="doc",shape="ScheduledInstanceRecurrenceRequest",member="<Member>")`):
+/// a frequency outside `Daily`, `Weekly` and `Monthly`, an interval of no periods, a day
+/// outside the period's published range — "one or more days of the week (1-7, where 1 is
+/// Sunday)" for a weekly schedule and "one or more days of the month (1-31)" for a monthly one
+/// — more than one day where "the occurrence is relative to the end of the month", and a unit
+/// that is neither of the two days are counted in.
+///
+/// What is READ rather than refused is a member the frequency gives no meaning to: a daily
+/// schedule comes round every day, so it has no occurrence day and no unit to count days in
+/// ("You can't specify this value with a daily schedule" on both members), and one carried
+/// beside it narrows nothing — so it is left out of the schedule rather than turned into a
+/// refusal of a search the recorded response shows served.
+fn validate_recurrence(
+    requested: &ScheduledInstanceRecurrenceRequest,
+) -> Result<ResolvedRecurrence, DescribeScheduledInstanceAvailabilityError> {
+    use crate::scaffolded::Scaffolded;
+    use crate::state::{
+        SCHEDULED_INSTANCE_DAYS_OF_MONTH, SCHEDULED_INSTANCE_DAYS_OF_WEEK,
+        SCHEDULED_INSTANCE_FREQUENCIES, SCHEDULED_INSTANCE_FREQUENCY_DAILY,
+        SCHEDULED_INSTANCE_FREQUENCY_WEEKLY, SCHEDULED_INSTANCE_OCCURRENCE_UNITS,
+    };
+
+    // The frequency is what every other rule about a recurrence is read against, so a
+    // recurrence that names none names no schedule at all. The model leaves the member
+    // optional, which is why this is the handler's to refuse rather than the boundary's.
+    let frequency = requested.frequency.as_deref().ok_or_else(|| {
+        Scaffolded::<DescribeScheduledInstanceAvailabilityErrorModeled>::missing_parameter(
+            "The request must contain the parameter Recurrence.Frequency",
+        )
+    })?;
+    if !SCHEDULED_INSTANCE_FREQUENCIES.contains(&frequency) {
+        return Err(Scaffolded::invalid_parameter_value(format!(
+            "Invalid value '{frequency}' for Recurrence.Frequency. It must be one of [{}]",
+            SCHEDULED_INSTANCE_FREQUENCIES.join(", ")
+        )));
+    }
+    let daily = frequency == SCHEDULED_INSTANCE_FREQUENCY_DAILY;
+
+    // "The interval quantity": a schedule that repeats every nothing repeats never.
+    if let Some(interval) = requested.interval {
+        if interval < 1 {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{interval}' for Recurrence.Interval. It must be at least 1"
+            )));
+        }
+    }
+    let interval = requested.interval.unwrap_or(1);
+
+    // A daily schedule comes round every day, so it has no occurrence day and no unit to count
+    // days in: both are left out of it rather than read, and the day range below is the one the
+    // frequency that DOES name days publishes.
+    let occurrence_days = if daily {
+        Vec::new()
+    } else {
+        requested.occurrence_days.clone().unwrap_or_default()
+    };
+    let (days_of, days_named) = if frequency == SCHEDULED_INSTANCE_FREQUENCY_WEEKLY {
+        (
+            SCHEDULED_INSTANCE_DAYS_OF_WEEK,
+            "one or more days of the week (1-7, where 1 is Sunday)",
+        )
+    } else {
+        (
+            SCHEDULED_INSTANCE_DAYS_OF_MONTH,
+            "one or more days of the month (1-31)",
+        )
+    };
+    if let Some(outside) = occurrence_days
+        .iter()
+        .find(|day| !days_of.contains(day))
+        .copied()
+    {
+        return Err(Scaffolded::invalid_parameter_value(format!(
+            "Invalid value '{outside}' for Recurrence.OccurrenceDays. It must be {days_named}"
+        )));
+    }
+    let occurrence_relative_to_end = requested.occurrence_relative_to_end.unwrap_or(false);
+    if occurrence_relative_to_end && occurrence_days.len() > 1 {
+        return Err(Scaffolded::invalid_parameter_value(format!(
+            "Invalid value for Recurrence.OccurrenceDays. If the occurrence is relative to the \
+             end of the month, you can specify only a single day; got {}",
+            occurrence_days.len()
+        )));
+    }
+
+    if let Some(unit) = requested.occurrence_unit.as_deref() {
+        if !SCHEDULED_INSTANCE_OCCURRENCE_UNITS.contains(&unit) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{unit}' for Recurrence.OccurrenceUnit. It must be one of [{}]",
+                SCHEDULED_INSTANCE_OCCURRENCE_UNITS.join(", ")
+            )));
+        }
+    }
+
+    Ok(ResolvedRecurrence {
+        frequency: frequency.to_string(),
+        interval,
+        occurrence_days,
+        occurrence_relative_to_end,
+        // The unit belongs to the days it counts, so a daily schedule reports none whatever the
+        // request carried.
+        occurrence_unit: (!daily)
+            .then(|| requested.occurrence_unit.clone())
+            .flatten(),
+    })
+}
+
+/// Refuse a slot bound the model declares invalid.
+///
+/// "The minimum available duration, in hours" and "The maximum available duration, in hours.
+/// This value must be greater than MinSlotDurationInHours and less than 1,720" — so a maximum
+/// at or above the published limit, or one that does not leave the minimum below it, is a value
+/// no slot could be measured by, and a bound below one hour is no duration at all.
+///
+/// What is NOT refused here is a pair that is valid and simply leaves no room for a slot
+/// meeting the term's minimum hours (a maximum of three hours against a daily schedule's four):
+/// those bounds SELECT which slots are on offer, so a search that finds none is a served search
+/// with nothing to report — see [`resolved_schedule`].
+fn validate_slot_duration_bounds(
+    input: &DescribeScheduledInstanceAvailabilityInput,
+) -> Result<(), DescribeScheduledInstanceAvailabilityError> {
+    use crate::scaffolded::Scaffolded;
+    use crate::state::SCHEDULED_INSTANCE_SLOT_DURATION_LIMIT_HOURS;
+
+    if let Some(minimum) = input.min_slot_duration_in_hours {
+        if minimum < 1 {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{minimum}' for MinSlotDurationInHours. It must be at least 1"
+            )));
+        }
+    }
+    if let Some(maximum) = input.max_slot_duration_in_hours {
+        if maximum < 1 {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{maximum}' for MaxSlotDurationInHours. It must be at least 1"
+            )));
+        }
+        if maximum >= SCHEDULED_INSTANCE_SLOT_DURATION_LIMIT_HOURS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{maximum}' for MaxSlotDurationInHours. It must be less than \
+                 {SCHEDULED_INSTANCE_SLOT_DURATION_LIMIT_HOURS}"
+            )));
+        }
+        if let Some(minimum) = input.min_slot_duration_in_hours {
+            if maximum <= minimum {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{maximum}' for MaxSlotDurationInHours. It must be greater \
+                     than MinSlotDurationInHours '{minimum}'"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The schedule a search asks for, laid over any block of capacity: when its first slot
+/// starts, how long one slot runs, what the term adds up to, and the recurrence it repeats on.
+#[derive(Debug, Clone)]
+struct ResolvedSchedule {
+    /// When the first slot starts, in seconds since the Unix epoch.
+    first_slot_start_secs: i64,
+    /// "The number of hours in the schedule"
+    /// (`ScheduledInstanceAvailability$SlotDurationInHours`).
+    slot_duration_in_hours: i32,
+    /// "The total number of hours for a single instance for the entire term"
+    /// (`ScheduledInstanceAvailability$TotalScheduledInstanceHours`).
+    total_scheduled_instance_hours: i32,
+    /// When a purchase token minted for this schedule stops being good, in seconds since the
+    /// Unix epoch.
+    purchase_token_expires_at_secs: i64,
+    /// The recurrence, as the response reports it.
+    recurrence: ScheduledInstanceRecurrence,
+}
+
+/// The schedule `input` asks for, or `None` when no schedule can satisfy it.
+///
+/// The schedule is the request's, not the capacity's. Its first slot starts at the earliest
+/// instant the caller allows that has not already passed — capacity cannot be scheduled into
+/// the past — and the slot is the shortest that still meets the documented 1,200 hours a year
+/// for the recurrence asked for, raised to the caller's own minimum where it asks for longer
+/// slots.
+///
+/// `None` is a well-formed search nothing on offer fits, which is an empty report rather than a
+/// refusal: a window that has closed or opens beyond the three months a search can see, a
+/// recurrence that comes round for no slot inside the term, or a slot the caller's maximum — or
+/// the published limit of 1,720 hours — leaves no room for.
+fn resolved_schedule(
+    input: &DescribeScheduledInstanceAvailabilityInput,
+    recurrence: &ResolvedRecurrence,
+    now_secs: i64,
+) -> Option<ResolvedSchedule> {
+    use crate::state::{
+        SCHEDULED_INSTANCE_PURCHASE_TOKEN_LIFETIME_SECONDS,
+        SCHEDULED_INSTANCE_SLOT_DURATION_LIMIT_HOURS, scheduled_instance_minimum_slot_hours,
+        scheduled_instance_occurrences_per_year,
+    };
+
+    let first_slot_start_secs = input
+        .first_slot_start_time_range
+        .earliest_time
+        .secs()
+        .max(now_secs);
+    if first_slot_start_secs > input.first_slot_start_time_range.latest_time.secs() {
+        return None;
+    }
+    // "You can search for an available schedule no more than 3 months in advance": a first slot
+    // beyond the horizon is one this search cannot see.
+    if first_slot_start_secs > now_secs.saturating_add(SEARCH_HORIZON_SECONDS) {
+        return None;
+    }
+
+    let occurrences = scheduled_instance_occurrences_per_year(
+        &recurrence.frequency,
+        recurrence.interval,
+        recurrence.occurrence_days.len(),
+    )?;
+    let slot_duration_in_hours = scheduled_instance_minimum_slot_hours(occurrences)?
+        .max(input.min_slot_duration_in_hours.unwrap_or(0));
+    if slot_duration_in_hours >= SCHEDULED_INSTANCE_SLOT_DURATION_LIMIT_HOURS {
+        return None;
+    }
+    if input
+        .max_slot_duration_in_hours
+        .is_some_and(|maximum| slot_duration_in_hours > maximum)
+    {
+        return None;
+    }
+
+    Some(ResolvedSchedule {
+        first_slot_start_secs,
+        slot_duration_in_hours,
+        total_scheduled_instance_hours: slot_duration_in_hours.saturating_mul(occurrences),
+        purchase_token_expires_at_secs: now_secs
+            .saturating_add(SCHEDULED_INSTANCE_PURCHASE_TOKEN_LIFETIME_SECONDS),
+        recurrence: ScheduledInstanceRecurrence {
+            frequency: Some(recurrence.frequency.clone()),
+            interval: Some(recurrence.interval),
+            // A schedule that names no occurrence day reports none, rather than reporting a
+            // day the request never asked for.
+            occurrence_day_set: (!recurrence.occurrence_days.is_empty())
+                .then(|| recurrence.occurrence_days.clone()),
+            occurrence_relative_to_end: Some(recurrence.occurrence_relative_to_end),
+            occurrence_unit: recurrence.occurrence_unit.clone(),
+        },
+    })
+}
+
+/// `record`'s capacity as the schedule `schedule` on it, or `None` when it offers no instance
+/// to schedule.
+///
+/// "The number of available instances" is what a block has left, so a block with none left is
+/// no availability at all — it is left out of the report rather than reported as a schedule
+/// nothing could be purchased on.
+fn availability_of(
+    record: &crate::state::ScheduledInstanceCapacityRecord,
+    schedule: &ResolvedSchedule,
+) -> Option<ScheduledInstanceAvailability> {
+    use crate::state::{
+        SCHEDULED_INSTANCE_TERM_DURATION_DAYS, ScheduledInstancePurchaseTerms,
+        encode_scheduled_instance_purchase_token,
+    };
+
+    if record.available_instance_count < 1 {
+        return None;
+    }
+    let purchase_token = encode_scheduled_instance_purchase_token(&ScheduledInstancePurchaseTerms {
+        availability_zone: record.availability_zone.clone(),
+        instance_type: record.instance_type.clone(),
+        platform: record.platform.clone(),
+        first_slot_start_secs: schedule.first_slot_start_secs,
+        slot_duration_in_hours: schedule.slot_duration_in_hours,
+        expires_at_secs: schedule.purchase_token_expires_at_secs,
+    });
+    Some(ScheduledInstanceAvailability {
+        availability_zone: Some(record.availability_zone.clone()),
+        available_instance_count: Some(record.available_instance_count),
+        first_slot_start_time: Some(::aws_smithy_types::DateTime::from_secs(
+            schedule.first_slot_start_secs,
+        )),
+        hourly_price: Some(record.hourly_price.clone()),
+        instance_type: Some(record.instance_type.clone()),
+        // "The minimum term. The only possible value is 365 days", and the same sentence on
+        // the maximum, so both report the one term.
+        max_term_duration_in_days: Some(SCHEDULED_INSTANCE_TERM_DURATION_DAYS),
+        min_term_duration_in_days: Some(SCHEDULED_INSTANCE_TERM_DURATION_DAYS),
+        network_platform: Some(record.network_platform.clone()),
+        platform: Some(record.platform.clone()),
+        purchase_token: Some(purchase_token),
+        recurrence: Some(schedule.recurrence.clone()),
+        slot_duration_in_hours: Some(schedule.slot_duration_in_hours),
+        total_scheduled_instance_hours: Some(schedule.total_scheduled_instance_hours),
+    })
+}
+
+/// The values the EC2 filter `name` compares against one block of capacity.
+///
+/// Each documented filter names one field of a block — "`availability-zone` - The
+/// Availability Zone (for example, us-west-2a). `instance-type` - The instance type (for
+/// example, c4.large). `platform` - The platform (Linux/UNIX or Windows)" — so the comparison
+/// is against the stored block rather than against the schedule computed over it, which is
+/// the same for every block of one search.
+fn filter_values<'a>(
+    record: &'a crate::state::ScheduledInstanceCapacityRecord,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    match name {
+        "availability-zone" => vec![Cow::Borrowed(record.availability_zone.as_str())],
+        "instance-type" => vec![Cow::Borrowed(record.instance_type.as_str())],
+        "platform" => vec![Cow::Borrowed(record.platform.as_str())],
+        // Unreachable: a name outside [`DOCUMENTED_FILTERS`] has already been refused. One
+        // compares against nothing, so it could never widen a result even if that check were
+        // bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `record` satisfy every filter?
+///
+/// The AND/OR evaluation, the wildcard matching and the budget charging all live in
+/// [`crate::state::matches_every_filter`], so this operation only says WHERE a filter's values
+/// come from.
+fn matches_every_filter(
+    record: &crate::state::ScheduledInstanceCapacityRecord,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    crate::state::matches_every_filter(selectors, budget, &|name| filter_values(record, name))
+}
+
+/// The fingerprint of the search `input` describes: the members that SELECT which schedules
+/// are reported and what each of them says, as the request gives them.
+///
+/// A `NextToken` names a position inside one search's sequence of blocks, so presenting it
+/// back against another search must be refused rather than resumed — which is what scoping
+/// the token to this digest does ([`crate::state::encode_scoped_page_token`]). The digest only
+/// has to agree with ITSELF inside one running emulator: a token is presented back to the
+/// process that minted it and nothing persists one. It is not an integrity check either —
+/// that is [`crate::state::decode_page_token`]'s — only a statement of which search a
+/// position belongs to.
+fn search_fingerprint(input: &DescribeScheduledInstanceAvailabilityInput) -> String {
+    use ::std::hash::{Hash, Hasher};
+
+    let mut hasher = ::std::hash::DefaultHasher::new();
+    input.first_slot_start_time_range.earliest_time.secs().hash(&mut hasher);
+    input.first_slot_start_time_range.latest_time.secs().hash(&mut hasher);
+    input.max_slot_duration_in_hours.hash(&mut hasher);
+    input.min_slot_duration_in_hours.hash(&mut hasher);
+    input.recurrence.frequency.hash(&mut hasher);
+    input.recurrence.interval.hash(&mut hasher);
+    input.recurrence.occurrence_days.hash(&mut hasher);
+    input.recurrence.occurrence_relative_to_end.hash(&mut hasher);
+    input.recurrence.occurrence_unit.hash(&mut hasher);
+    for filter in input.filters.as_deref().unwrap_or_default() {
+        filter.name.hash(&mut hasher);
+        filter.values.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
 }

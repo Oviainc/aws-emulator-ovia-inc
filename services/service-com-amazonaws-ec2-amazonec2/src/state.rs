@@ -1782,6 +1782,13 @@ pub use classic_link::*;
 pub mod reserved_instances;
 pub use reserved_instances::*;
 
+/// Scheduled Instances: the capacity a Region has set aside for them, the words a schedule is
+/// described in and the arithmetic that turns a recurrence into the hours of a term — in a
+/// module of its own, re-exported so a handler reaches them as `crate::state::<item>` like
+/// every other primitive here.
+pub mod scheduled_instances;
+pub use scheduled_instances::*;
+
 /// The EBS snapshots the account holds — what one snapshot is stored as, the store's
 /// bounds, its byte charge and the clock-owed `pending` -> `completed` move every snapshot
 /// starts out owing — in a module of its own, re-exported so a handler reaches them as
@@ -3215,6 +3222,19 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// ensure idempotency of your modification request"
     /// (`ModifyReservedInstancesRequest$ClientToken`).
     pub reserved_instances_modification_client_tokens: HashMap<String, String>,
+    /// Every block of Scheduled Instance capacity the account's Regions have set aside, by
+    /// [`scheduled_instance_capacity_key`] — the zone, platform and instance type that
+    /// identify a block — as a [`ScheduledInstanceCapacityRecord`]: what a search cannot
+    /// compute, beside nothing it can. Ordered by that key, which is the order
+    /// `DescribeScheduledInstanceAvailability` reports and pages over, so a pagination token
+    /// can name the block the next page starts at.
+    ///
+    /// Starts EMPTY, and no operation of this API writes it:
+    /// [`Self::insert_scheduled_instance_capacity`] is its one writer, because AWS sets
+    /// Scheduled Instance capacity aside itself the way it racks the Outpost behind
+    /// [`Self::local_gateways`]. A search of a Region that holds none is therefore answered
+    /// with no schedules — see [`scheduled_instances`].
+    pub scheduled_instance_capacity: BTreeMap<String, ScheduledInstanceCapacityRecord>,
     /// Every Network Access Scope the account holds, by `NetworkInsightsAccessScopeId`, as
     /// the modelled [`NetworkInsightsAccessScope`] shape itself — see the module docs.
     /// Ordered by id, the stable order every reader of it reports in.
@@ -4591,6 +4611,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             reserved_instances: BTreeMap::new(),
             reserved_instances_modifications: BTreeMap::new(),
             reserved_instances_modification_client_tokens: HashMap::new(),
+            // A fresh account's Regions have no Scheduled Instance capacity set aside for
+            // them, so a schedule search is answered with nothing to report.
+            scheduled_instance_capacity: BTreeMap::new(),
             network_insights_access_scopes: BTreeMap::new(),
             network_insights_access_scope_contents: BTreeMap::new(),
             network_insights_access_scope_client_tokens: HashMap::new(),

@@ -795,6 +795,14 @@ mod route_server_endpoints;
 mod route_server_peers;
 #[path = "all/route_servers.rs"]
 mod route_servers;
+// What `DescribeScheduledInstanceAvailability` computes a schedule search from — the Scheduled
+// Instance capacity the signed Region has set aside, the documented filters that narrow it, the
+// recurrence and slot bounds that fix each reported slot and the term's hours, how it pages, and
+// what it refuses. Declared in its SORTED position rather than beside `prefix_lists`: the head of
+// this file is where every concurrently landing ec2 suite inserts, and this fix lost several
+// serialized squash merges to exactly that.
+#[path = "all/scheduled_instance_availability.rs"]
+mod scheduled_instance_availability;
 #[path = "all/search_local_gateway_routes.rs"]
 mod search_local_gateway_routes;
 #[path = "all/secondary_interfaces.rs"]
