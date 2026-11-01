@@ -160,7 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // `None` rather than an empty list: `TagList` is `length(min: 1, max: 200)`.
+        // This output reports an untagged resource by leaving the member out,
+        // the form this crate's tests pin for it. The tag member of a reported
+        // `Tunnel` is the one that always carries its set, empty list and all,
+        // so the two readers of the one tag store differ only in how each
+        // reports "none".
         let tags = store.tag_list(&input.resource_arn);
         drop(store);
 

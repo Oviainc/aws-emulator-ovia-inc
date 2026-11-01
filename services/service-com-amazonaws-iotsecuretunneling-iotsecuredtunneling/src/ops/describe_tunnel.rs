@@ -11,6 +11,10 @@
 //! return them here), and the only state it settles is the close the clock already
 //! owed a tunnel whose `maxLifetimeTimeoutMinutes` has elapsed.
 //!
+//! The reported tunnel carries its whole tag set, so an untagged tunnel reports
+//! `tags` as an empty list rather than dropping the member: see
+//! `crate::state::ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState::projected_tag_list`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -157,7 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let tags = store.tag_list(&stored.tunnel_arn);
+        // The reported tunnel always carries its tag set, so an untagged tunnel
+        // reports an empty list rather than dropping the member: a reader can
+        // iterate the list without telling "no tags" from "tags not reported",
+        // and removing a tunnel's last tag leaves the member empty rather than
+        // making it vanish.
+        let tags = store.projected_tag_list(&stored.tunnel_arn);
         drop(store);
 
         let connection_state = |state: &crate::state::StoredConnectionState| ConnectionState {
@@ -184,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 timeout_config: Some(TimeoutConfig {
                     max_lifetime_timeout_minutes: Some(stored.max_lifetime_timeout_minutes),
                 }),
-                tags,
+                tags: Some(tags),
                 created_at: Some(::aws_smithy_types::DateTime::from(stored.created_at)),
                 last_updated_at: Some(::aws_smithy_types::DateTime::from(stored.last_updated_at)),
             }),

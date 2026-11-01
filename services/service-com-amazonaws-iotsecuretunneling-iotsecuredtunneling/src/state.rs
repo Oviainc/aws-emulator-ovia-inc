@@ -597,22 +597,31 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
         changed
     }
 
-    /// The tags stored for `arn`, as the modelled list — `None` when there are
-    /// none, because `TagList` is `length(min: 1, max: 200)` and so cannot carry
-    /// an empty list on the wire.
+    /// The tags stored for `arn`, as the modelled list — possibly EMPTY.
+    ///
+    /// This is the projection a reported resource carries its tag set in: the
+    /// member reports the stored set whatever its size, so a resource with no
+    /// tags reports an empty list and a reader can iterate it without having to
+    /// tell "no tags" from "tags not reported". `TagList`'s
+    /// `length(min: 1, max: 200)` bounds a list a CALLER sends, not the set a
+    /// resource reports back.
+    pub fn projected_tag_list(&self, arn: &str) -> Vec<Tag> {
+        self.tags
+            .get(arn)
+            .into_iter()
+            .flatten()
+            .map(|(key, value)| Tag {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
+
+    /// The tags stored for `arn` as an OPTIONAL list, `None` when there are
+    /// none — for a member whose absence is what reports an untagged resource.
     pub fn tag_list(&self, arn: &str) -> Option<Vec<Tag>> {
-        let tags = self.tags.get(arn)?;
-        if tags.is_empty() {
-            return None;
-        }
-        Some(
-            tags.iter()
-                .map(|(key, value)| Tag {
-                    key: key.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
-        )
+        let tags = self.projected_tag_list(arn);
+        (!tags.is_empty()).then_some(tags)
     }
 
     /// Close every tunnel whose `maxLifetimeTimeoutMinutes` has run out.

@@ -57,3 +57,5 @@ mod tunnel_lifecycle;
 mod tunnel_refusal_rules;
 #[path = "all/tunnel_region_isolation.rs"]
 mod tunnel_region_isolation;
+#[path = "all/tunnel_tag_projection.rs"]
+mod tunnel_tag_projection;
