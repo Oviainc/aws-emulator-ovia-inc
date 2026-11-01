@@ -14,6 +14,9 @@
 #[path = "all/codegen_job_lifecycle.rs"]
 mod codegen_job_lifecycle;
 
+#[path = "all/codegen_job_list.rs"]
+mod codegen_job_list;
+
 #[path = "all/codegen_job_scope.rs"]
 mod codegen_job_scope;
 

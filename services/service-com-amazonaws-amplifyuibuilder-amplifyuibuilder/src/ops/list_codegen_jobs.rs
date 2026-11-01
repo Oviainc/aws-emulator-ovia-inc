@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCodegenJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCodegenJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one page of the codegen jobs stored for the app environment the request
+//! names, in start order, as the `CodegenJobSummary` projection. `nextToken` carries
+//! the app environment it was issued for and the cursor the next page resumes at; a
+//! token this operation never issued for that app environment is refused with the
+//! modelled `InvalidParameterException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCodegenJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Like every codegen reader this settles first, so a page reports the status
+//! transitions the clock has already made due rather than moving a job because it
+//! was listed — see [`crate::state::StoredCodegenJob`].
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +150,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCodegenJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCodegenJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCodegenJobs"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCodegenJobsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the amplifyuibuilder codegen job store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` targets `ListCodegenJobsLimit`, modelled `@range(min: 1,
+        // max: 100)` with `@default(100)`, so the request walk has already filled
+        // the default in and refused anything outside the range before this
+        // handler ran. The `clamp` states that invariant rather than correcting a
+        // caller — a value reaching here outside the range is a validator bug,
+        // which the debug assertion surfaces.
+        let requested = input.max_results;
+        debug_assert!(
+            (1..=crate::state::CODEGEN_JOB_PAGE_LIMIT).contains(&requested),
+            "maxResults {requested} should have been refused at the boundary"
+        );
+        let page_size = usize::try_from(requested.clamp(1, crate::state::CODEGEN_JOB_PAGE_LIMIT))
+            .expect("a page size clamped into 1..=100 fits in usize");
+
+        let key = (input.app_id.clone(), input.environment_name.clone());
+        let mut store = state.lock();
+        // The only write a read performs: it applies the transitions the clock
+        // already owed at this instant, which were owed whether or not anybody
+        // called. A job's `modifiedAt` is part of its summary, so a page reports
+        // the instant its transition was due.
+        store.settle_codegen_jobs(::std::time::SystemTime::now());
+
+        // The token carries the app environment it was issued for and the cursor
+        // the next page starts at. A token this operation never issued — a
+        // malformed one, one issued while listing another app environment, or one
+        // whose cursor is not among those handed out, whether above the highest or
+        // below the first — names no page, so it is refused rather than silently
+        // served as a page of this list. With no token at all the list starts at
+        // the first cursor the service ever hands out, i.e. at its head.
+        let cursor = match input.next_token.as_deref() {
+            None => crate::state::FIRST_CURSOR,
+            Some(token) => {
+                match crate::state::parse_page_token(token, &key, store.cursor_seq) {
+                    Some(cursor) => cursor,
+                    None => {
+                        return Err(ListCodegenJobsErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(format!(
+                                    "nextToken {token:?} is not a token returned by \
+                                     ListCodegenJobs for this app environment"
+                                )),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        let mut entities = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for job in store.codegen_jobs_in(&input.app_id, &input.environment_name) {
+            // Resume at the first job at or after the cursor, so a page is still
+            // served when the job the token named is no longer at that position.
+            if job.cursor < cursor {
+                continue;
+            }
+            if entities.len() == page_size {
+                next_token = Some(crate::state::page_token(&key, job.cursor));
+                break;
+            }
+            entities.push(job.to_summary());
+        }
+
+        Ok(ListCodegenJobsOutput {
+            entities,
+            next_token,
+        })
     }
 }

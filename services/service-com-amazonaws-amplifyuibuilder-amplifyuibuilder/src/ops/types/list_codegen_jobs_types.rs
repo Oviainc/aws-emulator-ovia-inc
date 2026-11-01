@@ -27,13 +27,7 @@ pub struct ListCodegenJobsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.amplifyuibuilder#CodegenJobSummary")]
-#[derive(Debug, Clone, Default)]
-pub struct CodegenJobSummary {
-    pub app_id: String,
-    pub environment_name: String,
-    pub id: String,
-    pub created_at: Option<::aws_smithy_types::DateTime>,
-    pub modified_at: Option<::aws_smithy_types::DateTime>,
-}
+// `CodegenJobSummary` is declared in `shared_types`, with the hand-written schema its
+// `@timestampFormat("date-time")` members need; the note at the top of that module says
+// why. It is re-exported from `types`, so `use super::types::*` resolves it here.
 

@@ -15,8 +15,9 @@
 //!
 //! ## The codegen job, and the clock that moves its status
 //!
-//! `StartCodegenJob` mints the service's other resource, the CODEGEN JOB, and
-//! `GetCodegenJob` reports it. The job AWS returns is `in_progress` — a
+//! `StartCodegenJob` mints the service's other resource, the CODEGEN JOB,
+//! `GetCodegenJob` reports one and `ListCodegenJobs` reports a page of the
+//! summaries of an app environment's jobs. The job AWS returns is `in_progress` — a
 //! non-terminal status — so the service owes it a terminal status without
 //! anybody calling again. That owed transition is held as a DUE INSTANT
 //! ([`StoredCodegenJob::next_status_due`]) and materialised by
@@ -47,7 +48,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     CodegenFeatureFlags, CodegenJob, CodegenJobGenericDataSchema, CodegenJobRenderConfig,
-    Component, ComponentBindingPropertiesValue, ComponentChild, ComponentDataConfiguration,
+    CodegenJobSummary, Component, ComponentBindingPropertiesValue, ComponentChild,
+    ComponentDataConfiguration,
     ComponentEvent, ComponentProperty, ComponentSummary, ComponentVariant, FieldConfig, Form,
     FormCTA, FormDataTypeConfig, FormStyle, InvalidParameterException, ResourceConflictException,
     ResourceNotFoundException, SectionalElement, Theme, ThemeValues,
@@ -194,6 +196,11 @@ pub const CODEGEN_JOB_NOT_RUN: &str = "this emulator does not run the Amplify UI
 /// emulator serves.
 pub const CODEGEN_JOB_QUOTA: usize = 1_000;
 
+/// The largest page `ListCodegenJobs` serves: its `maxResults` member targets
+/// `ListCodegenJobsLimit`, which the model constrains `@range(min: 1, max: 100)`
+/// and defaults to 100, so a request that names no page size asks for this many.
+pub const CODEGEN_JOB_PAGE_LIMIT: i32 = 100;
+
 /// How a `ListComponents` page token is spelled, so a token this operation never
 /// issued can be told apart from one it did.
 const PAGE_TOKEN_PREFIX: &str = "c-";
@@ -322,6 +329,13 @@ pub struct StoredCodegenJob {
     /// The status the clock owes this job, and the instant it is owed from.
     /// `None` for a job in a terminal status, which owes nothing further.
     pub next_status_due: Option<(SystemTime, &'static str)>,
+    /// The position this job holds in its environment's start order.
+    ///
+    /// It is what a `ListCodegenJobs` page token indexes into: drawn from the
+    /// same counter [`StoredComponent::cursor`] is drawn from, it never changes
+    /// and never repeats, so a page resumes at the same place whatever was
+    /// started since the previous page.
+    pub cursor: u64,
 }
 
 impl StoredCodegenJob {
@@ -380,6 +394,22 @@ impl StoredCodegenJob {
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
             dependencies: None,
+        }
+    }
+
+    /// The `CodegenJobSummary` projection `ListCodegenJobs` returns.
+    ///
+    /// `CodegenJobSummary` models appId, environmentName, id, createdAt and
+    /// modifiedAt (`smithy_query(query="shape", shape="CodegenJobSummary")`) and
+    /// no status, so the summary is the same record's identity and timestamps —
+    /// nothing in it is recomputed.
+    pub fn to_summary(&self) -> CodegenJobSummary {
+        CodegenJobSummary {
+            app_id: self.app_id.clone(),
+            environment_name: self.environment_name.clone(),
+            id: self.id.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
         }
     }
 }

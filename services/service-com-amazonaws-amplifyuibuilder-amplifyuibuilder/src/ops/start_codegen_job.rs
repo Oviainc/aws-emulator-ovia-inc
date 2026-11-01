@@ -204,6 +204,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_codegen_job_id(&key);
+        // The position this job takes in its environment's start order, which is
+        // what a `ListCodegenJobs` page token indexes into.
+        let cursor = store.next_cursor();
         let job = crate::state::StoredCodegenJob {
             app_id: input.app_id,
             environment_name: input.environment_name,
@@ -223,6 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now + crate::state::CODEGEN_JOB_TRANSITION_DELAY,
                 crate::state::CODEGEN_JOB_FAILED,
             )),
+            cursor,
         };
 
         let entity = job.to_codegen_job();

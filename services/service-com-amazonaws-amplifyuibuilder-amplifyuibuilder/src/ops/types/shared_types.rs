@@ -11,17 +11,19 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplifyuibuilder-amplifyuibuilder.json");
 
-// `Component`, `Theme` and `CodegenJob` are the THREE shapes in this module whose schemas
-// are written out below rather than produced by `#[smithy_macros::smithy(shape = ...)]`,
-// and the reason is a single trait the vendored codegen does not read:
-// `@timestampFormat`.
+// `Component`, `Theme`, `CodegenJob` and `CodegenJobSummary` are the FOUR shapes in this
+// module whose schemas are written out below rather than produced by
+// `#[smithy_macros::smithy(shape = ...)]`, and the reason is a single trait the vendored
+// codegen does not read: `@timestampFormat`.
 //
-// Every `Timestamp` member of those three shapes carries `@timestampFormat("date-time")`
-// — `smithy_query(query="shape",shape="Component,Theme,CodegenJob")` reports
-// `"timestampFormat": "date-time"` on `Component$createdAt`, `Component$modifiedAt`,
-// `Theme$createdAt`, `Theme$modifiedAt`, `CodegenJob$createdAt` and
-// `CodegenJob$modifiedAt`, and they are the only `@timestampFormat` members this service
-// models. `vendor/smithy-macros` never emits `with_timestamp_format` (grep it: the only
+// Every `Timestamp` member of those four shapes carries `@timestampFormat("date-time")`
+// — `smithy_query(query="shape",shape="Component,Theme,CodegenJob,CodegenJobSummary")`
+// reports `"timestampFormat": "date-time"` on `Component$createdAt`,
+// `Component$modifiedAt`, `Theme$createdAt`, `Theme$modifiedAt`, `CodegenJob$createdAt`,
+// `CodegenJob$modifiedAt`, `CodegenJobSummary$createdAt` and
+// `CodegenJobSummary$modifiedAt`, and they are the only `@timestampFormat` members this
+// service models. `vendor/smithy-macros` never emits `with_timestamp_format` (grep it:
+// the only
 // call sites in the tree are hand-written service code), so a macro-built member schema
 // reports no format and the restJson1 JSON codec falls back to its protocol default,
 // epoch seconds — a NUMBER where the model (and every AWS SDK's generated deserializer
@@ -29,20 +31,24 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplifyuibuilder-amplif
 // differ from the macro's output in exactly that one chain call, which [`schema_for`]
 // attaches for the `date_time` member kind.
 //
+// `CodegenJobSummary` is reached by one operation only, so by this module's own rule it
+// would live in `list_codegen_jobs_types`; it is here because the five macros below are
+// what carries the format, and they are local to this module.
+//
 // Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` member
 // schema per member (index = that member's position in the model's member list), a
 // `SCHEMA` naming them in that order, the `<SHAPE>_SCHEMA` alias, and the
 // serialize/deserialize pair (a `@required` member is read into a slot and refused when
 // absent, exactly as the codegen does). Constraint traits are deliberately absent: the
-// validating walk runs on operation INPUTS only and all three shapes are output-only, so
+// validating walk runs on operation INPUTS only and all four shapes are output-only, so
 // the macro's captured constraints would be inert here too.
 //
 // REMOVE THIS BLOCK when the vendored codegen learns `smithy.api#timestampFormat`: the
 // fix belongs there, not here, because every `@timestampFormat` member of every service
 // has the same defect and `vendor/` is outside what a fix may change. Once
 // `vendor/smithy-macros` emits `with_timestamp_format`, delete the five macros and the
-// three `schema_and_codec_for!` blocks and put `#[smithy_macros::smithy(shape = ...)]`
-// back on the three structs — `tests/all/component_wire_fidelity.rs` pins the wire form,
+// four `schema_and_codec_for!` blocks and put `#[smithy_macros::smithy(shape = ...)]`
+// back on the four structs — `tests/all/component_wire_fidelity.rs` pins the wire form,
 // so it fails if the attribute does not carry it.
 
 /// The `ShapeType` one member kind names. Mirrors the vendored codegen's
@@ -576,6 +582,39 @@ pub struct CodegenDependency {
     pub is_sem_ver: Option<bool>,
     pub reason: Option<String>,
 }
+
+/// The summary of a code generation job `ListCodegenJobs` reports. Member set and order
+/// from `smithy_query(query="shape", shape="CodegenJobSummary")`; its schema is
+/// hand-written because `createdAt`/`modifiedAt` carry `@timestampFormat("date-time")`
+/// (see the note above).
+#[derive(Debug, Clone, Default)]
+pub struct CodegenJobSummary {
+    pub app_id: String,
+    pub environment_name: String,
+    pub id: String,
+    pub created_at: Option<::aws_smithy_types::DateTime>,
+    pub modified_at: Option<::aws_smithy_types::DateTime>,
+}
+
+schema_and_codec_for!(
+    CodegenJobSummary,
+    CODEGEN_JOB_SUMMARY_SCHEMA,
+    "com.amazonaws.amplifyuibuilder#CodegenJobSummary",
+    "com.amazonaws.amplifyuibuilder",
+    "CodegenJobSummary",
+    (M_APP_ID, app_id, "appId", 0, req, string),
+    (
+        M_ENVIRONMENT_NAME,
+        environment_name,
+        "environmentName",
+        1,
+        req,
+        string
+    ),
+    (M_ID, id, "id", 2, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 3, opt, date_time),
+    (M_MODIFIED_AT, modified_at, "modifiedAt", 4, opt, date_time),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.amplifyuibuilder#ComponentProperty")]
 #[derive(Debug, Clone, Default)]

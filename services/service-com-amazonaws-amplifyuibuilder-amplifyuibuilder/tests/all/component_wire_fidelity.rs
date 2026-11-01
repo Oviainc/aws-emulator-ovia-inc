@@ -8,10 +8,11 @@
 //! 1. A structure member the model marks `@timestampFormat("date-time")` appears on the
 //!    wire as an RFC 3339 / ISO-8601 date-time STRING — never as restJson1's default
 //!    epoch-seconds number. `smithy_query(query="shape",shape="Component,Theme,
-//!    CodegenJob")` reports that trait on `Component$createdAt`, `Component$modifiedAt`,
-//!    `Theme$createdAt`, `Theme$modifiedAt`, `CodegenJob$createdAt` and
-//!    `CodegenJob$modifiedAt` — every `@timestampFormat` member this service models, and
-//!    the catalog the schema case below walks.
+//!    CodegenJob,CodegenJobSummary")` reports that trait on `Component$createdAt`,
+//!    `Component$modifiedAt`, `Theme$createdAt`, `Theme$modifiedAt`,
+//!    `CodegenJob$createdAt`, `CodegenJob$modifiedAt`, `CodegenJobSummary$createdAt` and
+//!    `CodegenJobSummary$modifiedAt` — every `@timestampFormat` member this service
+//!    models, and the catalog the schema case below walks.
 //! 2. A component reports its last-modified instant and its tag map for every component,
 //!    whatever the create supplied: `modifiedAt` is the instant the record last changed
 //!    (its creation, until something updates it) and `tags` is a map — empty when the
@@ -20,7 +21,7 @@
 //! Case 1 is checked both end to end over HTTP (the `Component` payload of
 //! `CreateComponent`/`GetComponent`/`UpdateComponent`) and directly on the member
 //! schemas, which is the only reach the shapes whose operations are still scaffolded 501s
-//! (`Theme`, `CodegenJob`) have.
+//! (`Theme`) have.
 
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ use aws_smithy_types::DateTime;
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::ops::types::{
-    CodegenJob, Component, Theme,
+    CodegenJob, CodegenJobSummary, Component, Theme,
 };
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -339,12 +340,13 @@ async fn an_update_moves_modified_at_in_the_same_wire_form() {
 /// alone reports none.
 ///
 /// This is the only reach the shapes whose operations are still scaffolded 501s
-/// (`Theme`, `CodegenJob`) have, and it is what would fail if the schemas went back to
-/// the vendored codegen's output.
+/// (`Theme`) have, and it is what would fail if the schemas went back to the vendored
+/// codegen's output.
 #[test]
 fn every_modelled_date_time_member_carries_the_date_time_format() {
-    // Source: `smithy_query(query="shape", shape="Component,Theme,CodegenJob")` — the
-    // only members of this service carrying `"timestampFormat": "date-time"`.
+    // Source: `smithy_query(query="shape", shape="Component,Theme,CodegenJob,
+    // CodegenJobSummary")` — the only members of this service carrying
+    // `"timestampFormat": "date-time"`.
     let date_time_members: Vec<(&str, &Schema)> = vec![
         ("Component$createdAt", &Component::M_CREATED_AT),
         ("Component$modifiedAt", &Component::M_MODIFIED_AT),
@@ -352,6 +354,14 @@ fn every_modelled_date_time_member_carries_the_date_time_format() {
         ("Theme$modifiedAt", &Theme::M_MODIFIED_AT),
         ("CodegenJob$createdAt", &CodegenJob::M_CREATED_AT),
         ("CodegenJob$modifiedAt", &CodegenJob::M_MODIFIED_AT),
+        (
+            "CodegenJobSummary$createdAt",
+            &CodegenJobSummary::M_CREATED_AT,
+        ),
+        (
+            "CodegenJobSummary$modifiedAt",
+            &CodegenJobSummary::M_MODIFIED_AT,
+        ),
     ];
 
     for (case, schema) in date_time_members {
