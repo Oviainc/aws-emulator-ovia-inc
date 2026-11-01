@@ -1710,9 +1710,11 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             .iter()
             .map(|default| {
                 let service_code = default.service_code.as_str();
-                let applied = self
-                    .applied_entry(region, default, None)
-                    .map_or(default.value, |entry| entry.value);
+                // The value in force comes from the one helper every quota read uses
+                // ([`Self::value_in_force`]), so a report's `AppliedValue` is resolved
+                // by the same rule `GetServiceQuota` answers with: a report records the
+                // account-wide value, which is what the `None` context reads.
+                let applied = self.value_in_force(region, default, None);
                 QuotaUtilizationInfo {
                     quota_code: Some(default.quota_code.clone()),
                     service_code: Some(default.service_code.clone()),
