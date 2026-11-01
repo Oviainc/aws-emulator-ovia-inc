@@ -10,7 +10,10 @@
 //! `ConflictException` (HTTP 400). A request pairing an `incrementalRunConfig` with
 //! the `PROVIDER` `resolutionType` is refused with the modelled `ValidationException`
 //! (HTTP 400) — the rule [`crate::state::incremental_run_conflict`] states, which
-//! `UpdateMatchingWorkflow` applies identically.
+//! `UpdateMatchingWorkflow` applies identically. A `roleArn` this account's IAM shows
+//! the service cannot assume is refused with the modelled `AccessDeniedException`
+//! (HTTP 403) before anything is stored ([`crate::state::role_refusal`], the one reading
+//! every write that takes a role shares).
 //!
 //! ## Shape of an operation
 //!
@@ -203,6 +206,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One instant for both stamps: a workflow that has only just been created has
         // not been updated since, so `createdAt` and `updatedAt` are equal.
         let created = crate::state::now();
+
+        // The workflow RUNS AS the role the request names, so the role is resolved
+        // against this account's IAM BEFORE anything is minted or stored, and awaited
+        // with no store guard held. Only what IAM ANSWERED refuses the request.
+        if let Some(message) =
+            crate::state::role_refusal(ctx, &region, Some(&input.role_arn)).await
+        {
+            return Err(CreateMatchingWorkflowErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // The documented cross-member refusal is decided BEFORE anything is minted or
         // stored — the same rule `UpdateMatchingWorkflow` applies, since both carry the

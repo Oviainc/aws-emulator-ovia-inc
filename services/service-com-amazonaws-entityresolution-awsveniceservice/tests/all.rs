@@ -47,6 +47,10 @@ mod resource_tagging;
 mod response_fidelity;
 #[path = "all/response_messages.rs"]
 mod response_messages;
+#[path = "all/role_resolution.rs"]
+mod role_resolution;
+#[path = "all/schema_mapping_update.rs"]
+mod schema_mapping_update;
 #[path = "all/schema_mapping_workflow_lifecycle.rs"]
 mod schema_mapping_workflow_lifecycle;
 #[path = "all/state_roundtrip.rs"]

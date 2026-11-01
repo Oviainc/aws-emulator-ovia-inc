@@ -11,7 +11,10 @@
 //! succeed", so a name nothing was created under is refused with the modelled
 //! `ResourceNotFoundException` (HTTP 404) and persists nothing. Every member of the
 //! response is read back out of the stored record, so `GetIdMappingWorkflow` cannot
-//! disagree with it.
+//! disagree with it. A replacement `roleArn` this account's IAM shows the service cannot
+//! assume is refused with the modelled `AccessDeniedException` (HTTP 403), the rule
+//! [`crate::state::role_refusal`] states, leaving the stored workflow with the role it
+//! had.
 //!
 //! ## Shape of an operation
 //!
@@ -180,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateIdMappingWorkflowErrorModeled::InternalServerException(
@@ -191,6 +194,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+
+        // The workflow RUNS AS the role this request would store on it, so a role it
+        // names is resolved against this account's IAM BEFORE the store is touched, and
+        // awaited with no store guard held. Only what IAM ANSWERED refuses the request.
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) =
+            crate::state::role_refusal(ctx, &region, input.role_arn.as_deref()).await
+        {
+            return Err(UpdateIdMappingWorkflowErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let updated = crate::state::now();
 

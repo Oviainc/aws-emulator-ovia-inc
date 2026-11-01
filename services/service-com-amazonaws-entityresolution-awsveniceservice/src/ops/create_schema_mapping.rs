@@ -6,7 +6,11 @@
 //! the response is read back out of the stored record, so `GetSchemaMapping` cannot
 //! disagree with it. The name is the primary key, so re-creating an existing
 //! `schemaName` is refused with the modelled `ConflictException` (HTTP 400) —
-//! "There can't be multiple SchemaMappings with the same name."
+//! "There can't be multiple SchemaMappings with the same name." A `mappedInputFields`
+//! that does not declare exactly one `UNIQUE_ID` attribute is refused with the modelled
+//! `ValidationException` (HTTP 400) before anything is stored
+//! ([`crate::state::unique_id_cardinality_defect`], the one reading
+//! `UpdateSchemaMapping` shares).
 //!
 //! ## Shape of an operation
 //!
@@ -180,6 +184,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One instant for both stamps: a schema mapping that has only just been
         // created has not been updated since, so `createdAt` and `updatedAt` are equal.
         let created = crate::state::now();
+
+        // The list-wide rule the model cannot express is decided BEFORE the store is
+        // touched, so a refused create leaves it exactly as it was and no schema this
+        // service holds is one AWS would have refused.
+        if let Some(message) =
+            crate::state::unique_id_cardinality_defect(&input.mapped_input_fields)
+        {
+            return Err(CreateSchemaMappingErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let mut store = state.lock();
 

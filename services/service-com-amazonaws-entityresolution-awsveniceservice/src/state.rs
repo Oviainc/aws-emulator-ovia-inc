@@ -1111,6 +1111,35 @@ pub mod messages {
     /// example of the condition.
     pub const CREATE_SCHEMA_MAPPING_CONFLICT: &str = "SchemaMapping already exists.";
 
+    /// The `ValidationException$message` (HTTP 400) both schema-mapping write paths
+    /// answer when `mappedInputFields` does not declare exactly
+    /// [`super::REQUIRED_UNIQUE_ID_ATTRIBUTES`] attribute of type
+    /// [`super::UNIQUE_ID_ATTRIBUTE_TYPE`] (see [`super::unique_id_cardinality_defect`]).
+    ///
+    /// The text is AWS's own for this refusal, built from the two constants that STATE
+    /// the rule rather than written out as a sentence, so the required count and the
+    /// attribute type cannot drift from the check that enforces them. Nothing of the
+    /// request is composed into it: the schema's name and its field names are not part
+    /// of what AWS answers here.
+    pub fn schema_mapping_unique_id_cardinality() -> String {
+        format!(
+            "SchemaMapping must contain {} attribute with type: {}",
+            super::REQUIRED_UNIQUE_ID_ATTRIBUTES,
+            super::UNIQUE_ID_ATTRIBUTE_TYPE
+        )
+    }
+
+    /// The `AccessDeniedException$message` (HTTP 403) every write that hands this
+    /// service a caller-supplied `roleArn` answers when IAM shows the service cannot
+    /// assume it (see [`super::role_is_unassumable`]).
+    ///
+    /// A TEMPLATE over the request: AWS names the role the caller passed, which is what
+    /// tells a caller WHICH value to fix when a request carries more than one role, so
+    /// the ARN is taken from the request and never from any one recorded run.
+    pub fn role_not_assumable(role_arn: &str) -> String {
+        format!("Exception in assuming the passed role: {role_arn}")
+    }
+
     /// `CreateMatchingWorkflow`'s `ConflictException$message` (HTTP 400) when the
     /// `workflowName` is already taken. Not itself recorded; it is this operation's
     /// own constant, in the same form as the recorded
@@ -1199,6 +1228,25 @@ pub mod messages {
     /// InputSourceConfig"). Not recorded; a constant, not a composed sentence.
     pub const DELETE_SCHEMA_MAPPING_IN_USE: &str =
         "SchemaMapping is referenced by the InputSourceConfig of a MatchingWorkflow";
+
+    /// `UpdateSchemaMapping`'s `ConflictException$message` (HTTP 400) when a matching
+    /// workflow still names the schema in its `inputSourceConfig` — the refusal this
+    /// operation's own doc describes ("A schema is immutable if it is being used by a
+    /// workflow. Therefore, you can't update a schema mapping if it's associated with a
+    /// workflow"). Not itself recorded; this operation's OWN constant, kept apart from
+    /// [`DELETE_SCHEMA_MAPPING_IN_USE`] because nothing says AWS words the two alike,
+    /// and spelled with the resource types the API uses.
+    pub const UPDATE_SCHEMA_MAPPING_IN_USE: &str =
+        "SchemaMapping is immutable while it is referenced by the InputSourceConfig of a \
+         MatchingWorkflow";
+
+    /// `UpdateSchemaMapping`'s `ResourceNotFoundException$message` (HTTP 404) when no
+    /// schema mapping carries the `schemaName` @httpLabel. Not itself recorded; it is
+    /// this operation's own constant. The update addresses the SAME resource by the SAME
+    /// key as `GetSchemaMapping`, whose recorded text names no schema either, so it
+    /// follows the recorded [`GET_SCHEMA_MAPPING_NOT_FOUND`] form rather than the
+    /// templated delete one.
+    pub const UPDATE_SCHEMA_MAPPING_NOT_FOUND: &str = "SchemaMapping does not exist";
 
     /// `DeleteMatchingWorkflow`'s `ResourceNotFoundException$message` (HTTP 404).
     ///
@@ -1980,6 +2028,89 @@ pub fn incremental_run_conflict(
              resolutionTechniques.resolutionType is {resolution_type}"
         )
     })
+}
+
+/// The `SchemaAttributeType` that marks the attribute holding a record's own
+/// identifier.
+///
+/// One of the values `SchemaAttributeType` admits
+/// (`SCHEMA_ATTRIBUTE_TYPE_VALUES` = `ADDRESS … UNIQUE_ID`,
+/// `smithy_query(query="shape",shape="SchemaAttributeType")`), named here because
+/// [`unique_id_cardinality_defect`] is the one place the service branches on it.
+pub const UNIQUE_ID_ATTRIBUTE_TYPE: &str = "UNIQUE_ID";
+
+/// How many attributes of type [`UNIQUE_ID_ATTRIBUTE_TYPE`] a schema mapping declares.
+///
+/// A schema mapping's `UNIQUE_ID` attribute is the column that identifies ONE input
+/// record, which is what every id the matching surface answers is keyed by
+/// (`GenerateMatchId` takes "the unique ID of a record" and `BatchDeleteUniqueId`
+/// deletes by it), so a schema with none names no record and a schema with two names
+/// a record by two different columns at once. Exactly one, therefore.
+pub const REQUIRED_UNIQUE_ID_ATTRIBUTES: usize = 1;
+
+/// Why a schema mapping whose `mappedInputFields` does not declare exactly
+/// [`REQUIRED_UNIQUE_ID_ATTRIBUTES`] attribute of type [`UNIQUE_ID_ATTRIBUTE_TYPE`] is
+/// refused — `None` when the list satisfies the rule.
+///
+/// The model constrains `SchemaInputAttributes` only by LENGTH (2..60) and each
+/// member's `type` only by the `SchemaAttributeType` enum, so the model cannot express
+/// a condition over the WHOLE list and the boundary validator passes such a request:
+/// both write paths that take the list (`CreateSchemaMapping` and
+/// `UpdateSchemaMapping`, whose `mappedInputFields` is @required on each) refuse it
+/// here with the modelled `ValidationException` (HTTP 400) before anything is stored,
+/// so no schema this service holds is one AWS would have refused.
+pub fn unique_id_cardinality_defect(
+    mapped_input_fields: &[SchemaInputAttribute],
+) -> Option<String> {
+    let declared = mapped_input_fields
+        .iter()
+        .filter(|attribute| attribute.r#type == UNIQUE_ID_ATTRIBUTE_TYPE)
+        .count();
+    (declared != REQUIRED_UNIQUE_ID_ATTRIBUTES)
+        .then(messages::schema_mapping_unique_id_cardinality)
+}
+
+/// The service principal a caller-supplied `roleArn` has to let assume it.
+///
+/// Entity Resolution reads the caller's records and writes its output ITSELF, acting as
+/// the role the request hands it ("Entity Resolution assumes this role to create
+/// resources on your behalf as part of workflow execution",
+/// `smithy_query(query="doc",shape="CreateMatchingWorkflowInput",member="roleArn")`), so
+/// the role's trust policy has to name this principal.
+pub const SERVICE_PRINCIPAL: &str = "entityresolution.amazonaws.com";
+
+/// Why a request naming a `roleArn` this service cannot assume is refused — `None` when
+/// the request names no role, or when nothing is KNOWN about the one it names.
+///
+/// Every operation that STORES a caller-supplied role asks this before it writes,
+/// because the resource it creates RUNS AS that role, and refuses a request it answers
+/// for with the operation's modelled `AccessDeniedException` (HTTP 403) with nothing
+/// persisted. `roleArn` is optional on the ID-mapping and ID-namespace writes (modelled
+/// `default: ""`), and a request that names NO role hands the service nothing to assume,
+/// so there is nothing to resolve for it.
+///
+/// The whole question — which role of this account the value names, what IAM answers
+/// about it, and whether the trust document it carries admits a service principal — is
+/// the ONE reading every emulated service that resolves a caller-supplied role shares
+/// (`service_common::iam_role::role_is_unassumable`), so this crate states only WHICH
+/// principal has to be admitted ([`SERVICE_PRINCIPAL`]) and WHICH operations ask. IAM is
+/// reached the way any emulated service reaches another: the AWS SDK over the emulator's
+/// OWN in-process callback ([`smithy_server_runtime::OperationContext::callback`]), so
+/// this crate names no other service crate and nothing here opens a socket.
+///
+/// `None` — do not refuse — for every case where nothing is KNOWN about the role: a
+/// value that names no IAM role of this account (another account's IAM is not this
+/// emulator's to ask), or an emulator with no IAM mounted to ask at all. A refusal has
+/// to be grounded in what IAM answered, never assumed. Awaited with NO store guard held.
+pub async fn role_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: Option<&str>,
+) -> Option<String> {
+    let named = role_arn.filter(|value| !value.is_empty())?;
+    ::service_common::iam_role::role_is_unassumable(ctx, region, named, SERVICE_PRINCIPAL)
+        .await
+        .then(|| messages::role_not_assumable(named))
 }
 
 impl ComAmazonawsEntityresolutionAwsveniceserviceState {

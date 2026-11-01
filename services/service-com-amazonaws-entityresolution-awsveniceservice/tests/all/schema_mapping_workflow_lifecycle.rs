@@ -87,6 +87,27 @@ impl Emulator {
         Self { router, engine }
     }
 
+    /// The same emulator with the account's IAM service mounted BESIDE Entity Resolution
+    /// on the one shared engine.
+    ///
+    /// A write that hands this service a `roleArn` resolves that role by asking IAM over
+    /// the emulator's own in-process callback, so IAM has to be mounted for it to answer
+    /// at all — and every other suite here, which mounts Entity Resolution alone, is why
+    /// a role nothing can be shown about is never refused. The sibling
+    /// [`crate::role_resolution`] suite is the one that mounts both.
+    pub(crate) fn with_iam() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        Self { router, engine }
+    }
+
     /// The shared engine behind this emulator, for the one thing a response cannot
     /// show: how much the store holds.
     pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
@@ -349,13 +370,21 @@ struct SchemaCase {
 /// over absent and present.
 fn schema_cases() -> Vec<SchemaCase> {
     // The modelled 60-field maximum, built from the catalog so the list is a real
-    // 60-element `SchemaInputAttributes` rather than one repeated row.
+    // 60-element `SchemaInputAttributes` rather than one repeated row. A schema mapping
+    // declares EXACTLY ONE `UNIQUE_ID` attribute, so that one is the first field and the
+    // other 59 cycle the rest of the catalog.
+    let other_types: Vec<&str> = SCHEMA_ATTRIBUTE_TYPES
+        .iter()
+        .copied()
+        .filter(|attribute_type| *attribute_type != "UNIQUE_ID")
+        .collect();
     let widest: Vec<Value> = (0..60)
-        .map(|index| {
-            json!({
+        .map(|index| match index {
+            0 => json!({ "fieldName": "id", "type": "UNIQUE_ID" }),
+            _ => json!({
                 "fieldName": format!("col_{index}"),
-                "type": SCHEMA_ATTRIBUTE_TYPES[index % SCHEMA_ATTRIBUTE_TYPES.len()],
-            })
+                "type": other_types[(index - 1) % other_types.len()],
+            }),
         })
         .collect();
 
@@ -436,14 +465,14 @@ fn schema_cases() -> Vec<SchemaCase> {
             request: json!({
                 "schemaName": "s".repeat(255),
                 "mappedInputFields": [
-                    { "fieldName": "email", "type": "EMAIL_ADDRESS" },
+                    { "fieldName": "id", "type": "UNIQUE_ID" },
                     { "fieldName": "phone", "type": "PHONE_NUMBER" },
                 ],
             }),
             created_description: String::new(),
             read_description: None,
             mapped_input_fields: json!([
-                { "fieldName": "email", "type": "EMAIL_ADDRESS" },
+                { "fieldName": "id", "type": "UNIQUE_ID" },
                 { "fieldName": "phone", "type": "PHONE_NUMBER" },
             ]),
             tags: None,

@@ -33,5 +33,11 @@ hex = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# The account's own IAM records, mounted beside this service on one shared engine by the
+# role-resolution suite: a write that hands this service a `roleArn` asks IAM about that
+# role over the emulator's in-process callback, so IAM has to be there to answer.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+
 [lints]
 workspace = true

@@ -7,7 +7,10 @@
 //! every member of the response is read back out of the stored record, so
 //! `GetIdNamespace` cannot disagree with it. "Each ID namespace must have a unique
 //! name", so re-creating an existing `idNamespaceName` is refused with the modelled
-//! `ConflictException` (HTTP 400).
+//! `ConflictException` (HTTP 400). A `roleArn` this account's IAM shows the service
+//! cannot assume is refused with the modelled `AccessDeniedException` (HTTP 403) before
+//! anything is stored ([`crate::state::role_refusal`], the one reading every write that
+//! takes a role shares).
 //!
 //! ## Shape of an operation
 //!
@@ -204,6 +207,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One instant for both stamps: a namespace that has only just been created has
         // not been updated since, so `createdAt` and `updatedAt` are equal.
         let created = crate::state::now();
+
+        // The namespace's ID mapping RUNS AS the role the request names, so a role it
+        // names is resolved against this account's IAM BEFORE anything is minted or
+        // stored, and awaited with no store guard held. Only what IAM ANSWERED refuses
+        // the request.
+        if let Some(message) =
+            crate::state::role_refusal(ctx, &region, input.role_arn.as_deref()).await
+        {
+            return Err(CreateIdNamespaceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let mut store = state.lock();
 

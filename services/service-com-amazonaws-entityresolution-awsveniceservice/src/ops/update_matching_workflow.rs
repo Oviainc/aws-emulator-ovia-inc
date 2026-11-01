@@ -14,7 +14,10 @@
 //! unknown name answers the modelled `ResourceNotFoundException` (HTTP 404) and
 //! persists nothing; a request pairing an `incrementalRunConfig` with the `PROVIDER`
 //! `resolutionType` answers the modelled `ValidationException` (HTTP 400), the rule
-//! [`crate::state::incremental_run_conflict`] states.
+//! [`crate::state::incremental_run_conflict`] states; and a replacement `roleArn` this
+//! account's IAM shows the service cannot assume answers the modelled
+//! `AccessDeniedException` (HTTP 403), the rule [`crate::state::role_refusal`] states,
+//! leaving the stored workflow with the role it had.
 //!
 //! ## Shape of an operation
 //!
@@ -180,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateMatchingWorkflowErrorModeled::InternalServerException(InternalServerException {
@@ -189,6 +192,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
+
+        // The workflow RUNS AS the role this request would store on it, so the role is
+        // resolved against this account's IAM BEFORE the store is touched, and awaited
+        // with no store guard held. Only what IAM ANSWERED refuses the request.
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) =
+            crate::state::role_refusal(ctx, &region, Some(&input.role_arn)).await
+        {
+            return Err(UpdateMatchingWorkflowErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // The documented cross-member refusal is decided BEFORE the store is touched,
         // so a refused update leaves the workflow exactly as it was.

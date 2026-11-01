@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSchemaMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSchemaMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! REPLACES the `description` and the `mappedInputFields` of the schema mapping the
+//! `schemaName` @httpLabel names, in the SAME record `CreateSchemaMapping` wrote
+//! ([`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::schema_mappings`]),
+//! and refreshes its `updatedAt` — so a later `GetSchemaMapping` reads the values this
+//! call wrote and the two cannot disagree. The identity members (`schemaName`,
+//! `schemaArn`, `createdAt`) and the tags are not members of this request, so they stay
+//! as the create and `TagResource` left them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSchemaMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three refusals, each taken BEFORE anything is written, so a refused update leaves the
+//! stored mapping exactly as it was: a `mappedInputFields` that does not declare exactly
+//! one `UNIQUE_ID` attribute is the modelled `ValidationException` (HTTP 400)
+//! ([`crate::state::unique_id_cardinality_defect`], the one reading
+//! `CreateSchemaMapping` shares); a `schemaName` no mapping carries is the modelled
+//! `ResourceNotFoundException` (HTTP 404); and a mapping some matching workflow still
+//! names in its `inputSourceConfig` is the modelled `ConflictException` (HTTP 400),
+//! because "a schema is immutable if it is being used by a workflow".
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +173,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSchemaMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSchemaMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSchemaMapping"))
+        // An access record for this mutating call, emitted before any refusal can
+        // return so an attempt is recorded whatever its outcome. Request METADATA only:
+        // the name addressed and how many attributes the new list carries, never the
+        // attributes themselves or anything of the stored record.
+        ::tracing::info!(
+            operation = "UpdateSchemaMapping",
+            schema_name = %input.schema_name,
+            mapped_input_fields = input.mapped_input_fields.len(),
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            "schema mapping update requested"
+        );
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateSchemaMappingErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        // The list-wide rule the model cannot express is decided BEFORE the store is
+        // touched, so a refused update leaves the stored mapping exactly as it was.
+        if let Some(message) =
+            crate::state::unique_id_cardinality_defect(&input.mapped_input_fields)
+        {
+            return Err(UpdateSchemaMappingErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let updated = crate::state::now();
+
+        let mut store = state.lock();
+
+        // "A schema is immutable if it is being used by a workflow": refused while a
+        // matching workflow still names this schema in its `inputSourceConfig`, and
+        // refused BEFORE the write, so a conflicting update changes nothing. The
+        // relationship is derived from the workflows that exist NOW — the same reading
+        // `GetSchemaMapping` serves `hasWorkflows` from and `DeleteSchemaMapping`
+        // refuses on — so it cannot go stale.
+        let referenced = store.schema_has_workflows(&input.schema_name);
+
+        let stored = store
+            .schema_mappings
+            .get_mut(&input.schema_name)
+            .ok_or_else(|| {
+                UpdateSchemaMappingErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::messages::UPDATE_SCHEMA_MAPPING_NOT_FOUND.to_string(),
+                        ),
+                    },
+                )
+            })?;
+
+        if referenced {
+            return Err(UpdateSchemaMappingErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(
+                        crate::state::messages::UPDATE_SCHEMA_MAPPING_IN_USE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The two members this operation models are REPLACED wholesale, including an
+        // absent `description`, which says the schema now carries none.
+        stored.description = input.description;
+        stored.mapped_input_fields = input.mapped_input_fields;
+        stored.updated_at = updated;
+
+        // Answered from the STORED record, not from the request object: this response
+        // and a later `GetSchemaMapping` therefore cannot disagree.
+        Ok(UpdateSchemaMappingOutput {
+            schema_name: stored.schema_name.clone(),
+            schema_arn: stored.schema_arn.clone(),
+            description: stored.description.clone(),
+            mapped_input_fields: stored.mapped_input_fields.clone(),
+        })
     }
 }
