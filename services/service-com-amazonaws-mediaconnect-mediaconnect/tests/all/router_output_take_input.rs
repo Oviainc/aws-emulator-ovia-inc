@@ -285,13 +285,22 @@ async fn create_output(
 
 /// Create the router input `configuration` describes under `name` and answer its
 /// `(Arn, Name)`.
+///
+/// The input is created with the GLOBAL routing scope, which "connects to outputs in any
+/// Region" (`CreateRouterInputRequest$RoutingScope`), because the rows below cross every
+/// input with every kind of router output — including one that lives in another Region. What
+/// the routing scopes and the Regions of a pair admit is its own rule, asserted over its own
+/// table in `tests/all/router_route_region_scope.rs`; these cases are about the association
+/// itself.
 async fn create_input(
     emulator: &Emulator,
     case: &str,
     name: &str,
     configuration: Value,
 ) -> (String, String) {
-    let (status, code, created) = create_router_input(emulator, create_body(name, configuration)).await;
+    let mut body = create_body(name, configuration);
+    body["routingScope"] = json!("GLOBAL");
+    let (status, code, created) = create_router_input(emulator, body).await;
     assert_eq!(
         (status, code.as_deref()),
         (201, None),

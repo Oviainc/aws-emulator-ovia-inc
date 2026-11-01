@@ -350,6 +350,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(rejection));
         }
 
+        // The routing scope the input ENDS UP with bounds the associations it may be part
+        // of: a REGIONAL input reaches outputs in its own Region only, so narrowing the
+        // scope of an input that is routed to an output in another Region would leave
+        // standing an association the stored scope forbids. Judged through the crate's one
+        // reading of that rule, the same one TakeRouterInput records an association through
+        // (`crate::state::routing_scopes_admit_association`), over the outputs this input is
+        // routed to. A request that does not move the scope is never refused for an
+        // association it did not introduce.
+        if let Some(routing_scope) = input.routing_scope.as_deref() {
+            let Some(router_input) = store.router_inputs.get(&input.arn) else {
+                return Err(store_unavailable(
+                    "the router input could not be read back before it was updated",
+                ));
+            };
+            if let Some(rejection) =
+                store.router_input_routing_scope_rejection(router_input, routing_scope)
+            {
+                return Err(refused_by_input(format!(
+                    "{rejection} Unroute the router output before narrowing the router \
+                     input's RoutingScope."
+                )));
+            }
+        }
+
         // Nothing above this line has written anything, so a refused request changes nothing
         // at all. The record is taken mutably only now, once every verdict is in.
         let Some(router_input) = store.router_inputs.get_mut(&input.arn) else {

@@ -4984,6 +4984,88 @@ pub fn default_availability_zone(region: &str) -> String {
     format!("{region}a")
 }
 
+/// The `RoutingScope` member that binds a router resource to its own Region
+/// (`smithy_query(query="shape",shape="RoutingScope")` declares REGIONAL and GLOBAL): a
+/// REGIONAL router input "connects only to outputs in same Region"
+/// (`CreateRouterInputRequest$RoutingScope`) and a REGIONAL router output "can only take
+/// inputs from same Region" (`CreateRouterOutputRequest$RoutingScope`). The other member
+/// puts no such bound on the side that carries it.
+pub const ROUTING_SCOPE_REGIONAL: &str = "REGIONAL";
+
+/// Whether a router input in `router_input_region` whose routing scope is
+/// `router_input_scope` may be associated with a router output in `router_output_region`
+/// whose routing scope is `router_output_scope`.
+///
+/// The model states one rule from both sides of the association — a REGIONAL input reaches
+/// outputs in its own Region only, and a REGIONAL output takes inputs from its own Region
+/// only — so a pair in ONE Region is admitted whatever the two scopes are, and a pair that
+/// spans two Regions is admitted only when NEITHER side is bound to its Region
+/// ([`ROUTING_SCOPE_REGIONAL`]). This is the crate's one reading of that rule: every
+/// operation that would record such an association, or leave a recorded one standing under
+/// a narrower scope, asks here.
+pub fn routing_scopes_admit_association(
+    router_input_scope: &str,
+    router_input_region: &str,
+    router_output_scope: &str,
+    router_output_region: &str,
+) -> bool {
+    router_input_region == router_output_region
+        || (router_input_scope != ROUTING_SCOPE_REGIONAL
+            && router_output_scope != ROUTING_SCOPE_REGIONAL)
+}
+
+/// The sentence a refusal carries when [`routing_scopes_admit_association`] does not admit
+/// the pair: both sides, with the scope and the Region the verdict was taken on, and the
+/// rule they break.
+///
+/// One function, so a take that would record the association and an update that would
+/// narrow a scope under one state the same rule the same way.
+pub fn cross_region_association_detail(
+    router_input_arn: &str,
+    router_input_scope: &str,
+    router_input_region: &str,
+    router_output_arn: &str,
+    router_output_scope: &str,
+    router_output_region: &str,
+) -> String {
+    format!(
+        "Router input {router_input_arn} (RoutingScope {router_input_scope}, RegionName \
+         {router_input_region}) cannot be associated with router output {router_output_arn} \
+         (RoutingScope {router_output_scope}, RegionName {router_output_region}): a REGIONAL \
+         router input connects only to router outputs in the same Region, and a REGIONAL \
+         router output can only take router inputs from the same Region."
+    )
+}
+
+/// Why the router input `router_input` cannot be associated with the router output
+/// `router_output`, or `None` when the pair may be associated.
+///
+/// The verdict is [`routing_scopes_admit_association`] over the two STORED records, so the
+/// association TakeRouterInput records is one the two sides' routing scopes and Regions
+/// admit — and the route an output reports, and the count an input reports, name an
+/// association the model allows to exist.
+pub fn cross_region_route_rejection(
+    router_input: &StoredRouterInput,
+    router_output: &StoredRouterOutput,
+) -> Option<String> {
+    if routing_scopes_admit_association(
+        &router_input.routing_scope,
+        &router_input.region_name,
+        &router_output.routing_scope,
+        &router_output.region_name,
+    ) {
+        return None;
+    }
+    Some(cross_region_association_detail(
+        &router_input.arn,
+        &router_input.routing_scope,
+        &router_input.region_name,
+        &router_output.arn,
+        &router_output.routing_scope,
+        &router_output.region_name,
+    ))
+}
+
 /// A router output, as the service holds it between calls. Every router output
 /// operation's response is computed from this record.
 #[derive(Debug, Clone)]
@@ -6168,6 +6250,71 @@ impl ComAmazonawsMediaconnectMediaconnectState {
             .filter(|router_output| router_output.routed_input_arn.as_deref() == Some(input_arn))
             .count();
         i32::try_from(routed).unwrap_or(i32::MAX)
+    }
+
+    /// Why the router input `router_input` cannot be given the routing scope
+    /// `routing_scope`, or `None` when every association it is currently part of survives
+    /// that scope.
+    ///
+    /// The relation lives on the output records ([`StoredRouterOutput::routed_input_arn`]),
+    /// so the outputs routed to this input are the pairs the narrower scope is judged over,
+    /// through the same rule a take is judged through: an update may not leave standing an
+    /// association the scope it stores forbids.
+    pub fn router_input_routing_scope_rejection(
+        &self,
+        router_input: &StoredRouterInput,
+        routing_scope: &str,
+    ) -> Option<String> {
+        self.router_outputs
+            .values()
+            .find(|router_output| {
+                router_output.routed_input_arn.as_deref() == Some(router_input.arn.as_str())
+                    && !routing_scopes_admit_association(
+                        routing_scope,
+                        &router_input.region_name,
+                        &router_output.routing_scope,
+                        &router_output.region_name,
+                    )
+            })
+            .map(|router_output| {
+                cross_region_association_detail(
+                    &router_input.arn,
+                    routing_scope,
+                    &router_input.region_name,
+                    &router_output.arn,
+                    &router_output.routing_scope,
+                    &router_output.region_name,
+                )
+            })
+    }
+
+    /// Why the router output `router_output` cannot be given the routing scope
+    /// `routing_scope`, or `None` when the association it currently carries survives that
+    /// scope — the router output side of [`Self::router_input_routing_scope_rejection`].
+    pub fn router_output_routing_scope_rejection(
+        &self,
+        router_output: &StoredRouterOutput,
+        routing_scope: &str,
+    ) -> Option<String> {
+        let router_input = self
+            .router_inputs
+            .get(router_output.routed_input_arn.as_deref()?)?;
+        if routing_scopes_admit_association(
+            &router_input.routing_scope,
+            &router_input.region_name,
+            routing_scope,
+            &router_output.region_name,
+        ) {
+            return None;
+        }
+        Some(cross_region_association_detail(
+            &router_input.arn,
+            &router_input.routing_scope,
+            &router_input.region_name,
+            &router_output.arn,
+            routing_scope,
+            &router_output.region_name,
+        ))
     }
 
     /// The modelled `RouterInput` the store holds for `arn`, with everything the clock

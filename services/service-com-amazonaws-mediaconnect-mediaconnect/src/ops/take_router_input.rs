@@ -100,6 +100,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse a WELL-FORMED request the two records it names do not admit, with
+/// `BadRequestException` (HTTP 400): "thrown if the request contains a semantic error. The
+/// precise meaning depends on the API, and is documented in the error message". The request
+/// is not malformed, so the sentence carries the envelope this service puts on a refusal the
+/// addressed resources' own properties state ([`crate::state::bad_request_message`]), the
+/// way the router update operations word theirs.
+fn refused_pair(detail: impl Into<String>) -> TakeRouterInputError {
+    TakeRouterInputErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::bad_request_message(&detail.into()),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -237,6 +250,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
+                // The two records' ROUTING SCOPES and REGIONS decide whether this
+                // association may exist at all: a REGIONAL side reaches only counterparts
+                // in its own Region, so a pair spanning two Regions is admitted only when
+                // neither side is bound to its own. The verdict is the crate's one reading
+                // of that rule (`crate::state::cross_region_route_rejection`), taken on the
+                // stored records, and it is a semantic refusal of a well-formed request —
+                // the modelled `BadRequestException` — not a state conflict: no later call
+                // on either resource would make this pair routable.
+                let Some(router_output) = store.router_outputs.get(&input.router_output_arn)
+                else {
+                    return Err(TakeRouterInputErrorModeled::NotFoundException(
+                        NotFoundException {
+                            message: crate::state::not_found_message(&input.router_output_arn),
+                        },
+                    )
+                    .into());
+                };
+                if let Some(rejection) =
+                    crate::state::cross_region_route_rejection(router_input, router_output)
+                {
+                    return Err(refused_pair(rejection));
+                }
+
                 Some((router_input.arn.clone(), router_input.name.clone()))
             }
             // A request that names no router input asks for the output to carry nothing.
