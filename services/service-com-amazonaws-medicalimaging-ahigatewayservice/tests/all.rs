@@ -91,6 +91,8 @@ mod resource_tagging;
 mod search_sort_key_page_token;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/study_date_range_bounds.rs"]
+mod study_date_range_bounds;
 #[path = "all/study_update_membership.rs"]
 mod study_update_membership;
 #[path = "all/tag_map_rule_order.rs"]

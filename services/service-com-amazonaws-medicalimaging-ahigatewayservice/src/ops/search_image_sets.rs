@@ -31,7 +31,12 @@
 //!   (HTTP 400) rather than answered with an empty page.
 //!
 //! A study date and time bound that names no `DICOMStudyTime` bounds the whole study
-//! DATE, which is what makes a one-day range expressible with the date alone.
+//! DATE, which is what makes a one-day range expressible with the date alone. The check
+//! that two bounds state a usable range reads a bound exactly as the range's evaluation
+//! does, so a range is refused as out of order only when no study date and time could lie
+//! in it: a time-less lower bound starts at the first instant of its date and a time-less
+//! upper bound runs to the last instant of its own, so bounds of one date state a range
+//! whenever either of them names no time.
 //!
 //! # The order, and where a page resumes
 //!
@@ -566,14 +571,32 @@ impl SortKey {
 /// ordering of the pair, not of two strings glued together.
 const STUDY_RANK_SEPARATOR: char = '\u{1f}';
 
-/// The rank of a stored study date and time. An image set carrying neither ranks below
-/// every image set carrying either, because an absent value is the lowest.
+/// The rank of a STORED study date and time. An image set carrying neither ranks below
+/// every image set carrying either, because an absent value is the lowest — which is also
+/// how a stored time is placed against a bound ([`place_against_bound`]), so the order a
+/// search walks and the ranges it evaluates agree about a record holding no time.
 fn study_rank(study_date: Option<&str>, study_time: Option<&str>) -> String {
     format!(
         "{}{STUDY_RANK_SEPARATOR}{}",
         study_date.unwrap_or_default(),
         study_time.unwrap_or_default()
     )
+}
+
+/// One study date and time a filter compares AGAINST, as canonical text.
+///
+/// A value naming no `DICOMStudyTime` is compared by date alone — it stands for the whole
+/// date — which is not the comparison a value naming a time states, and the model admits
+/// the empty time (`DICOMStudyTime` carries no minimum length), so the two spell different
+/// text rather than digesting to one marker for filters that select different image sets.
+/// The date is length-prefixed, so no date can spell another value's text by sliding a
+/// separator into itself.
+fn study_bound_canonical(value: &DICOMStudyDateAndTime) -> String {
+    let date = &value.dicom_study_date;
+    match value.dicom_study_time.as_deref() {
+        None => format!("{} {date} whole-date", date.len()),
+        Some(time) => format!("{} {date} at {} {time}", date.len(), time.len()),
+    }
 }
 
 /// The key an instant ranks by, to full nanosecond precision.
@@ -632,13 +655,9 @@ fn attribute_canonical(value: &SearchByAttributeValue) -> String {
         SearchByAttributeValue::updatedAt(wanted) => {
             ("updatedAt", instant_canonical(date_time_key(wanted)))
         }
-        SearchByAttributeValue::DICOMStudyDateAndTime(wanted) => (
-            "DICOMStudyDateAndTime",
-            study_rank(
-                Some(&wanted.dicom_study_date),
-                wanted.dicom_study_time.as_deref(),
-            ),
-        ),
+        SearchByAttributeValue::DICOMStudyDateAndTime(wanted) => {
+            ("DICOMStudyDateAndTime", study_bound_canonical(wanted))
+        }
         SearchByAttributeValue::isPrimary(wanted) => ("isPrimary", wanted.to_string()),
     };
     format!("{member} {} {text}", text.len())
@@ -828,10 +847,8 @@ impl RangeFilter {
                 instant_canonical(*upper)
             ),
             Self::StudyDateAndTime { lower, upper } => {
-                let lower =
-                    study_rank(Some(&lower.dicom_study_date), lower.dicom_study_time.as_deref());
-                let upper =
-                    study_rank(Some(&upper.dicom_study_date), upper.dicom_study_time.as_deref());
+                let lower = study_bound_canonical(lower);
+                let upper = study_bound_canonical(upper);
                 format!(
                     "DICOMStudyDateAndTime {} {lower} {} {upper}",
                     lower.len(),
@@ -843,12 +860,24 @@ impl RangeFilter {
 
     /// Whether the bounds are in the order the documentation requires, `(lowerBound,
     /// upperBound)`.
+    ///
+    /// For a study date and time that is decided by the SAME placement the range is
+    /// evaluated with ([`place_against_bound`]): the bounds state a usable range exactly
+    /// when the earliest study date and time the lower bound admits is one the upper bound
+    /// admits too. A bound naming no `DICOMStudyTime` bounds the whole of its date, so a
+    /// time-less lower bound starts at the first instant of its date and a time-less upper
+    /// bound runs to the last instant of its own — which is why two bounds of the same date
+    /// state a range whenever either of them names no time, and are placed by time only
+    /// when both do.
     fn is_ordered(&self) -> bool {
         match self {
             Self::CreatedAt { lower, upper } | Self::UpdatedAt { lower, upper } => lower <= upper,
             Self::StudyDateAndTime { lower, upper } => {
-                study_rank(Some(&lower.dicom_study_date), lower.dicom_study_time.as_deref())
-                    <= study_rank(Some(&upper.dicom_study_date), upper.dicom_study_time.as_deref())
+                place_against_bound(
+                    &lower.dicom_study_date,
+                    lower.dicom_study_time.as_deref(),
+                    upper,
+                ) != Ordering::Greater
             }
         }
     }
@@ -890,17 +919,34 @@ fn instant_pair(instant: SystemTime) -> (i64, u32) {
 /// compared, so every study of that date is inside it whatever its time.
 fn compare_study(tags: &DICOMTags, bound: &DICOMStudyDateAndTime) -> Option<Ordering> {
     let stored_date = tags.dicom_study_date.as_deref()?;
-    let by_date = stored_date.cmp(bound.dicom_study_date.as_str());
+    Some(place_against_bound(
+        stored_date,
+        tags.dicom_study_time.as_deref(),
+        bound,
+    ))
+}
+
+/// Where the study date and time `(candidate_date, candidate_time)` sits against `bound` —
+/// the ONE placement every study-date-and-time comparison this operation makes goes
+/// through, so the check that decides whether a range is usable and the evaluation of that
+/// range cannot read the same pair of bounds differently.
+///
+/// A bound that names no `DICOMStudyTime` bounds the whole study DATE: only the dates are
+/// compared, so every time of that date is inside it. A candidate with no time is placed
+/// at the start of its date — which is both where a stored study carrying no time sits and
+/// the earliest study a time-less LOWER BOUND admits, so the candidate may be either a
+/// stored pair or a lower bound's own value.
+fn place_against_bound(
+    candidate_date: &str,
+    candidate_time: Option<&str>,
+    bound: &DICOMStudyDateAndTime,
+) -> Ordering {
+    let by_date = candidate_date.cmp(bound.dicom_study_date.as_str());
     if by_date != Ordering::Equal {
-        return Some(by_date);
+        return by_date;
     }
     let Some(bound_time) = bound.dicom_study_time.as_deref() else {
-        return Some(Ordering::Equal);
+        return Ordering::Equal;
     };
-    Some(
-        tags.dicom_study_time
-            .as_deref()
-            .unwrap_or_default()
-            .cmp(bound_time),
-    )
+    candidate_time.unwrap_or_default().cmp(bound_time)
 }
