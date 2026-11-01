@@ -431,8 +431,11 @@ async fn the_per_resource_tag_ceiling_is_reported_and_never_exceeded() {
         ),
     ];
 
-    for (case, batches) in &cases {
-        let arn = create_resource(&router, "asset-model", "capped").await;
+    for (at, (case, batches)) in cases.iter().enumerate() {
+        // A fresh resource per row, under a name of its own: `assetModelName` is
+        // unique per account, so two rows cannot both open a model called
+        // "capped".
+        let arn = create_resource(&router, "asset-model", &format!("capped-{at}")).await;
         for batch in batches {
             let (status, body) = tag_resource(&router, &arn, tags_json(batch)).await;
             assert_eq!(

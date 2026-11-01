@@ -154,7 +154,7 @@ struct ReplacementRow {
     /// Built from the model as `DescribeAssetModel` reports it before the update,
     /// so a row can resubmit the stored properties with their ids.
     update: Box<dyn Fn(&Value) -> Value>,
-    expected_name: &'static str,
+    expected_name: Option<&'static str>,
     expected_description: &'static str,
     expected_properties: Vec<&'static str>,
     expected_hierarchies: Vec<&'static str>,
@@ -182,7 +182,7 @@ async fn update_asset_model_replaces_the_whole_stored_definition() {
                     "assetModelProperties": before["assetModelProperties"].clone(),
                 })
             }),
-            expected_name: "Renamed",
+            expected_name: Some("Renamed"),
             // The request carried no description, so the model keeps none: this
             // request describes the new state rather than patching the old one.
             expected_description: "",
@@ -194,12 +194,12 @@ async fn update_asset_model_replaces_the_whole_stored_definition() {
             case: "a new description",
             update: Box::new(|before| {
                 json!({
-                    "assetModelName": "Boiler",
+                    "assetModelName": before["assetModelName"].clone(),
                     "assetModelDescription": "the definition after the update",
                     "assetModelProperties": before["assetModelProperties"].clone(),
                 })
             }),
-            expected_name: "Boiler",
+            expected_name: None,
             expected_description: "the definition after the update",
             expected_properties: vec!["Temperature", "Serial"],
             expected_hierarchies: vec![],
@@ -217,11 +217,11 @@ async fn update_asset_model_replaces_the_whole_stored_definition() {
                     "type": {"measurement": {}},
                 }));
                 json!({
-                    "assetModelName": "Boiler",
+                    "assetModelName": before["assetModelName"].clone(),
                     "assetModelProperties": properties,
                 })
             }),
-            expected_name: "Boiler",
+            expected_name: None,
             expected_description: "",
             expected_properties: vec!["Temperature", "Serial", "Pressure"],
             expected_hierarchies: vec![],
@@ -238,11 +238,11 @@ async fn update_asset_model_replaces_the_whole_stored_definition() {
                     .filter(|property| property["name"] != "Temperature")
                     .collect();
                 json!({
-                    "assetModelName": "Boiler",
+                    "assetModelName": before["assetModelName"].clone(),
                     "assetModelProperties": properties,
                 })
             }),
-            expected_name: "Boiler",
+            expected_name: None,
             expected_description: "",
             expected_properties: vec!["Serial"],
             expected_hierarchies: vec![],
@@ -250,8 +250,8 @@ async fn update_asset_model_replaces_the_whole_stored_definition() {
         },
         ReplacementRow {
             case: "every property removed by omitting the list",
-            update: Box::new(|_| json!({ "assetModelName": "Boiler" })),
-            expected_name: "Boiler",
+            update: Box::new(|before| json!({ "assetModelName": before["assetModelName"].clone() })),
+            expected_name: None,
             expected_description: "",
             expected_properties: vec![],
             expected_hierarchies: vec![],
@@ -274,11 +274,11 @@ async fn update_asset_model_replaces_the_whole_stored_definition() {
                     })
                     .collect();
                 json!({
-                    "assetModelName": "Boiler",
+                    "assetModelName": before["assetModelName"].clone(),
                     "assetModelProperties": properties,
                 })
             }),
-            expected_name: "Boiler",
+            expected_name: None,
             expected_description: "",
             expected_properties: vec!["CoreTemperature", "Serial"],
             expected_hierarchies: vec![],
@@ -288,14 +288,14 @@ async fn update_asset_model_replaces_the_whole_stored_definition() {
             case: "a hierarchy added",
             update: Box::new(move |before| {
                 json!({
-                    "assetModelName": "Boiler",
+                    "assetModelName": before["assetModelName"].clone(),
                     "assetModelProperties": before["assetModelProperties"].clone(),
                     "assetModelHierarchies": [
                         {"name": "Sensors", "childAssetModelId": child_for_rows.clone()},
                     ],
                 })
             }),
-            expected_name: "Boiler",
+            expected_name: None,
             expected_description: "",
             expected_properties: vec!["Temperature", "Serial"],
             expected_hierarchies: vec!["Sensors"],
@@ -305,12 +305,12 @@ async fn update_asset_model_replaces_the_whole_stored_definition() {
             case: "an external id assigned",
             update: Box::new(|before| {
                 json!({
-                    "assetModelName": "Boiler",
+                    "assetModelName": before["assetModelName"].clone(),
                     "assetModelExternalId": "boiler.line-one",
                     "assetModelProperties": before["assetModelProperties"].clone(),
                 })
             }),
-            expected_name: "Boiler",
+            expected_name: None,
             expected_description: "",
             expected_properties: vec!["Temperature", "Serial"],
             expected_hierarchies: vec![],
@@ -322,10 +322,12 @@ async fn update_asset_model_replaces_the_whole_stored_definition() {
     // CREATING -> ACTIVE transition is a clock the store shares, so after a single
     // wait every model has settled and the state the update reports is the one
     // THIS call owes. Each carries a description, so a row whose request carries
-    // none is observably a removal.
+    // none is observably a removal, and each carries a NAME of its own, because
+    // `assetModelName` is unique per account; a row that keeps its name resubmits
+    // the one its model reads back with.
     let mut model_ids = Vec::new();
-    for _ in &rows {
-        model_ids.push(create_described_model(&router, "Boiler").await);
+    for at in 0..rows.len() {
+        model_ids.push(create_described_model(&router, &format!("Boiler-{at}")).await);
     }
     tokio::time::sleep(PAST_ACTIVATION).await;
 
@@ -339,6 +341,12 @@ async fn update_asset_model_replaces_the_whole_stored_definition() {
             row.case
         );
         let before_ids = ids_by_name(&seed["assetModelProperties"]);
+        // The name the row's model was created with: what a row that does not
+        // rename must still report.
+        let seed_name = seed["assetModelName"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let before_tag = describe_e_tag(&router, &model_id).await;
         let before_version = seed["assetModelVersion"].as_str().unwrap_or("0").to_string();
 
@@ -366,7 +374,7 @@ async fn update_asset_model_replaces_the_whole_stored_definition() {
         let after = describe_model(&router, &model_id).await;
         assert_eq!(
             after["assetModelName"].as_str(),
-            Some(row.expected_name),
+            Some(row.expected_name.unwrap_or(&seed_name)),
             "case {:?}: unexpected name in {after}",
             row.case
         );
@@ -498,7 +506,10 @@ async fn an_existing_property_may_change_its_name_but_not_its_type_or_data_type(
                 property
             })
             .collect();
-        json!({"assetModelName": "Boiler", "assetModelProperties": properties})
+        json!({
+            "assetModelName": before["assetModelName"].clone(),
+            "assetModelProperties": properties,
+        })
     }
 
     let rows: Vec<PropertyRuleRow> = vec![
@@ -571,15 +582,18 @@ async fn an_existing_property_may_change_its_name_but_not_its_type_or_data_type(
                     .unwrap_or_default();
                 let first = properties.first().cloned().expect("a stored property");
                 properties.push(first);
-                json!({"assetModelName": "Boiler", "assetModelProperties": properties})
+                json!({
+                    "assetModelName": before["assetModelName"].clone(),
+                    "assetModelProperties": properties,
+                })
             }),
             expected_status: 400,
         },
         PropertyRuleRow {
             case: "a new property carrying no property type",
-            update: Box::new(|_| {
+            update: Box::new(|before| {
                 json!({
-                    "assetModelName": "Boiler",
+                    "assetModelName": before["assetModelName"].clone(),
                     "assetModelProperties": [{"name": "P", "dataType": "DOUBLE", "type": {}}],
                 })
             }),
@@ -587,9 +601,9 @@ async fn an_existing_property_may_change_its_name_but_not_its_type_or_data_type(
         },
         PropertyRuleRow {
             case: "a new property carrying two property types",
-            update: Box::new(|_| {
+            update: Box::new(|before| {
                 json!({
-                    "assetModelName": "Boiler",
+                    "assetModelName": before["assetModelName"].clone(),
                     "assetModelProperties": [{
                         "name": "P", "dataType": "DOUBLE",
                         "type": {"measurement": {}, "attribute": {}},
@@ -600,9 +614,9 @@ async fn an_existing_property_may_change_its_name_but_not_its_type_or_data_type(
         },
         PropertyRuleRow {
             case: "a new STRUCT property carrying no dataTypeSpec",
-            update: Box::new(|_| {
+            update: Box::new(|before| {
                 json!({
-                    "assetModelName": "Boiler",
+                    "assetModelName": before["assetModelName"].clone(),
                     "assetModelProperties": [{
                         "name": "P", "dataType": "STRUCT", "type": {"measurement": {}},
                     }],
@@ -612,8 +626,10 @@ async fn an_existing_property_may_change_its_name_but_not_its_type_or_data_type(
         },
     ];
 
-    for row in &rows {
-        let model_id = create_model(&router, "Boiler", seed_properties.clone()).await;
+    for (at, row) in rows.iter().enumerate() {
+        // A model of its own per row, under a name of its own: `assetModelName` is
+        // unique per account, and every row resubmits the name its model holds.
+        let model_id = create_model(&router, &format!("Boiler-{at}"), seed_properties.clone()).await;
         let before = describe_model(&router, &model_id).await;
         let before_tag = describe_e_tag(&router, &model_id).await;
 
@@ -719,17 +735,19 @@ async fn update_asset_model_evaluates_its_conditional_headers_before_writing() {
         ),
     ];
 
-    // One model per row, each already updated once so it has an earlier version
+    // One model per row, each under a name of its own because `assetModelName` is
+    // unique per account, each already updated once so it has an earlier version
     // whose tag is the `$STALE` token, then waited for ONCE so every model's owed
     // transition has fallen due and its ACTIVE version exists.
     let mut cases: Vec<ConditionalCase<'_>> = Vec::new();
-    for (case, headers, expected) in &rows {
-        let model_id = create_model(&router, "Boiler", base_properties()).await;
+    for (at, (case, headers, expected)) in rows.iter().enumerate() {
+        let seed_name = format!("Boiler-{at}");
+        let model_id = create_model(&router, &seed_name, base_properties()).await;
         let stale = describe_e_tag(&router, &model_id).await;
         let (status, answered) = update_model(
             &router,
             &model_id,
-            json!({"assetModelName": "Boiler", "assetModelProperties": base_properties()}),
+            json!({"assetModelName": seed_name, "assetModelProperties": base_properties()}),
             &[],
         )
         .await;
@@ -740,6 +758,14 @@ async fn update_asset_model_evaluates_its_conditional_headers_before_writing() {
 
     for (case, headers, expected, model_id, stale) in &cases {
         let tag = describe_e_tag(&router, model_id).await;
+        // The name this model holds, and the one the conditioned update asks for:
+        // a rename may not take a name another model holds, so each row's target
+        // is derived from the name its own model carries.
+        let held_name = describe_model(&router, model_id).await["assetModelName"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let conditioned = format!("{held_name}-conditioned");
         assert_ne!(
             &tag, stale,
             "case {case:?}: the seeding update must have changed the tag, both {tag}"
@@ -759,7 +785,7 @@ async fn update_asset_model_evaluates_its_conditional_headers_before_writing() {
         let (status, answered) = update_model(
             &router,
             model_id,
-            json!({"assetModelName": "Conditioned", "assetModelProperties": base_properties()}),
+            json!({"assetModelName": conditioned, "assetModelProperties": base_properties()}),
             &headers,
         )
         .await;
@@ -779,7 +805,7 @@ async fn update_asset_model_evaluates_its_conditional_headers_before_writing() {
             // version are the ones the read reported.
             assert_eq!(
                 after["assetModelName"].as_str(),
-                Some("Boiler"),
+                Some(held_name.as_str()),
                 "case {case:?}: a refused update must leave the name alone, got {after}"
             );
             assert_eq!(
@@ -790,7 +816,7 @@ async fn update_asset_model_evaluates_its_conditional_headers_before_writing() {
         } else {
             assert_eq!(
                 after["assetModelName"].as_str(),
-                Some("Conditioned"),
+                Some(conditioned.as_str()),
                 "case {case:?}: the accepted update must have landed, got {after}"
             );
         }

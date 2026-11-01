@@ -347,6 +347,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `assetModelName` is "A unique name for the asset model", so a second
+        // asset model may not take a name one already holds — the same
+        // one-name-one-resource rule `CreateGateway` enforces for the identically
+        // documented `gatewayName`. The refusal names the collided DIMENSION and
+        // points `resourceId`/`resourceArn` at the model that holds the name.
+        if let Some((holder, holder_arn)) = store
+            .asset_model_holding_name(&input.asset_model_name, None)
+            .map(|record| (record.id.clone(), record.arn.clone()))
+        {
+            return Err(already_exists(&holder, holder_arn, "name"));
+        }
+
         let properties =
             convert_property_definitions(input.asset_model_properties.as_deref().unwrap_or(&[]))?;
 

@@ -4335,6 +4335,28 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         }
     }
 
+    /// The asset model, other than `except`, that already holds `name`.
+    ///
+    /// `assetModelName` is documented "A unique name for the asset model", so a
+    /// name one asset model holds is not free for another: a create may not take
+    /// it, and neither may a rename. `except` is the model the request is about —
+    /// a model is never in conflict with the name it already carries — and is
+    /// `None` for a create, which is about no stored model yet.
+    ///
+    /// Answers the RECORD, so the refusal names the holder by the id and the ARN
+    /// that model carries rather than by anything rebuilt from the refused
+    /// request. One place, so the create and the rename cannot read one rule two
+    /// ways.
+    pub fn asset_model_holding_name(
+        &self,
+        name: &str,
+        except: Option<&str>,
+    ) -> Option<&AssetModelRecord> {
+        self.asset_models
+            .values()
+            .find(|record| record.name == name && Some(record.id.as_str()) != except)
+    }
+
     /// Resolve a `CustomID` label — a raw id or `externalId:<externalId>` — to a
     /// stored `assetId`.
     pub fn resolve_asset_id(&self, label: &str) -> Option<String> {

@@ -84,6 +84,12 @@ struct CreateRow {
     /// The same request with ONE member different, which is a DIFFERENT request
     /// and so must not replay.
     changed: Value,
+    /// The body the FRESH-token call sends, when [`Self::changed`] cannot be
+    /// served a second time because the member it varies is not the one a
+    /// uniqueness rule of the resource binds: such a row names a body here that
+    /// varies the unique member too. `None` where `changed` is itself free to be
+    /// served.
+    fresh: Option<Value>,
     id_member: &'static str,
     arn_member: &'static str,
     status_member: &'static str,
@@ -111,6 +117,7 @@ fn create_rows(model_id: &str) -> Vec<CreateRow> {
             path: "/asset-models",
             body: json!({"assetModelName": "IdempotentModel"}),
             changed: json!({"assetModelName": "IdempotentModel renamed"}),
+            fresh: None,
             id_member: "assetModelId",
             arn_member: "assetModelArn",
             status_member: "assetModelStatus",
@@ -137,6 +144,17 @@ fn create_rows(model_id: &str) -> Vec<CreateRow> {
                 ],
                 "tags": {"line": "B"},
             }),
+            // `assetModelName` is unique per account, so the request that differs
+            // only in a tag value cannot ALSO be minted under a fresh token: the
+            // fresh-token call varies the name as well.
+            fresh: Some(json!({
+                "assetModelName": "IdempotentTaggedModel of its own",
+                "assetModelDescription": "the first definition",
+                "assetModelProperties": [
+                    {"name": "Temperature", "dataType": "DOUBLE", "type": {"measurement": {}}},
+                ],
+                "tags": {"line": "B"},
+            })),
             id_member: "assetModelId",
             arn_member: "assetModelArn",
             status_member: "assetModelStatus",
@@ -149,6 +167,7 @@ fn create_rows(model_id: &str) -> Vec<CreateRow> {
             path: "/assets",
             body: json!({"assetName": "IdempotentAsset", "assetModelId": model_id}),
             changed: json!({"assetName": "IdempotentAsset renamed", "assetModelId": model_id}),
+            fresh: None,
             id_member: "assetId",
             arn_member: "assetArn",
             status_member: "assetStatus",
@@ -176,6 +195,7 @@ fn create_rows(model_id: &str) -> Vec<CreateRow> {
                 "assetExternalId": "idempotent-asset-other",
                 "tags": {"line": "A"},
             }),
+            fresh: None,
             id_member: "assetId",
             arn_member: "assetArn",
             status_member: "assetStatus",
@@ -196,6 +216,7 @@ fn create_rows(model_id: &str) -> Vec<CreateRow> {
                 "assetModelId": model_id,
                 "assetId": OTHER_CHOSEN_ID,
             }),
+            fresh: None,
             id_member: "assetId",
             arn_member: "assetArn",
             status_member: "assetStatus",
@@ -217,6 +238,7 @@ async fn a_retried_create_replays_the_first_answer_and_mints_nothing_more() {
             path,
             body,
             changed,
+            fresh: fresh_body,
             id_member,
             arn_member,
             status_member,
@@ -293,8 +315,9 @@ async fn a_retried_create_replays_the_first_answer_and_mints_nothing_more() {
         // The same changed request under a FRESH token is simply a new call: the
         // refusal above is about the TOKEN, not about the body.
         let fresh = client_token(&format!("{token_seed}-fresh"));
+        let fresh_body = fresh_body.unwrap_or_else(|| changed.clone());
         let (fresh_status, created) =
-            call(&router, "POST", path, Some(with_token(&changed, &fresh))).await;
+            call(&router, "POST", path, Some(with_token(&fresh_body, &fresh))).await;
         assert_eq!(
             fresh_status, status,
             "case {case:?}: a fresh token must serve the changed request, got {fresh_status} \

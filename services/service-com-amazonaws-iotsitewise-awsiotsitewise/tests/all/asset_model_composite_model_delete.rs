@@ -201,14 +201,16 @@ fn removal_cases() -> Vec<RemovalCase> {
 async fn deleting_a_composite_model_removes_it_and_everything_nested_in_it() {
     let router = router();
 
-    for case in removal_cases() {
+    for (at, case) in removal_cases().into_iter().enumerate() {
         let RemovalCase {
             case: name,
             creates,
             delete,
             gone,
         } = &case;
-        let model_id = plain_model(&router, "Boiler").await;
+        // One model per row, under a name of its own: `assetModelName` is unique
+        // per account and every row runs against the same router.
+        let model_id = plain_model(&router, &format!("Boiler-{at}")).await;
 
         let mut ids: Vec<String> = Vec::new();
         for (at, (body, parent)) in creates.iter().enumerate() {
@@ -1008,7 +1010,9 @@ async fn externalid_labels_delete_the_same_composite_model_as_the_raw_ids() {
             "POST",
             "/asset-models",
             Some(json!({
-                "assetModelName": "Boiler",
+                // A name of its own per row: `assetModelName` is unique per
+                // account, and every row of this table runs against one router.
+                "assetModelName": format!("Boiler {case}"),
                 "assetModelExternalId": model_external,
             })),
         )

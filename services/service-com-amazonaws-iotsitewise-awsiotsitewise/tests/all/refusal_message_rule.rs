@@ -676,6 +676,22 @@ async fn a_uniqueness_collision_names_the_dimension_that_collided() {
             // name an ARN for — so this row distinguishes the two.
             stranger_model.clone(),
         ),
+        (
+            "CreateAssetModel claiming an assetModelName another asset model holds",
+            "POST",
+            "/asset-models".to_string(),
+            json!({ "assetModelName": "Boiler", "assetModelProperties": [] }),
+            "Another asset model is already using the same name".to_string(),
+            model_id.clone(),
+        ),
+        (
+            "UpdateAssetModel renaming onto a name another asset model holds",
+            "PUT",
+            format!("/asset-models/{stranger_model}"),
+            json!({ "assetModelName": "Boiler" }),
+            "Another asset model is already using the same name".to_string(),
+            model_id.clone(),
+        ),
     ];
 
     for (case, method, uri, body, expected, points_at) in &rows {

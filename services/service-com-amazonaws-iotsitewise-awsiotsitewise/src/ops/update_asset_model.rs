@@ -355,6 +355,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `assetModelName` is "A unique name for the asset model", so a rename may
+        // not take a name another asset model holds — the same
+        // one-name-one-resource rule `CreateAssetModel` enforces, applied here to
+        // the model this request renames. Asking for the name this model already
+        // carries asks for the state it is already in, so it is accepted rather
+        // than refused against itself.
+        if let Some((holder, holder_arn)) = store
+            .asset_model_holding_name(&input.asset_model_name, Some(&id))
+            .map(|record| (record.id.clone(), record.arn.clone()))
+        {
+            return Err(already_exists(&holder, holder_arn, "name"));
+        }
+
         // The request carries the model's NEW definition in full: "The updated
         // property definitions" / "The updated hierarchy definitions". An omitted
         // list therefore leaves the model carrying none of that kind — removing a

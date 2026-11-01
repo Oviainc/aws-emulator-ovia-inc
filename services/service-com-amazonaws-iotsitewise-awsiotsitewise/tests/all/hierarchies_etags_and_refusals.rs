@@ -553,6 +553,8 @@ async fn describe_asset_model_reports_a_stable_content_derived_etag() {
     // Rows differ along what the ETag generalises over: a model's name, its
     // description, how many properties it carries, and whether it carries a
     // hierarchy. Each must get its own tag, and each tag must survive a re-read.
+    // `assetModelName` is unique per account, so every row names its own model
+    // and the name is one of the dimensions the rows vary rather than a constant.
     let child_model = create_model(
         &router,
         json!({ "assetModelName": "Child", "assetModelProperties": [] }),
@@ -570,15 +572,15 @@ async fn describe_asset_model_reports_a_stable_content_derived_etag() {
         (
             "a description",
             json!({
-                "assetModelName": "Alpha",
-                "assetModelDescription": "the very same name",
+                "assetModelName": "Gamma",
+                "assetModelDescription": "a description of its own",
                 "assetModelProperties": []
             }),
         ),
         (
             "one property",
             json!({
-                "assetModelName": "Alpha",
+                "assetModelName": "Delta",
                 "assetModelProperties": [{
                     "name": "Temperature",
                     "dataType": "DOUBLE",
@@ -589,7 +591,7 @@ async fn describe_asset_model_reports_a_stable_content_derived_etag() {
         (
             "two properties",
             json!({
-                "assetModelName": "Alpha",
+                "assetModelName": "Epsilon",
                 "assetModelProperties": [
                     {
                         "name": "Temperature",
@@ -607,7 +609,7 @@ async fn describe_asset_model_reports_a_stable_content_derived_etag() {
         (
             "a hierarchy",
             json!({
-                "assetModelName": "Alpha",
+                "assetModelName": "Zeta",
                 "assetModelProperties": [],
                 "assetModelHierarchies": [{
                     "name": "Children",
