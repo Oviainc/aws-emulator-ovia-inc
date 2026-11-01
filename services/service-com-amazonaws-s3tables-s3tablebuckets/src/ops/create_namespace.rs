@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +114,24 @@ impl From<CreateNamespaceErrorModeled> for CreateNamespaceError {
     }
 }
 
+/// `BadRequestException` (HTTP 400) — the refusal this operation models for a
+/// request the boundary accepted but the service's own rules reject.
+fn bad_request(message: String) -> CreateNamespaceError {
+    CreateNamespaceErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// `NotFoundException` (HTTP 404) — the table bucket the namespace would be
+/// created in does not exist.
+fn no_such_table_bucket() -> CreateNamespaceError {
+    CreateNamespaceErrorModeled::NotFoundException(NotFoundException {
+        message: Some("The specified table bucket does not exist.".to_string()),
+    })
+    .into()
+}
+
 /// The `CreateNamespace` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -159,18 +168,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNamespace"))
+        use crate::state::Namespace;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateNamespaceErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // `namespace` is modeled `@length(min: 1, max: 1)`, so a namespace is
+        // created under ONE name and the boundary refuses any other count.
+        let [namespace_name] = input.namespace.as_slice() else {
+            return Err(bad_request(format!(
+                "A namespace is created under exactly one name, and the request carried {}.",
+                input.namespace.len()
+            )));
+        };
+        let namespace_name = namespace_name.clone();
+
+        let mut store = state.lock();
+
+        let bucket = store
+            .table_buckets
+            .get(&input.table_bucket_arn)
+            .ok_or_else(no_such_table_bucket)?;
+        // A namespace name is unique within its table bucket: a second create of
+        // a resident name is the conflict with a previous write the model's
+        // `ConflictException` (HTTP 409) names.
+        if bucket.namespaces.contains_key(&namespace_name) {
+            return Err(CreateNamespaceErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A namespace with the name {namespace_name} already exists in the table \
+                     bucket."
+                )),
+            })
+            .into());
+        }
+        // The store is BOUNDED, as it is for table buckets: past the cap a
+        // create is refused rather than growing the process's memory without
+        // limit.
+        if bucket.namespaces.len() >= crate::state::NAMESPACES_PER_TABLE_BUCKET {
+            return Err(bad_request(format!(
+                "This table bucket already holds the maximum of {} namespaces.",
+                crate::state::NAMESPACES_PER_TABLE_BUCKET
+            )));
+        }
+
+        let namespace_id = store.mint_namespace_id();
+        let account = ::engine::emulator_account_id().to_string();
+        let bucket = store
+            .table_buckets
+            .get_mut(&input.table_bucket_arn)
+            .ok_or_else(no_such_table_bucket)?;
+        bucket.namespaces.insert(
+            namespace_name.clone(),
+            Namespace {
+                namespace: vec![namespace_name.clone()],
+                namespace_id: namespace_id.clone(),
+                created_at: ::std::time::SystemTime::now(),
+                created_by: account.clone(),
+                owner_account_id: account,
+                // A fresh namespace holds no tables; `CreateTable` is what puts
+                // one in it.
+                tables: ::std::collections::BTreeMap::new(),
+            },
+        );
+
+        // The answer is read back out of the record that was just stored, so a
+        // response a caller sees is one the store can serve again.
+        let stored = bucket
+            .namespaces
+            .get(&namespace_name)
+            .ok_or_else(no_such_table_bucket)?;
+        let output = CreateNamespaceOutput {
+            table_bucket_arn: bucket.arn.clone(),
+            namespace: stored.namespace.clone(),
+        };
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what and the
+        // outcome. Metadata only.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            namespace_id = ?namespace_id,
+            outcome = "created",
+            "namespace created",
+        );
+
+        Ok(output)
     }
 }

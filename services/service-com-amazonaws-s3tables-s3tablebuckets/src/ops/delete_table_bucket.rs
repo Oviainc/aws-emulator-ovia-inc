@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTableBucket
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTableBucket`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTableBucket::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +163,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTableBucket` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTableBucketErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTableBucket"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTableBucketErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        let bucket = store
+            .table_buckets
+            .get(&input.table_bucket_arn)
+            .ok_or_else(|| {
+                DeleteTableBucketErrorModeled::NotFoundException(NotFoundException {
+                    message: Some("The specified table bucket does not exist.".to_string()),
+                })
+            })?;
+
+        // A table bucket is deleted only once it holds nothing: the namespaces
+        // in it, and the tables in those, are what a delete would otherwise
+        // orphan, so the delete conflicts with the writes that created them.
+        if !bucket.namespaces.is_empty() {
+            return Err(DeleteTableBucketErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "The table bucket {} is not empty. Delete the namespaces it contains \
+                         before deleting it.",
+                        bucket.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let bucket_id = bucket.bucket_id.clone();
+        store.table_buckets.remove(&input.table_bucket_arn);
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what and the
+        // outcome. Metadata only.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            table_bucket_id = ?bucket_id,
+            outcome = "deleted",
+            "table bucket deleted",
+        );
+
+        Ok(DeleteTableBucketOutput)
     }
 }

@@ -175,9 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{
-            BucketEncryption, SseAlgorithm, StorageClass, TableBucket, TableBucketType,
-        };
+        use crate::state::{StorageClass, TableBucket, TableBucketType};
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateTableBucketErrorModeled::InternalServerErrorException(
@@ -199,57 +197,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // `encryptionConfiguration`: the algorithm must be one the model
-        // declares, and the model documents `kmsKeyArn` as "required only when
-        // `sseAlgorithm` is set to `aws:kms`" — so it is required with that
-        // algorithm and meaningless without it. A value outside the enum is
-        // refused at the boundary, so reaching here with an unknown one would
-        // mean the model changed under us; refuse it rather than silently
-        // picking an algorithm.
+        // `encryptionConfiguration` and `storageClassConfiguration` are stored
+        // as the caller asked for them, once they name values this service has
+        // an algorithm and storage for.
         let encryption = match input.encryption_configuration {
             None => None,
-            Some(configuration) => {
-                let algorithm = SseAlgorithm::from_wire(&configuration.sse_algorithm)
-                    .ok_or_else(|| {
-                        bad_request(format!(
-                            "The server-side encryption algorithm {} is not supported.",
-                            configuration.sse_algorithm
-                        ))
-                    })?;
-                match (algorithm.takes_kms_key(), &configuration.kms_key_arn) {
-                    (true, None) => {
-                        return Err(bad_request(format!(
-                            "kmsKeyArn is required when sseAlgorithm is {}.",
-                            algorithm.as_wire()
-                        )));
-                    }
-                    (false, Some(_)) => {
-                        return Err(bad_request(format!(
-                            "kmsKeyArn is not valid when sseAlgorithm is {}.",
-                            algorithm.as_wire()
-                        )));
-                    }
-                    _ => {}
-                }
-                Some(BucketEncryption {
-                    sse_algorithm: algorithm,
-                    kms_key_arn: configuration.kms_key_arn,
-                })
-            }
+            Some(configuration) => Some(
+                crate::state::stored_encryption(
+                    &configuration.sse_algorithm,
+                    configuration.kms_key_arn,
+                )
+                .map_err(bad_request)?,
+            ),
         };
-
-        // `storageClassConfiguration`: same contract — one of the modeled
-        // storage classes, or the request names a class this service has no
-        // storage for.
-        let storage_class = match input.storage_class_configuration {
+        let storage_class: Option<StorageClass> = match input.storage_class_configuration {
             None => None,
             Some(configuration) => Some(
-                StorageClass::from_wire(&configuration.storage_class).ok_or_else(|| {
-                    bad_request(format!(
-                        "The storage class {} is not supported.",
-                        configuration.storage_class
-                    ))
-                })?,
+                crate::state::stored_storage_class(&configuration.storage_class)
+                    .map_err(bad_request)?,
             ),
         };
 
@@ -290,6 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let bucket = TableBucket {
             name: input.name,
             arn: arn.clone(),
+            region: region.clone(),
             owner_account_id: ::engine::emulator_account_id().to_string(),
             bucket_id: bucket_id.clone(),
             // This operation is how a CUSTOMER creates a table bucket; the
@@ -300,6 +266,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encryption,
             storage_class,
             tags,
+            // A fresh bucket holds no namespaces; `CreateNamespace` is what
+            // puts one in it.
+            namespaces: ::std::collections::BTreeMap::new(),
         };
         store.table_buckets.insert(arn.clone(), bucket);
         // The lock covers the state change only; everything below is owned.

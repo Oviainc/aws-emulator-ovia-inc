@@ -2,10 +2,10 @@
 
 //! Engine state for the com-amazonaws-s3tables-s3tablebuckets service.
 //!
-//! The S3 Tables control plane is, at this level, a store of **table buckets**.
-//! Everything the handlers in `src/ops/` answer with is reconstructed from the
-//! records below: nothing is echoed straight back out of a request and nothing
-//! is canned.
+//! The S3 Tables control plane is, at this level, a store of **table buckets**,
+//! each holding **namespaces**, each holding **tables**. Everything the handlers
+//! in `src/ops/` answer with is reconstructed from the records below: nothing is
+//! echoed straight back out of a request and nothing is canned.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -23,6 +23,24 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// deletes — and that the refusal is the client-input error this operation
 /// models, `BadRequestException`.
 pub const TABLE_BUCKETS_PER_ACCOUNT: usize = 1_000;
+
+/// The most namespaces this emulator keeps resident in one table bucket.
+///
+/// CHOSEN, for the same reason as [`TABLE_BUCKETS_PER_ACCOUNT`]: the store is
+/// BOUNDED, so a caller cannot grow the process's memory without limit, and the
+/// refusal is the client-input error the create models.
+pub const NAMESPACES_PER_TABLE_BUCKET: usize = 1_000;
+
+/// The most tables this emulator keeps resident in one namespace. CHOSEN, for
+/// the same reason as [`TABLE_BUCKETS_PER_ACCOUNT`].
+pub const TABLES_PER_NAMESPACE: usize = 1_000;
+
+/// The most items any one page of a list operation carries.
+///
+/// Both paginated list operations model their page size (`maxBuckets`,
+/// `maxTables`) with `@range(min: 1, max: 1000)`, so 1000 is the largest page a
+/// caller can ask for and therefore the cap for a caller that asks for none.
+pub const MAX_PAGE_SIZE: usize = 1_000;
 
 /// `TableBucketType` — the `type` member of a table bucket. Values from
 /// `com.amazonaws.s3tables#TableBucketType`.
@@ -44,6 +62,66 @@ impl TableBucketType {
             Self::Customer => "customer",
             Self::Aws => "aws",
         }
+    }
+
+    /// Parse a wire value, or `None` when it names no modeled value.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_wire() == value)
+    }
+}
+
+/// `TableType` — the `type` member of a table. Values from
+/// `com.amazonaws.s3tables#TableType`, a shape of its own even though its two
+/// values read like `TableBucketType`'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableType {
+    /// A table the caller created.
+    Customer,
+    /// A table Amazon Web Services created on the account's behalf.
+    Aws,
+}
+
+impl TableType {
+    /// Every modeled value, for exhaustiveness checks.
+    pub const ALL: &'static [Self] = &[Self::Customer, Self::Aws];
+
+    /// The value as it goes on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Customer => "customer",
+            Self::Aws => "aws",
+        }
+    }
+}
+
+/// `OpenTableFormat` — the open table format a table is stored in. Values from
+/// `com.amazonaws.s3tables#OpenTableFormat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenTableFormat {
+    /// Apache Iceberg, the one format the model declares.
+    Iceberg,
+}
+
+impl OpenTableFormat {
+    /// Every modeled value, for exhaustiveness checks.
+    pub const ALL: &'static [Self] = &[Self::Iceberg];
+
+    /// The value as it goes on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Iceberg => "ICEBERG",
+        }
+    }
+
+    /// Parse a wire value, or `None` when it names no modeled value.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_wire() == value)
     }
 }
 
@@ -132,6 +210,10 @@ pub struct BucketEncryption {
 pub struct TableBucket {
     pub name: String,
     pub arn: String,
+    /// The region the bucket lives in — the one its ARN carries. Stored because
+    /// `ListTableBuckets` takes no ARN, so the region it answers for can only
+    /// come from the request's own endpoint.
+    pub region: String,
     pub owner_account_id: String,
     pub bucket_id: String,
     pub bucket_type: TableBucketType,
@@ -139,6 +221,67 @@ pub struct TableBucket {
     pub encryption: Option<BucketEncryption>,
     pub storage_class: Option<StorageClass>,
     pub tags: BTreeMap<String, String>,
+    /// The namespaces resident in this bucket, keyed by namespace name, so a
+    /// list has one stable order to page over.
+    pub namespaces: BTreeMap<String, Namespace>,
+}
+
+/// A namespace, as this emulator stores it: a logical grouping of tables inside
+/// one table bucket.
+///
+/// `namespace` is the modeled `NamespaceList` the create was given — one name,
+/// as the model's `@length(min: 1, max: 1)` on the input requires — and its
+/// single element is the key this namespace is stored under.
+#[derive(Debug, Clone)]
+pub struct Namespace {
+    pub namespace: Vec<String>,
+    pub namespace_id: String,
+    pub created_at: SystemTime,
+    pub created_by: String,
+    pub owner_account_id: String,
+    /// The tables resident in this namespace, keyed by table name.
+    pub tables: BTreeMap<String, Table>,
+}
+
+/// A table, as this emulator stores it.
+///
+/// `encryption` and `storage_class` are `None` when the create named neither,
+/// for the same reason as on [`TableBucket`]: which default applies belongs to
+/// the operations that report it, so what is persisted is what the caller asked
+/// for. `metadata_location` is `Some` only once a metadata file exists for the
+/// table — the create writes one when the request carries table metadata, and
+/// `UpdateTableMetadataLocation` is what moves it afterwards.
+#[derive(Debug, Clone)]
+pub struct Table {
+    pub name: String,
+    pub table_arn: String,
+    pub table_type: TableType,
+    pub namespace: Vec<String>,
+    pub namespace_id: String,
+    pub table_bucket_id: String,
+    pub format: OpenTableFormat,
+    /// Regenerated on every mutation of the table, so a caller holding an older
+    /// token can tell its view is stale.
+    pub version_token: String,
+    pub metadata_location: Option<String>,
+    pub warehouse_location: String,
+    pub created_at: SystemTime,
+    pub created_by: String,
+    pub modified_at: SystemTime,
+    pub modified_by: String,
+    pub owner_account_id: String,
+    pub encryption: Option<BucketEncryption>,
+    pub storage_class: Option<StorageClass>,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// Where a table lives: the index entry a `tableARN` resolves to, so the
+/// ARN-addressed operations reach a record without scanning every bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableLocation {
+    pub table_bucket_arn: String,
+    pub namespace: String,
+    pub name: String,
 }
 
 /// Per-service state for com-amazonaws-s3tables-s3tablebuckets. A handler reaches it through [`service_state`].
@@ -150,32 +293,40 @@ pub struct TableBucket {
 pub struct ComAmazonawsS3tablesS3tablebucketsState {
     /// Every live table bucket, keyed by its `tableBucketARN`.
     pub table_buckets: BTreeMap<String, TableBucket>,
-    /// Counts the table buckets this store has minted, so two ids minted inside
-    /// one clock tick still differ. Never exposed on the wire.
-    pub minted_buckets: u64,
+    /// Every live table, keyed by its `tableARN`: the index the `tableArn`
+    /// addressing mode resolves through.
+    pub tables_by_arn: BTreeMap<String, TableLocation>,
+    /// Counts the ids this store has minted, so two ids minted inside one clock
+    /// tick still differ. Never exposed on the wire.
+    pub minted_ids: u64,
 }
 
 impl ComAmazonawsS3tablesS3tablebucketsState {
-    /// A fresh `tableBucketId`: 32 lowercase hex characters.
+    /// A fresh server-generated id: 32 lowercase hex characters.
     ///
-    /// The id is a digest of the instant the bucket is being created and this
-    /// store's mint counter, so it is server-generated and opaque: it carries
-    /// nothing from the request, two creates never collide (the counter
-    /// separates them inside one clock tick), and two emulator runs do not
-    /// repeat each other's ids. Retried against the store so an id is never
+    /// The id is a digest of the instant it is minted, this store's mint counter
+    /// and `domain` (which kind of id it is), so it is opaque: it carries nothing
+    /// from the request, two mints never collide (the counter separates them
+    /// inside one clock tick), and two emulator runs do not repeat each other's
+    /// ids.
+    fn mint_id(&mut self, domain: &str) -> String {
+        use ::sha2::{Digest, Sha256};
+        self.minted_ids = self.minted_ids.wrapping_add(1);
+        let since_epoch = SystemTime::now()
+            .duration_since(::std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let digest = Sha256::digest(
+            format!("s3tables-{domain}:{since_epoch}:{}", self.minted_ids).as_bytes(),
+        );
+        ::hex::encode(&digest[..16])
+    }
+
+    /// A fresh `tableBucketId`, retried against the store so an id is never
     /// reused.
     pub fn mint_bucket_id(&mut self) -> String {
-        use ::sha2::{Digest, Sha256};
         loop {
-            self.minted_buckets = self.minted_buckets.wrapping_add(1);
-            let since_epoch = SystemTime::now()
-                .duration_since(::std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or_default();
-            let digest = Sha256::digest(
-                format!("s3tables-table-bucket:{since_epoch}:{}", self.minted_buckets).as_bytes(),
-            );
-            let candidate = ::hex::encode(&digest[..16]);
+            let candidate = self.mint_id("table-bucket");
             if !self
                 .table_buckets
                 .values()
@@ -186,11 +337,169 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
         }
     }
 
+    /// A fresh `namespaceId`, retried against the store so an id is never
+    /// reused.
+    pub fn mint_namespace_id(&mut self) -> String {
+        loop {
+            let candidate = self.mint_id("namespace");
+            if !self.namespaces().any(|namespace| namespace.namespace_id == candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// A fresh table id — the last segment of a `tableARN`, which is what
+    /// identifies a table for the life of the record whatever it is renamed to.
+    /// Retried against the ARN index so an id is never reused.
+    pub fn mint_table_id(&mut self) -> String {
+        loop {
+            let candidate = self.mint_id("table");
+            let suffix = format!("/table/{candidate}");
+            if !self.tables_by_arn.keys().any(|arn| arn.ends_with(&suffix)) {
+                return candidate;
+            }
+        }
+    }
+
+    /// A fresh `versionToken` for a table that is being created or changed.
+    pub fn mint_version_token(&mut self) -> String {
+        self.mint_id("table-version")
+    }
+
+    /// A fresh id for a table's metadata file, which names the file under the
+    /// table's warehouse location.
+    pub fn mint_metadata_id(&mut self) -> String {
+        self.mint_id("table-metadata")
+    }
+
+    /// Every resident namespace, in bucket then namespace order.
+    pub fn namespaces(&self) -> impl Iterator<Item = &Namespace> {
+        self.table_buckets
+            .values()
+            .flat_map(|bucket| bucket.namespaces.values())
+    }
+
+    /// The table `table_arn` names, resolved through the ARN index.
+    pub fn table_by_arn(&self, table_arn: &str) -> Option<&Table> {
+        let location = self.tables_by_arn.get(table_arn)?;
+        self.table_buckets
+            .get(&location.table_bucket_arn)?
+            .namespaces
+            .get(&location.namespace)?
+            .tables
+            .get(&location.name)
+    }
+
     /// Whether the store already holds [`TABLE_BUCKETS_PER_ACCOUNT`] table
     /// buckets, so a further create must be refused.
     pub fn is_at_bucket_quota(&self) -> bool {
         self.table_buckets.len() >= TABLE_BUCKETS_PER_ACCOUNT
     }
+}
+
+/// One page of a `@paginated` list operation.
+#[derive(Debug)]
+pub struct Page<T> {
+    /// The page's items, in key order.
+    pub items: Vec<T>,
+    /// The opaque cursor the next page resumes from, set only when items the
+    /// caller has not seen remain.
+    pub continuation_token: Option<String>,
+}
+
+/// Read one page out of an ordered sequence of `(key, item)` pairs.
+///
+/// Both list operations are `@paginated` with
+/// `inputToken: continuationToken, outputToken: continuationToken`, so: items
+/// come back in key order, at most `max_items` of them, the page starts at the
+/// key a caller's token decoded to, and a token comes back only when a later key
+/// remains. `max_items` is modeled `1..1000` and refused outside that range
+/// before a handler runs; an absent one falls back to [`MAX_PAGE_SIZE`], so no
+/// response renders more than one page however large the store is.
+pub fn page<T>(
+    ordered: impl IntoIterator<Item = (String, T)>,
+    resume_from: Option<&str>,
+    max_items: Option<i32>,
+) -> Page<T> {
+    let cap = max_items
+        .filter(|requested| *requested > 0)
+        .and_then(|requested| usize::try_from(requested).ok())
+        .unwrap_or(MAX_PAGE_SIZE)
+        .min(MAX_PAGE_SIZE);
+
+    let mut items = Vec::new();
+    let mut continuation_token = None;
+    for (key, item) in ordered {
+        if resume_from.is_some_and(|start| key.as_str() < start) {
+            continue;
+        }
+        if items.len() >= cap {
+            continuation_token = Some(encode_continuation_token(&key));
+            break;
+        }
+        items.push(item);
+    }
+
+    Page {
+        items,
+        continuation_token,
+    }
+}
+
+/// The `continuationToken` for a page that starts at `key`.
+///
+/// Hex of the key rather than the key itself, so a caller can read no structure
+/// into the token and has nothing to build one from: the token is opaque and
+/// only ever travels back unchanged.
+pub fn encode_continuation_token(key: &str) -> String {
+    ::hex::encode(key.as_bytes())
+}
+
+/// The inclusive start key a token minted by [`encode_continuation_token`]
+/// carries, or `None` when the token was not minted by this service (which a
+/// list operation refuses rather than silently treating as a start key).
+pub fn decode_continuation_token(token: &str) -> Option<String> {
+    String::from_utf8(::hex::decode(token).ok()?).ok()
+}
+
+/// The stored form of an `encryptionConfiguration`, or the reason the request is
+/// refused.
+///
+/// The algorithm must be one the model declares, and the model documents
+/// `kmsKeyArn` as "required only when `sseAlgorithm` is set to `aws:kms`" — so
+/// it is required with that algorithm and meaningless without it. A value
+/// outside the enum is refused at the boundary, so reaching here with an unknown
+/// one would mean the model changed under us; it is refused rather than silently
+/// picking an algorithm.
+pub fn stored_encryption(
+    sse_algorithm: &str,
+    kms_key_arn: Option<String>,
+) -> Result<BucketEncryption, String> {
+    let algorithm = SseAlgorithm::from_wire(sse_algorithm).ok_or_else(|| {
+        format!("The server-side encryption algorithm {sse_algorithm} is not supported.")
+    })?;
+    match (algorithm.takes_kms_key(), &kms_key_arn) {
+        (true, None) => Err(format!(
+            "kmsKeyArn is required when sseAlgorithm is {}.",
+            algorithm.as_wire()
+        )),
+        (false, Some(_)) => Err(format!(
+            "kmsKeyArn is not valid when sseAlgorithm is {}.",
+            algorithm.as_wire()
+        )),
+        _ => Ok(BucketEncryption {
+            sse_algorithm: algorithm,
+            kms_key_arn,
+        }),
+    }
+}
+
+/// The stored form of a `storageClassConfiguration`, or the reason the request is
+/// refused: one of the modeled storage classes, or the request names a class
+/// this service has no storage for.
+pub fn stored_storage_class(storage_class: &str) -> Result<StorageClass, String> {
+    StorageClass::from_wire(storage_class)
+        .ok_or_else(|| format!("The storage class {storage_class} is not supported."))
 }
 
 /// The region this request is for: the one its SigV4 credential scope names,
@@ -222,6 +531,31 @@ pub fn request_caller(parts: &::http::request::Parts) -> String {
 /// The ARN of a table bucket: `arn:aws:s3tables:<region>:<account>:bucket/<name>`.
 pub fn table_bucket_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("s3tables", region, &format!("bucket/{name}"))
+}
+
+/// The ARN of a table: its bucket's ARN, then `/table/<table id>`.
+///
+/// Built from the bucket's own ARN rather than from the request, so the table's
+/// ARN sits under the bucket's in the same region and account, and the last
+/// segment is the server-minted table id rather than the name — the name can be
+/// changed by `RenameTable`, the ARN cannot.
+pub fn table_arn(table_bucket_arn: &str, table_id: &str) -> String {
+    format!("{table_bucket_arn}/table/{table_id}")
+}
+
+/// The warehouse location of a table: the S3 location its data and metadata are
+/// written under, named for the table's own id.
+pub fn warehouse_location(table_id: &str) -> String {
+    format!("s3://{table_id}--table-s3")
+}
+
+/// The location of a table's metadata file, under its warehouse location.
+///
+/// `metadata_id` is server-minted, and the `00000-` prefix is the first
+/// metadata version of a table, as the Iceberg table specification names
+/// metadata files.
+pub fn metadata_location(warehouse_location: &str, metadata_id: &str) -> String {
+    format!("{warehouse_location}/metadata/00000-{metadata_id}.metadata.json")
 }
 
 /// Whether `name` satisfies the table-bucket naming rule the model's

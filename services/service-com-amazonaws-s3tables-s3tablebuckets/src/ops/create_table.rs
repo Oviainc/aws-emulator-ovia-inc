@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -152,6 +143,24 @@ impl From<CreateTableErrorModeled> for CreateTableError {
     }
 }
 
+/// `BadRequestException` (HTTP 400) — the refusal this operation models for a
+/// request the boundary accepted but the service's own rules reject.
+fn bad_request(message: String) -> CreateTableError {
+    CreateTableErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// `NotFoundException` (HTTP 404) — nothing the request addresses holds the
+/// table it would create.
+fn not_found(message: &str) -> CreateTableError {
+    CreateTableErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 /// The `CreateTable` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -188,18 +197,173 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTable"))
+        use crate::state::{OpenTableFormat, Table, TableLocation, TableType};
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTableErrorModeled::InternalServerErrorException(InternalServerErrorException {
+                message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+            })
+        })?;
+
+        // `format` is a modeled enum, so a value outside it is refused at the
+        // boundary; reaching here with an unknown one would mean the model
+        // changed under us, and a table is never stored in a format this service
+        // cannot read back.
+        let format = OpenTableFormat::from_wire(&input.format).ok_or_else(|| {
+            bad_request(format!(
+                "The open table format {} is not supported.",
+                input.format
+            ))
+        })?;
+
+        // The table-level overrides of what the bucket configures, stored as the
+        // caller asked for them.
+        let encryption = match input.encryption_configuration {
+            None => None,
+            Some(configuration) => Some(
+                crate::state::stored_encryption(
+                    &configuration.sse_algorithm,
+                    configuration.kms_key_arn,
+                )
+                .map_err(bad_request)?,
+            ),
+        };
+        let storage_class = match input.storage_class_configuration {
+            None => None,
+            Some(configuration) => Some(
+                crate::state::stored_storage_class(&configuration.storage_class)
+                    .map_err(bad_request)?,
+            ),
+        };
+        let tags: ::std::collections::BTreeMap<String, String> =
+            input.tags.into_iter().flatten().collect();
+        // A table carries a metadata file only once one exists for it: the create
+        // writes the first one when the request describes the table's metadata,
+        // and `UpdateTableMetadataLocation` is what moves it afterwards. The
+        // schema itself is the metadata file's content, which no operation in
+        // this service reads back.
+        let has_metadata = input.metadata.is_some();
+
+        let mut store = state.lock();
+
+        let bucket = store
+            .table_buckets
+            .get(&input.table_bucket_arn)
+            .ok_or_else(|| not_found("The specified table bucket does not exist."))?;
+        let bucket_arn = bucket.arn.clone();
+        let bucket_id = bucket.bucket_id.clone();
+        let namespace = bucket
+            .namespaces
+            .get(&input.namespace)
+            .ok_or_else(|| not_found("The specified namespace does not exist."))?;
+        let namespace_id = namespace.namespace_id.clone();
+        let namespace_names = namespace.namespace.clone();
+
+        // A table name is unique within its namespace: a second create of a
+        // resident name is the conflict with a previous write the model's
+        // `ConflictException` (HTTP 409) names.
+        if namespace.tables.contains_key(&input.name) {
+            return Err(CreateTableErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A table with the name {} already exists in the namespace {}.",
+                    input.name, input.namespace
+                )),
+            })
+            .into());
+        }
+        // The store is BOUNDED, as it is for table buckets and namespaces.
+        if namespace.tables.len() >= crate::state::TABLES_PER_NAMESPACE {
+            return Err(bad_request(format!(
+                "This namespace already holds the maximum of {} tables.",
+                crate::state::TABLES_PER_NAMESPACE
+            )));
+        }
+
+        // The table's identity: an id that outlives any rename, the ARN built
+        // from it under the bucket's own ARN, the warehouse the table's files
+        // live under, and the first version token — all minted here and
+        // persisted, never recomputed from a later request.
+        let table_id = store.mint_table_id();
+        let version_token = store.mint_version_token();
+        let table_arn = crate::state::table_arn(&bucket_arn, &table_id);
+        let warehouse_location = crate::state::warehouse_location(&table_id);
+        let metadata_location = if has_metadata {
+            let metadata_id = store.mint_metadata_id();
+            Some(crate::state::metadata_location(
+                &warehouse_location,
+                &metadata_id,
+            ))
+        } else {
+            None
+        };
+        let account = ::engine::emulator_account_id().to_string();
+        let now = ::std::time::SystemTime::now();
+        let table = Table {
+            name: input.name.clone(),
+            table_arn: table_arn.clone(),
+            // This operation is how a CUSTOMER creates a table; the other
+            // modeled type is for the tables Amazon Web Services creates on an
+            // account's behalf.
+            table_type: TableType::Customer,
+            namespace: namespace_names,
+            namespace_id,
+            table_bucket_id: bucket_id,
+            format,
+            version_token,
+            metadata_location,
+            warehouse_location,
+            created_at: now,
+            created_by: account.clone(),
+            // A table that has not been changed since it was created was last
+            // modified when it was created.
+            modified_at: now,
+            modified_by: account.clone(),
+            owner_account_id: account,
+            encryption,
+            storage_class,
+            tags,
+        };
+
+        let namespace = store
+            .table_buckets
+            .get_mut(&input.table_bucket_arn)
+            .and_then(|bucket| bucket.namespaces.get_mut(&input.namespace))
+            .ok_or_else(|| not_found("The specified namespace does not exist."))?;
+        namespace.tables.insert(input.name.clone(), table);
+        // The index the `tableArn` addressing mode resolves through.
+        store.tables_by_arn.insert(
+            table_arn.clone(),
+            TableLocation {
+                table_bucket_arn: bucket_arn,
+                namespace: input.namespace,
+                name: input.name.clone(),
+            },
+        );
+
+        // The answer is read back out of the record that was just stored, so a
+        // response a caller sees is one the store can serve again.
+        let stored = store
+            .table_by_arn(&table_arn)
+            .ok_or_else(|| not_found("The specified table does not exist."))?;
+        let output = CreateTableOutput {
+            table_arn: stored.table_arn.clone(),
+            version_token: stored.version_token.clone(),
+        };
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what and the
+        // outcome. Metadata only — never a tag key or value, and never the
+        // encryption configuration.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            table_id = ?table_id,
+            outcome = "created",
+            "table created",
+        );
+
+        Ok(output)
     }
 }

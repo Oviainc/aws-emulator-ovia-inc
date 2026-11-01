@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,6 +145,15 @@ impl From<GetTableErrorModeled> for GetTableError {
     }
 }
 
+/// `NotFoundException` (HTTP 404) — no table is stored at what the request
+/// addresses.
+fn no_such_table() -> GetTableError {
+    GetTableErrorModeled::NotFoundException(NotFoundException {
+        message: Some("The specified table does not exist.".to_string()),
+    })
+    .into()
+}
+
 /// The `GetTable` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -190,18 +190,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTable"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTableErrorModeled::InternalServerErrorException(InternalServerErrorException {
+                message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+            })
+        })?;
+
+        // A pure read: whichever way the request addresses the table, the
+        // answer is the ONE record the create persisted, and nothing in the
+        // store is touched.
+        let store = state.lock();
+        // The two addressing modes the model offers: a table's own ARN, which
+        // names it on its own, or the bucket, namespace and name that locate it.
+        // Neither of the four members is required on its own, so a request that
+        // carries neither whole mode addresses nothing.
+        let table = match (
+            input.table_arn.as_deref(),
+            input.table_bucket_arn.as_deref(),
+            input.namespace.as_deref(),
+            input.name.as_deref(),
+        ) {
+            (Some(table_arn), ..) => store.table_by_arn(table_arn),
+            (None, Some(table_bucket_arn), Some(namespace), Some(name)) => store
+                .table_buckets
+                .get(table_bucket_arn)
+                .and_then(|bucket| bucket.namespaces.get(namespace))
+                .and_then(|namespace| namespace.tables.get(name)),
+            _ => {
+                return Err(GetTableErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(
+                        "Either tableArn, or tableBucketARN, namespace and name together, must be \
+                         specified."
+                            .to_string(),
+                    ),
+                })
+                .into());
+            }
+        }
+        .ok_or_else(no_such_table)?;
+
+        Ok(GetTableOutput {
+            name: table.name.clone(),
+            r#type: table.table_type.as_wire().to_string(),
+            table_arn: table.table_arn.clone(),
+            namespace: table.namespace.clone(),
+            namespace_id: Some(table.namespace_id.clone()),
+            version_token: table.version_token.clone(),
+            metadata_location: table.metadata_location.clone(),
+            warehouse_location: table.warehouse_location.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(table.created_at),
+            created_by: table.created_by.clone(),
+            // No Amazon Web Services service manages a table a caller created
+            // through this API, and none of it is a replica, so the members that
+            // report a managing service carry nothing.
+            managed_by_service: None,
+            modified_at: ::aws_smithy_types::DateTime::from(table.modified_at),
+            modified_by: table.modified_by.clone(),
+            owner_account_id: table.owner_account_id.clone(),
+            format: table.format.as_wire().to_string(),
+            table_bucket_id: Some(table.table_bucket_id.clone()),
+            managed_table_information: None,
+        })
     }
 }
