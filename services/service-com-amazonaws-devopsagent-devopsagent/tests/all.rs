@@ -25,5 +25,7 @@ mod assets;
 mod operator_app;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/trigger_refusal_arms.rs"]
+mod trigger_refusal_arms;
 #[path = "all/triggers.rs"]
 mod triggers;

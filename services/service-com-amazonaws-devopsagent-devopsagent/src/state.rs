@@ -185,32 +185,96 @@ pub const AUTH_FLOW_IDP: &str = "idp";
 /// `aws.api#service` trait — `smithy_query(query="service_info")`.
 pub const ARN_NAMESPACE: &str = "aidevops";
 
-/// The prefix every Trigger identifier carries.
+/// The prefix every goal identifier carries.
 ///
 /// A Trigger is the schedule of one goal in its agent space, so the identifier
 /// that names a Trigger IS that goal's identifier. The model constrains
 /// `triggerId` no further than `ResourceId` (`^[a-zA-Z0-9_.-]+$`, 1..128), so the
-/// narrower form a Trigger identifier takes is enforced here.
-pub const TRIGGER_ID_PREFIX: &str = "goal-";
+/// narrower form a goal identifier takes is enforced here.
+pub const GOAL_ID_PREFIX: &str = "goal-";
 
-/// The form a Trigger identifier takes: [`TRIGGER_ID_PREFIX`] followed by a
-/// non-empty goal id, whose characters are the ones `ResourceId` already admits.
+/// The form a goal identifier takes: [`GOAL_ID_PREFIX`] followed by a UUID.
 /// Rendered into the refusal a malformed identifier gets, so the caller reads the
 /// requirement it missed.
-pub const TRIGGER_ID_PATTERN: &str = "^goal-[a-zA-Z0-9_.-]+$";
+pub const GOAL_ID_PATTERN: &str =
+    "^goal-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
 
-/// Whether `value` has the form of a Trigger identifier, i.e. satisfies
-/// [`TRIGGER_ID_PATTERN`].
+/// The member a request naming a goal is validated as, as a JSON pointer: the
+/// goal identifier the service resolves, whatever the wire member it arrived on is
+/// called. Rendered into the refusal's message and into its
+/// `ValidationExceptionField` path.
+pub const GOAL_ID_PATH: &str = "/goalId";
+
+/// Whether `value` has the form of a goal identifier, i.e. satisfies
+/// [`GOAL_ID_PATTERN`].
 ///
 /// An identifier that does not is refused as invalid rather than looked up: it
 /// names no goal, so it can name no Trigger in any agent space.
-pub fn is_trigger_id(value: &str) -> bool {
-    value.strip_prefix(TRIGGER_ID_PREFIX).is_some_and(|goal| {
-        !goal.is_empty()
-            && goal
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
-    })
+pub fn is_goal_id(value: &str) -> bool {
+    value.strip_prefix(GOAL_ID_PREFIX).is_some_and(is_uuid)
+}
+
+/// Whether `value` is a UUID in its canonical 8-4-4-4-12 hexadecimal form, which
+/// is what [`GOAL_ID_PATTERN`] states after the prefix.
+fn is_uuid(value: &str) -> bool {
+    /// The hexadecimal digits each dash-separated group of a UUID carries.
+    const GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+
+    let mut groups = value.split('-');
+    for length in GROUP_LENGTHS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != length || !group.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    groups.next().is_none()
+}
+
+/// The refusal message a member whose value fails a regular-expression constraint
+/// this service enforces itself carries.
+///
+/// The fixed text of the class is "1 validation error detected. Value at
+/// '<path>' failed to satisfy constraint: Member must satisfy regular expression
+/// pattern: <pattern>" — one sentence, with no echo of the rejected value. Its
+/// variable parts are the JSON-pointer path of the validated member and the
+/// pattern that member must satisfy.
+pub fn pattern_validation_message(path: &str, pattern: &str) -> String {
+    format!(
+        "1 validation error detected. Value at '{path}' failed to satisfy constraint: {}",
+        pattern_constraint_message(pattern)
+    )
+}
+
+/// The constraint clause a `ValidationExceptionField` carries for a member whose
+/// value fails a regular-expression constraint: the same clause the message states.
+pub fn pattern_constraint_message(pattern: &str) -> String {
+    format!("Member must satisfy regular expression pattern: {pattern}")
+}
+
+/// The refusal message an operation in the goal plane answers with when the
+/// identifier it was given is well formed but names no goal in the agent space
+/// the caller reached.
+///
+/// A Trigger is the schedule of a goal, so the goal is the resource actually
+/// resolved and the one the refusal names. The fixed text is "Goal not found: ";
+/// the identifier is taken verbatim from the request.
+pub fn goal_not_found_message(goal_id: &str) -> String {
+    format!("Goal not found: {goal_id}")
+}
+
+/// The UUID a minted goal identifier carries, rendered from `sequence`.
+///
+/// The 16 bytes are the store's monotonic sequence and its complement, so no two
+/// mints agree; the version and variant bits and the `8-4-4-4-12` text form come
+/// from [`service_common::uuid_from_random_bytes`], this tree's one rendering of
+/// them.
+fn goal_uuid(sequence: u64) -> String {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&(!sequence).to_be_bytes());
+    bytes[8..].copy_from_slice(&sequence.to_be_bytes());
+    ::service_common::uuid_from_random_bytes(bytes)
 }
 
 /// The region a request whose SigV4 credential scope names none is served in.
@@ -267,14 +331,14 @@ pub fn agent_space_not_found_message(agent_space_id: &str) -> String {
     )
 }
 
-/// The message an asset-plane refusal of an AgentSpace the caller cannot reach
-/// carries.
+/// The message a refusal of an AgentSpace the caller cannot reach carries.
 ///
-/// The asset plane authorises the caller against the named AgentSpace before it can
-/// know whether anything inside it exists, so a space it cannot see fails closed:
-/// the refusal names no identifier at all, because naming one would tell a caller
-/// which spaces exist outside their authorization. The text is wholly fixed, with
-/// no variable part.
+/// An operation addressed to a resource INSIDE an AgentSpace — an asset, a
+/// Trigger — authorises the caller against that space before it can know whether
+/// anything inside it exists, so a space it cannot see fails closed: the refusal
+/// names no identifier at all, because naming one would tell a caller which spaces
+/// exist outside their authorization. The text is wholly fixed, with no variable
+/// part.
 pub const ACCESS_DENIED_MESSAGE: &str = "Access denied";
 
 /// The refusal message an asset operation answers with when the `assetId` it was
@@ -972,6 +1036,15 @@ pub struct ComAmazonawsDevopsagentDevopsagentState {
 }
 
 impl ComAmazonawsDevopsagentDevopsagentState {
+    /// The next value of the store's monotonic id sequence.
+    ///
+    /// The one place that advances it, so every minted id — whatever form it takes
+    /// — comes out of the same sequence and no value is handed out twice.
+    fn next_sequence(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
+
     /// Mint a fresh resource id of the form `<prefix>-<hex sequence>`.
     ///
     /// The sequence is monotonic within this emulator, so an id is never handed
@@ -979,17 +1052,17 @@ impl ComAmazonawsDevopsagentDevopsagentState {
     /// `AgentSpaceId` (`^[a-zA-Z0-9-]{1,64}$`) and `ResourceId`
     /// (`^[a-zA-Z0-9_.-]+$`, max 128).
     pub fn mint_id(&mut self, prefix: &str) -> String {
-        self.next_id += 1;
-        format!("{prefix}-{:016x}", self.next_id)
+        format!("{prefix}-{:016x}", self.next_sequence())
     }
 
     /// Mint a fresh Trigger identifier.
     ///
-    /// A Trigger is the schedule of a goal, so the identifier is a goal identifier:
-    /// [`TRIGGER_ID_PREFIX`] and a sequence from [`mint_id`](Self::mint_id), which
-    /// satisfies [`is_trigger_id`] by construction.
+    /// A Trigger is the schedule of a goal, so the identifier is a goal
+    /// identifier: [`GOAL_ID_PREFIX`] and a UUID minted from the store's own
+    /// monotonic sequence, so it satisfies [`is_goal_id`] by construction and no
+    /// two mints agree.
     pub fn mint_trigger_id(&mut self) -> String {
-        self.mint_id(TRIGGER_ID_PREFIX.trim_end_matches('-'))
+        format!("{GOAL_ID_PREFIX}{}", goal_uuid(self.next_sequence()))
     }
 
     /// The id a previous `@idempotent` create recorded for `client_token`, when

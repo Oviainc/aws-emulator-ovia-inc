@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `service-common` carries this tree's ONE rendering of a minted 16-byte identifier
+# as the text of a UUID, which a Trigger's goal identifier is built from.
+service-common = { path = "../common" }
 # Opaque pagination tokens: hex-encodes the list cursor a `nextToken` carries.
 hex = { workspace = true }
 # Reads the zip bundle an asset's content can arrive as, so its entries become the

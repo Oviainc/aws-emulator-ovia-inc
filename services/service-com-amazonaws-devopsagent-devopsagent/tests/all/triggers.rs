@@ -25,7 +25,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_devopsagent_devopsagent::state::is_trigger_id;
+use service_com_amazonaws_devopsagent_devopsagent::state::is_goal_id;
 
 /// A SigV4 credential scope naming this service's signing name (`aidevops`), which is
 /// how the router resolves which service claims a request. Signature verification is
@@ -35,8 +35,10 @@ const AUTHORIZATION: &str = concat!(
     "SignedHeaders=host, Signature=0123456789abcdef"
 );
 
-/// The form a Trigger identifier takes, as the refusal states it.
-const TRIGGER_ID_PATTERN: &str = "^goal-[a-zA-Z0-9_.-]+$";
+/// The form a Trigger identifier takes — a goal identifier — as the refusal states
+/// it.
+const GOAL_ID_PATTERN: &str =
+    "^goal-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
 
 /// The published bounds of `GetTriggerInput$triggerId` (`ResourceId`, `@length(min: 1,
 /// max: 128)`), from `smithy_query(query="operation", operation="GetTrigger")`.
@@ -176,11 +178,12 @@ fn schedule_request(expression: &str) -> Value {
 }
 
 /// The refusal a Trigger identifier without the goal form gets, as the service words
-/// it.
-fn identifier_refusal(trigger_id: &str) -> String {
+/// it: one sentence naming the validated member and the pattern it must satisfy, with
+/// no echo of the rejected value.
+fn identifier_refusal() -> String {
     format!(
-        "1 validation error detected: Value '{trigger_id}' at 'triggerId' failed to satisfy \
-         constraint: Member must satisfy regular expression pattern: {TRIGGER_ID_PATTERN}"
+        "1 validation error detected. Value at '/goalId' failed to satisfy constraint: \
+         Member must satisfy regular expression pattern: {GOAL_ID_PATTERN}"
     )
 }
 
@@ -196,18 +199,26 @@ async fn get_trigger_refuses_an_identifier_that_is_not_a_goal_identifier() {
     // Each row satisfies `ResourceId` (`^[a-zA-Z0-9_.-]+$`, 1..128), so the boundary
     // validator passes it and the handler is what refuses it: a bare resource name, a
     // differently-typed identifier, the prefix with no goal after it, the prefix in the
-    // wrong case, the prefix joined by the wrong separator, and the prefix buried
-    // inside the value rather than starting it.
+    // wrong case, the prefix joined by the wrong separator, the prefix buried inside the
+    // value rather than starting it, and the prefix followed by something that is not a
+    // UUID.
+    // The last row sits exactly on the published 128-character bound of `triggerId`,
+    // so the modelled constraint admits it and the goal form is what refuses it.
+    let longest = format!("goal-{}", "a".repeat(TRIGGER_ID_MAX_LEN - "goal-".len()));
     let malformed = [
         "0001",
         "trigger-0000000000000001",
         "task-0000000000000001",
         "goal",
         "goal-",
-        "GOAL-0000000000000001",
-        "goal_0000000000000001",
-        "goal.0000000000000001",
-        "my-goal-0000000000000001",
+        "GOAL-00000000-0000-0000-0000-000000000000",
+        "goal_00000000-0000-0000-0000-000000000000",
+        "goal.00000000-0000-0000-0000-000000000000",
+        "my-goal-00000000-0000-0000-0000-000000000000",
+        "goal-anything",
+        "goal-0000000000009999",
+        "goal-00000000-0000-0000-0000-00000000000",
+        longest.as_str(),
     ];
     for case in malformed {
         for space_id in [space.as_str(), absent_space] {
@@ -223,21 +234,18 @@ async fn get_trigger_refuses_an_identifier_that_is_not_a_goal_identifier() {
             );
             assert_eq!(
                 error_message(&body),
-                identifier_refusal(case),
+                identifier_refusal(),
                 "case {case:?} in space {space_id:?}: unexpected refusal message"
             );
         }
     }
 
     // A goal identifier that names no stored Trigger is a different failure: the
-    // request is well formed, the resource is simply absent. The last row sits exactly
-    // on the published 128-character bound of `triggerId`.
-    let longest = format!("goal-{}", "a".repeat(TRIGGER_ID_MAX_LEN - "goal-".len()));
+    // request is well formed, the resource is simply absent.
     let well_formed = [
-        "goal-0000000000009999",
-        "goal-abcDEF123",
-        "goal-a.b_c-d",
-        longest.as_str(),
+        "goal-00000000-0000-0000-0000-000000000000",
+        "goal-ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "goal-ABCDEF01-2345-6789-abcd-ef0123456789",
     ];
     for case in well_formed {
         assert_eq!(
@@ -257,7 +265,7 @@ async fn get_trigger_refuses_an_identifier_that_is_not_a_goal_identifier() {
         );
         assert_eq!(
             error_message(&body),
-            format!("Trigger not found: {case}"),
+            format!("Goal not found: {case}"),
             "case {case:?}: unexpected refusal message"
         );
     }
@@ -277,21 +285,27 @@ async fn get_trigger_refuses_an_identifier_that_is_not_a_goal_identifier() {
         "case {too_long:?}: expected ValidationException, got {body}"
     );
 
-    // A well-formed identifier in an agent space that does not exist reports the
-    // absent space, not the absent Trigger.
-    let (status, body) = get_trigger(&router, absent_space, "goal-0000000000009999").await;
+    // A well-formed identifier in an agent space that does not exist fails closed: the
+    // caller is authorised against the space before anything inside it can be known,
+    // and the refusal names no identifier at all.
+    let (status, body) = get_trigger(
+        &router,
+        absent_space,
+        "goal-00000000-0000-0000-0000-000000000000",
+    )
+    .await;
     assert_eq!(
-        status, 404,
-        "case absent space: expected 404, got {status} with {body}"
+        status, 403,
+        "case absent space: expected 403, got {status} with {body}"
     );
     assert_eq!(
         error_code(&body),
-        "ResourceNotFoundException",
-        "case absent space: expected ResourceNotFoundException, got {body}"
+        "AccessDeniedException",
+        "case absent space: expected AccessDeniedException, got {body}"
     );
     assert_eq!(
         error_message(&body),
-        format!("Agent space not found: {absent_space}"),
+        "Access denied",
         "case absent space: unexpected refusal message"
     );
 }
@@ -347,7 +361,7 @@ async fn created_triggers_round_trip_through_get_trigger() {
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: no triggerId in {created}"));
         assert!(
-            is_trigger_id(trigger_id),
+            is_goal_id(trigger_id),
             "case {case:?}: minted identifier is not a goal identifier: {trigger_id:?}"
         );
         assert_eq!(
@@ -414,7 +428,7 @@ async fn created_triggers_round_trip_through_get_trigger() {
         );
         assert_eq!(
             error_message(&body),
-            format!("Trigger not found: {trigger_id}"),
+            format!("Goal not found: {trigger_id}"),
             "case {case:?}: unexpected refusal message from another agent space"
         );
     }
@@ -609,17 +623,24 @@ async fn create_trigger_requires_exactly_one_schedule_source_and_replays_its_tok
         "case replayed token: a repeat must replay the first Trigger"
     );
 
-    // A create against an agent space that does not exist stores nothing.
+    // A create against an agent space that does not exist stores nothing, and fails
+    // closed: a Trigger lives inside the space that owns it, so the caller is
+    // authorised against that space before anything inside it can be known.
     let absent_space = "as-ffffffffffffffff";
     let (status, body) =
         create_trigger(&router, absent_space, schedule_request("rate(1 hour)")).await;
     assert_eq!(
-        status, 404,
-        "case absent space: expected 404, got {status} with {body}"
+        status, 403,
+        "case absent space: expected 403, got {status} with {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "AccessDeniedException",
+        "case absent space: expected AccessDeniedException, got {body}"
     );
     assert_eq!(
         error_message(&body),
-        format!("Agent space not found: {absent_space}"),
+        "Access denied",
         "case absent space: unexpected refusal message"
     );
 }

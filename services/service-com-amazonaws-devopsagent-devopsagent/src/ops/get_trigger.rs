@@ -151,21 +151,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The identifier that names a Trigger is the identifier of the goal whose
         // schedule it is, which `ResourceId` does not express — so an identifier
         // without that form is refused as invalid BEFORE anything is looked up,
-        // rather than reported as an absent resource.
-        if !crate::state::is_trigger_id(&input.trigger_id) {
+        // rather than reported as an absent resource. The member the refusal names
+        // is the goal identifier the service validates, not the wire member it
+        // arrived on.
+        if !crate::state::is_goal_id(&input.trigger_id) {
             return Err(GetTriggerErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "1 validation error detected: Value '{}' at 'triggerId' failed to \
-                         satisfy constraint: Member must satisfy regular expression pattern: {}",
-                        input.trigger_id,
-                        crate::state::TRIGGER_ID_PATTERN
+                    message: crate::state::pattern_validation_message(
+                        crate::state::GOAL_ID_PATH,
+                        crate::state::GOAL_ID_PATTERN,
                     ),
                     field_list: Some(vec![ValidationExceptionField {
-                        path: "triggerId".to_string(),
-                        message: format!(
-                            "Member must satisfy regular expression pattern: {}",
-                            crate::state::TRIGGER_ID_PATTERN
+                        path: crate::state::GOAL_ID_PATH.to_string(),
+                        message: crate::state::pattern_constraint_message(
+                            crate::state::GOAL_ID_PATTERN,
                         ),
                     }]),
                 },
@@ -174,20 +173,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `@readonly`: this reports the stored Trigger and writes nothing. A Trigger
-        // is reachable only through the agent space that owns it, and the two
-        // absences are distinct resources, so each is reported on its own.
+        // is reachable only through the agent space that owns it, and the caller is
+        // authorised against that space before anything inside it can be known, so
+        // an `agentSpaceId` that resolves to no space fails CLOSED instead of
+        // disclosing which spaces exist; only inside a space the caller reached is a
+        // missing resource reported as one — and what is resolved there is the goal
+        // the Trigger schedules.
         let store = state.lock();
         let space = store
             .agent_spaces
             .get(&input.agent_space_id)
             .ok_or_else(|| {
-                GetTriggerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("Agent space not found: {}", input.agent_space_id),
+                GetTriggerErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
                 })
             })?;
         let trigger = space.triggers.get(&input.trigger_id).ok_or_else(|| {
             GetTriggerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Trigger not found: {}", input.trigger_id),
+                message: crate::state::goal_not_found_message(&input.trigger_id),
             })
         })?;
 
