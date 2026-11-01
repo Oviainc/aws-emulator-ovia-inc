@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/airflow_description_bound_single_rule.rs"]
 mod airflow_description_bound_single_rule;
+#[path = "all/airflow_log_group_provisioning.rs"]
+mod airflow_log_group_provisioning;
 #[path = "all/airflow_rest_api.rs"]
 mod airflow_rest_api;
 #[path = "all/airflow_rest_api_body_document.rs"]

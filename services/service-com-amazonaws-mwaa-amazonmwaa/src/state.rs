@@ -21,6 +21,11 @@ use crate::ops::types::{
 /// shared engine this service's own store lives in.
 pub mod metrics;
 
+/// Where the Apache Airflow logs of an ENABLED log type are published: the CloudWatch Logs
+/// group this service creates for that log type, in the same shared engine this service's
+/// own store lives in.
+pub mod log_groups;
+
 /// STS's own state accessors, which answer who a request's credential speaks for. The
 /// service that MINTS a session is the one asked about it, so the identity this service
 /// reports for a credential is the one `sts:GetCallerIdentity` reports for it.
@@ -588,24 +593,60 @@ impl LoggingConfigurationRecord {
         }
     }
 
+    /// Each log type's settings beside the log-type name MWAA publishes it under, in the
+    /// order the modelled `LoggingConfiguration` lists the five module blocks.
+    ///
+    /// The ONE place a module is paired with its log type, so the group a reader is told
+    /// about ([`LoggingConfigurationRecord::to_modelled`]) and the group that is created for
+    /// it ([`LoggingConfigurationRecord::enabled_log_groups`]) cannot name two different
+    /// log types for one module.
+    fn modules(&self) -> [(&ModuleLoggingRecord, &'static str); 5] {
+        [
+            (&self.dag_processing_logs, LOG_TYPE_DAG_PROCESSING),
+            (&self.scheduler_logs, LOG_TYPE_SCHEDULER),
+            (&self.task_logs, LOG_TYPE_TASK),
+            (&self.webserver_logs, LOG_TYPE_WEBSERVER),
+            (&self.worker_logs, LOG_TYPE_WORKER),
+        ]
+    }
+
+    /// The names of the CloudWatch Logs groups the log types this configuration ENABLES
+    /// publish to — the groups MWAA creates for the environment named `name` — smallest
+    /// log-type position first.
+    ///
+    /// A disabled log type publishes nothing, so it has no group: the same condition under
+    /// which no `CloudWatchLogGroupArn` is reported for it.
+    pub fn enabled_log_groups(&self, name: &str) -> Vec<String> {
+        self.modules()
+            .into_iter()
+            .filter(|(module, _)| module.enabled)
+            .map(|(_, log_type)| log_group_name(name, log_type))
+            .collect()
+    }
+
+    /// The groups of the log types this configuration enables that `previous` did not: what
+    /// a change to an environment's logging settings asks MWAA to create.
+    ///
+    /// A log type that was already publishing keeps the group it was already publishing to,
+    /// so it is not among these; one that this configuration switched ON is.
+    pub fn log_groups_enabled_since(&self, previous: &Self, name: &str) -> Vec<String> {
+        let already_publishing = previous.enabled_log_groups(name);
+        let mut opened = self.enabled_log_groups(name);
+        opened.retain(|group| !already_publishing.contains(group));
+        opened
+    }
+
     /// The modelled `LoggingConfiguration`: all five module blocks, always.
     fn to_modelled(&self, region: &str, name: &str) -> LoggingConfiguration {
+        let [dag_processing_logs, scheduler_logs, task_logs, webserver_logs, worker_logs] = self
+            .modules()
+            .map(|(module, log_type)| Some(module.to_modelled(region, name, log_type)));
         LoggingConfiguration {
-            dag_processing_logs: Some(self.dag_processing_logs.to_modelled(
-                region,
-                name,
-                LOG_TYPE_DAG_PROCESSING,
-            )),
-            scheduler_logs: Some(
-                self.scheduler_logs
-                    .to_modelled(region, name, LOG_TYPE_SCHEDULER),
-            ),
-            task_logs: Some(self.task_logs.to_modelled(region, name, LOG_TYPE_TASK)),
-            webserver_logs: Some(
-                self.webserver_logs
-                    .to_modelled(region, name, LOG_TYPE_WEBSERVER),
-            ),
-            worker_logs: Some(self.worker_logs.to_modelled(region, name, LOG_TYPE_WORKER)),
+            dag_processing_logs,
+            scheduler_logs,
+            task_logs,
+            webserver_logs,
+            worker_logs,
         }
     }
 }
@@ -1637,16 +1678,23 @@ pub fn environment_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("environment/{name}"))
 }
 
-/// The CloudWatch Logs group ARN an Apache Airflow log type publishes to. MWAA names the
-/// group `airflow-<EnvironmentName>-<LogType>`, which is the shape the
-/// `CloudWatchLogGroupArn` doc's own example carries
+/// The CloudWatch Logs group an Apache Airflow log type publishes to: MWAA names it
+/// `airflow-<EnvironmentName>-<LogType>`, which is the shape the `CloudWatchLogGroupArn`
+/// doc's own example carries
 /// (`arn:aws:logs:us-east-1:…:log-group:airflow-MyMWAAEnvironment-…`).
+///
+/// The ONE place that name is built, so the group that is CREATED for a log type
+/// ([`log_groups`]) and the group whose ARN is REPORTED for it are the same group.
+pub fn log_group_name(name: &str, log_type: &str) -> String {
+    format!("airflow-{name}-{log_type}")
+}
+
+/// The ARN of the group [`log_group_name`] names, built by the OWNING service's own ARN
+/// formatter in the form the `CloudWatchLogGroupArn` doc's own example carries — the one
+/// ending `:*`, which is a log group's own `arn` member — so the ARN MWAA reports for a log
+/// type cannot drift from the ARN CloudWatch Logs reports for the group created for it.
 pub fn log_group_arn(region: &str, name: &str, log_type: &str) -> String {
-    ::engine::emulator_arn(
-        "logs",
-        region,
-        &format!("log-group:airflow-{name}-{log_type}"),
-    )
+    log_groups::destination_log_group_arn(region, &log_group_name(name, log_type))
 }
 
 /// The weekly maintenance window MWAA assigns an environment whose create named none.

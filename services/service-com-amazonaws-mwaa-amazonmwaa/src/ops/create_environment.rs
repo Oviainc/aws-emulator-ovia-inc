@@ -8,6 +8,12 @@
 //! starts in is decided by who manages its VPC endpoints: see
 //! `crate::state::create_lifecycle`.
 //!
+//! One resource is provisioned OUTSIDE this service's own store: each Apache Airflow log
+//! type the create ENABLES publishes to a CloudWatch Logs log group MWAA creates for the
+//! environment, so that group is created in the CloudWatch Logs store of the same shared
+//! engine ([`crate::state::log_groups`]) — the `CloudWatchLogGroupArn` every later read
+//! reports for an enabled log type names a group `logs:DescribeLogGroups` finds.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -414,6 +420,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // Enabling an Apache Airflow log type asks MWAA to publish that type's logs, and it
+        // publishes them to a log group it creates for the environment — the group whose ARN
+        // every later read reports for that log type. The destination is resolved BEFORE the
+        // environment store is touched, so a deployment that carries no CloudWatch Logs for
+        // those groups to be created in records no environment advertising groups nothing
+        // holds; a create that enables no log type publishes nothing and needs none.
+        let log_groups = spec.logging_configuration.enabled_log_groups(&input.name);
+        let log_destination = if log_groups.is_empty() {
+            None
+        } else {
+            Some(
+                crate::state::log_groups::logs_state(&*self.engine)
+                    .ok_or_else(log_destination_unavailable)?,
+            )
+        };
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
         store.settle(now);
@@ -448,6 +470,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "You have reached the maximum number of environments ({})",
                 crate::state::MAX_ENVIRONMENTS
             )));
+        }
+
+        // The log groups the environment's enabled log types publish to, created before the
+        // record that advertises them: every refusal this create owes has been decided by
+        // now, so the groups are provisioned only for a create nothing can still refuse, and
+        // a destination with no room for them leaves no environment behind. A group already
+        // under one of those names is adopted rather than replaced.
+        if let Some(destination) = &log_destination {
+            crate::state::log_groups::create_missing(destination, &region, &log_groups, now)
+                .map_err(|_| log_destination_at_capacity())?;
         }
 
         let name = input.name.clone();
@@ -505,6 +537,31 @@ fn validation(message: impl Into<String>) -> CreateEnvironmentError {
 fn store_unavailable() -> CreateEnvironmentError {
     CreateEnvironmentErrorModeled::InternalServerException(InternalServerException {
         message: Some("the Amazon MWAA environment store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The CloudWatch Logs store being unreachable is a server fault too: a create that enables
+/// an Apache Airflow log type has to create that type's log group there
+/// ([`crate::state::log_groups`]), and answering 200 would report a `CloudWatchLogGroupArn`
+/// naming a group no reader can find.
+fn log_destination_unavailable() -> CreateEnvironmentError {
+    CreateEnvironmentErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the Amazon CloudWatch Logs log group store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The CloudWatch Logs store holding no more log groups is a server-side limit rather than a
+/// fault in the request: the same create would be provisioned by a store with room for the
+/// groups its log types publish to.
+fn log_destination_at_capacity() -> CreateEnvironmentError {
+    CreateEnvironmentErrorModeled::InternalServerException(InternalServerException {
+        message: Some(
+            "the Amazon CloudWatch Logs log group store is at capacity, so the log groups \
+             this environment's Apache Airflow log types publish to were not created"
+                .to_string(),
+        ),
     })
     .into()
 }

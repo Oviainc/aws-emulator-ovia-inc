@@ -40,6 +40,11 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # as their destination, and CloudWatch refuses a `PutMetricData` into a reserved `AWS/`
 # namespace, so this writes the very store `ListMetrics`/`GetMetricStatistics` read.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The CloudWatch Logs store the log group of each ENABLED Apache Airflow log type is created
+# in (`state::log_groups`): MWAA publishes a log type's logs to the group it creates for that
+# type and reports that group's ARN, so the group has to exist in the very store CloudWatch
+# Logs' own `DescribeLogGroups` / `GetLogEvents` read.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

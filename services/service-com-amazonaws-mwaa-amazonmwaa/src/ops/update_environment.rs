@@ -18,6 +18,14 @@
 //! of a pair leaves the environment loading no such object, with neither member of the
 //! pair left on the record (see [`crate::state::EnvironmentSpec::normalise_s3_objects`]).
 //!
+//! An update that SWITCHES AN APACHE AIRFLOW LOG TYPE ON provisions one resource outside
+//! this service's own store, exactly as a create that enables one does: that log type
+//! publishes to a CloudWatch Logs log group MWAA creates for the environment, so the group
+//! is created in the CloudWatch Logs store of the same shared engine
+//! ([`crate::state::log_groups`]) and the `CloudWatchLogGroupArn` the applied configuration
+//! reports for it names a group `logs:DescribeLogGroups` finds. Switching one OFF leaves its
+//! group where it is: the Apache Airflow logs already in it belong to the account.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -389,6 +397,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already stored, and vice versa.
         merged.validate().map_err(validation)?;
 
+        // A log type this update SWITCHES ON publishes to a log group MWAA creates for the
+        // environment, so that group is created now, before the update is accepted: the
+        // `CloudWatchLogGroupArn` the applied configuration reports for it names a group
+        // `logs:DescribeLogGroups` finds. A log type that was already publishing keeps the
+        // group it was already publishing to, so an update that changes nothing about the
+        // logging settings creates nothing — and a refusal here leaves the stored record
+        // alone, exactly like the business rules above.
+        let opened_log_groups = merged
+            .logging_configuration
+            .log_groups_enabled_since(&stored.spec.logging_configuration, &input.name);
+        if !opened_log_groups.is_empty() {
+            let destination = crate::state::log_groups::logs_state(&*self.engine)
+                .ok_or_else(log_destination_unavailable)?;
+            crate::state::log_groups::create_missing(
+                &destination,
+                &region,
+                &opened_log_groups,
+                now,
+            )
+            .map_err(|_| log_destination_at_capacity())?;
+        }
+
         // The merged configuration is handed to the update's PHASES rather than written
         // here: Amazon MWAA snapshots the environment's database cluster before it applies
         // a change, so the environment goes on reporting the configuration it is running
@@ -413,6 +443,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn validation(message: impl Into<String>) -> UpdateEnvironmentError {
     UpdateEnvironmentErrorModeled::ValidationException(ValidationException {
         message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The CloudWatch Logs store being unreachable is a server fault, which this operation
+/// models: an update that switches an Apache Airflow log type on has to create that type's
+/// log group there ([`crate::state::log_groups`]), and answering 200 would leave the applied
+/// configuration reporting a `CloudWatchLogGroupArn` naming a group no reader can find.
+fn log_destination_unavailable() -> UpdateEnvironmentError {
+    UpdateEnvironmentErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the Amazon CloudWatch Logs log group store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The CloudWatch Logs store holding no more log groups is a server-side limit rather than a
+/// fault in the request: the same update would be applied by a store with room for the
+/// groups the log types it switches on publish to.
+fn log_destination_at_capacity() -> UpdateEnvironmentError {
+    UpdateEnvironmentErrorModeled::InternalServerException(InternalServerException {
+        message: Some(
+            "the Amazon CloudWatch Logs log group store is at capacity, so the log groups \
+             the Apache Airflow log types this update enables publish to were not created"
+                .to_string(),
+        ),
     })
     .into()
 }
