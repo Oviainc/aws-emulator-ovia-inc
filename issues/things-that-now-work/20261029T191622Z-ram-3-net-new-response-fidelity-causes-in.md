@@ -77,3 +77,53 @@ Model facts used (services/service-com-amazonaws-ram-amazonresourcesharing/smith
 4. Cause 2: replay fixture ram-resource-share-tagging up to step task#2 — call TagResource with the share's resourceShareArn and one tag. Inspect the 200 body: tagsCreated[0] carries key/value but no "__type": "Tag" member.
 5. Cause 3: continue the same fixture to step task#4 — call UntagResource with that tag's key. Inspect the 200 body: deletedTags[0] likewise has no "__type": "Tag" member.
 6. Re-replay ram-principal-association-workflow#task#5, ram-resource-share-tagging#task#2 and ram-resource-share-tagging#task#4 after the fix; all three must pass before this issue is closed.
+
+## Resolution notes
+
+All three causes are FIXED. Two of the report's claims about what AWS does are
+contradicted by the recording itself, and the fix follows the recording:
+
+### Causes 2 and 3 — `__type` on a tag-mutation entry
+
+RULE: `TagResource$tagsCreated` and `UntagResource$deletedTags` are serialized as
+self-describing JSON documents — every entry carries the AWS JSON structure
+discriminator `__type` with the serialized structure's own local name — while a `Tag`
+reported as part of a resource's STATE (`ResourceShare$tags`,
+`ResourceSharePermission*$tags`) carries the modelled members alone.
+
+The report asks for the discriminator "for every Tag element". The recording disagrees:
+the SAME fixture reports `ResourceShare$tags` WITHOUT it (those steps replayed clean
+before this change and still do), so the discriminator belongs to the two
+tag-mutation members, not to the `Tag` shape. Implemented in
+`src/ops/types/tag_wire.rs`, which states the schema and serializer of the two response
+shapes once and points their element writer at a document view of `Tag`.
+
+### Cause 1 — `external` on a teardown report
+
+RULE: `DisassociateResourceShare` answers with the association records it REMOVES from
+the share; the call leaves no principal participating in the share, so there is no
+principal to place in the owning account's organization and every record it reports
+carries `external = false`. The stored derivation (the entity against the share's
+owning account) is untouched, and every operation that reports an association still
+participating in the share reports it.
+
+The report asks for one derivation used by Associate/Disassociate/Get alike. Two
+controlled replays show the recording does not work that way: forcing every principal
+association to `false` makes `AssociateResourceShare` (task#2) and
+`GetResourceShareAssociations` diverge, and deriving the flag from the record's status
+makes `GetResourceShareAssociations` (task#6, AFTER the teardown) diverge — so the
+recorded `external` is the derived value everywhere except in the teardown's own report.
+Implemented as `state::AssociationRecord::removal_view`, used by both the fresh and the
+idempotent-repeat path of the teardown handler.
+
+### Tests
+
+`tests/all/document_entries_and_removal_reports.rs` (new, declared in `tests/all.rs`)
+asserts both rules over tables: the document rule over the length and shape of the
+reported list, with each entry's discriminator-stripped object matched against the pair
+the share reports through `GetResourceShares`; the teardown rule over entity form,
+association type and how many of each one call names — including a row whose entities
+derive BOTH values — plus the idempotent repeat and the read-back that shows the stored
+flag unmoved. `tests/all/response_payload_fidelity.rs` and
+`tests/all/mutation_reports.rs` carried the opposite expectations (they were written when
+these causes were declined) and now assert these rules.

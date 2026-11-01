@@ -16,7 +16,8 @@
 //! `ResourceShareConfiguration$exclusiveAccountAccess` was before it. The RULE the
 //! handler implements is "a tag mutation reports what it changed": the response lists
 //! the keys the share actually carried and this call removed, so an untag that was a
-//! no-op is distinguishable from one that detached a tag.
+//! no-op is distinguishable from one that detached a tag. Each reported entry goes onto
+//! the wire as a self-describing document — see [`crate::ops::types::tag_wire`].
 //!
 //! Exactly one of `resourceShareArn` and `resourceArn` may be named ("You must
 //! specify either resourceArn, or resourceShareArn, but not both"). `resourceArn`

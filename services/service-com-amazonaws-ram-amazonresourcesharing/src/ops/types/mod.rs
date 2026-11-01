@@ -48,6 +48,7 @@ pub mod replace_permission_associations_types;
 pub mod set_default_permission_version_types;
 pub mod shared_types;
 pub mod tag_resource_types;
+pub mod tag_wire;
 pub mod untag_resource_types;
 pub mod update_resource_share_types;
 
@@ -119,6 +120,8 @@ pub use set_default_permission_version_types::*;
 pub use shared_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use tag_resource_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use tag_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use untag_resource_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

@@ -14,7 +14,9 @@
 //! `smithy-model/com-amazonaws-ram-amazonresourcesharing.json`, exactly as
 //! `ResourceShareConfiguration$exclusiveAccountAccess` was before it. The RULE the
 //! handler implements is "a tag mutation reports what it changed": the response lists
-//! the pair now in effect for every distinct key the request named.
+//! the pair now in effect for every distinct key the request named. Each reported entry
+//! goes onto the wire as a self-describing document — see
+//! [`crate::ops::types::tag_wire`].
 //!
 //! Exactly one of `resourceShareArn` and `resourceArn` may be named ("You must
 //! specify either resourceArn, or resourceShareArn, but not both"). `resourceArn`

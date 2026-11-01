@@ -8,7 +8,9 @@
 //! * a tag mutation reports what it changed: `TagResource` answers with the pair now
 //!   in effect for every distinct key the request named, and `UntagResource` answers
 //!   with the keys the share actually carried and this call removed — so a mutation
-//!   that was a no-op is distinguishable from one that changed the tag set;
+//!   that was a no-op is distinguishable from one that changed the tag set — and each
+//!   reported entry is a self-describing document, carrying the structure
+//!   discriminator beside the pair (see `src/ops/types/tag_wire.rs`);
 //! * `DisassociateResourceShare` takes an association to the terminal `DISASSOCIATED`
 //!   status and the record SURVIVES there, so a read still reports the association,
 //!   a status-filtered read selects it and a caller polling for the teardown sees it
@@ -173,9 +175,13 @@ async fn a_tag_mutation_reports_exactly_what_it_changed() {
                     for (key, value) in pairs {
                         attached.insert((*key).to_string(), (*value).to_string());
                     }
+                    // A reported entry is the pair plus the structure discriminator the
+                    // tag mutations serialize their entries with.
                     let expected: Vec<Value> = attached
                         .iter()
-                        .map(|(key, value)| json!({ "key": key, "value": value }))
+                        .map(|(key, value)| {
+                            json!({ "__type": "Tag", "key": key, "value": value })
+                        })
                         .collect();
 
                     let tags: Vec<Value> = pairs
@@ -209,8 +215,10 @@ async fn a_tag_mutation_reports_exactly_what_it_changed() {
                         removed.dedup();
                         removed
                     };
-                    let expected: Vec<Value> =
-                        removed.iter().map(|key| json!({ "key": key })).collect();
+                    let expected: Vec<Value> = removed
+                        .iter()
+                        .map(|key| json!({ "__type": "Tag", "key": key }))
+                        .collect();
 
                     let (status, body) = untag_resource(
                         &router,

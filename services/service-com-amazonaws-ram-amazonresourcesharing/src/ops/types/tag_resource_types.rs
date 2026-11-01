@@ -19,7 +19,11 @@ pub struct TagResourceInput {
     pub resource_arn: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ram#TagResourceResponse")]
+/// `com.amazonaws.ram#TagResourceResponse`.
+///
+/// Its schema and serializer are stated in [`super::tag_wire`] rather than emitted by
+/// `#[smithy_macros::smithy(shape = ...)]`, because each reported entry carries the
+/// structure discriminator the model does not declare; see that module's docs.
 #[derive(Debug, Clone, Default)]
 pub struct TagResourceOutput {
     /// The pairs the call attached, one per tag key the request named. The member was

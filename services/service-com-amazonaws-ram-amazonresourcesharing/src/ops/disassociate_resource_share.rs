@@ -10,6 +10,13 @@
 //! caller polling for the teardown to finish sees it complete. How long that takes
 //! follows from what there was to revoke — see [`crate::state::ComAmazonawsRamAmazonresourcesharingState::disassociate`].
 //!
+//! What this operation reports is the association being REMOVED, so every record in
+//! its answer carries `external = false`: the call leaves no principal participating
+//! in the share, so there is none to place in the owning account's organization. The
+//! stored derivation is untouched, and the operations that report an association still
+//! participating in the share report it — see
+//! [`crate::state::AssociationRecord::removal_view`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -322,7 +329,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 (*association_type).to_string(),
                                 (*entity).clone(),
                             ))
-                            .map(crate::state::AssociationRecord::view)
+                            .map(crate::state::AssociationRecord::removal_view)
                     })
                     .collect();
                 return Ok(DisassociateResourceShareOutput {
@@ -375,7 +382,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 store
                     .disassociate(&share_arn, association_type, entity.as_str(), now)
                     .as_ref()
-                    .map(crate::state::AssociationRecord::view)
+                    .map(crate::state::AssociationRecord::removal_view)
             })
             .collect();
 

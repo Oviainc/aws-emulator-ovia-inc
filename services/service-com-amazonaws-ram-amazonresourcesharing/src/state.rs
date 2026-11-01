@@ -438,6 +438,26 @@ impl AssociationRecord {
         }
     }
 
+    /// This record as the modelled `ResourceShareAssociation` wire shape, reported by
+    /// the operation that REMOVES the association from the share.
+    ///
+    /// `DisassociateResourceShare` "removes the specified principals, resources, or
+    /// source constraints from participating in the specified resource share" (the
+    /// operation's own documentation) and answers with the records it removed. On those
+    /// records the organization-membership flag is false whatever the entity is: the
+    /// call leaves no principal participating in the share, so there is none to place
+    /// in the owning account's organization. Every operation that reports an
+    /// association still participating in the share — `AssociateResourceShare`,
+    /// `GetResourceShareAssociations`, and the list a `ResourceShareInvitation` carries
+    /// — reports [`Self::view`], with the flag derived from the entity and the share's
+    /// owning account, so the stored derivation is untouched by a teardown.
+    pub fn removal_view(&self) -> ResourceShareAssociation {
+        ResourceShareAssociation {
+            external: Some(false),
+            ..self.view()
+        }
+    }
+
     /// Whether this record's status is one no further move is owed from.
     pub fn is_terminal(&self) -> bool {
         association_status_is_terminal(&self.status)

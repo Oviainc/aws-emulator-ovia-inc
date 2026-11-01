@@ -5,26 +5,30 @@
 //!
 //! The two rules under test, each asserted over a table rather than one case:
 //!
-//! * **A success body carries exactly the members the model declares.** Every `Tag`
-//!   RAM reports — in `TagResource$tagsCreated`, in `UntagResource$deletedTags` and in
-//!   `ResourceShare$tags` — is the one modelled `com.amazonaws.ram#Tag`
-//!   (`smithy_query(query="shape",shape="Tag")`: exactly `key` and `value`), so one
-//!   stored pair serializes identically wherever it is reported and no type
-//!   discriminator appears anywhere inside a 2xx body. The restJson1 discriminator
-//!   `__type` belongs to the ERROR envelope (`vendor/smithy-schema-server/src/rest_json.rs`),
-//!   which the last case of that test pins from the other side.
-//! * **`external` is ONE value per association record, derived from the share's owner.**
-//!   `ResourceShareAssociation$external` "indicates whether the principal belongs to
-//!   the same organization in Organizations as the Amazon Web Services account that
-//!   owns the resource share", and all three association operations report that one
-//!   member of that one shape — so `AssociateResourceShare`,
-//!   `GetResourceShareAssociations` and `DisassociateResourceShare` report the same
-//!   value for the same record, and that value follows the entity: the owning account
-//!   and anything inside the owner's Organizations hierarchy are in-organization, any
-//!   other account is external. The second `external` test pins the other half of that
-//!   rule — the flag is a property of the ENTITY and the OWNER alone, so neither the
-//!   share's `allowExternalPrincipals` switch (before or after an update flips it), nor
-//!   a repeat of the association, nor which operation reports the record moves it.
+//! * **A tag MUTATION reports its entries as self-describing documents; a tag reported
+//!   as part of a resource's state does not.** `TagResource$tagsCreated` and
+//!   `UntagResource$deletedTags` carry, on every entry, the AWS JSON structure
+//!   discriminator `__type` naming the serialized structure (`Tag`) beside the modelled
+//!   `key`/`value` pair (`smithy_query(query="shape",shape="Tag")`: the model declares
+//!   exactly `key` and `value`, so the discriminator is not a modelled member);
+//!   `ResourceShare$tags` carries the pair alone. Strip the discriminator and one
+//!   stored pair is the same object in both places.
+//! * **`external` is derived from the entity and the share's owning account, and the
+//!   teardown report carries false.** `ResourceShareAssociation$external` "indicates
+//!   whether the principal belongs to the same organization in Organizations as the
+//!   Amazon Web Services account that owns the resource share", so for every operation
+//!   that reports an association still participating in the share
+//!   (`AssociateResourceShare`, `GetResourceShareAssociations`) it follows the entity:
+//!   the owning account and anything inside the owner's Organizations hierarchy are
+//!   in-organization, any other account is external.
+//!   `DisassociateResourceShare` reports the association it is REMOVING — the call
+//!   leaves no principal participating in the share, so there is none to place in the
+//!   owner's organization and the flag on its records is false whatever the entity,
+//!   while the stored derivation is untouched and a later read reports it again. The
+//!   second `external` test pins the other half of the rule — the stored flag is a
+//!   property of the ENTITY and the OWNER alone, so neither the share's
+//!   `allowExternalPrincipals` switch (before or after an update flips it) nor a repeat
+//!   of the association moves it.
 
 use std::collections::BTreeSet;
 
@@ -64,8 +68,9 @@ fn member_names(value: &Value, into: &mut BTreeSet<String>) {
     }
 }
 
-/// Assert no member of a SUCCESS body is a type discriminator: a member whose name
-/// starts with `__` (restJson1 writes `__type` only in an error envelope).
+/// Assert no member of a body reporting a resource's own state is a type
+/// discriminator: a member whose name starts with `__`. Only the two tag mutations
+/// report their entries as documents; everything else carries modelled members alone.
 fn assert_no_discriminator(label: &str, body: &Value) {
     let mut names = BTreeSet::new();
     member_names(body, &mut names);
@@ -75,7 +80,7 @@ fn assert_no_discriminator(label: &str, body: &Value) {
         .collect();
     assert!(
         discriminators.is_empty(),
-        "case {label:?}: a 2xx body must carry only modelled members, \
+        "case {label:?}: a body reporting stored state must carry only modelled members, \
          got the discriminator(s) {discriminators:?} in {body:?}"
     );
 }
@@ -104,8 +109,41 @@ fn modelled_tag_members() -> BTreeSet<String> {
     ["key", "value"].iter().map(|m| (*m).to_string()).collect()
 }
 
+/// The member name the AWS JSON structure discriminator travels under.
+const DISCRIMINATOR: &str = "__type";
+
+/// The value the discriminator carries on a tag entry: the local name of the
+/// `com.amazonaws.ram#Tag` structure being serialized.
+const TAG_STRUCTURE_NAME: &str = "Tag";
+
+/// `entry` with its structure discriminator checked and taken off, so what is left can
+/// be compared with the same pair reported as part of a resource's own state.
+fn without_discriminator(label: &str, entry: &Value) -> Value {
+    let mut object = entry
+        .as_object()
+        .unwrap_or_else(|| panic!("case {label:?}: expected a JSON object, got {entry:?}"))
+        .clone();
+    let discriminator = object.remove(DISCRIMINATOR);
+    assert_eq!(
+        discriminator.as_ref().and_then(Value::as_str),
+        Some(TAG_STRUCTURE_NAME),
+        "case {label:?}: a tag-mutation entry must carry {DISCRIMINATOR:?} = \
+         {TAG_STRUCTURE_NAME:?}, got {entry:?}"
+    );
+    Value::Object(object)
+}
+
+/// The members a tag-mutation entry carries: the discriminator plus the modelled
+/// members named in `modelled`.
+fn document_members(modelled: &[&str]) -> BTreeSet<String> {
+    std::iter::once(DISCRIMINATOR)
+        .chain(modelled.iter().copied())
+        .map(str::to_string)
+        .collect()
+}
+
 #[tokio::test]
-async fn every_reported_tag_carries_exactly_the_modelled_members() {
+async fn a_tag_mutation_reports_documents_while_a_share_reports_plain_pairs() {
     let router = emulator();
 
     // The rule generalises over the tag PAIR, so the rows differ along the form of the
@@ -188,9 +226,9 @@ async fn every_reported_tag_carries_exactly_the_modelled_members() {
 
         let arn = arn_of(case, &created);
 
-        // TagResource: every reported entry is the modelled Tag, and the entry for a
-        // key is byte-identical to the entry the SAME pair gets inside the share — one
-        // shape, serialized one way, wherever it is reported.
+        // TagResource: every reported entry is a document — the discriminator naming the
+        // Tag structure, plus the modelled pair — and with the discriminator taken off
+        // it is the very object the SAME pair gets inside the share.
         let tags: Vec<Value> = add
             .iter()
             .map(|(key, value)| json!({ "key": key, "value": value }))
@@ -201,7 +239,6 @@ async fn every_reported_tag_carries_exactly_the_modelled_members() {
             status, 200,
             "case {case:?}: TagResource expected 200, got {status} with {tagged:?}"
         );
-        assert_no_discriminator(case, &tagged);
         let created_entries = list_of(case, &tagged, "tagsCreated");
         assert_eq!(
             created_entries.len(),
@@ -211,8 +248,8 @@ async fn every_reported_tag_carries_exactly_the_modelled_members() {
         for entry in &created_entries {
             assert_eq!(
                 members_of(case, entry),
-                modelled_tag_members(),
-                "case {case:?}: tagsCreated entry carries unmodelled members: {entry:?}"
+                document_members(&["key", "value"]),
+                "case {case:?}: tagsCreated entry carries the wrong members: {entry:?}"
             );
         }
 
@@ -229,15 +266,16 @@ async fn every_reported_tag_carries_exactly_the_modelled_members() {
         let share = only_share(case, &listed);
         let share_entries = list_of(case, &share, "tags");
         for entry in &created_entries {
+            let plain = without_discriminator(case, entry);
             assert!(
-                share_entries.contains(entry),
-                "case {case:?}: the pair {entry:?} TagResource reported is serialized \
+                share_entries.contains(&plain),
+                "case {case:?}: the pair {plain:?} TagResource reported is serialized \
                  differently inside the share: {share_entries:?}"
             );
         }
 
-        // UntagResource: the pair is gone, so an entry names the key alone — still the
-        // modelled Tag, with no member the model does not declare.
+        // UntagResource: the pair is gone, so an entry names the key alone — still a
+        // document, carrying the discriminator and no member the model does not declare.
         let (status, untagged) = untag_resource(
             &router,
             &json!({ "resourceShareArn": arn, "tagKeys": remove }),
@@ -247,7 +285,6 @@ async fn every_reported_tag_carries_exactly_the_modelled_members() {
             status, 200,
             "case {case:?}: UntagResource expected 200, got {status} with {untagged:?}"
         );
-        assert_no_discriminator(case, &untagged);
         let deleted_entries = list_of(case, &untagged, "deletedTags");
         assert_eq!(
             deleted_entries.len(),
@@ -257,14 +294,15 @@ async fn every_reported_tag_carries_exactly_the_modelled_members() {
         for entry in &deleted_entries {
             assert_eq!(
                 members_of(case, entry),
-                ["key"].iter().map(|m| (*m).to_string()).collect(),
-                "case {case:?}: deletedTags entry carries unmodelled members: {entry:?}"
+                document_members(&["key"]),
+                "case {case:?}: deletedTags entry carries the wrong members: {entry:?}"
             );
         }
     }
 
-    // The other side of the same rule: the `__type` discriminator belongs to the ERROR
-    // envelope, where restJson1 writes it, and a failed tag mutation carries it.
+    // The other side of the same rule: a REFUSED tag mutation carries no tag entry at
+    // all — it answers in the restJson1 error envelope, whose own discriminator names
+    // the error class rather than the Tag structure.
     let (status, refused) = tag_resource(
         &router,
         &json!({
@@ -435,7 +473,7 @@ fn external_of(label: &str, association: &Value) -> bool {
 }
 
 #[tokio::test]
-async fn external_is_derived_from_the_owning_organization_and_is_one_value_per_record() {
+async fn external_is_derived_from_the_owning_organization_and_the_teardown_reports_false() {
     let router = emulator();
 
     for (index, row) in external_cases().into_iter().enumerate() {
@@ -485,8 +523,9 @@ async fn external_is_derived_from_the_owning_organization_and_is_one_value_per_r
              got {on_read} for {entity}"
         );
 
-        // 3. The call that tears it down: the same member of the same record, so the
-        // same value — the operation reporting it cannot change what the flag says.
+        // 3. The call that REMOVES it: the entity stops participating in the share, so
+        // there is no principal left to place in the owner's organization and this
+        // report carries false for every row of the table.
         let (status, disassociated) = disassociate(&router, &request).await;
         assert_eq!(
             status, 200,
@@ -494,19 +533,14 @@ async fn external_is_derived_from_the_owning_organization_and_is_one_value_per_r
              with {disassociated:?}"
         );
         let on_disassociate = external_of(case, &association_for(case, &disassociated, entity));
-        assert_eq!(
-            on_disassociate, external,
-            "case {case:?}: DisassociateResourceShare expected external {external}, \
+        assert!(
+            !on_disassociate,
+            "case {case:?}: DisassociateResourceShare expected external false, \
              got {on_disassociate} for {entity}"
         );
-        assert_eq!(
-            (on_associate, on_read),
-            (on_disassociate, on_disassociate),
-            "case {case:?}: external must be one value per record, got \
-             associate={on_associate}, read={on_read}, disassociate={on_disassociate}"
-        );
 
-        // And the teardown left the record where a later read still finds the same flag.
+        // And the teardown left the STORED flag where a later read reports it again:
+        // the removal report does not rewrite the record.
         let (_, after) = get_associations(
             &router,
             &json!({ "associationType": association_type, "resourceShareArns": [arn] }),
@@ -695,7 +729,8 @@ async fn external_is_a_property_of_the_entity_and_the_owner_alone() {
              got {on_repeat} for {entity}"
         );
 
-        // And the teardown reports the record it tore down, flag included.
+        // And the teardown reports the record it tore down with the flag the removal
+        // carries, whatever the entity and whatever the share's switch now says.
         let (status, disassociated) = disassociate(&router, &request).await;
         assert_eq!(
             status, 200,
@@ -704,9 +739,9 @@ async fn external_is_a_property_of_the_entity_and_the_owner_alone() {
         );
         assert_no_discriminator(case, &disassociated);
         let on_disassociate = external_of(case, &association_for(case, &disassociated, entity));
-        assert_eq!(
-            on_disassociate, external,
-            "case {case:?}: DisassociateResourceShare expected external {external}, \
+        assert!(
+            !on_disassociate,
+            "case {case:?}: DisassociateResourceShare expected external false, \
              got {on_disassociate} for {entity}"
         );
     }
