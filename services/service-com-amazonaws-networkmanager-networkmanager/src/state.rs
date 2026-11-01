@@ -5515,6 +5515,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// network records the registration and no attachment of it — so no such ARN resolves to
     /// one and the analysis reports the "cannot find an attachment" it really found rather
     /// than a placeholder.
+    ///
+    /// The endpoint's attachment ARN is an OPTIONAL reference member, so it is read through
+    /// [`optional_reference`]: the empty string its modelled `len 0..` admits names no
+    /// attachment, resolves nothing, and is held as none exactly as the omitted member is —
+    /// so the stored endpoint options never echo back an ARN nothing can be stored under.
     fn resolve_route_endpoint(
         &self,
         global_network_id: &str,
@@ -5522,7 +5527,8 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         spec: &RouteAnalysisEndpointOptionsSpecification,
         now: SystemTime,
     ) -> RouteEndpoint {
-        let resolution = match spec.transit_gateway_attachment_arn.as_deref() {
+        let attachment_arn = optional_reference(spec.transit_gateway_attachment_arn.clone());
+        let resolution = match attachment_arn.as_deref() {
             None => RouteEndpointResolution::Unspecified,
             Some(arn) => {
                 let held = self
@@ -5549,7 +5555,7 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         };
         RouteEndpoint {
             member,
-            attachment_arn: spec.transit_gateway_attachment_arn.clone(),
+            attachment_arn,
             ip_address: spec.ip_address.clone(),
             resolution,
         }

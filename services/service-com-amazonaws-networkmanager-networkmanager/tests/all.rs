@@ -205,6 +205,8 @@ mod resource_state_machine;
 mod resource_tagging;
 #[path = "all/route_analysis.rs"]
 mod route_analysis;
+#[path = "all/route_analysis_empty_endpoint_reference.rs"]
+mod route_analysis_empty_endpoint_reference;
 #[path = "all/site_ids_filter_maximum.rs"]
 mod site_ids_filter_maximum;
 #[path = "all/site_to_site_vpn_attachment_lifecycle.rs"]
