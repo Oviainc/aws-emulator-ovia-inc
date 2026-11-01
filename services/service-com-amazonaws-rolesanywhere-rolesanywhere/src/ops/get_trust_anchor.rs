@@ -144,10 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a 404, never a canned success.
         let record = store.trust_anchors.get(&input.trust_anchor_id).ok_or_else(|| {
             GetTrustAnchorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "Trust anchor {} not found",
-                    input.trust_anchor_id
-                )),
+                message: Some(crate::state::addressed_trust_anchor_not_found_message()),
             })
         })?;
 

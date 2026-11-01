@@ -28,7 +28,9 @@
 //! name as the model spells it), a `SCHEMA` naming them in that order, the
 //! `<SHAPE>_SCHEMA` static and the `SerializableStruct` / `DeserializableStruct` pair.
 //! Each member list is the model's, member for member: same shape ids, same wire names,
-//! same order, same shape types.
+//! same order, same shape types. The ONE exception is marked where it is declared:
+//! `TrustAnchorDetail$crlDpRevocationEnabled`, which the vendored model snapshot does not
+//! carry while the recorded service answers with it.
 //!
 //! WHAT IS DELIBERATELY ABSENT.
 //!
@@ -355,6 +357,16 @@ ra_schema_and_codec!(
         7,
         opt,
         list_of_struct(NotificationSettingDetail)
+    ),
+    // Not in the vendored model snapshot, but on every recorded `TrustAnchorDetail` the
+    // real service answers with; see the member's own note on the struct.
+    (
+        M_CRL_DP_REVOCATION_ENABLED,
+        crl_dp_revocation_enabled,
+        "crlDpRevocationEnabled",
+        8,
+        opt,
+        boolean
     ),
 );
 

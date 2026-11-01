@@ -31,6 +31,14 @@ const REGION: &str = "us-west-2";
 /// The account every emulated ARN carries (`engine::emulator_account_id`).
 const ACCOUNT: &str = "000000000000";
 
+/// Every value the modelled `NotificationEvent` enum accepts, in the order the model
+/// lists them (`smithy_query(query="shape", shape="NotificationEvent")`).
+const NOTIFICATION_EVENTS: [&str; 2] = ["CA_CERTIFICATE_EXPIRY", "END_ENTITY_CERTIFICATE_EXPIRY"];
+
+/// The principal a setting this service configured is reported under
+/// (`NotificationSettingDetail$configuredBy` doc).
+const SERVICE_NOTIFICATION_PRINCIPAL: &str = "rolesanywhere.amazonaws.com";
+
 /// A client over one emulator: one engine, one mounted service, so every request in a
 /// test observes the state the previous one wrote.
 struct Client {
@@ -300,29 +308,48 @@ async fn created_trust_anchor_round_trips_through_get_trust_anchor() {
                 "case {case:?}: {member} must be present, got {anchor:?}"
             );
         }
-        // Notification settings come back as `NotificationSettingDetail`s, i.e. what was
-        // configured plus the account that configured it.
-        let configured = body
+        // A trust anchor reports one notification setting per modelled event whatever the
+        // request said: the ones it customized plus this service's own default for the
+        // rest. `tests/all/notification_settings.rs` pins the whole rule; here it is the
+        // create-path projection that matters.
+        let customized: BTreeSet<&str> = body
             .get("notificationSettings")
             .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        let returned = anchor
+            .map(|settings| {
+                settings
+                    .iter()
+                    .filter_map(|setting| setting.get("event").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let settings = anchor
             .get("notificationSettings")
             .and_then(Value::as_array)
-            .map_or(usize::MAX, Vec::len);
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: notificationSettings must be a list, got {anchor:?}")
+            });
+        let returned: Vec<&str> = settings
+            .iter()
+            .filter_map(|setting| setting.get("event").and_then(Value::as_str))
+            .collect();
         assert_eq!(
-            returned, configured,
-            "case {case:?}: expected {configured} notificationSettings, got {anchor:?}"
+            returned, NOTIFICATION_EVENTS,
+            "case {case:?}: every modelled NotificationEvent must carry a setting, got \
+             {anchor:?}"
         );
-        if let Some(settings) = anchor.get("notificationSettings").and_then(Value::as_array) {
-            for setting in settings {
-                assert_eq!(
-                    setting.get("configuredBy").and_then(Value::as_str),
-                    Some(ACCOUNT),
-                    "case {case:?}: a customized notification setting is configuredBy the \
-                     account, got {setting:?}"
-                );
-            }
+        for setting in settings {
+            let event = setting.get("event").and_then(Value::as_str).unwrap_or_default();
+            let expected_by = if customized.contains(event) {
+                ACCOUNT
+            } else {
+                SERVICE_NOTIFICATION_PRINCIPAL
+            };
+            assert_eq!(
+                setting.get("configuredBy").and_then(Value::as_str),
+                Some(expected_by),
+                "case {case:?}: the setting for {event} must be configuredBy \
+                 {expected_by:?}, got {setting:?}"
+            );
         }
 
         let fetched = client.get_trust_anchor(&id).await;

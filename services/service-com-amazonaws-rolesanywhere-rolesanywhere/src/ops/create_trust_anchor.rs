@@ -4,6 +4,9 @@
 //! Mints a trust anchor from the caller's certificate source and stores it in
 //! [`crate::state::ComAmazonawsRolesanywhereRolesanywhereState::trust_anchors`], so
 //! `GetTrustAnchor`, `ListTrustAnchors` and `DeleteTrustAnchor` all see the same record.
+//! The stored record carries this service's own notification settings for every modelled
+//! event from the start, with whatever the request customized applied on top
+//! ([`crate::state::default_notification_details`]).
 //!
 //! ## Shape of an operation
 //!
@@ -146,48 +149,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
 
-        // `Source` is `@required`, but its own two members are not, and the model names
-        // which certificate data member belongs to which `sourceType`. A source that
-        // carries neither, or carries the data of the other type, describes no
-        // certificate authority at all — so it is refused rather than stored.
-        let source_type = input
-            .source
-            .source_type
-            .clone()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| validation("source.sourceType", "Member must not be null"))?;
-        if !TRUST_ANCHOR_TYPE_VALUES.contains(&source_type.as_str()) {
-            return Err(validation(
-                "source.sourceType",
-                &format!(
-                    "Member must satisfy enum value set: [{}]",
-                    TRUST_ANCHOR_TYPE_VALUES.join(", ")
-                ),
-            ));
-        }
-        let source_data = input
-            .source
-            .source_data
-            .as_ref()
-            .ok_or_else(|| validation("source.sourceData", "Member must not be null"))?;
-        let expected_data_member = match source_type.as_str() {
-            crate::state::CERTIFICATE_BUNDLE_SOURCE_TYPE => Some("x509CertificateData"),
-            crate::state::ACM_PCA_SOURCE_TYPE => Some("acmPcaArn"),
-            // `SELF_SIGNED_REPOSITORY` is the third modelled `sourceType` and the model
-            // ties neither `SourceData` member to it, so no pairing can be asserted for
-            // it and whatever the caller sent is stored as sent.
-            _ => None,
-        };
-        let actual_data_member = match source_data {
-            SourceData::x509CertificateData(_) => "x509CertificateData",
-            SourceData::acmPcaArn(_) => "acmPcaArn",
-        };
-        if let Some(expected) = expected_data_member.filter(|member| *member != actual_data_member)
-        {
-            return Err(validation(
-                "source.sourceData",
-                &format!("Member must be {expected} for a trust anchor of type {source_type}"),
-            ));
+        // A `Source` that names no certificate authority this service can store is
+        // refused rather than stored; `UpdateTrustAnchor` judges a submitted source the
+        // same way, so the rule lives beside the record it guards.
+        if let Some((member, constraint)) = crate::state::source_rejection(&input.source) {
+            return Err(validation(member, &constraint));
         }
 
         let region = crate::state::request_region(ctx.parts());
@@ -209,6 +175,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let trust_anchor_id = store.mint_uuid();
+        // The anchor starts with this service's own notification settings in force —
+        // every modelled event, enabled, at the service threshold — and the settings this
+        // request carried are applied on top, so an event the caller said nothing about
+        // is still monitored.
+        let mut notification_settings = crate::state::default_notification_details();
+        crate::state::apply_notification_settings(
+            &mut notification_settings,
+            input.notification_settings.unwrap_or_default(),
+        );
         let record = crate::state::TrustAnchorRecord {
             trust_anchor_arn: ::engine::emulator_arn(
                 crate::state::ARN_NAMESPACE,
@@ -222,11 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // anchor: the member is optional, and `DisableTrustAnchor` is the way to
             // turn one off afterwards.
             enabled: input.enabled.unwrap_or(true),
+            // No member of this service's surface asks for CRL-distribution-point
+            // revocation, so a created anchor does not check one.
+            crl_dp_revocation_enabled: false,
             created_at: now,
             updated_at: now,
-            notification_settings: crate::state::notification_details(
-                input.notification_settings.unwrap_or_default(),
-            ),
+            notification_settings,
             tags: input.tags.unwrap_or_default(),
         };
         let trust_anchor = record.to_detail();

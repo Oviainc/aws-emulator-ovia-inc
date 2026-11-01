@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTrustAnchor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTrustAnchor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTrustAnchor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the members a request carries onto one stored trust anchor — the name, the
+//! certificate source, or both — and bumps the instant it was last updated, so every
+//! later read, list projection and delete echo reports what the update wrote. A member
+//! the request omits keeps the value the record held.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTrustAnchor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTrustAnchorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTrustAnchor"))
+        let _ = ctx;
+        // A submitted `Source` is judged exactly as `CreateTrustAnchor` judges one, and
+        // before anything is written, so a source naming no certificate authority never
+        // replaces a usable one.
+        if let Some((member, constraint)) = input
+            .source
+            .as_ref()
+            .and_then(crate::state::source_rejection)
+        {
+            return Err(UpdateTrustAnchorErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::validation_message(member, &constraint)),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // An id no stored trust anchor carries — never created, or already deleted — is
+        // a 404, never an update that lands nowhere.
+        let record = store
+            .trust_anchors
+            .get_mut(&input.trust_anchor_id)
+            .ok_or_else(|| {
+                UpdateTrustAnchorErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::addressed_trust_anchor_not_found_message()),
+                    },
+                )
+            })?;
+
+        // Both members are optional: this is a partial update, so only what the request
+        // carried is written.
+        if let Some(name) = input.name {
+            record.name = name;
+        }
+        if let Some(source) = input.source {
+            record.source = source;
+        }
+        record.updated_at = ::std::time::SystemTime::now();
+
+        Ok(UpdateTrustAnchorOutput {
+            trust_anchor: record.to_detail(),
+        })
     }
 }

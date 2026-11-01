@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-rolesanywhere-rolesanywhere service.
 //!
 //! The trust-anchor, profile and certificate-revocation-list lifecycles
-//! (`CreateTrustAnchor`, `GetTrustAnchor`, `ListTrustAnchors`, `DeleteTrustAnchor`,
+//! (`CreateTrustAnchor`, `UpdateTrustAnchor`, `GetTrustAnchor`, `ListTrustAnchors`,
+//! `DeleteTrustAnchor`, `PutNotificationSettings`, `ResetNotificationSettings`,
 //! `CreateProfile`, `GetProfile`, `ListProfiles`, `DeleteProfile`, `ImportCrl`,
 //! `GetCrl`, `ListCrls`) are backed entirely by the maps below, so a write is visible to the next
 //! request on the same engine. The record types and their projections live here rather
@@ -20,8 +21,9 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AttributeMapping, CrlDetail, NotificationSetting, NotificationSettingDetail, ProfileDetail,
-    Source, Tag, TrustAnchorDetail,
+    AttributeMapping, CrlDetail, NotificationSetting, NotificationSettingDetail,
+    NotificationSettingKey, ProfileDetail, Source, SourceData, Tag, TrustAnchorDetail,
+    NOTIFICATION_EVENT_VALUES, TRUST_ANCHOR_TYPE_VALUES,
 };
 
 /// The ARN service namespace (`OPERATIONS.md`: "ARN namespace: `rolesanywhere`").
@@ -92,6 +94,17 @@ pub struct TrustAnchorRecord {
     pub enabled: bool,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
+    /// Whether this trust anchor checks a presented certificate against the CRL
+    /// distribution points the certificate itself names.
+    ///
+    /// Nothing in this service's surface turns it on: no modelled request member carries
+    /// it, so a stored anchor keeps the value its create wrote. It lives on the record
+    /// rather than in the projection so that an operation that learns to toggle it has
+    /// one place to write, exactly like [`Self::enabled`].
+    pub crl_dp_revocation_enabled: bool,
+    /// This anchor's notification settings: one entry per key in force, covering every
+    /// modelled `NotificationEvent` from the moment it is created. See
+    /// [`default_notification_details`].
     pub notification_settings: Vec<NotificationSettingDetail>,
     pub tags: Vec<Tag>,
 }
@@ -108,6 +121,7 @@ impl TrustAnchorRecord {
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
             notification_settings: Some(self.notification_settings.clone()),
+            crl_dp_revocation_enabled: Some(self.crl_dp_revocation_enabled),
         }
     }
 }
@@ -439,11 +453,22 @@ pub fn trust_anchor_id_in_arn(trust_anchor_arn: &str) -> &str {
         .unwrap_or_default()
 }
 
-/// The `message` a refusal carries when a request references a trust anchor that is not
-/// stored: the fixed wording, whose only variable part is the id taken from the ARN the
-/// request carried.
+/// The `message` a refusal carries when a request REFERENCES, by ARN, a trust anchor
+/// that is not stored: the fixed wording, whose only variable part is the id taken from
+/// the ARN the request carried.
 pub fn trust_anchor_not_found_message(trust_anchor_id: &str) -> String {
     format!("Unable to find Trust Anchor with ID {trust_anchor_id}.")
+}
+
+/// The `message` a refusal carries when the trust anchor a request ADDRESSES by
+/// `trustAnchorId` is not stored.
+///
+/// Wholly fixed text, with no variable part: the id is already the resource the request
+/// named, and this is the wording the service is recorded answering such a miss with —
+/// unlike the ARN-reference wording above, which belongs to an operation that names a
+/// trust anchor while addressing something else.
+pub fn addressed_trust_anchor_not_found_message() -> String {
+    "TrustAnchor not found".to_string()
 }
 
 /// The region this request was signed for, from its SigV4 credential scope; an
@@ -455,21 +480,175 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// Project the `NotificationSetting`s a create request carried into the
-/// `NotificationSettingDetail`s a read returns, stamping `configuredBy` with the
-/// account that configured them — "for customized notifications settings, it is the
-/// respective account ID" (`NotificationSettingDetail$configuredBy` doc).
-pub fn notification_details(settings: Vec<NotificationSetting>) -> Vec<NotificationSettingDetail> {
-    settings
-        .into_iter()
-        .map(|setting| NotificationSettingDetail {
+/// The principal `NotificationSettingDetail$configuredBy` names for a setting this
+/// service configured: "For default settings configured by IAM Roles Anywhere, the value
+/// is `rolesanywhere.amazonaws.com`, and for customized notifications settings, it is the
+/// respective account ID"
+/// (`smithy_query(query="shape", shape="NotificationSettingDetail")`, member
+/// `configuredBy`).
+pub const SERVICE_NOTIFICATION_PRINCIPAL: &str = "rolesanywhere.amazonaws.com";
+
+/// The `threshold` — "the number of days before a notification event" — a notification
+/// setting carries while this service, rather than the caller, configures it.
+///
+/// The model publishes no default for the member (it carries `@range(1, 360)` and nothing
+/// else), so this is the value the service is RECORDED to seed a trust anchor's settings
+/// with, not a modelled constant.
+pub const DEFAULT_NOTIFICATION_THRESHOLD_DAYS: i32 = 45;
+
+/// The channel a notification setting that names none applies to: "In the absence of a
+/// specific channel, IAM Roles Anywhere applies this setting to 'ALL' channels"
+/// (`smithy_query(query="doc", shape="NotificationSetting", member="channel")`). It is
+/// also the only value the modelled `NotificationChannel` enum accepts.
+pub const DEFAULT_NOTIFICATION_CHANNEL: &str = "ALL";
+
+/// The notification setting this service configures for one event until a caller
+/// customizes it: enabled, at [`DEFAULT_NOTIFICATION_THRESHOLD_DAYS`], on every channel,
+/// and configured by [`SERVICE_NOTIFICATION_PRINCIPAL`].
+fn default_notification_detail(event: &str, channel: &str) -> NotificationSettingDetail {
+    NotificationSettingDetail {
+        enabled: true,
+        event: event.to_string(),
+        threshold: Some(DEFAULT_NOTIFICATION_THRESHOLD_DAYS),
+        channel: Some(channel.to_string()),
+        configured_by: Some(SERVICE_NOTIFICATION_PRINCIPAL.to_string()),
+    }
+}
+
+/// The notification settings a trust anchor holds before any caller customizes one: the
+/// service default for EVERY value of the modelled `NotificationEvent` enum
+/// (`NOTIFICATION_EVENT_VALUES`), in the order the model lists them.
+///
+/// A trust anchor is never without its expiry notifications: nothing in the surface
+/// deletes a setting, so this set is the floor a read reports and the state a reset
+/// returns one key to.
+pub fn default_notification_details() -> Vec<NotificationSettingDetail> {
+    NOTIFICATION_EVENT_VALUES
+        .iter()
+        .map(|event| default_notification_detail(event, DEFAULT_NOTIFICATION_CHANNEL))
+        .collect()
+}
+
+/// The key one notification setting is held under: its event and its channel, the pair
+/// `NotificationSettingKey` is made of ("A notification setting key includes the event and
+/// the channel"), with an unnamed channel resolved to
+/// [`DEFAULT_NOTIFICATION_CHANNEL`].
+fn notification_key(event: &str, channel: Option<&str>) -> (String, String) {
+    (
+        event.to_string(),
+        channel.unwrap_or(DEFAULT_NOTIFICATION_CHANNEL).to_string(),
+    )
+}
+
+/// Store one setting under its key: it REPLACES the setting the anchor held for that
+/// event and channel, and is appended only when the anchor holds none — so a write
+/// changes one key and leaves every other key as it was.
+fn put_notification_detail(
+    held: &mut Vec<NotificationSettingDetail>,
+    detail: NotificationSettingDetail,
+) {
+    let key = notification_key(&detail.event, detail.channel.as_deref());
+    match held
+        .iter_mut()
+        .find(|existing| notification_key(&existing.event, existing.channel.as_deref()) == key)
+    {
+        Some(existing) => *existing = detail,
+        None => held.push(detail),
+    }
+}
+
+/// Apply the `NotificationSetting`s a request carried to the settings a trust anchor
+/// holds: each one is stored as submitted — enabled, threshold and channel as sent, with
+/// an unnamed channel resolved to [`DEFAULT_NOTIFICATION_CHANNEL`] — under its own key,
+/// and stamped `configuredBy` with the caller's account, because "for customized
+/// notifications settings, it is the respective account ID"
+/// (`NotificationSettingDetail$configuredBy` doc).
+pub fn apply_notification_settings(
+    held: &mut Vec<NotificationSettingDetail>,
+    submitted: Vec<NotificationSetting>,
+) {
+    for setting in submitted {
+        let detail = NotificationSettingDetail {
             enabled: setting.enabled,
             event: setting.event,
             threshold: setting.threshold,
-            channel: setting.channel,
+            channel: Some(
+                setting
+                    .channel
+                    .unwrap_or_else(|| DEFAULT_NOTIFICATION_CHANNEL.to_string()),
+            ),
             configured_by: Some(::engine::emulator_account_id().to_string()),
+        };
+        put_notification_detail(held, detail);
+    }
+}
+
+/// Return the keys a request named to the setting this service configures for them —
+/// "Resets the custom notification setting to IAM Roles Anywhere default setting"
+/// (`ResetNotificationSettings` doc) — leaving every key the request did not name as the
+/// caller customized it.
+pub fn reset_notification_settings(
+    held: &mut Vec<NotificationSettingDetail>,
+    keys: &[NotificationSettingKey],
+) {
+    for key in keys {
+        let channel = key
+            .channel
+            .as_deref()
+            .unwrap_or(DEFAULT_NOTIFICATION_CHANNEL);
+        put_notification_detail(held, default_notification_detail(&key.event, channel));
+    }
+}
+
+/// The member and the constraint a `Source` fails, or `None` when it describes a
+/// certificate authority this service can store.
+///
+/// `Source`'s own two members are optional even where the `Source` itself is
+/// `@required`, and the model names which certificate data member belongs to which
+/// `sourceType`, so a source that carries neither — or carries the data of the other
+/// type — describes no certificate authority at all. Shared, because every operation that
+/// accepts a `Source` has to judge it the same way.
+pub fn source_rejection(source: &Source) -> Option<(&'static str, String)> {
+    let source_type = match source
+        .source_type
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        Some(source_type) => source_type,
+        None => return Some(("source.sourceType", "Member must not be null".to_string())),
+    };
+    if !TRUST_ANCHOR_TYPE_VALUES.contains(&source_type) {
+        return Some((
+            "source.sourceType",
+            format!(
+                "Member must satisfy enum value set: [{}]",
+                TRUST_ANCHOR_TYPE_VALUES.join(", ")
+            ),
+        ));
+    }
+    let Some(source_data) = source.source_data.as_ref() else {
+        return Some(("source.sourceData", "Member must not be null".to_string()));
+    };
+    let expected_data_member = match source_type {
+        CERTIFICATE_BUNDLE_SOURCE_TYPE => Some("x509CertificateData"),
+        ACM_PCA_SOURCE_TYPE => Some("acmPcaArn"),
+        // `SELF_SIGNED_REPOSITORY` is the third modelled `sourceType` and the model ties
+        // neither `SourceData` member to it, so no pairing can be asserted for it and
+        // whatever the caller sent is stored as sent.
+        _ => None,
+    };
+    let actual_data_member = match source_data {
+        SourceData::x509CertificateData(_) => "x509CertificateData",
+        SourceData::acmPcaArn(_) => "acmPcaArn",
+    };
+    expected_data_member
+        .filter(|member| *member != actual_data_member)
+        .map(|expected| {
+            (
+                "source.sourceData",
+                format!("Member must be {expected} for a trust anchor of type {source_type}"),
+            )
         })
-        .collect()
 }
 
 /// The failure a handler answers when this service's state cannot be reached — i.e.

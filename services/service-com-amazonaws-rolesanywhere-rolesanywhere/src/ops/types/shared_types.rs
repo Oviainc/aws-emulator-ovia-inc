@@ -58,6 +58,17 @@ pub struct TrustAnchorDetail {
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
     pub notification_settings: Option<Vec<NotificationSettingDetail>>,
+    /// Whether the trust anchor checks a presented certificate against the CRL
+    /// distribution points the certificate names.
+    ///
+    /// The vendored `smithy-model/` snapshot of this service does not declare this member
+    /// (`smithy_query(query="shape", shape="TrustAnchorDetail")` lists the eight above),
+    /// while the service it emulates is RECORDED serving it on every `TrustAnchorDetail`
+    /// it answers with — so a client reading it off a real response finds it absent here.
+    /// It is served from the stored record like every other member; the hand-declared
+    /// schema in [`super::date_time_wire`] is what puts it on the wire, and it goes away
+    /// on its own once the snapshot catches up.
+    pub crl_dp_revocation_enabled: Option<bool>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.rolesanywhere#Source")]

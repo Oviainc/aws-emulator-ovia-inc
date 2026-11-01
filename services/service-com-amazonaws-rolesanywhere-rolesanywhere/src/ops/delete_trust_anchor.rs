@@ -146,10 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DeleteTrustAnchorErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Trust anchor {} not found",
-                            input.trust_anchor_id
-                        )),
+                        message: Some(crate::state::addressed_trust_anchor_not_found_message()),
                     },
                 )
             })?;

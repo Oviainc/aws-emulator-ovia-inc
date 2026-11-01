@@ -19,6 +19,8 @@ mod crl_import_and_read;
 mod crl_listing;
 #[path = "all/iso8601_timestamp_members.rs"]
 mod iso8601_timestamp_members;
+#[path = "all/notification_settings.rs"]
+mod notification_settings;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
