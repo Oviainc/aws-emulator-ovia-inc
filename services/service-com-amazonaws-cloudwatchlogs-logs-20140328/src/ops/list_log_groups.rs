@@ -348,11 +348,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cursor = match input.next_token.as_deref() {
             Some(token) => {
                 let Some(cursor) = Cursor::decode(token) else {
-                    return Err(invalid("nextToken is not a valid token".to_string()));
+                    return Err(invalid(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()));
                 };
                 if cursor.filters != filters_of(&input) {
                     return Err(invalid(
-                        "nextToken was issued for a different ListLogGroups request".to_string(),
+                        crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                     ));
                 }
                 Some(cursor)

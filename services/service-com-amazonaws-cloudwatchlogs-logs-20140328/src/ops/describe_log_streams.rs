@@ -283,10 +283,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(|| ORDER_BY_LOG_STREAM_NAME.to_string());
         // "If you order the results by event time, you cannot specify the
-        // logStreamNamePrefix parameter."
+        // logStreamNamePrefix parameter." The refusal is the service's fixed sentence for
+        // the combination, carrying neither the prefix nor the order it was sent with.
         if order_by == ORDER_BY_LAST_EVENT_TIME && input.log_stream_name_prefix.is_some() {
             return Err(invalid(
-                "logStreamNamePrefix cannot be specified when orderBy is LastEventTime",
+                "Cannot order by LastEventTime with a logStreamNamePrefix.",
             ));
         }
         let descending = input.descending.unwrap_or(false);
@@ -303,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cursor = match input.next_token.as_deref() {
             Some(token) => {
                 let Some(cursor) = Cursor::decode(token) else {
-                    return Err(invalid("nextToken is not a valid token"));
+                    return Err(invalid(crate::state::INVALID_NEXT_TOKEN_MESSAGE));
                 };
                 if cursor.log_group_name != log_group_name
                     || cursor.order_by != order_by
@@ -311,7 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     || cursor.log_stream_name_prefix != input.log_stream_name_prefix
                 {
                     return Err(invalid(
-                        "nextToken was issued for a different DescribeLogStreams request",
+                        crate::state::INVALID_NEXT_TOKEN_MESSAGE,
                     ));
                 }
                 Some(cursor)

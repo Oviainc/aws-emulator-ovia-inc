@@ -147,10 +147,16 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
     for stage in &stages {
         let trimmed = stage.text.trim();
         if trimmed.is_empty() {
+            // A stage with no command in it is the compiler running out of input where a
+            // command was required, so it stopped at the END of what it had read: the
+            // location is the zero-width position there rather than the blank run it
+            // scanned, which is what lets the refusal name the end of the query as the
+            // symbol it stopped on.
+            let at = stage.start_char_offset + stage.text.chars().count();
             return Err(QueryCompileFailure {
                 message: "The query has an empty command.".to_string(),
-                start_char_offset: stage.start_char_offset,
-                end_char_offset: stage.start_char_offset + stage.text.chars().count(),
+                start_char_offset: at,
+                end_char_offset: at,
             });
         }
         let command_offset = stage.start_char_offset + leading_blank_chars(&stage.text);
@@ -326,7 +332,10 @@ fn unseparated_command(arguments: &str, arguments_offset: usize) -> Option<Query
                 .take_while(|character| !character.is_whitespace())
                 .collect();
             let (start, end) = if word.is_empty() {
-                (index, characters.len())
+                // Nothing follows the separator: the compiler ran out of input where a
+                // command was required, so it stopped at the end of what it had read (see
+                // the empty-stage branch of `compile`).
+                (characters.len(), characters.len())
             } else {
                 (after, after + word.chars().count())
             };

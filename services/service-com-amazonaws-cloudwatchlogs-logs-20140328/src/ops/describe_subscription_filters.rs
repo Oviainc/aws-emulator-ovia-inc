@@ -224,13 +224,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cursor = match input.next_token.as_deref() {
             Some(token) => {
                 let Some(cursor) = Cursor::decode(token) else {
-                    return Err(invalid("nextToken is not a valid token"));
+                    return Err(invalid(crate::state::INVALID_NEXT_TOKEN_MESSAGE));
                 };
                 if cursor.log_group_name != input.log_group_name
                     || cursor.filter_name_prefix != input.filter_name_prefix
                 {
                     return Err(invalid(
-                        "nextToken was issued for a different DescribeSubscriptionFilters request",
+                        crate::state::INVALID_NEXT_TOKEN_MESSAGE,
                     ));
                 }
                 Some(cursor)

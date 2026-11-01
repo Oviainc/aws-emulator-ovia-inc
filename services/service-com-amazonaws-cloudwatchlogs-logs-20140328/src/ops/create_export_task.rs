@@ -183,10 +183,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; an export task is identified by the id this
-        // call mints and by nothing about the request.
-        let _ = ctx;
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateExportTaskError::from(
                 CreateExportTaskErrorModeled::ServiceUnavailableException(
@@ -196,7 +192,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let mut store = state.lock();
 
         let invalid = |message: String| {
             CreateExportTaskError::from(
@@ -210,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The log group the export reads is resolved FIRST: a group this account does not
         // hold is the more specific client error, and resolution must not mint a task id.
-        if !store.log_groups.contains_key(&input.log_group_name) {
+        if !state.lock().log_groups.contains_key(&input.log_group_name) {
             return Err(CreateExportTaskErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message("log group")),
@@ -230,6 +225,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid(crate::state::export_time_range_message(
                 input.from, input.to,
             )));
+        }
+
+        // "The name of S3 bucket for the exported log data" names a resource of the OBJECT
+        // STORE, so it is resolved where that service holds it — no lock is held across the
+        // call. An export to a bucket that is not there could never write a byte, so the
+        // service refuses it rather than minting a task id the caller would then poll for
+        // data nothing will write. `ctx` carries the credential scope the resolution is
+        // addressed in; nothing else about the request enters into it.
+        if crate::state::export_destination::bucket_is_absent(
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &input.destination,
+        )
+        .await
+        {
+            return Err(invalid(
+                crate::state::EXPORT_DESTINATION_BUCKET_MISSING_MESSAGE.to_string(),
+            ));
+        }
+
+        let mut store = state.lock();
+
+        // The log group is resolved again under the lock the task is minted beneath: the
+        // bucket resolution above released it, and a group deleted in that span must not get
+        // an export task (nor consume the account's one active slot).
+        if !store.log_groups.contains_key(&input.log_group_name) {
+            return Err(CreateExportTaskErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("log group")),
+                },
+            )
+            .into());
         }
 
         // "Each account can only have one active (RUNNING or PENDING) export task at a

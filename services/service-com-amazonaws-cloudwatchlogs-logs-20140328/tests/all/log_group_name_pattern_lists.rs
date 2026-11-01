@@ -26,9 +26,20 @@
 //! issue happens to mention is one row.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::LOG_GROUP_NAME_REGEX_PATTERN;
+use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
+    AGGREGATE_SUMMARY_VISIBILITY_DELAY_MS, LOG_GROUP_NAME_REGEX_PATTERN,
+};
 
 use crate::harness::{Logs, REGION};
+
+/// How long a case waits before treating a freshly created log group as part of the
+/// aggregate view: past the span that view lags its log groups by, plus room for a loaded
+/// host's own scheduling.
+fn past_aggregation_lag() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        u64::try_from(AGGREGATE_SUMMARY_VISIBILITY_DELAY_MS).unwrap_or(0) + 600,
+    )
+}
 
 /// The log groups every matching table below is run against. They span the forms
 /// `LogGroupName`'s pattern (`^[\.\-_/#A-Za-z0-9]+$`) admits — a path, a dotted and
@@ -805,59 +816,218 @@ async fn pages_walk_the_whole_match_without_repeating_or_dropping_one() {
     );
 }
 
-/// Both `groupBy` values are answered for every filter combination, and the aggregate's
-/// own `limit` and `nextToken` members are in the response shape the model shows: an
-/// aggregation with nothing to count carries an empty list and no token.
+/// Both `groupBy` values are answered for every filter combination, over the grouping the
+/// log groups of this store fall in: no operation of this model associates a data source
+/// with a log group, so every group here shares the all-unknown grouping, and the summary
+/// counts the groups the request selected. A filter that requires a data source selects
+/// none of them, which is an empty list and no token.
 #[tokio::test]
 async fn the_aggregate_answers_every_group_by_and_filter() {
     let logs = store_with_groups().await;
+    // The aggregate view lags its log groups, so the whole store is in it only once that
+    // span has passed (the lag itself is the subject of
+    // `a_log_group_enters_the_aggregate_view_after_its_span`).
+    tokio::time::sleep(past_aggregation_lag()).await;
 
-    let filters: Vec<(&str, Value)> = vec![
-        ("no filter at all", json!({})),
+    // (case, the filter, how many of this store's log groups it selects) — `None` where
+    // the filter selects no log group at all.
+    let filters: Vec<(&str, Value, Option<i64>)> = vec![
+        ("no filter at all", json!({}), Some(GROUPS.len() as i64)),
         (
             "an anchored pattern that matches",
             json!({"logGroupNamePattern": "^/aws/lambda"}),
+            Some(2),
         ),
         (
             "a pattern longer than the modelled segment cap",
             json!({"logGroupNamePattern": "/aws/lambda/checkout-service-production-handler"}),
+            Some(1),
         ),
         (
+            // Every group of this store was created in the default class.
             "a class filter",
             json!({"logGroupClass": "STANDARD"}),
+            Some(GROUPS.len() as i64),
         ),
         (
+            "a class filter no log group here is in",
+            json!({"logGroupClass": "INFREQUENT_ACCESS"}),
+            None,
+        ),
+        (
+            // "Filters the results by data source characteristics to include only log
+            // groups associated with the specified data sources": a log group no data
+            // source ingests into is associated with none.
             "a data source filter",
             json!({"dataSources": [{"name": "amazon_vpc", "type": "flow"}]}),
+            None,
         ),
-        (
-            "a page bound",
-            json!({"limit": 50}),
-        ),
+        ("a page bound", json!({"limit": 50}), Some(GROUPS.len() as i64)),
         (
             "a search of another account only",
             json!({"includeLinkedAccounts": true, "accountIdentifiers": ["210987654321"]}),
+            None,
         ),
     ];
 
     for group_by in GROUP_BY_VALUES {
-        for (case, filter) in &filters {
+        for (case, filter, selected) in &filters {
             let mut request = filter.clone();
             request["groupBy"] = json!(group_by);
             let body = logs
                 .ok("ListAggregateLogGroupSummaries", &request)
                 .await;
             let summaries = aggregate_summaries(case, &body);
-            assert!(
-                summaries.is_empty(),
-                "case {case} grouped by {group_by}: no log group in this store is associated \
-                 with a data source, so there is nothing to count, got {summaries:?}"
+            let Some(selected) = *selected else {
+                assert!(
+                    summaries.is_empty(),
+                    "case {case} grouped by {group_by}: no log group is selected, so there is \
+                     nothing to count, got {summaries:?}"
+                );
+                assert_eq!(
+                    body.get("nextToken"),
+                    None,
+                    "case {case} grouped by {group_by}: nothing follows an empty page, got {body}"
+                );
+                continue;
+            };
+
+            assert_eq!(
+                summaries.len(),
+                1,
+                "case {case} grouped by {group_by}: the selected log groups share one \
+                 grouping, got {summaries:?}"
             );
             assert_eq!(
-                body.get("nextToken"),
-                None,
-                "case {case} grouped by {group_by}: nothing follows an empty page, got {body}"
+                summaries[0].get("logGroupCount").and_then(Value::as_i64),
+                Some(selected),
+                "case {case} grouped by {group_by}: expected {selected} log groups in the \
+                 grouping, got {:?}",
+                summaries[0]
+            );
+            assert_eq!(
+                unknown_identifiers(group_by),
+                summaries[0]
+                    .get("groupingIdentifiers")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+                "case {case} grouped by {group_by}: every characteristic grouped by is \
+                 reported, unknown for a log group no data source ingests into, got {:?}",
+                summaries[0]
+            );
+            // "The operation paginates results. By default, it returns up to 50 results
+            // and includes a token to retrieve more results": a page carrying a summary
+            // carries the token that resumes after it, and walking that token ends the
+            // enumeration.
+            let token = body
+                .get("nextToken")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case} grouped by {group_by}: a page of summaries carries a token, got {body}")
+                })
+                .to_string();
+            request["nextToken"] = json!(token);
+            let resumed = logs
+                .ok("ListAggregateLogGroupSummaries", &request)
+                .await;
+            assert!(
+                aggregate_summaries(case, &resumed).is_empty()
+                    && resumed.get("nextToken").is_none(),
+                "case {case} grouped by {group_by}: the continuation past the last grouping \
+                 ends the enumeration, got {resumed}"
             );
         }
+    }
+}
+
+/// The `groupingIdentifiers` a grouping of log groups that no data source ingests into
+/// reports, for each `groupBy`: every characteristic it groups by, each unknown.
+fn unknown_identifiers(group_by: &str) -> Vec<Value> {
+    let mut identifiers = vec![
+        json!({"key": "dataSource.Name", "value": "Unknown"}),
+        json!({"key": "dataSource.Type", "value": "Unknown"}),
+    ];
+    if group_by == "DATA_SOURCE_NAME_TYPE_AND_FORMAT" {
+        identifiers.push(json!({"key": "dataSource.Format", "value": "Unknown"}));
+    }
+    identifiers
+}
+
+/// The aggregate view LAGS its log groups: a group aggregated straight after its create is
+/// not counted yet, and the same request made once the span has passed counts it — while
+/// `ListLogGroups` reports it immediately throughout, so the lag belongs to the aggregate
+/// view alone and not to the store.
+#[tokio::test]
+async fn a_log_group_enters_the_aggregate_view_after_its_span() {
+    let logs = Logs::new();
+    // Three groups created one after another, so the assertion is about the span and not
+    // about one name.
+    let names = ["lagging/one", "lagging/two", "lagging/three"];
+    for name in names {
+        create_group(&logs, name, None, None).await;
+    }
+
+    for group_by in GROUP_BY_VALUES {
+        let fresh = logs
+            .ok(
+                "ListAggregateLogGroupSummaries",
+                &json!({"groupBy": group_by, "logGroupNamePattern": "^lagging/"}),
+            )
+            .await;
+        assert!(
+            aggregate_summaries("straight after the creates", &fresh).is_empty()
+                && fresh.get("nextToken").is_none(),
+            "case grouped by {group_by}: a log group is not in the aggregate view yet, got \
+             {fresh}"
+        );
+    }
+
+    // The same groups ARE listed meanwhile: only the aggregate view lags.
+    let listed = listed_names(
+        &logs,
+        "straight after the creates",
+        &json!({"logGroupNamePattern": "^lagging/"}),
+    )
+    .await;
+    assert_eq!(
+        listed.len(),
+        names.len(),
+        "case ListLogGroups: a created log group is listed at once, got {listed:?}"
+    );
+
+    tokio::time::sleep(past_aggregation_lag()).await;
+
+    for group_by in GROUP_BY_VALUES {
+        let settled = logs
+            .ok(
+                "ListAggregateLogGroupSummaries",
+                &json!({"groupBy": group_by, "logGroupNamePattern": "^lagging/"}),
+            )
+            .await;
+        let summaries = aggregate_summaries("once the span has passed", &settled);
+        assert_eq!(
+            summaries.len(),
+            1,
+            "case grouped by {group_by}: the three groups share one grouping, got \
+             {summaries:?}"
+        );
+        assert_eq!(
+            summaries[0].get("logGroupCount").and_then(Value::as_i64),
+            Some(names.len() as i64),
+            "case grouped by {group_by}: every group is counted once the span has passed, \
+             got {:?}",
+            summaries[0]
+        );
+        assert_eq!(
+            unknown_identifiers(group_by),
+            summaries[0]
+                .get("groupingIdentifiers")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            "case grouped by {group_by}: the grouping is the all-unknown one, got {:?}",
+            summaries[0]
+        );
     }
 }

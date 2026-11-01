@@ -175,11 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID number of the query to stop. To find this ID number, use DescribeQueries":
         // an id this account holds no query under names no query to stop, which is the missing
-        // resource this operation models.
+        // resource this operation models — stated by naming the id that was rejected.
         let Some(query) = store.queries.get_mut(&input.query_id) else {
             return Err(StopQueryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message("query")),
+                    message: Some(crate::state::invalid_query_id_message(&input.query_id)),
                 },
             )
             .into());

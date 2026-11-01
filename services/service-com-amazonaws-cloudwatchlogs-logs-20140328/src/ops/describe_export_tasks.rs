@@ -222,11 +222,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cursor = match input.next_token.as_deref() {
             Some(token) => {
                 let Some(cursor) = Cursor::decode(token) else {
-                    return Err(invalid("nextToken is not a valid token"));
+                    return Err(invalid(crate::state::INVALID_NEXT_TOKEN_MESSAGE));
                 };
                 if cursor.task_id != input.task_id || cursor.status_code != input.status_code {
                     return Err(invalid(
-                        "nextToken was issued for a different DescribeExportTasks request",
+                        crate::state::INVALID_NEXT_TOKEN_MESSAGE,
                     ));
                 }
                 Some(cursor)

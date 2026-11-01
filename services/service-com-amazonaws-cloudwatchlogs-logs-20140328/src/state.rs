@@ -165,6 +165,9 @@ pub mod metric_filters;
 /// filters.
 pub mod subscription_delivery;
 
+/// Resolving the S3 bucket an export task's `destination` names against the object store.
+pub mod export_destination;
+
 /// The AWS-vended log record formats a log group's transformer parses.
 pub mod log_transformer;
 
@@ -231,6 +234,19 @@ pub const DEFAULT_EVENTS_LIMIT: i32 = 10_000;
 /// groups") and `ListAggregateLogGroupSummaries` ("If you omit this parameter, the
 /// default is up to 50 aggregated summaries").
 pub const DEFAULT_LIST_LIMIT: i32 = 50;
+
+/// How long after a log group is created the AGGREGATE summaries of
+/// `ListAggregateLogGroupSummaries` count it.
+///
+/// That operation "returns an aggregate summary of all log groups in the Region grouped by
+/// specified data source characteristics" — a view maintained beside the log groups
+/// themselves rather than read off them, so a group enters it a short span after the create
+/// that made it, and a caller that aggregates straight after creating one is answered
+/// without it while every later call counts it. The span is this emulator's own choice (the
+/// service publishes none) and is the one every clock-owed transition here takes, so a
+/// caller sees the view catch up rather than never settle. Only the aggregate view lags:
+/// `DescribeLogGroups` and `ListLogGroups` report a group as soon as it is created.
+pub const AGGREGATE_SUMMARY_VISIBILITY_DELAY_MS: i64 = 3_000;
 
 /// The shortest `logGroupNamePattern` the model admits: `LogGroupNameRegexPattern`
 /// carries `@length(min: 3, max: 129)`.
@@ -5811,14 +5827,20 @@ fn is_log_group_name_pattern_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '/' | '#')
 }
 
-/// The `LogGroupNameRegexPattern` `@pattern` as the service states it in a refusal: the
-/// modelled expression itself, which is the form the pattern-rendering rule of
-/// `requirement` in `crate::service` states for a shape AWS publishes no other form for.
-/// It includes the per-alternative 24-character maximum the service accepts values past,
-/// which the emulator therefore does not enforce (see
-/// [`check_log_group_name_pattern`]).
-pub const LOG_GROUP_NAME_REGEX_PATTERN: &str =
-    r"^(\^?[\.\-_\/#A-Za-z0-9]{3,24})(\|\^?[\.\-_\/#A-Za-z0-9]{3,24}){0,4}$";
+/// The `LogGroupNameRegexPattern` expression as the SERVICE states it in a refusal, which
+/// is not the trait string the model carries: it is stated UNANCHORED, the form the
+/// pattern-rendering rule of `requirement` in `crate::service` states for every shape AWS
+/// publishes another form for, and it carries one alternative the model omits — a SINGLE
+/// pattern of 3..512 characters, which is the form the service accepts for a pattern naming
+/// a whole log group name and which the model's `{3,24}` segments alone would exclude.
+///
+/// It still includes the per-alternative 24-character maximum of the multi-pattern
+/// alternative, which the emulator does not enforce for the same reason the service does
+/// not (see [`check_log_group_name_pattern`]).
+pub const LOG_GROUP_NAME_REGEX_PATTERN: &str = concat!(
+    r"(\^?[\.\-_\/#A-Za-z0-9]{3,512})",
+    r"|(\^?[\.\-_\/#A-Za-z0-9]{3,24})(\|\^?[\.\-_\/#A-Za-z0-9]{3,24}){0,4}"
+);
 
 /// One refused member, worded on the template CloudWatch Logs words a constraint
 /// violation with: "N validation error detected: Value at '<member>' failed to satisfy
@@ -5863,11 +5885,13 @@ pub fn check_log_group_name_pattern(pattern: &str) -> Result<(), String> {
         ));
     }
     let alternatives: Vec<&str> = pattern.split(LOG_GROUP_NAME_PATTERN_SEPARATOR).collect();
+    // Every shape the value can break beyond its length — more alternatives than the
+    // grammar admits, an alternative that is too short, and a character outside the
+    // class — is one expression it does not satisfy, so each is stated as the `@pattern`
+    // constraint it is, naming the expression itself rather than a prose rule of this
+    // emulator's own.
     if alternatives.len() > MAX_LOG_GROUP_NAME_PATTERN_ALTERNATIVES {
-        return refuse(format!(
-            "Member must specify at most {MAX_LOG_GROUP_NAME_PATTERN_ALTERNATIVES} \
-             '{LOG_GROUP_NAME_PATTERN_SEPARATOR}'-separated patterns"
-        ));
+        return refuse(pattern_constraint());
     }
     for alternative in alternatives {
         let literal = alternative
@@ -5876,13 +5900,17 @@ pub fn check_log_group_name_pattern(pattern: &str) -> Result<(), String> {
         let shaped = literal.chars().count() >= MIN_LOG_GROUP_NAME_PATTERN_ALTERNATIVE_LEN
             && literal.chars().all(is_log_group_name_pattern_char);
         if !shaped {
-            return refuse(format!(
-                "Member must satisfy regular expression pattern: \
-                 {LOG_GROUP_NAME_REGEX_PATTERN}"
-            ));
+            return refuse(pattern_constraint());
         }
     }
     Ok(())
+}
+
+/// The `@pattern` clause a `logGroupNamePattern` outside the accepted grammar is refused
+/// with: the one constraint sentence, stating the expression the service publishes
+/// ([`LOG_GROUP_NAME_REGEX_PATTERN`]).
+fn pattern_constraint() -> String {
+    format!("Member must satisfy regular expression pattern: {LOG_GROUP_NAME_REGEX_PATTERN}")
 }
 
 /// Whether a log group name matches a `logGroupNamePattern`.
@@ -7009,6 +7037,10 @@ pub type SdkEnvelopeFacts = (u16, &'static str);
 /// declares `InvalidParameterException` for this service (client error, HTTP 400).
 pub const ENVELOPE_INVALID_PARAMETER: SdkEnvelopeFacts = (400, "InvalidParameterException");
 
+/// The status and code of a refusal for a resource that "does not exist", as the model
+/// declares `ResourceNotFoundException` for this service (client error, HTTP 400).
+pub const ENVELOPE_RESOURCE_NOT_FOUND: SdkEnvelopeFacts = (400, "ResourceNotFoundException");
+
 /// `body` followed by the envelope the AWS SDK appends to a CloudWatch Logs refusal:
 /// ` (Service: AWSLogs; Status Code: <status>; Error Code: <code>; Request ID: <id>; Proxy: null)`.
 ///
@@ -7029,6 +7061,20 @@ pub fn with_sdk_error_envelope(body: &str, facts: SdkEnvelopeFacts) -> String {
         ::service_common::query_error_envelope::new_request_id()
     )
 }
+
+/// The refusal every paginated read of this service answers for a `nextToken` it cannot
+/// resume the enumeration from — one this service never minted, one whose payload it cannot
+/// decode, and one minted for a different enumeration than the request carrying it describes.
+/// AWS states one fixed sentence for the whole class, carrying neither the token nor the
+/// operation, so a paginating reader that keys on it restarts from the head of the stream.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The specified nextToken is invalid.";
+
+/// The refusal `CreateExportTask` answers when the S3 bucket its `destination` names is one
+/// the object store does not hold: an export that could never write anything mints no task.
+/// Fixed text for the class — it carries neither the bucket name nor anything else of the
+/// request.
+pub const EXPORT_DESTINATION_BUCKET_MISSING_MESSAGE: &str =
+    "The given bucket does not exist. Please make sure the bucket is valid.";
 
 /// The sentence CloudWatch Logs answers when the time range a query is asked over runs
 /// backwards — its end before its start — which includes no instant at all. Fixed text for
@@ -7140,6 +7186,29 @@ pub fn mint_s3_table_integration_source_identifier(seq: u64) -> String {
 /// missing resource the same way.
 pub fn resource_not_found_message(resource_kind: &str) -> String {
     format!("The specified {resource_kind} does not exist.")
+}
+
+/// The refusal CloudWatch Logs answers when the missing resource is a QUERY the request
+/// named by `queryId`: the service states the id it was handed rather than the resource kind,
+/// and calls it INVALID rather than absent — a caller holding several ids learns which one was
+/// rejected, and keeps the distinction the service draws between an id it cannot place and a
+/// query that is simply no longer running ([`query_not_running_message`]).
+///
+/// The only variable part is the `queryId` the request carried, taken from it verbatim.
+pub fn invalid_query_id_message(query_id: &str) -> String {
+    format!("The provided queryId={query_id} is invalid.")
+}
+
+/// The refusal CloudWatch Logs answers when the missing resource is a QUERY DEFINITION: the
+/// service states the fixed sentence for the class — it carries nothing of the request, not
+/// even the id — inside the SDK envelope of the `ResourceNotFoundException` it is refused
+/// under ([`with_sdk_error_envelope`]), so the status and the code stated in the text are the
+/// ones the response itself answers with and the only per-run field is the request id.
+pub fn query_definition_not_found_message() -> String {
+    with_sdk_error_envelope(
+        "Query definition id is invalid.",
+        ENVELOPE_RESOURCE_NOT_FOUND,
+    )
 }
 
 /// The refusal CloudWatch Logs answers when the missing resource is a SCHEDULED QUERY: the

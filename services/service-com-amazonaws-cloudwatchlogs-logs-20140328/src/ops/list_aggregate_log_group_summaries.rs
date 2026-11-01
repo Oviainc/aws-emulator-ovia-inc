@@ -2,9 +2,9 @@
 
 //! @op ListAggregateLogGroupSummaries
 //! Implemented: counts the log groups in the shared store that each data-source
-//! characteristic is shared by, honouring the name-pattern, class, data-source and
-//! account filters and the page bounds. This is the ONLY file to touch for this
-//! operation.
+//! characteristic is shared by — a group no data source ingests into sharing the
+//! all-unknown grouping — honouring the name-pattern, class, data-source and account
+//! filters and the page bounds. This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`ListAggregateLogGroupSummaries::handle`] with real behaviour and
@@ -165,6 +165,14 @@ const GROUPING_KEY_NAME: &str = "dataSource.Name";
 const GROUPING_KEY_TYPE: &str = "dataSource.Type";
 const GROUPING_KEY_FORMAT: &str = "dataSource.Format";
 
+/// The value a grouping identifier carries for a characteristic the log groups in that
+/// group have none of: a log group no data source ingests into, or one whose data source
+/// publishes no type or no format, is still a log group this aggregation counts, and the
+/// grouping it falls in is the one whose identifiers are all unknown. Every identifier
+/// `groupBy` names is reported for every grouping, so a client reading a summary always
+/// finds the characteristics it grouped by.
+const UNKNOWN_IDENTIFIER: &str = "Unknown";
+
 /// One aggregation group: the `(key, value)` identifiers the log groups in it share, in
 /// the order `groupBy` names them. Ordered, so the enumeration — and therefore the page
 /// a token resumes — is stable across calls.
@@ -222,31 +230,60 @@ fn filters_of(input: &ListAggregateLogGroupSummariesInput) -> ::serde_json::Valu
 }
 
 /// The identifiers one data source is grouped under, for the requested `groupBy`: its
-/// name and type always, its format as well when `groupBy` names the format. An
-/// identifier the data source does not carry is left out rather than reported empty.
+/// name and type always, its format as well when `groupBy` names the format. A
+/// characteristic the data source does not carry is reported as [`UNKNOWN_IDENTIFIER`]
+/// rather than left out, so one `groupBy` answers one shape of key.
 fn grouping_key(source: &crate::state::DataSourceRecord, group_by: &str) -> GroupingKey {
-    let mut key = vec![(GROUPING_KEY_NAME.to_string(), source.name.clone())];
-    if let Some(source_type) = &source.source_type {
-        key.push((GROUPING_KEY_TYPE.to_string(), source_type.clone()));
-    }
+    let mut key = vec![
+        (GROUPING_KEY_NAME.to_string(), source.name.clone()),
+        (
+            GROUPING_KEY_TYPE.to_string(),
+            or_unknown(source.source_type.as_deref()),
+        ),
+    ];
     if group_by == GROUP_BY_NAME_TYPE_AND_FORMAT {
-        if let Some(format) = &source.format {
-            key.push((GROUPING_KEY_FORMAT.to_string(), format.clone()));
-        }
+        key.push((
+            GROUPING_KEY_FORMAT.to_string(),
+            or_unknown(source.format.as_deref()),
+        ));
     }
     key
+}
+
+/// The identifiers a log group NO data source ingests into is grouped under: every
+/// characteristic `groupBy` names, each unknown.
+fn unknown_grouping_key(group_by: &str) -> GroupingKey {
+    let mut key = vec![
+        (GROUPING_KEY_NAME.to_string(), or_unknown(None)),
+        (GROUPING_KEY_TYPE.to_string(), or_unknown(None)),
+    ];
+    if group_by == GROUP_BY_NAME_TYPE_AND_FORMAT {
+        key.push((GROUPING_KEY_FORMAT.to_string(), or_unknown(None)));
+    }
+    key
+}
+
+/// One grouping identifier's value: what the data source publishes, or
+/// [`UNKNOWN_IDENTIFIER`] when it publishes none.
+fn or_unknown(value: Option<&str>) -> String {
+    value.unwrap_or(UNKNOWN_IDENTIFIER).to_string()
 }
 
 /// Count, per grouping key, the log groups whose data sources share it: "The operation
 /// aggregates log groups by data source name and type and optionally format, providing
 /// counts of log groups that share these characteristics."
 ///
-/// One log group counts ONCE towards each DISTINCT key among the data sources that
-/// ingest into it, so a group with two data sources that group to the same key is not
+/// EVERY log group handed here is counted — the aggregation is over the log groups the
+/// request selected, and a group no data source ingests into shares the
+/// all-[`UNKNOWN_IDENTIFIER`] grouping with every other such group rather than falling out
+/// of the count. One log group counts ONCE towards each DISTINCT key among the data sources
+/// that ingest into it, so a group with two data sources that group to the same key is not
 /// counted twice. `data_source_filters` narrows which of a group's data sources count
 /// ("Filters the results by data source characteristics to include only log groups
-/// associated with the specified data sources"). The result is ordered by grouping key,
-/// which is what a page token is a position in.
+/// associated with the specified data sources"), and a group none of whose data sources the
+/// filter admits is not associated with what was asked for, so it is left out entirely
+/// rather than counted as unknown. The result is ordered by grouping key, which is what a
+/// page token is a position in.
 fn aggregate_counts<'a>(
     groups: impl Iterator<Item = &'a crate::state::LogGroupRecord>,
     group_by: &str,
@@ -267,6 +304,12 @@ fn aggregate_counts<'a>(
             .collect();
         keys.sort();
         keys.dedup();
+        if keys.is_empty() {
+            if data_source_filters.is_some() {
+                continue;
+            }
+            keys.push(unknown_grouping_key(group_by));
+        }
         for key in keys {
             *counts.entry(key).or_default() += 1;
         }
@@ -370,13 +413,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cursor = match input.next_token.as_deref() {
             Some(token) => {
                 let Some(cursor) = Cursor::decode(token) else {
-                    return Err(invalid("nextToken is not a valid token".to_string()));
+                    return Err(invalid(
+                        crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                    ));
                 };
                 if cursor.filters != filters_of(&input) {
                     return Err(invalid(
-                        "nextToken was issued for a different ListAggregateLogGroupSummaries \
-                         request"
-                            .to_string(),
+                        crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                     ));
                 }
                 Some(cursor)
@@ -393,9 +436,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // The aggregate view is maintained beside the log groups rather than read off
+        // them, so a group enters it the span after its create that
+        // `AGGREGATE_SUMMARY_VISIBILITY_DELAY_MS` states: a caller aggregating straight
+        // after creating a group is answered without it, and every later call counts it.
+        // Read from the stored creation instant, so nothing is written by this report.
+        let aggregated_from = crate::state::now_ms()
+            .saturating_sub(crate::state::AGGREGATE_SUMMARY_VISIBILITY_DELAY_MS);
         let selected = store
             .log_groups
             .values()
+            .filter(|group| group.creation_time_ms <= aggregated_from)
             // "Use this parameter to limit the returned log groups to only those with
             // names that match the pattern that you specify."
             .filter(|group| {
@@ -427,9 +478,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let last = first.saturating_add(limit).min(groups.len());
         let page = &groups[first..last];
 
-        // A token only where a page follows this one: "The token for the next set of
-        // items to return."
-        let next_token = page.last().filter(|_| last < groups.len()).map(|(key, _)| {
+        // "The operation paginates results. By default, it returns up to 50 results and
+        // includes a token to retrieve more results": a page that reports a summary hands
+        // back the token that resumes AFTER its last grouping, whether or not a further
+        // grouping is already there. Walking that token ends the enumeration — the
+        // continuation past the last grouping reports no summary, and a page with nothing
+        // on it hands back no token — so a client paginating on the token terminates.
+        let next_token = page.last().map(|(key, _)| {
             Cursor {
                 filters: filters_of(&input),
                 after: key.clone(),
@@ -460,14 +515,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// Unit tests for the aggregation itself.
 ///
-/// [`aggregate_counts`] is the part of this operation no end-to-end test can drive yet:
-/// a log group's data sources are what AWS's own vended-log ingestion creates, and this
+/// A log group's data sources are what AWS's own vended-log ingestion creates, and this
 /// model exposes no operation that associates one with a log group (see
-/// [`crate::state::DataSourceRecord`]), so over the wire every aggregation is empty. The
-/// table below seeds the records directly and spans what the rule generalises over: how
-/// many groups share a key, how many data sources one group carries, a duplicate data
-/// source, both `groupBy` values, a data source carrying no type or no format, and the
-/// `dataSources` filter.
+/// [`crate::state::DataSourceRecord`]), so over the wire every log group falls in the
+/// all-unknown grouping; the rows below seed the records directly to drive the rest of
+/// [`aggregate_counts`]. They span what the rule generalises over: how many groups share a
+/// key, how many data sources one group carries, a duplicate data source, both `groupBy`
+/// values, a data source carrying no type or no format, a group carrying no data source at
+/// all, and the `dataSources` filter.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,18 +636,25 @@ mod tests {
     }
 
     #[test]
-    fn an_identifier_the_data_source_does_not_carry_is_left_out() {
+    fn an_identifier_the_data_source_does_not_carry_is_unknown() {
         let groups = [group("a", &[("custom", None, None)])];
         for group_by in [GROUP_BY_NAME_AND_TYPE, GROUP_BY_NAME_TYPE_AND_FORMAT] {
             let counts = counted(&groups, group_by, None);
+            let mut expected = vec![
+                (GROUPING_KEY_NAME.to_string(), "custom".to_string()),
+                (GROUPING_KEY_TYPE.to_string(), UNKNOWN_IDENTIFIER.to_string()),
+            ];
+            if group_by == GROUP_BY_NAME_TYPE_AND_FORMAT {
+                expected.push((
+                    GROUPING_KEY_FORMAT.to_string(),
+                    UNKNOWN_IDENTIFIER.to_string(),
+                ));
+            }
             assert_eq!(
                 counts,
-                vec![(
-                    vec![(GROUPING_KEY_NAME.to_string(), "custom".to_string())],
-                    1
-                )],
-                "case {group_by} with neither a type nor a format: only the name identifies the \
-                 group, got {counts:?}"
+                vec![(expected, 1)],
+                "case {group_by} with neither a type nor a format: the characteristics the data \
+                 source does not publish are unknown, got {counts:?}"
             );
         }
     }
@@ -658,15 +720,30 @@ mod tests {
     }
 
     #[test]
-    fn a_store_with_no_data_source_aggregates_nothing() {
+    fn log_groups_with_no_data_source_share_the_unknown_grouping() {
         let groups = [group("a", &[]), group("b", &[])];
         for group_by in [GROUP_BY_NAME_AND_TYPE, GROUP_BY_NAME_TYPE_AND_FORMAT] {
             let counts = counted(&groups, group_by, None);
-            assert!(
-                counts.is_empty(),
-                "case {group_by}: log groups with no data source share no characteristic to \
-                 count, got {counts:?}"
+            assert_eq!(
+                counts,
+                vec![(unknown_grouping_key(group_by), 2)],
+                "case {group_by}: both log groups fall in the all-unknown grouping, got \
+                 {counts:?}"
             );
         }
+
+        // A `dataSources` filter asks for log groups ASSOCIATED with the data sources it
+        // names, which a log group without one is not: it is left out rather than counted
+        // as unknown.
+        let filters = [DataSourceFilter {
+            name: UNKNOWN_IDENTIFIER.to_string(),
+            r#type: None,
+        }];
+        let counts = counted(&groups, GROUP_BY_NAME_AND_TYPE, Some(&filters));
+        assert!(
+            counts.is_empty(),
+            "case a data source filter: a log group no data source ingests into is not \
+             associated with the one asked for, got {counts:?}"
+        );
     }
 }

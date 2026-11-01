@@ -195,12 +195,20 @@ fn invalid_parameter(message: String) -> StartQueryError {
 /// compile: "The query string is not valid. Details about this error are displayed in a
 /// QueryCompileError object."
 ///
-/// The `QueryCompileError` is where the detail goes — what the compiler stopped on and the
-/// character range it stopped in — so the top-level message states the condition and the
-/// location travels in the structure the model declares for it.
-fn malformed_query(failure: &crate::state::query_compile::QueryCompileFailure) -> StartQueryError {
+/// The message is the service's PARSER DIAGNOSTIC, not a fixed sentence: it names the symbol
+/// the compiler stopped on and where in the submitted string that symbol sits, which is the
+/// whole value of the refusal — a caller has to be able to tell WHERE the query is wrong, and
+/// two different faults in two different queries cannot read alike. Both variable parts come
+/// from the request: the symbol is the text the compiler stopped on, taken out of the query
+/// string itself, and the position is that text's place in it. The accompanying
+/// `QueryCompileError` carries the compiler's own account of WHAT is wrong plus the character
+/// range it stopped in, which is the structure the model declares for the detail.
+fn malformed_query(
+    query: &str,
+    failure: &crate::state::query_compile::QueryCompileFailure,
+) -> StartQueryError {
     StartQueryErrorModeled::MalformedQueryException(MalformedQueryException {
-        message: Some(MALFORMED_QUERY_MESSAGE.to_string()),
+        message: Some(unexpected_symbol_message(query, failure)),
         query_compile_error: Some(QueryCompileError {
             message: Some(failure.message.clone()),
             location: Some(QueryCompileErrorLocation {
@@ -214,10 +222,60 @@ fn malformed_query(failure: &crate::state::query_compile::QueryCompileFailure) -
     .into()
 }
 
-/// The sentence `MalformedQueryException` itself publishes for the condition, which every
-/// query this operation cannot compile is refused with: the detail of WHY is in the
-/// accompanying `QueryCompileError`, so this text interpolates nothing.
-const MALFORMED_QUERY_MESSAGE: &str = "The query string is not valid.";
+/// The diagnostic a query that does not compile is refused with: the symbol the compiler
+/// stopped on, and where in the submitted query string that symbol sits.
+///
+/// The symbol is the text the failure spans, read out of `query` — so it is the caller's own
+/// token and never a word of this emulator's. A span that holds no text is the end of the
+/// query string, where the compiler ran out of input with a command or an argument still
+/// owed, and that is reported as [`END_OF_QUERY_SYMBOL`]. A query string may carry newlines
+/// (`QueryString` bounds only its length), so the place is stated the way a parser states
+/// one: the LINE the symbol is on, counted from one, and its character position WITHIN that
+/// line, counted from zero.
+///
+/// Nothing else is appended: this fault class is stated as the diagnostic alone, unlike the
+/// refusals of this service that carry the SDK error envelope
+/// ([`crate::state::with_sdk_error_envelope`]).
+fn unexpected_symbol_message(
+    query: &str,
+    failure: &crate::state::query_compile::QueryCompileFailure,
+) -> String {
+    let symbol: String = query
+        .chars()
+        .skip(failure.start_char_offset)
+        .take(failure.end_char_offset.saturating_sub(failure.start_char_offset))
+        .collect();
+    let symbol = symbol.trim();
+    let symbol = if symbol.is_empty() {
+        END_OF_QUERY_SYMBOL
+    } else {
+        symbol
+    };
+    let (line, position) = line_and_position(query, failure.start_char_offset);
+    format!("unexpected symbol found {symbol} at line {line} and position {position}")
+}
+
+/// Where the character at `offset` sits in `query`: its line, counted from one, and its
+/// position within that line, counted from zero — the place a parser reports beside the
+/// symbol it stopped on. A query with no newline in it is all one line, so every offset
+/// there is on line 1 at its own character position.
+fn line_and_position(query: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut position = 0usize;
+    for character in query.chars().take(offset) {
+        if character == '\n' {
+            line = line.saturating_add(1);
+            position = 0;
+        } else {
+            position = position.saturating_add(1);
+        }
+    }
+    (line, position)
+}
+
+/// What the diagnostic names as the symbol when the compiler stopped at the END of the query
+/// string: there is no text there to name, and the fault is that the query ended.
+const END_OF_QUERY_SYMBOL: &str = "<EOF>";
 
 /// The three members a request may name the log groups to query by, in the order
 /// `StartQuery`'s own documentation lists them ("Either exactly one of the following
@@ -285,7 +343,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let compiled = if query_language == crate::state::DEFAULT_QUERY_LANGUAGE {
             Some(
                 crate::state::query_compile::compile(&input.query_string)
-                    .map_err(|failure| malformed_query(&failure))?,
+                    .map_err(|failure| malformed_query(&input.query_string, &failure))?,
             )
         } else {
             // The OpenSearch languages are compiled by the engine that runs them, which this

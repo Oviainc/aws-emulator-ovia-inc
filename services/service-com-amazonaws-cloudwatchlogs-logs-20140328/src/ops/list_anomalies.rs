@@ -232,13 +232,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cursor = match input.next_token.as_deref() {
             Some(token) => {
                 let Some(cursor) = Cursor::decode(token) else {
-                    return Err(invalid("nextToken is not a valid token"));
+                    return Err(invalid(crate::state::INVALID_NEXT_TOKEN_MESSAGE));
                 };
                 if cursor.anomaly_detector_arn != input.anomaly_detector_arn
                     || cursor.suppression_state != input.suppression_state
                 {
                     return Err(invalid(
-                        "nextToken was issued for a different ListAnomalies request",
+                        crate::state::INVALID_NEXT_TOKEN_MESSAGE,
                     ));
                 }
                 Some(cursor)

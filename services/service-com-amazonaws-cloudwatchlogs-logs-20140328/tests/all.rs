@@ -155,6 +155,8 @@ mod metric_filters;
 mod metric_transformation_exclusion_wording;
 #[path = "all/missing_destination_refusal.rs"]
 mod missing_destination_refusal;
+#[path = "all/query_and_stream_refusal_text.rs"]
+mod query_and_stream_refusal_text;
 #[path = "all/query_cancellation.rs"]
 mod query_cancellation;
 #[path = "all/query_compilation.rs"]

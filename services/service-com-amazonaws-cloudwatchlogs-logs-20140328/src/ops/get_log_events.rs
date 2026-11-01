@@ -384,13 +384,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `nextToken` carries the scan it belongs to: the direction, in its envelope,
         // and the stream and time window, in its body. A continuation that names a
         // different stream, or contradicts the window, is refused rather than answered
-        // over a different set of events.
+        // over a different set of events — and every token this scan cannot be resumed
+        // from is refused with the service's one fixed sentence for the class
+        // ([`crate::state::INVALID_NEXT_TOKEN_MESSAGE`]), whichever way it fails to place.
         let inbound = match input.next_token.as_deref() {
             Some(token) => {
                 let Some(token) = Token::parse(token) else {
                     return Err(GetLogEventsErrorModeled::InvalidParameterException(
                         InvalidParameterException {
-                            message: Some("nextToken is not a valid token".to_string()),
+                            message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
                         },
                     )
                     .into());
@@ -422,7 +424,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(GetLogEventsErrorModeled::InvalidParameterException(
                         InvalidParameterException {
                             message: Some(
-                                "nextToken was issued for a different log stream".to_string(),
+                                crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                             ),
                         },
                     )
@@ -438,8 +440,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(GetLogEventsErrorModeled::InvalidParameterException(
                         InvalidParameterException {
                             message: Some(
-                                "startTime and endTime must match the scan the nextToken was issued for"
-                                    .to_string(),
+                                crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                             ),
                         },
                     )

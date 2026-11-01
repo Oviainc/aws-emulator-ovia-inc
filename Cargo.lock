@@ -7589,6 +7589,7 @@ dependencies = [
  "aws-sdk-firehose",
  "aws-sdk-kinesis",
  "aws-sdk-lambda",
+ "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",

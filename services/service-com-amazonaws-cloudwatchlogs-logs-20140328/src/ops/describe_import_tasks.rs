@@ -266,14 +266,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cursor = match input.next_token.as_deref() {
             Some(token) => {
                 let Some(cursor) = Cursor::decode(token) else {
-                    return Err(invalid("nextToken is not a valid token"));
+                    return Err(invalid(crate::state::INVALID_NEXT_TOKEN_MESSAGE));
                 };
                 if cursor.import_id != input.import_id
                     || cursor.import_status != input.import_status
                     || cursor.import_source_arn != input.import_source_arn
                 {
                     return Err(invalid(
-                        "nextToken was issued for a different DescribeImportTasks request",
+                        crate::state::INVALID_NEXT_TOKEN_MESSAGE,
                     ));
                 }
                 Some(cursor)

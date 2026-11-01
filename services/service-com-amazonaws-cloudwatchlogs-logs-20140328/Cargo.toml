@@ -55,6 +55,9 @@ aws-sdk-kinesis = { version = "1", default-features = false }
 # against the `aws-smithy-http` this lock already holds.
 aws-sdk-firehose = { version = "=1.126.0", default-features = false }
 aws-sdk-lambda = { version = "1", default-features = false }
+# `CreateExportTask` resolves the S3 bucket its `destination` names against the object
+# store, over the same in-process callback, with the `HeadBucket` this client generates.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
