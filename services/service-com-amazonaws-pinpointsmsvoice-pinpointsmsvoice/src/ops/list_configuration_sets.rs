@@ -178,12 +178,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `NextToken` is opaque to the caller but it is OURS: one this service did not
-        // mint cannot name a position in the listing.
+        // mint cannot name a position in the listing, so it is a parameter this
+        // service's validation cannot use.
         let resume_after = match input.next_token.as_deref().map(str::trim) {
             None | Some("") => None,
             Some(raw) => Some(decode_token(raw).ok_or_else(|| {
                 ListConfigurationSetsErrorModeled::BadRequestException(BadRequestException {
-                    message: Some("NextToken is not a token returned by ListConfigurationSets".into()),
+                    message: Some(super::types::refusal_wording::invalid_parameters(&[
+                        "NextToken",
+                    ])),
                 })
             })?),
         };
@@ -232,13 +235,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// clamped rather than refused: the caller asked for at most that many, and it gets a
 /// `NextToken` for the remainder.
 fn parse_page_size(raw: &str) -> Result<usize, ListConfigurationSetsErrorModeled> {
+    // The refused value is NOT quoted back: this service names the parameter it could
+    // not use and nothing else, so the sentence is the same whatever was sent.
     match raw.parse::<usize>() {
         Ok(size) if size > 0 => Ok(size.min(MAX_PAGE_SIZE)),
         _ => Err(ListConfigurationSetsErrorModeled::BadRequestException(
             BadRequestException {
-                message: Some(format!(
-                    "PageSize must be a positive whole number of items, got {raw}"
-                )),
+                message: Some(super::types::refusal_wording::invalid_parameters(&[
+                    "PageSize",
+                ])),
             },
         )),
     }

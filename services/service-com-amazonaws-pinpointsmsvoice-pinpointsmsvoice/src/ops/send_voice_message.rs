@@ -155,23 +155,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // There is no message without a recipient, and the member's shape is
-        // `NonEmptyString`, so a blank or absent destination is refused. The number is
-        // recorded EXACTLY as sent — trimming is only how blankness is detected.
+        // `NonEmptyString`, so a blank or absent destination is a parameter this
+        // service's validation cannot use. The number is recorded EXACTLY as sent —
+        // trimming is only how blankness is detected.
         let destination = input
             .destination_phone_number
             .filter(|number| !number.trim().is_empty())
             .ok_or_else(|| {
                 SendVoiceMessageErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(
-                        "DestinationPhoneNumber must be a non-empty phone number".into(),
-                    ),
+                    message: Some(super::types::refusal_wording::invalid_parameters(&[
+                        "DestinationPhoneNumber",
+                    ])),
                 })
             })?;
 
         // `VoiceMessageContent` holds one message body of one kind: exactly one of
         // `PlainTextMessage`, `SSMLMessage` and `CallInstructionsMessage`. None of them
         // describes nothing to speak, and two of them describe no single message, so
-        // either way the request names no voice message to send.
+        // either way `Content` is a parameter this service's validation cannot use.
         let content = input.content.unwrap_or_default();
         let bodies = usize::from(content.plain_text_message.is_some())
             + usize::from(content.ssml_message.is_some())
@@ -179,10 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if bodies != 1 {
             return Err(SendVoiceMessageErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(
-                        "Content must carry exactly one of PlainTextMessage, SSMLMessage or CallInstructionsMessage"
-                            .into(),
-                    ),
+                    message: Some(super::types::refusal_wording::invalid_parameters(&[
+                        "Content",
+                    ])),
                 },
             )
             .into());

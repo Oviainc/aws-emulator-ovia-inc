@@ -45,6 +45,17 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// This service's own Smithy shape id, whose LOCAL name (`PinpointSMSVoiceV2`) is what an
+/// `awsJson1_0` request names its target service by
+/// (`X-Amz-Target: PinpointSMSVoiceV2.<Operation>`).
+///
+/// The SigV4 signing name cannot tell this service from its V1 peer — both models declare
+/// `sigv4Name` `sms-voice`, and a host-addressed request resolves to the first label of the
+/// endpoint host, which is `sms-voice` for `sms-voice` here and for `sms-voice.pinpoint`
+/// there — so the shape id is what `service_common::claims_request` keys this service's RPC
+/// traffic on.
+const RPC_SERVICE_SHAPE_ID: &str = "com.amazonaws.pinpointsmsvoicev2#PinpointSMSVoiceV2";
+
 /// The `com-amazonaws-pinpointsmsvoicev2-pinpointsmsvoicev2` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +85,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `sms-voice` — a signing name it SHARES with Pinpoint SMS
+        // Voice V1, a wire service of its own (`sms-voice.pinpoint`, `restJson1`) against
+        // this one's `sms-voice`, `awsJson1_0`. The router resolves the routing key from
+        // the SigV4 credential scope first, so both services see the key `sms-voice`:
+        // claiming on the signing name ALONE makes each claim the other's traffic, and
+        // the router, which refuses rather than guesses, answers `AmbiguousService` for
+        // ALL of it.
+        //
+        // So the claim is narrowed to this service's own modelled wire surface, by the
+        // one rule `service-common` states for every service under a shared signing
+        // name. This model is `awsJson1_0` and binds no `smithy.api#http` route, so its
+        // surface is the RPC form: the request must NAME this service in
+        // `X-Amz-Target: PinpointSMSVoiceV2.<Operation>` and arrive on the path that
+        // protocol posts to (the root). The V1 peer's own `/v1/...` URI path space is
+        // then claimed by it alone.
+        service_common::claims_request(
+            parts,
+            self.entry.identity().signing_name(),
+            crate::ROUTE_PATH_SEGMENTS,
+            Some(RPC_SERVICE_SHAPE_ID),
+        )
     }
 
     fn override_operation(

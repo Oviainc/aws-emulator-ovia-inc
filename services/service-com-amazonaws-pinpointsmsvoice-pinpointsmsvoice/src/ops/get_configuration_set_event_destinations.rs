@@ -140,6 +140,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
+        // A `{ConfigurationSetName}` path label the request binds no usable value to names
+        // no configuration set to report on, so it is refused ahead of any lookup — which
+        // is why this is a 400 and not the 404 a name that merely does not exist gets. The
+        // layer, and so the sentence, is `refusal_wording`'s to decide.
+        if let Some(message) = super::types::refusal_wording::unusable_required_label(
+            "ConfigurationSetName",
+            &input.configuration_set_name,
+        ) {
+            return Err(
+                GetConfigurationSetEventDestinationsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetConfigurationSetEventDestinationsErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {

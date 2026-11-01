@@ -151,20 +151,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
+        // A `{ConfigurationSetName}` path label the request binds no usable value to names
+        // no configuration set to attach a destination to, so it is refused ahead of any
+        // lookup — which is why this is a 400 and not the 404 a name that merely does not
+        // exist gets. The layer, and so the sentence, is `refusal_wording`'s to decide.
+        if let Some(message) = super::types::refusal_wording::unusable_required_label(
+            "ConfigurationSetName",
+            &input.configuration_set_name,
+        ) {
+            return Err(
+                CreateConfigurationSetEventDestinationErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // The destination is filed under `EventDestinationName`, so a blank or absent
-        // one names nothing to create. The name is stored EXACTLY as sent — trimming is
-        // only how blankness is detected, because `Update`/`Delete` resolve the
-        // destination by the raw `{EventDestinationName}` path label.
+        // one names nothing to create: a parameter this service's validation cannot
+        // use. The name is stored EXACTLY as sent — trimming is only how blankness is
+        // detected, because `Update`/`Delete` resolve the destination by the raw
+        // `{EventDestinationName}` path label.
         let destination_name = input
             .event_destination_name
             .filter(|name| !name.trim().is_empty())
             .ok_or_else(|| {
                 CreateConfigurationSetEventDestinationErrorModeled::BadRequestException(
                     BadRequestException {
-                        message: Some(
-                            "EventDestinationName must be a non-empty event destination name"
-                                .into(),
-                        ),
+                        message: Some(super::types::refusal_wording::invalid_parameters(&[
+                            "EventDestinationName",
+                        ])),
                     },
                 )
             })?;

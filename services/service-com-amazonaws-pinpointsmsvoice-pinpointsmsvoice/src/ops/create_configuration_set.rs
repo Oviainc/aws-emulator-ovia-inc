@@ -150,19 +150,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // `ConfigurationSetName` is the only input and it is what the set is keyed by,
-        // so an absent or blank name names no resource to create: the modelled
-        // "input you provided is invalid" refusal, HTTP 400. The name is stored EXACTLY
-        // as sent — trimming is only how blankness is detected, because every other
-        // operation resolves the set by the raw `{ConfigurationSetName}` path label, so
-        // a stored key that differs from what the caller sent would not resolve there.
+        // so an absent or blank name names no resource to create: a parameter this
+        // service's validation cannot use, refused as the modelled "input you provided
+        // is invalid", HTTP 400. The name is stored EXACTLY as sent — trimming is only
+        // how blankness is detected, because every other operation resolves the set by
+        // the raw `{ConfigurationSetName}` path label, so a stored key that differs from
+        // what the caller sent would not resolve there.
         let name = input
             .configuration_set_name
             .filter(|name| !name.trim().is_empty())
             .ok_or_else(|| {
                 CreateConfigurationSetErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(
-                        "ConfigurationSetName must be a non-empty configuration set name".into(),
-                    ),
+                    message: Some(super::types::refusal_wording::invalid_parameters(&[
+                        "ConfigurationSetName",
+                    ])),
                 })
             })?;
 

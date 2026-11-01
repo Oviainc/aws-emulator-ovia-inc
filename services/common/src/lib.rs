@@ -254,6 +254,10 @@ pub mod data_plane_addressing;
 /// documents a member as one and targets it at a bare string — so two services asked
 /// whether a value is an address cannot answer differently.
 pub mod email_address;
+/// The ONE renaming of the body member a JSON error carries its DETAIL TEXT in, for every
+/// service whose wire form reports that text under a different member name from the one its
+/// model declares — so a client reads one member whichever layer answered.
+pub mod error_detail_member;
 /// The ONE reading and matching of an EventBridge EVENT PATTERN, for every service
 /// whose API accepts one — a rule's `EventPattern`, a pipe's `FilterCriteria` filter —
 /// so two services handed the same pattern and event cannot disagree about whether it
