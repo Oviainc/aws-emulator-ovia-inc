@@ -112,7 +112,9 @@ const IMAGE_IDS_PER_HOP: usize = 64;
 ///
 /// `DescribeInstances` answers a page of reservations and a token for the next, so without
 /// a cap one report could walk an unbounded inventory. A pass that spends the budget
-/// records what it read and leaves the rest to the next one.
+/// records what it read and leaves the rest to the next one — which the next one then
+/// reads, because the point this one stopped at is recorded
+/// ([`crate::state::DiscoveryResume`]) and its plan begins there.
 const MAX_INVENTORY_PAGES: usize = 8;
 
 /// The most instances of the account's inventory ONE refresh reads, over all of its
@@ -181,7 +183,12 @@ fn ec2(ctx: &smithy_server_runtime::OperationContext<'_>, region: &str) -> ::aws
 ///
 /// One hop per configured source Region (the modelled `SourceRegions` list bounds that at
 /// 100 entries), plus the AMI hops the instances found there need, all bounded by the
-/// constants above — and the store's lock is never held across any of them.
+/// constants above — and the store's lock is never held across any of them. A plan whose
+/// Regions hold more inventory than those constants let one pass read is read over
+/// SUCCESSIVE passes: the point a pass stopped at is recorded
+/// ([`crate::state::DiscoveryResume`]) and the next pass's plan begins there
+/// ([`crate::state::ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState::discovery_plan`]),
+/// so every Region the settings name is asked about rather than only the first few of them.
 ///
 /// The settings are therefore re-read from the store at every point the pass needs them —
 /// before each Region's hop and under the lock each write takes — rather than snapshotted
@@ -195,18 +202,24 @@ pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
     let Some(state) = crate::state::service_state(engine) else {
         return;
     };
-    // The Regions to ask about, read with the lock taken and released HERE — the store is
-    // never held across an await. This is the pass's PLAN and not its authority: each
-    // Region is checked against the settings again below, because they can be rewritten
-    // while the pass is reading another Region.
-    let planned: BTreeSet<String> = state.lock().discovered_regions();
+    // The Regions to ask about and where in them to start, read with the lock taken and
+    // released HERE — the store is never held across an await. This is the pass's PLAN and
+    // not its authority: each Region is checked against the settings again below, because
+    // they can be rewritten while the pass is reading another Region.
+    let plan = state.lock().discovery_plan();
 
     let mut budget = Budget {
         pages: MAX_INVENTORY_PAGES,
         records: MAX_DISCOVERED_INSTANCES,
     };
-    for region in &planned {
+    // Where this pass got to, recorded at the end so the NEXT one resumes there.
+    let mut stopped: Option<crate::state::DiscoveryResume> = None;
+    // Whether the pass left part of its plan unread: a plan it walked to the end holds
+    // nothing for a later pass to pick up, so that pass starts the plan afresh.
+    let mut unread = false;
+    for (position, region) in plan.regions.iter().enumerate() {
         if budget.spent() {
+            unread = true;
             break;
         }
         // Asked again right before the hop: an account does not discover a Region its
@@ -217,10 +230,19 @@ pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
         if !discovered_now {
             continue;
         }
-        let Some(pass) = discovered_in_region(ctx, region, &mut budget).await else {
+        // An inventory cursor means something only in the Region it was reached in, which
+        // is the one the plan BEGINS at: every other Region of the plan is read from the
+        // beginning of its own inventory, including when the first one was skipped above.
+        let from = match position {
+            0 => plan.resume_cursor.clone(),
+            _ => None,
+        };
+        let Some(read) = discovered_in_region(ctx, region, &mut budget, from).await else {
             // EC2 could not be asked about this Region at all: that is evidence of
             // NOTHING, so what an earlier pass discovered there stays as it was rather
-            // than being dropped.
+            // than being dropped. The Region was still asked about, so the next pass goes
+            // on past it instead of stopping on the same unanswerable hop.
+            stopped = Some(crate::state::DiscoveryResume::After(region.clone()));
             continue;
         };
         let now = SystemTime::now();
@@ -228,7 +250,7 @@ pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
         // (`record_discovery_pass` / `merge_discovery_pass`), so what this pass found in a
         // Region the account stopped discovering while the pass was reading is dropped
         // instead of recorded.
-        match pass {
+        match read.pass {
             // The Region's whole inventory was read, so these records are what it holds.
             RegionPass::Complete(found) => {
                 state.lock().record_discovery_pass(region, found, now);
@@ -239,13 +261,20 @@ pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
                 state.lock().merge_discovery_pass(found, now);
             }
         }
+        stopped = Some(read.resume);
     }
+    // A Region whose inventory this pass stopped INSIDE is unread work too, even when it
+    // was the last Region of the plan and the loop above ended on its own.
+    let unread = unread || matches!(stopped, Some(crate::state::DiscoveryResume::Inside(_, _)));
     // Discovery holds data for the Regions it discovers and no others, so a Region the
     // settings no longer name is dropped — including one dropped while this pass was
     // reading another, and every Region at once for an account that discovers none. The
     // Regions kept are the ones the store's settings name when this write takes the lock,
     // which is what lets it drop a Region this pass itself still had in its plan.
-    state.lock().retain_discovered_regions();
+    let mut store = state.lock();
+    store.retain_discovered_regions();
+    // What is left for the next pass to read, which is what decides where its plan begins.
+    store.record_discovery_resume(if unread { stopped } else { None });
 }
 
 /// What ONE refresh may still spend: pages of the owner's inventory, and records it may
@@ -267,17 +296,30 @@ impl Budget {
 /// What one Region's pass found.
 #[derive(Debug)]
 enum RegionPass {
-    /// The whole inventory of the Region was read, so these records ARE what the account
-    /// has discovered there.
+    /// The whole inventory of the Region was read, from its beginning, so these records ARE
+    /// what the account has discovered there.
     Complete(Vec<DiscoveredInstanceRecord>),
-    /// The pass spent its budget before the Region's inventory ran out, so these records
-    /// are only part of it: what an earlier pass found there is still evidence, and is
-    /// merged with rather than replaced by them.
+    /// The pass read only part of that inventory — it spent its budget before the inventory
+    /// ran out, or it resumed one an earlier pass had stopped inside — so these records are
+    /// only part of it: what an earlier pass found there is still evidence, and is merged
+    /// with rather than replaced by them.
     Truncated(Vec<DiscoveredInstanceRecord>),
+}
+
+/// What one Region's read left behind: the records it found, and where a later pass picks
+/// that Region up ([`crate::state::DiscoveryResume`]).
+#[derive(Debug)]
+struct RegionRead {
+    pass: RegionPass,
+    resume: crate::state::DiscoveryResume,
 }
 
 /// The instances this pass discovered in `region`, or `None` when EC2 could not be asked
 /// about it at all.
+///
+/// `from` is the owner's inventory cursor to begin at — `None` being the beginning of that
+/// inventory, and `Some` the point an earlier pass stopped inside it, so the remainder it
+/// left is what this read covers.
 ///
 /// An instance is recorded only when the AMI it was launched from bills a Linux
 /// subscription ([`subscription_of_image`]); everything else the account runs there is
@@ -286,20 +328,28 @@ async fn discovered_in_region(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     budget: &mut Budget,
-) -> Option<RegionPass> {
+    from: Option<String>,
+) -> Option<RegionRead> {
     let client = ec2(ctx, region);
     let mut inventory: Vec<InventoryInstance> = Vec::new();
-    let mut next_token: Option<String> = None;
-    // Whether the Region's inventory was read to its end, or the budget ran out first.
-    let mut complete = true;
+    // Where the inventory this read has NOT covered begins: the cursor the next page is
+    // asked for, which starts at the point an earlier pass stopped at.
+    let mut cursor: Option<String> = from.clone();
+    // Whether the Region's inventory ran out, or the budget ran out first.
+    let mut reached_end = false;
     loop {
         if budget.spent() {
-            complete = false;
             break;
         }
         let answer = client
             .describe_instances()
-            .set_next_token(next_token.clone())
+            // A page no larger than what this pass may still RECORD, so a page it asked for
+            // can always be read to its end and a resumed read always moves past the page
+            // it starts at: `MaxResults` is the `@paginated` page size of
+            // `DescribeInstances` — "the maximum number of items to return for this
+            // request" — on which that model declares no range.
+            .set_max_results(i32::try_from(budget.records).ok())
+            .set_next_token(cursor.clone())
             .send()
             .await;
         let page = match answer {
@@ -317,14 +367,16 @@ async fn discovered_in_region(
             }
         };
         budget.pages -= 1;
+        let mut whole_page = true;
         'page: for reservation in page.reservations() {
             let account_id = reservation.owner_id().unwrap_or_default().to_string();
             for instance in reservation.instances() {
                 if budget.records == 0 {
                     // Nothing more may be recorded, so the rest of this PAGE is not read
-                    // either: the pass is truncated and the loop above ends on its next
-                    // turn.
-                    complete = false;
+                    // either. The page was asked for no more items than the record budget
+                    // held, so this is reached only when the owner answered a larger page
+                    // than it was asked for.
+                    whole_page = false;
                     break 'page;
                 }
                 if let Some(held) = inventory_instance(instance, &account_id, region) {
@@ -333,8 +385,14 @@ async fn discovered_in_region(
                 }
             }
         }
-        next_token = page.next_token().map(str::to_string);
-        if next_token.is_none() {
+        if !whole_page {
+            // Part of THIS page was never read, so the unread remainder begins at the page
+            // itself — which is the cursor this read asked it for, left as it is.
+            break;
+        }
+        cursor = page.next_token().map(str::to_string);
+        if cursor.is_none() {
+            reached_end = true;
             break;
         }
     }
@@ -350,9 +408,11 @@ async fn discovered_in_region(
         .collect();
     // A hop that was not answered leaves this pass without the billing facts of some of the
     // instances it read, so it has not established that those are gone: it records as a
-    // TRUNCATED pass, the same treatment an unanswered inventory hop gets.
+    // TRUNCATED pass, the same treatment an unanswered inventory hop gets. So does a read
+    // that RESUMED this Region's inventory: the part an earlier pass covered is not part of
+    // what this one established, so it is kept rather than replaced.
     let (billing, answered) = image_billing(&client, region, &image_ids).await;
-    let complete = complete && answered;
+    let complete = reached_end && answered && from.is_none();
 
     let found: Vec<DiscoveredInstanceRecord> = inventory
         .into_iter()
@@ -390,10 +450,19 @@ async fn discovered_in_region(
             })
         })
         .collect();
-    Some(if complete {
-        RegionPass::Complete(found)
-    } else {
-        RegionPass::Truncated(found)
+    Some(RegionRead {
+        pass: if complete {
+            RegionPass::Complete(found)
+        } else {
+            RegionPass::Truncated(found)
+        },
+        // A Region whose inventory ran out is behind the plan; one this read stopped inside
+        // is where the next pass resumes, at the cursor the unread remainder begins at.
+        resume: if reached_end {
+            crate::state::DiscoveryResume::After(region.to_string())
+        } else {
+            crate::state::DiscoveryResume::Inside(region.to_string(), cursor)
+        },
     })
 }
 

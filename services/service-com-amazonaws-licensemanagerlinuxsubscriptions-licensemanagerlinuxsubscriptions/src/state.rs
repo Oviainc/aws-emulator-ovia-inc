@@ -304,6 +304,46 @@ pub struct DiscoveredSubscription {
     pub instance_count: i64,
 }
 
+/// Where a discovery pass STOPPED reading, so the next one picks the plan up there
+/// instead of re-reading the prefix the previous one already spent its budget on.
+///
+/// One pass reads a bounded amount of the owner's inventory
+/// ([`discovery::materialize_for_report`]), which can be less than the source Regions its
+/// plan names hold; what makes every Region of that plan eventually read is that the point
+/// a pass stopped at is RECORDED and the next pass starts from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveryResume {
+    /// The pass read this Region's inventory to its end, so the next one starts at the
+    /// first Region of the plan ordered AFTER it.
+    After(String),
+    /// The pass stopped INSIDE this Region's inventory, at the owner's inventory cursor it
+    /// had reached (`None` being the beginning of that inventory, for a pass that stopped
+    /// before it recorded a whole page of it), so the next one resumes that Region there.
+    Inside(String, Option<String>),
+}
+
+impl DiscoveryResume {
+    /// The source Region the pass stopped in or on — the point the plan is rotated to.
+    pub fn region(&self) -> &str {
+        match self {
+            Self::After(region) | Self::Inside(region, _) => region,
+        }
+    }
+}
+
+/// The source Regions ONE discovery pass asks about, in the order it asks about them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveryPlan {
+    /// Every Region the account discovers right now, each exactly once: the sorted set,
+    /// rotated so the walk begins where the previous pass stopped. A pass therefore asks
+    /// about no Region twice, and successive passes cover them all.
+    pub regions: Vec<String>,
+    /// The owner's inventory cursor the FIRST of those Regions resumes from, when the
+    /// previous pass stopped inside it; `None` when that Region's inventory is read from
+    /// its beginning.
+    pub resume_cursor: Option<String>,
+}
+
 /// The per-account Linux subscriptions service settings, as `UpdateServiceSettings`
 /// persisted them.
 #[derive(Debug, Clone)]
@@ -352,6 +392,14 @@ pub struct ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscr
     /// until one has run, the account has discovered nothing and both lists are empty,
     /// which is exactly what an account with no instances reports.
     pub discovered_instances: BTreeMap<String, DiscoveredInstanceRecord>,
+    /// Where the last discovery pass stopped, when it left part of its plan unread.
+    ///
+    /// A pass reads a bounded amount of the owner's inventory, so a plan with more source
+    /// Regions than that bound serves is read over several passes: this is the one record
+    /// of how far the last of them got ([`DiscoveryResume`]), and `None` means the next
+    /// pass picks the plan up at its beginning — which is what a pass that read its whole
+    /// plan leaves behind.
+    pub discovery_resume: Option<DiscoveryResume>,
 }
 
 impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState {
@@ -555,8 +603,9 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
     /// while `LinuxSubscriptionsDiscovery` is [`DISCOVERY_ENABLED`], and NO Region while it
     /// is not — nor while the account has no settings at all.
     ///
-    /// A Region named twice is one Region, so the set is deduplicated and in a stable order,
-    /// which is also the order a pass asks about them in.
+    /// A Region named twice is one Region, so the set is deduplicated and in a stable
+    /// order, which is the order [`Self::discovery_plan`] lays a pass's walk of them out
+    /// in.
     pub fn discovered_regions(&self) -> BTreeSet<String> {
         match self.service_settings.as_ref() {
             Some(settings) if settings.linux_subscriptions_discovery == DISCOVERY_ENABLED => {
@@ -584,6 +633,62 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
             }
             _ => false,
         }
+    }
+
+    /// The plan the NEXT discovery pass walks: every Region this account discovers right
+    /// now, in the order that pass asks about them.
+    ///
+    /// One pass reads a bounded amount of the owner's inventory, which can be less than
+    /// the Regions of its plan hold, so the plan is ROTATED to where the previous pass
+    /// stopped ([`Self::discovery_resume`]): at the Region it stopped inside, or at the
+    /// first Region ordered after the one whose inventory it finished. Successive passes
+    /// therefore read every Region of the plan rather than the same prefix of it, and each
+    /// single pass still asks about no Region twice. A recorded stopping point no Region of
+    /// the plan is ordered at or after — the settings having dropped the Regions behind it
+    /// — rotates to the beginning, as does no recorded stopping point at all.
+    pub fn discovery_plan(&self) -> DiscoveryPlan {
+        let regions: Vec<String> = self.discovered_regions().into_iter().collect();
+        let Some(resume) = self.discovery_resume.as_ref() else {
+            return DiscoveryPlan {
+                regions,
+                resume_cursor: None,
+            };
+        };
+        let start = regions.iter().position(|region| match resume {
+            // The Region the previous pass stopped INSIDE is read again, from where it
+            // stopped; the one it finished is behind this pass.
+            DiscoveryResume::Inside(stopped, _) => region.as_str() >= stopped.as_str(),
+            DiscoveryResume::After(stopped) => region.as_str() > stopped.as_str(),
+        });
+        let Some(start) = start else {
+            return DiscoveryPlan {
+                regions,
+                resume_cursor: None,
+            };
+        };
+        // The inventory cursor belongs to the Region it was reached in, so it is handed on
+        // only when the rotation really does begin at that Region: one the settings have
+        // since dropped leaves this pass reading the next Region from its beginning.
+        let resume_cursor = match resume {
+            DiscoveryResume::Inside(stopped, cursor) if *stopped == regions[start] => {
+                cursor.clone()
+            }
+            _ => None,
+        };
+        let mut rotated: Vec<String> = regions[start..].to_vec();
+        rotated.extend_from_slice(&regions[..start]);
+        DiscoveryPlan {
+            regions: rotated,
+            resume_cursor,
+        }
+    }
+
+    /// Record where the pass that just ran stopped, which is where the next one resumes.
+    ///
+    /// `None` is what a pass that left nothing of its plan unread records: the next pass
+    /// starts the plan at its beginning again.
+    pub fn record_discovery_resume(&mut self, resume: Option<DiscoveryResume>) {
+        self.discovery_resume = resume;
     }
 
     /// The discovered subscriptions: one `Subscription` per distinct (name, type) pair

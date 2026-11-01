@@ -17,6 +17,8 @@ mod discovered_fleet_selection;
 mod discovery_from_ec2;
 #[path = "all/discovery_pass_settings_change.rs"]
 mod discovery_pass_settings_change;
+#[path = "all/discovery_resumes_where_it_stopped.rs"]
+mod discovery_resumes_where_it_stopped;
 #[path = "all/discovery_switch_off.rs"]
 mod discovery_switch_off;
 #[path = "all/error_taxonomy.rs"]
