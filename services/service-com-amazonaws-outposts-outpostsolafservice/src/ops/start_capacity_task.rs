@@ -5,8 +5,9 @@
 //! persists everything the caller requested, and answers it from what was persisted;
 //! `GetCapacityTask` reads the same record back. The optional `OrderId` and `AssetId`
 //! name OTHER resources of this service, so both are resolved against the store
-//! before anything is created — the `OrderId` in the region the request is addressed
-//! to, the `AssetId` among the named Outpost's own hardware — and a reference that
+//! before anything is created — the `OrderId` among the orders placed on the named
+//! Outpost in the region the request is addressed to, the `AssetId` among that same
+//! Outpost's own hardware — and a reference that
 //! resolves to nothing is refused with the modelled `NotFoundException` rather than
 //! stored on the task. The task
 //! starts in the non-terminal
@@ -278,22 +279,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource is, and no task is stored carrying it. Each is resolved in the scope
         // the model gives it, coarsest member first:
         //
-        // * an `OrderId` names an Amazon Web Services Outposts ORDER, which is a
-        //   top-level resource of the inventory this endpoint serves
-        //   (`/orders/{OrderId}`) and is the order "of the host associated with the
-        //   capacity task" — so it is resolved in the region the request is addressed
-        //   to, exactly as `GetOrder` and `CancelOrder` resolve the same member: an
-        //   order of another region is as absent as one that was never placed, and a
-        //   task is never stored carrying an id this region's endpoint cannot show the
-        //   caller. That region scope is also what makes the one-active-task rule
-        //   below a rule about this region's order;
+        // * an `OrderId` names an Amazon Web Services Outposts ORDER, a resource of
+        //   the inventory this endpoint serves (`/orders/{OrderId}`) that is PLACED
+        //   on one Outpost, and here it is the order "of the host associated with the
+        //   capacity task" — the host being hardware of the Outpost this task runs
+        //   on. So it is resolved in the region the request is addressed to AND
+        //   against that Outpost
+        //   ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::order_of_outpost`]),
+        //   as the report that scopes itself by the same member does: an order of
+        //   another region, or one placed against another Outpost, delivered no host
+        //   of this Outpost and is as absent as one that was never placed, and a task
+        //   is never stored carrying an id that names other hardware. That scope is
+        //   also what makes the one-active-task rule below a rule about an order of
+        //   this Outpost, so a task can never hold an order against an Outpost whose
+        //   own tasks the caller cannot see;
         // * an `AssetId` names one physical unit of hardware INSTALLED on an Outpost,
         //   a resource nested under the Outpost the task runs on
         //   (`/outposts/{OutpostIdentifier}/assets`), so it is resolved among THAT
         //   Outpost's assets.
         let order_id = crate::state::non_empty(input.order_id);
         if let Some(order_id) = order_id.as_deref() {
-            if store.order(&region, order_id).is_none() {
+            if store
+                .order_of_outpost(&region, &outpost_id, order_id)
+                .is_none()
+            {
                 return Err(StartCapacityTaskErrorModeled::NotFoundException(
                     NotFoundException {
                         message: Some(crate::state::order_not_found(order_id)),
@@ -377,7 +386,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_capacity_tasks();
         // "You can have one active capacity task for each order and each Outpost":
         // a second one is the conflict this operation models, naming the resource
-        // the conflict is about in `ResourceId` / `ResourceType`.
+        // the conflict is about in `ResourceId` / `ResourceType`. Both halves are
+        // about work in hand HERE: the order resolved above is an order of this
+        // Outpost, so a task active on that order is a task on this Outpost, and the
+        // Outpost's own half — asked first — is what a caller reads, naming the
+        // Outpost it addressed rather than a resource further from the request.
         let conflict = store
             .active_capacity_task_on_outpost(&outpost_id)
             .map(|active| {

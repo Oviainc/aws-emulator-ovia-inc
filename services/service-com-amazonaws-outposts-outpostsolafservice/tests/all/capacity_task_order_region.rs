@@ -12,9 +12,11 @@
 //! and one that names an order of another region is as absent as one nothing ever
 //! minted: 404 `NotFoundException` worded as every refusal about an order this service
 //! holds none of is,
-//! and no task stored carrying it. The one-active-capacity-task-per-order rule reads
+//! and no task stored carrying it. The one-active-capacity-task rule reads
 //! the same scope, so the 409 `ConflictException` it states is only ever about a task
-//! of the inventory the caller's endpoint serves.
+//! of the inventory the caller's endpoint serves. Which OUTPOST of that region's
+//! inventory the order has to have been placed on is
+//! [`crate::capacity_task_order_outpost`]'s.
 //!
 //! The rows differ along the region the call is addressed to, the region the order was
 //! placed in, why the id names nothing here (another region's order, an id nothing
@@ -24,7 +26,7 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
-    capacity_task_conflict, order_not_found, RESOURCE_TYPE_ORDER,
+    capacity_task_conflict, order_not_found, RESOURCE_TYPE_OUTPOST,
 };
 
 use crate::capacity_task_lifecycle::{capacity_route, pool, task_route, ABSENT_ORDER_ID};
@@ -291,12 +293,12 @@ async fn a_capacity_task_resolves_its_order_id_in_the_request_region() {
     }
 }
 
-/// The rule, stated for the one-active-task-per-order refusal: the task it is about is
+/// The rule, stated for the one-active-task refusal: the task it is about is
 /// a task of the region the request is addressed to, so a start naming another
 /// region's order is the not-found of an absent id and never a conflict about a
 /// resource this endpoint does not serve.
 #[tokio::test]
-async fn the_one_active_task_per_order_rule_is_about_this_regions_order() {
+async fn the_one_active_task_rule_is_about_this_regions_own_work() {
     let outposts = Outposts::new();
     let placed = inventory(&outposts).await;
 
@@ -316,11 +318,12 @@ async fn the_one_active_task_per_order_rule_is_about_this_regions_order() {
 
     for (request, active_task) in placed.iter().zip(&active) {
         // Inside the region, the rule holds: a second task naming the same order, on
-        // another Outpost of that region, is the modelled conflict naming the order.
+        // the Outpost that order was placed on — the only Outpost it can be named on at
+        // all — is the modelled conflict, naming the work in hand on that Outpost.
         let reply = start_in(
             &outposts,
             request.region,
-            &request.spare_outpost_id,
+            &request.outpost_id,
             &request_naming(&request.order_id, false),
         )
         .await;
@@ -340,11 +343,11 @@ async fn the_one_active_task_per_order_rule_is_about_this_regions_order() {
                 text(&reply.body, "Message"),
             ),
             (
-                request.order_id.clone(),
-                RESOURCE_TYPE_ORDER.to_string(),
-                capacity_task_conflict(RESOURCE_TYPE_ORDER, &request.order_id, active_task),
+                request.outpost_id.clone(),
+                RESOURCE_TYPE_OUTPOST.to_string(),
+                capacity_task_conflict(RESOURCE_TYPE_OUTPOST, &request.outpost_id, active_task),
             ),
-            "case {case:?}: the conflict must name this region's order and the task \
+            "case {case:?}: the conflict must name this region's Outpost and the task \
              holding it, got {}",
             reply.body
         );

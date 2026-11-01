@@ -253,6 +253,16 @@ async fn every_route_that_resolves_an_order_states_the_order_wording() {
         None,
         no_such_order(&order_of_elsewhere),
     ));
+    cases.push(case(
+        format!("StartCapacityTask naming another Outpost's order {order_of_elsewhere}"),
+        "POST",
+        capacity_route(&outpost_id),
+        Some(json!({
+            "InstancePools": [pool("m5.4xlarge", 1)],
+            "OrderId": order_of_elsewhere,
+        })),
+        no_such_order(&order_of_elsewhere),
+    ));
 
     expect_not_found(&outposts, &cases).await;
 

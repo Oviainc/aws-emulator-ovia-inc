@@ -33,6 +33,8 @@ mod capacity_task_dry_run;
 mod capacity_task_lifecycle;
 #[path = "all/capacity_task_listing.rs"]
 mod capacity_task_listing;
+#[path = "all/capacity_task_order_outpost.rs"]
+mod capacity_task_order_outpost;
 #[path = "all/capacity_task_order_region.rs"]
 mod capacity_task_order_region;
 #[path = "all/capacity_task_outcome.rs"]

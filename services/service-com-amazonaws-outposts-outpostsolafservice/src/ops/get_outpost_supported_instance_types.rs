@@ -277,8 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let ordered = match input.order_id.as_deref().filter(|id| !id.is_empty()) {
             Some(order_id) => {
                 let order = store
-                    .order(&region, order_id)
-                    .filter(|record| record.order.outpost_id.as_deref() == Some(&outpost_id))
+                    .order_of_outpost(&region, &outpost_id, order_id)
                     .ok_or_else(|| {
                         GetOutpostSupportedInstanceTypesErrorModeled::NotFoundException(
                             NotFoundException {

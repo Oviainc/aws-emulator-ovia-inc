@@ -3393,6 +3393,31 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         in_region(&self.orders, region, order_id)
     }
 
+    /// The order `order_id` names in `region` that was PLACED on `outpost_id`, or
+    /// `None` when this store holds no such order — whether it holds none under that
+    /// id at all, or holds one placed against another Outpost.
+    ///
+    /// An order is placed ON exactly one Outpost (`Order$OutpostId`, fixed by
+    /// `CreateOrder` and never moved), and the hardware it delivers is installed on
+    /// that Outpost and on no other. So wherever an `OrderId` arrives on a request
+    /// addressed to an Outpost — where the member is the order "of the host
+    /// associated with" that Outpost — the order it names has to be one of THAT
+    /// Outpost's: an order placed against another Outpost names no hardware here, so
+    /// for such a request it is as absent as an id nothing ever minted, and is
+    /// refused with the same [`order_not_found`] wording. Stated once here so the
+    /// operations that resolve the member in an Outpost's scope cannot disagree about
+    /// what it names, exactly as [`Self::order`] states the region scope every order
+    /// lookup shares. Scoped to `region` for the reason [`RegionalRecord`] gives.
+    pub fn order_of_outpost(
+        &self,
+        region: &str,
+        outpost_id: &str,
+        order_id: &str,
+    ) -> Option<&OrderRecord> {
+        self.order(region, order_id)
+            .filter(|record| record.order.outpost_id.as_deref() == Some(outpost_id))
+    }
+
     /// The same order, to CHANGE. See [`Self::order`].
     pub fn order_mut(&mut self, region: &str, order_id: &str) -> Option<&mut OrderRecord> {
         in_region_mut(&mut self.orders, region, order_id)

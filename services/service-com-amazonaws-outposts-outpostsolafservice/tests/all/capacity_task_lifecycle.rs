@@ -23,7 +23,9 @@
 //!    never moves the task itself.
 //! 3. One active capacity task per Outpost and per order: a second one is refused
 //!    409 `ConflictException` naming the resource the conflict is about, and the
-//!    same request is accepted once the first task has completed.
+//!    same request is accepted once the first task has completed. An order is an
+//!    order of one Outpost (rule 7), so the order half of that rule is the Outpost
+//!    half: there is no second Outpost a task on the same order could be started on.
 //! 4. A capacity task is a task OF an Outpost: an identifier that names nothing is
 //!    404 `NotFoundException` with the identifier echo of the member it arrived in,
 //!    a task of another Outpost is not reachable under this one's route, and the
@@ -34,11 +36,13 @@
 //! 6. The store a task lands in is bounded: at the emulator's entry ceiling a start
 //!    is refused and nothing is stored.
 //! 7. The two optional references a task carries name OTHER resources, each resolved
-//!    in the scope the model gives it: an `OrderId` is an order of this region's
-//!    inventory (which region that is, is [`crate::capacity_task_order_region`]'s),
+//!    in the scope the model gives it: an `OrderId` is an order placed on the Outpost
+//!    the task runs on, in this region's inventory (which region that is, is
+//!    [`crate::capacity_task_order_region`]'s; that the order has to be THAT Outpost's
+//!    is [`crate::capacity_task_order_outpost`]'s),
 //!    an `AssetId` is hardware installed on the Outpost the task runs on. One that
-//!    resolves to nothing is 404 `NotFoundException` with the identifier echo of the
-//!    member it arrived in, and no task is created.
+//!    resolves to nothing is 404 `NotFoundException` worded as every refusal about
+//!    that kind of resource is, and no task is created.
 
 use std::collections::VecDeque;
 
@@ -624,8 +628,8 @@ async fn one_active_capacity_task_per_outpost_and_per_order() {
     let first_outpost = outpost(&outposts, "conflict-first").await;
     let second_outpost = outpost(&outposts, "conflict-second").await;
     // Two orders the account actually placed (rule 7), one per Outpost: an order is
-    // a resource of this region's inventory, so a task on either Outpost of it may
-    // name either one.
+    // placed on ONE Outpost, so each of them can only be named on a task of the
+    // Outpost it was placed on.
     let order_id = an_order(&outposts, &first_outpost).await;
     let other_order_id = an_order(&outposts, &second_outpost).await;
     let request = json!({ "InstancePools": [pool("m5.4xlarge", 1)], "OrderId": order_id });
@@ -642,13 +646,25 @@ async fn one_active_capacity_task_per_outpost_and_per_order() {
             "OUTPOST",
         ),
         (
-            "a task on another Outpost for the same order",
-            &second_outpost,
-            order_id.clone(),
-            "ORDER",
+            "a second task on the same Outpost, naming another order of it",
+            &first_outpost,
+            first_outpost.clone(),
+            "OUTPOST",
         ),
     ];
-    for (case, outpost_identifier, resource_id, resource_type) in &cases {
+    for (index, (case, outpost_identifier, resource_id, resource_type)) in
+        cases.iter().enumerate()
+    {
+        // The second row names a DIFFERENT order of the same Outpost, so the one
+        // resource both rows have in common is the Outpost — which is the resource the
+        // conflict is about.
+        let request = match index {
+            0 => request.clone(),
+            _ => json!({
+                "InstancePools": [pool("m5.4xlarge", 1)],
+                "OrderId": an_order(&outposts, &first_outpost).await,
+            }),
+        };
         let reply = start(&outposts, outpost_identifier, &request).await;
         assert_eq!(
             (reply.status, reply.error_code.as_str()),
@@ -674,7 +690,23 @@ async fn one_active_capacity_task_per_outpost_and_per_order() {
         );
     }
 
-    // A task for ANOTHER order on another Outpost is nobody's conflict.
+    // The order half of the rule needs no check of its own: an order is placed on one
+    // Outpost and the task has to name an order of the Outpost it runs on (rule 7), so
+    // the only Outpost a second task on this order could be started on is the one
+    // already holding it — and starting it anywhere else is the not-found of an order
+    // that was not placed there, so no second active task on one order can be reached.
+    let elsewhere = start(&outposts, &second_outpost, &request).await;
+    assert_eq!(
+        (elsewhere.status, text(&elsewhere.body, "Message")),
+        (404, order_not_found(&order_id)),
+        "case \"the same order named on another Outpost\": expected 404 and the order \
+         not-found wording, got {} {}",
+        elsewhere.status,
+        elsewhere.body
+    );
+
+    // A task for ANOTHER order on the Outpost that order was placed on is nobody's
+    // conflict.
     let other = start_ok(
         &outposts,
         &second_outpost,
@@ -712,12 +744,10 @@ async fn one_active_capacity_task_per_outpost_and_per_order() {
 }
 
 /// Which order a row of the reference-resolution case names: one the account placed
-/// against the Outpost the task runs on, one it placed against another Outpost, or
-/// none at all.
+/// against the Outpost the task runs on, or none at all.
 #[derive(Debug, Clone, Copy)]
 enum NamedOrder {
     OfThisOutpost,
-    OfAnotherOutpost,
     None,
 }
 
@@ -726,10 +756,10 @@ enum NamedOrder {
 /// resolves to nothing is refused with no task created.
 ///
 /// The rows differ along everything the rule generalises over: which of the two
-/// members carries the dangling reference, whether the other one resolves, whether
-/// the named hardware exists somewhere else or nowhere at all, whether the Outpost
-/// has hardware recorded, and — on the accepting side — each combination of an order
-/// of this Outpost, an order of another one and no order with an asset and no asset.
+/// members carries the reference that resolves to nothing, whether the other one
+/// resolves, whether the named resource exists somewhere else or nowhere at all,
+/// whether the Outpost has hardware recorded, and — on the accepting side — each
+/// combination of an order of this Outpost and no order with an asset and no asset.
 #[tokio::test]
 async fn a_capacity_task_resolves_the_order_and_the_asset_it_names() {
     let outposts = Outposts::new();
@@ -767,6 +797,25 @@ async fn a_capacity_task_resolves_the_order_and_the_asset_it_names() {
                 "AssetId": INSTALLED[0],
             }),
             order_not_found(ABSENT_ORDER_ID),
+        ),
+        (
+            "an OrderId the account placed against another Outpost",
+            &outpost_id,
+            json!({
+                "InstancePools": [pool("m5.4xlarge", 1)],
+                "OrderId": elsewhere_order_id,
+            }),
+            order_not_found(&elsewhere_order_id),
+        ),
+        (
+            "an OrderId of another Outpost, beside an asset of this one that resolves",
+            &outpost_id,
+            json!({
+                "InstancePools": [pool("m5.4xlarge", 1)],
+                "OrderId": elsewhere_order_id,
+                "AssetId": INSTALLED[0],
+            }),
+            order_not_found(&elsewhere_order_id),
         ),
         (
             "an AssetId none of the Outpost's assets carries",
@@ -846,11 +895,10 @@ async fn a_capacity_task_resolves_the_order_and_the_asset_it_names() {
             None,
         ),
         (
-            "an order the account placed against another Outpost",
-            NamedOrder::OfAnotherOutpost,
+            "an asset and no order",
+            NamedOrder::None,
             Some(INSTALLED[1]),
         ),
-        ("an asset and no order", NamedOrder::None, Some(INSTALLED[1])),
         ("neither reference", NamedOrder::None, None),
     ];
     for (index, (case, named_order, asset_id)) in accepted.iter().enumerate() {
@@ -861,7 +909,6 @@ async fn a_capacity_task_resolves_the_order_and_the_asset_it_names() {
         let mut request = json!({ "InstancePools": [pool("m5.4xlarge", 1)] });
         let named_order_id = match named_order {
             NamedOrder::OfThisOutpost => Some(an_order(&outposts, &target).await),
-            NamedOrder::OfAnotherOutpost => Some(elsewhere_order_id.clone()),
             NamedOrder::None => None,
         };
         if let Some(named_order_id) = &named_order_id {
