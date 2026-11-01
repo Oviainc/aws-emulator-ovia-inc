@@ -237,14 +237,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         };
-        if !(0..=crate::state::MAX_DATA_RETENTION_IN_HOURS).contains(&updated) {
+        // The refusal names the bound the desired retention fell outside, and then the
+        // state and the request members that produced it: the retention the stream
+        // carries now, the `Operation` and the requested change. Fixed text plus those
+        // three values — never the resulting figure, which the caller can derive.
+        if updated < 0 {
             return Err(UpdateDataRetentionErrorModeled::InvalidArgumentException(
                 InvalidArgumentException {
                     message: Some(format!(
-                        "The resulting data retention of {updated} hours is outside the \
-                         supported range: the minimum value for data retention is 0 and the \
-                         maximum value is {} (ten years).",
-                        crate::state::MAX_DATA_RETENTION_IN_HOURS
+                        "The desired data retention cannot be less than 0. Current data \
+                         retention: {current}. Operation: {}, Requested change: {change}",
+                        input.operation
+                    )),
+                },
+            )
+            .into());
+        }
+        if updated > crate::state::MAX_DATA_RETENTION_IN_HOURS {
+            return Err(UpdateDataRetentionErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(format!(
+                        "The desired data retention cannot be more than {}. Current data \
+                         retention: {current}. Operation: {}, Requested change: {change}",
+                        crate::state::MAX_DATA_RETENTION_IN_HOURS, input.operation
                     )),
                 },
             )

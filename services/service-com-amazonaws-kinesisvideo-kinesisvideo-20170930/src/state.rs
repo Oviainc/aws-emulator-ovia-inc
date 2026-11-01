@@ -178,12 +178,16 @@ pub const STREAM_IDENTIFIER_REQUIRED_MESSAGE: &str =
     "Either StreamName or StreamARN must be specified.";
 
 /// How this service words the `VersionMismatchException` every stream mutation
-/// guarded by `CurrentVersion` answers: "The stream version that you specified is not
-/// the latest version. To get the latest version, use the DescribeStream API." Stated
-/// once so the operations that take a version word one failure one way.
+/// guarded by `CurrentVersion` answers. The sentence the service sends names the two
+/// versions it compared — the provided one and the existing one — without quoting
+/// either, so the text is wholly fixed: no stream name, ARN or version string belongs
+/// in it. It is NOT the error shape's documentation paragraph ("The stream version that
+/// you specified is not the latest version. To get the latest version, use the
+/// DescribeStream API."), which describes the condition rather than being the wire
+/// message. Stated once so the operations that take a stream version word one failure
+/// one way.
 pub const STREAM_VERSION_MISMATCH_MESSAGE: &str =
-    "The stream version specified is not the latest version. To get the latest version, \
-     use the DescribeStream API.";
+    "The provided stream version does not match the existing stream version.";
 
 /// How this service words the `InvalidArgumentException` for a request whose
 /// `StreamName` and `StreamARN` name two different streams. The companion of

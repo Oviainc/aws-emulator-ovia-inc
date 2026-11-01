@@ -31,3 +31,5 @@ mod stream_lifecycle;
 mod stream_record_state_model;
 #[path = "all/stream_tags.rs"]
 mod stream_tags;
+#[path = "all/stream_version_mismatch_message.rs"]
+mod stream_version_mismatch_message;
