@@ -1712,7 +1712,7 @@ async fn state_changing_operations_write_an_audit_record() {
             "a deleted app bundle",
             "DeleteAppBundle",
             "AppBundle",
-            bundle.clone(),
+            bundle_id.clone(),
             "deleted",
         ),
         (

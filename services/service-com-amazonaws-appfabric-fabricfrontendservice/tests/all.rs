@@ -27,6 +27,8 @@ mod app_bundle_ingestion_lifecycle;
 mod app_bundle_refusal_wording;
 #[path = "all/app_bundle_region_quota.rs"]
 mod app_bundle_region_quota;
+#[path = "all/audit_record_resource_identity.rs"]
+mod audit_record_resource_identity;
 #[path = "all/bundle_scope_resolved_before_body_rules.rs"]
 mod bundle_scope_resolved_before_body_rules;
 #[path = "all/chain_read_not_found_attribution.rs"]

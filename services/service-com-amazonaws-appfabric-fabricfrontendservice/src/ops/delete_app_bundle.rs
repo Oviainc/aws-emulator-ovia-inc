@@ -172,8 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Ok(DeleteAppBundleOutput {});
         };
-        // The record's own key, read off the record the lookup resolved, so the
-        // remove below cannot name anything else.
+        // The record's own key — its server-minted id — read off the record the
+        // lookup resolved, so neither the remove nor the audit record below can
+        // name anything else.
         let bundle_key = bundle.id.clone();
 
         // The precondition the operation documents: "You must delete all
@@ -197,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ctx.parts(),
             Self::NAME,
             "AppBundle",
-            &input.app_bundle_identifier,
+            &bundle_key,
             "deleted",
         );
         Ok(DeleteAppBundleOutput {})
