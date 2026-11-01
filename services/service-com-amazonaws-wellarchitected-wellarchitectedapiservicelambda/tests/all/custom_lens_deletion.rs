@@ -80,8 +80,9 @@ pub(crate) async fn delete_lens(
 }
 
 /// `GET /lenses/{LensAlias}`, the wire form of `GetLens` — the read that proves what a
-/// delete left.
-async fn get_lens(client: &Client, alias: &str, version: Option<&str>) -> Answer {
+/// delete left. `pub(crate)` because `super::bare_lens_name_resolution` reads a lens back
+/// through this one spelling of the request.
+pub(crate) async fn get_lens(client: &Client, alias: &str, version: Option<&str>) -> Answer {
     let path = format!("/lenses/{}", encode_path_segment(alias));
     let uri = match version {
         Some(version) => format!("{path}?LensVersion={}", encode_path_segment(version)),

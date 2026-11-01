@@ -18,7 +18,8 @@
 //!
 //! 1. `DeleteLensShare`: every pair of spellings — the one the delete landed under and the
 //!    one the retry names the same lens by — replays the empty success and removes nothing
-//!    else.
+//!    else. A custom lens is spelled by its ARN ([`ARN_SPELLINGS`]), so those are the
+//!    spellings a table of them spans.
 //! 2. Taking the lens as the lens it names does not flatten the fingerprint: under every
 //!    spelling, the same token over a DIFFERENT share or a DIFFERENT lens is still another
 //!    request and the modelled 409.
@@ -67,22 +68,20 @@ const PUBLISHED_VERSION: &str = "1.0";
 /// The `LensStatus` of a `DeleteLens` that removes the whole lens.
 const DELETE_EVERYTHING: &str = state::LENS_STATUS_TYPE_ALL;
 
-/// The spellings that all name ONE custom lens.
+/// The spellings that all name ONE custom lens: the ARN forms only.
 ///
 /// SOURCE: the `LensAlias` doc — "For custom lenses, this is the lens ARN, such as
 /// `arn:aws:wellarchitected:us-west-2:123456789012:lens/0123…`. Each lens is identified by
 /// its `LensSummary$LensAlias`" (`smithy_query(query="doc", shape="DeleteLensShareInput",
-/// member="LensAlias")`) — plus the two further forms this crate resolves a lens by: that
-/// ARN with a version pinned after it (the form `super::lens_share_deletion`'s rule 3 pins
-/// as naming the same lens) and the bare lens id.
-const LENS_SPELLINGS: [&str; 3] = ["plain-arn", "version-pinned-arn", "bare-lens-id"];
-
-/// The spellings of a custom lens that an operation refusing an Amazon Web Services official
-/// lens accepts: the ARN forms only, because "for Amazon Web Services official lenses, this
-/// is either the lens alias … or the lens ARN" (`LensAlias` doc) makes a NON-ARN alias an
-/// official lens's spelling, which `DeleteLens`, `CreateLensShare` and `CreateLensVersion`
-/// refuse with a 400 (rules 3 and 4 assert that refusal). `DeleteLensShare` takes all three
-/// spellings of [`LENS_SPELLINGS`], because it resolves the SHARE the lens holds.
+/// member="LensAlias")`) — plus the further form this crate resolves a lens by: that ARN
+/// with a version pinned after it (the form `super::lens_share_deletion`'s rule 3 pins as
+/// naming the same lens).
+///
+/// A NON-ARN alias is not among them, because "for Amazon Web Services official lenses, this
+/// is either the lens alias … or the lens ARN" (the same doc) makes a bare name an OFFICIAL
+/// lens's spelling: it names no custom lens at all, so the operations that refuse an official
+/// lens answer 400 for it (rules 3 and 4 assert that refusal) and those that resolve the lens
+/// to act on what it holds answer 404 (`super::bare_lens_name_resolution`).
 const ARN_SPELLINGS: [&str; 2] = ["plain-arn", "version-pinned-arn"];
 
 /// The alias of the AWS Well-Architected Framework lens, the Amazon Web Services official
@@ -242,7 +241,7 @@ async fn a_share_delete_retry_replays_under_every_spelling_of_the_same_lens() {
     let bystander = create_share(&client, &arn, "111122223333", "share-bystander").await;
     let bystander_id = created_share_id(&bystander, "bystander");
 
-    for (index, (deleted_as, retried_as)) in spelling_pairs(&LENS_SPELLINGS)
+    for (index, (deleted_as, retried_as)) in spelling_pairs(&ARN_SPELLINGS)
         .into_iter()
         .enumerate()
     {
@@ -328,7 +327,7 @@ async fn the_share_delete_token_still_discriminates_different_parameters_under_e
 
     let cases: Vec<(&Changed, &'static str)> = rows
         .iter()
-        .flat_map(|row| LENS_SPELLINGS.iter().map(move |spelling| (row, *spelling)))
+        .flat_map(|row| ARN_SPELLINGS.iter().map(move |spelling| (row, *spelling)))
         .collect();
 
     for (index, (row, spelling)) in cases.into_iter().enumerate() {

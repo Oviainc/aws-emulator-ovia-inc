@@ -44,8 +44,10 @@ use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state
 /// `GET /lenses/{LensAlias}/versionDifference`, the wire form of
 /// `GetLensVersionDifference`. The alias is percent-encoded because a custom lens is
 /// named by its ARN, which carries `:` and `/` inside ONE path segment; the versions
-/// travel as `@httpQuery` parameters.
-async fn difference(
+/// travel as `@httpQuery` parameters. `pub(crate)` because
+/// `super::bare_lens_name_resolution` issues this operation through this one spelling of the
+/// request.
+pub(crate) async fn difference(
     client: &Client,
     alias: &str,
     base: Option<&str>,

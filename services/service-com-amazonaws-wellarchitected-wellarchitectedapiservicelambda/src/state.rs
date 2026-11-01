@@ -4178,11 +4178,16 @@ pub fn lens_identities(lenses: &[String]) -> Vec<&str> {
 }
 
 /// Whether `alias` names `record`: an ARN must agree with the lens's own ARN (so the
-/// account and Region it carries have to match), optionally pinning a version after it;
-/// a bare id names the lens whose id it is.
+/// account and Region it carries have to match), optionally pinning a version after it.
+///
+/// A name that is NOT an ARN never names a stored lens, whatever id it happens to spell:
+/// "For custom lenses, this is the lens ARN" (`LensAlias` doc) is the only spelling a
+/// custom lens answers to, so a bare name is an AWS-official lens's alias
+/// ([`is_aws_official_lens`]) — the same classification every operation that refuses a
+/// bare name as official applies before it reaches this store.
 fn alias_names_lens(alias: &str, record: &LensRecord) -> bool {
     if !alias.starts_with("arn:") {
-        return alias == record.lens_id;
+        return false;
     }
     alias == record.lens_arn
         || alias
@@ -7000,7 +7005,9 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// in this store. An ARN names more than the id, though: a lens belongs to the
     /// account and Region its ARN carries, so an ARN that agrees on the id and disagrees
     /// on either names a DIFFERENT lens and resolves to nothing. A version-pinned ARN
-    /// (`…:lens/<id>/<version>`) names the same lens.
+    /// (`…:lens/<id>/<version>`) names the same lens. A name that is not an ARN resolves
+    /// to nothing at all ([`alias_names_lens`]): it is an AWS-official lens's alias
+    /// ([`is_aws_official_lens`]), and this store holds only custom lenses.
     pub fn lens_by_alias(&self, alias: &str) -> Option<&LensRecord> {
         let record = self.lenses.get(lens_alias(alias))?;
         alias_names_lens(alias, record).then_some(record)

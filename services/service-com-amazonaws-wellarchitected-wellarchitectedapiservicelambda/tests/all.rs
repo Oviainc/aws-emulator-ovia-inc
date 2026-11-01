@@ -498,3 +498,8 @@ mod agent_no_op_updates;
 // are appended here so a new suite does not collide with another insertion.
 #[path = "all/defaulted_member_token_identity.rs"]
 mod defaulted_member_token_identity;
+
+// Appended at the end of this list for the same reason as the declaration above: the sorted
+// position for a lens suite falls in a crowded run of this list.
+#[path = "all/bare_lens_name_resolution.rs"]
+mod bare_lens_name_resolution;

@@ -260,7 +260,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot be shared" (`CreateLensShare` doc). Its own `lens_id` is what the share
         // store is keyed by (`CreateLensShare` records a share under it), so the key is
         // read off the resolved record in ONE lookup rather than derived from the alias a
-        // second time: the two sides of the store cannot drift.
+        // second time: the two sides of the store cannot drift. That lookup classifies the
+        // name the way the create does — a custom lens is named by its ARN, so a name that
+        // is not one names no stored lens here (`crate::state::lens_by_alias`) — so a
+        // spelling the create refuses cannot revoke what it recorded.
         let lens_id = match store
             .lens_by_alias(&input.lens_alias)
             .map(|record| record.lens_id.clone())

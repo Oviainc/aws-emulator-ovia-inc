@@ -74,8 +74,10 @@ const NEW_SHARE_STATUS: &str = "PENDING";
 /// `GET /lenses/{LensAlias}/shares`, the wire form of `ListLensShares`, with every filter
 /// and paging member bound to the query string. The alias is percent-encoded because a
 /// custom lens is named by its ARN, which carries `:` and `/` inside ONE path segment.
-/// `query` is passed as sent, empty for a request that names none.
-async fn list_shares(client: &Client, alias: &str, query: &str) -> Answer {
+/// `query` is passed as sent, empty for a request that names none. `pub(crate)` because
+/// `super::bare_lens_name_resolution` lists a lens's shares through this one spelling of the
+/// request.
+pub(crate) async fn list_shares(client: &Client, alias: &str, query: &str) -> Answer {
     let encoded = encode_path_segment(alias);
     let uri = if query.is_empty() {
         format!("/lenses/{encoded}/shares")

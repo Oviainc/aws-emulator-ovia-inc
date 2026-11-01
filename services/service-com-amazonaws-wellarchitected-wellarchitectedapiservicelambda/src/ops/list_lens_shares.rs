@@ -217,7 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "List the lens shares associated with the lens" (this operation's doc): the lens
         // is resolved by this lookup, and its own `lens_id` is what the share store is
         // keyed by (`CreateLensShare` records a share under it), so the key is read off the
-        // resolved record rather than derived from the alias a second time.
+        // resolved record rather than derived from the alias a second time. A custom lens is
+        // named by its ARN, so a name that is not one names no stored lens here
+        // (`crate::state::lens_by_alias`) and falls to the arms below.
         let lens_id = match store
             .lens_by_alias(&input.lens_alias)
             .map(|record| record.lens_id.clone())
