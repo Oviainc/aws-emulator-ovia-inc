@@ -50,6 +50,16 @@ const DEFAULT_AI_AGENT_TYPES: [&str; 8] = [
     "SELF_SERVICE",
 ];
 
+/// The qualifier that names an AI agent's floating alias rather than one of its published
+/// versions, which is what the service's own binding for the answer-recommendation type
+/// carries.
+const QUALIFIER_LATEST: &str = "$LATEST";
+
+/// The one `AIAgentType` whose service-made binding names the agent's floating alias; the
+/// service pins a published version for every other type. Source: the recorded wire
+/// answers of `CreateAssistant`, `CreateSession` and `GetSession`.
+const FLOATING_DEFAULT_AI_AGENT_TYPE: &str = "ANSWER_RECOMMENDATION";
+
 /// Ids a caller may configure, each matching the modelled `UuidWithQualifier` pattern:
 /// a bare uuid, one pinned to a numbered version, and a third bare uuid for the rows that
 /// need two distinct agents.
@@ -242,8 +252,9 @@ fn assistant_rows() -> Vec<AssistantRow> {
     ]
 }
 
-/// Assert every binding of one reported `aiAgentConfiguration` map is a service-made,
-/// version-qualified id, and hand back the map so two reports can be compared.
+/// Assert every binding of one reported `aiAgentConfiguration` map is a service-made id
+/// qualified by the revision of the agent the service bound, and hand back the map so two
+/// reports can be compared.
 fn assert_service_bindings(case: &str, bound: &Map<String, Value>) {
     let reported: BTreeSet<&str> = bound.keys().map(String::as_str).collect();
     let expected: BTreeSet<&str> = DEFAULT_AI_AGENT_TYPES.iter().copied().collect();
@@ -266,25 +277,32 @@ fn assert_service_bindings(case: &str, bound: &Map<String, Value>) {
             uuids.insert(uuid),
             "case {case:?}/{agent_type}: agent {uuid} is already bound to another type"
         );
-        // The qualifier of a service-made binding is the version number of the agent it
-        // bound, and the modelled `Version` shape is `range 1..`.
-        let version: i64 = qualifier.parse().unwrap_or_else(|_| {
-            panic!(
-                "case {case:?}/{agent_type}: expected the bound agent's version number as \
-                 the qualifier, got {qualifier:?}"
-            )
-        });
-        assert!(
-            version >= 1,
-            "case {case:?}/{agent_type}: expected a version of at least 1, got {version}"
-        );
+        // The qualifier of a service-made binding names the revision of the agent it
+        // bound: the floating alias for the one type the service binds to the agent
+        // itself, and the agent's published version number (the modelled `Version` shape
+        // is `range 1..`) for every other type.
+        if agent_type == FLOATING_DEFAULT_AI_AGENT_TYPE {
+            assert_eq!(
+                qualifier, QUALIFIER_LATEST,
+                "case {case:?}/{agent_type}: expected the floating qualifier \
+                 {QUALIFIER_LATEST}, got {qualifier:?}"
+            );
+        } else {
+            let version = qualifier.parse::<i64>().ok();
+            assert!(
+                version.is_some_and(|version| version >= 1),
+                "case {case:?}/{agent_type}: expected the bound agent's published version \
+                 number (at least 1) as the qualifier, got {qualifier:?}"
+            );
+        }
     }
 }
 
-/// Rule 1: the bindings a create reports are version-qualified, and the SAME stored
-/// values `GetAssistant` and `ListAssistants` report.
+/// Rule 1: the bindings a create reports are qualified by the revision of the agent the
+/// service bound, and are the SAME stored values `GetAssistant` and `ListAssistants`
+/// report.
 #[tokio::test]
-async fn service_made_ai_agent_bindings_are_version_qualified_and_stable() {
+async fn service_made_ai_agent_bindings_are_revision_qualified_and_stable() {
     for row in assistant_rows() {
         // One emulator per row, so the list below reports exactly this row's assistant.
         let emulator = Emulator::new();

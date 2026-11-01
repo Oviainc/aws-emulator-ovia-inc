@@ -23,6 +23,8 @@ mod assistant_configuration;
 mod assistant_lifecycle;
 #[path = "all/authorization_precedence.rs"]
 mod authorization_precedence;
+#[path = "all/built_in_ai_agent_revisions.rs"]
+mod built_in_ai_agent_revisions;
 #[path = "all/content_search.rs"]
 mod content_search;
 #[path = "all/content_summary.rs"]

@@ -40,9 +40,11 @@ const REGION: &str = "us-east-1";
 /// wire answers of `CreateAssistant`, `CreateSession` and `GetSession` carry: one entry
 /// per `AIAgentType` the model declares
 /// (`smithy_query(query="shape",shape="AIAgentType")`) except `ORCHESTRATION`, which has
-/// no built-in agent, each the service's `<agentId>:<publishedVersion>` for the type.
+/// no built-in agent, each the service's `<agentId>:<qualifier>` for the type — the
+/// floating `$LATEST` alias where the service binds the agent itself, the published
+/// version number where it pins one.
 const BUILT_IN_AGENTS: [(&str, &str); 8] = [
-    ("ANSWER_RECOMMENDATION", "3025a3fa-5419-4c9c-a040-877213b93f70:12"),
+    ("ANSWER_RECOMMENDATION", "3025a3fa-5419-4c9c-a040-877213b93f70:$LATEST"),
     ("CASE_SUMMARIZATION", "9114812c-2a1e-4501-8817-daec4223ce57:3"),
     ("EMAIL_GENERATIVE_ANSWER", "4d7e9f2a-1b3c-5d6e-8f7a-9b0c1d2e3f4a:7"),
     ("EMAIL_OVERVIEW", "91bb967b-bd5e-4e02-a8d5-cb7c5b2bf9c7:5"),
@@ -57,6 +59,11 @@ const BUILT_IN_AGENTS: [(&str, &str); 8] = [
 /// the `ANSWER_RECOMMENDATION` AI Agent type" — and whose built-in binding is reported
 /// disabled.
 const ANSWER_RECOMMENDATION: &str = "ANSWER_RECOMMENDATION";
+
+/// The qualifier that names an AI agent's floating alias rather than one of its published
+/// versions, which is what the service's binding to the answer-recommendation default
+/// carries.
+const QUALIFIER_LATEST: &str = "$LATEST";
 
 /// The `AIAgentType` the service publishes no built-in agent for, so no fresh assistant
 /// and no fresh session reports a binding for it.
@@ -314,25 +321,33 @@ async fn built_in_ai_agent_bindings_are_service_constants_for_every_assistant() 
         );
     }
 
-    // Every type's binding names its own agent, and the qualifier is that agent's
-    // published version — so no two types share an agent and nothing is bound to a
-    // version-less id.
+    // Every type's binding names its own agent, and the qualifier is the revision of that
+    // agent the service bound — the floating alias, or a published version number within
+    // the modelled `Version` range (`smithy_query(query="shape",shape="Version")`:
+    // `range 1..`) — so no two types share an agent and nothing is bound to a
+    // qualifier-less id.
     let mut agents: BTreeSet<&str> = BTreeSet::new();
     for (agent_type, ai_agent_id) in BUILT_IN_AGENTS {
-        let (uuid, version) = ai_agent_id
+        let (uuid, qualifier) = ai_agent_id
             .split_once(':')
             .unwrap_or_else(|| panic!("case {agent_type:?}: {ai_agent_id} carries no qualifier"));
         assert!(
             agents.insert(uuid),
             "case {agent_type:?}: agent {uuid} is already bound to another type"
         );
-        let version: i64 = version
-            .parse()
-            .unwrap_or_else(|_| panic!("case {agent_type:?}: qualifier {version:?} is no version"));
-        assert!(
-            version >= 1,
-            "case {agent_type:?}: expected a published version of at least 1, got {version}"
-        );
+        if agent_type == ANSWER_RECOMMENDATION {
+            assert_eq!(
+                qualifier, QUALIFIER_LATEST,
+                "case {agent_type:?}: expected the floating qualifier {QUALIFIER_LATEST}, \
+                 got {qualifier:?}"
+            );
+        } else {
+            assert!(
+                qualifier.parse::<i64>().is_ok_and(|version| version >= 1),
+                "case {agent_type:?}: expected a published version of at least 1, got \
+                 {qualifier:?}"
+            );
+        }
     }
 }
 

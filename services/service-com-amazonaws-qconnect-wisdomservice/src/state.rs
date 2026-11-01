@@ -230,16 +230,54 @@ pub const AI_RESOURCE_STATUS_ACTIVE: &str = "ACTIVE";
 /// turned off.
 pub const AI_AGENT_TYPE_ANSWER_RECOMMENDATION: &str = "ANSWER_RECOMMENDATION";
 
+/// Which revision of a built-in AI agent the service's own binding to it names: the
+/// agent's floating alias, or one published version of it.
+///
+/// The qualifier is part of the service's published identity for the type's default
+/// agent, not something an assistant or a session decides, so it is recorded per
+/// built-in agent beside that agent's id — see [`BUILT_IN_AI_AGENTS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltInAiAgentRevision {
+    /// The agent itself, named by the floating [`VERSION_QUALIFIER_LATEST`] alias: the
+    /// binding tracks the agent rather than pinning one of its versions, so a client that
+    /// follows the reported id reaches the agent that is running for the type.
+    Latest,
+    /// One published version of the agent, named by its number. Within the modelled
+    /// `Version` range (`smithy_query(query="shape",shape="Version")`: `range 1..`).
+    Version(i64),
+}
+
+impl BuiltInAiAgentRevision {
+    /// The `:<QUALIFIER>` text this revision is named by, which is what a binding appends
+    /// to the agent's id — see [`qualified_ai_agent_id`].
+    pub fn qualifier(self) -> String {
+        match self {
+            Self::Latest => VERSION_QUALIFIER_LATEST.to_string(),
+            Self::Version(version_number) => version_number.to_string(),
+        }
+    }
+
+    /// The version number this revision pins, or `None` when it names the agent's
+    /// floating alias instead — which is what a read of the agent reports for
+    /// `versionNumber`: a label carrying the floating alias names the agent's own working
+    /// copy, which is no numbered version.
+    pub fn published_version(self) -> Option<i64> {
+        match self {
+            Self::Latest => None,
+            Self::Version(version_number) => Some(version_number),
+        }
+    }
+}
+
 /// One built-in AI agent of the service: the `AIAgentType` it serves, the id Amazon Q in
-/// Connect publishes it under and the version of it that is published.
+/// Connect publishes it under and the revision of it the service's own binding names.
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltInAiAgent {
     pub r#type: &'static str,
     pub ai_agent_id: &'static str,
-    /// The published version of this agent, which the binding that names it qualifies
-    /// the id with — see [`qualified_ai_agent_id`]. Within the modelled `Version` range
-    /// (`smithy_query(query="shape",shape="Version")`: `range 1..`).
-    pub version_number: i64,
+    /// The revision of this agent the binding that names it qualifies the id with — see
+    /// [`qualified_ai_agent_id`].
+    pub revision: BuiltInAiAgentRevision,
 }
 
 /// The built-in (`SYSTEM`-origin) AI agents Amazon Q in Connect provisions every
@@ -247,11 +285,12 @@ pub struct BuiltInAiAgent {
 /// `aiAgentConfiguration` is bound to.
 ///
 /// These agents belong to the SERVICE, not to the assistant that reports them, so their
-/// ids and published versions are service constants: every assistant and every session,
-/// in every account and region, names the same eight `<id>:<version>` pairs. The ids and
-/// versions below are the ones the recorded answers of `CreateAssistant`,
+/// ids and the revisions bound to them are service constants: every assistant and every
+/// session, in every account and region, names the same eight `<id>:<qualifier>` pairs.
+/// The ids and qualifiers below are the ones the recorded answers of `CreateAssistant`,
 /// `CreateSession` and `GetSession` report, which agree across independently created
-/// assistants.
+/// assistants: the service names the answer-recommendation default by its floating alias
+/// and every other type's default by a published version number.
 ///
 /// One entry per `AIAgentType` the model declares
 /// (`smithy_query(query="shape",shape="AIAgentType")`) except `ORCHESTRATION`, which has
@@ -262,42 +301,42 @@ pub const BUILT_IN_AI_AGENTS: [BuiltInAiAgent; 8] = [
     BuiltInAiAgent {
         r#type: "ANSWER_RECOMMENDATION",
         ai_agent_id: "3025a3fa-5419-4c9c-a040-877213b93f70",
-        version_number: 12,
+        revision: BuiltInAiAgentRevision::Latest,
     },
     BuiltInAiAgent {
         r#type: "CASE_SUMMARIZATION",
         ai_agent_id: "9114812c-2a1e-4501-8817-daec4223ce57",
-        version_number: 3,
+        revision: BuiltInAiAgentRevision::Version(3),
     },
     BuiltInAiAgent {
         r#type: "EMAIL_GENERATIVE_ANSWER",
         ai_agent_id: "4d7e9f2a-1b3c-5d6e-8f7a-9b0c1d2e3f4a",
-        version_number: 7,
+        revision: BuiltInAiAgentRevision::Version(7),
     },
     BuiltInAiAgent {
         r#type: "EMAIL_OVERVIEW",
         ai_agent_id: "91bb967b-bd5e-4e02-a8d5-cb7c5b2bf9c7",
-        version_number: 5,
+        revision: BuiltInAiAgentRevision::Version(5),
     },
     BuiltInAiAgent {
         r#type: "EMAIL_RESPONSE",
         ai_agent_id: "8f4e7d2a-9c31-4b5e-a6f8-e2d9c7b54321",
-        version_number: 7,
+        revision: BuiltInAiAgentRevision::Version(7),
     },
     BuiltInAiAgent {
         r#type: "MANUAL_SEARCH",
         ai_agent_id: "652f0287-1610-4fee-bbe3-c687c13f5ec3",
-        version_number: 9,
+        revision: BuiltInAiAgentRevision::Version(9),
     },
     BuiltInAiAgent {
         r#type: "NOTE_TAKING",
         ai_agent_id: "7fc84960-5b46-4e44-9dd6-5956b2acfaa4",
-        version_number: 3,
+        revision: BuiltInAiAgentRevision::Version(3),
     },
     BuiltInAiAgent {
         r#type: "SELF_SERVICE",
         ai_agent_id: "529207fe-80fd-42be-bcf2-facd2141aec7",
-        version_number: 5,
+        revision: BuiltInAiAgentRevision::Version(5),
     },
 ];
 
@@ -960,20 +999,25 @@ pub fn quick_response_arn(region: &str, knowledge_base_id: &str, quick_response_
 pub const VERSION_QUALIFIER_LATEST: &str = "$LATEST";
 
 /// The id a binding to an AI agent names that agent by: the agent's own `Uuid` followed
-/// by the `:<VERSION>` qualifier of the version of it that runs.
+/// by the `:<QUALIFIER>` of the revision of it that runs.
 ///
 /// A binding targets `UuidWithQualifier`, whose pattern is a uuid plus an OPTIONAL
 /// qualifier (`^[a-f0-9]{8}-…-[a-f0-9]{12}(:[A-Z0-9_$]+){0,1}$`,
 /// `smithy_query(query="shape",shape="UuidWithQualifier")`), and an AI agent type's
 /// binding is documented as mapping the type "to AI Agent version"
 /// (`smithy_query(query="shape",shape="SessionData")`, member `aiAgentConfiguration`):
-/// what runs for the type is one VERSION of an agent, so the binding the service itself
-/// made names the version it bound rather than leaving a client unable to tell which one
-/// it got. An id a CALLER configured is stored and reported exactly as given — the
-/// caller already chose whether to pin a version — so this is used only where the
-/// SERVICE binds an agent of its own.
-pub fn qualified_ai_agent_id(ai_agent_id: &str, version_number: i64) -> String {
-    format!("{ai_agent_id}:{version_number}")
+/// what runs for the type is one revision of an agent, so the binding the service itself
+/// made names the revision it bound rather than leaving a client unable to tell which one
+/// it got. WHICH revision that is belongs to the agent, not to the assistant or session
+/// reporting it — a floating alias where the service binds the agent itself, a number
+/// where it pins a published version — so it is taken from the built-in agent's own
+/// record ([`BuiltInAiAgentRevision`]) and never materialised here.
+///
+/// An id a CALLER configured is stored and reported exactly as given — the caller already
+/// chose whether to pin a version — so this is used only where the SERVICE binds an agent
+/// of its own.
+pub fn qualified_ai_agent_id(ai_agent_id: &str, revision: BuiltInAiAgentRevision) -> String {
+    format!("{ai_agent_id}:{}", revision.qualifier())
 }
 
 /// This service's ARN for an AI agent, which names its parent assistant too:
@@ -1053,7 +1097,10 @@ pub fn default_ai_agents(
                 origin: AI_AGENT_ORIGIN_SYSTEM.to_string(),
                 visibility_status: AI_AGENT_VISIBILITY_PUBLISHED.to_string(),
                 status: AI_RESOURCE_STATUS_ACTIVE.to_string(),
-                published_version: Some(agent.version_number),
+                // The revision the service's binding names: a numbered version where it
+                // pins one, and none at all where the binding names the agent's floating
+                // alias — see [`BuiltInAiAgentRevision::published_version`].
+                published_version: agent.revision.published_version(),
                 created_at,
                 // Nothing has modified the record yet, so it was last written when the
                 // assistant it belongs to was created.
@@ -1067,9 +1114,9 @@ pub fn default_ai_agents(
                 // — the model's own wording for the member is "The ID of the AI Agent to
                 // be configured", and the map it lives in maps an AI agent type "to AI
                 // Agent version" — so what this assistant reports is the id of the
-                // service's agent for the type, qualified by that agent's published
-                // version. See [`qualified_ai_agent_id`].
-                ai_agent_id: qualified_ai_agent_id(agent.ai_agent_id, agent.version_number),
+                // service's agent for the type, qualified by the revision of it the
+                // service publishes for that type. See [`qualified_ai_agent_id`].
+                ai_agent_id: qualified_ai_agent_id(agent.ai_agent_id, agent.revision),
                 // The model's own wording: "Indicates whether the AI Agent
                 // configured for this AI Agent type is enabled … Setting this value
                 // to false is currently supported only for the
@@ -1485,8 +1532,9 @@ pub struct AiAgent {
     pub tags: HashMap<String, String>,
     /// The version of this agent that is published, and so the version an assistant's or
     /// session's binding to it names — see [`qualified_ai_agent_id`]. A built-in agent
-    /// carries the version the SERVICE publishes it at; an agent a caller created has
-    /// none until `CreateAIAgentVersion` publishes one.
+    /// carries the version the SERVICE pins its binding to, and none where that binding
+    /// names the agent's floating alias instead; an agent a caller created has none until
+    /// `CreateAIAgentVersion` publishes one.
     pub published_version: Option<i64>,
     pub created_at: SystemTime,
     /// When this record was last written: the create that minted it, until something
