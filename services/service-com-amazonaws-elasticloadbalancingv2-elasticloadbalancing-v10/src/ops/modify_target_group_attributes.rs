@@ -167,8 +167,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // no value at all names nothing to store.
             let value = attribute.value.clone().unwrap_or_default();
             let Some(spec) = crate::state::target_group_attribute(&key) else {
-                return Err(invalid_configuration(format!(
-                    "'{key}' is not a target group attribute this service supports"
+                // A key this service defines no target group attribute under is a value
+                // the request has to fix rather than a configuration this target group
+                // cannot hold, so it answers under the code Elastic Load Balancing
+                // answers an unusable input with.
+                return Err(refuse(crate::state::unrecognized_attribute_key(
+                    crate::state::AttributeOwner::TargetGroup,
+                    &key,
                 )));
             };
             if !spec.applies_to(group) {
@@ -209,10 +214,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The operation's own refusal for an attribute it cannot store: an unknown key, a key
-/// this target group does not carry, or a value outside the set the attribute's
-/// documentation states. The message names the key and the value from the request and
-/// the rule they broke, because that is what the caller has to fix.
+/// The refusal a rule in `crate::state` answered, under the code Elastic Load Balancing
+/// answers that CLASS of rule with: a value the request has to fix is a `ValidationError`,
+/// while a configuration this target group cannot hold is the modelled refusal.
+fn refuse(refusal: crate::state::Refusal) -> ModifyTargetGroupAttributesError {
+    match refusal {
+        crate::state::Refusal::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation_error(message)
+        }
+        crate::state::Refusal::Configuration(message) => invalid_configuration(message),
+    }
+}
+
+/// The operation's own refusal for an attribute it cannot store: a key this target group
+/// does not carry, or a value outside the set the attribute's documentation states. The
+/// message names the key and the value from the request and the rule they broke, because
+/// that is what the caller has to fix.
 fn invalid_configuration(detail: String) -> ModifyTargetGroupAttributesError {
     ModifyTargetGroupAttributesErrorModeled::InvalidConfigurationRequestException(
         InvalidConfigurationRequestException {

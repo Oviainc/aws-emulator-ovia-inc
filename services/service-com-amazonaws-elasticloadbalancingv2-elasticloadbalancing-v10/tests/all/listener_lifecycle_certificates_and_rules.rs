@@ -1156,64 +1156,93 @@ async fn listener_attributes_default_and_accept_only_their_documented_domain() {
     // Rows differ along the family, the key and the value: the documented bounds of the
     // one ranged attribute and a value either side of them, a boolean inside and outside
     // its two values, header-name and header-value attributes the issue did not cite, an
-    // attribute of another family, and a key no attribute carries.
-    let rows: Vec<(&str, &str, &str, bool)> = vec![
-        ("network", "tcp.idle_timeout.seconds", "60", true),
-        ("network", "tcp.idle_timeout.seconds", "6000", true),
-        ("network", "tcp.idle_timeout.seconds", "59", false),
-        ("network", "tcp.idle_timeout.seconds", "6001", false),
-        ("network", "tcp.idle_timeout.seconds", "not-a-number", false),
+    // attribute of another family, and a key no attribute carries. The last column is the
+    // awsQuery code the row is refused under, empty for a row that is stored: a value
+    // outside an attribute's domain, and an attribute this listener's family does not
+    // carry, are configurations this listener cannot hold, while a key the service defines
+    // no attribute under is an input value the request has to fix.
+    let rows: Vec<(&str, &str, &str, &str)> = vec![
+        ("network", "tcp.idle_timeout.seconds", "60", ""),
+        ("network", "tcp.idle_timeout.seconds", "6000", ""),
+        (
+            "network",
+            "tcp.idle_timeout.seconds",
+            "59",
+            INVALID_CONFIGURATION,
+        ),
+        (
+            "network",
+            "tcp.idle_timeout.seconds",
+            "6001",
+            INVALID_CONFIGURATION,
+        ),
+        (
+            "network",
+            "tcp.idle_timeout.seconds",
+            "not-a-number",
+            INVALID_CONFIGURATION,
+        ),
         (
             "gateway",
             "send_tcp_reset.on_idle_timeout.enabled",
             "true",
-            true,
+            "",
         ),
         (
             "gateway",
             "send_tcp_reset.on_idle_timeout.enabled",
             "yes",
-            false,
+            INVALID_CONFIGURATION,
         ),
         (
             "application",
             "routing.http.response.server.enabled",
             "false",
-            true,
+            "",
         ),
         (
             "application",
             "routing.http.request.x_amzn_mtls_clientcert_subject.header_name",
             "X-Client-Subject",
-            true,
+            "",
         ),
         (
             "application",
             "routing.http.response.x_frame_options.header_value",
             "DENY",
-            true,
+            "",
         ),
         // The ranged attribute belongs to the Network and Gateway families only, so an
         // Application Load Balancer's listener does not carry it...
-        ("application", "tcp.idle_timeout.seconds", "350", false),
+        (
+            "application",
+            "tcp.idle_timeout.seconds",
+            "350",
+            INVALID_CONFIGURATION,
+        ),
         // ...and the Application-only routing attributes are not a Network listener's.
         (
             "network",
             "routing.http.response.server.enabled",
             "true",
-            false,
+            INVALID_CONFIGURATION,
         ),
         // A Gateway-only attribute on a Network listener, which carries the other one.
         (
             "network",
             "send_tcp_reset.on_idle_timeout.enabled",
             "true",
-            false,
+            INVALID_CONFIGURATION,
         ),
-        ("application", "not.a.listener.attribute", "1", false),
+        (
+            "application",
+            "not.a.listener.attribute",
+            "1",
+            VALIDATION_ERROR,
+        ),
     ];
 
-    for (lb_type, key, value, accepted) in rows {
+    for (lb_type, key, value, code) in rows {
         let case = format!("{lb_type} listener setting {key} to {value:?}");
         let listener = listeners
             .get(lb_type)
@@ -1226,7 +1255,7 @@ async fn listener_attributes_default_and_accept_only_their_documented_domain() {
         form.push(p("Attributes.member.1.Value", value));
         let reply = call(&router, &form).await;
 
-        if accepted {
+        if code.is_empty() {
             assert_eq!(
                 reply.status, 200,
                 "case {case}: expected the attribute to be stored, got {} {}",
@@ -1262,8 +1291,8 @@ async fn listener_attributes_default_and_accept_only_their_documented_domain() {
         } else {
             assert_eq!(
                 (reply.status, reply.error_code().as_str()),
-                (400, INVALID_CONFIGURATION),
-                "case {case}: expected 400 {INVALID_CONFIGURATION}, got {} {}",
+                (400, code),
+                "case {case}: expected 400 {code}, got {} {}",
                 reply.status,
                 reply.body
             );

@@ -285,9 +285,12 @@ async fn every_operation_naming_an_absent_load_balancer_answers_the_modelled_ref
 /// `InvalidConfigurationRequest` and changes nothing.
 ///
 /// The rows span the three values the enum carries against the three families and both
-/// schemes, which is what the two rules generalise over: "Internal load balancers must
-/// use ipv4", and `dualstack-without-public-ipv4` is documented for Application Load
-/// Balancers alone.
+/// schemes, which is what the family rule generalises over:
+/// `dualstack-without-public-ipv4` is documented for Application Load Balancers alone. The
+/// SCHEME decides nothing, and the other rule — the IPv6 ranges every type but `ipv4` needs
+/// of the load balancer's subnets — is grounded in what EC2 reports about them, so with no
+/// EC2 mounted here nothing is known and nothing is refused on it; that rule is tabled in
+/// `all/input_rejection_classes.rs`.
 #[tokio::test]
 async fn set_ip_address_type_stores_what_its_documented_rules_accept() {
     // (case, the fields the load balancer is created with, the type asked for, the
@@ -346,7 +349,7 @@ async fn set_ip_address_type_stores_what_its_documented_rules_accept() {
             "dualstack on an internal load balancer",
             vec![("Scheme", "internal")],
             "dualstack",
-            INVALID_CONFIGURATION,
+            "",
         ),
     ];
 
@@ -647,7 +650,9 @@ async fn the_private_link_setting_is_refused_where_it_is_not_available() {
 
 /// `SetSubnets` replaces the subnets — and so the Availability Zones — the load balancer
 /// is placed in, and a later read reports exactly those; a request outside one of its
-/// documented rules is the modelled `InvalidConfigurationRequest` and changes nothing.
+/// documented rules is refused and changes nothing — as the modelled
+/// `InvalidConfigurationRequest` where the rule is a configuration no load balancer can
+/// hold, and as `ValidationError` where it is a count the request itself has to satisfy.
 #[tokio::test]
 async fn set_subnets_replaces_the_placement_a_load_balancer_reports() {
     let (router, _engine) = emulator();
@@ -724,7 +729,7 @@ async fn set_subnets_replaces_the_placement_a_load_balancer_reports() {
             vec![],
             vec![("Subnets.member.1", "subnet-fffffff1")],
             vec![],
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
         (
             "IPv6 source NAT prefixes on a load balancer that is not dualstack",

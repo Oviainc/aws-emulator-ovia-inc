@@ -20,8 +20,12 @@
 //! replace the enabled ones are the load balancer's own VPC's: its network interfaces live
 //! in them and each belongs to exactly one VPC, so a placement naming a subnet of another
 //! VPC is a configuration no load balancer can hold. A request one of these rules refuses
-//! is the modelled `InvalidConfigurationRequestException`; an ARN this store holds no load
-//! balancer for is the modelled `LoadBalancerNotFoundException`.
+//! is the modelled `InvalidConfigurationRequestException`, except where the rule is one the
+//! REQUEST's own values have to satisfy — the Application family's floor of two zones, and
+//! the IPv6 ranges a placement asking for IPv6 addresses needs — which Elastic Load
+//! Balancing refuses under `ValidationError` (`crate::state::Refusal` carries which);
+//! an ARN this store holds no load balancer for is the modelled
+//! `LoadBalancerNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -244,8 +248,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // EC2. Both the ceiling ("you can specify only one subnet per Availability Zone")
         // and the Application family's floor are one reading in `crate::state`, the same
         // one `CreateLoadBalancer` applies to the subnets a load balancer STARTS in.
-        if let Err(rule) = crate::state::check_placement_count(family, requested_placements) {
-            return Err(invalid_configuration(rule));
+        if let Err(refusal) = crate::state::check_placement_count(family, requested_placements) {
+            return Err(refuse(refusal));
         }
         // Each `SubnetMapping` member is documented for one family, and two of them for
         // one scheme of it, so an address pinned on a load balancer that could never carry
@@ -266,14 +270,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         // The IP address type the load balancer will carry after this call: the one the
-        // request names, else the one it already has. Judged by the same two rules
+        // request names, else the one it already has. Judged by the same rules
         // `SetIpAddressType` applies, so one call cannot set a type the other refuses.
         let ip_address_type = input
             .ip_address_type
             .clone()
             .unwrap_or(carried_address_type);
-        if let Err(rule) = crate::state::check_ip_address_type(family, &scheme, &ip_address_type) {
-            return Err(invalid_configuration(rule));
+        if let Err(refusal) = crate::state::check_ip_address_type(family, &ip_address_type) {
+            return Err(refuse(refusal));
         }
         // `EnablePrefixForIpv6SourceNat`: "[Network Load Balancers with UDP listeners]
         // Indicates whether to use an IPv6 prefix from each subnet for source NAT. The IP
@@ -338,6 +342,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(invalid_configuration(rule));
         }
+        // A load balancer carries IPv6 addresses out of the IPv6 ranges of the subnets it
+        // is placed in, so a placement that asks for them needs subnets that have one —
+        // the same reading `CreateLoadBalancer` and `SetIpAddressType` apply.
+        if let Err(refusal) = crate::state::check_subnet_ipv6_cidrs(
+            &ip_address_type,
+            resolved_subnets.as_deref(),
+        ) {
+            return Err(refuse(refusal));
+        }
         let zones = crate::state::availability_zone_records(
             subnets,
             subnet_mappings,
@@ -392,6 +405,19 @@ fn not_found(arn: &str) -> SetSubnetsError {
         message: Some(crate::state::load_balancer_not_found_message(arn)),
     })
     .into()
+}
+
+/// The refusal a rule in `crate::state` answered, under the code Elastic Load Balancing
+/// answers that CLASS of rule with: a value the request has to fix is a `ValidationError`,
+/// while a configuration no load balancer can hold is the modelled
+/// `InvalidConfigurationRequest`.
+fn refuse(refusal: crate::state::Refusal) -> SetSubnetsError {
+    match refusal {
+        crate::state::Refusal::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation_error(message)
+        }
+        crate::state::Refusal::Configuration(message) => invalid_configuration(message),
+    }
 }
 
 /// The modelled "the requested configuration is not valid" refusal, for a request this

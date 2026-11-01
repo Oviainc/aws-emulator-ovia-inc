@@ -775,29 +775,36 @@ async fn a_not_found_refusal_names_the_identifiers_the_lookup_carried() {
 async fn a_load_balancer_takes_at_most_one_subnet_per_availability_zone() {
     let (router, _engine) = emulator();
 
-    // (case, the load balancer type, how many subnets the request names, whether it is
-    // accepted)
+    // (case, the load balancer type, how many subnets the request names, the awsQuery code
+    // the request is refused under — empty for a placement that is accepted)
     //
     // "You can specify only one subnet per Availability Zone" (`Subnets`), so the ceiling
     // is the number of zones a Region has — which this service names with the 26 letters
     // a zone name can carry. A request past it names two subnets in one zone whatever its
-    // subnets are. The FLOOR is the family's: a Network Load Balancer "can specify subnets
-    // from one or more Availability Zones", while an Application Load Balancer "must
-    // specify subnets from at least two".
-    let rows: [(&str, &str, usize, bool); 5] = [
-        ("one subnet on a network load balancer", "network", 1, true),
-        ("one subnet on an application load balancer", "application", 1, false),
-        ("two subnets", "application", 2, true),
-        ("one subnet per zone of the region", "application", 26, true),
+    // subnets are, which is a placement no load balancer can hold — the modelled
+    // `InvalidConfigurationRequest`. The FLOOR is the family's: a Network Load Balancer
+    // "can specify subnets from one or more Availability Zones", while an Application Load
+    // Balancer "must specify subnets from at least two" — a count the request itself has to
+    // satisfy, refused as `ValidationError`.
+    let rows: [(&str, &str, usize, &str); 5] = [
+        ("one subnet on a network load balancer", "network", 1, ""),
+        (
+            "one subnet on an application load balancer",
+            "application",
+            1,
+            "ValidationError",
+        ),
+        ("two subnets", "application", 2, ""),
+        ("one subnet per zone of the region", "application", 26, ""),
         (
             "one subnet more than the region has zones",
             "application",
             27,
-            false,
+            "InvalidConfigurationRequest",
         ),
     ];
 
-    for (index, (case, lb_type, count, accepted)) in rows.into_iter().enumerate() {
+    for (index, (case, lb_type, count, code)) in rows.into_iter().enumerate() {
         let name = format!("subnet-bound-{index}");
         let mut form = action("CreateLoadBalancer");
         form.push(p("Name", &name));
@@ -809,7 +816,7 @@ async fn a_load_balancer_takes_at_most_one_subnet_per_availability_zone() {
             ));
         }
         let reply = call(&router, &form).await;
-        if accepted {
+        if code.is_empty() {
             assert_eq!(
                 reply.status, 200,
                 "case {case:?}: expected the create to be accepted, got {} body {}",
@@ -832,8 +839,8 @@ async fn a_load_balancer_takes_at_most_one_subnet_per_availability_zone() {
         } else {
             assert_eq!(
                 (reply.status, reply.error_code().as_str()),
-                (400, "InvalidConfigurationRequest"),
-                "case {case:?}: expected 400 InvalidConfigurationRequest, got {} body {}",
+                (400, code),
+                "case {case:?}: expected 400 {code}, got {} body {}",
                 reply.status,
                 reply.body
             );

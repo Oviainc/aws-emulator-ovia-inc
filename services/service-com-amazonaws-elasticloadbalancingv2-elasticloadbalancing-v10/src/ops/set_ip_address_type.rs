@@ -5,11 +5,17 @@
 //! Sets the IP address type of the load balancer `LoadBalancerArn` names and answers the
 //! type it now carries, which every later read of that load balancer reports.
 //!
-//! Two rules decide whether the type can be set at all, both from the model's own
-//! `IpAddressType` documentation and applied by `crate::state::check_ip_address_type`:
-//! "Internal load balancers must use ipv4", and `dualstack-without-public-ipv4` is
-//! documented for Application Load Balancers alone. A type one of them refuses is the
-//! modelled `InvalidConfigurationRequestException`; an ARN this store holds no load
+//! Two rules decide whether the type can be set at all. One is the model's own
+//! `IpAddressType` documentation, applied by `crate::state::check_ip_address_type`:
+//! `dualstack-without-public-ipv4` is documented for Application Load Balancers alone, so
+//! a type this load balancer's family cannot hold is the modelled
+//! `InvalidConfigurationRequestException`. The other is what every type but `ipv4` needs of
+//! the subnets the load balancer is placed in — an associated IPv6 CIDR block, since that
+//! is where its IPv6 addresses come from — applied by
+//! `crate::state::check_subnet_ipv6_cidrs` on what EC2 reports for those subnets and
+//! refused under `ValidationError`, because it is the request's own value that has to be
+//! satisfiable. The load balancer's SCHEME decides neither: an internal load balancer whose
+//! subnets carry IPv6 ranges is dualstack like any other. An ARN this store holds no load
 //! balancer for is the modelled `LoadBalancerNotFoundException`.
 //!
 //! ## Shape of an operation
@@ -153,47 +159,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Only reachable on an engine that is not the shared `InMemoryEngine`,
             // which this service has no store on — so nothing is implemented for it.
             crate::scaffolded::Scaffolded::not_implemented("SetIpAddressType")
         })?;
+        let region = crate::state::request_region(ctx);
 
-        let mut guard = state.lock();
-        let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) else {
-            return Err(SetIpAddressTypeErrorModeled::LoadBalancerNotFoundException(
-                LoadBalancerNotFoundException {
-                    message: Some(crate::state::load_balancer_not_found_message(
-                        &input.load_balancer_arn,
-                    )),
-                },
+        // What the load balancer is today, read under the lock and then released: the
+        // subnets it is placed in are resolved against EC2 next, and nothing is held
+        // across that call.
+        let (family, placed_subnets) = {
+            let guard = state.lock();
+            let Some(load_balancer) = guard.load_balancers.get(&input.load_balancer_arn) else {
+                return Err(not_found(&input.load_balancer_arn));
+            };
+            (
+                load_balancer.family(),
+                load_balancer
+                    .availability_zones
+                    .iter()
+                    .map(|zone| zone.subnet_id.clone())
+                    .collect::<Vec<String>>(),
             )
-            .into());
         };
 
-        // Judged against the load balancer as it stands, because both rules are about
-        // THIS load balancer: its scheme and its family.
-        if let Err(rule) = crate::state::check_ip_address_type(
-            load_balancer.family(),
-            &load_balancer.scheme,
+        // The family rule, which is about THIS load balancer's type.
+        if let Err(refusal) = crate::state::check_ip_address_type(family, &input.ip_address_type) {
+            return Err(refuse(refusal));
+        }
+        // Every type but `ipv4` gives the load balancer IPv6 addresses, and those come out
+        // of the IPv6 range of each subnet it is placed in — which is EC2's to say, so the
+        // subnets it already carries are resolved against EC2 before anything is written.
+        // The ONE reading of that rule, the same one `CreateLoadBalancer` and `SetSubnets`
+        // apply to the subnets a request places a load balancer in.
+        let resolved_subnets =
+            crate::state::network::subnets_by_id(ctx, &region, &placed_subnets).await;
+        if let Err(refusal) = crate::state::check_subnet_ipv6_cidrs(
             &input.ip_address_type,
+            resolved_subnets.as_deref(),
         ) {
-            return Err(
-                SetIpAddressTypeErrorModeled::InvalidConfigurationRequestException(
-                    InvalidConfigurationRequestException {
-                        message: Some(rule),
-                    },
-                )
-                .into(),
-            );
+            return Err(refuse(refusal));
         }
 
+        let mut guard = state.lock();
+        // Looked up again because the lock was released for the EC2 read: the load
+        // balancer may have been deleted while it ran.
+        let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) else {
+            return Err(not_found(&input.load_balancer_arn));
+        };
         load_balancer.ip_address_type = input.ip_address_type.clone();
         Ok(SetIpAddressTypeOutput {
             // What the load balancer now carries, read back off the record rather than
             // echoed from the request.
             ip_address_type: Some(load_balancer.ip_address_type.clone()),
         })
+    }
+}
+
+/// The modelled refusal for an ARN this store holds no load balancer for, with the
+/// message every operation addressing one load balancer answers
+/// (`crate::state::load_balancer_not_found_message`).
+fn not_found(arn: &str) -> SetIpAddressTypeError {
+    SetIpAddressTypeErrorModeled::LoadBalancerNotFoundException(LoadBalancerNotFoundException {
+        message: Some(crate::state::load_balancer_not_found_message(arn)),
+    })
+    .into()
+}
+
+/// The refusal a rule in `crate::state` answered, under the code Elastic Load Balancing
+/// answers that CLASS of rule with: a value the request has to fix is a `ValidationError`,
+/// while a type this load balancer cannot hold is the modelled
+/// `InvalidConfigurationRequest`.
+fn refuse(refusal: crate::state::Refusal) -> SetIpAddressTypeError {
+    match refusal {
+        crate::state::Refusal::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation_error(message)
+        }
+        crate::state::Refusal::Configuration(message) => {
+            SetIpAddressTypeErrorModeled::InvalidConfigurationRequestException(
+                InvalidConfigurationRequestException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }

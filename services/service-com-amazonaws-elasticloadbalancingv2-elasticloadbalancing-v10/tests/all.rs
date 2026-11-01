@@ -23,6 +23,8 @@ mod certificate_resolution_and_redirect_protocol;
 mod declared_action_set;
 #[path = "all/describe_input_bounds.rs"]
 mod describe_input_bounds;
+#[path = "all/input_rejection_classes.rs"]
+mod input_rejection_classes;
 #[path = "all/ip_targets.rs"]
 mod ip_targets;
 #[path = "all/listener_lifecycle_certificates_and_rules.rs"]

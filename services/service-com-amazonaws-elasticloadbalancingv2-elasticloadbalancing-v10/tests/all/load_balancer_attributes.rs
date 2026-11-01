@@ -56,6 +56,10 @@ type RefusalCase = (
 /// (`smithy_query(query="operation",operation="ModifyLoadBalancerAttributes")`).
 pub(crate) const INVALID_CONFIGURATION: &str = "InvalidConfigurationRequest";
 
+/// The code Elastic Load Balancing answers an input value it cannot accept with, for a
+/// rule its model documents in prose and declares no error shape for.
+pub(crate) const VALIDATION_ERROR: &str = "ValidationError";
+
 /// Create a load balancer named `name` with `fields` beside it, and answer its ARN.
 ///
 /// Two subnets by default, because an Application Load Balancer must be placed in at
@@ -458,8 +462,11 @@ async fn repeated_writes_replace_only_the_keys_they_name_and_are_idempotent() {
 // Refusals, and what a refused write leaves behind.
 // ---------------------------------------------------------------------------
 
-/// An attribute this service cannot store is refused with the operation's own
-/// `InvalidConfigurationRequest`, and the load balancer is left exactly as it was.
+/// An attribute this service cannot store is refused and the load balancer is left exactly
+/// as it was: a key the service defines no attribute under is an input value the request
+/// has to fix (`ValidationError`), while every other way a write can be wrong is a
+/// configuration this load balancer cannot hold (the operation's own
+/// `InvalidConfigurationRequest`).
 ///
 /// The rows span every way a write can be wrong: a key no documentation lists, a key
 /// another family's load balancers carry (in both directions), a value outside a
@@ -473,7 +480,7 @@ async fn an_attribute_this_service_cannot_store_is_refused_and_changes_nothing()
             "a key no documentation lists",
             vec![],
             ("routing.http.invented_mode", "on"),
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
         (
             "a network load balancer's attribute on an application load balancer",

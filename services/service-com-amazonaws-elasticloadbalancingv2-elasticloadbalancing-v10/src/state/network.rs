@@ -29,6 +29,14 @@ pub struct SubnetFacts {
     pub cidrs: Vec<IpNet>,
 }
 
+impl SubnetFacts {
+    /// Whether EC2 reported an IPv6 range for this subnet, which is where a load balancer
+    /// placed in it draws its IPv6 addresses from.
+    pub fn has_ipv6_cidr(&self) -> bool {
+        self.cidrs.iter().any(|cidr| matches!(cidr, IpNet::V6(_)))
+    }
+}
+
 /// What EC2 says about an instance a request named as a target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstanceLookup {
@@ -395,7 +403,12 @@ pub enum SecurityGroupLookup {
 /// thing about an association, and no OTHER `InvalidGroup…` code does — a group that
 /// exists but cannot be used says something else — so the two are matched exactly rather
 /// than by prefix.
-const GROUP_REFUSAL_CODES: &[&str] = &[GROUP_NOT_FOUND, "InvalidGroupId.Malformed"];
+const GROUP_REFUSAL_CODES: &[&str] = &[GROUP_NOT_FOUND, GROUP_ID_MALFORMED];
+
+/// The EC2 code for a value that is not a security group id at all, which says the same
+/// thing about an association as [`GROUP_NOT_FOUND`]: nothing the request named is a group
+/// this account can use.
+const GROUP_ID_MALFORMED: &str = "InvalidGroupId.Malformed";
 
 /// The EC2 code for an id the account holds no security group for, which is what a read
 /// that resolved without reporting one of the ids ran into.
@@ -464,55 +477,6 @@ pub async fn resolve_security_groups(
         "the security groups a request named could not be resolved against EC2"
     );
     SecurityGroupLookup::Unknown
-}
-
-/// The VPC each security group a request named belongs to, keyed by group id, or `None`
-/// when EC2 could not be asked (including a group id that names no security group of the
-/// account, which refuses the whole read).
-///
-/// The VPC half of [`resolve_security_groups`], for a caller whose only question is which
-/// VPC the groups govern traffic in.
-pub async fn security_group_vpcs(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-    group_ids: &[String],
-) -> Option<Vec<(String, Option<String>)>> {
-    match resolve_security_groups(ctx, region, group_ids).await {
-        SecurityGroupLookup::Resolved(groups) => Some(
-            groups
-                .into_iter()
-                .map(|group| (group.group_id, group.vpc_id))
-                .collect(),
-        ),
-        SecurityGroupLookup::Absent(_) | SecurityGroupLookup::Unknown => None,
-    }
-}
-
-/// Whether any security group a request names belongs to a VPC OTHER than `vpc_id`, as
-/// EC2 reported it.
-///
-/// A load balancer's security groups govern traffic to its network interfaces, which live
-/// in the subnets it is placed in: a group of another VPC can never be applied to them.
-/// `false` when there is no EC2 to ask, because a refusal has to be grounded in what EC2
-/// reported rather than assumed from silence — and `false` for a request that names no
-/// group at all, which associates nothing foreign.
-///
-/// The ONE reading of that rule, called by `CreateLoadBalancer` for the groups a new load
-/// balancer starts with and by `SetSecurityGroups` for the groups that replace them.
-pub async fn has_foreign_security_group(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-    vpc_id: &str,
-    security_groups: &[String],
-) -> bool {
-    let Some(reported) = security_group_vpcs(ctx, region, security_groups).await else {
-        return false;
-    };
-    reported.iter().any(|(_, group_vpc)| {
-        group_vpc
-            .as_deref()
-            .is_some_and(|holding| holding != vpc_id)
-    })
 }
 
 /// What EC2 says about the instances a request named as targets.

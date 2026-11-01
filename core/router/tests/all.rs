@@ -20,6 +20,11 @@
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `e…` span (where every elbv2 suite lands) are both regions concurrently landing
+// suites add their line to.
+#[path = "all/elbv2_dualstack_and_security_group_classes.rs"]
+mod elbv2_dualstack_and_security_group_classes;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions
 // concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_codeartifact_resources.rs"]

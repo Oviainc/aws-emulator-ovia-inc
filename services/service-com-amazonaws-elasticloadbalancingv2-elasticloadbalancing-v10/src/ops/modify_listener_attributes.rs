@@ -182,8 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // caller's own value rather than a re-rendered one.
             let value = attribute.value.clone().unwrap_or_default();
             let Some(spec) = crate::state::listener_attribute(&key) else {
-                return Err(invalid_configuration(format!(
-                    "'{key}' is not a listener attribute this service supports"
+                // A key this service defines no listener attribute under is a value the
+                // request has to fix rather than a configuration this listener cannot
+                // hold, so it answers under the code Elastic Load Balancing answers an
+                // unusable input with.
+                return Err(refuse(crate::state::unrecognized_attribute_key(
+                    crate::state::AttributeOwner::Listener,
+                    &key,
                 )));
             };
             if !spec.applies_to(family) {
@@ -226,10 +231,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The operation's own refusal for an attribute it cannot store: an unknown key, a key
-/// this listener does not carry, or a value outside the domain the attribute's
-/// documentation states. The message names the key and the value from the request and
-/// the rule they broke, because that is what the caller has to fix.
+/// The refusal a rule in `crate::state` answered, under the code Elastic Load Balancing
+/// answers that CLASS of rule with: a value the request has to fix is a `ValidationError`,
+/// while a configuration this listener cannot hold is the modelled refusal.
+fn refuse(refusal: crate::state::Refusal) -> ModifyListenerAttributesError {
+    match refusal {
+        crate::state::Refusal::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation_error(message)
+        }
+        crate::state::Refusal::Configuration(message) => invalid_configuration(message),
+    }
+}
+
+/// The operation's own refusal for an attribute it cannot store: a key this listener does
+/// not carry, or a value outside the domain the attribute's documentation states. The
+/// message names the key and the value from the request and the rule they broke, because
+/// that is what the caller has to fix.
 fn invalid_configuration(detail: String) -> ModifyListenerAttributesError {
     ModifyListenerAttributesErrorModeled::InvalidConfigurationRequestException(
         InvalidConfigurationRequestException {

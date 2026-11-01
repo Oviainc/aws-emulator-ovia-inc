@@ -232,19 +232,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A security group governs traffic to the load balancer's network interfaces,
         // which live in its own VPC: a group EC2 reports in another VPC can never be
-        // applied to them.
-        if let Some(vpc_id) = vpc_id.as_deref() {
-            if crate::state::network::has_foreign_security_group(
-                ctx,
-                &region,
-                vpc_id,
-                &input.security_groups,
-            )
-            .await
-            {
+        // applied to them, and neither can a value that is no group id at all, while an id
+        // the account holds no group for is the modelled refusal for an absent group. The
+        // ONE reading of all three, shared with `CreateLoadBalancer`.
+        let lookup = crate::state::network::resolve_security_groups(
+            ctx,
+            &region,
+            &input.security_groups,
+        )
+        .await;
+        match crate::state::check_security_groups(
+            vpc_id.as_deref(),
+            &input.security_groups,
+            &lookup,
+        ) {
+            Ok(()) => {}
+            Err(crate::state::SecurityGroupRefusal::Invalid) => {
                 return Err(invalid_configuration(
-                    "One or more security groups are invalid".to_string(),
-                ));
+                    crate::state::INVALID_SECURITY_GROUPS.to_string(),
+                ))
+            }
+            Err(crate::state::SecurityGroupRefusal::NotFound) => {
+                return Err(
+                    SetSecurityGroupsErrorModeled::InvalidSecurityGroupException(
+                        InvalidSecurityGroupException {
+                            message: Some(crate::state::SECURITY_GROUP_NOT_FOUND.to_string()),
+                        },
+                    )
+                    .into(),
+                )
             }
         }
 

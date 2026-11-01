@@ -949,6 +949,43 @@ pub fn listener_attribute(key: &str) -> Option<&'static ListenerAttributeSpec> {
     LISTENER_ATTRIBUTES.iter().find(|spec| spec.key == key)
 }
 
+/// Whose attribute set a key was judged against, for the refusal that names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributeOwner {
+    LoadBalancer,
+    Listener,
+    TargetGroup,
+}
+
+impl AttributeOwner {
+    /// How the refusal names the resource whose attributes the key was looked for among,
+    /// in the words the API's own `…Attribute` shapes name them by
+    /// (`LoadBalancerAttribute`, `ListenerAttribute`, `TargetGroupAttribute`).
+    fn noun(self) -> &'static str {
+        match self {
+            Self::LoadBalancer => "Load balancer",
+            Self::Listener => "Listener",
+            Self::TargetGroup => "Target group",
+        }
+    }
+}
+
+/// The refusal an attribute key this service defines no attribute under earns: a value the
+/// request has to fix, which Elastic Load Balancing answers as [`Refusal::Validation`]
+/// naming the key it did not recognise.
+///
+/// Every attribute write judges its key against a fixed set of names — the ones its
+/// resource's documentation lists — so a key outside that set is the same failure whichever
+/// of the three resources it was named for, and this is the ONE reading of it, called by
+/// `ModifyLoadBalancerAttributes`, `ModifyListenerAttributes` and
+/// `ModifyTargetGroupAttributes`.
+pub fn unrecognized_attribute_key(owner: AttributeOwner, key: &str) -> Refusal {
+    Refusal::Validation(format!(
+        "{} attribute key '{key}' is not recognized",
+        owner.noun()
+    ))
+}
+
 /// Which family of load balancer a `Type` names, which is what decides WHICH listener
 /// attributes its listeners carry. The pairing is the model's own `LoadBalancerTypeEnum`
 /// (`application`, `network`, `gateway`), as [`load_balancer_type_code`] reads it.
@@ -1470,30 +1507,92 @@ pub const IPV4_ADDRESS_TYPE: &str = "ipv4";
 /// dualstack".
 pub const APPLICATION_ONLY_ADDRESS_TYPE: &str = "dualstack-without-public-ipv4";
 
-/// Whether a load balancer of `family` with this `scheme` can use `ip_address_type`,
-/// and — when it cannot — the rule it broke, so a refusal can name the value and the
-/// rule the caller has to satisfy.
+/// How Elastic Load Balancing classifies a refusal of a rule its model declares no error
+/// shape for — which is the thing a client branches on, so each rule below carries its own
+/// class and answers under the same code wherever it is applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The request's own values do not satisfy a rule this service documents in prose: a
+    /// required number of subnets, an attribute key it defines no attribute under, the
+    /// IPv6 ranges a placement that asks for IPv6 addresses needs. Elastic Load Balancing
+    /// answers these under `ValidationError`
+    /// ([`crate::scaffolded::Scaffolded::validation_error`]), whatever the operation's own
+    /// model declares, so the caller is told to fix the request.
+    Validation(String),
+    /// The resources the request names cannot hold the configuration together: subnets of
+    /// two VPCs or two subnets of one Availability Zone, an address member the family or
+    /// scheme does not carry, a security group that cannot govern this load balancer's
+    /// traffic. That is the modelled "the requested configuration is not valid".
+    Configuration(String),
+}
+
+impl Refusal {
+    /// What the caller has to fix, as the refusal states it.
+    pub fn message(self) -> String {
+        match self {
+            Self::Validation(message) | Self::Configuration(message) => message,
+        }
+    }
+}
+
+/// Whether a load balancer of `family` can use `ip_address_type`, and — when it cannot —
+/// the rule it broke, so a refusal can name the value and the rule the caller has to
+/// satisfy.
 ///
-/// Two rules, both from `IpAddressType`'s own documentation on the operations that set
-/// it: "Internal load balancers must use ipv4", and `dualstack-without-public-ipv4` is
-/// bracketed for Application Load Balancers alone.
+/// One rule, from `IpAddressType`'s own documentation on the operations that set it:
+/// `dualstack-without-public-ipv4` is bracketed for Application Load Balancers alone,
+/// while the other two values are listed for every family. Nothing here is decided on the
+/// load balancer's SCHEME: an internal load balancer carries IPv6 addresses like any
+/// other once its subnets have IPv6 ranges, which is [`check_subnet_ipv6_cidrs`].
 pub fn check_ip_address_type(
     family: LoadBalancerFamily,
-    scheme: &str,
     ip_address_type: &str,
-) -> Result<(), String> {
-    if scheme == INTERNAL_SCHEME && ip_address_type != IPV4_ADDRESS_TYPE {
-        return Err(format!(
-            "The IP address type '{ip_address_type}' is not valid for an internal load \
-             balancer, which must use '{IPV4_ADDRESS_TYPE}'"
-        ));
-    }
+) -> Result<(), Refusal> {
     if ip_address_type == APPLICATION_ONLY_ADDRESS_TYPE && family != LoadBalancerFamily::Application
     {
-        return Err(format!(
+        return Err(Refusal::Configuration(format!(
             "The IP address type '{ip_address_type}' is only valid for an application load \
              balancer"
-        ));
+        )));
+    }
+    Ok(())
+}
+
+/// What a placement asking for IPv6 addresses needs of the subnets it names, in the words
+/// Elastic Load Balancing refuses one without it with.
+pub const IPV6_CIDR_REQUIRED: &str = "You must specify subnets with an associated IPv6 CIDR block.";
+
+/// Whether the subnets a load balancer is placed in can carry `ip_address_type`, and — when
+/// they cannot — the rule the request broke.
+///
+/// Every `IpAddressType` but [`IPV4_ADDRESS_TYPE`] gives the load balancer IPv6 addresses,
+/// and those come out of the IPv6 range of the subnet each node sits in, so a placement
+/// asking for one needs subnets that have an IPv6 CIDR block associated with them — every
+/// one of them, since a node is placed in each. The load balancer's scheme does not enter
+/// into it.
+///
+/// Which ranges a subnet holds is EC2's to say, so the rule is judged on what EC2 reported
+/// (`resolved`); with no EC2 to ask nothing is known and nothing is refused, because a
+/// refusal has to be grounded in what EC2 reported rather than assumed from silence.
+///
+/// The ONE reading of that rule, called by `CreateLoadBalancer` for the subnets a load
+/// balancer starts in, by `SetSubnets` for the subnets that replace them and by
+/// `SetIpAddressType` for the subnets it already has.
+pub fn check_subnet_ipv6_cidrs(
+    ip_address_type: &str,
+    resolved: Option<&[network::SubnetFacts]>,
+) -> Result<(), Refusal> {
+    if ip_address_type == IPV4_ADDRESS_TYPE {
+        return Ok(());
+    }
+    let Some(resolved) = resolved else {
+        return Ok(());
+    };
+    if resolved
+        .iter()
+        .any(|subnet| !subnet.has_ipv6_cidr())
+    {
+        return Err(Refusal::Validation(IPV6_CIDR_REQUIRED.to_string()));
     }
     Ok(())
 }
@@ -1503,6 +1602,12 @@ pub fn check_ip_address_type(
 /// specify subnets from at least two Availability Zones" — one subnet per zone, so two
 /// subnets.
 pub const SUBNETS_PER_APPLICATION_LOAD_BALANCER: usize = 2;
+
+/// The words Elastic Load Balancing refuses a placement with fewer subnets than an
+/// Application Load Balancer needs with — the rule itself, with nothing from the request
+/// in it: what the caller has to fix is which subnets the request names.
+pub const SUBNETS_IN_TWO_ZONES_REQUIRED: &str =
+    "At least two subnets in two different Availability Zones must be specified";
 
 /// Whether a load balancer of `family` can be placed in `count` subnets and — when it
 /// cannot — the rule it broke.
@@ -1514,29 +1619,30 @@ pub const SUBNETS_PER_APPLICATION_LOAD_BALANCER: usize = 2;
 /// persisted on the load balancer, and the addresses resolved against EC2 — so no request
 /// can ask for more of them than a Region has zones.
 ///
-/// Both bounds come from the same documentation. The ceiling is `Subnets`' "you can specify
+/// Both bounds come from the same documentation, and they are refused under different codes
+/// because they are different kinds of failure. The ceiling is `Subnets`' "you can specify
 /// only one subnet per Availability Zone", so at most the [`SUBNETS_PER_LOAD_BALANCER`]
 /// zones this emulator's Regions have: a request past it names two subnets in one zone
-/// whatever those subnets are. The floor belongs to the Application family alone — its
-/// subnets must come "from at least two Availability Zones" — while a Network or Gateway
-/// Load Balancer "can specify subnets from one or more Availability Zones", so one is
-/// enough.
+/// whatever those subnets are, which is a placement no load balancer can hold —
+/// [`Refusal::Configuration`]. The floor belongs to the Application family alone — its
+/// subnets must come "from at least two Availability Zones", while a Network or Gateway Load
+/// Balancer "can specify subnets from one or more Availability Zones", so one is enough —
+/// and it is a count the request itself has to satisfy, which Elastic Load Balancing
+/// answers as [`Refusal::Validation`].
 ///
 /// The ONE reading of both, called by `CreateLoadBalancer` for the subnets a new load
 /// balancer starts in and by `SetSubnets` for the subnets that replace them, BEFORE either
 /// does any work proportional to what the request named.
-pub fn check_placement_count(family: LoadBalancerFamily, count: usize) -> Result<(), String> {
+pub fn check_placement_count(family: LoadBalancerFamily, count: usize) -> Result<(), Refusal> {
     if count > SUBNETS_PER_LOAD_BALANCER {
-        return Err(format!(
+        return Err(Refusal::Configuration(format!(
             "You can specify only one subnet per Availability Zone, so at most \
              {SUBNETS_PER_LOAD_BALANCER} subnets, and this request names {count}"
-        ));
+        )));
     }
     if family == LoadBalancerFamily::Application && count < SUBNETS_PER_APPLICATION_LOAD_BALANCER {
-        return Err(format!(
-            "An application load balancer must be placed in at least \
-             {SUBNETS_PER_APPLICATION_LOAD_BALANCER} subnets, in as many Availability Zones, \
-             and this request names {count}"
+        return Err(Refusal::Validation(
+            SUBNETS_IN_TWO_ZONES_REQUIRED.to_string(),
         ));
     }
     Ok(())
@@ -1677,6 +1783,105 @@ pub fn check_subnet_vpcs(
         return Err(format!("All subnets must belong to the same VPC: '{vpc_id}'"));
     }
     Ok(())
+}
+
+/// The refusal the security groups a request names earn when they cannot be applied to the
+/// load balancer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecurityGroupRefusal {
+    /// The request named a value that is not a security group id at all, so no security
+    /// group exists under it in any account: the modelled "the specified security group
+    /// does not exist", stated in the words [`SECURITY_GROUP_NOT_FOUND`] carries.
+    NotFound,
+    /// The groups the request named cannot govern THIS load balancer's traffic: one of them
+    /// is a group id this account holds no group for, or one that governs traffic in
+    /// another VPC than the one the load balancer's network interfaces live in. Either way
+    /// the request is a configuration that cannot hold together, which the modelled
+    /// `InvalidConfigurationRequest` states in the words Elastic Load Balancing words it
+    /// ([`INVALID_SECURITY_GROUPS`]).
+    Invalid,
+}
+
+/// The words Elastic Load Balancing refuses a request whose security groups cannot be
+/// applied to the load balancer's network interfaces with.
+///
+/// A fixed sentence, because what the caller has to fix is WHICH groups the request names
+/// rather than anything about one value: no one of them is more at fault than another.
+pub const INVALID_SECURITY_GROUPS: &str = "One or more security groups are invalid";
+
+/// What the modelled refusal for a value that names no security group at all states, which
+/// is the sentence the model itself gives `InvalidSecurityGroupException`
+/// (`smithy_query(query="shape",shape="InvalidSecurityGroupException")`). It names no
+/// value, because a request may carry several and none of them is more at fault.
+pub const SECURITY_GROUP_NOT_FOUND: &str = "The specified security group does not exist";
+
+/// The prefix of a security group id, from EC2's own ids.
+const SECURITY_GROUP_ID_PREFIX: &str = "sg-";
+
+/// Whether `id` is shaped like a security group id: [`SECURITY_GROUP_ID_PREFIX`] followed
+/// by 8 or 17 hexadecimal digits — the short and the long form EC2 mints ids in.
+///
+/// A value outside that form names no security group of ANY account, so it is judged here
+/// rather than asked about: it is a value the request carries, not an id to look for.
+pub fn security_group_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix(SECURITY_GROUP_ID_PREFIX) else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17) && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Whether the security groups a request names can be applied to a load balancer in
+/// `vpc_id`, and — when they cannot — the refusal the request earns.
+///
+/// A load balancer's security groups govern traffic to its network interfaces, which live
+/// in the subnets it is placed in and belong to one VPC, so there are two ways a request's
+/// groups can fail and Elastic Load Balancing answers them differently. A value that is not
+/// a security group id at all is no group of ANY account, which is the modelled "the
+/// specified security group does not exist". An id that IS one but names no group of this
+/// account — or names a group governing traffic in another VPC — is a group this load
+/// balancer cannot be given, so the request is a configuration that cannot hold together:
+/// the modelled `InvalidConfigurationRequest`, in the words [`INVALID_SECURITY_GROUPS`].
+///
+/// `named` is what the request listed, judged on its own form; `lookup` is what EC2
+/// answered about those ids. Whether a group exists and which VPC it governs traffic in is
+/// EC2's to say, so those two readings are of what EC2 ANSWERED: nothing is refused on them
+/// when there is no EC2 to ask ([`network::SecurityGroupLookup::Unknown`], which is also
+/// the answer for a request that names no group at all), and a load balancer whose own VPC
+/// is not known yet is judged on existence alone.
+///
+/// The ONE reading of that rule, called by `CreateLoadBalancer` for the groups a new load
+/// balancer starts with — BEFORE it judges the name, because a caller told to rename cannot
+/// discover that its groups are the problem — and by `SetSecurityGroups` for the groups
+/// that replace them.
+pub fn check_security_groups(
+    vpc_id: Option<&str>,
+    named: &[String],
+    lookup: &network::SecurityGroupLookup,
+) -> Result<(), SecurityGroupRefusal> {
+    if named
+        .iter()
+        .any(|id| !security_group_id_is_well_formed(id))
+    {
+        return Err(SecurityGroupRefusal::NotFound);
+    }
+    match lookup {
+        network::SecurityGroupLookup::Absent(_) => Err(SecurityGroupRefusal::Invalid),
+        network::SecurityGroupLookup::Unknown => Ok(()),
+        network::SecurityGroupLookup::Resolved(groups) => {
+            let Some(vpc_id) = vpc_id else {
+                return Ok(());
+            };
+            if groups.iter().any(|group| {
+                group
+                    .vpc_id
+                    .as_deref()
+                    .is_some_and(|holding| holding != vpc_id)
+            }) {
+                return Err(SecurityGroupRefusal::Invalid);
+            }
+            Ok(())
+        }
+    }
 }
 
 /// The `LoadBalancerTypeEnum` value a family is named by, for a refusal that states which

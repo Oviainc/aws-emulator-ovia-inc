@@ -15,10 +15,10 @@
 //!   shape, carrying the documented default until a write changes it
 //!   (`smithy_query(query="doc",shape="TargetGroupAttribute",member="Key")` is the only
 //!   catalog of them, since the Smithy shape itself is an unconstrained key/value pair).
-//! * A value outside an attribute's documented domain, a key the model does not
-//!   document, and a key another load balancer family's groups carry are each refused
-//!   with the operation's own `InvalidConfigurationRequest`, and a refused write stores
-//!   nothing.
+//! * A value outside an attribute's documented domain and a key another load balancer
+//!   family's groups carry are each refused with the operation's own
+//!   `InvalidConfigurationRequest`, a key the model does not document with
+//!   `ValidationError`, and a refused write stores nothing.
 //! * `ModifyTargetGroup` replaces the health-check members the request names and leaves
 //!   every other one as it was.
 //! * `CreateTargetGroup` refuses a `Name` outside the rule its own documentation states
@@ -36,6 +36,30 @@ use std::collections::BTreeMap;
 /// One row of the not-found table: the case name, the request's form fields, and the
 /// message the refusal must answer.
 type NotFoundCase = (&'static str, Vec<(String, String)>, String);
+
+/// A key this service defines no target group attribute under, which no row of the write
+/// table's accepted half names.
+const UNDOCUMENTED_ATTRIBUTE_KEY: &str = "not_a_real_attribute";
+
+/// The awsQuery code of `InvalidConfigurationRequestException`
+/// (`smithy_query(query="operation",operation="ModifyTargetGroupAttributes")`).
+const INVALID_CONFIGURATION: &str = "InvalidConfigurationRequest";
+
+/// The code Elastic Load Balancing answers an input value it cannot accept with, for a
+/// rule its model documents in prose and declares no error shape for.
+const VALIDATION_ERROR: &str = "ValidationError";
+
+/// The code a refused attribute write answers under: a key the service defines no
+/// attribute for is an input value the request has to fix, while a value outside an
+/// attribute's documented domain and an attribute this target group does not carry are
+/// configurations it cannot hold.
+fn refusal_code(key: &str) -> &'static str {
+    if key == UNDOCUMENTED_ATTRIBUTE_KEY {
+        VALIDATION_ERROR
+    } else {
+        INVALID_CONFIGURATION
+    }
+}
 
 /// One row of the attribute-default table: the case name, the fields the target group is
 /// created with, and the whole attribute set it must then report.
@@ -443,9 +467,9 @@ async fn attribute_defaults_follow_the_documented_catalog_of_the_load_balancer_f
 // ---------------------------------------------------------------------------
 
 /// A write inside an attribute's documented domain is stored and read back verbatim; a
-/// write outside it, a key the model does not document, and a key that belongs to
-/// another load balancer family are each refused with `InvalidConfigurationRequest` and
-/// store nothing.
+/// write outside it and a key that belongs to another load balancer family are each
+/// refused with `InvalidConfigurationRequest`, a key the model does not document with
+/// `ValidationError`, and each of them stores nothing.
 ///
 /// The accepted rows sit ON each published bound; the refused ones one step past it, so
 /// the deregistration-delay value the issue recorded is one cell of the table.
@@ -516,7 +540,7 @@ async fn an_attribute_write_is_accepted_on_its_documented_bounds_and_refused_pas
         ("stickiness.app_cookie.cookie_name", "session", true),
         ("stickiness.app_cookie.cookie_name", "AWSALBAPP-1", false),
         // A key the model documents nowhere.
-        ("not_a_real_attribute", "1", false),
+        (UNDOCUMENTED_ATTRIBUTE_KEY, "1", false),
         // A key documented "only by Network Load Balancers", on an Application Load
         // Balancer's target group.
         ("proxy_protocol_v2.enabled", "true", false),
@@ -568,10 +592,11 @@ async fn an_attribute_write_is_accepted_on_its_documented_bounds_and_refused_pas
                 "case {case:?}: a write must touch only the attribute it names"
             );
         } else {
+            let code = refusal_code(key);
             assert_eq!(
                 (reply.status, reply.error_code().as_str()),
-                (400, "InvalidConfigurationRequest"),
-                "case {case:?}: expected 400 InvalidConfigurationRequest, got {} body {}",
+                (400, code),
+                "case {case:?}: expected 400 {code}, got {} body {}",
                 reply.status,
                 reply.body
             );

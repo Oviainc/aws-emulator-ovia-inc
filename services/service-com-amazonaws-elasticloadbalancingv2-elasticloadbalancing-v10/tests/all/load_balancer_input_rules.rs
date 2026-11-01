@@ -18,7 +18,8 @@
 //!   address per subnet ... for your internet-facing load balancer. For internal load
 //!   balancers, you can specify one private IP address per subnet ... For internet-facing
 //!   load balancer, you can specify one IPv6 address per subnet";
-//! * `IpAddressType` — "Internal load balancers must use ipv4";
+//! * `IpAddressType` — `dualstack-without-public-ipv4` is an Application Load Balancer's
+//!   alone, and the load balancer's scheme decides nothing;
 //! * `CanonicalHostedZoneId` — the Route 53 hosted zone Elastic Load Balancing publishes
 //!   for the load balancer's Region and family.
 //!
@@ -368,14 +369,18 @@ async fn a_subnet_mapping_pins_only_what_the_family_and_scheme_carry() {
 }
 
 #[tokio::test]
-async fn an_internal_load_balancer_takes_only_the_ipv4_address_type() {
+async fn the_ip_address_type_a_create_takes_follows_the_family_not_the_scheme() {
     let (router, _engine) = emulator();
 
     // (case, the type, the scheme, the IP address type, whether it is accepted)
     //
-    // "Internal load balancers must use ipv4", and `dualstack-without-public-ipv4` is
-    // bracketed for Application Load Balancers alone — the same two rules
-    // `SetIpAddressType` applies to a load balancer that already exists.
+    // `dualstack-without-public-ipv4` is bracketed for Application Load Balancers alone,
+    // which is the one rule the family decides — the same one `SetIpAddressType` applies to
+    // a load balancer that already exists. The SCHEME decides nothing: an internal load
+    // balancer carries IPv6 addresses like any other once its subnets have IPv6 ranges,
+    // and which ranges a subnet holds is EC2's to say, so with no EC2 mounted here nothing
+    // is known about them and nothing is refused on them (that rule is tabled over what
+    // EC2 reports in `all/input_rejection_classes.rs`).
     type AddressTypeCase = (&'static str, &'static str, &'static str, &'static str, bool);
     let rows: [AddressTypeCase; 6] = [
         ("ipv4 on an internal load balancer", "application", "internal", "ipv4", true),
@@ -391,14 +396,14 @@ async fn an_internal_load_balancer_takes_only_the_ipv4_address_type() {
             "application",
             "internal",
             "dualstack",
-            false,
+            true,
         ),
         (
             "dualstack on an internal network load balancer",
             "network",
             "internal",
             "dualstack",
-            false,
+            true,
         ),
         (
             "an application-only type on an application load balancer",

@@ -290,10 +290,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the family's floor are one reading in `crate::state`, which `SetSubnets` applies
         // to the subnets that REPLACE these, so one call cannot place a load balancer where
         // the other would not.
-        if let Err(rule) =
+        if let Err(refusal) =
             crate::state::check_placement_count(family, subnets.len() + subnet_mappings.len())
         {
-            return Err(invalid_configuration(&rule));
+            return Err(refuse(refusal));
         }
         // The subnets a load balancer is placed in are EC2's resources, and they are
         // what say which VPC and which Availability Zone it is in — so they are resolved
@@ -316,12 +316,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(invalid_configuration(&rule));
             }
         }
-        // "Internal load balancers must use ipv4", and `dualstack-without-public-ipv4` is
-        // an Application Load Balancer's alone — the same two rules `SetIpAddressType` and
-        // `SetSubnets` apply, so a create cannot start a load balancer at a type they
-        // would refuse to set.
-        if let Err(rule) = crate::state::check_ip_address_type(family, &scheme, &ip_address_type) {
-            return Err(invalid_configuration(&rule));
+        // `dualstack-without-public-ipv4` is an Application Load Balancer's alone — the
+        // same rule `SetIpAddressType` and `SetSubnets` apply, so a create cannot start a
+        // load balancer at a type they would refuse to set.
+        if let Err(refusal) = crate::state::check_ip_address_type(family, &ip_address_type) {
+            return Err(refuse(refusal));
         }
 
         let resolved_subnets = match crate::state::network::resolve_subnets(
@@ -380,21 +379,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(invalid_configuration(&rule));
         }
+        // A load balancer carries IPv6 addresses out of the IPv6 ranges of the subnets it
+        // is placed in, so a create asking for them needs subnets that have one — the same
+        // reading `SetSubnets` and `SetIpAddressType` apply.
+        if let Err(refusal) =
+            crate::state::check_subnet_ipv6_cidrs(&ip_address_type, resolved_subnets.as_deref())
+        {
+            return Err(refuse(refusal));
+        }
         // "Every DescribeLoadBalancers entry carries the VpcId the load balancer's
         // subnets belong to": the VPC of the subnets it was created in, reported only
         // when the subnets agree on one — which is the only case AWS creates at all.
         let vpc_id = crate::state::subnets_vpc(resolved_subnets.as_deref());
-        if let Some(vpc_id) = vpc_id.as_deref() {
-            if let Some(refusal) = foreign_security_group(
-                ctx,
-                &region,
-                vpc_id,
-                input.security_groups.as_deref().unwrap_or_default(),
-            )
-            .await
-            {
-                return Err(refusal);
-            }
+        // The security groups the load balancer starts with govern traffic to its network
+        // interfaces, so they are judged — against EC2, which owns them — BEFORE the name
+        // is judged for uniqueness: a caller told to rename cannot discover that its groups
+        // are the problem, and a request with both faults has to be answered for the groups.
+        if let Some(refusal) = unusable_security_groups(
+            ctx,
+            &region,
+            vpc_id.as_deref(),
+            input.security_groups.as_deref().unwrap_or_default(),
+        )
+        .await
+        {
+            return Err(refusal);
         }
 
         let mut candidate = LoadBalancerRecord {
@@ -504,6 +513,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The refusal a rule in `crate::state` answered, under the code Elastic Load Balancing
+/// answers that CLASS of rule with: a value the request has to fix is a `ValidationError`,
+/// while a configuration no load balancer can hold is the modelled
+/// `InvalidConfigurationRequest`.
+fn refuse(refusal: crate::state::Refusal) -> CreateLoadBalancerError {
+    match refusal {
+        crate::state::Refusal::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation_error(message)
+        }
+        crate::state::Refusal::Configuration(message) => invalid_configuration(&message),
+    }
+}
+
 /// The modelled "the requested configuration is not valid" refusal, for a pairing of
 /// members the model forbids but cannot express.
 fn invalid_configuration(message: &str) -> CreateLoadBalancerError {
@@ -536,34 +558,41 @@ fn tag_map(
     Ok(map)
 }
 
-/// The refusal a request whose security groups are not the VPC's earns, or `None` when
-/// every group EC2 reported belongs to `vpc_id` — and also when there is no EC2 to ask,
-/// because a refusal has to be grounded in what EC2 reported rather than assumed from
+/// The refusal a request whose security groups cannot govern this load balancer's traffic
+/// earns, or `None` when every group EC2 reported can — and also when there is no EC2 to
+/// ask, because a refusal has to be grounded in what EC2 reported rather than assumed from
 /// silence.
 ///
 /// A load balancer's security groups govern traffic to its network interfaces, which live
-/// in the subnets it is placed in: a group of ANOTHER VPC can never be applied to them, so
-/// the request is a configuration that cannot hold together — the modelled
-/// `InvalidConfigurationRequest` — rather than a load balancer carrying a group that
-/// enforces nothing.
-async fn foreign_security_group(
+/// in the subnets it is placed in: a group of ANOTHER VPC, and a value that is no group id
+/// at all, can never be applied to them, so the request is a configuration that cannot
+/// hold together — the modelled `InvalidConfigurationRequest` — rather than a load balancer
+/// carrying a group that enforces nothing. An id the account simply holds no group for is
+/// the modelled refusal for an absent group, carrying the code EC2 answered. Both readings
+/// are `crate::state::check_security_groups`, shared with `SetSecurityGroups`.
+async fn unusable_security_groups(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
-    vpc_id: &str,
+    vpc_id: Option<&str>,
     security_groups: &[String],
 ) -> Option<CreateLoadBalancerError> {
-    crate::state::network::has_foreign_security_group(ctx, region, vpc_id, security_groups)
-        .await
-        .then(|| invalid_configuration(FOREIGN_SECURITY_GROUP))
+    let lookup =
+        crate::state::network::resolve_security_groups(ctx, region, security_groups).await;
+    match crate::state::check_security_groups(vpc_id, security_groups, &lookup) {
+        Ok(()) => None,
+        Err(crate::state::SecurityGroupRefusal::Invalid) => Some(invalid_configuration(
+            crate::state::INVALID_SECURITY_GROUPS,
+        )),
+        Err(crate::state::SecurityGroupRefusal::NotFound) => Some(
+            CreateLoadBalancerErrorModeled::InvalidSecurityGroupException(
+                InvalidSecurityGroupException {
+                    message: Some(crate::state::SECURITY_GROUP_NOT_FOUND.to_string()),
+                },
+            )
+            .into(),
+        ),
+    }
 }
-
-/// The refusal a request whose security groups cannot be applied to the load balancer's
-/// network interfaces earns.
-///
-/// A fixed sentence, because what the caller has to fix is WHICH groups the request names
-/// rather than anything about one value: the request named groups of another VPC, and no
-/// one of them is more at fault than another.
-const FOREIGN_SECURITY_GROUP: &str = "One or more security groups are invalid";
 
 /// The load balancer's DNS name, in the form AWS publishes:
 /// `<name>-<id>.<region>.elb.amazonaws.com`, prefixed `internal-` for an internal
