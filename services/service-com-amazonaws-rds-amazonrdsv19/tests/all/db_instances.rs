@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
+use service_com_amazonaws_rds_amazonrdsv19::state;
 use service_com_amazonaws_rds_amazonrdsv19::state::{
     DB_INSTANCE_QUOTA_PER_REGION, DB_SNAPSHOT_QUOTA_PER_REGION, MAX_FILTER_TERMS, MAX_REGIONS,
     STATUS_TRANSITION_DELAY,
@@ -271,9 +272,55 @@ pub(crate) fn texts(xml: &str, tag: &str) -> Vec<String> {
         .collect()
 }
 
-/// The text of the one `<tag>` element in `xml`.
+/// How many elements enclose the one that starts at `offset`.
+///
+/// A member read below reads the member of the RESOURCE a response carries, and a response
+/// can carry an element of the same name deeper inside it — a `DBCluster` reports its own
+/// `Status` and carries another `Status` inside each of its security-group and option-group
+/// memberships — so "the one `<tag>`" is only unambiguous at one depth.
+fn depth_at(xml: &str, offset: usize) -> usize {
+    let mut depth = 0usize;
+    let mut cursor = 0usize;
+    while let Some(found) = xml[cursor..offset].find('<') {
+        let start = cursor + found;
+        let Some(close) = xml[start..].find('>') else { break };
+        let tag = &xml[start + 1..start + close];
+        cursor = start + close + 1;
+        if tag.starts_with('?') || tag.starts_with('!') || tag.ends_with('/') {
+            continue;
+        }
+        if tag.starts_with('/') {
+            depth = depth.saturating_sub(1);
+        } else {
+            depth += 1;
+        }
+    }
+    depth
+}
+
+/// The text of every `<tag>` element that sits at the SHALLOWEST depth any `<tag>` in `xml`
+/// sits at: the ones that are members of the resource `xml` carries rather than of
+/// something nested inside it (see [`depth_at`]).
+fn shallowest_texts(xml: &str, tag: &str) -> Vec<String> {
+    let spans = element_spans(xml, tag);
+    let Some(shallowest) = spans
+        .iter()
+        .map(|(start, ..)| depth_at(xml, *start))
+        .min()
+    else {
+        return Vec::new();
+    };
+    spans
+        .into_iter()
+        .filter(|(start, ..)| depth_at(xml, *start) == shallowest)
+        .map(|(_, content_start, content_end, _)| unescape(&xml[content_start..content_end]))
+        .collect()
+}
+
+/// The text of the one `<tag>` element `xml` carries as a member of its own resource; see
+/// [`shallowest_texts`].
 pub(crate) fn text(xml: &str, tag: &str) -> String {
-    let found = texts(xml, tag);
+    let found = shallowest_texts(xml, tag);
     assert_eq!(
         found.len(),
         1,
@@ -283,9 +330,10 @@ pub(crate) fn text(xml: &str, tag: &str) -> String {
     found.into_iter().next().expect("checked just above")
 }
 
-/// The text of the one `<tag>` element in `xml`, or `None` when it carries none.
+/// The text of the one `<tag>` element `xml` carries as a member of its own resource, or
+/// `None` when it carries none; see [`shallowest_texts`].
 pub(crate) fn optional_text(xml: &str, tag: &str) -> Option<String> {
-    let found = texts(xml, tag);
+    let found = shallowest_texts(xml, tag);
     assert!(
         found.len() <= 1,
         "expected at most one <{tag}> in {xml}, found {}",
@@ -611,13 +659,15 @@ async fn create_persists_every_setting_and_describe_reads_it_back() {
         hosted_zone_ids.push(optional_text(&read_back, "HostedZoneId"));
     }
 
-    // Every row ran in the same region, and this emulator carries no published hosted
-    // zone id for it, so every row reports the member the same way: not at all. A
-    // made-up id of the published form would mislead a client building a DNS alias.
+    // Every row ran in the same region and under the same control plane's endpoint domain,
+    // so every row reports the SAME hosted zone id: there is one Route 53 zone per region
+    // and domain, which is the invariance the member promises.
+    let expected_zone = state::hosted_zone_id(REGION, state::RDS_ENDPOINT_DOMAIN);
     for (row, hosted_zone_id) in INSTANCE_CASES.iter().zip(&hosted_zone_ids) {
         assert_eq!(
-            *hosted_zone_id, None,
-            "case {:?}: expected no HostedZoneId for {REGION}, got {hosted_zone_id:?}",
+            hosted_zone_id.as_deref(),
+            Some(expected_zone.as_str()),
+            "case {:?}: expected the one hosted zone id of {REGION}, got {hosted_zone_id:?}",
             row.case
         );
     }
@@ -709,19 +759,28 @@ async fn one_identifier_names_a_different_instance_in_each_region() {
             );
         }
     }
-    // The emulator reports a `HostedZoneId` only where it can cite the id AWS
-    // published for that region, never a made-up value of the published form.
+    // The emulator reports the id AWS published where it can cite one, and a minted id of
+    // the published form everywhere else — one per region, never absent, since every
+    // endpoint it reports sits in some hosted zone.
     assert_eq!(
         hosted_zones[2].as_deref(),
         Some("Z2R2ITUGPM61AM"),
         "us-east-1 must report its published hosted zone id"
     );
     for index in [0usize, 1] {
+        let expected = state::hosted_zone_id(regions[index], state::RDS_ENDPOINT_DOMAIN);
         assert_eq!(
-            hosted_zones[index], None,
-            "case {:?}: a region whose published hosted zone id the emulator does not \
-             carry must report none, got {:?}",
-            regions[index], hosted_zones[index]
+            hosted_zones[index].as_deref(),
+            Some(expected.as_str()),
+            "case {:?}: a region must report its own hosted zone id, got {:?}",
+            regions[index],
+            hosted_zones[index]
+        );
+        assert_ne!(
+            hosted_zones[index].as_deref(),
+            hosted_zones[2].as_deref(),
+            "case {:?}: two regions must not report one hosted zone",
+            regions[index]
         );
     }
 }

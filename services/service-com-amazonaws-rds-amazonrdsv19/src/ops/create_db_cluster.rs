@@ -951,8 +951,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             engine_mode,
             database_name: input.database_name,
             // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying it,
-            // so it is validated above, never stored or returned. The username is.
-            master_username: input.master_username,
+            // so it is validated above, never stored or returned. The username is — and
+            // where the engine's own control plane cannot be given one, the username it
+            // ASSIGNS the cluster is what the cluster carries
+            // ([`crate::state::assigned_master_username`]).
+            master_username: input.master_username.or_else(|| {
+                crate::state::assigned_master_username(&input.engine).map(str::to_string)
+            }),
             port: input
                 .port
                 .unwrap_or_else(|| crate::state::default_port(&input.engine)),
@@ -963,7 +968,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Availability Zone"). This emulator picks the region's first three, named the
             // way AWS names a zone of a region.
             availability_zones: if availability_zones.is_empty() {
-                DEFAULT_ZONE_SUFFIXES
+                crate::state::AVAILABILITY_ZONE_SUFFIXES
                     .iter()
                     .map(|suffix| format!("{region}{suffix}"))
                     .collect()
@@ -1010,8 +1015,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             db_cluster_instance_class: input.db_cluster_instance_class,
             publicly_accessible: input.publicly_accessible,
             // `AutoMinorVersionUpgrade`: "By default, minor engine upgrades are applied
-            // automatically."
-            auto_minor_version_upgrade: input.auto_minor_version_upgrade.unwrap_or(true),
+            // automatically" — for a cluster of an engine whose control plane takes the
+            // setting at all ([`crate::state::default_cluster_auto_minor_version_upgrade`]).
+            auto_minor_version_upgrade: input.auto_minor_version_upgrade.unwrap_or_else(|| {
+                crate::state::default_cluster_auto_minor_version_upgrade(&input.engine)
+            }),
             deletion_protection: input.deletion_protection.unwrap_or(false),
             copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
             http_endpoint_enabled: input.enable_http_endpoint.unwrap_or(false),
@@ -1150,11 +1158,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// is documented for a single engine ("Valid for Cluster Type: Aurora MySQL DB clusters
 /// only").
 const AURORA_MYSQL_ENGINE: &str = "aurora-mysql";
-
-/// The Availability Zone suffixes a cluster the request named none for spans: the first
-/// three zones of its region, named `<region>a`, `<region>b`, `<region>c` the way AWS names
-/// the zones of a region (and the way `CreateDBInstance` names the one zone it picks).
-const DEFAULT_ZONE_SUFFIXES: [&str; 3] = ["a", "b", "c"];
 
 /// The lowest and highest ratio of `Iops` to `AllocatedStorage` a Multi-AZ DB cluster may
 /// be created with: `Iops` "must be a multiple between .5 and 50 of the storage amount for

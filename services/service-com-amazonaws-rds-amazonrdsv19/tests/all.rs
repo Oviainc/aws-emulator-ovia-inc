@@ -127,6 +127,8 @@ mod modify_db_shard_group;
 mod modify_event_subscription;
 #[path = "all/neptune_engine_catalog.rs"]
 mod neptune_engine_catalog;
+#[path = "all/neptune_probe.rs"]
+mod neptune_probe;
 #[path = "all/not_found_paths.rs"]
 mod not_found_paths;
 #[path = "all/not_found_refusal_sentences.rs"]
@@ -153,6 +155,8 @@ mod query_error_envelope;
 mod reboot_db_shard_group;
 #[path = "all/refusal_wording_and_input_guards.rs"]
 mod refusal_wording_and_input_guards;
+#[path = "all/resource_member_projection.rs"]
+mod resource_member_projection;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/sibling_control_plane_clusters.rs"]

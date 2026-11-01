@@ -174,7 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // EC2 subnet id form and the documented two-Availability-Zone coverage are
         // checked once in `crate::state` and mapped here onto THIS operation's modelled
         // faults.
-        if let Err(rejection) = crate::state::check_db_subnet_group_subnets(&input.subnet_ids) {
+        if let Err(rejection) =
+            crate::state::check_db_subnet_group_subnets(&region, &input.subnet_ids)
+        {
             return Err(match rejection {
                 crate::state::SubnetListRejection::TooManySubnets(message) => {
                     CreateDBSubnetGroupErrorModeled::DBSubnetQuotaExceededFault(
@@ -215,7 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateDBSubnetGroupErrorModeled::DBSubnetGroupAlreadyExistsFault(
                     DBSubnetGroupAlreadyExistsFault {
-                        message: Some(format!("DB subnet group already exists: {name}")),
+                        message: Some(crate::state::db_subnet_group_already_exists_message(
+                            &name,
+                        )),
                     },
                 )
                 .into(),

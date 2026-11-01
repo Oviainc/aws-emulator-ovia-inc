@@ -301,7 +301,15 @@ struct SnapshotCase {
     /// The `DBClusterSnapshotIdentifier` the request names, which is "stored as a
     /// lowercase string".
     snapshot: &'static str,
+    /// Whether the source cluster has a DB INSTANCE in it when the snapshot is taken: the
+    /// storage a snapshot holds and the port it was taken on are facts about the cluster's
+    /// instances, so a cluster with none reports zero for both.
+    with_instance: bool,
 }
+
+/// The instance class a cluster member is created with here — one the orderable-options
+/// report offers for every engine this front door serves a cluster for.
+const CLUSTER_MEMBER_CLASS: &str = "db.r5.large";
 
 #[tokio::test]
 async fn a_snapshot_of_a_stored_cluster_is_read_back_through_the_describe() {
@@ -309,36 +317,58 @@ async fn a_snapshot_of_a_stored_cluster_is_read_back_through_the_describe() {
 
     // The engines this front door serves, which is what the snapshot's own `Engine`,
     // `Port` and `EngineVersion` are read off, plus both spellings of the identifier the
-    // snapshot is stored under.
+    // snapshot is stored under, and both sides of the rule the snapshot's storage and port
+    // follow: a source cluster that has a DB instance in it, and one that has none.
     let table: &[SnapshotCase] = &[
         SnapshotCase {
-            case: "an Aurora PostgreSQL cluster",
+            case: "an Aurora PostgreSQL cluster with a member instance",
             cluster: "emu-snap-aurora-pg",
             engine: "aurora-postgresql",
             snapshot: "emu-snap-aurora-pg-1",
+            with_instance: true,
         },
         SnapshotCase {
             case: "an Aurora MySQL cluster, snapshot named in upper case",
             cluster: "emu-snap-aurora-mysql",
             engine: "aurora-mysql",
             snapshot: "EMU-SNAP-AURORA-MYSQL-1",
+            with_instance: false,
         },
         SnapshotCase {
             case: "a DocumentDB cluster",
             cluster: "emu-snap-docdb",
             engine: "docdb",
             snapshot: "emu-snap-docdb-1",
+            with_instance: false,
         },
         SnapshotCase {
-            case: "a Neptune cluster",
+            case: "a Neptune cluster with a member instance",
             cluster: "emu-snap-neptune",
             engine: "neptune",
             snapshot: "emu-snap-neptune-1",
+            with_instance: true,
         },
     ];
 
     for row in table {
         create_available_cluster(&router, row.cluster, row.engine, &[]).await;
+        if row.with_instance {
+            let member = format!("{}-m0", row.cluster);
+            expect_ok(
+                row.case,
+                call(
+                    &router,
+                    "CreateDBInstance",
+                    &[
+                        ("DBInstanceIdentifier", member.as_str()),
+                        ("Engine", row.engine),
+                        ("DBInstanceClass", CLUSTER_MEMBER_CLASS),
+                        ("DBClusterIdentifier", row.cluster),
+                    ],
+                )
+                .await,
+            );
+        }
         // The snapshot holds the CLUSTER's settings as they stand now, so what it must
         // report is read off the cluster itself rather than restated here.
         let source = describe_one(&router, row.case, row.cluster).await;
@@ -354,12 +384,25 @@ async fn a_snapshot_of_a_stored_cluster_is_read_back_through_the_describe() {
             )
             .await,
         );
+        // A cluster with no DB instance holds no data and nothing was listening on its
+        // port, so its snapshot reports zero for both; one with an instance reports the
+        // cluster's own.
+        let zero_without_instances = |member: &str| {
+            if row.with_instance {
+                text(&source, member)
+            } else {
+                "0".to_string()
+            }
+        };
         let folded = row.snapshot.to_ascii_lowercase();
         for (member, expected) in [
             ("DBClusterSnapshotIdentifier", folded.clone()),
             ("DBClusterIdentifier", row.cluster.to_string()),
             ("Engine", row.engine.to_string()),
-            ("Port", text(&source, "Port")),
+            ("Port", zero_without_instances("Port")),
+            // The snapshot's own size is not known while it is still being made, so it
+            // reports the storage of the cluster it is being taken from.
+            ("AllocatedStorage", text(&source, "AllocatedStorage")),
             ("EngineVersion", text(&source, "EngineVersion")),
             ("DbClusterResourceId", text(&source, "DbClusterResourceId")),
             ("SnapshotType", "manual".to_string()),

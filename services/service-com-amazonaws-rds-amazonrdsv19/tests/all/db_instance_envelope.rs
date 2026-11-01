@@ -24,10 +24,13 @@
 use std::thread::sleep;
 use std::time::Duration;
 
+use service_com_amazonaws_rds_amazonrdsv19::state;
 use service_com_amazonaws_rds_amazonrdsv19::state::STATUS_TRANSITION_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::db_instances::{call, emulator, expect_error, expect_ok, optional_text, subtrees, text};
+use crate::db_instances::{
+    call, emulator, expect_error, expect_ok, optional_text, subtrees, text, REGION,
+};
 
 /// How long a test waits before expecting the `creating` → `available` transition this
 /// service owes to have settled: the span itself plus slack for a loaded test machine.
@@ -426,10 +429,11 @@ async fn every_db_instance_envelope_projects_the_whole_stored_record() {
             );
 
             // The lists an instance with no such association carries: present and
-            // empty, which is what says it has none.
+            // empty, which is what says it has none. `VpcSecurityGroups` is NOT one of
+            // them: an instance always belongs to at least one security group — its VPC's
+            // default group where the request named none — which the next block asserts.
             for member in [
                 "DBSecurityGroups",
-                "VpcSecurityGroups",
                 "AssociatedRoles",
                 "DomainMemberships",
                 "ReadReplicaDBInstanceIdentifiers",
@@ -444,6 +448,26 @@ async fn every_db_instance_envelope_projects_the_whole_stored_record() {
                     row.case
                 );
             }
+
+            // An instance whose request named no security group reports the one group RDS
+            // placed it in: its VPC's default group, in the `active` status.
+            let groups = subtrees(instance, "VpcSecurityGroupMembership");
+            assert_eq!(
+                groups.len(),
+                1,
+                "case {:?}: the {envelope} envelope must report the one security group the \
+                 instance belongs to, got {groups:?}",
+                row.case
+            );
+            let membership = groups.first().map(String::as_str).unwrap_or_default();
+            assert_member(
+                row.case,
+                envelope,
+                membership,
+                "VpcSecurityGroupId",
+                &state::default_security_group_id(REGION),
+            );
+            assert_member(row.case, envelope, membership, "Status", "active");
         }
     }
 }

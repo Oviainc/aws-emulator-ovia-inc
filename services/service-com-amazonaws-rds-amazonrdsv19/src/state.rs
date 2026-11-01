@@ -67,14 +67,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    Certificate, CertificateDetails, ClusterPendingModifiedValues, CreateDBShardGroupOutput,
+    AvailabilityZone, Certificate, CertificateDetails, ClusterPendingModifiedValues,
+    CreateDBShardGroupOutput,
     DBCluster, DBClusterAutomatedBackup, DBClusterMember, DBClusterOptionGroupStatus,
     DBClusterParameterGroup, DBClusterRole, DBClusterSnapshot, DBClusterSnapshotAttribute,
     DBClusterSnapshotAttributesResult, DBInstance, DBParameterGroup, DBParameterGroupStatus,
     DBSecurityGroup, DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
     DomainMembership, EC2SecurityGroup, Endpoint, EventCategoriesMap, EventSubscription,
     GlobalCluster, GlobalClusterMember, IPRange, Option2, OptionGroup, OptionGroupMembership,
-    OptionSetting, Parameter, PendingModifiedValues, RestoreWindow, ScalingConfigurationInfo,
+    OptionSetting, Outpost, Parameter, PendingModifiedValues, RestoreWindow,
+    ScalingConfigurationInfo,
     ServerlessV2ScalingConfigurationInfo, SourceNotFoundFault, Subnet, Tag,
     VpcSecurityGroupMembership,
 };
@@ -2513,7 +2515,10 @@ impl DbInstanceRecord {
             endpoint: Some(Endpoint {
                 address: Some(self.endpoint_address()),
                 port: Some(self.endpoint_port),
-                hosted_zone_id: hosted_zone_id(&self.region).map(str::to_string),
+                hosted_zone_id: Some(hosted_zone_id(
+                    &self.region,
+                    endpoint_domain(&self.engine),
+                )),
             }),
             allocated_storage: self.allocated_storage,
             instance_create_time: Some(self.instance_create_time),
@@ -2531,15 +2536,10 @@ impl DbInstanceRecord {
                     })
                     .collect(),
             ),
-            vpc_security_groups: Some(
-                self.vpc_security_group_ids
-                    .iter()
-                    .map(|id| VpcSecurityGroupMembership {
-                        vpc_security_group_id: Some(id.clone()),
-                        status: Some(MEMBERSHIP_ACTIVE.to_string()),
-                    })
-                    .collect(),
-            ),
+            vpc_security_groups: Some(vpc_security_group_memberships(
+                &self.region,
+                &self.vpc_security_group_ids,
+            )),
             db_parameter_groups: Some(
                 self.db_parameter_group_name
                     .iter()
@@ -2897,6 +2897,40 @@ impl DbClusterRecord {
         )
     }
 
+    /// The VPC this cluster sits in: the one its DB subnet group's subnets belong to, which
+    /// is the region's VPC — see [`region_vpc_id`] for why one region resolves to one VPC.
+    pub fn vpc_id(&self) -> String {
+        region_vpc_id(&self.region)
+    }
+
+    /// The window a point-in-time restore of this cluster can target, as of now: "the
+    /// earliest and latest time a DB cluster can be restored to" is at most
+    /// `BackupRetentionPeriod` days back and never before the cluster existed.
+    fn backup_window(&self) -> (::aws_smithy_types::DateTime, ::aws_smithy_types::DateTime) {
+        let now = now_as_wire_timestamp();
+        let retention = f64::from(self.backup_retention_period) * 24.0 * 60.0 * 60.0;
+        let earliest = (now.as_secs_f64() - retention).max(self.cluster_create_time.as_secs_f64());
+        (
+            ::aws_smithy_types::DateTime::from_secs_f64(earliest),
+            now,
+        )
+    }
+
+    /// `EarliestRestorableTime` and `LatestRestorableTime`: the window
+    /// [`Self::backup_window`] computes, for a cluster that HAS an automated backup to
+    /// restore from.
+    ///
+    /// `None` for a cluster that retains no automated backup at all
+    /// ([`Self::has_automated_backup`]), and for one that is still being created, which has
+    /// not taken its first backup yet — in both cases there is no point in time the cluster
+    /// can be restored to, which is what reporting neither member says.
+    pub fn restore_window(
+        &self,
+    ) -> Option<(::aws_smithy_types::DateTime, ::aws_smithy_types::DateTime)> {
+        (self.has_automated_backup() && self.status != DB_CLUSTER_STATUS_CREATING)
+            .then(|| self.backup_window())
+    }
+
     /// Project this cluster's automated backup onto the modelled
     /// `DBClusterAutomatedBackup` shape.
     ///
@@ -2907,19 +2941,15 @@ impl DbClusterRecord {
     /// `Status` is `active` while that cluster is still here — the member documents
     /// `retained` for the backups of a cluster that has been deleted.
     pub fn automated_backup_to_wire(&self) -> DBClusterAutomatedBackup {
-        let now = now_as_wire_timestamp();
-        let retention = f64::from(self.backup_retention_period) * 24.0 * 60.0 * 60.0;
-        let earliest = (now.as_secs_f64() - retention).max(self.cluster_create_time.as_secs_f64());
+        let (earliest, latest) = self.backup_window();
         DBClusterAutomatedBackup {
             engine: Some(self.engine.clone()),
-            // The VPC a cluster belongs to is not state this service holds, so the member
-            // is left out rather than invented.
-            vpc_id: None,
+            vpc_id: Some(self.vpc_id()),
             db_cluster_automated_backups_arn: Some(self.automated_backup_arn()),
             db_cluster_identifier: Some(self.identifier.clone()),
             restore_window: Some(RestoreWindow {
-                earliest_time: Some(::aws_smithy_types::DateTime::from_secs_f64(earliest)),
-                latest_time: Some(now),
+                earliest_time: Some(earliest),
+                latest_time: Some(latest),
             }),
             master_username: self.master_username.clone(),
             db_cluster_resource_id: Some(self.resource_id.clone()),
@@ -2999,6 +3029,9 @@ impl DbClusterRecord {
     /// list it does have state for is reported empty, which is what RDS reports for a
     /// cluster that has none of those associations.
     pub fn to_wire(&self, membership: &ClusterMembership) -> DBCluster {
+        // One reading of the restore window, so the two members it fills name the two ends
+        // of the SAME window rather than two instants a moment apart.
+        let restorable = self.restore_window();
         DBCluster {
             db_cluster_identifier: Some(self.identifier.clone()),
             db_cluster_arn: Some(self.arn()),
@@ -3015,8 +3048,22 @@ impl DbClusterRecord {
             // Only `CreateDBClusterEndpoint` adds a custom endpoint, and it is still a
             // stub, so no cluster this service holds has one.
             custom_endpoints: Some(Vec::new()),
-            hosted_zone_id: hosted_zone_id(&self.region).map(str::to_string),
+            hosted_zone_id: Some(hosted_zone_id(&self.region, endpoint_domain(&self.engine))),
             availability_zones: Some(self.availability_zones.clone()),
+            // "The earliest / latest time to which a database can be restored with
+            // point-in-time restore": the window the cluster's automated backup covers,
+            // computed from the same record as the backup itself ([`Self::restore_window`])
+            // so the two cannot disagree. A cluster still being created has no backup to
+            // restore from yet, and one that retains no automated backup never has, so
+            // neither reports a window.
+            earliest_restorable_time: restorable.map(|(earliest, _)| earliest),
+            latest_restorable_time: restorable.map(|(_, latest)| latest),
+            // The two settings express configuration turns on. A cluster created through
+            // this operation reaches its VPC's network and nothing else: it is VPC-based,
+            // and it has no internet access gateway in front of it, which is what the two
+            // members report rather than leaving a client to guess.
+            vpc_networking_enabled: Some(true),
+            internet_access_gateway_enabled: Some(false),
             backup_retention_period: Some(self.backup_retention_period),
             preferred_backup_window: Some(self.preferred_backup_window.clone()),
             preferred_maintenance_window: Some(self.preferred_maintenance_window.clone()),
@@ -3032,15 +3079,10 @@ impl DbClusterRecord {
                     })
                     .collect(),
             ),
-            vpc_security_groups: Some(
-                self.vpc_security_group_ids
-                    .iter()
-                    .map(|id| VpcSecurityGroupMembership {
-                        vpc_security_group_id: Some(id.clone()),
-                        status: Some(MEMBERSHIP_ACTIVE.to_string()),
-                    })
-                    .collect(),
-            ),
+            vpc_security_groups: Some(vpc_security_group_memberships(
+                &self.region,
+                &self.vpc_security_group_ids,
+            )),
             storage_encrypted: Some(self.storage_encrypted),
             storage_encryption_type: Some(self.storage_encryption_type().to_string()),
             kms_key_id: self.kms_key_id.clone(),
@@ -3330,7 +3372,10 @@ impl DbClusterParameterGroupRecord {
     /// caller set, plus the metadata the family publishes for it when it publishes any.
     pub fn parameter_to_wire(&self, name: &str) -> Parameter {
         let setting = self.parameters.get(name);
-        let spec = published_parameter(&self.family, name);
+        let spec = crate::ops::describe_engine_default_cluster_parameters::cluster_parameter_spec(
+            &self.family,
+            name,
+        );
         Parameter {
             parameter_name: Some(name.to_string()),
             parameter_value: setting.map(|setting| setting.value.clone()),
@@ -3342,8 +3387,52 @@ impl DbClusterParameterGroupRecord {
             is_modifiable: spec.map(|spec| spec.is_modifiable),
             minimum_engine_version: spec.map(|spec| spec.minimum_engine_version.to_string()),
             apply_method: setting.map(|setting| setting.apply_method.clone()),
-            supported_engine_modes: None,
+            supported_engine_modes: Some(
+                crate::ops::describe_engine_default_cluster_parameters::family_engine_modes(
+                    &self.family,
+                ),
+            ),
         }
+    }
+
+    /// Every parameter of this group at once, which is what a describe that names no
+    /// `Source` reports: each parameter the group's family publishes, under the value and
+    /// apply method the GROUP sets for it where it sets one (`Source` `user`) and under the
+    /// engine's own default where it does not (`Source` `engine-default`), plus any
+    /// parameter the group carries that the family publishes nothing for.
+    ///
+    /// A group inherits its family's whole parameter list the moment it is created — "the
+    /// detailed parameter list for a particular DB cluster parameter group" is that list,
+    /// with each parameter's source saying where its current value came from — so a group
+    /// nobody has modified reports the family's parameters at their engine defaults rather
+    /// than nothing at all.
+    ///
+    /// Keyed by parameter name, so the report is in name order whichever half an entry came
+    /// from — the order its pagination marker walks.
+    pub fn every_parameter(&self) -> BTreeMap<String, Parameter> {
+        let mut reported = self.published_defaults();
+        for name in self.parameters.keys() {
+            reported.insert(name.clone(), self.parameter_to_wire(name));
+        }
+        reported
+    }
+
+    /// The parameters this group's family publishes, each with the default value the engine
+    /// runs with and `Source` `engine-default`: what a `Source` naming the engine reports,
+    /// and the half of [`Self::every_parameter`] the group has set nothing for.
+    pub fn published_defaults(&self) -> BTreeMap<String, Parameter> {
+        crate::ops::describe_engine_default_cluster_parameters::cluster_parameter_catalog(
+            &self.family,
+        )
+        .unwrap_or_default()
+        .iter()
+        .map(|spec| {
+            (
+                spec.name.to_string(),
+                cluster_engine_default_parameter_to_wire(&self.family, spec),
+            )
+        })
+        .collect()
     }
 }
 
@@ -3488,6 +3577,21 @@ pub fn engine_default_parameter_to_wire(spec: &ClusterParameterSpec) -> Paramete
             .then(|| spec.minimum_engine_version.to_string()),
         apply_method: None,
         supported_engine_modes: None,
+    }
+}
+
+/// A CLUSTER parameter the family `family` publishes, as the modelled `Parameter`: what
+/// [`engine_default_parameter_to_wire`] reports plus `SupportedEngineModes`, "the valid DB
+/// engine modes", which a cluster parameter has and an instance parameter does not.
+pub fn cluster_engine_default_parameter_to_wire(
+    family: &str,
+    spec: &ClusterParameterSpec,
+) -> Parameter {
+    Parameter {
+        supported_engine_modes: Some(
+            crate::ops::describe_engine_default_cluster_parameters::family_engine_modes(family),
+        ),
+        ..engine_default_parameter_to_wire(spec)
     }
 }
 
@@ -3751,7 +3855,12 @@ pub struct DbClusterSnapshotRecord {
     pub engine: String,
     pub engine_version: Option<String>,
     pub engine_mode: Option<String>,
+    /// `AllocatedStorage` of the cluster the snapshot was taken from, which the snapshot
+    /// reports until its own size is known; see [`Self::to_wire`].
     pub allocated_storage: Option<i32>,
+    /// Whether the cluster the snapshot was taken from had a DB INSTANCE in it, i.e.
+    /// whether the snapshot holds any data at all.
+    pub holds_data: bool,
     pub master_username: Option<String>,
     pub availability_zones: Vec<String>,
     pub port: i32,
@@ -3759,6 +3868,16 @@ pub struct DbClusterSnapshotRecord {
     pub storage_encrypted: bool,
     pub kms_key_id: Option<String>,
     pub license_model: Option<String>,
+    /// `VpcId`: the VPC of the cluster the snapshot was taken from.
+    pub vpc_id: String,
+    /// `BackupRetentionPeriod`, as the source cluster retained automated backups when the
+    /// snapshot was taken.
+    pub backup_retention_period: Option<i32>,
+    /// `PreferredBackupWindow`, as the source cluster carried it when the snapshot was
+    /// taken.
+    pub preferred_backup_window: Option<String>,
+    /// `IAMDatabaseAuthenticationEnabled`, as the source cluster carried it.
+    pub iam_database_authentication_enabled: bool,
     /// `SnapshotType`: `manual` for every snapshot a caller asked for.
     pub snapshot_type: String,
     /// `Status`: [`SNAPSHOT_STATUS_COPYING`] while a copy is being made,
@@ -3792,6 +3911,7 @@ impl DbClusterSnapshotRecord {
     /// one".
     pub fn from_cluster(
         cluster: &DbClusterRecord,
+        cluster_has_instances: bool,
         snapshot_identifier: &str,
         tags: Vec<Tag>,
     ) -> Self {
@@ -3803,16 +3923,30 @@ impl DbClusterSnapshotRecord {
             engine: cluster.engine.clone(),
             engine_version: cluster.engine_version.clone(),
             engine_mode: Some(cluster.engine_mode.clone()),
-            allocated_storage: cluster.allocated_storage,
+            // "The allocated storage size of the DB cluster snapshot in gibibytes (GiB)":
+            // the storage of the cluster the snapshot is being taken from, which is what
+            // the API reports until the snapshot's own size is known ([`Self::to_wire`]).
+            allocated_storage: cluster.reported_allocated_storage(),
+            holds_data: cluster_has_instances,
             master_username: cluster.master_username.clone(),
             availability_zones: cluster.availability_zones.clone(),
-            port: cluster.port,
+            // "The port that the DB cluster was listening on at the time of the snapshot":
+            // a fact about the cluster's DB INSTANCES. A cluster with none had nothing
+            // listening, so the snapshot was taken on no port at all.
+            port: if cluster_has_instances { cluster.port } else { 0 },
             storage_type: cluster.storage_type.clone(),
             storage_encrypted: cluster.storage_encrypted,
             kms_key_id: cluster.kms_key_id.clone(),
-            // `LicenseModel` is a property of a DB INSTANCE, which a DB cluster record
-            // holds none of, so the snapshot reports none rather than inventing one.
-            license_model: None,
+            // The license the engine the snapshot was taken from runs under; see
+            // [`default_license_model`] for where each engine's comes from.
+            license_model: default_license_model(&cluster.engine).map(str::to_string),
+            // The cluster settings the snapshot reports members of its own for, copied here
+            // with the rest so a later change to the cluster cannot rewrite what the
+            // snapshot reports.
+            vpc_id: cluster.vpc_id(),
+            backup_retention_period: Some(cluster.backup_retention_period),
+            preferred_backup_window: Some(cluster.preferred_backup_window.clone()),
+            iam_database_authentication_enabled: cluster.iam_database_authentication_enabled,
             snapshot_type: SNAPSHOT_TYPE_MANUAL.to_string(),
             status: SNAPSHOT_STATUS_CREATING.to_string(),
             pending_status: Some(PendingStatus::in_a_moment(SNAPSHOT_STATUS_AVAILABLE)),
@@ -3868,7 +4002,19 @@ impl DbClusterSnapshotRecord {
             snapshot_create_time: Some(self.snapshot_create_time),
             engine: Some(self.engine.clone()),
             engine_mode: self.engine_mode.clone(),
-            allocated_storage: self.allocated_storage,
+            // The storage the snapshot holds. That size is only known once the snapshot has
+            // been taken: while it is still being made the API reports the allocated
+            // storage of the CLUSTER it is being taken from, and a finished snapshot of a
+            // cluster that had no DB instance in it holds no data at all.
+            allocated_storage: if self.status == SNAPSHOT_STATUS_AVAILABLE {
+                Some(if self.holds_data {
+                    self.allocated_storage.unwrap_or(0)
+                } else {
+                    0
+                })
+            } else {
+                self.allocated_storage
+            },
             status: Some(self.status.clone()),
             port: Some(self.port),
             cluster_create_time: Some(self.cluster_create_time),
@@ -3890,6 +4036,10 @@ impl DbClusterSnapshotRecord {
             tag_list: Some(self.tags.clone()),
             storage_type: self.storage_type.clone(),
             db_cluster_resource_id: Some(self.db_cluster_resource_id.clone()),
+            vpc_id: Some(self.vpc_id.clone()),
+            backup_retention_period: self.backup_retention_period,
+            preferred_backup_window: self.preferred_backup_window.clone(),
+            iam_database_authentication_enabled: Some(self.iam_database_authentication_enabled),
             ..DBClusterSnapshot::default()
         }
     }
@@ -4243,6 +4393,15 @@ pub fn db_subnet_group_does_not_exist_message(name: &str) -> String {
     format!("DB subnet group '{name}' does not exist.")
 }
 
+/// The message the `DBSubnetGroupAlreadyExistsFault` carries for `name`: the fault reports
+/// "`DBSubnetGroupName` is already used by an existing DB subnet group", and RDS words it
+/// as a sentence about the group — the resource type, the requested name in quotes, then
+/// "already exists." — the same shape as the two wordings above, parameterized by the name
+/// the request carried in the folded spelling the group is stored under.
+pub fn db_subnet_group_already_exists_message(name: &str) -> String {
+    format!("The DB subnet group '{name}' already exists.")
+}
+
 /// The message the `InvalidDBSubnetGroupStateFault` carries where a DB subnet group cannot
 /// be deleted because a database is still placed in it ("The specified database subnet
 /// group must not be associated with any DB instances").
@@ -4316,22 +4475,31 @@ impl DbSubnetGroupRecord {
                     .map(|id| Subnet {
                         subnet_identifier: Some(id.clone()),
                         subnet_status: Some("Active".to_string()),
-                        // The Availability Zone a subnet lies in, and the VPC it
-                        // belongs to, are EC2 facts: RDS reads them from the subnet,
-                        // and this service holds no subnets. Reported ABSENT rather
-                        // than carrying a made-up zone or VPC id, which a caller that
-                        // placed an instance by zone would be misled by.
-                        subnet_availability_zone: None,
-                        // `SubnetOutpost` describes a subnet on an Outpost, which
-                        // nothing here is.
-                        subnet_outpost: None,
+                        // The Availability Zone a subnet lies in is an EC2 fact RDS reads
+                        // off the subnet; this service resolves it from the subnet's own
+                        // id ([`subnet_availability_zone`]), so one subnet is always
+                        // reported in one zone and a client can tell which zones the
+                        // group covers.
+                        subnet_availability_zone: Some(AvailabilityZone {
+                            name: Some(subnet_availability_zone(&self.region, id)),
+                        }),
+                        // `SubnetOutpost` describes a subnet on an Outpost. Nothing here
+                        // is on one, so the element is reported EMPTY — which says the
+                        // subnet is not associated with an Outpost — rather than omitted.
+                        subnet_outpost: Some(Outpost::default()),
                     })
                     .collect()
             }),
             db_subnet_group_arn: Some(self.arn()),
-            // `VpcId` and `SupportedNetworkTypes` are read off the subnets too, for the
-            // same reason.
-            ..DBSubnetGroup::default()
+            // The VPC the group's subnets belong to, and the network protocols those
+            // subnets carry: both read off the subnets, as RDS reads them.
+            vpc_id: Some(region_vpc_id(&self.region)),
+            supported_network_types: Some(
+                SUBNET_GROUP_NETWORK_TYPES
+                    .iter()
+                    .map(|network_type| (*network_type).to_string())
+                    .collect(),
+            ),
         }
     }
 }
@@ -4846,8 +5014,8 @@ pub enum SubnetListRejection {
     TooManySubnets(String),
     /// A value that is not an EC2 subnet id at all — `InvalidSubnet`.
     NotASubnet(String),
-    /// Fewer than two distinct subnets, so fewer than two Availability Zones can be
-    /// covered — `DBSubnetGroupDoesNotCoverEnoughAZs`.
+    /// The named subnets cover fewer Availability Zones than a group must —
+    /// `DBSubnetGroupDoesNotCoverEnoughAZs`.
     NotEnoughAvailabilityZones(String),
 }
 
@@ -4856,11 +5024,16 @@ pub enum SubnetListRejection {
 /// ([`MAX_SUBNETS_PER_DB_SUBNET_GROUP`]), the EC2 subnet id form
 /// ([`check_subnet_id`]), and the documented coverage requirement ("DB subnet groups
 /// must contain at least one subnet in at least two AZs in the Amazon Web Services
-/// Region" — a subnet lies in exactly ONE Availability Zone, so a group naming fewer
-/// than two DISTINCT subnets cannot cover two zones whatever those subnets are, which
-/// is all that follows from the request alone; which zones the named subnets actually
-/// lie in is an EC2 fact this service does not hold).
-pub fn check_db_subnet_group_subnets(subnet_ids: &[String]) -> Result<(), SubnetListRejection> {
+/// Region").
+///
+/// A subnet lies in exactly ONE Availability Zone, so a list naming fewer than two DISTINCT
+/// subnets cannot cover two zones whatever those subnets are — which is what the request
+/// alone settles, and so what is refused here. The refusal NAMES the coverage those subnets
+/// resolve to ([`subnet_availability_zone`]), which is what RDS reports.
+pub fn check_db_subnet_group_subnets(
+    region: &str,
+    subnet_ids: &[String],
+) -> Result<(), SubnetListRejection> {
     if subnet_ids.len() > MAX_SUBNETS_PER_DB_SUBNET_GROUP {
         return Err(SubnetListRejection::TooManySubnets(format!(
             "the request names {} subnets: a DB subnet group holds at most {}",
@@ -4872,14 +5045,37 @@ pub fn check_db_subnet_group_subnets(subnet_ids: &[String]) -> Result<(), Subnet
         check_subnet_id(subnet_id).map_err(SubnetListRejection::NotASubnet)?;
     }
     let distinct: BTreeSet<&str> = subnet_ids.iter().map(String::as_str).collect();
-    if distinct.len() < 2 {
-        return Err(SubnetListRejection::NotEnoughAvailabilityZones(format!(
-            "the request names {} distinct subnet(s): a DB subnet group must cover at \
-             least two Availability Zones, so it must name at least two subnets",
-            distinct.len()
-        )));
+    if distinct.len() < MIN_DB_SUBNET_GROUP_AVAILABILITY_ZONES {
+        let covered: BTreeSet<String> = distinct
+            .iter()
+            .map(|subnet_id| subnet_availability_zone(region, subnet_id))
+            .collect();
+        return Err(SubnetListRejection::NotEnoughAvailabilityZones(
+            db_subnet_group_az_coverage_message(&covered),
+        ));
     }
     Ok(())
+}
+
+/// The Availability Zones a DB subnet group must cover: "DB subnet groups must contain at
+/// least one subnet in at least two AZs in the Amazon Web Services Region."
+pub const MIN_DB_SUBNET_GROUP_AVAILABILITY_ZONES: usize = 2;
+
+/// The message the `DBSubnetGroupDoesNotCoverEnoughAZs` fault carries: RDS states the
+/// requirement, then the coverage the request's own subnets add up to, then what to do
+/// about it. The zones are named in order, and a request that names no subnet at all
+/// covers none.
+pub fn db_subnet_group_az_coverage_message(covered: &BTreeSet<String>) -> String {
+    let coverage = covered
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<&str>>()
+        .join(", ");
+    format!(
+        "The DB subnet group doesn't meet Availability Zone (AZ) coverage requirement. \
+         Current AZ coverage: {coverage}. Add subnets to cover at least \
+         {MIN_DB_SUBNET_GROUP_AVAILABILITY_ZONES} AZs."
+    )
 }
 
 /// The region segment of an ARN (`arn:aws:<service>:<region>:<account>:<resource>`), or
@@ -5249,24 +5445,144 @@ pub fn mint_db_cluster_resource_id(mint: u64) -> String {
     format!("cluster-{}", base36(mint, 26))
 }
 
-/// The Route 53 hosted zone id RDS reports for the endpoints in one region, when it
-/// is a region this emulator can cite one for.
+/// The Route 53 hosted zone id reported for the endpoints of one region under one control
+/// plane's DNS domain.
 ///
-/// RDS publishes ONE zone per region, so this is a function of the region alone. The
-/// published ids are values AWS ALLOCATED — nothing computes them — so the only honest
-/// source is a table, and a region the table does not carry gets no `HostedZoneId` at
-/// all rather than a made-up value dressed in the published form: a client that reads
-/// this member to build a DNS alias would be misled by an id no zone answers to.
-/// Extend the table as published ids are cited.
-pub fn hosted_zone_id(region: &str) -> Option<&'static str> {
+/// There is ONE zone per region and endpoint domain, so this is a function of those two
+/// alone: every cluster and every instance a region serves under one domain reports the
+/// same id, which is the invariance the member promises ("The ID that Amazon Route 53
+/// assigns when you create a hosted zone").
+///
+/// Where this emulator can cite the id AWS allocated it reports that; for every other
+/// region and domain the id is MINTED from the two, in the published `Z`-prefixed form. A
+/// client comparing it against AWS's own id for that region will see a different label;
+/// what it gets is an id with the member's form, per-region-and-domain invariance and
+/// stability across reads — which is what a client resolving an endpoint through this
+/// member needs. Reporting nothing instead says the endpoint sits in no hosted zone at
+/// all, which is not true of any endpoint this service reports. Extend the table as
+/// published ids are cited.
+pub fn hosted_zone_id(region: &str, endpoint_domain: &str) -> String {
     /// The published RDS hosted zone ids this emulator carries, as
-    /// `(region, hosted zone id)`.
-    const PUBLISHED: &[(&str, &str)] = &[("us-east-1", "Z2R2ITUGPM61AM")];
+    /// `(region, endpoint domain, hosted zone id)`.
+    const PUBLISHED: &[(&str, &str, &str)] =
+        &[("us-east-1", RDS_ENDPOINT_DOMAIN, "Z2R2ITUGPM61AM")];
 
     PUBLISHED
         .iter()
-        .find(|(name, _)| *name == region)
-        .map(|(_, published)| *published)
+        .find(|(name, domain, _)| *name == region && *domain == endpoint_domain)
+        .map(|(_, _, published)| (*published).to_string())
+        .unwrap_or_else(|| {
+            format!(
+                "Z{}",
+                minted_base36(&format!("hosted-zone/{endpoint_domain}/{region}"), 13)
+            )
+        })
+}
+
+/// `width` characters drawn from the digits-and-uppercase alphabet AWS's server-assigned
+/// ids are written in, derived from the SHA-256 digest of `seed`.
+///
+/// Deterministic in the seed and in nothing else, so a value minted for one seed is the
+/// same every time any read asks for it. The digest is the maintained `sha2` crate's, as
+/// [`mint_uuid_token`]'s is.
+fn minted_base36(seed: &str, width: usize) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    const DIGITS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    Sha256::digest(seed.as_bytes())
+        .iter()
+        .take(width)
+        .map(|byte| char::from(DIGITS[usize::from(*byte) % DIGITS.len()]))
+        .collect()
+}
+
+/// `width` lowercase hexadecimal characters of the SHA-256 digest of `seed` — the alphabet
+/// an EC2 resource id is written in; see [`minted_base36`] for what being derived from the
+/// seed alone buys.
+fn minted_hex(seed: &str, width: usize) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    let mut encoded = ::hex::encode(Sha256::digest(seed.as_bytes()));
+    encoded.truncate(width);
+    encoded
+}
+
+/// The EC2 VPC the subnets of one region resolve into.
+///
+/// RDS reads a subnet's VPC and Availability Zone off EC2, and this service holds no EC2
+/// resources of its own, so a subnet a request names is resolved into the ONE VPC of its
+/// region — the account's default VPC, which is the VPC a DB subnet group that names no
+/// other one belongs to. The id is minted from the region in EC2's published `vpc-` form
+/// and is the same for every read of every group in that region, so a client that resolves
+/// a subnet group's `VpcId` to decide where to place a cluster gets an answer that holds
+/// still; reporting nothing says the group belongs to no VPC, which no DB subnet group
+/// does.
+pub fn region_vpc_id(region: &str) -> String {
+    format!("vpc-{}", minted_hex(&format!("vpc/{region}"), EC2_ID_WIDTH))
+}
+
+/// The default security group of a region's VPC: the group every VPC carries, and the one
+/// a cluster or instance whose request named no `VpcSecurityGroupIds` belongs to.
+///
+/// Source: `CreateDBClusterMessage$VpcSecurityGroupIds` / `DBInstance$VpcSecurityGroups` —
+/// a resource created without any named security group is placed in its VPC's default
+/// group, which is why that group is what `VpcSecurityGroups` reports rather than an empty
+/// list. Minted from the VPC it belongs to, in EC2's published `sg-` form.
+pub fn default_security_group_id(region: &str) -> String {
+    format!(
+        "sg-{}",
+        minted_hex(&format!("default-security-group/{}", region_vpc_id(region)), EC2_ID_WIDTH)
+    )
+}
+
+/// The number of hexadecimal characters in a current-generation EC2 resource id
+/// (`vpc-0a1b2c3d4e5f60718`, `sg-0a1b2c3d4e5f60718`).
+const EC2_ID_WIDTH: usize = 17;
+
+/// The Availability Zone a subnet lies in: the zone of its region the subnet's own id maps
+/// to.
+///
+/// Derived from the subnet id alone, so ONE subnet is reported in one zone whichever group
+/// names it and however often it is read, and a group naming several subnets covers
+/// several zones — which is the fact a `DBSubnetGroupDoesNotCoverEnoughAZs` is about and
+/// the one a client reads `Subnet$SubnetAvailabilityZone` for.
+pub fn subnet_availability_zone(region: &str, subnet_id: &str) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    let index = usize::from(Sha256::digest(subnet_id.as_bytes())[0]) % AVAILABILITY_ZONE_SUFFIXES.len();
+    format!("{region}{}", AVAILABILITY_ZONE_SUFFIXES[index])
+}
+
+/// How AWS names the Availability Zones of a region: the region's name and a letter.
+pub const AVAILABILITY_ZONE_SUFFIXES: [&str; 3] = ["a", "b", "c"];
+
+/// The network types a DB subnet group of this service supports.
+///
+/// Source: `DBSubnetGroup$SupportedNetworkTypes` — "Valid values: IPV4 | DUAL … A
+/// DBSubnetGroup can support only the IPv4 protocol or the IPv4 and the IPv6 protocols
+/// (DUAL)." A group supports `DUAL` only where its subnets carry an IPv6 CIDR, and the
+/// subnets this service resolves carry none, so every group it holds supports IPv4.
+pub const SUBNET_GROUP_NETWORK_TYPES: [&str; 1] = ["IPV4"];
+
+/// The `VpcSecurityGroups` membership list a cluster or an instance in `region` reports for
+/// the security groups `ids` names.
+///
+/// Each association is in place from the create onwards, so each reports the `active`
+/// status; a request that named none gets the one group RDS puts the resource in, its VPC's
+/// default security group ([`default_security_group_id`]) — the member reports the groups
+/// the resource BELONGS to, and every resource belongs to at least one.
+pub fn vpc_security_group_memberships(
+    region: &str,
+    ids: &[String],
+) -> Vec<VpcSecurityGroupMembership> {
+    let membership = |id: String| VpcSecurityGroupMembership {
+        vpc_security_group_id: Some(id),
+        status: Some(MEMBERSHIP_ACTIVE.to_string()),
+    };
+    if ids.is_empty() {
+        return vec![membership(default_security_group_id(region))];
+    }
+    ids.iter().cloned().map(membership).collect()
 }
 
 /// The port a DB instance accepts connections on when the request names none.
@@ -5325,13 +5641,20 @@ pub const NEPTUNE_DEFAULT_PORT: i32 = 8182;
 /// is the same server-assigned one either way; only the domain follows the engine.
 pub fn endpoint_domain(engine: &str) -> &'static str {
     if engine.eq_ignore_ascii_case(DOCDB_ENGINE) {
-        "docdb.amazonaws.com"
+        DOCDB_ENDPOINT_DOMAIN
     } else if engine.eq_ignore_ascii_case(NEPTUNE_ENGINE) {
-        "neptune.amazonaws.com"
+        NEPTUNE_ENDPOINT_DOMAIN
     } else {
-        "rds.amazonaws.com"
+        RDS_ENDPOINT_DOMAIN
     }
 }
+
+/// The DNS domain this front door's own endpoints sit in; see [`endpoint_domain`].
+pub const RDS_ENDPOINT_DOMAIN: &str = "rds.amazonaws.com";
+/// The DNS domain the Amazon DocumentDB control plane's endpoints sit in.
+pub const DOCDB_ENDPOINT_DOMAIN: &str = "docdb.amazonaws.com";
+/// The DNS domain the Amazon Neptune control plane's endpoints sit in.
+pub const NEPTUNE_ENDPOINT_DOMAIN: &str = "neptune.amazonaws.com";
 
 
 /// The CA certificate an instance's server certificate is issued under when the
@@ -5556,9 +5879,44 @@ pub fn default_license_model(engine: &str) -> Option<&'static str> {
         Some("postgresql-license")
     } else if engine.contains("mysql") || engine.contains("mariadb") {
         Some("general-public-license")
+    } else if engine == NEPTUNE_ENGINE {
+        // Amazon Neptune publishes no separate license: the engine IS the licensed
+        // product, and its control plane reports the engine's own name as the license
+        // model of a Neptune cluster's snapshots and instances.
+        Some(NEPTUNE_ENGINE)
     } else {
         None
     }
+}
+
+/// The master user a control plane ASSIGNS a cluster of `engine`, for an engine whose
+/// `CreateDBCluster` cannot be given one.
+///
+/// `MasterUsername` is documented "Not supported by Neptune"
+/// (`smithy_query(query="doc",shape="CreateDBClusterMessage",member="MasterUsername",model_path="services/service-com-amazonaws-neptune-amazonrdsv19/smithy-model/com-amazonaws-neptune-amazonrdsv19.json")`),
+/// so a Neptune cluster's master user is not a value the request carries — the control
+/// plane assigns it, and `admin` is the name it assigns. Every other engine's cluster
+/// reports the username its own request named and nothing where it named none.
+pub fn assigned_master_username(engine: &str) -> Option<&'static str> {
+    engine
+        .eq_ignore_ascii_case(NEPTUNE_ENGINE)
+        .then_some(NEPTUNE_ASSIGNED_MASTER_USERNAME)
+}
+
+/// The master user Amazon Neptune assigns a cluster; see [`assigned_master_username`].
+pub const NEPTUNE_ASSIGNED_MASTER_USERNAME: &str = "admin";
+
+/// Whether a cluster of `engine` has `AutoMinorVersionUpgrade` on when its request named
+/// nothing.
+///
+/// The default belongs to the control plane the cluster was created through: for this
+/// model's own engines "minor engine upgrades are applied automatically"
+/// (`CreateDBClusterMessage$AutoMinorVersionUpgrade`), while the two sibling control
+/// planes' `CreateDBCluster` carries NO `AutoMinorVersionUpgrade` member at all
+/// (`smithy_query(query="operation",operation="CreateDBCluster",model_path="services/service-com-amazonaws-neptune-amazonrdsv19/smithy-model/com-amazonaws-neptune-amazonrdsv19.json")`),
+/// so nothing can turn it on for such a cluster and it is off.
+pub fn default_cluster_auto_minor_version_upgrade(engine: &str) -> bool {
+    !is_sibling_control_plane_engine(engine)
 }
 
 /// The name of the default DB parameter group of one engine-version family.

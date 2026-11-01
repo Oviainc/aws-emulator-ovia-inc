@@ -46,10 +46,11 @@ const MULTI_AZ_SETTINGS: &[(&str, &str)] = &[
     ("Iops", "1000"),
 ];
 
-/// The `BackupRetentionPeriod` the WINNING modification of the overlapping pair names, and
-/// the one the loser names: the two differ, so the row can check the refused call changed
-/// nothing.
-const WINNING_RETENTION: &str = "3";
+/// The `BackupRetentionPeriod` the loser of the overlapping pair names, and the `Port` the
+/// WINNER names: the winner's change is one the cluster's instances must be restarted for,
+/// which is what leaves the cluster `modifying` for the loser to meet, and the two members
+/// differ so the row can check the refused call changed nothing.
+const WINNING_PORT: &str = "3307";
 const LOSING_RETENTION: &str = "9";
 
 /// How the test puts a cluster into a status the modification cannot be performed in.
@@ -144,8 +145,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             ]),
             blocked: Blocked::ApplyingAModification,
             modification: owned(&[("BackupRetentionPeriod", LOSING_RETENTION)]),
-        },
-        RefusalCase {
+        },        RefusalCase {
             case: "a cluster still coming up, named in mixed case",
             identifier: "EMU-ModState-Creating".to_string(),
             engine: "aurora-mysql",
@@ -197,7 +197,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             engine: "aurora-mysql",
             create_extra: Vec::new(),
             blocked: Blocked::BeingDeleted,
-            modification: owned(&[("BackupRetentionPeriod", WINNING_RETENTION)]),
+            modification: owned(&[("BackupRetentionPeriod", "3")]),
         },
     ]
 }
@@ -315,7 +315,7 @@ async fn a_modification_of_a_cluster_in_a_blocking_state_is_refused_with_one_fix
                     modify_cluster(
                         &router,
                         &row.identifier,
-                        &owned(&[("BackupRetentionPeriod", WINNING_RETENTION)]),
+                        &owned(&[("Port", WINNING_PORT)]),
                     )
                     .await,
                 );
@@ -424,19 +424,27 @@ async fn a_modification_of_a_cluster_in_a_blocking_state_is_refused_with_one_fix
         overlapping.case
     );
     let retention = text(&settled, "BackupRetentionPeriod");
+    assert_ne!(
+        retention, LOSING_RETENTION,
+        "case {:?}: the refused modification must have written nothing, got {retention:?}",
+        overlapping.case
+    );
+    let port = text(&settled, "Port");
     assert_eq!(
-        retention, WINNING_RETENTION,
-        "case {:?}: expected the accepted modification's value {WINNING_RETENTION:?} and \
-         not the refused one's {LOSING_RETENTION:?}, got {retention:?}",
+        port, WINNING_PORT,
+        "case {:?}: expected the accepted modification's value {WINNING_PORT:?} to be the \
+         one the cluster kept, got {port:?}",
         overlapping.case
     );
     let accepted = expect_ok(
         overlapping.case,
         modify_cluster(&router, &overlapping.identifier, &overlapping.modification).await,
     );
+    // The same modification is taken now the cluster is available — and since it needs no
+    // downtime, it leaves the cluster available rather than moving it.
     let status = text(&accepted, "Status");
     assert_eq!(
-        status, DB_CLUSTER_STATUS_MODIFYING,
+        status, DB_CLUSTER_STATUS_AVAILABLE,
         "case {:?}: expected the same modification to be taken once the cluster is \
          available, got {status:?}",
         overlapping.case

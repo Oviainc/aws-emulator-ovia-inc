@@ -390,7 +390,7 @@ const PUBLISHED: [Published; 12] = [
         "Amazon Neptune",
         "neptune1.2",
         "neptune_query_timeout",
-        APPLY_TYPE_DYNAMIC,
+        APPLY_TYPE_STATIC,
         "integer",
         "10-2147483647",
         "120000",

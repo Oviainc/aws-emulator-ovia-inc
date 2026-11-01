@@ -894,12 +894,22 @@ pub(crate) const SQLSERVER_PARAMETERS: &[crate::state::ClusterParameterSpec] = &
 /// not a sample of it.
 pub(crate) const NEPTUNE_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[parameter(
     "neptune_query_timeout",
-    crate::state::APPLY_TYPE_DYNAMIC,
+    // A change to it takes effect only once the DB instance is rebooted, which is what
+    // `static` tells a caller: Neptune's parameter reference lists the parameter as one
+    // whose change requires a reboot.
+    crate::state::APPLY_TYPE_STATIC,
     "integer",
     "10-2147483647",
     "120000",
     true,
     "",
-    "The time in milliseconds after which a graph query is timed out.",
+    NEPTUNE_QUERY_TIMEOUT_DESCRIPTION,
 )];
+
+/// The description Amazon Neptune publishes for `neptune_query_timeout`, the one text its
+/// control plane reports for the parameter at either level — a DB parameter group's
+/// (`DescribeDBParameters`) and a DB cluster parameter group's
+/// (`DescribeDBClusterParameters`), which is why it lives in one place and is read by both
+/// catalogs.
+pub(crate) const NEPTUNE_QUERY_TIMEOUT_DESCRIPTION: &str = "Graph query timeout (ms)";
 

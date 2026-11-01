@@ -206,7 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The subnets the modified group would cover are the same list
         // `CreateDBSubnetGroup` takes, checked by the one rule in `crate::state` and
         // mapped here onto THIS operation's modelled faults.
-        if let Err(rejection) = crate::state::check_db_subnet_group_subnets(&input.subnet_ids) {
+        if let Err(rejection) =
+            crate::state::check_db_subnet_group_subnets(&region, &input.subnet_ids)
+        {
             return Err(match rejection {
                 crate::state::SubnetListRejection::TooManySubnets(message) => {
                     ModifyDBSubnetGroupErrorModeled::DBSubnetQuotaExceededFault(

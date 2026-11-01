@@ -637,6 +637,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove(&key)
             .expect("the cluster was found above and the store is locked");
 
+        // Which modifications take the cluster OUT OF SERVICE while they are applied, and
+        // so move its reported `Status`.
+        //
+        // RDS reports a cluster `modifying` while a change the cluster's instances have to
+        // be restarted for is being applied; a change that needs no downtime leaves the
+        // cluster `available`, which is what the response to it reports. The settings that
+        // need the restart are the ones a running instance serves FROM: the engine version
+        // and mode it runs, the compute class it is provisioned with, the port it accepts
+        // connections on, and the identifier its endpoints are named after. Every other
+        // setting here is applied to the stored record at once and leaves nothing pending,
+        // so the cluster keeps the status it had.
+        let takes_the_cluster_out_of_service = renamed_to.is_some()
+            || input.engine_version.is_some()
+            || input.engine_mode.is_some()
+            || input.port.is_some()
+            || input.db_cluster_instance_class.is_some();
+
         // Every supplied setting is written onto the stored record. The settings RDS
         // defers to the maintenance window when `ApplyImmediately` is disabled are applied
         // immediately here: this slice keeps no pending-modified-values set for a cluster,
@@ -817,9 +834,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // accepted and neither stored nor returned.
         changed |= input.master_user_password.is_some();
 
-        if changed {
-            // RDS answers a modification with the cluster `modifying`; it settles back to
-            // `available` on its own, and until it does no further modification is taken.
+        if changed && takes_the_cluster_out_of_service {
+            // The cluster is out of service while this change is applied: RDS answers
+            // `modifying`, and it settles back to `available` on its own, until when no
+            // further modification is taken.
             record.status = crate::state::DB_CLUSTER_STATUS_MODIFYING.to_string();
             record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
                 crate::state::DB_CLUSTER_STATUS_AVAILABLE,

@@ -138,6 +138,11 @@ struct ModifyCase {
     /// The elements the cluster reports after the modification settles, as
     /// `(element, text)`.
     expected: &'static [(&'static str, &'static str)],
+    /// Whether applying this modification takes the cluster out of service, which is what
+    /// decides the `Status` the modification is acknowledged with: a change the cluster's
+    /// instances must be restarted to serve reports `modifying` until the clock settles it,
+    /// and one that needs no downtime leaves the cluster `available`.
+    out_of_service: bool,
 }
 
 /// The modifications the round trip applies and reads back.
@@ -145,32 +150,38 @@ struct ModifyCase {
 /// The rows differ along what the rule generalises over: both published bounds of the
 /// numeric members `ModifyDBCluster` documents a range for, each boolean member in both
 /// directions, a window string, a storage type the cluster type publishes, and the log
-/// export list the request adds to.
+/// export list the request adds to — and, across all of them, whether the change takes the
+/// cluster out of service while it is applied.
 const MODIFY_CASES: &[ModifyCase] = &[
     ModifyCase {
         case: "BackupRetentionPeriod at its published minimum",
         params: &[("BackupRetentionPeriod", "1")],
         expected: &[("BackupRetentionPeriod", "1")],
+        out_of_service: false,
     },
     ModifyCase {
         case: "BackupRetentionPeriod at its published maximum",
         params: &[("BackupRetentionPeriod", "35")],
         expected: &[("BackupRetentionPeriod", "35")],
+        out_of_service: false,
     },
     ModifyCase {
         case: "Port at its published minimum",
         params: &[("Port", "1150")],
         expected: &[("Port", "1150")],
+        out_of_service: true,
     },
     ModifyCase {
         case: "Port at its published maximum",
         params: &[("Port", "65535")],
         expected: &[("Port", "65535")],
+        out_of_service: true,
     },
     ModifyCase {
         case: "BacktrackWindow at its published maximum",
         params: &[("BacktrackWindow", "259200")],
         expected: &[("BacktrackWindow", "259200")],
+        out_of_service: false,
     },
     ModifyCase {
         case: "the booleans turned on together",
@@ -186,6 +197,7 @@ const MODIFY_CASES: &[ModifyCase] = &[
             ("IAMDatabaseAuthenticationEnabled", "true"),
             ("HttpEndpointEnabled", "true"),
         ],
+        out_of_service: false,
     },
     ModifyCase {
         case: "the booleans turned back off",
@@ -199,6 +211,7 @@ const MODIFY_CASES: &[ModifyCase] = &[
             ("CopyTagsToSnapshot", "false"),
             ("IAMDatabaseAuthenticationEnabled", "false"),
         ],
+        out_of_service: false,
     },
     ModifyCase {
         case: "the maintenance and backup windows",
@@ -210,11 +223,13 @@ const MODIFY_CASES: &[ModifyCase] = &[
             ("PreferredBackupWindow", "04:00-04:30"),
             ("PreferredMaintenanceWindow", "sun:05:00-sun:05:30"),
         ],
+        out_of_service: false,
     },
     ModifyCase {
         case: "a storage type the Aurora cluster type publishes",
         params: &[("StorageType", "aurora-iopt1")],
         expected: &[("StorageType", "aurora-iopt1")],
+        out_of_service: false,
     },
     ModifyCase {
         case: "a CloudWatch log export the request enables",
@@ -225,6 +240,7 @@ const MODIFY_CASES: &[ModifyCase] = &[
         // The list element wraps each value it carries in a `member` element, which is
         // what the reader below sees as the list's text.
         expected: &[("EnabledCloudwatchLogsExports", "<member>audit</member>")],
+        out_of_service: false,
     },
 ];
 
@@ -247,18 +263,25 @@ async fn modify_db_cluster_writes_every_named_setting_onto_the_stored_cluster() 
         case,
         params,
         expected,
+        out_of_service,
     } in MODIFY_CASES
     {
         let mut request = vec![("DBClusterIdentifier", "emu-modify-cluster")];
         request.extend_from_slice(params);
         let answered = expect_ok(case, call(&router, "ModifyDBCluster", &request).await);
-        // The modification is acknowledged with the cluster already `modifying`: it is
-        // applied to a cluster, and the clock owes the return to `available`.
+        // A modification the cluster's instances must be restarted for is acknowledged with
+        // the cluster already `modifying`, and the clock owes the return to `available`; one
+        // that needs no downtime leaves the cluster as it was.
+        let expected_status = if *out_of_service {
+            DB_CLUSTER_STATUS_MODIFYING
+        } else {
+            DB_CLUSTER_STATUS_AVAILABLE
+        };
         let status = text(&answered, "Status");
         assert_eq!(
-            status, DB_CLUSTER_STATUS_MODIFYING,
-            "case {case:?}: expected the cluster to report {DB_CLUSTER_STATUS_MODIFYING} \
-             while the modification applies, got {status:?}"
+            status, expected_status,
+            "case {case:?}: expected the cluster to report {expected_status} while the \
+             modification applies, got {status:?}"
         );
         wait_for_settle();
 
@@ -372,9 +395,11 @@ async fn two_modifications_of_one_cluster_serialise() {
     let router = emulator();
     create_available_cluster(&router, "emu-race-cluster", &[]).await;
 
-    // The first modification is accepted and leaves the cluster `modifying`; a second one
-    // arriving before the clock has settled it sees a state the operation cannot be
-    // performed in. One accepted, one refused — whichever order the two arrive in.
+    // The first modification takes the cluster out of service — the `Port` its instances
+    // accept connections on is one the engine has to be restarted to serve — so it leaves
+    // the cluster `modifying`; a second one arriving before the clock has settled it sees a
+    // state the operation cannot be performed in. One accepted, one refused — whichever
+    // order the two arrive in.
     let first = expect_ok(
         "the accepted modification",
         call(
@@ -382,7 +407,7 @@ async fn two_modifications_of_one_cluster_serialise() {
             "ModifyDBCluster",
             &[
                 ("DBClusterIdentifier", "emu-race-cluster"),
-                ("BackupRetentionPeriod", "7"),
+                ("Port", "3307"),
             ],
         )
         .await,
@@ -400,7 +425,7 @@ async fn two_modifications_of_one_cluster_serialise() {
                 "ModifyDBCluster",
                 &[
                     ("DBClusterIdentifier", "emu-race-cluster"),
-                    ("BackupRetentionPeriod", "9"),
+                    ("Port", "3308"),
                 ],
             )
             .await,
@@ -412,8 +437,8 @@ async fn two_modifications_of_one_cluster_serialise() {
     wait_for_settle();
     let reported = describe_cluster(&router, "emu-race-cluster").await;
     assert_eq!(
-        text(&reported, "BackupRetentionPeriod"),
-        "7",
+        text(&reported, "Port"),
+        "3307",
         "the accepted modification is the one the cluster keeps: {reported}"
     );
     // Once the cluster is back to `available` a further modification is taken again.
@@ -424,7 +449,7 @@ async fn two_modifications_of_one_cluster_serialise() {
             "ModifyDBCluster",
             &[
                 ("DBClusterIdentifier", "emu-race-cluster"),
-                ("BackupRetentionPeriod", "9"),
+                ("Port", "3308"),
             ],
         )
         .await,

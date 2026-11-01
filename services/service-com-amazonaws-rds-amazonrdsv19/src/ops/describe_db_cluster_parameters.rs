@@ -168,8 +168,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // `Source`: a filter over the sources this API names, not a constraint — so a value
         // naming none of them selects nothing instead of refusing the request, and a
-        // describe of a group that is not there still answers the modelled 404.
-        let source = crate::state::parameter_source_filter(input.source.as_deref());
+        // describe of a group that is not there still answers the modelled 404. It is read
+        // below, where what the filter selects is decided.
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
@@ -192,30 +192,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Which source the caller asked for decides what is reported: the group's own
-        // parameters (`customer`/`user`, and the default when the caller names no source),
-        // the family's published defaults (`engine`/`engine-default`), or nothing — for
-        // `service`/`system`, because this emulator sets no service-sourced parameter, and
-        // for a value naming no source at all.
-        let parameters: Vec<(String, Parameter)> = match source {
-            crate::state::ParameterSourceFilter::Engine => {
-                crate::state::published_parameters(&group.family)
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|spec| {
-                        (
-                            spec.name.to_string(),
-                            crate::state::engine_default_parameter_to_wire(spec),
-                        )
-                    })
-                    .collect()
-            }
-            crate::state::ParameterSourceFilter::Customer => group
-                .parameters
-                .keys()
-                .map(|name| (name.clone(), group.parameter_to_wire(name)))
-                .collect(),
-            crate::state::ParameterSourceFilter::Service
-            | crate::state::ParameterSourceFilter::Unknown => Vec::new(),
+        // parameters (`customer`/`user`), the family's published defaults
+        // (`engine`/`engine-default`), nothing — for `service`/`system`, because this
+        // emulator sets no service-sourced parameter, and for a value naming no source at
+        // all — or, where the caller names no source, EVERY parameter of the group at once,
+        // which is the detailed parameter list this operation reports for a group.
+        let parameters: Vec<(String, Parameter)> = match input.source.as_deref() {
+            None => group.every_parameter().into_iter().collect(),
+            Some(source) => match crate::state::parameter_source_filter(Some(source)) {
+                crate::state::ParameterSourceFilter::Engine => {
+                    group.published_defaults().into_iter().collect()
+                }
+                crate::state::ParameterSourceFilter::Customer => group
+                    .parameters
+                    .keys()
+                    .map(|name| (name.clone(), group.parameter_to_wire(name)))
+                    .collect(),
+                crate::state::ParameterSourceFilter::Service
+                | crate::state::ParameterSourceFilter::Unknown => Vec::new(),
+            },
         };
 
         let page = crate::state::paginate(parameters, input.marker.as_deref(), page_size)

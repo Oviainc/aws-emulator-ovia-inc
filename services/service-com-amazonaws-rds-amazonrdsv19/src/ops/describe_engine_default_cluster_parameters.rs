@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|spec| {
                 (
                     spec.name.to_string(),
-                    crate::state::engine_default_parameter_to_wire(spec),
+                    crate::state::cluster_engine_default_parameter_to_wire(&family, spec),
                 )
             })
             .collect();
@@ -385,13 +385,16 @@ pub(crate) const NEPTUNE_CLUSTER_PARAMETERS: &[crate::state::ClusterParameterSpe
     ),
     parameter(
         "neptune_query_timeout",
-        crate::state::APPLY_TYPE_DYNAMIC,
+        // The same parameter the engine's DB parameter groups carry, with the one apply
+        // type and description that control plane publishes for it; see
+        // [`super::describe_engine_default_parameters::NEPTUNE_QUERY_TIMEOUT_DESCRIPTION`].
+        crate::state::APPLY_TYPE_STATIC,
         "integer",
         "10-2147483647",
         "120000",
         true,
         "",
-        "The time in milliseconds after which a graph query is timed out.",
+        super::describe_engine_default_parameters::NEPTUNE_QUERY_TIMEOUT_DESCRIPTION,
     ),
     parameter(
         "neptune_streams",
@@ -404,3 +407,56 @@ pub(crate) const NEPTUNE_CLUSTER_PARAMETERS: &[crate::state::ClusterParameterSpe
         "Enables the change-log stream of the cluster's graph.",
     ),
 ];
+
+/// The cluster parameters the DB CLUSTER parameter group family `family` publishes.
+///
+/// ONE catalog per family, whichever operation is asked: this is what
+/// [`cluster_engine_default_parameters`] reports for the family as the engine's own
+/// defaults, and what a GROUP of that family reports the metadata of its parameters from
+/// (`crate::state::DbClusterParameterGroupRecord::parameter_to_wire`), so the two can never
+/// disagree about what a parameter is. A family this emulator publishes no catalog for —
+/// including a string that names no family at all — publishes nothing, so nothing invents
+/// metadata for it.
+pub(crate) fn cluster_parameter_catalog(
+    family: &str,
+) -> Option<&'static [crate::state::ClusterParameterSpec]> {
+    cluster_engine_default_parameters(family)
+        .ok()
+        .filter(|published| !published.is_empty())
+}
+
+/// The spec `family` publishes for the cluster parameter named `name`, if any; see
+/// [`cluster_parameter_catalog`].
+pub(crate) fn cluster_parameter_spec(
+    family: &str,
+    name: &str,
+) -> Option<&'static crate::state::ClusterParameterSpec> {
+    crate::state::spec_in_catalog(cluster_parameter_catalog(family), name)
+}
+
+/// The DB engine modes a cluster parameter of `family` is valid in —
+/// `Parameter$SupportedEngineModes`, "the valid DB engine modes".
+///
+/// A cluster parameter belongs to an engine, and which modes that engine's clusters can run
+/// in is published per engine VERSION by the engine-version catalogue
+/// (`DescribeDBEngineVersions`' `SupportedEngineModes`), so the modes a parameter is valid
+/// in are the ones the versions of its family publish — read from that catalogue rather
+/// than listed again here, so the two reports cannot disagree. A family the catalogue
+/// carries no version of publishes the one mode every DB cluster runs in.
+pub(crate) fn family_engine_modes(family: &str) -> Vec<String> {
+    let mut modes: Vec<String> = Vec::new();
+    for entry in super::describe_db_engine_versions::CATALOG
+        .iter()
+        .filter(|entry| entry.parameter_group_family.eq_ignore_ascii_case(family))
+    {
+        for mode in entry.profile.engine_modes {
+            if !modes.iter().any(|known| known == mode) {
+                modes.push((*mode).to_string());
+            }
+        }
+    }
+    if modes.is_empty() {
+        modes.push(crate::state::DEFAULT_DB_CLUSTER_ENGINE_MODE.to_string());
+    }
+    modes
+}

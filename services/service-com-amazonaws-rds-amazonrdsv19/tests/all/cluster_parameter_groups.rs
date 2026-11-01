@@ -225,9 +225,27 @@ async fn the_cluster_parameter_group_lifecycle_is_computed_from_persisted_state(
         );
     }
 
-    // 3. A freshly created group carries no parameters of its own: the defaults belong to
-    //    the family, so `Parameters` is empty.
+    // 3. A freshly created group has set no parameter of its own: every parameter its
+    //    family publishes is reported at the engine's own default, and none under `user`.
     let fresh = expect_ok(
+        "describe parameters of a fresh group",
+        call(
+            &router,
+            "DescribeDBClusterParameters",
+            &[
+                ("DBClusterParameterGroupName", "probe-cpg"),
+                ("Source", PARAMETER_SOURCE_USER),
+            ],
+        )
+        .await,
+    );
+    assert_eq!(
+        count(&fresh, "Parameter"),
+        0,
+        "case \"describe parameters of a fresh group\": a group carries no parameter of its \
+         own until one is set, got {fresh}"
+    );
+    let inherited = expect_ok(
         "describe parameters of a fresh group",
         call(
             &router,
@@ -237,10 +255,10 @@ async fn the_cluster_parameter_group_lifecycle_is_computed_from_persisted_state(
         .await,
     );
     assert_eq!(
-        count(&fresh, "Parameter"),
-        0,
-        "case \"describe parameters of a fresh group\": a group carries no parameter until \
-         one is set, got {fresh}"
+        count(&inherited, "Parameter"),
+        DOCDB_CLUSTER_PARAMETERS.len(),
+        "case \"describe parameters of a fresh group\": the group inherits its family's \
+         whole parameter list, got {inherited}"
     );
 
     // 4. ModifyDBClusterParameterGroup sets one and echoes the group name...
@@ -260,7 +278,10 @@ async fn the_cluster_parameter_group_lifecycle_is_computed_from_persisted_state(
         call(
             &router,
             "DescribeDBClusterParameters",
-            &[("DBClusterParameterGroupName", "probe-cpg")],
+            &[
+                ("DBClusterParameterGroupName", "probe-cpg"),
+                ("Source", PARAMETER_SOURCE_USER),
+            ],
         )
         .await,
     );
@@ -529,18 +550,17 @@ async fn a_parameter_value_outside_the_published_set_is_refused() {
     );
 }
 
-/// A family this emulator publishes no catalog for — the one `rds` front door also serves
-/// the Amazon RDS and Neptune engine families — carries whatever the caller sets, because
-/// refusing a value there would invent a constraint. The value is still read back from
-/// state, without the metadata only a published parameter has.
+/// A parameter the family's published catalog does not carry is still accepted and read
+/// back from state, because refusing a value there would invent a constraint — it simply
+/// carries none of the metadata only a published parameter has.
 #[tokio::test]
 async fn a_family_with_no_published_catalog_carries_any_parameter() {
     let router = emulator();
-    // (case, family, publishes a catalog, parameter, value)
+    // (case, family, the family's catalog publishes this parameter, parameter, value)
     let rows: [(&str, &str, bool, &str, &str); 3] = [
         ("a docdb family", "docdb4.0", true, "tls", "enabled"),
         (
-            "an aurora family",
+            "a parameter an aurora family's catalog does not carry",
             "aurora-postgresql15",
             false,
             "max_connections",
@@ -549,7 +569,7 @@ async fn a_family_with_no_published_catalog_carries_any_parameter() {
         (
             "a neptune family",
             "neptune1.3",
-            false,
+            true,
             "neptune_query_timeout",
             "120000",
         ),
@@ -564,12 +584,17 @@ async fn a_family_with_no_published_catalog_carries_any_parameter() {
         )
         .await;
         expect_ok(case, modify(&router, &group, name, value, None).await);
+        // The group's OWN parameters: the whole report also carries the family's published
+        // defaults, which the `Source` filter is what selects between.
         let reported = expect_ok(
             case,
             call(
                 &router,
                 "DescribeDBClusterParameters",
-                &[("DBClusterParameterGroupName", group.as_str())],
+                &[
+                    ("DBClusterParameterGroupName", group.as_str()),
+                    ("Source", PARAMETER_SOURCE_USER),
+                ],
             )
             .await,
         );
@@ -581,7 +606,7 @@ async fn a_family_with_no_published_catalog_carries_any_parameter() {
             ),
             (vec![name.to_string()], vec![value.to_string()], publishes),
             "case {case:?}: expected the stored parameter reported, with published metadata \
-             only for a family that has a catalog, got {reported}"
+             only for a parameter its family's catalog carries, got {reported}"
         );
     }
 }
@@ -728,7 +753,10 @@ async fn a_change_waiting_on_a_reboot_blocks_a_reset() {
                 call(
                     &router,
                     "DescribeDBClusterParameters",
-                    &[("DBClusterParameterGroupName", group.as_str())],
+                    &[
+                        ("DBClusterParameterGroupName", group.as_str()),
+                        ("Source", PARAMETER_SOURCE_USER),
+                    ],
                 )
                 .await,
             );
@@ -758,7 +786,10 @@ async fn a_change_waiting_on_a_reboot_blocks_a_reset() {
                 call(
                     &router,
                     "DescribeDBClusterParameters",
-                    &[("DBClusterParameterGroupName", group.as_str())],
+                    &[
+                        ("DBClusterParameterGroupName", group.as_str()),
+                        ("Source", PARAMETER_SOURCE_USER),
+                    ],
                 )
                 .await,
             );
@@ -815,10 +846,12 @@ async fn a_reset_refuses_a_combination_the_api_forbids() {
 // ---------------------------------------------------------------------------
 
 /// `Source` selects what `DescribeDBClusterParameters` reports: the group's own parameters
-/// (`customer`/`user`, and the default when none is named), the family's published defaults
-/// (`engine`/`engine-default`), or nothing (`service`/`system`, which this emulator sets no
-/// parameter under, and any value naming no source at all — a `Source` is a filter, so it
-/// narrows the answer instead of refusing the request).
+/// (`customer`/`user`), the family's published defaults (`engine`/`engine-default`), or
+/// nothing (`service`/`system`, which this emulator sets no parameter under, and any value
+/// naming no source at all — a `Source` is a filter, so it narrows the answer instead of
+/// refusing the request). A request naming NO source reports the group's whole detailed
+/// parameter list: every parameter of its family, each under the source its current value
+/// came from.
 #[tokio::test]
 async fn the_source_selects_which_parameters_a_describe_reports() {
     let router = emulator();
@@ -829,36 +862,47 @@ async fn the_source_selects_which_parameters_a_describe_reports() {
     );
     let published = DOCDB_CLUSTER_PARAMETERS.len();
 
-    // (case, Source, parameters expected, the Source each carries). Both names of each
-    // source are rows: the request vocabulary the model documents (`customer`, `engine`,
-    // `service`) and the one a response reports (`user`, `engine-default`, `system`).
-    let rows: [(&str, Option<&str>, usize, &str); 7] = [
-        ("no source named", None, 1, PARAMETER_SOURCE_USER),
-        ("the customer's own parameters", Some("customer"), 1, PARAMETER_SOURCE_USER),
+    // (case, Source, parameters expected, the Source each carries — `None` where the rows
+    // reported span more than one source). Both names of each source are rows: the request
+    // vocabulary the model documents (`customer`, `engine`, `service`) and the one a
+    // response reports (`user`, `engine-default`, `system`).
+    let rows: [(&str, Option<&str>, usize, Option<&str>); 7] = [
+        ("no source named", None, published, None),
+        (
+            "the customer's own parameters",
+            Some("customer"),
+            1,
+            Some(PARAMETER_SOURCE_USER),
+        ),
         (
             "the same source by its reported name",
             Some(PARAMETER_SOURCE_USER),
             1,
-            PARAMETER_SOURCE_USER,
+            Some(PARAMETER_SOURCE_USER),
         ),
         (
             "the engine's published defaults",
             Some("engine"),
             published,
-            PARAMETER_SOURCE_ENGINE_DEFAULT,
+            Some(PARAMETER_SOURCE_ENGINE_DEFAULT),
         ),
         (
             "the same source by its reported name",
             Some(PARAMETER_SOURCE_ENGINE_DEFAULT),
             published,
-            PARAMETER_SOURCE_ENGINE_DEFAULT,
+            Some(PARAMETER_SOURCE_ENGINE_DEFAULT),
         ),
-        ("the service's own parameters", Some("service"), 0, PARAMETER_SOURCE_SYSTEM),
+        (
+            "the service's own parameters",
+            Some("service"),
+            0,
+            Some(PARAMETER_SOURCE_SYSTEM),
+        ),
         (
             "a value naming no source this API knows",
             Some("not-a-source"),
             0,
-            PARAMETER_SOURCE_SYSTEM,
+            Some(PARAMETER_SOURCE_SYSTEM),
         ),
     ];
 
@@ -873,7 +917,7 @@ async fn the_source_selects_which_parameters_a_describe_reports() {
             expected,
             "case {case:?} (Source={source:?}): expected {expected} parameter(s), got {reported}"
         );
-        if expected > 0 {
+        if let Some(source_reported) = source_reported.filter(|_| expected > 0) {
             let sources = texts(&reported, "Source");
             assert!(
                 sources.iter().all(|value| value == source_reported),
@@ -882,6 +926,37 @@ async fn the_source_selects_which_parameters_a_describe_reports() {
             );
         }
     }
+
+    // In that whole list the one parameter the group has SET is reported under `user` and
+    // every other published parameter under the engine's own default.
+    let reported = expect_ok(
+        "no source named",
+        call(
+            &router,
+            "DescribeDBClusterParameters",
+            &[("DBClusterParameterGroupName", group.as_str())],
+        )
+        .await,
+    );
+    let sources = texts(&reported, "Source");
+    assert_eq!(
+        sources
+            .iter()
+            .filter(|value| *value == PARAMETER_SOURCE_USER)
+            .count(),
+        1,
+        "expected exactly the one parameter the group set to carry Source \
+         {PARAMETER_SOURCE_USER:?}, got {sources:?}"
+    );
+    assert_eq!(
+        sources
+            .iter()
+            .filter(|value| *value == PARAMETER_SOURCE_ENGINE_DEFAULT)
+            .count(),
+        published - 1,
+        "expected every other published parameter to carry Source \
+         {PARAMETER_SOURCE_ENGINE_DEFAULT:?}, got {sources:?}"
+    );
 
     // A `Source` cannot turn a missing group's 404 into anything else: the group is looked
     // up whatever the filter says.
@@ -980,7 +1055,10 @@ async fn a_group_carries_at_most_the_capped_number_of_parameters() {
         call(
             &router,
             "DescribeDBClusterParameters",
-            &[("DBClusterParameterGroupName", group.as_str())],
+            &[
+                ("DBClusterParameterGroupName", group.as_str()),
+                ("Source", PARAMETER_SOURCE_USER),
+            ],
         )
         .await,
     );

@@ -286,6 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let snapshot = crate::state::DbClusterSnapshotRecord::from_cluster(
             cluster,
+            // Whether the cluster has any DB instance in it, which is what decides the
+            // storage the snapshot holds and the port it was taken on; see
+            // `DbClusterSnapshotRecord::from_cluster`.
+            !store.cluster_members(cluster).is_empty(),
             &snapshot_key,
             tags,
         );

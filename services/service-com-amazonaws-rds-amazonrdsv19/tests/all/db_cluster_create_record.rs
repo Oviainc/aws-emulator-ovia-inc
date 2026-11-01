@@ -210,13 +210,36 @@ fn assert_named(case: &str, label: &str, cluster: &str, row: &RecordCase) {
     }
 }
 
+/// `cluster` with the members the CLOCK fills removed.
+///
+/// The point-in-time restore window is "the earliest and latest time a database can be
+/// restored to" AS OF the moment of the read, so it differs between any two reads of one
+/// record — exactly as `Status` does while the transition the create owes is still
+/// outstanding, which is why this comparison already splits at that member.
+fn without_clock_derived_members(cluster: &str) -> String {
+    let mut stripped = cluster.to_string();
+    for member in ["EarliestRestorableTime", "LatestRestorableTime"] {
+        let close = format!("</{member}>");
+        while let Some(start) = stripped.find(&format!("<{member}>")) {
+            let Some(end) = stripped[start..]
+                .find(&close)
+                .map(|offset| start + offset + close.len())
+            else {
+                break;
+            };
+            stripped.replace_range(start..end, "");
+        }
+    }
+    stripped
+}
+
 #[tokio::test]
 async fn the_record_a_create_acknowledges_is_the_record_describe_reports() {
     let router = emulator();
 
     for row in RECORD_CASES {
         let created = expect_ok(row.case, create_case(&router, row).await);
-        let created = the_cluster(row.case, &created);
+        let created = without_clock_derived_members(&the_cluster(row.case, &created));
         assert_named(row.case, "CreateDBCluster", &created, row);
         let (created_head, created_status, created_tail) = split_at_status(row.case, &created);
         assert_eq!(
@@ -228,7 +251,9 @@ async fn the_record_a_create_acknowledges_is_the_record_describe_reports() {
         // The same cluster, read back out of the store once the transition the clock owed
         // it has come due.
         wait_for_settle();
-        let read_back = describe_one(&router, row.case, row.identifier).await;
+        let read_back = without_clock_derived_members(
+            &describe_one(&router, row.case, row.identifier).await,
+        );
         assert_named(row.case, "DescribeDBClusters", &read_back, row);
         let (read_head, read_status, read_tail) = split_at_status(row.case, &read_back);
         assert_eq!(
