@@ -45,6 +45,8 @@ mod list_tags_for_resource;
 mod manager_not_found_message;
 #[path = "all/manager_region_scope.rs"]
 mod manager_region_scope;
+#[path = "all/not_found_message_echo_bound.rs"]
+mod not_found_message_echo_bound;
 #[path = "all/page_token_region_scope.rs"]
 mod page_token_region_scope;
 #[path = "all/pagination_tokens.rs"]

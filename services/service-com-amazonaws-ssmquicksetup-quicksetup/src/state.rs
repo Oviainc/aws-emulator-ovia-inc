@@ -101,12 +101,23 @@ pub const TEARDOWN_IN_FLIGHT_MESSAGE: &str =
 /// The model declares `ResourceNotFoundException` with a single `Message` member and
 /// states no text for it, so the wording is what the service itself emits: the fixed
 /// text `Quick setup manager with arn: ` and ` could not be found.` around the ARN the
-/// REQUEST carried, echoed verbatim. Nothing else varies — no account id, Region or
-/// uuid is part of the template, and the ARN is never re-derived from stored state.
+/// REQUEST carried. Nothing else varies — no account id, Region or uuid is part of the
+/// template, and the ARN is never re-derived from stored state.
 /// The one place the message lives, so every operation that addresses a manager by ARN
 /// refuses an absent one the same way.
+///
+/// The ARN is rendered through [`echoed_value`], the way every caller-supplied value
+/// this service echoes into a refusal is, because no modelled constraint bounds the
+/// length of the one this template renders: the tag plane's `ResourceArn` carries
+/// neither a `@pattern` nor a `@length`, and the `ManagerArn` pattern of the manager
+/// routes leaves the Region segment it admits (`[^:]+`) unbounded, so text of any
+/// length the request can carry reaches here. Every ARN this service mints is far
+/// inside that bound, so the sentence for one is the ARN itself, unchanged.
 pub fn manager_not_found_message(manager_arn: &str) -> String {
-    format!("Quick setup manager with arn: {manager_arn} could not be found.")
+    format!(
+        "Quick setup manager with arn: {} could not be found.",
+        echoed_value(manager_arn)
+    )
 }
 
 /// The sentence this service refuses with when a configuration-definition id a request
@@ -121,10 +132,17 @@ pub fn manager_not_found_message(manager_arn: &str) -> String {
 /// REQUEST carried — nothing is re-derived from stored state. The one place the message
 /// lives, so every operation that addresses a configuration definition by id refuses an
 /// absent one the same way.
+///
+/// The ARN is bounded by [`echoed_value`] for the reason
+/// [`manager_not_found_message`] gives: it arrives on a member whose modelled pattern
+/// leaves its Region segment unbounded. The id needs no bound — every member that
+/// carries one into this template is modelled `^[a-z0-9-]{1,20}$`, far inside
+/// [`MAX_ECHOED_VALUE`] — so it is rendered as the request spelled it.
 pub fn definition_not_found_message(manager_arn: Option<&str>, id: &str) -> String {
     match manager_arn {
         Some(manager_arn) => format!(
-            "configuration manager {manager_arn} holds no configuration definition with ID {id}"
+            "configuration manager {} holds no configuration definition with ID {id}",
+            echoed_value(manager_arn)
         ),
         None => format!("no configuration definition with ID {id} exists"),
     }
