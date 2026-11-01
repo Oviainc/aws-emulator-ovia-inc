@@ -342,23 +342,31 @@ fn decode_next_token(app_monitor_name: &str, token: &str) -> Option<usize> {
 struct Window {
     /// `TimeRange$After`: the first instant the window covers.
     after: i64,
-    /// The last instant the window covers: `TimeRange$Before`, or now for a request that
-    /// named none.
+    /// The last instant the window covers: `TimeRange$Before` where the request named
+    /// one, and now where it left the member at its modelled default.
     before: i64,
 }
+
+/// The value `TimeRange$Before` carries for a request that left the member out: its
+/// modelled `@default`, which the deserializer fills in, so this exact value — and no
+/// other — is the one the member's "If you omit this" documentation speaks for.
+const OMITTED_BEFORE: i64 = 0;
 
 impl Window {
     /// The window `time_range` asks for.
     ///
     /// `TimeRange$Before` is modelled `@default(0)` and documented "If you omit this, the
     /// time range extends to the time that this operation is performed", so a request
-    /// that left it at the default is answered against the window ending NOW. Both bounds
-    /// are read in the unit this protocol carries a `RumEvent$timestamp` in — seconds
-    /// since the epoch — because they bound that same instant.
+    /// that left it at the default ([`OMITTED_BEFORE`]) is answered against the window
+    /// ending NOW. Every OTHER value the member admits is one the caller SENT, so it
+    /// bounds the window where it says: `QueryTimestamp` is a `long` with no `@range`, and
+    /// an instant before the epoch is as much an instant as one after it. Both bounds are
+    /// read in the unit this protocol carries a `RumEvent$timestamp` in — seconds since
+    /// the epoch — because they bound that same instant.
     fn from(time_range: &TimeRange) -> Self {
         Self {
             after: time_range.after,
-            before: if time_range.before <= 0 {
+            before: if time_range.before == OMITTED_BEFORE {
                 now_seconds()
             } else {
                 time_range.before

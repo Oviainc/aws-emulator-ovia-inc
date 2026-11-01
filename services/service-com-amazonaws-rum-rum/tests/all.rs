@@ -87,6 +87,8 @@ mod platform_domain_authority;
 mod put_rum_events_unresolvable_id;
 #[path = "all/query_bound_required_members.rs"]
 mod query_bound_required_members;
+#[path = "all/query_window_bounds.rs"]
+mod query_window_bounds;
 #[path = "all/refused_create_side_effects.rs"]
 mod refused_create_side_effects;
 #[path = "all/region_scoped_app_monitors.rs"]
