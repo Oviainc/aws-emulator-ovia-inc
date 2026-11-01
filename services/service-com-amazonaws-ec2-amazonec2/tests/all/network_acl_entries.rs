@@ -31,6 +31,19 @@
 //!    with any subnets" (`DeleteNetworkAcl`), and an id that is not a network ACL id at all
 //!    is told apart from one the account holds no ACL for.
 //! 6. A `DryRun` of either mutation answers `DryRunOperation` and changes nothing.
+//! 7. "The protocol number. A value of -1 means all protocols" (`$Protocol`): a rule's
+//!    protocol is a NUMBER, so every number the field of the IP header holds is accepted —
+//!    whichever way the request spells it, stored as the number it names — and a value that is
+//!    not such a number (a protocol NAME, a value past either end) is refused with nothing
+//!    stored.
+//! 8. A rule matches a range of ONE address family: a request naming both `CidrBlock` and
+//!    `Ipv6CidrBlock` is refused, and a range of either family that is not a CIDR block is
+//!    refused, with nothing stored.
+//! 9. A network ACL holds at most the published number of rules, counted over the whole ACL,
+//!    and one more is refused with the quota code rather than displacing a stored rule.
+//! 10. A request with two faults is refused for the one the handler reads first: the ACL id's
+//!     FORM before any other member, and the members of the request before the ACL is looked
+//!     up — the same order `DeleteNetworkAclEntry` reads them in.
 //!
 //! Every table row is a distinct input along what those rules generalise over — the
 //! direction, the rule number, the protocol, the address family, the range's spelling, the
@@ -38,8 +51,9 @@
 
 use ec2::state::{
     ALL_IPV4_ADDRESSES, ALL_IP_PROTOCOLS, DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER,
-    NETWORK_ACL_ENTRY_RULE_NUMBERS, NETWORK_ACL_PROTOCOL_ICMP, NETWORK_ACL_PROTOCOL_ICMPV6,
-    NETWORK_ACL_PROTOCOL_TCP, NETWORK_ACL_PROTOCOL_UDP, RULE_ACTION_ALLOW, RULE_ACTION_DENY,
+    MAX_NETWORK_ACL_ENTRIES, MAX_PROTOCOL_NUMBER, NETWORK_ACL_ENTRY_RULE_NUMBERS,
+    NETWORK_ACL_PROTOCOL_ICMP, NETWORK_ACL_PROTOCOL_ICMPV6, NETWORK_ACL_PROTOCOL_TCP,
+    NETWORK_ACL_PROTOCOL_UDP, RULE_ACTION_ALLOW, RULE_ACTION_DENY,
 };
 use ec2::state::ComAmazonawsEc2Amazonec2State as Ec2State;
 use service_com_amazonaws_ec2_amazonec2 as ec2;
@@ -932,5 +946,468 @@ async fn a_deleted_network_acl_is_not_found_afterwards() {
         error_code(&body),
         "InvalidNetworkAclID.NotFound",
         "an entry on a deleted ACL: expected InvalidNetworkAclID.NotFound, got {body}"
+    );
+}
+
+/// The form fields of a `CreateNetworkAclEntry` for one ingress allow rule over every IPv4
+/// address, with `extra` naming whatever the row under test varies.
+fn plain_entry_params(
+    network_acl_id: &str,
+    rule_number: i32,
+    egress: bool,
+    extra: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut params = vec![
+        param("NetworkAclId", network_acl_id),
+        param("RuleNumber", &rule_number.to_string()),
+        param("Egress", &egress.to_string()),
+        param("RuleAction", RULE_ACTION_ALLOW),
+    ];
+    params.extend(extra);
+    params
+}
+
+/// The entry the ACL reports at `rule_number` in the direction `egress` names, if it holds
+/// one — the read every row below checks its create against.
+async fn entry_at(
+    router: &MultiServiceRouter,
+    case: &str,
+    network_acl_id: &str,
+    rule_number: i32,
+    egress: bool,
+) -> Option<ReportedEntry> {
+    let described = acl_body(router, case, network_acl_id).await;
+    reported_entries(case, &described).into_iter().find(|entry| {
+        entry.rule_number == rule_number.to_string() && entry.egress == egress.to_string()
+    })
+}
+
+/// One row of the protocol table: the `Protocol` field a create sends, and the protocol the
+/// stored rule must report — or `None` when the value names no protocol at all.
+#[derive(Debug)]
+struct ProtocolCase {
+    case: &'static str,
+    rule_number: i32,
+    requested: String,
+    reported: Option<String>,
+}
+
+/// A rule's protocol is the NUMBER it names: every number the protocol field of the IP header
+/// holds is accepted and stored as that number, whichever way the request spells it, and a
+/// value that is no such number is refused with nothing stored.
+///
+/// The catalogue is the one the member publishes: "The protocol number. A value of -1 means
+/// all protocols" (`CreateNetworkAclEntryRequest$Protocol`,
+/// `smithy_query(query="doc",shape="CreateNetworkAclEntryRequest",member="Protocol")`), over a
+/// protocol number no row of the create table above names (47, GRE), each bound of the
+/// one-byte protocol field, and each value one past those bounds.
+#[tokio::test]
+async fn a_rules_protocol_is_the_number_it_names() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let (_vpc_id, acl_id) = vpc_and_acl(&router, "10.6.0.0/16").await;
+
+    let cases = vec![
+        ProtocolCase {
+            case: "every protocol",
+            rule_number: 10,
+            requested: ALL_IP_PROTOCOLS.to_string(),
+            reported: Some(ALL_IP_PROTOCOLS.to_string()),
+        },
+        ProtocolCase {
+            case: "the lowest protocol number",
+            rule_number: 20,
+            requested: "0".to_string(),
+            reported: Some("0".to_string()),
+        },
+        ProtocolCase {
+            case: "a protocol number no other row names",
+            rule_number: 30,
+            requested: "47".to_string(),
+            reported: Some("47".to_string()),
+        },
+        ProtocolCase {
+            case: "the highest protocol number",
+            rule_number: 40,
+            requested: MAX_PROTOCOL_NUMBER.to_string(),
+            reported: Some(MAX_PROTOCOL_NUMBER.to_string()),
+        },
+        ProtocolCase {
+            case: "the same number spelled with a leading zero",
+            rule_number: 50,
+            requested: "047".to_string(),
+            reported: Some("47".to_string()),
+        },
+        ProtocolCase {
+            case: "one past the highest protocol number",
+            rule_number: 60,
+            requested: (MAX_PROTOCOL_NUMBER + 1).to_string(),
+            reported: None,
+        },
+        ProtocolCase {
+            case: "one past the lowest, where only every-protocol sits below it",
+            rule_number: 70,
+            requested: "-2".to_string(),
+            reported: None,
+        },
+        ProtocolCase {
+            case: "a protocol name rather than a number",
+            rule_number: 80,
+            requested: "tcp".to_string(),
+            reported: None,
+        },
+        ProtocolCase {
+            case: "a protocol number with a fraction",
+            rule_number: 90,
+            requested: "6.0".to_string(),
+            reported: None,
+        },
+    ];
+
+    for row in &cases {
+        let params = plain_entry_params(
+            &acl_id,
+            row.rule_number,
+            false,
+            vec![
+                param("Protocol", &row.requested),
+                param("CidrBlock", ALL_IPV4_ADDRESSES),
+            ],
+        );
+        let (status, body) = create_entry(&router, &params).await;
+        let case = row.case;
+        match row.reported.as_deref() {
+            Some(expected) => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected HTTP 200, got {status} with body {body}"
+                );
+                let stored = entry_at(&router, case, &acl_id, row.rule_number, false)
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: expected the ACL to hold the created rule")
+                    });
+                assert_eq!(
+                    stored.protocol, expected,
+                    "case {case:?}: expected the rule to report protocol {expected}, \
+                     got {stored:?}"
+                );
+            }
+            None => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected HTTP 400, got {status} with body {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "InvalidParameterValue",
+                    "case {case:?}: expected InvalidParameterValue, got {body}"
+                );
+                let message = error_message(&body);
+                assert!(
+                    message.contains(&row.requested) && message.contains("protocol"),
+                    "case {case:?}: expected the refusal to name parameter protocol and the \
+                     value {requested:?} the request sent, got {message:?}",
+                    requested = row.requested,
+                );
+                assert!(
+                    entry_at(&router, case, &acl_id, row.rule_number, false)
+                        .await
+                        .is_none(),
+                    "case {case:?}: a refused create must store nothing"
+                );
+            }
+        }
+    }
+}
+
+/// One row of the address-family table: the range members a create sends, and the code its
+/// refusal must carry.
+#[derive(Debug)]
+struct RangeCase {
+    case: &'static str,
+    rule_number: i32,
+    cidr_block: Option<&'static str>,
+    ipv6_cidr_block: Option<&'static str>,
+    code: &'static str,
+    /// The member the refusal must name, for a range that is not a CIDR block.
+    names: Option<&'static str>,
+}
+
+/// A rule matches a range of ONE address family, and that range has to be a CIDR block: a
+/// request naming both "the IPv4 network range" (`$CidrBlock`) and "the IPv6 network range"
+/// (`$Ipv6CidrBlock`) is refused, as is a range of either family this is not notation for,
+/// with nothing stored either way.
+#[tokio::test]
+async fn an_entry_matches_one_well_formed_range() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let (_vpc_id, acl_id) = vpc_and_acl(&router, "10.7.0.0/16").await;
+
+    let cases = [
+        RangeCase {
+            case: "a range of each family at once",
+            rule_number: 100,
+            cidr_block: Some("10.0.0.0/8"),
+            ipv6_cidr_block: Some("2001:db8::/32"),
+            code: "InvalidParameterCombination",
+            names: None,
+        },
+        RangeCase {
+            case: "an IPv4 prefix longer than an IPv4 address",
+            rule_number: 110,
+            cidr_block: Some("10.0.0.0/33"),
+            ipv6_cidr_block: None,
+            code: "InvalidParameterValue",
+            names: Some("cidrBlock"),
+        },
+        RangeCase {
+            case: "an IPv4 address with no prefix at all",
+            rule_number: 120,
+            cidr_block: Some("10.0.0.0"),
+            ipv6_cidr_block: None,
+            code: "InvalidParameterValue",
+            names: Some("cidrBlock"),
+        },
+        RangeCase {
+            case: "an IPv4 range whose address is not an address",
+            rule_number: 130,
+            cidr_block: Some("10.0.0.256/24"),
+            ipv6_cidr_block: None,
+            code: "InvalidParameterValue",
+            names: Some("cidrBlock"),
+        },
+        RangeCase {
+            case: "an IPv6 prefix longer than an IPv6 address",
+            rule_number: 140,
+            cidr_block: None,
+            ipv6_cidr_block: Some("2001:db8::/129"),
+            code: "InvalidParameterValue",
+            names: Some("ipv6CidrBlock"),
+        },
+        RangeCase {
+            case: "an IPv6 address with no prefix at all",
+            rule_number: 150,
+            cidr_block: None,
+            ipv6_cidr_block: Some("2001:db8::"),
+            code: "InvalidParameterValue",
+            names: Some("ipv6CidrBlock"),
+        },
+    ];
+
+    for row in &cases {
+        let mut extra = vec![param("Protocol", ALL_IP_PROTOCOLS)];
+        if let Some(cidr_block) = row.cidr_block {
+            extra.push(param("CidrBlock", cidr_block));
+        }
+        if let Some(ipv6_cidr_block) = row.ipv6_cidr_block {
+            extra.push(param("Ipv6CidrBlock", ipv6_cidr_block));
+        }
+        let params = plain_entry_params(&acl_id, row.rule_number, false, extra);
+        let (status, body) = create_entry(&router, &params).await;
+        let case = row.case;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            row.code,
+            "case {case:?}: expected {expected}, got {body}",
+            expected = row.code
+        );
+        if let Some(member) = row.names {
+            let message = error_message(&body);
+            let requested = row
+                .cidr_block
+                .or(row.ipv6_cidr_block)
+                .unwrap_or_default();
+            assert!(
+                message.contains(member) && message.contains(requested),
+                "case {case:?}: expected the refusal to name parameter {member} and the \
+                 value {requested:?} the request sent, got {message:?}"
+            );
+        }
+        assert!(
+            entry_at(&router, case, &acl_id, row.rule_number, false)
+                .await
+                .is_none(),
+            "case {case:?}: a refused create must store nothing"
+        );
+    }
+
+    // The positive control: the ACL still holds only the catch-all pair it was created with.
+    let described = acl_body(&router, "nothing stored", &acl_id).await;
+    let entries = reported_entries("nothing stored", &described);
+    assert_eq!(
+        entries,
+        vec![catch_all_entry(true), catch_all_entry(false)],
+        "expected only the ACL's own catch-all pair after the refusals, got {entries:?}"
+    );
+}
+
+/// A network ACL holds at most the published number of rules, counted over the whole ACL: one
+/// more is refused with the quota code and displaces nothing.
+///
+/// "Rules per network ACL" is 20 by default and adjustable to a maximum of 40 (Amazon VPC
+/// quotas), named here through `MAX_NETWORK_ACL_ENTRIES`, so the table is that many rules
+/// split over the two directions and then one rule too many in each direction.
+#[tokio::test]
+async fn an_acl_holds_at_most_the_published_number_of_rules() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let (_vpc_id, acl_id) = vpc_and_acl(&router, "10.8.0.0/16").await;
+
+    // Half the ceiling in each direction, so the count under test is the ACL's and not one
+    // direction's.
+    let per_direction = MAX_NETWORK_ACL_ENTRIES / 2;
+    for index in 0..per_direction {
+        for egress in [false, true] {
+            let rule_number = i32::try_from(index).expect("a rule number fits in an i32") + 1;
+            let params = plain_entry_params(
+                &acl_id,
+                rule_number,
+                egress,
+                vec![
+                    param("Protocol", ALL_IP_PROTOCOLS),
+                    param("CidrBlock", ALL_IPV4_ADDRESSES),
+                ],
+            );
+            let (status, body) = create_entry(&router, &params).await;
+            assert_eq!(
+                status, 200,
+                "rule {rule_number} (egress {egress}): expected HTTP 200 while the ACL has \
+                 room, got {status} with body {body}"
+            );
+        }
+    }
+
+    let described = acl_body(&router, "a full ACL", &acl_id).await;
+    let entries = reported_entries("a full ACL", &described);
+    assert_eq!(
+        entries.len(),
+        MAX_NETWORK_ACL_ENTRIES + 2,
+        "expected the ACL's {MAX_NETWORK_ACL_ENTRIES} rules beside its catch-all pair, \
+         got {entries:?}"
+    );
+
+    // One rule too many, in either direction.
+    for egress in [false, true] {
+        let rule_number = i32::try_from(MAX_NETWORK_ACL_ENTRIES)
+            .expect("a rule count fits in an i32")
+            + 1;
+        let params = plain_entry_params(
+            &acl_id,
+            rule_number,
+            egress,
+            vec![
+                param("Protocol", ALL_IP_PROTOCOLS),
+                param("CidrBlock", ALL_IPV4_ADDRESSES),
+            ],
+        );
+        let (status, body) = create_entry(&router, &params).await;
+        assert_eq!(
+            status, 400,
+            "one rule too many (egress {egress}): expected HTTP 400, got {status} with \
+             body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "NetworkAclEntryLimitExceeded",
+            "one rule too many (egress {egress}): expected NetworkAclEntryLimitExceeded, \
+             got {body}"
+        );
+        assert!(
+            entry_at(&router, "one rule too many", &acl_id, rule_number, egress)
+                .await
+                .is_none(),
+            "one rule too many (egress {egress}): a refused create must store nothing"
+        );
+    }
+
+    let described = acl_body(&router, "a full ACL afterwards", &acl_id).await;
+    let entries = reported_entries("a full ACL afterwards", &described);
+    assert_eq!(
+        entries.len(),
+        MAX_NETWORK_ACL_ENTRIES + 2,
+        "a refused create must displace nothing, got {entries:?}"
+    );
+}
+
+/// A request with two faults is refused for the one the handler reads first: the ACL id's
+/// FORM before any other member — an id that is not a network ACL id names nothing that could
+/// exist — and the request's own members before the ACL is looked up.
+#[tokio::test]
+async fn a_request_with_two_faults_is_refused_for_the_fault_read_first() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let (_vpc_id, acl_id) = vpc_and_acl(&router, "10.9.0.0/16").await;
+
+    // A well-formed id of no ACL, and one that is not a network ACL id at all.
+    let unknown_acl_id = "acl-0123456789abcdef0";
+    let malformed_acl_id = "not-an-acl";
+    let out_of_range_rule_number = *NETWORK_ACL_ENTRY_RULE_NUMBERS.end() + 1;
+
+    for (case, network_acl_id, rule_number, protocol, expected_code) in [
+        (
+            "an id that is no id, beside a rule number out of range",
+            malformed_acl_id,
+            out_of_range_rule_number,
+            ALL_IP_PROTOCOLS,
+            "InvalidNetworkAclID.Malformed",
+        ),
+        (
+            "an id of no ACL, beside a rule number out of range",
+            unknown_acl_id,
+            out_of_range_rule_number,
+            ALL_IP_PROTOCOLS,
+            "InvalidParameterValue",
+        ),
+        (
+            "an id of no ACL, beside a protocol that is no protocol",
+            unknown_acl_id,
+            100,
+            "tcp",
+            "InvalidParameterValue",
+        ),
+        (
+            "an id of no ACL, with every member in order",
+            unknown_acl_id,
+            100,
+            ALL_IP_PROTOCOLS,
+            "InvalidNetworkAclID.NotFound",
+        ),
+        (
+            "a stored ACL, beside a rule number out of range",
+            &acl_id,
+            out_of_range_rule_number,
+            ALL_IP_PROTOCOLS,
+            "InvalidParameterValue",
+        ),
+    ] {
+        let params = plain_entry_params(
+            network_acl_id,
+            rule_number,
+            false,
+            vec![
+                param("Protocol", protocol),
+                param("CidrBlock", ALL_IPV4_ADDRESSES),
+            ],
+        );
+        let (status, body) = create_entry(&router, &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
+        );
+    }
+
+    // And nothing above reached the stored ACL.
+    let described = acl_body(&router, "two faults", &acl_id).await;
+    let entries = reported_entries("two faults", &described);
+    assert_eq!(
+        entries,
+        vec![catch_all_entry(true), catch_all_entry(false)],
+        "expected only the ACL's own catch-all pair after the refusals, got {entries:?}"
     );
 }
