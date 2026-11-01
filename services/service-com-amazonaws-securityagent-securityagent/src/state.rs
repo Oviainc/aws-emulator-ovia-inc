@@ -170,6 +170,14 @@ pub const MAX_AGENT_SPACES: usize = 1_000;
 /// plausible client's association count, so normal use never meets it.
 pub const MAX_AGENT_SPACE_TARGET_DOMAINS: usize = 100;
 
+/// The sentence a refusal of an agent space the account does not hold states.
+///
+/// RECORDED, not modelled: the recorded 404 for an `agentSpaceId` that resolves to no
+/// agent space carries this sentence, which is wholly FIXED — it names the resource
+/// CLASS under the name the service's own records use for an agent space, and carries no
+/// value from the request, so a refusal never echoes a caller's own identifier back.
+pub const AGENT_SPACE_NOT_FOUND: &str = "The specified agent instance does not exist.";
+
 /// The most security requirement packs this emulator stores for the account before
 /// `CreateSecurityRequirementPack` answers the service's
 /// `ServiceQuotaExceededException`.
@@ -399,6 +407,23 @@ impl AgentSpaceRecord {
                     .collect()
             }),
         }
+    }
+
+    /// This agent space as a READ of the store reports it: [`Self::modelled`]'s
+    /// projection with both of its collection members PRESENT rather than absent — a
+    /// record that holds no association carries them as EMPTY lists.
+    ///
+    /// RECORDED, not modelled: a read of the store reports the record's collections, so
+    /// `targetDomainIds` and the resolved `targetDomains` beside it are arrays on every
+    /// agent space a read answers and a caller iterating either one loops zero times
+    /// instead of dereferencing a missing member. The create and update echo paths are
+    /// NOT this: there an optional member the request did not carry stays absent, which
+    /// is why the normalisation lives here and not in [`Self::modelled`].
+    pub fn read_view(&self, target_domains: &BTreeMap<String, TargetDomainRecord>) -> AgentSpace {
+        let mut view = self.modelled(target_domains);
+        view.target_domain_ids = Some(view.target_domain_ids.unwrap_or_default());
+        view.target_domains = Some(view.target_domains.unwrap_or_default());
+        view
     }
 }
 

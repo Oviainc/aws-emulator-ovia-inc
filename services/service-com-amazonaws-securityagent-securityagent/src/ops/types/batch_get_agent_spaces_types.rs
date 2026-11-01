@@ -30,17 +30,22 @@ pub struct BatchGetAgentSpacesInput {
 ///    `agentInstances` and `ids`, which the model does not declare
 ///    (`smithy_query(query="operation", operation="BatchGetAgentSpaces",
 ///    model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`
-///    states `agentSpaces` and `notFound` alone). In every recording they are EMPTY
-///    ARRAYS — including the read that matched an agent space, whose record the recorded
-///    `agentSpaces` carries — so they are not this operation's partition under other
-///    names: they are a second pair the service keeps in the response and does not fill.
-///    This emulator cannot fill them either: nothing in this service's model creates an
-///    agent instance, so no stored state could put an entry in one. They are written as
-///    the empty arrays they are, which is why neither has a field to carry.
+///    states `agentSpaces` and `notFound` alone). They are the SAME resolved records
+///    under the name the service's own store uses for an agent space — an agent
+///    INSTANCE, the resource type its ARN carries — and the ids those records resolved
+///    to: one `agentInstances` entry and one `ids` entry per agent space answered in
+///    `agentSpaces`, so an id reported in `notFound` contributes to neither and a batch
+///    that matched nothing carries them as empty arrays. All four are plain `Vec`s for
+///    the reason above: no state of this response omits one.
 #[derive(Debug, Clone, Default)]
 pub struct BatchGetAgentSpacesOutput {
     pub agent_spaces: Vec<AgentSpace>,
     pub not_found: Vec<String>,
+    /// Recorded, not modelled: every resolved record again, as the agent INSTANCE view
+    /// of it.
+    pub agent_instances: Vec<AgentSpace>,
+    /// Recorded, not modelled: the id of every resolved record, in the order answered.
+    pub ids: Vec<String>,
 }
 
 #[allow(non_upper_case_globals)]
@@ -67,7 +72,7 @@ impl BatchGetAgentSpacesOutput {
         1,
     );
 
-    /// Recorded, not modelled; always empty. See the note on the struct.
+    /// Recorded, not modelled. See the note on the struct.
     const M_AGENT_INSTANCES: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
         ::aws_smithy_schema::ShapeId::from_static(
             "com.amazonaws.securityagent.recorded#BatchGetAgentSpacesOutput$agentInstances",
@@ -79,7 +84,7 @@ impl BatchGetAgentSpacesOutput {
         2,
     );
 
-    /// Recorded, not modelled; always empty. See the note on the struct.
+    /// Recorded, not modelled. See the note on the struct.
     const M_IDS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
         ::aws_smithy_schema::ShapeId::from_static(
             "com.amazonaws.securityagent.recorded#BatchGetAgentSpacesOutput$ids",
@@ -127,10 +132,21 @@ impl ::aws_smithy_schema::serde::SerializableStruct for BatchGetAgentSpacesOutpu
             }
             Ok(())
         })?;
-        // The recorded second pair: present, and empty because this emulator holds no
-        // agent instance to report in it — no operation of this service creates one.
-        serializer.write_list(&Self::M_AGENT_INSTANCES, &|_| Ok(()))?;
-        serializer.write_list(&Self::M_IDS, &|_| Ok(()))?;
+        // The recorded second pair: the resolved records again as the agent instance
+        // view of them, and the ids they resolved to. Present on every answer, empty
+        // when no requested id resolved.
+        serializer.write_list(&Self::M_AGENT_INSTANCES, &|elements| {
+            for agent_instance in self.agent_instances.iter() {
+                elements.write_struct(&AgentSpace::SCHEMA, agent_instance)?;
+            }
+            Ok(())
+        })?;
+        serializer.write_list(&Self::M_IDS, &|elements| {
+            for id in self.ids.iter() {
+                elements.write_string(&Self::M_IDS, id.as_str())?;
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 }

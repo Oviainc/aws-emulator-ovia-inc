@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAgentSpace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAgentSpace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAgentSpace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one stored agent space from the store, so every later read of that id — a
+//! batch get, a listing — no longer resolves it. An `agentSpaceId` the store does not
+//! hold is a 404 `ResourceNotFoundException`, so a caller cannot read the deletion of a
+//! typo as the deletion of the agent space it meant. The answer names the record this
+//! call removed.
 //!
 //! ## Shape of an operation
 //!
@@ -72,12 +69,28 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityagent-securitya
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `DeleteAgentSpaceError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityagent#DeleteAgentSpace")]
+// here — hence the `DeleteAgentSpaceError` alias below.
+//
+// This operation lists NO errors of its own, so every variant below is widened in with
+// `extra_errors`, exactly as `DeleteTargetDomain` beside it does: the SERVICE models all
+// three shapes (every other agent space operation lists them), and a delete needs them —
+// `ResourceNotFoundException` (HTTP 404) for an id the account does not hold,
+// `ValidationException` (HTTP 400) for one that could never name a record, and
+// `InternalServerException` (HTTP 500) for a store this process cannot reach, which is a
+// server fault and not a bad request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityagent#DeleteAgentSpace",
+    extra_errors = [
+        "InternalServerException",
+        "ResourceNotFoundException",
+        "ValidationException"
+    ]
+)]
 #[derive(Debug)]
 pub enum DeleteAgentSpaceErrorModeled {
+    InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -131,18 +144,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAgentSpace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAgentSpaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAgentSpaceErrorModeled::InternalServerException(InternalServerException {
+                message: "the agent space store is unavailable".to_string(),
+            })
+        })?;
+
+        // `agentSpaceId` is `@required` but carries no `@length` in the model, so an
+        // empty one reaches the handler. It names no agent space and never could, so it
+        // is a bad request rather than a missing resource — the same split
+        // `UpdateAgentSpace` applies to the id it looks up.
+        if input.agent_space_id.is_empty() {
+            let violation = "member must not be empty";
+            return Err(DeleteAgentSpaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "1 validation error detected: value for 'agentSpaceId' failed to \
+                         satisfy constraint: {violation}"
+                    ),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "agentSpaceId".to_string(),
+                        message: violation.to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let mut state = state.lock();
+
+        // The record is dropped from the store, so every read that resolves an id — a
+        // batch get, a listing — no longer finds it and reports that id as unresolved
+        // instead of serving the record this call removed. An id the account does not
+        // hold is refused rather than answered as a delete that happened, so a client
+        // cannot read the deletion of a typo as the deletion of the agent space it meant.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAgentSpace"))
+        // "and all of its associated resources": this service's store holds no record
+        // that hangs off an agent space yet (`crate::state`), so there is nothing beside
+        // the agent space itself to cascade to. The target domains it was associated
+        // with are records of their own, registered independently of any agent space,
+        // so they are not removed with it.
+        let removed = state
+            .agent_spaces
+            .remove(&input.agent_space_id)
+            .ok_or_else(|| {
+                DeleteAgentSpaceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        // The service's own sentence for an agent space it cannot
+                        // resolve (`crate::state::AGENT_SPACE_NOT_FOUND`): fixed text,
+                        // carrying nothing the request sent.
+                        message: crate::state::AGENT_SPACE_NOT_FOUND.to_string(),
+                    },
+                )
+            })?;
+
+        // "The unique identifier of the deleted agent space": the id of the record that
+        // was removed, read off that record rather than off the request — under the
+        // modelled member and, recorded but not modelled, under the name the service's
+        // own record uses for the same value.
+        Ok(DeleteAgentSpaceOutput {
+            id: removed.agent_space_id.clone(),
+            agent_space_id: Some(removed.agent_space_id),
+        })
     }
 }

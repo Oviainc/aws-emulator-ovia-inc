@@ -60,9 +60,11 @@
 //!
 //! Both lists above are always present, empty when nothing fell on that side of the
 //! partition, and each agent space carries `id`, `ownerId`, `arn` and the resolved
-//! `targetDomains` beside the modelled members. Beside the partition the recorded 200
-//! carries a second pair of lists, `agentInstances` and `ids`, which the service keeps
-//! in the response and does not fill. The wire form, and the evidence for it, live on
+//! `targetDomains` beside the modelled members, with its collection members present as
+//! arrays rather than absent. Beside the partition the recorded 200 carries a second
+//! pair of lists, `agentInstances` and `ids`: the records this read resolved, again as
+//! the agent INSTANCE view the service's own store names them by, and the ids they
+//! resolved to. The wire form, and the evidence for it, live on
 //! `BatchGetAgentSpacesOutput` and `AgentSpace` in
 //! `src/ops/types/batch_get_agent_spaces_types.rs`.
 
@@ -154,6 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut agent_spaces = Vec::new();
         let mut not_found = Vec::new();
+        let mut ids = Vec::new();
         // Each requested id is answered once, in the order it was asked for: a repeat
         // of an id already answered adds no second entry to either list.
         let mut answered = ::std::collections::BTreeSet::new();
@@ -164,8 +167,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match state.agent_spaces.get(agent_space_id) {
                 // The stored record's own projection, never the request's text — the
                 // same one `CreateAgentSpace` answered, so the read reports the record
-                // member for member.
-                Some(record) => agent_spaces.push(record.modelled(&state.target_domains)),
+                // member for member, with the record's collections present as the
+                // arrays a read of the store reports (see
+                // `crate::state::AgentSpaceRecord::read_view`).
+                Some(record) => {
+                    agent_spaces.push(record.read_view(&state.target_domains));
+                    // The id the record resolved to, which is the record's own id and
+                    // not the requested text: an id this read answered.
+                    ids.push(record.agent_space_id.clone());
+                }
                 // An unknown id is part of the answer, not a failure of the call: the
                 // operation models no error for it and reports it in `notFound`.
                 None => not_found.push(agent_space_id.clone()),
@@ -174,10 +184,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Both lists always, even when empty: every requested id lands in exactly one of
         // them, so a caller iterates both unconditionally (the fields are plain `Vec`s
-        // for that reason — see `BatchGetAgentSpacesOutput`).
+        // for that reason — see `BatchGetAgentSpacesOutput`). The recorded pair beside
+        // them reports the SAME resolved records as the agent instance view of them, and
+        // the ids they resolved to, so an id answered in `notFound` contributes to
+        // neither — and the second view adds one entry per record already answered, so
+        // the response stays bounded by what the store holds (`MAX_AGENT_SPACES` records,
+        // each expanding at most `MAX_AGENT_SPACE_TARGET_DOMAINS` target domains).
         Ok(BatchGetAgentSpacesOutput {
+            agent_instances: agent_spaces.clone(),
             agent_spaces,
             not_found,
+            ids,
         })
     }
 }

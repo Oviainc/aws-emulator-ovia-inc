@@ -17,9 +17,27 @@ pub struct DeleteAgentSpaceInput {
     pub agent_space_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#DeleteAgentSpaceOutput")]
+/// `DeleteAgentSpaceOutput`, with its schema and serializer written out instead of
+/// derived (the machinery lives in `super::wire_shape`), because the recorded 200
+/// carries one member the model does not declare: `id`, the removed record's identifier
+/// under the name the service's own records use for it — the same recorded member
+/// `CreateAgentSpaceOutput` and the batch read's `AgentSpace` carry. A derived struct
+/// cannot carry a field that matches no Smithy member at all.
 #[derive(Debug, Clone, Default)]
 pub struct DeleteAgentSpaceOutput {
     pub agent_space_id: Option<String>,
+    /// Recorded, not modelled: the removed agent space's id again, under the name the
+    /// service's own record uses for it.
+    pub id: String,
 }
+
+sa_schema_and_codec!(
+    DeleteAgentSpaceOutput,
+    DELETE_AGENT_SPACE_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#DeleteAgentSpaceOutput",
+    "com.amazonaws.securityagent",
+    "DeleteAgentSpaceOutput",
+    modelled: [(M_AGENT_SPACE_ID, agent_space_id, "agentSpaceId", 0, opt, string)],
+    recorded: [(M_ID, id, "id", 1, req, string)],
+);
 

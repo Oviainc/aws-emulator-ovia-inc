@@ -12,8 +12,8 @@
 //!   emulator can carry;
 //! * an agent space carries its `id`, its owning account and its ARN, and the target
 //!   domains it is associated with RESOLVED;
-//! * a batch read always answers BOTH partition lists, beside the second, always-empty
-//!   pair the recorded wire carries;
+//! * a batch read always answers BOTH partition lists, beside the second pair the
+//!   recorded wire carries;
 //! * a pending target domain names the challenge AWS actually looks for: the
 //!   `_aws_securityagent-challenge` TXT record, or the one fixed, token-free HTTP route.
 //!
@@ -119,8 +119,9 @@ async fn create_agent_space(
 
 /// `BatchGetAgentSpaces`, as the modelled partition pair it answers: the agent spaces
 /// under `agentSpaces` and the unmatched ids under `notFound`. Both must be present.
-/// (The recorded 200 carries a second, always-empty pair beside them — `agentInstances`
-/// and `ids`; `a_batch_read_always_answers_both_partition_lists` pins those.)
+/// (The recorded 200 carries a second pair beside them — `agentInstances` and `ids`;
+/// `a_batch_read_always_answers_both_partition_lists` pins that they are present and
+/// `crate::agent_space_batch_read` pins what they carry.)
 async fn batch_get_agent_spaces(
     router: &MultiServiceRouter,
     ids: &[String],
@@ -533,8 +534,9 @@ async fn create_agent_space_echoes_the_associated_target_domains_resolved() {
 /// answers both — an id the store holds in the first, every other id in the second —
 /// so a caller iterates both unconditionally and a batch that matched nothing answers
 /// two empty arrays. `BatchGetAgentSpaces` carries, beside that modelled pair, the
-/// recorded second pair `agentInstances`/`ids`, which the service keeps in the response
-/// and does not fill: both are always present and always empty.
+/// recorded second pair `agentInstances`/`ids`: also always present, and carrying one
+/// entry per agent space the read resolved — so a batch that matched nothing answers
+/// four empty arrays. `crate::agent_space_batch_read` owns what those two entries ARE.
 #[tokio::test]
 async fn a_batch_read_always_answers_both_partition_lists() {
     let router = emulator();
@@ -575,7 +577,8 @@ async fn a_batch_read_always_answers_both_partition_lists() {
              {found_count} found and {missing_count} missing, got {spaces:?} and \
              {space_missing:?}"
         );
-        // The recorded second pair is there on every answer, and empty on every answer.
+        // The recorded second pair is there on every answer, with one entry per
+        // resolved agent space — so it is empty exactly when nothing resolved.
         let payload = ok(
             &router,
             "BatchGetAgentSpaces",
@@ -585,10 +588,10 @@ async fn a_batch_read_always_answers_both_partition_lists() {
         .await;
         for recorded in ["agentInstances", "ids"] {
             assert_eq!(
-                array(&payload, recorded, case),
-                Vec::<Value>::new(),
-                "case {case:?}: the recorded {recorded} list is present and empty — this \
-                 emulator holds no agent instance to report in it: {payload}"
+                array(&payload, recorded, case).len(),
+                found_count,
+                "case {case:?}: the recorded {recorded} list is present and carries one \
+                 entry per resolved agent space ({found_count} here): {payload}"
             );
         }
     }

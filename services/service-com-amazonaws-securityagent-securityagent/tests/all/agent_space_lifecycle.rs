@@ -59,7 +59,7 @@ fn created_id(created: &Value, case: &str) -> String {
 /// `BatchGetAgentSpaces` over `ids`, as the (found, not-found) pair it reports.
 ///
 /// The partition is the modelled `agentSpaces`/`notFound` pair; the recorded 200 carries
-/// a second, always-empty pair beside it, which `crate::recorded_wire_form` pins.
+/// a second pair beside it, which `crate::agent_space_batch_read` pins.
 async fn batch_get(
     router: &MultiServiceRouter,
     ids: &[String],
@@ -308,11 +308,22 @@ async fn create_then_batch_get_reads_back_the_stored_agent_space() {
             "case {case:?}: BatchGetAgentSpaces reported another agent space: {read}"
         );
         for name in PASS_THROUGH_MEMBERS {
+            // `targetDomainIds` is the one member the READ reports differently from the
+            // create: a read of the store reports the record's collections, so the
+            // member is an array on every agent space it answers — empty for a record
+            // that names no target domain, where the create echoes the absent member as
+            // absent. `crate::agent_space_batch_read` owns that rule; here the stored
+            // value is compared against what the request supplied, read through the
+            // same normalisation.
+            let supplied = if *name == "targetDomainIds" {
+                Some(value(&request, name).unwrap_or_else(|| json!([])))
+            } else {
+                value(&request, name)
+            };
             assert_eq!(
                 value(read, name),
-                value(&request, name),
-                "case {case:?}: expected the stored {name} {:?}, got {:?}",
-                value(&request, name),
+                supplied,
+                "case {case:?}: expected the stored {name} {supplied:?}, got {:?}",
                 value(read, name)
             );
         }
