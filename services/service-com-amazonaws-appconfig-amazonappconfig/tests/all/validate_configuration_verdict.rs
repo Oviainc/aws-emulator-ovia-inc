@@ -88,7 +88,7 @@ fn schema_validator(schema: &str) -> Value {
 }
 
 /// A hosted configuration profile carrying `validators`. Answers its minted id.
-async fn given_profile(
+pub(crate) async fn given_profile(
     router: &MultiServiceRouter,
     case: &str,
     application: &str,
@@ -120,7 +120,7 @@ async fn given_profile(
 ///
 /// Asserted to be accepted: a profile's validators gate the calls that put a configuration
 /// into service, not its STORAGE, so a version no validator admits is stored verbatim.
-async fn given_version(
+pub(crate) async fn given_version(
     router: &MultiServiceRouter,
     case: &str,
     application: &str,
@@ -155,7 +155,7 @@ async fn given_version(
 }
 
 /// `ValidateConfiguration` of one configuration version, named as the caller spells it.
-async fn validate_configuration(
+pub(crate) async fn validate_configuration(
     router: &MultiServiceRouter,
     application: &str,
     profile: &str,
