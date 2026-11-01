@@ -127,7 +127,7 @@ async fn furnished_bucket(router: &MultiServiceRouter, name: &str) {
     );
     let tagged = send(router, "PUT", &format!("/{name}?tagging"), &[], &tagging).await;
     assert_eq!(
-        tagged.status, 200,
+        tagged.status, 204,
         "the bucket {name:?} must take its tag set, got {}",
         tagged.status
     );

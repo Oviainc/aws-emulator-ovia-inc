@@ -28,7 +28,9 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{create_bucket, router, send, Answer};
-use super::bucket_tagging::{get_bucket_tagging, put_bucket_tagging, tag, tag_set_of};
+use super::bucket_tagging::{
+    delete_bucket_tagging, get_bucket_tagging, put_bucket_tagging, tag, tag_set_of,
+};
 
 /// One row: which bucket's which subresource is read, and the status, wire code and
 /// `<Message>` that read must answer with.
@@ -49,12 +51,6 @@ async fn read_subresource(
     subresource: &str,
 ) -> Answer {
     send(router, "GET", &format!("/{bucket}?{subresource}"), &[], "").await
-}
-
-/// `DELETE /<bucket>?tagging` — `DeleteBucketTagging`, one of the two ways below a bucket
-/// ends up holding no tag set after having held one.
-async fn delete_bucket_tagging(router: &MultiServiceRouter, bucket: &str) -> Answer {
-    send(router, "DELETE", &format!("/{bucket}?tagging"), &[], "").await
 }
 
 #[tokio::test]
@@ -91,7 +87,7 @@ async fn an_absent_subresource_is_refused_with_its_codes_published_message() {
     // The tag set this bucket keeps: every refusal below must be unaffected by it.
     let neighbour = put_bucket_tagging(&router, "subresource-tagging-neighbour", &stored).await;
     assert_eq!(
-        neighbour.status, 200,
+        neighbour.status, 204,
         "the neighbouring bucket must accept a tag set, got {} with body {:?}",
         neighbour.status,
         String::from_utf8_lossy(&neighbour.body)
@@ -100,7 +96,7 @@ async fn an_absent_subresource_is_refused_with_its_codes_published_message() {
     // Way two to hold no tag set: one was stored and then deleted.
     let put = put_bucket_tagging(&router, "subresource-tagging-deleted", &stored).await;
     assert_eq!(
-        put.status, 200,
+        put.status, 204,
         "the setup put must succeed, got {} with body {:?}",
         put.status,
         String::from_utf8_lossy(&put.body)
@@ -116,14 +112,14 @@ async fn an_absent_subresource_is_refused_with_its_codes_published_message() {
     // Way three: one was stored and then replaced by an empty tag set.
     let put = put_bucket_tagging(&router, "subresource-tagging-emptied", &stored).await;
     assert_eq!(
-        put.status, 200,
+        put.status, 204,
         "the setup put must succeed, got {} with body {:?}",
         put.status,
         String::from_utf8_lossy(&put.body)
     );
     let emptied = put_bucket_tagging(&router, "subresource-tagging-emptied", &[]).await;
     assert_eq!(
-        emptied.status, 200,
+        emptied.status, 204,
         "the setup put of an empty tag set must succeed, got {} with body {:?}",
         emptied.status,
         String::from_utf8_lossy(&emptied.body)
@@ -344,7 +340,7 @@ async fn an_absent_subresource_is_refused_with_its_codes_published_message() {
     // it, so the refusal left the bucket usable.
     let put = put_bucket_tagging(&router, "subresource-absent", &stored).await;
     assert_eq!(
-        put.status, 200,
+        put.status, 204,
         "a refused read must leave the bucket tagable, got {} with body {:?}",
         put.status,
         String::from_utf8_lossy(&put.body)

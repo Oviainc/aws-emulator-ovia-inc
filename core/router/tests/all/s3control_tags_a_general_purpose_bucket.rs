@@ -400,8 +400,8 @@ fn a_bucket_tagged_through_s3control_reports_those_tags_through_s3() {
                 let replaced =
                     s3_put_bucket_tagging(&router, &runtime, &row.bucket, &row.through_s3);
                 assert_eq!(
-                    replaced.status, 200,
-                    "case {case:?}: expected 200 from PutBucketTagging, got {} / {}",
+                    replaced.status, 204,
+                    "case {case:?}: expected 204 from PutBucketTagging, got {} / {}",
                     replaced.status, replaced.body
                 );
                 let listed = s3control_list_tags(&router, &runtime, &row.resource_arn);

@@ -3,8 +3,8 @@
 //! @op PutBucketTagging
 //!
 //! Stores the request's `TagSet` as the named bucket's whole tag set, replacing whatever
-//! the bucket held, and answers 200 with an empty body. `GetBucketTagging` reads the same
-//! state back and `DeleteBucketTagging` removes it.
+//! the bucket held, and answers `204 No Content` with an empty body. `GetBucketTagging`
+//! reads the same state back and `DeleteBucketTagging` removes it.
 //!
 //! ## Shape of an operation
 //!
@@ -106,8 +106,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 pub struct PutBucketTaggingOutput;
 
 impl PutBucketTaggingOutput {
-    // `with_http` carries this operation's modelled response status. Remove it and
-    // the status falls back to the protocol default, so a modelled 204 answers 200.
+    // `with_http` carries this operation's response status. Remove it and the status
+    // falls back to the protocol default, so a 204 operation answers 200.
+    //
+    // 204, not the model's declared 200: see [`PUT_BUCKET_TAGGING_SUCCESS_STATUS`].
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
         ::aws_smithy_schema::ShapeType::Structure,
@@ -116,9 +118,21 @@ impl PutBucketTaggingOutput {
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "PUT",
         "/{Bucket}?tagging",
-        Some(200u16),
+        Some(PUT_BUCKET_TAGGING_SUCCESS_STATUS),
     ));
 }
+
+/// The HTTP status a successful `PutBucketTagging` answers: `204 No Content`.
+///
+/// A successful bucket-tagging write has nothing to return — the modelled output shape is
+/// `smithy.api#Unit`, which `smithy_query(query="operation",
+/// operation="PutBucketTagging")` reports with no members — and S3 reports it with 204
+/// and an empty body (its API Reference sample response is `HTTP/1.1 204 No Content`, and
+/// recorded traffic agrees), where the model's `@http(code:)` says 200. The same
+/// subresource's `DeleteBucketTagging` carries 204 in the model itself. Named once here
+/// so the operation's `SUCCESS_STATUS` (which is what the serializer reads) and the
+/// output schema's `@http` code cannot drift apart.
+pub const PUT_BUCKET_TAGGING_SUCCESS_STATUS: u16 = 204;
 
 pub static PUT_BUCKET_TAGGING_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &PutBucketTaggingOutput::SCHEMA;
 
@@ -188,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "PutBucketTagging";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_BUCKET_TAGGING_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = PUT_BUCKET_TAGGING_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = PUT_BUCKET_TAGGING_SUCCESS_STATUS;
 
     async fn handle(
         &self,
@@ -251,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the bucket with no tags associated.
         bucket.replace_tags(tags);
 
-        // `Unit` output: success is the 200 and an empty body.
+        // `Unit` output: success is the 204 and an empty body.
         Ok(PutBucketTaggingOutput)
     }
 }

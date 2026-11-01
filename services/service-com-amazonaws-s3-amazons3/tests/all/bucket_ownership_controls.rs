@@ -633,7 +633,7 @@ async fn deleting_ownership_controls_is_scoped_to_the_named_bucket() {
         // scoped to the ownership controls rather than to the bucket's whole record.
         let tagged = put_bucket_tagging(&router, bucket, &[tag("suite", bucket)]).await;
         assert_eq!(
-            tagged.status, 200,
+            tagged.status, 204,
             "case {bucket:?}: the setup tagging put must succeed, got {} with body {:?}",
             tagged.status,
             String::from_utf8_lossy(&tagged.body)

@@ -270,7 +270,7 @@ async fn a_removal_is_scoped_to_the_object_it_addresses() {
     }
     let stored = put_bucket_tagging(&router, "removal-scope-one", &bucket_set).await;
     assert_eq!(
-        stored.status, 200,
+        stored.status, 204,
         "the bucket's own tag set must be stored first, got {} with body {:?}",
         stored.status,
         text(&stored)

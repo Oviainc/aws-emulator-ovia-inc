@@ -1188,8 +1188,8 @@ async fn objects_and_tag_sets_are_held_per_bucket() {
         );
         let tagged = put_bucket_tagging(&router, name, &[tag("side", side)]).await;
         assert_eq!(
-            tagged.status, 200,
-            "case {name:?}: expected HTTP 200 from PutBucketTagging, got {} with body {:?}",
+            tagged.status, 204,
+            "case {name:?}: expected HTTP 204 from PutBucketTagging, got {} with body {:?}",
             tagged.status,
             text(&tagged)
         );

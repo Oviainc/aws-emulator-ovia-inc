@@ -363,7 +363,7 @@ async fn a_bucket_tag_set_round_trips_and_a_put_replaces_it() {
         )
         .await;
         assert_eq!(
-            answer.status, 200,
+            answer.status, 204,
             "case {label:?}: PutBucketTagging must accept it, got {} with body {}",
             answer.status, answer.body
         );

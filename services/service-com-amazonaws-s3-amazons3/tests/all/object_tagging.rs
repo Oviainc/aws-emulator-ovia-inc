@@ -398,7 +398,7 @@ async fn a_tag_set_past_a_published_limit_is_refused_and_changes_nothing() {
     );
     let on_bucket = put_bucket_tagging(&router, "object-tag-refusals", &eleven).await;
     assert_eq!(
-        on_bucket.status, 200,
+        on_bucket.status, 204,
         "a bucket holds up to {MAX_TAGS_PER_BUCKET} tags, so the set must be accepted \
          there, got {} with body {:?}",
         on_bucket.status,

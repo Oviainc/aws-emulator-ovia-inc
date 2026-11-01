@@ -91,6 +91,8 @@ mod bucket_request_payment;
 mod bucket_subresource_absent_messages;
 #[path = "all/bucket_tagging.rs"]
 mod bucket_tagging;
+#[path = "all/bucket_tagging_put_status.rs"]
+mod bucket_tagging_put_status;
 #[path = "all/bucket_versioning.rs"]
 mod bucket_versioning;
 #[path = "all/bucket_website.rs"]

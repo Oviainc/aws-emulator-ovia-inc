@@ -10,7 +10,9 @@
 //! The rules under test, with their sources:
 //!
 //! * `PutBucketTagging` replaces a bucket's whole tag set with the request's `TagSet` and
-//!   answers 200 with an empty body: "When this operation sets the tags for a bucket, it
+//!   answers `204 No Content` with an empty body (the status the sibling suite
+//!   [`super::bucket_tagging_put_status`] pins over a table of its own): "When this
+//!   operation sets the tags for a bucket, it
 //!   will overwrite any current tags the bucket already has. You cannot use this operation
 //!   to add tags to an existing list of tags" (the operation's own documentation).
 //! * `GetBucketTagging` reports exactly that tag set, and when a bucket has none it
@@ -80,7 +82,10 @@ pub(crate) async fn get_bucket_tagging(router: &MultiServiceRouter, bucket: &str
 }
 
 /// `DELETE /<bucket>?tagging` — `DeleteBucketTagging`.
-async fn delete_bucket_tagging(router: &MultiServiceRouter, bucket: &str) -> Answer {
+///
+/// `pub(crate)`, like the helpers above it: the sibling suites in this same test crate
+/// remove a bucket's tag set through this one rather than writing the request again.
+pub(crate) async fn delete_bucket_tagging(router: &MultiServiceRouter, bucket: &str) -> Answer {
     send(router, "DELETE", &format!("/{bucket}?tagging"), &[], "").await
 }
 
@@ -230,8 +235,8 @@ async fn putting_a_tag_set_stores_it_and_reads_back_through_get_bucket_tagging()
 
         let put = put_bucket_tagging(&router, &bucket, &tags).await;
         assert_eq!(
-            put.status, 200,
-            "case {case:?}: expected the modelled 200 from PutBucketTagging, got {} with \
+            put.status, 204,
+            "case {case:?}: expected 204 No Content from PutBucketTagging, got {} with \
              body {:?}",
             put.status,
             String::from_utf8_lossy(&put.body)
@@ -263,7 +268,7 @@ async fn putting_a_tag_set_stores_it_and_reads_back_through_get_bucket_tagging()
         let replacement = vec![tag("replaced", "by-the-second-put")];
         let second = put_bucket_tagging(&router, &bucket, &replacement).await;
         assert_eq!(
-            second.status, 200,
+            second.status, 204,
             "case {case:?}: the replacing put must succeed, got {} with body {:?}",
             second.status,
             String::from_utf8_lossy(&second.body)
@@ -300,7 +305,7 @@ async fn removing_a_tag_set_leaves_the_bucket_with_none() {
             1 => {
                 let put = put_bucket_tagging(&router, bucket, &stored).await;
                 assert_eq!(
-                    put.status, 200,
+                    put.status, 204,
                     "case {case:?}: the setup put must succeed, got {}",
                     put.status
                 );
@@ -316,13 +321,13 @@ async fn removing_a_tag_set_leaves_the_bucket_with_none() {
             2 => {
                 let put = put_bucket_tagging(&router, bucket, &stored).await;
                 assert_eq!(
-                    put.status, 200,
+                    put.status, 204,
                     "case {case:?}: the setup put must succeed, got {}",
                     put.status
                 );
                 let emptied = put_bucket_tagging(&router, bucket, &[]).await;
                 assert_eq!(
-                    emptied.status, 200,
+                    emptied.status, 204,
                     "case {case:?}: a put of an empty TagSet must succeed, got {} with \
                      body {:?}",
                     emptied.status,
@@ -361,7 +366,7 @@ async fn removing_a_tag_set_leaves_the_bucket_with_none() {
     // broken bucket.
     let put = put_bucket_tagging(&router, bucket, &stored).await;
     assert_eq!(
-        put.status, 200,
+        put.status, 204,
         "a bucket whose tag set was removed must accept a new one, got {}",
         put.status
     );
@@ -389,7 +394,7 @@ async fn a_tag_set_past_a_published_limit_is_refused_and_changes_nothing() {
     let stored = vec![tag("keep", "me"), tag("and", "me-too")];
     let put = put_bucket_tagging(&router, bucket, &stored).await;
     assert_eq!(
-        put.status, 200,
+        put.status, 204,
         "the setup put must succeed, got {} with body {:?}",
         put.status,
         String::from_utf8_lossy(&put.body)
@@ -554,7 +559,7 @@ async fn tagging_a_bucket_this_emulator_does_not_hold_is_no_such_bucket() {
     let tags = vec![tag("sim2real", "held")];
     let put = put_bucket_tagging(&router, "held-tagged-bucket", &tags).await;
     assert_eq!(
-        put.status, 200,
+        put.status, 204,
         "the held bucket must still accept a tag set, got {} with body {:?}",
         put.status,
         String::from_utf8_lossy(&put.body)
