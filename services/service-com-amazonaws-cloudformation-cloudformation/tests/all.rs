@@ -91,6 +91,8 @@ mod failed_create_rollback;
 mod forced_stack_deletion;
 #[path = "all/foreach_expanded_output_values.rs"]
 mod foreach_expanded_output_values;
+#[path = "all/gated_update_terminal_status.rs"]
+mod gated_update_terminal_status;
 #[path = "all/generated_physical_names.rs"]
 mod generated_physical_names;
 #[path = "all/generated_template_body.rs"]

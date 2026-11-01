@@ -156,7 +156,7 @@ fn age_the_wait(
 }
 
 /// Every `LogicalResourceId` `ListStackResources` reports for a stack right now.
-async fn listed_resources(router: &MultiServiceRouter, stack_name: &str) -> Vec<String> {
+pub(crate) async fn listed_resources(router: &MultiServiceRouter, stack_name: &str) -> Vec<String> {
     let (http_status, body) = call(
         router,
         "ListStackResources",

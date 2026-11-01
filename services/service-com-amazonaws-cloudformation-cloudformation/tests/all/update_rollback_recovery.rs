@@ -599,7 +599,7 @@ pub(crate) async fn status_of(router: &MultiServiceRouter, stack: &str) -> Strin
 }
 
 /// The `StackStatusReason` a stack reports right now.
-async fn reason_of(router: &MultiServiceRouter, stack: &str) -> String {
+pub(crate) async fn reason_of(router: &MultiServiceRouter, stack: &str) -> String {
     let (_, body) = call(router, "DescribeStacks", &[member("StackName", stack)]).await;
     xml_text(&body, "StackStatusReason").unwrap_or_default()
 }
