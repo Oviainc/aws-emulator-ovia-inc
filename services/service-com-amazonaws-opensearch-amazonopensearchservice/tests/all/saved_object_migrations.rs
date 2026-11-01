@@ -27,7 +27,7 @@
 //!   job the first call started, while the same token for a different application is the
 //!   modelled `ConflictException`;
 //! * a request naming no migration target, two at once, an unsupported conflict
-//!   resolution or a source that is no ARN is refused with the modelled
+//!   resolution or a source that is no collection ARN is refused with the modelled
 //!   `ValidationException` and starts nothing;
 //! * an `applicationId` naming no application of this account, and a `migrationId`
 //!   naming no job, are refused with the modelled `ResourceNotFoundException`.
@@ -52,7 +52,7 @@ use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFI
 const SOURCE: &str = "arn:aws:aoss:us-east-1:123456789012:collection/savedobjects";
 
 /// `StartMigration`: `POST /2021-01-01/opensearch/app-migrations`.
-async fn start_migration(emulator: &Emulator, body: Value) -> Answer {
+pub(crate) async fn start_migration(emulator: &Emulator, body: Value) -> Answer {
     emulator
         .call(
             "POST",
@@ -63,7 +63,7 @@ async fn start_migration(emulator: &Emulator, body: Value) -> Answer {
 }
 
 /// `GetMigration`: `GET /2021-01-01/opensearch/app-migrations/{migrationId}`.
-async fn get_migration(emulator: &Emulator, migration_id: &str) -> Answer {
+pub(crate) async fn get_migration(emulator: &Emulator, migration_id: &str) -> Answer {
     emulator
         .call(
             "GET",
@@ -574,8 +574,8 @@ async fn a_client_token_identifies_the_start_of_one_job() {
 }
 
 /// RULE: a request that names no one migration target, an unsupported conflict
-/// resolution, a source that is no ARN or an application this account does not hold is
-/// refused with the error the operation models for it, and starts nothing.
+/// resolution, a source that is no collection ARN or an application this account does
+/// not hold is refused with the error the operation models for it, and starts nothing.
 #[tokio::test]
 async fn a_request_the_service_cannot_run_is_refused_and_starts_nothing() {
     let emulator = Emulator::new();
@@ -646,7 +646,7 @@ async fn a_request_the_service_cannot_run_is_refused_and_starts_nothing() {
             "ValidationException",
         ),
         (
-            "a source that is no ARN",
+            "a source that is no ARN at all",
             id.clone(),
             json!({
                 "source": { "datasourceArn": "saved-objects-source-domain" },
@@ -699,8 +699,10 @@ async fn a_request_the_service_cannot_run_is_refused_and_starts_nothing() {
     );
 }
 
-/// RULE: a `migrationId` that addresses no job of this account is refused with the
-/// modelled `ResourceNotFoundException`, whatever its shape.
+/// RULE: a job is addressed by its id alone, and that id names the application the job
+/// belongs to — so a `migrationId` whose application this account does not hold is
+/// refused naming THAT application, one whose application holds no such job is refused
+/// naming the job, and both are the modelled `ResourceNotFoundException`.
 #[tokio::test]
 async fn an_id_naming_no_job_is_refused() {
     let emulator = Emulator::new();
@@ -717,20 +719,51 @@ async fn an_id_naming_no_job_is_refused() {
     )
     .await;
     let migration_id = string_member(&started.body, "migrationId", "unknown ids");
+    assert!(
+        migration_id.starts_with(&format!("{id}-")),
+        "case the job that was started: expected the id to name the application it \
+         belongs to ({id}), got {migration_id:?}"
+    );
 
-    for case in [
-        "mig-000000000000",
-        "migration-1",
-        "0",
-        &migration_id.to_uppercase(),
-        &format!("{migration_id}x"),
-    ] {
-        let answer = get_migration(&emulator, case).await;
+    // (the id, the application its leading segment names, whether the refusal's message
+    // is pinned). A row whose segment is an application this account holds is refused for
+    // the JOB; every other row is refused for the APPLICATION, because there is nothing
+    // to look a job up in. The message is pinned for every row whose id has the shape an
+    // id of this service has — which refusal a MALFORMED id earns is a separate question
+    // this suite leaves to the operation's own refusal rules, so that row pins the status
+    // and the code only.
+    let rows: Vec<(String, Option<&str>, bool)> = vec![
+        ("mig-000000000000".to_string(), None, true),
+        ("migration-1".to_string(), None, true),
+        ("0".to_string(), None, false),
+        (migration_id.to_uppercase(), None, true),
+        (format!("{migration_id}x"), Some(id.as_str()), true),
+        (format!("{id}-000000000000"), Some(id.as_str()), true),
+    ];
+
+    for (case, held_by, pinned) in rows {
+        let answer = get_migration(&emulator, &case).await;
         assert_eq!(
             (answer.status, error_code(&answer).as_str()),
             (409, "ResourceNotFoundException"),
             "case {case:?}: expected 409 ResourceNotFoundException, got {} with {:?}",
             answer.status,
+            answer.body
+        );
+        if !pinned {
+            continue;
+        }
+        let expected = match held_by {
+            Some(_) => format!("Migration not found: {case}"),
+            None => format!(
+                "Application {} not found",
+                case.split_once('-').map_or(case.as_str(), |(head, _)| head)
+            ),
+        };
+        assert_eq!(
+            answer.body["message"].as_str(),
+            Some(expected.as_str()),
+            "case {case:?}: expected the refusal to name what could not be resolved, got {:?}",
             answer.body
         );
     }

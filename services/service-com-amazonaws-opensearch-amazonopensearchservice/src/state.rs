@@ -2154,10 +2154,49 @@ impl Migration {
 }
 
 /// The `ResourceNotFoundException` payload for an id that addresses no migration job of
-/// this account — the migration mirror of [`application_not_found`].
+/// an application this account DOES hold — the migration mirror of
+/// [`application_not_found`].
 pub fn migration_not_found(migration_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Migration not found: {migration_id}")),
+    }
+}
+
+/// The application a `migrationId` belongs to, as the id itself names it: the text
+/// before its first hyphen.
+///
+/// A migration is addressed by its id ALONE — `GetMigration` takes no `applicationId`
+/// (`smithy_query(query="operation",operation="GetMigration")`) — so the id has to carry
+/// the application whose workspace the job imports into, and the id this service mints
+/// ([`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_migration_id`]) does. An
+/// `Id` is `^[a-z0-9]{3,30}$`, which carries no hyphen, so the first hyphen is where the
+/// application's part of the id ends.
+///
+/// An id carrying NO hyphen names no application and no job either, so the whole of it is
+/// what the refusal has to state; whether a value that is no id of this service at all is
+/// better refused for its SHAPE, before it is resolved, is the operation's own validation
+/// question rather than this resolution's.
+pub fn migration_application_id(migration_id: &str) -> &str {
+    migration_id
+        .split_once('-')
+        .map_or(migration_id, |(application_id, _)| application_id)
+}
+
+/// The `ResourceNotFoundException` payload for a `migrationId` whose application
+/// ([`migration_application_id`]) is one this account does not hold: there is no
+/// application to resolve the job in, so what the refusal states is the missing
+/// application rather than the job.
+///
+/// It names the application, where [`application_not_found`] — the refusal an operation
+/// that CARRIES an `applicationId` answers — states only that the account holds no such
+/// application. The two are not one sentence because the saved-object migration API
+/// words this one with the id it read out of the `migrationId`, which is the only place
+/// the caller can see which application the id resolved to: a read that names the id
+/// back is the recorded answer this operation gives, and the id it names is the
+/// request's, never a value from any one run.
+pub fn migration_application_not_found(application_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Application {application_id} not found")),
     }
 }
 
@@ -9088,14 +9127,16 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Mint the identifier a saved-object migration job is addressed by, so two jobs
     /// never share one.
     ///
-    /// `migrationId` is an opaque string the model constrains not at all, so it is
-    /// minted off its own counter through the same bijection as
-    /// [`Self::mint_endpoint_suffix`], behind the `mig-` prefix that names the resource
-    /// it identifies the way `dsa-` names a data source attachment.
-    pub fn mint_migration_id(&mut self) -> String {
+    /// `migrationId` is an opaque string the model constrains not at all, and a read is
+    /// addressed by it ALONE, so it names the application whose workspace the job
+    /// imports into and then an opaque part minted off its own counter through the same
+    /// bijection as [`Self::mint_endpoint_suffix`]. The application's `Id` carries no
+    /// hyphen (`^[a-z0-9]{3,30}$`), so the hyphen between the two parts is what
+    /// [`migration_application_id`] reads the application back out of.
+    pub fn mint_migration_id(&mut self, application_id: &str) -> String {
         self.migration_seq = self.migration_seq.wrapping_add(1);
         format!(
-            "mig-{}",
+            "{application_id}-{}",
             opaque_token(self.migration_seq, MIGRATION_ID_OFFSET)
         )
     }
@@ -10171,55 +10212,132 @@ pub fn domain_arn(domain_name: &str, region: &str) -> String {
 /// ([`Index::schema`]), while the domain's own REST data plane reads and writes JSON, so
 /// the two meet here — one index record whichever path created it, rather than two stores
 /// that could report the same index differently.
+///
+/// Iterative rather than recursive, like every other walk over a document here
+/// ([`index_schema_depth`], [`index_schema_values`], [`merged_index_schema`]): the
+/// nesting of the value handed over is the CALLER's, and a stack this process overruns
+/// takes the whole process down rather than failing the one request, so the walk holds
+/// its state on the heap, where the size of the value already bounds it. A container is
+/// assembled out of its converted children, so it is pushed BEHIND them.
 #[must_use]
 pub fn document_from_json(value: &::serde_json::Value) -> ::aws_smithy_types::Document {
     use ::aws_smithy_types::{Document, Number};
-    match value {
-        ::serde_json::Value::Null => Document::Null,
-        ::serde_json::Value::Bool(flag) => Document::Bool(*flag),
-        ::serde_json::Value::String(text) => Document::String(text.clone()),
-        ::serde_json::Value::Number(number) => Document::Number(
-            number
-                .as_i64()
-                .map(Number::NegInt)
-                .unwrap_or_else(|| Number::Float(number.as_f64().unwrap_or_default())),
-        ),
-        ::serde_json::Value::Array(elements) => {
-            Document::Array(elements.iter().map(document_from_json).collect())
+
+    let mut pending = vec![Step::Convert(value)];
+    // The children converted so far whose container has yet to be assembled, in the
+    // order they were converted.
+    let mut converted: Vec<Document> = Vec::new();
+    while let Some(step) = pending.pop() {
+        match step {
+            Step::Convert(::serde_json::Value::Null) => converted.push(Document::Null),
+            Step::Convert(::serde_json::Value::Bool(flag)) => {
+                converted.push(Document::Bool(*flag));
+            }
+            Step::Convert(::serde_json::Value::String(text)) => {
+                converted.push(Document::String(text.clone()));
+            }
+            Step::Convert(::serde_json::Value::Number(number)) => {
+                converted.push(Document::Number(
+                    number
+                        .as_i64()
+                        .map(Number::NegInt)
+                        .unwrap_or_else(|| Number::Float(number.as_f64().unwrap_or_default())),
+                ));
+            }
+            Step::Convert(::serde_json::Value::Array(elements)) => {
+                pending.push(Step::Array(elements.len()));
+                // Pushed in reverse, so the elements come off the stack in order.
+                pending.extend(elements.iter().rev().map(Step::Convert));
+            }
+            Step::Convert(::serde_json::Value::Object(members)) => {
+                // The names and the children are taken from ONE walk of the members, so
+                // a name cannot be paired with another member's value.
+                let (names, children): (Vec<String>, Vec<&::serde_json::Value>) = members
+                    .iter()
+                    .map(|(name, child)| (name.clone(), child))
+                    .unzip();
+                pending.push(Step::Object(names));
+                pending.extend(children.into_iter().rev().map(Step::Convert));
+            }
+            Step::Array(len) => {
+                let elements = converted.split_off(converted.len().saturating_sub(len));
+                converted.push(Document::Array(elements));
+            }
+            Step::Object(names) => {
+                let values = converted.split_off(converted.len().saturating_sub(names.len()));
+                converted.push(Document::Object(names.into_iter().zip(values).collect()));
+            }
         }
-        ::serde_json::Value::Object(members) => Document::Object(
-            members
-                .iter()
-                .map(|(name, member)| (name.clone(), document_from_json(member)))
-                .collect(),
-        ),
     }
+    // The walk started with ONE value, so what it leaves behind is that value's document.
+    converted.pop().unwrap_or(Document::Null)
+}
+
+/// One step of a conversion walk: a value still to convert, or the container to assemble
+/// out of the converted children that follow it — a list of that many elements, or a set
+/// of members under those names.
+///
+/// Shared by both directions ([`document_from_json`] and [`json_from_document`]), so the
+/// two cannot drift into different walks of the same tree.
+enum Step<'a, T> {
+    Convert(&'a T),
+    Array(usize),
+    Object(Vec<String>),
 }
 
 /// [`document_from_json`] the other way: the JSON value a stored schema document is
 /// reported as on the REST data plane.
+///
+/// Iterative for the same reason, and by the same walk: a document this service stored is
+/// as deeply nested as the value a caller handed it.
 #[must_use]
 pub fn json_from_document(document: &::aws_smithy_types::Document) -> ::serde_json::Value {
     use ::aws_smithy_types::{Document, Number};
-    match document {
-        Document::Null => ::serde_json::Value::Null,
-        Document::Bool(flag) => ::serde_json::Value::Bool(*flag),
-        Document::String(text) => ::serde_json::Value::String(text.clone()),
-        Document::Number(Number::PosInt(value)) => ::serde_json::Value::from(*value),
-        Document::Number(Number::NegInt(value)) => ::serde_json::Value::from(*value),
-        Document::Number(Number::Float(value)) => ::serde_json::Number::from_f64(*value)
-            .map(::serde_json::Value::Number)
-            .unwrap_or(::serde_json::Value::Null),
-        Document::Array(elements) => {
-            ::serde_json::Value::Array(elements.iter().map(json_from_document).collect())
+    use ::serde_json::Value;
+
+    let mut pending = vec![Step::Convert(document)];
+    let mut converted: Vec<Value> = Vec::new();
+    while let Some(step) = pending.pop() {
+        match step {
+            Step::Convert(Document::Null) => converted.push(Value::Null),
+            Step::Convert(Document::Bool(flag)) => converted.push(Value::Bool(*flag)),
+            Step::Convert(Document::String(text)) => converted.push(Value::String(text.clone())),
+            Step::Convert(Document::Number(Number::PosInt(value))) => {
+                converted.push(Value::from(*value));
+            }
+            Step::Convert(Document::Number(Number::NegInt(value))) => {
+                converted.push(Value::from(*value));
+            }
+            Step::Convert(Document::Number(Number::Float(value))) => {
+                converted.push(
+                    ::serde_json::Number::from_f64(*value)
+                        .map(Value::Number)
+                        .unwrap_or(Value::Null),
+                );
+            }
+            Step::Convert(Document::Array(elements)) => {
+                pending.push(Step::Array(elements.len()));
+                pending.extend(elements.iter().rev().map(Step::Convert));
+            }
+            Step::Convert(Document::Object(members)) => {
+                let (names, children): (Vec<String>, Vec<&Document>) = members
+                    .iter()
+                    .map(|(name, child)| (name.clone(), child))
+                    .unzip();
+                pending.push(Step::Object(names));
+                pending.extend(children.into_iter().rev().map(Step::Convert));
+            }
+            Step::Array(len) => {
+                let elements = converted.split_off(converted.len().saturating_sub(len));
+                converted.push(Value::Array(elements));
+            }
+            Step::Object(names) => {
+                let values = converted.split_off(converted.len().saturating_sub(names.len()));
+                converted.push(Value::Object(names.into_iter().zip(values).collect()));
+            }
         }
-        Document::Object(members) => ::serde_json::Value::Object(
-            members
-                .iter()
-                .map(|(name, member)| (name.clone(), json_from_document(member)))
-                .collect(),
-        ),
     }
+    converted.pop().unwrap_or(Value::Null)
 }
 
 /// The domain-specific endpoint index, search and data-upload requests go to.

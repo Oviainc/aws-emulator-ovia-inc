@@ -7,6 +7,13 @@
 //! materialised, so a caller polling the job sees the export and the import complete
 //! without any call having asked for the move.
 //!
+//! The job is addressed by its id ALONE, and that id names the application the job
+//! imports into ([`crate::state::migration_application_id`]), so the application is what
+//! is resolved first: an id whose application this account does not hold names no
+//! application to look a job up in
+//! ([`crate::state::migration_application_not_found`]), and one whose application holds
+//! no such job names no job ([`crate::state::migration_not_found`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -88,7 +95,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{migration_not_found, service_state, state_unavailable};
+use crate::state::{
+    migration_application_id, migration_application_not_found, migration_not_found, service_state,
+    state_unavailable,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -167,6 +177,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // The applications are settled first, so what follows is decided on the set of
+        // applications this account holds at `now`: one whose deletion has fallen due is
+        // no longer held, and neither are the jobs that belonged to it.
+        store.settle_applications(now);
+
+        // A job belongs to the application it imports into, and its id names that
+        // application, so the application is where the id is resolved: an id naming one
+        // this account does not hold addresses no job because there is nothing to address
+        // it in, which is what the refusal states.
+        let application_id = migration_application_id(&input.migration_id);
+        if !store.applications.contains_key(application_id) {
+            return Err(GetMigrationErrorModeled::ResourceNotFoundException(
+                migration_application_not_found(application_id),
+            )
+            .into());
+        }
 
         let migration = store
             .settled_migration_mut(&input.migration_id, now)

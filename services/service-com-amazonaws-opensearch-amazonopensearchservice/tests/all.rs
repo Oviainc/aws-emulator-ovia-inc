@@ -115,6 +115,8 @@ mod instance_type_engine_refusal;
 mod instance_type_limits;
 #[path = "all/migration_listing.rs"]
 mod migration_listing;
+#[path = "all/migration_source_constraint.rs"]
+mod migration_source_constraint;
 #[path = "all/package_association_listings.rs"]
 mod package_association_listings;
 #[path = "all/package_associations.rs"]

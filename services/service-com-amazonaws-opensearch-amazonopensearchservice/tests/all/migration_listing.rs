@@ -44,7 +44,11 @@ use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFI
 const SOURCE: &str = "arn:aws:aoss:us-east-1:123456789012:collection/listedobjects";
 
 /// `ListMigrations`: `GET /2021-01-01/opensearch/app-migrations?applicationId=…`.
-async fn list_migrations(emulator: &Emulator, application_id: &str, query: &str) -> Answer {
+pub(crate) async fn list_migrations(
+    emulator: &Emulator,
+    application_id: &str,
+    query: &str,
+) -> Answer {
     emulator
         .call(
             "GET",

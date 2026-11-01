@@ -452,14 +452,18 @@ fn the_es_endpoint_serves_both_api_versions() {
                 },
                 Call {
                     // As for `StartMigration` above: the implemented modern-model read
-                    // answers its own not-found refusal for an id addressing no job.
+                    // answers its own not-found refusal for an id addressing no job. A
+                    // migration's id names the application it belongs to, and the
+                    // segment of this one names no application of this account, so the
+                    // refusal states that — a sentence only the modern model can
+                    // produce.
                     case: "GetMigration reaches the modern model",
                     method: "GET",
                     path: "/2021-01-01/opensearch/app-migrations/router-migration-id",
                     body: None,
                     expected_status: 409,
                     expected_error: Some("ResourceNotFoundException"),
-                    expected_contains: &["Migration not found: router-migration-id"],
+                    expected_contains: &["Application router not found"],
                     expected_absent: &[],
                 },
                 Call {

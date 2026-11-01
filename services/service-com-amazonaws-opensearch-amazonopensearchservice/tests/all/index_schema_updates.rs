@@ -34,7 +34,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::INDEX_STATUS_VALUES;
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    INDEX_SCHEMA_MAX_DEPTH, INDEX_SCHEMA_QUOTA, INDEX_STATUS_UPDATED,
+    self, INDEX_SCHEMA_MAX_DEPTH, INDEX_SCHEMA_QUOTA, INDEX_STATUS_UPDATED,
 };
 
 use super::data_source_registry::created_domain;
@@ -932,6 +932,60 @@ async fn a_schema_nesting_past_the_emulators_own_depth_bound_is_refused() {
         "after the refusals",
     )
     .await;
+}
+
+/// RULE: converting a schema between the JSON a REST request carries and the document
+/// this service stores it as preserves the value — a value converted to a document and
+/// back is the value it started as, with its nesting intact — at every nesting a caller
+/// can hand over, including past the depth a stored schema may reach.
+///
+/// The conversion walks hold their state on the heap rather than one stack frame per
+/// level, because the nesting is the CALLER's: the rows therefore run from a flat value
+/// to one nesting several times the bound this service enforces on a stored schema and
+/// past the depth the request boundary's own deserializer admits, over both kinds of
+/// container and the leaf value types a schema carries.
+///
+/// The deepest row is capped by what the TEST can do, not by what the conversion can: a
+/// `serde_json::Value` is compared and dropped by walks of its own that recurse per
+/// level, so a row deep enough to overrun a recursive conversion would overrun this
+/// test's own comparison first — and a stack overflow aborts the whole test binary
+/// rather than failing one case. What the rows pin is therefore that the walk preserves
+/// the value and its nesting; costing no stack is a property of the implementation,
+/// which holds no per-level frame at all.
+#[test]
+fn the_schema_conversions_round_trip_at_any_nesting() {
+    // (the case, the depth the value nests to)
+    let rows: Vec<(&str, usize)> = vec![
+        ("a flat value", 1),
+        ("inside the stored bound", INDEX_SCHEMA_MAX_DEPTH / 2),
+        ("at the stored bound", INDEX_SCHEMA_MAX_DEPTH),
+        ("past what any request may carry", INDEX_SCHEMA_MAX_DEPTH * 3),
+    ];
+
+    for (case, depth) in rows {
+        // Both kinds of container at every level, so the walk is exercised over lists as
+        // well as named sets, beside the leaf value types a schema carries.
+        let mut value = json!({ "type": "text", "boost": 1.5, "indexed": true, "copy_to": null });
+        for _ in 1..depth {
+            value = json!({ "properties": [value] });
+        }
+
+        let document = state::document_from_json(&value);
+        let back = state::json_from_document(&document);
+        assert_eq!(
+            back, value,
+            "case {case:?} (depth {depth}): expected the conversion to round-trip, got {back:?}"
+        );
+        assert_eq!(
+            state::index_schema_depth(&document),
+            // Two levels per step of the construction above — the named set and the list
+            // inside it — and two for the leaf set and its members.
+            depth * 2,
+            "case {case:?}: expected the document to nest as deeply as the value it was \
+             converted from, got {:?}",
+            state::index_schema_depth(&document)
+        );
+    }
 }
 
 #[tokio::test]

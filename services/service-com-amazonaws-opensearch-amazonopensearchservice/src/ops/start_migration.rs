@@ -97,8 +97,8 @@
 use super::types::*;
 
 use crate::state::{
-    application_not_found, is_arn, malformed_arn, migration_client_token_taken,
-    migration_quota_exceeded, migration_workspace_refusal, service_state, state_unavailable,
+    application_not_found, migration_client_token_taken, migration_quota_exceeded,
+    migration_workspace_refusal, service_state, state_unavailable,
     unsupported_conflict_resolution, Migration, CONFLICT_RESOLUTION_VALUES, MIGRATION_QUOTA,
     MIGRATION_STATUS_PENDING,
 };
@@ -200,17 +200,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `ARN` is `@length(20..2048)` with pattern `.*`, so the request boundary
-        // enforces only the length: a value no ARN parser would accept names no data
-        // source, and is refused as the malformed input it is.
-        if !is_arn(&options.source.datasource_arn) {
-            return Err(StartMigrationErrorModeled::ValidationException(malformed_arn(
-                "migrationOptions.source.datasourceArn",
-                &options.source.datasource_arn,
-            ))
-            .into());
-        }
-
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -258,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut migration = Migration {
-            migration_id: store.mint_migration_id(),
+            migration_id: store.mint_migration_id(&input.application_id),
             application_id: input.application_id,
             source: options.source,
             workspace: options.workspace,
