@@ -1330,7 +1330,7 @@ impl ComAmazonawsAmplifyAmplifyState {
     /// case-insensitive and ignores any port, because a host is. `None` when no branch
     /// of any app is hosted there.
     ///
-    /// `&mut` because serving a request REPORTS on the branch, and reporting
+    /// `&mut` on the branch because serving a request REPORTS on it, and reporting
     /// materialises what the clock already owes it ([`AmplifyBranch::settle`]) — never
     /// anything else. The resolution happens HERE, where the rules and the files both
     /// live, so a visit copies neither: the rules are configured on the APP

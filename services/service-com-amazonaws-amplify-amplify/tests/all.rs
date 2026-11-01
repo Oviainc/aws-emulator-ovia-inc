@@ -43,6 +43,8 @@ mod domain_associations;
 mod hosted_branch_rewrites;
 #[path = "all/hosted_branch_site.rs"]
 mod hosted_branch_site;
+#[path = "all/hosted_site_custom_rules.rs"]
+mod hosted_site_custom_rules;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/resource_untagging.rs"]
