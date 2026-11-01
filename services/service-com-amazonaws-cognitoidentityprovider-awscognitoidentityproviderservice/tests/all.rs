@@ -217,6 +217,8 @@ mod user_pool_mfa_config;
 mod user_pool_replica_deletion;
 #[path = "all/user_pool_replicas.rs"]
 mod user_pool_replicas;
+#[path = "all/user_pool_server_set_configuration.rs"]
+mod user_pool_server_set_configuration;
 #[path = "all/verification_code_pipeline.rs"]
 mod verification_code_pipeline;
 #[path = "all/web_authn_credential_registration.rs"]

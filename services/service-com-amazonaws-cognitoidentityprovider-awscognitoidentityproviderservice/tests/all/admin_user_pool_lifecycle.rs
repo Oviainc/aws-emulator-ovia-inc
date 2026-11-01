@@ -572,8 +572,36 @@ async fn a_created_pool_and_client_read_back_through_describe() {
     )
     .await["UserPool"]
         .clone();
+    // A describe reports exactly the pool the create stored, with ONE addition
+    // to the schema it reports: the attribute the service maintains for every
+    // pool (`identities`), which belongs to the pool rather than to the
+    // configuration the create's own answer reports.
+    let schema_names = |pool: &Value| -> Vec<String> {
+        pool["SchemaAttributes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a pool reports its schema, got {pool}"))
+            .iter()
+            .map(|entry| entry["Name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let without_schema = |pool: &Value| -> Value {
+        let mut pool = pool.clone();
+        if let Some(members) = pool.as_object_mut() {
+            members.remove("SchemaAttributes");
+        }
+        pool
+    };
+    let mut expected_schema = schema_names(&created_pool);
+    expected_schema.push("identities".to_string());
     assert_eq!(
-        created_pool, described_pool,
+        schema_names(&described_pool),
+        expected_schema,
+        "a describe reports the configured schema and the attribute the service maintains, got \
+         {described_pool}"
+    );
+    assert_eq!(
+        without_schema(&created_pool),
+        without_schema(&described_pool),
         "a describe must report exactly the pool the create stored"
     );
 

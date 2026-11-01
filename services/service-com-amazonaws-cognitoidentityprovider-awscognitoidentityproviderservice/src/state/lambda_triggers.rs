@@ -213,7 +213,7 @@ pub fn post_confirmation(
     caller: Caller<'_>,
     client_metadata: Option<&HashMap<String, String>>,
 ) -> Option<Dispatch> {
-    let function_arn = pool.lambda_config.as_ref()?.post_confirmation.clone()?;
+    let function_arn = pool.lambda_config.post_confirmation.clone()?;
     let event = event(
         pool,
         user,
@@ -252,7 +252,7 @@ pub fn pre_authentication(
 ) -> Option<Dispatch> {
     let pool = state.pool(user_pool_id)?;
     let user = pool.user(username)?;
-    let function_arn = pool.lambda_config.as_ref()?.pre_authentication.clone()?;
+    let function_arn = pool.lambda_config.pre_authentication.clone()?;
     let mut members = Map::new();
     // "validationData — One or more key-value pairs containing the validation data in the
     // user's sign-in request. You can pass this data to your Lambda function by using the
@@ -310,7 +310,7 @@ pub fn pre_token_generation(
 ) -> Option<Dispatch> {
     let pool = state.pool(user_pool_id)?;
     let user = pool.user(username)?;
-    let configured = pool.lambda_config.as_ref()?;
+    let configured = &pool.lambda_config;
     let (trigger_version, function_arn) = match configured.pre_token_generation_config.as_ref() {
         Some(versioned) => (
             versioned.lambda_version.clone(),

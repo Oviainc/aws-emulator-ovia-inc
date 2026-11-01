@@ -328,7 +328,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pool.schema = crate::state::effective_schema(input.schema);
         pool.admin_create_user_config =
             crate::state::effective_admin_create_user_config(input.admin_create_user_config);
-        pool.user_pool_add_ons = input.user_pool_add_ons;
+        pool.user_pool_add_ons = crate::state::effective_user_pool_add_ons(input.user_pool_add_ons);
         // The plan this pool is created on. A request that names one configures
         // it, and a request that names none is created on the cheapest plan that
         // includes every feature its configuration asks for.
@@ -346,18 +346,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pool.username_attributes = input.username_attributes.unwrap_or_default();
         pool.alias_attributes = input.alias_attributes.unwrap_or_default();
         pool.auto_verified_attributes = input.auto_verified_attributes.unwrap_or_default();
-        pool.lambda_config = input.lambda_config;
+        pool.lambda_config = crate::state::effective_lambda_config(input.lambda_config);
         pool.username_configuration = input.username_configuration;
         pool.device_configuration = input.device_configuration;
-        pool.email_configuration = input.email_configuration;
+        pool.email_configuration =
+            crate::state::effective_email_configuration(input.email_configuration);
         pool.sms_configuration = input.sms_configuration;
-        pool.verification_message_template = input.verification_message_template;
+        pool.verification_message_template =
+            crate::state::effective_verification_message_template(
+                input.verification_message_template,
+            );
         pool.account_recovery_setting = Some(crate::state::effective_account_recovery_setting(
             input.account_recovery_setting,
         ));
-        pool.user_attribute_update_settings = input.user_attribute_update_settings;
-        pool.key_configuration = input.key_configuration;
-        pool.issuer_configuration = input.issuer_configuration;
+        pool.user_attribute_update_settings =
+            crate::state::effective_user_attribute_update_settings(
+                input.user_attribute_update_settings,
+            );
+        pool.key_configuration = crate::state::effective_key_configuration(input.key_configuration);
+        pool.issuer_configuration =
+            crate::state::effective_issuer_configuration(input.issuer_configuration);
         pool.acr_configuration = input.acr_configuration;
         pool.sms_authentication_message = input.sms_authentication_message;
         pool.tags = input.user_pool_tags.unwrap_or_default();
@@ -392,11 +400,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let user_pool_id = pool.id.clone();
         guard.user_pools.insert(user_pool_id.clone(), pool);
 
-        // Rendered from the STORED pool, so the response is what a later read sees.
+        // Rendered from the STORED pool, so the response is the pool a later
+        // read reads — carrying the schema this request CONFIGURED, since the
+        // attributes the service maintains itself belong to the pool rather
+        // than to the configuration this answer reports.
         let stored = guard
             .pool(&user_pool_id)
             .ok_or_else(internal_error)?
-            .to_user_pool_type();
+            .to_configured_user_pool_type();
         Ok(CreateUserPoolOutput {
             user_pool: Some(stored),
         })

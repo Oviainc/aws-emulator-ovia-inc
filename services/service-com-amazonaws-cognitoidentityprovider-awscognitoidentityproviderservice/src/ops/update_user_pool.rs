@@ -361,20 +361,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ));
 
         // Everything else is optional with no default but "absent", so an omitted
-        // member clears what the pool held.
+        // member clears what the pool held — except the configuration blocks the
+        // service materialises for every pool, which go back to the defaults
+        // `state.rs` owns, exactly as a create with no such member stores them.
         pool.auto_verified_attributes = input.auto_verified_attributes.unwrap_or_default();
-        pool.lambda_config = input.lambda_config;
+        pool.lambda_config = crate::state::effective_lambda_config(input.lambda_config);
         pool.device_configuration = input.device_configuration;
-        pool.email_configuration = input.email_configuration;
+        pool.email_configuration =
+            crate::state::effective_email_configuration(input.email_configuration);
         pool.sms_configuration = input.sms_configuration;
-        pool.verification_message_template = input.verification_message_template;
-        pool.user_attribute_update_settings = input.user_attribute_update_settings;
-        pool.user_pool_add_ons = input.user_pool_add_ons;
-        pool.key_configuration = input.key_configuration;
-        pool.issuer_configuration = input.issuer_configuration;
+        pool.verification_message_template =
+            crate::state::effective_verification_message_template(
+                input.verification_message_template,
+            );
+        pool.user_attribute_update_settings =
+            crate::state::effective_user_attribute_update_settings(
+                input.user_attribute_update_settings,
+            );
+        pool.user_pool_add_ons = crate::state::effective_user_pool_add_ons(input.user_pool_add_ons);
+        pool.key_configuration = crate::state::effective_key_configuration(input.key_configuration);
+        pool.issuer_configuration =
+            crate::state::effective_issuer_configuration(input.issuer_configuration);
         pool.acr_configuration = input.acr_configuration;
         pool.sms_authentication_message = input.sms_authentication_message;
-        pool.tags = input.user_pool_tags.unwrap_or_default();
+        // `UserPoolTags` is the one member an absent value does NOT reset: a
+        // pool's tags are assigned and removed through the tagging operations
+        // (`TagResource`, `UntagResource`), so an update that names no tag asks
+        // for no tag change and the pool keeps the tags it holds.
+        if let Some(user_pool_tags) = input.user_pool_tags {
+            pool.tags = user_pool_tags;
+        }
 
         // `Schema`, `UsernameAttributes`, `AliasAttributes` and
         // `UsernameConfiguration` are NOT members of this operation's input — they are

@@ -33,9 +33,11 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/us-east-1/cognito-idp/aws4_request, \
      SignedHeaders=host;x-amz-date, Signature=0000";
 
-/// The 20 standard attributes every pool's schema starts with, in the order
-/// `CreateUserPool` stores them: the schema an add appends BEHIND.
-const STANDARD_ATTRIBUTE_COUNT: usize = 20;
+/// The attributes a read of a new pool's schema reports, in the order
+/// `CreateUserPool` stores them: the 20 standard attributes the pool is created
+/// with, then the one attribute the service maintains for every pool
+/// (`identities`). The schema an add appends BEHIND.
+const STANDARD_ATTRIBUTE_COUNT: usize = 21;
 
 /// One emulator with just this service mounted.
 fn router() -> MultiServiceRouter {

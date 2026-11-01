@@ -413,10 +413,11 @@ async fn a_deleted_replica_is_gone_once_the_clock_owes_its_removal() {
                 .cloned()
         })
         .unwrap_or_else(|| panic!("the pool must be listed, got {listed}"));
-    assert!(
-        entry.get("ReplicaRegions").is_none(),
-        "a pool whose only replica the clock has removed reports no ReplicaRegions, exactly as \
-         one nothing was ever replicated to does, got {entry}"
+    assert_eq!(
+        entry["ReplicaRegions"],
+        json!([PRIMARY_REGION]),
+        "a pool whose only secondary replica the clock has removed reports the Region its \
+         PRIMARY replica is in, exactly as one nothing was ever replicated to does, got {entry}"
     );
 
     // The Region a removed replica held takes another replica, which comes up

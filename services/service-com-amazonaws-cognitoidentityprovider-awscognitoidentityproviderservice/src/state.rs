@@ -577,6 +577,14 @@ pub const ADVANCED_SECURITY_MODE_OFF: &str = "OFF";
 /// [`crate::ops::types::ADVANCED_SECURITY_MODE_TYPE_VALUES`].
 pub const ADVANCED_SECURITY_MODE_ENFORCED: &str = "ENFORCED";
 
+/// The `AdvancedSecurityEnabledModeType` that logs "user security information
+/// but take[s] no action" (`UserPoolAddOnsType` in this service's model), and the
+/// mode threat protection runs the additional authentication types in where the
+/// request configures none for them: that enum admits no "off" value
+/// ([`crate::ops::types::ADVANCED_SECURITY_ENABLED_MODE_TYPE_VALUES`]), so a pool
+/// whose add-ons are configured reports the auditing mode for them.
+pub const ADVANCED_SECURITY_MODE_AUDIT: &str = "AUDIT";
+
 /// The message a `UserPoolAddOnNotEnabledException` carries.
 ///
 /// `UserPoolAddOnNotEnabledException` is thrown "when user pool add-ons aren't
@@ -2212,7 +2220,10 @@ pub struct UserPool {
     pub creation_date: SystemTime,
     pub last_modified_date: SystemTime,
     pub policies: UserPoolPolicyType,
-    pub lambda_config: Option<LambdaConfigType>,
+    /// This pool's Lambda triggers, EMPTY for a pool that configures none: the
+    /// service materialises the configuration every pool applies, so this is
+    /// stored rather than left absent ([`effective_lambda_config`]).
+    pub lambda_config: LambdaConfigType,
     pub mfa_configuration: String,
     pub deletion_protection: String,
     pub user_pool_tier: String,
@@ -2223,14 +2234,22 @@ pub struct UserPool {
     pub admin_create_user_config: AdminCreateUserConfigType,
     pub username_configuration: Option<UsernameConfigurationType>,
     pub device_configuration: Option<DeviceConfigurationType>,
-    pub email_configuration: Option<EmailConfigurationType>,
+    /// How this pool sends its email messages ([`effective_email_configuration`]).
+    pub email_configuration: EmailConfigurationType,
     pub sms_configuration: Option<SmsConfigurationType>,
-    pub verification_message_template: Option<VerificationMessageTemplateType>,
+    /// The templates this pool's verification messages are rendered from
+    /// ([`effective_verification_message_template`]).
+    pub verification_message_template: VerificationMessageTemplateType,
     pub account_recovery_setting: Option<AccountRecoverySettingType>,
-    pub user_attribute_update_settings: Option<UserAttributeUpdateSettingsType>,
+    /// Which attribute changes wait on verification
+    /// ([`effective_user_attribute_update_settings`]).
+    pub user_attribute_update_settings: UserAttributeUpdateSettingsType,
     pub user_pool_add_ons: Option<UserPoolAddOnsType>,
-    pub key_configuration: Option<KeyConfigurationType>,
-    pub issuer_configuration: Option<IssuerConfigurationType>,
+    /// The key this pool's data is encrypted under
+    /// ([`effective_key_configuration`]).
+    pub key_configuration: KeyConfigurationType,
+    /// The issuer this pool's tokens carry ([`effective_issuer_configuration`]).
+    pub issuer_configuration: IssuerConfigurationType,
     pub acr_configuration: Option<HashMap<String, AcrLevelConfigType>>,
     pub sms_authentication_message: Option<String>,
     /// This pool's TOTP MFA configuration: "Settings for time-based one-time
@@ -3054,12 +3073,8 @@ impl UserPool {
     /// service's model).
     pub fn requires_verification_before_update(&self, name: &str) -> bool {
         self.user_attribute_update_settings
+            .attributes_require_verification_before_update
             .as_ref()
-            .and_then(|settings| {
-                settings
-                    .attributes_require_verification_before_update
-                    .as_ref()
-            })
             .is_some_and(|names| names.iter().any(|attribute| attribute == name))
     }
 
@@ -3188,10 +3203,12 @@ impl UserPool {
     /// schema holds it: one column per attribute of this pool a user import can
     /// carry, then the columns the import format adds
     /// ([`CSV_HEADER_TRAILING_COLUMNS`]). [`SUB_ATTRIBUTE`] is not among them —
-    /// the pool mints it for every user and no import supplies it. The stored
-    /// order is the pool's own, as created ([`effective_schema`]), so the header
-    /// a client builds its CSV from and the schema `DescribeUserPool` reports
-    /// list the pool's attributes in ONE order.
+    /// the pool mints it for every user and no import supplies it — and neither
+    /// are the attributes the service maintains itself
+    /// ([`SERVICE_MAINTAINED_SCHEMA`]), which no import supplies either. The
+    /// stored order is the pool's own, as created ([`effective_schema`]), so the
+    /// header a client builds its CSV from and the schema `DescribeUserPool`
+    /// reports list the pool's attributes in ONE order.
     pub fn csv_header(&self) -> Vec<String> {
         self.schema
             .iter()
@@ -3525,34 +3542,85 @@ impl UserPool {
         self.replicas.retain(|_, replica| !replica.removed(now));
     }
 
+    /// The schema a READ of this pool reports: the attributes the pool is
+    /// CONFIGURED with ([`UserPool::schema`]) and, behind the standard ones, the
+    /// attributes the service maintains for every pool
+    /// ([`SERVICE_MAINTAINED_SCHEMA`]).
+    ///
+    /// A service-maintained attribute belongs to the pool rather than to the
+    /// request that created it, so it sits with the standard attributes a pool
+    /// starts with, ahead of the custom attributes added behind them; an
+    /// attribute the pool's own schema already declares under that name is left
+    /// as the pool declares it.
+    pub fn reported_schema(&self) -> Vec<SchemaAttributeType> {
+        let mut reported = self.schema.clone();
+        // Behind the last standard attribute the pool carries, so the custom
+        // attributes appended after them stay behind them.
+        let behind_standard = reported
+            .iter()
+            .rposition(|entry| {
+                entry
+                    .name
+                    .as_deref()
+                    .is_some_and(is_standard_attribute)
+            })
+            .map_or(0, |at| at + 1);
+        for (offset, standard) in SERVICE_MAINTAINED_SCHEMA
+            .iter()
+            .filter(|standard| self.schema_attribute(standard.name).is_none())
+            .enumerate()
+        {
+            reported.insert(behind_standard + offset, standard_schema_attribute(standard));
+        }
+        reported
+    }
+
     /// The modelled view of this pool, rendered from what is stored.
     pub fn to_user_pool_type(&self) -> UserPoolType {
+        self.to_user_pool_type_with(self.reported_schema())
+    }
+
+    /// The modelled view of this pool as the CREATE that configured it answers:
+    /// [`UserPool::to_user_pool_type`] carrying the schema the request
+    /// CONFIGURED, without the attributes the service maintains itself
+    /// ([`SERVICE_MAINTAINED_SCHEMA`]).
+    ///
+    /// A create answers with the pool it stored from the request; the service's
+    /// own attributes are the pool's from then on, and every later read of the
+    /// pool reports them beside the configured ones.
+    pub fn to_configured_user_pool_type(&self) -> UserPoolType {
+        self.to_user_pool_type_with(self.schema.clone())
+    }
+
+    /// The modelled view of this pool carrying `schema_attributes`, which is
+    /// what the two views above differ in.
+    fn to_user_pool_type_with(&self, schema_attributes: Vec<SchemaAttributeType>) -> UserPoolType {
         UserPoolType {
             id: Some(self.id.clone()),
             name: Some(self.name.clone()),
             policies: Some(self.policies.clone()),
             deletion_protection: Some(self.deletion_protection.clone()),
-            lambda_config: self.lambda_config.clone(),
+            lambda_config: Some(self.lambda_config.clone()),
             // `UserPoolType.Status` is `@deprecated` ("This property is no longer
             // available."), so it is left out rather than invented.
             status: None,
             last_modified_date: Some(to_date_time(self.last_modified_date)),
             creation_date: Some(to_date_time(self.creation_date)),
-            schema_attributes: Some(self.schema.clone()),
+            schema_attributes: Some(schema_attributes),
             auto_verified_attributes: non_empty(&self.auto_verified_attributes),
             alias_attributes: non_empty(&self.alias_attributes),
             username_attributes: non_empty(&self.username_attributes),
             sms_verification_message: None,
             email_verification_message: None,
             email_verification_subject: None,
-            verification_message_template: self.verification_message_template.clone(),
+            verification_message_template: Some(self.verification_message_template.clone()),
             sms_authentication_message: self.sms_authentication_message.clone(),
-            user_attribute_update_settings: self.user_attribute_update_settings.clone(),
+            user_attribute_update_settings: Some(self.user_attribute_update_settings.clone()),
             mfa_configuration: Some(self.mfa_configuration.clone()),
             device_configuration: self.device_configuration.clone(),
             // Computed from what the pool holds, never from a request.
             estimated_number_of_users: i32::try_from(self.users.len()).unwrap_or(i32::MAX),
-            email_configuration: self.email_configuration.clone(),
+            email_configuration: Some(self.email_configuration.clone()),
             sms_configuration: self.sms_configuration.clone(),
             user_pool_tags: Some(self.tags.clone()),
             sms_configuration_failure: None,
@@ -3565,8 +3633,8 @@ impl UserPool {
             arn: Some(self.arn.clone()),
             account_recovery_setting: self.account_recovery_setting.clone(),
             user_pool_tier: Some(self.user_pool_tier.clone()),
-            key_configuration: self.key_configuration.clone(),
-            issuer_configuration: self.issuer_configuration.clone(),
+            key_configuration: Some(self.key_configuration.clone()),
+            issuer_configuration: Some(self.issuer_configuration.clone()),
             acr_configuration: self.acr_configuration.clone(),
         }
     }
@@ -3580,7 +3648,7 @@ impl UserPool {
         UserPoolDescriptionType {
             id: Some(self.id.clone()),
             name: Some(self.name.clone()),
-            lambda_config: self.lambda_config.clone(),
+            lambda_config: Some(self.lambda_config.clone()),
             // `UserPoolDescriptionType.Status` is `@deprecated` ("This property
             // is no longer available."), so it is left out rather than
             // invented — as `to_user_pool_type` leaves it out too.
@@ -3589,14 +3657,11 @@ impl UserPool {
             creation_date: Some(to_date_time(self.creation_date)),
             // "A list of Amazon Web Services Regions where replicas of this
             // user pool exist": exactly the Regions `ListUserPoolReplicas`
-            // reports a replica in, so the two readers never disagree. A pool
-            // nothing replicated reports none rather than its own Region alone,
-            // and so does one whose only replica the clock has already removed.
-            replica_regions: self
-                .replicas
-                .values()
-                .any(|replica| !replica.removed(now))
-                .then(|| self.replica_regions(now)),
+            // reports a replica in, so the two readers never disagree. Every
+            // pool holds its PRIMARY replica in the Region it was created in, so
+            // a pool nothing was replicated to reports that one Region, and so
+            // does one whose only secondary the clock has already removed.
+            replica_regions: Some(self.replica_regions(now)),
         }
     }
 }
@@ -6368,6 +6433,144 @@ pub fn effective_admin_create_user_config(
     config
 }
 
+/// The `EmailSendingAccount` a pool that asks for no email sending method gets:
+/// "When Amazon Cognito emails your users, it uses its built-in email
+/// functionality. When you use the default option ..."
+/// (`EmailConfigurationType.EmailSendingAccount` in this service's model), as
+/// against `DEVELOPER`, which sends through the caller's own Amazon SES
+/// configuration. One of
+/// [`crate::ops::types::EMAIL_SENDING_ACCOUNT_TYPE_VALUES`].
+pub const DEFAULT_EMAIL_SENDING_ACCOUNT: &str = "COGNITO_DEFAULT";
+
+/// The `IssuerConfiguration.Type` a pool that asks for none gets: "the ORIGINAL
+/// issuer configuration for user pools. The issuer URL is hosted in the user
+/// pool's region" (`IssuerConfigurationType.Type` in this service's model),
+/// which is the issuer every pool's tokens carry until one is configured
+/// otherwise. One of [`crate::ops::types::ISSUER_TYPE_VALUES`].
+pub const DEFAULT_ISSUER_TYPE: &str = "ORIGINAL";
+
+/// The `KeyConfiguration.KeyType` a pool that names no key gets: "a key owned by
+/// Amazon Web Services in Key Management Service"
+/// (`KeyConfigurationType.KeyType` in this service's model), the key a pool that
+/// carries no `KmsKeyArn` is encrypted under. One of
+/// [`crate::ops::types::ENCRYPTION_KEY_TYPE_VALUES`].
+pub const DEFAULT_ENCRYPTION_KEY_TYPE: &str = "AWS_OWNED_KEY";
+
+/// The `DefaultEmailOption` a pool that configures no verification message gets:
+/// a verification email carries a code rather than a clickable link, which is
+/// the option the code-bearing `{####}` template of
+/// `VerificationMessageTemplateType.EmailMessage` is written for. One of
+/// [`crate::ops::types::DEFAULT_EMAIL_OPTION_TYPE_VALUES`].
+pub const DEFAULT_EMAIL_OPTION: &str = "CONFIRM_WITH_CODE";
+
+/// The `LambdaConfig` a pool is STORED with, which is the one the request
+/// carried or no trigger at all.
+///
+/// A pool always HAS a trigger configuration — every stage runs the function it
+/// names, or none ([`crate::state::lambda_triggers`]) — so a request that
+/// configures none is stored with an empty collection rather than with nothing,
+/// and every read reports the configuration the pool actually applies.
+pub fn effective_lambda_config(requested: Option<LambdaConfigType>) -> LambdaConfigType {
+    requested.unwrap_or_default()
+}
+
+/// The `EmailConfiguration` a pool is STORED with: the request's, with the
+/// sending method the pool applies filled in.
+///
+/// A pool always sends its messages one of the two ways
+/// `EmailConfigurationType.EmailSendingAccount` names, so a configuration that
+/// names neither is stored with [`DEFAULT_EMAIL_SENDING_ACCOUNT`], the built-in
+/// one; a request that carries no configuration at all gets that same method
+/// with nothing else set.
+pub fn effective_email_configuration(
+    requested: Option<EmailConfigurationType>,
+) -> EmailConfigurationType {
+    let mut configuration = requested.unwrap_or_default();
+    if configuration.email_sending_account.is_none() {
+        configuration.email_sending_account = Some(DEFAULT_EMAIL_SENDING_ACCOUNT.to_string());
+    }
+    configuration
+}
+
+/// The `IssuerConfiguration` a pool is STORED with: the request's, with
+/// [`DEFAULT_ISSUER_TYPE`] filled in where it names no issuer type, since a
+/// pool's tokens always carry one issuer.
+pub fn effective_issuer_configuration(
+    requested: Option<IssuerConfigurationType>,
+) -> IssuerConfigurationType {
+    let mut configuration = requested.unwrap_or_default();
+    if configuration.r#type.is_none() {
+        configuration.r#type = Some(DEFAULT_ISSUER_TYPE.to_string());
+    }
+    configuration
+}
+
+/// The `KeyConfiguration` a pool is STORED with: the request's, with
+/// [`DEFAULT_ENCRYPTION_KEY_TYPE`] filled in where it names no key type, since a
+/// pool's data is always encrypted under one key.
+pub fn effective_key_configuration(
+    requested: Option<KeyConfigurationType>,
+) -> KeyConfigurationType {
+    let mut configuration = requested.unwrap_or_default();
+    if configuration.key_type.is_none() {
+        configuration.key_type = Some(DEFAULT_ENCRYPTION_KEY_TYPE.to_string());
+    }
+    configuration
+}
+
+/// The `UserAttributeUpdateSettings` a pool is STORED with: the request's, with
+/// an EMPTY list of attributes filled in where it names none.
+///
+/// The setting decides, for every attribute, whether a change waits on
+/// verification ([`UserPool::requires_verification_before_update`]), so a pool
+/// that configures none holds the empty collection — no attribute requires it —
+/// rather than nothing.
+pub fn effective_user_attribute_update_settings(
+    requested: Option<UserAttributeUpdateSettingsType>,
+) -> UserAttributeUpdateSettingsType {
+    let mut settings = requested.unwrap_or_default();
+    if settings
+        .attributes_require_verification_before_update
+        .is_none()
+    {
+        settings.attributes_require_verification_before_update = Some(Vec::new());
+    }
+    settings
+}
+
+/// The `VerificationMessageTemplate` a pool is STORED with: the request's, with
+/// [`DEFAULT_EMAIL_OPTION`] filled in where it chooses no email option, since a
+/// pool's verification emails always carry either a code or a link.
+pub fn effective_verification_message_template(
+    requested: Option<VerificationMessageTemplateType>,
+) -> VerificationMessageTemplateType {
+    let mut template = requested.unwrap_or_default();
+    if template.default_email_option.is_none() {
+        template.default_email_option = Some(DEFAULT_EMAIL_OPTION.to_string());
+    }
+    template
+}
+
+/// The `UserPoolAddOns` a pool is STORED with: `None` for a pool whose request
+/// configures no threat protection at all, and otherwise the requested add-ons
+/// with the mode for the additional authentication types filled in.
+///
+/// `AdvancedSecurityAdditionalFlows` holds the mode threat protection runs
+/// custom authentication in, and that mode's enum admits no "off" value, so a
+/// pool whose add-ons are configured runs them in
+/// [`ADVANCED_SECURITY_MODE_AUDIT`] unless the request chose otherwise.
+pub fn effective_user_pool_add_ons(
+    requested: Option<UserPoolAddOnsType>,
+) -> Option<UserPoolAddOnsType> {
+    let mut add_ons = requested?;
+    let mut flows = add_ons.advanced_security_additional_flows.unwrap_or_default();
+    if flows.custom_auth_mode.is_none() {
+        flows.custom_auth_mode = Some(ADVANCED_SECURITY_MODE_AUDIT.to_string());
+    }
+    add_ons.advanced_security_additional_flows = Some(flows);
+    Some(add_ons)
+}
+
 /// The feature plan a request leaves unset: "Defaults to `ESSENTIALS`".
 pub fn effective_user_pool_tier(requested: Option<String>) -> String {
     requested.unwrap_or_else(|| DEFAULT_USER_POOL_TIER.to_string())
@@ -6388,37 +6591,139 @@ pub fn effective_prevent_user_existence_errors(requested: Option<String>) -> Str
     requested.unwrap_or_else(|| DEFAULT_PREVENT_USER_EXISTENCE_ERRORS.to_string())
 }
 
+/// One of Amazon Cognito's standard (OIDC) user-pool attributes, as the default
+/// schema declares it. `min`/`max` are the bounds the service stamps on that
+/// attribute's values: `MinLength`/`MaxLength` for a `String` attribute and
+/// `MinValue`/`MaxValue` for a `Number` one
+/// (`smithy_query(query="shape",shape="SchemaAttributeType")`); `None` leaves
+/// that bound out of the attribute's constraints.
+#[derive(Debug, Clone, Copy)]
+struct StandardAttribute {
+    name: &'static str,
+    data_type: &'static str,
+    mutable: bool,
+    required: bool,
+    min: Option<&'static str>,
+    max: Option<&'static str>,
+}
+
 /// Amazon Cognito's standard (OIDC) user-pool attributes, the schema every new
-/// pool starts with: each entry is `(name, AttributeDataType, mutable,
-/// required)`. The names are the standard attributes of the Amazon Cognito
+/// pool starts with. The names are the standard attributes of the Amazon Cognito
 /// Developer Guide's "User pool attributes"; the fields are
 /// `SchemaAttributeType` (`smithy_query(query="shape",shape="SchemaAttributeType")`).
-const STANDARD_SCHEMA: [(&str, &str, bool, bool); 20] = [
-    ("sub", "String", false, true),
-    ("name", "String", true, false),
-    ("given_name", "String", true, false),
-    ("family_name", "String", true, false),
-    ("middle_name", "String", true, false),
-    ("nickname", "String", true, false),
-    ("preferred_username", "String", true, false),
-    ("profile", "String", true, false),
-    ("picture", "String", true, false),
-    ("website", "String", true, false),
-    ("email", "String", true, false),
-    ("email_verified", "Boolean", true, false),
-    ("gender", "String", true, false),
-    ("birthdate", "String", true, false),
-    ("zoneinfo", "String", true, false),
-    ("locale", "String", true, false),
-    ("phone_number", "String", true, false),
-    ("phone_number_verified", "Boolean", true, false),
-    ("address", "String", true, false),
-    ("updated_at", "Number", true, false),
+///
+/// Each attribute carries the service's OWN bounds rather than one generic
+/// template: the minted identifier is at least one character long, the
+/// date-of-birth attribute holds exactly a ten-character date, the number
+/// attribute starts at zero, and every other string attribute takes up to the
+/// 2048 characters an attribute value may be.
+const STANDARD_SCHEMA: [StandardAttribute; 20] = [
+    StandardAttribute { name: "sub", data_type: "String", mutable: false, required: true, min: Some("1"), max: Some("2048") },
+    StandardAttribute { name: "name", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "given_name", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "family_name", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "middle_name", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "nickname", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "preferred_username", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "profile", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "picture", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "website", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "email", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "email_verified", data_type: "Boolean", mutable: true, required: false, min: None, max: None },
+    StandardAttribute { name: "gender", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "birthdate", data_type: "String", mutable: true, required: false, min: Some("10"), max: Some("10") },
+    StandardAttribute { name: "zoneinfo", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "locale", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "phone_number", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "phone_number_verified", data_type: "Boolean", mutable: true, required: false, min: None, max: None },
+    StandardAttribute { name: "address", data_type: "String", mutable: true, required: false, min: Some("0"), max: Some("2048") },
+    StandardAttribute { name: "updated_at", data_type: "Number", mutable: true, required: false, min: Some("0"), max: None },
 ];
 
-/// Whether `name` is one of the standard attributes every pool carries.
+/// The schema attributes the SERVICE itself maintains on every pool, beyond the
+/// ones a create configures: the attribute that renders the external identities
+/// a profile is linked to ([`IDENTITIES_ATTRIBUTE`], whose value this service
+/// writes when a link is made, never a caller). Unbounded, so it reports the
+/// empty string constraints of a string attribute with no bounds.
+///
+/// They belong to the pool from the moment it exists, so every READ of a pool
+/// reports them ([`UserPool::reported_schema`]); the create that configured the
+/// pool answers with the configured attributes alone
+/// ([`UserPool::to_configured_user_pool_type`]).
+const SERVICE_MAINTAINED_SCHEMA: [StandardAttribute; 1] = [StandardAttribute {
+    name: IDENTITIES_ATTRIBUTE,
+    data_type: "String",
+    mutable: true,
+    required: false,
+    min: None,
+    max: None,
+}];
+
+/// The schema entry `standard` declares.
+fn standard_schema_attribute(standard: &StandardAttribute) -> SchemaAttributeType {
+    let (number_attribute_constraints, string_attribute_constraints) =
+        schema_attribute_constraints(standard.data_type, standard.min, standard.max);
+    SchemaAttributeType {
+        name: Some(standard.name.to_string()),
+        attribute_data_type: Some(standard.data_type.to_string()),
+        developer_only_attribute: Some(false),
+        mutable: Some(standard.mutable),
+        required: Some(standard.required),
+        number_attribute_constraints,
+        string_attribute_constraints,
+    }
+}
+
+/// Whether `name` is one of the standard attributes a pool's schema starts
+/// from, which a request names rather than adds.
 pub fn is_standard_attribute(name: &str) -> bool {
-    STANDARD_SCHEMA.iter().any(|(standard, ..)| *standard == name)
+    STANDARD_SCHEMA
+        .iter()
+        .any(|standard| standard.name == name)
+}
+
+/// The `AttributeDataType` values whose values a `String` bound describes, and
+/// the one whose values a `Number` bound describes
+/// (`smithy_query(query="shape",shape="AttributeDataType")`): an attribute of
+/// any OTHER type carries neither constraints structure.
+const STRING_ATTRIBUTE_DATA_TYPE: &str = "String";
+const NUMBER_ATTRIBUTE_DATA_TYPE: &str = "Number";
+
+/// The constraints structures a schema attribute of `data_type` reports, as
+/// `(NumberAttributeConstraints, StringAttributeConstraints)`.
+///
+/// An attribute reports the structure that describes ITS data type and nothing
+/// else: "specifies the constraints for an attribute of the number type" /
+/// "... of the string type" (`SchemaAttributeType` in this service's model). The
+/// structure is reported even where the attribute is unbounded — then as the
+/// EMPTY structure — because it is the attribute's data type, not the presence
+/// of a bound, that decides which constraints an attribute has; an attribute of
+/// any other type (a boolean, a date) reports neither.
+fn schema_attribute_constraints(
+    data_type: &str,
+    min: Option<&str>,
+    max: Option<&str>,
+) -> (
+    Option<NumberAttributeConstraintsType>,
+    Option<StringAttributeConstraintsType>,
+) {
+    match data_type {
+        NUMBER_ATTRIBUTE_DATA_TYPE => (
+            Some(NumberAttributeConstraintsType {
+                min_value: min.map(str::to_string),
+                max_value: max.map(str::to_string),
+            }),
+            None,
+        ),
+        STRING_ATTRIBUTE_DATA_TYPE => (
+            None,
+            Some(StringAttributeConstraintsType {
+                min_length: min.map(str::to_string),
+                max_length: max.map(str::to_string),
+            }),
+        ),
+        _ => (None, None),
+    }
 }
 
 /// The columns Amazon Cognito's user-import CSV carries BEYOND the pool's own
@@ -7479,28 +7784,8 @@ pub fn code_delivery_details(attribute: &str, value: &str) -> Option<CodeDeliver
 /// reach is dropped here.
 pub fn effective_schema(requested: Option<Vec<SchemaAttributeType>>) -> Vec<SchemaAttributeType> {
     let requested = requested.unwrap_or_default();
-    let mut schema: Vec<SchemaAttributeType> = STANDARD_SCHEMA
-        .iter()
-        .map(|(name, data_type, mutable, required)| SchemaAttributeType {
-            name: Some((*name).to_string()),
-            attribute_data_type: Some((*data_type).to_string()),
-            developer_only_attribute: Some(false),
-            mutable: Some(*mutable),
-            required: Some(*required),
-            number_attribute_constraints: (*data_type == "Number").then_some(
-                NumberAttributeConstraintsType {
-                    min_value: None,
-                    max_value: None,
-                },
-            ),
-            string_attribute_constraints: (*data_type == "String").then(|| {
-                StringAttributeConstraintsType {
-                    min_length: Some("0".to_string()),
-                    max_length: Some("2048".to_string()),
-                }
-            }),
-        })
-        .collect();
+    let mut schema: Vec<SchemaAttributeType> =
+        STANDARD_SCHEMA.iter().map(standard_schema_attribute).collect();
 
     // Where each stored attribute sits, so a requested one is resolved by name
     // instead of by scanning the schema.
@@ -7618,21 +7903,48 @@ pub fn custom_schema_attribute(
     } else {
         format!("{prefix}{name}")
     };
+    let data_type = requested
+        .attribute_data_type
+        .clone()
+        .unwrap_or_else(|| DEFAULT_ATTRIBUTE_DATA_TYPE.to_string());
+    // The attribute reports the constraints its own data type has, holding the
+    // bounds the request asked for and EMPTY where it asked for none — the same
+    // rule the default schema's attributes report theirs by
+    // ([`schema_attribute_constraints`]).
+    let (min, max) = match data_type.as_str() {
+        NUMBER_ATTRIBUTE_DATA_TYPE => (
+            requested
+                .number_attribute_constraints
+                .as_ref()
+                .and_then(|constraints| constraints.min_value.as_deref()),
+            requested
+                .number_attribute_constraints
+                .as_ref()
+                .and_then(|constraints| constraints.max_value.as_deref()),
+        ),
+        _ => (
+            requested
+                .string_attribute_constraints
+                .as_ref()
+                .and_then(|constraints| constraints.min_length.as_deref()),
+            requested
+                .string_attribute_constraints
+                .as_ref()
+                .and_then(|constraints| constraints.max_length.as_deref()),
+        ),
+    };
+    let (number_attribute_constraints, string_attribute_constraints) =
+        schema_attribute_constraints(&data_type, min, max);
     let entry = SchemaAttributeType {
         name: Some(stored_name.clone()),
-        attribute_data_type: Some(
-            requested
-                .attribute_data_type
-                .clone()
-                .unwrap_or_else(|| DEFAULT_ATTRIBUTE_DATA_TYPE.to_string()),
-        ),
+        attribute_data_type: Some(data_type.clone()),
         developer_only_attribute: Some(developer_only),
         // A custom attribute is mutable unless the request says otherwise;
         // a custom attribute can never be required.
         mutable: Some(requested.mutable.unwrap_or(true)),
         required: Some(false),
-        number_attribute_constraints: requested.number_attribute_constraints.clone(),
-        string_attribute_constraints: requested.string_attribute_constraints.clone(),
+        number_attribute_constraints,
+        string_attribute_constraints,
     };
     Some((stored_name, entry))
 }
@@ -7651,7 +7963,7 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         creation_date: now,
         last_modified_date: now,
         policies: effective_policies(None),
-        lambda_config: None,
+        lambda_config: effective_lambda_config(None),
         mfa_configuration: effective_mfa_configuration(None),
         deletion_protection: effective_deletion_protection(None),
         user_pool_tier: DEFAULT_USER_POOL_TIER.to_string(),
@@ -7662,14 +7974,14 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         admin_create_user_config: effective_admin_create_user_config(None),
         username_configuration: None,
         device_configuration: None,
-        email_configuration: None,
+        email_configuration: effective_email_configuration(None),
         sms_configuration: None,
-        verification_message_template: None,
+        verification_message_template: effective_verification_message_template(None),
         account_recovery_setting: None,
-        user_attribute_update_settings: None,
+        user_attribute_update_settings: effective_user_attribute_update_settings(None),
         user_pool_add_ons: None,
-        key_configuration: None,
-        issuer_configuration: None,
+        key_configuration: effective_key_configuration(None),
+        issuer_configuration: effective_issuer_configuration(None),
         acr_configuration: None,
         sms_authentication_message: None,
         software_token_mfa_configuration: None,

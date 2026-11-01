@@ -196,7 +196,9 @@ async fn walk(
 
 /// The short description `DescribeUserPool` implies for `user_pool_id`: the
 /// members a listing entry shares with the full pool, taken from the STORED pool
-/// the reader of that one pool renders.
+/// the reader of that one pool renders, plus the `ReplicaRegions` the one member
+/// a short description carries beyond them must report — exactly the Regions
+/// `ListUserPoolReplicas` reports a replica of the pool in.
 async fn expected_entry(router: &MultiServiceRouter, user_pool_id: &str) -> Value {
     let described = ok(
         router,
@@ -213,6 +215,19 @@ async fn expected_entry(router: &MultiServiceRouter, user_pool_id: &str) -> Valu
             expected.insert(member.to_string(), value.clone());
         }
     }
+    let listed = ok(
+        router,
+        "ListUserPoolReplicas",
+        &json!({ "UserPoolId": user_pool_id }),
+    )
+    .await;
+    let regions: Vec<Value> = listed["UserPoolReplicas"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ListUserPoolReplicas answers a list, got {listed}"))
+        .iter()
+        .map(|replica| replica["RegionName"].clone())
+        .collect();
+    expected.insert("ReplicaRegions".to_string(), Value::Array(regions));
     Value::Object(expected)
 }
 
@@ -319,9 +334,9 @@ async fn a_listing_reports_every_stored_pool_rendered_from_the_stored_pool() {
         );
 
         // Every entry is the STORED pool's short description, member for
-        // member — the same values the reader of that one pool renders, and
-        // nothing else (the `@deprecated` `Status` and a `ReplicaRegions` no
-        // stored replica backs are absent).
+        // member — the same values the reader of that one pool renders, the
+        // Regions the pool holds a replica in, and nothing else (the
+        // `@deprecated` `Status` is absent).
         for entry in &served {
             let id = entry["Id"].as_str().expect("an entry names a pool");
             let expected = expected_entry(&router, id).await;

@@ -1276,7 +1276,8 @@ async fn the_csv_header_reports_one_column_per_attribute_of_the_pools_schema() {
         .collect();
 
     // Every column is an attribute of the stored schema or one of the two the
-    // import format adds, and the minted `sub` is not importable.
+    // import format adds; the minted `sub` is not importable, and neither is the
+    // `identities` attribute the service maintains itself.
     let described = described_pool(&router, &user_pool_id).await;
     let schema: Vec<String> = described["SchemaAttributes"]
         .as_array()
@@ -1285,7 +1286,7 @@ async fn the_csv_header_reports_one_column_per_attribute_of_the_pools_schema() {
         .map(|attribute| attribute["Name"].as_str().unwrap_or_default().to_string())
         .collect();
     for attribute in &schema {
-        let expected = attribute != "sub";
+        let expected = attribute != "sub" && attribute != "identities";
         assert_eq!(
             columns.contains(attribute),
             expected,

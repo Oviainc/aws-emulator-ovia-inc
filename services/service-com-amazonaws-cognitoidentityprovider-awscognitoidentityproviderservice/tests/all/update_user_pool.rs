@@ -209,7 +209,10 @@ struct UpdateCase {
 /// which `src/state.rs` derives from the model's documented defaults.
 fn reset_to_defaults() -> Vec<(&'static str, Value)> {
     vec![
-        ("LambdaConfig", Value::Null),
+        // A pool always applies a trigger configuration, so an update that
+        // carries none leaves the pool with the EMPTY one rather than with
+        // nothing.
+        ("LambdaConfig", json!({})),
         ("DeviceConfiguration", Value::Null),
         // An omitted `AccountRecoverySetting` goes back to the service default,
         // which is the configuration the pool then applies.
@@ -222,7 +225,9 @@ fn reset_to_defaults() -> Vec<(&'static str, Value)> {
         ),
         ("SmsAuthenticationMessage", Value::Null),
         ("AutoVerifiedAttributes", Value::Null),
-        ("UserPoolTags", json!({})),
+        // Tags are assigned and removed through the tagging operations, so an
+        // update that names none leaves the pool's tags as they are.
+        ("UserPoolTags", json!({ "env": "created" })),
         ("MfaConfiguration", json!("OFF")),
         ("DeletionProtection", json!("INACTIVE")),
         ("UserPoolTier", json!("ESSENTIALS")),
@@ -413,6 +418,9 @@ async fn an_update_replaces_every_member_this_operation_models() {
 
         let mut request = case.request.clone();
         request["UserPoolId"] = json!(user_pool_id);
+        // The pool as a read saw it BEFORE the update, which is what the members
+        // this operation's input does not model are checked against.
+        let before_update = described_pool(&router, &user_pool_id).await;
         let answered = ok(&router, "UpdateUserPool", &request).await;
         assert!(
             answered.is_null() || answered.as_object().is_some_and(serde_json::Map::is_empty),
@@ -430,7 +438,7 @@ async fn an_update_replaces_every_member_this_operation_models() {
         for member in ["Id", "Arn", "CreationDate", "SchemaAttributes", "UsernameAttributes"] {
             assert_eq!(
                 updated.get(member),
-                created.get(member),
+                before_update.get(member),
                 "case {:?}: {member} must survive an update, got {:?}",
                 case.case,
                 updated.get(member)

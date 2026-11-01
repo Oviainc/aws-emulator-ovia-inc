@@ -52,6 +52,11 @@ const DEFAULT_PLAN: &str = "ESSENTIALS";
 /// so no CSV column carries.
 const MINTED_ATTRIBUTE: &str = "sub";
 
+/// The attribute the SERVICE maintains on every pool — it renders the external
+/// identities a profile is linked to — so a read of the schema reports it with
+/// the standard attributes, and no import supplies it either.
+const SERVICE_MAINTAINED_ATTRIBUTE: &str = "identities";
+
 /// The columns Amazon Cognito's user-import CSV adds BEYOND the pool's own
 /// attributes, in the order the import format puts them: the imported user's MFA
 /// state, the username to create them under, and their password as a hash —
@@ -376,17 +381,21 @@ async fn the_plan_a_create_configures_is_what_judges_its_configuration() {
                 .expect("the members are a JSON object")
             {
                 // `Policies` reads back with the password policy's documented
-                // defaults filled in, so the sign-in policy the request carried
-                // is what is compared there.
-                let (path, expected) = if member == "Policies" {
-                    ("Policies.SignInPolicy", &requested_value["SignInPolicy"])
-                } else {
-                    (member.as_str(), requested_value)
-                };
-                let answered = if member == "Policies" {
-                    &stored["Policies"]["SignInPolicy"]
-                } else {
-                    &stored[member]
+                // defaults filled in, and `UserPoolAddOns` with the mode the
+                // additional authentication types run in, so inside those two
+                // the comparison is against the member the request carried.
+                let (path, expected, answered) = match member.as_str() {
+                    "Policies" => (
+                        "Policies.SignInPolicy",
+                        &requested_value["SignInPolicy"],
+                        &stored["Policies"]["SignInPolicy"],
+                    ),
+                    "UserPoolAddOns" => (
+                        "UserPoolAddOns.AdvancedSecurityMode",
+                        &requested_value["AdvancedSecurityMode"],
+                        &stored["UserPoolAddOns"]["AdvancedSecurityMode"],
+                    ),
+                    other => (other, requested_value, &stored[other]),
                 };
                 assert_eq!(
                     answered, expected,
@@ -483,7 +492,8 @@ fn stored_name(requested: &str) -> String {
 /// The order the RULE says a pool stores its schema in: the minted attribute,
 /// then the attributes the create's `Schema` names in the order it names them,
 /// then the standard attributes it does not name in the standard claim order,
-/// then the attributes `AddCustomAttributes` appended afterwards.
+/// then the attribute the service maintains for every pool, then the attributes
+/// `AddCustomAttributes` appended afterwards.
 ///
 /// Computed from the request alone, so it is an expectation the handler cannot
 /// satisfy by templating a constant order of its own.
@@ -499,6 +509,7 @@ fn expected_schema_order(named: &[&str], added: &[&str]) -> Vec<String> {
             order.push(standard.to_string());
         }
     }
+    order.push(SERVICE_MAINTAINED_ATTRIBUTE.to_string());
     for appended in added.iter().map(|name| stored_name(name)) {
         if !order.contains(&appended) {
             order.push(appended);
@@ -527,7 +538,7 @@ async fn assert_header_is_the_stored_schema(
     let header = csv_header(router, user_pool_id).await;
     let expected: Vec<String> = schema
         .iter()
-        .filter(|name| *name != MINTED_ATTRIBUTE)
+        .filter(|name| *name != MINTED_ATTRIBUTE && *name != SERVICE_MAINTAINED_ATTRIBUTE)
         .cloned()
         .chain(IMPORT_FORMAT_COLUMNS.iter().map(|column| column.to_string()))
         .collect();
