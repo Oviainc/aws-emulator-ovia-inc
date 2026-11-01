@@ -31,6 +31,8 @@ mod defaulted_page_bound;
 mod discovered_metric_references;
 #[path = "all/discovery_enablement.rs"]
 mod discovery_enablement;
+#[path = "all/edge_end_identity_agreement.rs"]
+mod edge_end_identity_agreement;
 #[path = "all/entity_events.rs"]
 mod entity_events;
 #[path = "all/entity_identity.rs"]

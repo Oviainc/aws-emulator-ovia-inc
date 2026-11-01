@@ -2270,6 +2270,77 @@ pub fn attributes_contain(
         .all(|(key, value)| candidate.get(key) == Some(value))
 }
 
+/// The fullest of `candidates` that names the entity `named` names, or `None` when none of
+/// them does.
+///
+/// An entity is identified by as few as one of its up to four `Attributes` entries
+/// ([`attributes_contain`]), so a candidate holding every entry of `named` names the SAME
+/// entity as `named`, and the LONGEST of those candidates is the fullest identity the
+/// candidates hold for it. A `named` map that states NO attribute identifies no entity —
+/// every candidate holds its entries — so there is no identity to resolve.
+///
+/// Equal-length candidates are two identities neither of which contains the other, i.e. two
+/// distinct entities both answering to `named`; the first of them is kept, which is the order
+/// the store holds its records in.
+///
+/// Single-homed so that every resolution of an entity's ONE identity applies one rule: the
+/// identity of a DISCOVERED entity
+/// ([`ComAmazonawsApplicationsignalsApplicationsignalsState::observed_identity`]) and the
+/// identity of an entity the store knows as the far end of a recorded edge
+/// ([`far_end_identity`]) differ only in WHICH records are evidence of the entity, never in
+/// how the fullest of them is picked.
+fn fullest_identity<'a>(
+    candidates: &'a [HashMap<String, String>],
+    named: &HashMap<String, String>,
+) -> Option<&'a HashMap<String, String>> {
+    if named.is_empty() {
+        return None;
+    }
+    candidates
+        .iter()
+        .filter(|candidate| attributes_contain(Some(candidate), named))
+        .fold(None, |fullest: Option<&HashMap<String, String>>, candidate| {
+            match fullest {
+                Some(current) if current.len() >= candidate.len() => Some(current),
+                _ => Some(candidate),
+            }
+        })
+}
+
+/// The ONE identity this store holds for the entity a recorded edge's FAR end names — the
+/// entity that was INVOKED — which is `named` itself when none of the identities the stored
+/// edges record (`candidates`,
+/// [`ComAmazonawsApplicationsignalsApplicationsignalsState::recorded_far_identities`]) holds a
+/// fuller one.
+///
+/// The far end of an edge is not an entity this emulator discovered: "the edge is evidence
+/// that the monitored entity calls it, not that Application Signals discovered and
+/// instrumented the callee"
+/// ([`ComAmazonawsApplicationsignalsApplicationsignalsState::observed_services`], which is why
+/// no such entity is a reported service). The records that are evidence OF IT are therefore
+/// the recorded edges that name it, and the identity it is reported and dimensioned by is the
+/// fullest identity any of them holds for it ([`fullest_identity`]) — exactly as a discovered
+/// entity is reported by the fullest identity the SLOs that monitor it hold
+/// ([`ComAmazonawsApplicationsignalsApplicationsignalsState::observed_identity`]).
+///
+/// Resolving it is what keeps the two views of one edge from disagreeing: an edge is recorded
+/// by each SLO that measures it, and two such records may name the far end by identities of
+/// different fullness, which are the SAME entity ([`attributes_contain`]). Reporting each
+/// record's own identity would list that one entity twice — once under a strict subset of the
+/// identity the other entry carries, which is the reporting
+/// [`ComAmazonawsApplicationsignalsApplicationsignalsState::observed_services`] refuses for a
+/// service, and which need not even carry the minimum identity a read of that entity must name
+/// it by ([`entity_identity_refusal`]) — and would make the two views disagree about how many
+/// edges there are.
+fn far_end_identity(
+    candidates: &[HashMap<String, String>],
+    named: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    fullest_identity(candidates, named)
+        .cloned()
+        .unwrap_or_else(|| named.clone())
+}
+
 /// The `Attributes` entry that says WHICH KIND of object a key-attribute map identifies:
 /// "`Type` designates the type of object this is"
 /// (`smithy_query(query="doc", shape="GetServiceInput", member="KeyAttributes")`).
@@ -3288,25 +3359,35 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         window_end: &DateTime,
         now: &DateTime,
     ) -> Option<HashMap<String, String>> {
-        if key_attributes.is_empty() {
-            return None;
-        }
-        let mut reported: Option<HashMap<String, String>> = None;
-        for slo in self.monitoring(key_attributes, window_start, window_end, now) {
-            // Every record this walk admits holds every entry the caller named
-            // ([`attributes_contain`]), so a matched identity is a SUPERSET of the named one
-            // and the longest of them is the fullest this store holds for the entity.
-            let Some(observed) = entity_of(slo).key_attributes else {
-                continue;
-            };
-            let fuller = reported
-                .as_ref()
-                .is_none_or(|current| observed.len() > current.len());
-            if fuller {
-                reported = Some(observed);
-            }
-        }
-        reported
+        // Every record this walk admits holds every entry the named identity states
+        // ([`attributes_contain`]), so a matched identity is a SUPERSET of the named one and
+        // the fullest of them is the fullest this store monitors the entity under
+        // ([`fullest_identity`], the one rule every identity resolution here applies).
+        let monitored: Vec<HashMap<String, String>> = self
+            .monitoring(key_attributes, window_start, window_end, now)
+            .filter_map(|slo| entity_of(slo).key_attributes)
+            .collect();
+        fullest_identity(&monitored, key_attributes).cloned()
+    }
+
+    /// The identities the stored edges record a FAR end by, over the window: the candidates an
+    /// invoked entity's one identity is resolved out of ([`far_end_identity`]).
+    ///
+    /// Collected ONCE per read, so an answer over many edges walks the store once rather than
+    /// once per edge, and every entry of that answer resolves an identity against the same
+    /// candidates.
+    ///
+    /// The request's own half of the window test is the caller's one decision
+    /// ([`window_has_begun`]), so only the per-record half is applied here
+    /// ([`monitored_in_window`]) — the same window every other topology read derives its
+    /// answer over.
+    fn recorded_far_identities(&self, window_end: &DateTime) -> Vec<HashMap<String, String>> {
+        self.slos
+            .values()
+            .filter(|slo| monitored_in_window(slo, window_end))
+            .filter_map(|slo| entity_of(slo).dependency_config)
+            .map(|dependency| dependency.dependency_key_attributes)
+            .collect()
     }
 
     /// The entity `key_attributes` identifies, as `GetService` reports it over the window.
@@ -3489,10 +3570,13 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// service carry different references. The near end's identity is the ONE this emulator
     /// holds for the entity ([`Self::observed_identity`]), resolved once for the whole
     /// answer rather than per edge, so no two edges out of one entity — and no other read of
-    /// it over the same window — disagree about the entity's own dimensions. The far end's
-    /// is the one the edge RECORDS, which this entry also reports under its `@required`
-    /// `DependencyKeyAttributes`, so an entry's dimensions state the same far end its
-    /// members do.
+    /// it over the same window — disagree about the entity's own dimensions. The far end's is
+    /// the ONE this store holds for the INVOKED entity ([`far_end_identity`]) rather than
+    /// whichever subset of it the record this edge was read off happens to name, so one far
+    /// entity is reported under one identity — the identity the dependent view of this edge
+    /// dimensions its far end by, and one `ListServiceDependents` answers for — and this
+    /// entry's dimensions state the same far end its `@required` `DependencyKeyAttributes`
+    /// does.
     pub fn observed_dependencies(
         &self,
         key_attributes: &HashMap<String, String>,
@@ -3505,6 +3589,11 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             return Vec::new();
         };
         let mut by_edge: BTreeMap<String, ServiceDependency> = BTreeMap::new();
+        let recorded_far_identities = self.recorded_far_identities(window_end);
+        // The identity resolved for each far end, by the record's own identity: several
+        // records can name one invoked entity, so the answer resolves one identity per
+        // distinct recorded identity rather than one per edge.
+        let mut far_identities: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
         for slo in self.monitoring(key_attributes, window_start, window_end, now) {
             let entity = entity_of(slo);
             let (Some(operation_name), Some(dependency)) =
@@ -3512,22 +3601,35 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             else {
                 continue;
             };
+            let dependency_key_attributes = far_identities
+                .entry(attribute_key(&dependency.dependency_key_attributes))
+                .or_insert_with(|| {
+                    far_end_identity(
+                        &recorded_far_identities,
+                        &dependency.dependency_key_attributes,
+                    )
+                })
+                .clone();
+            // The edge is the near operation, the entity it reached and the operation of that
+            // entity it called — the far end by the ONE identity this store holds for it, so
+            // two records naming it by identities of different fullness are the one edge they
+            // are evidence of rather than two.
             let edge = format!(
                 "{operation_name}\u{1d}{}\u{1d}{}",
-                attribute_key(&dependency.dependency_key_attributes),
+                attribute_key(&dependency_key_attributes),
                 dependency.dependency_operation_name,
             );
             let metric_references = standard_metric_references(metric_dimensions(
                 &identity,
                 Some(&operation_name),
                 Some((
-                    &dependency.dependency_key_attributes,
+                    &dependency_key_attributes,
                     &dependency.dependency_operation_name,
                 )),
             ));
             by_edge.entry(edge).or_insert_with(|| ServiceDependency {
                 operation_name,
-                dependency_key_attributes: dependency.dependency_key_attributes,
+                dependency_key_attributes,
                 dependency_operation_name: dependency.dependency_operation_name,
                 metric_references,
             });
@@ -3549,12 +3651,23 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// the dimensions are the dependent's identity and operation on the near end and the
     /// invoked entity and operation on the far end — the same dimension set
     /// [`Self::observed_dependencies`] reports for the same edge seen from the caller, which
-    /// is what keeps the two directions from disagreeing about one edge. The dependent is an
-    /// entity of its own, so the identity reported and dimensioned for it is the ONE this
-    /// emulator holds for it ([`Self::observed_identity`]) rather than whichever subset of it
-    /// the record this edge was read off happens to name — the identity a `GetService` on the
-    /// dependent echoes back, and the identity the dependency view of this edge dimensions
-    /// its near end by.
+    /// is what keeps the two directions from disagreeing about one edge. Each end is the ONE
+    /// identity this store holds for the entity at it rather than whichever subset of it the
+    /// record this edge was read off happens to name: the dependent is a DISCOVERED entity of
+    /// its own, so its identity is the one a `GetService` on it echoes back
+    /// ([`Self::observed_identity`]) and the one the dependency view of this edge dimensions
+    /// its near end by, while the invoked end is the entity the caller named, whose identity
+    /// is the fullest the recorded edges hold for it ([`far_end_identity`]) — the identity
+    /// that view reports the same edge's far end under.
+    ///
+    /// A record is evidence of an edge into the named entity when the identity it records the
+    /// invoked end by NAMES that entity, which is the resolved identity rather than the
+    /// record's own map: a record naming a strict subset of the request's identity records a
+    /// call into the SAME entity ([`attributes_contain`]), so the edge set this read reports
+    /// is the inverse of the one [`Self::observed_dependencies`] reports for its near end.
+    /// Two records that agree on the dependent, its operation and the invoked operation are
+    /// evidence of the one edge between them, so they are reported once: a `ServiceDependent`
+    /// states nothing else for a caller to tell two entries apart by.
     pub fn observed_dependents(
         &self,
         key_attributes: &HashMap<String, String>,
@@ -3574,6 +3687,10 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         // the answer is resolved once per distinct recorded identity rather than once per
         // edge.
         let mut identities: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
+        // The same, for the invoked end each record names, resolved by the same rule and out
+        // of the same candidates the caller-side view resolves it by.
+        let recorded_far_identities = self.recorded_far_identities(window_end);
+        let mut invoked_identities: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
         for slo in self
             .slos
             .values()
@@ -3583,7 +3700,16 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             let Some(dependency) = entity.dependency_config else {
                 continue;
             };
-            if !attributes_contain(Some(&dependency.dependency_key_attributes), key_attributes) {
+            let invoked = invoked_identities
+                .entry(attribute_key(&dependency.dependency_key_attributes))
+                .or_insert_with(|| {
+                    far_end_identity(
+                        &recorded_far_identities,
+                        &dependency.dependency_key_attributes,
+                    )
+                })
+                .clone();
+            if !attributes_contain(Some(&invoked), key_attributes) {
                 continue;
             }
             let Some(recorded) = entity.key_attributes else {
@@ -3605,10 +3731,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             let metric_references = standard_metric_references(metric_dimensions(
                 &dependent_key_attributes,
                 entity.operation_name.as_deref(),
-                Some((
-                    &dependency.dependency_key_attributes,
-                    &dependency.dependency_operation_name,
-                )),
+                Some((&invoked, &dependency.dependency_operation_name)),
             ));
             by_edge.entry(edge).or_insert_with(|| ServiceDependent {
                 operation_name: Some(dependency.dependency_operation_name),
