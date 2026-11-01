@@ -903,9 +903,7 @@ pub fn workspace_series_miss_message(workspace_name: &str, miss: &WorkspaceSerie
         WorkspaceSeriesMiss::NoSuchWorkspace => {
             not_found_message(RESOURCE_WORKSPACE, workspace_name)
         }
-        WorkspaceSeriesMiss::NoSuchAsset(asset_label) => {
-            not_found_message(RESOURCE_ASSET, asset_label)
-        }
+        WorkspaceSeriesMiss::NoSuchAsset(asset_label) => asset_not_found_message(asset_label),
         WorkspaceSeriesMiss::NoSuchProperty(asset_label, property_label) => {
             format!("The asset {asset_label} has no property {property_label}.")
         }
@@ -1560,11 +1558,10 @@ pub enum TripleRefusal {
 
 impl TripleRefusal {
     /// What the caller is told. Every variant here is an absent resource, so the
-    /// wording is the service's not-found rule: the resource kind, then the
-    /// identifier the request supplied.
+    /// wording is the one this service states that resource's absence in.
     pub fn message(&self) -> String {
         match self {
-            Self::AssetNotFound(label) => not_found_message(RESOURCE_ASSET, label),
+            Self::AssetNotFound(label) => asset_not_found_message(label),
             Self::HierarchyNotFound(label) => hierarchy_not_found_message(label),
         }
     }
@@ -3111,7 +3108,7 @@ impl ResolveToRefusal {
             Self::StatedByHalves { stated, missing } => {
                 format!("{missing} is required when {stated} is specified.")
             }
-            Self::AssetNotFound(asset_id) => not_found_message(RESOURCE_ASSET, asset_id),
+            Self::AssetNotFound(asset_id) => asset_not_found_message(asset_id),
         }
     }
 }
@@ -6860,18 +6857,13 @@ pub const RESOURCE_PIPELINE_EXECUTION: &str = "Pipeline Execution";
 /// The resource kind those errors name for a query of a workspace.
 pub const RESOURCE_QUERY: &str = "Query";
 
-/// The resource kind those errors name for a composite model of an asset model.
-///
-/// A composite model is not a top-level resource, so it is named as what it is
-/// rather than as an "Asset Model"; it lives here beside its siblings so the
-/// operations that address one cannot each invent a kind of their own.
-pub const RESOURCE_ASSET_MODEL_COMPOSITE_MODEL: &str = "Asset Model Composite Model";
-
 /// The resource kind those errors name for a composite model of an ASSET — the
 /// instance of an asset model's composite model that lives on one asset.
 ///
-/// Named as what it is for the same reason as the kind above: a composite model
-/// is not a top-level resource.
+/// A composite model is not a top-level resource, so it is named as what it is
+/// rather than as an "Asset". The composite model of an asset MODEL is not here:
+/// the service states its absence in its own form, naming the model it was
+/// looked for in ([`composite_model_not_found_message`]).
 pub const RESOURCE_ASSET_COMPOSITE_MODEL: &str = "Asset Composite Model";
 
 /// The resource kind those errors name for a gateway.
@@ -6928,12 +6920,88 @@ pub const RESOURCE_ACTION_DEFINITION: &str = "Action Definition";
 /// identifier took for the resource in question (a raw id, an `externalId:`
 /// label, a stream alias, a workspace name).
 ///
-/// One rule for every not-found path in this service, so no handler invents its
-/// own template: AWS states the absence as `<Resource> with ID <id> not found`,
-/// which is why the identifier is echoed rather than replaced by whatever the
-/// handler resolved.
+/// The form every absence this service has no resource-specific wording for is
+/// stated in, so no handler invents its own template: AWS states such an absence
+/// as `<Resource> with ID <id> not found`, which is why the identifier is echoed
+/// rather than replaced by whatever the handler resolved. The families whose own
+/// wording the service uses instead each have one function of their own beside
+/// this one ([`asset_not_found_message`],
+/// [`composite_model_not_found_message`], [`alias_not_found_message`],
+/// [`gateway_not_found_message`], [`gateway_not_found_for_update_message`],
+/// [`hierarchy_not_found_message`], [`not_found_arn_message`]).
 pub fn not_found_message(resource: &str, requested: &str) -> String {
     format!("{resource} with ID {requested} not found")
+}
+
+/// The message a not-found refusal for an ASSET carries.
+///
+/// An asset is addressed either by its own id or by the `externalId:` selector
+/// the `CustomID` pattern admits. Which of the two the REQUEST used is what
+/// failed to resolve, so it is what the refusal reports: a selector-addressed
+/// request failed to resolve an EXTERNAL ID, which the service states with the
+/// bare external id — the selector is how the request named the dimension, not
+/// part of its value — while a request that supplied the id itself keeps the one
+/// form [`not_found_message`] states every absence in.
+///
+/// One place, so every operation that resolves an asset label words the same
+/// absence identically whichever form the label took.
+pub fn asset_not_found_message(requested: &str) -> String {
+    match requested.strip_prefix(EXTERNAL_ID_PREFIX) {
+        Some(external_id) => format!("asset with externalId: {external_id} doesn't exist."),
+        None => not_found_message(RESOURCE_ASSET, requested),
+    }
+}
+
+/// The message a not-found refusal for one COMPOSITE MODEL of an asset model
+/// carries: a composite model is addressable only WITHIN an asset model, and the
+/// same composite-model id can be absent from many models, so the absence names
+/// both halves of the address — the composite model asked for and the asset model
+/// it was looked for in — each echoed as the request supplied it.
+///
+/// One place, so the read, the create of a nested one, the update and the delete
+/// cannot word the same absence four ways.
+pub fn composite_model_not_found_message(asset_model: &str, composite_model: &str) -> String {
+    format!("CompositeModel: {composite_model} not found for AssetModel: {asset_model}")
+}
+
+/// The message a not-found refusal for a data stream addressed by its ALIAS
+/// carries: an alias is resolved as a `dataAlias` within ONE account, so the
+/// absence names the account the lookup ran in and the alias it ran for, rather
+/// than reporting the alias as an id of the stream.
+///
+/// The account is the one every ARN this emulator mints carries, so a refusal and
+/// the resources a caller can see agree about which account it is addressing.
+/// One place, so every operation that resolves the `alias` of a time series —
+/// the read, the delete and the binding of one to an asset property — words that
+/// absence identically.
+pub fn alias_not_found_message(alias: &str) -> String {
+    let account = ::engine::EMULATOR_ACCOUNT_ID;
+    format!(
+        "dataAlias with accountId AwsAccountId{{value={account}}}, \
+         alias PropertyAlias(super=PropertyAlias{{value={alias}}}) not found"
+    )
+}
+
+/// The message a READ of an absent gateway is refused with: the id that resolved
+/// to nothing, and the service's guidance to check it.
+///
+/// A gateway's `gatewayId` is modelled as a plain `ID`, so the only identifier a
+/// refusal can name is the id the request path carried.
+pub fn gateway_not_found_message(gateway_id: &str) -> String {
+    format!(
+        "No gateway with ID {gateway_id} was found. Please verify that you supplied the correct \
+         gateway ID and try again."
+    )
+}
+
+/// The message an UPDATE of an absent gateway is refused with. The service words
+/// this one differently from the read above ([`gateway_not_found_message`]), so
+/// the two are kept as the two sentences they are rather than collapsed into one.
+pub fn gateway_not_found_for_update_message(gateway_id: &str) -> String {
+    format!(
+        "A gateway with ID {gateway_id} could not be found. Please verify you supplied the \
+         correct gateway ID and try again."
+    )
 }
 
 /// The message a half-open span covering no time is refused with: a span's

@@ -293,7 +293,7 @@ fn invalid_token() -> ListAssetPropertiesError {
 /// HTTP 404 `ResourceNotFoundException` naming the label that resolved to nothing.
 fn not_found(label: &str) -> ListAssetPropertiesError {
     ListAssetPropertiesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: crate::state::not_found_message(crate::state::RESOURCE_ASSET, label),
+        message: crate::state::asset_not_found_message(label),
     })
     .into()
 }

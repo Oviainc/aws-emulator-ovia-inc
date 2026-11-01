@@ -287,20 +287,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The one stream the alias names, associated or not, resolved through
             // the shared resolver every alias-addressed operation uses.
             crate::state::SeriesLookup::Alias(alias) => {
-                store.resolve_alias_series(alias).ok_or_else(|| {
-                    not_found(crate::state::not_found_message(
-                        crate::state::RESOURCE_TIME_SERIES,
-                        alias,
-                    ))
-                })?
+                store
+                    .resolve_alias_series(alias)
+                    .ok_or_else(|| not_found(crate::state::alias_not_found_message(alias)))?
             }
             crate::state::SeriesLookup::Pair(asset_label, property_label) => {
-                let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
-                    not_found(crate::state::not_found_message(
-                        crate::state::RESOURCE_ASSET,
-                        asset_label,
-                    ))
-                })?;
+                let asset_id = store
+                    .resolve_asset_id(asset_label)
+                    .ok_or_else(|| not_found(crate::state::asset_not_found_message(asset_label)))?;
                 let property_id = store
                     .assets
                     .get(&asset_id)

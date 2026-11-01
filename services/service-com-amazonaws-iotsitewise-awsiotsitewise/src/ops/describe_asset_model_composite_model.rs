@@ -218,10 +218,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let composite_model_id = record
             .resolve_composite_model_id(&input.asset_model_composite_model_id)
-            .ok_or_else(|| composite_not_found(&input.asset_model_composite_model_id))?;
+            .ok_or_else(|| {
+                composite_not_found(&input.asset_model_id, &input.asset_model_composite_model_id)
+            })?;
         let composite = record
             .composite_model(&composite_model_id)
-            .ok_or_else(|| composite_not_found(&input.asset_model_composite_model_id))?;
+            .ok_or_else(|| {
+                composite_not_found(&input.asset_model_id, &input.asset_model_composite_model_id)
+            })?;
 
         // A component-model-based composite model has no properties of its own:
         // the component model it reuses provides them, so they are read from that
@@ -295,14 +299,19 @@ fn model_not_found(label: &str) -> DescribeAssetModelCompositeModelError {
     .into()
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the composite model label that
-/// resolved to nothing on this asset model.
-fn composite_not_found(label: &str) -> DescribeAssetModelCompositeModelError {
+/// HTTP 404 `ResourceNotFoundException` for a composite-model label that resolved
+/// to nothing on the asset model the request scoped it to: both halves of the
+/// address are named, as [`crate::state::composite_model_not_found_message`]
+/// words that absence for every operation that addresses a composite model.
+fn composite_not_found(
+    asset_model_label: &str,
+    composite_model_label: &str,
+) -> DescribeAssetModelCompositeModelError {
     DescribeAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: crate::state::not_found_message(
-                crate::state::RESOURCE_ASSET_MODEL_COMPOSITE_MODEL,
-                label,
+            message: crate::state::composite_model_not_found_message(
+                asset_model_label,
+                composite_model_label,
             ),
         },
     )

@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{
-    not_found_message, service_state, RESOURCE_GATEWAY,
+    gateway_not_found_message, not_found_message, service_state, RESOURCE_GATEWAY,
 };
 
 use crate::asset_lifecycle::{call, error_code, is_modelled_id, router, router_with_engine};
@@ -206,7 +206,7 @@ async fn deleting_a_gateway_forgets_it_and_frees_what_it_reserved() {
         );
         assert_eq!(
             gone["message"].as_str().unwrap_or(""),
-            not_found_message(RESOURCE_GATEWAY, &id),
+            gateway_not_found_message(&id),
             "case {:?}: unexpected refusal message in {gone}",
             case.label
         );

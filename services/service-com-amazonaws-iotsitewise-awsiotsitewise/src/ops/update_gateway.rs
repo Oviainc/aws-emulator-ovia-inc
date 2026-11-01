@@ -218,13 +218,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the id the request supplied, worded
-/// by this service's one not-found rule rather than by a template of this handler's
-/// own.
+/// HTTP 404 `ResourceNotFoundException` naming the id the request supplied, in
+/// the sentence this service answers an UPDATE of an absent gateway with — which
+/// is not the one the read answers, so the two stay the two sentences they are.
 fn not_found(gateway_id: &str) -> UpdateGatewayError {
     UpdateGatewayError::Modeled(UpdateGatewayErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: crate::state::not_found_message(crate::state::RESOURCE_GATEWAY, gateway_id),
+            message: crate::state::gateway_not_found_for_update_message(gateway_id),
         },
     ))
 }

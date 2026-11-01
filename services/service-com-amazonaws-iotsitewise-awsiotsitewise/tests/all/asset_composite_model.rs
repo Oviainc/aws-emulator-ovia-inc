@@ -458,10 +458,13 @@ async fn a_label_that_names_no_composite_model_of_the_asset_is_a_modelled_refusa
             absent.to_string(),
         ),
         (
+            // An asset addressed by the selector failed to resolve an EXTERNAL
+            // ID, which the refusal reports by the bare external id — the
+            // selector is how the request named the dimension, not its value.
             "an asset externalId label that resolves to nothing",
             "externalId:no_such_asset".to_string(),
             custom.clone(),
-            "externalId:no_such_asset".to_string(),
+            "no_such_asset".to_string(),
         ),
         (
             "a composite model id that resolves to nothing",

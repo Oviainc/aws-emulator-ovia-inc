@@ -316,7 +316,7 @@ fn token_spent(asset_id: &str, resource_arn: String) -> UpdateAssetError {
 fn not_found(label: &str) -> UpdateAssetError {
     UpdateAssetError::Modeled(UpdateAssetErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: crate::state::not_found_message(crate::state::RESOURCE_ASSET, label),
+            message: crate::state::asset_not_found_message(label),
         },
     ))
 }

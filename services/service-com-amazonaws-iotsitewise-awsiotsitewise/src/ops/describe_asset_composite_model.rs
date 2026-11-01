@@ -258,7 +258,7 @@ fn internal_failure() -> DescribeAssetCompositeModelError {
 /// nothing.
 fn asset_not_found(label: &str) -> DescribeAssetCompositeModelError {
     DescribeAssetCompositeModelErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: crate::state::not_found_message(crate::state::RESOURCE_ASSET, label),
+        message: crate::state::asset_not_found_message(label),
     })
     .into()
 }

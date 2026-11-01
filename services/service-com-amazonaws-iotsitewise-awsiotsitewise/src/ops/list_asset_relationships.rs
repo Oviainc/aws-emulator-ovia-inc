@@ -181,10 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The label is either the raw UUID or the `externalId:<externalId>` alias form.
         let asset_id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
-            not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_ASSET,
-                &input.asset_id,
-            ))
+            not_found(crate::state::asset_not_found_message(&input.asset_id))
         })?;
 
         // PATH_TO_ROOT walks the hierarchy tree upwards from the asset: one HIERARCHY

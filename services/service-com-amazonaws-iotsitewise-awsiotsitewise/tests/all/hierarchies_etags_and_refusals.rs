@@ -1220,11 +1220,13 @@ async fn not_found_and_uniqueness_refusals_are_worded_from_the_request() {
             format!("Asset with ID {UNKNOWN_ID} not found"),
         ),
         (
+            // Addressed by the selector, the asset's absence is reported as an
+            // EXTERNAL ID that does not exist, by the bare external id.
             "DescribeAsset, unknown externalId label",
             "GET",
             "/assets/externalId:not-an-asset".to_string(),
             None,
-            "Asset with ID externalId:not-an-asset not found".to_string(),
+            "asset with externalId: not-an-asset doesn't exist.".to_string(),
         ),
         (
             "DeleteAsset, unknown id",

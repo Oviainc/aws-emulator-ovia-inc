@@ -311,7 +311,7 @@ fn resolve_entry(
             let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
                 (
                     ERROR_NOT_FOUND,
-                    crate::state::not_found_message(crate::state::RESOURCE_ASSET, asset_label),
+                    crate::state::asset_not_found_message(asset_label),
                 )
             })?;
             // The one definition of "the property this pair names": the asset's

@@ -430,7 +430,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(label) => Some(
                 record
                     .resolve_composite_model_id(label)
-                    .ok_or_else(|| composite_not_found(label))?,
+                    .ok_or_else(|| composite_not_found(&input.asset_model_id, label))?,
             ),
             None => None,
         };
@@ -602,14 +602,19 @@ fn model_not_found(label: &str) -> CreateAssetModelCompositeModelError {
     .into()
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the composite model label that
-/// resolved to nothing on this asset model.
-fn composite_not_found(label: &str) -> CreateAssetModelCompositeModelError {
+/// HTTP 404 `ResourceNotFoundException` for a composite-model label that resolved
+/// to nothing on the asset model the request scoped it to: both halves of the
+/// address are named, as [`crate::state::composite_model_not_found_message`]
+/// words that absence for every operation that addresses a composite model.
+fn composite_not_found(
+    asset_model_label: &str,
+    composite_model_label: &str,
+) -> CreateAssetModelCompositeModelError {
     CreateAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: crate::state::not_found_message(
-                crate::state::RESOURCE_ASSET_MODEL_COMPOSITE_MODEL,
-                label,
+            message: crate::state::composite_model_not_found_message(
+                asset_model_label,
+                composite_model_label,
             ),
         },
     )

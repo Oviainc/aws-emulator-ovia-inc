@@ -191,16 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both ids are `CustomID`s: a raw UUID, or `externalId:<externalId>`. The
         // asset resolves through the shared resolver every other handler uses.
         let asset_id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
-            not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_ASSET,
-                &input.asset_id,
-            ))
+            not_found(crate::state::asset_not_found_message(&input.asset_id))
         })?;
         let asset = store.assets.get(&asset_id).ok_or_else(|| {
-            not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_ASSET,
-                &input.asset_id,
-            ))
+            not_found(crate::state::asset_not_found_message(&input.asset_id))
         })?;
         // The model is what declares every property this asset carries. An asset
         // cannot be created without one and `DeleteAssetModel` refuses while any

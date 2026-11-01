@@ -368,7 +368,7 @@ fn resolve_entry<'a>(
             let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
                 (
                     "ResourceNotFoundException",
-                    crate::state::not_found_message(crate::state::RESOURCE_ASSET, asset_label),
+                    crate::state::asset_not_found_message(asset_label),
                 )
             })?;
             // The property resolves through the one definition of "the property

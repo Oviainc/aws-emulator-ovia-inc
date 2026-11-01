@@ -226,10 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both ids are modelled `CustomID`: the raw UUID or the
         // `externalId:<externalId>` form, resolved through the shared resolvers.
         let asset_id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
-            not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_ASSET,
-                &input.asset_id,
-            ))
+            not_found(crate::state::asset_not_found_message(&input.asset_id))
         })?;
         let property = store
             .assets
@@ -292,8 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             input.alias
                         )))
                     }
-                    _ => Err(not_found(crate::state::not_found_message(
-                        crate::state::RESOURCE_TIME_SERIES,
+                    _ => Err(not_found(crate::state::alias_not_found_message(
                         &input.alias,
                     ))),
                 };

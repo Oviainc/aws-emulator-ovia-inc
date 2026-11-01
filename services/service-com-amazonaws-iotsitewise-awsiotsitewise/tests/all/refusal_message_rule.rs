@@ -3,14 +3,22 @@
 //! The two refusal-WORDING rules this service follows, pinned over a SET of
 //! inputs rather than over the one request an issue happened to record:
 //!
-//! 1. An absent resource is stated as the resource KIND followed by the
-//!    identifier the REQUEST supplied, echoed exactly as sent — whatever form
-//!    that identifier takes (a raw id, an `externalId:` label, a stream alias, a
-//!    workspace name) and whichever operation did the lookup. The one exception
-//!    the service's own wording makes is a resource addressed by ARN, where the
-//!    ARN is the dimension the request named, and a HIERARCHY, which AWS words as
-//!    a hierarchy that "doesn't exist" — so the two association operations, which
-//!    look up the same grouping, must word that absence identically.
+//! 1. An absent resource is stated in the form the service words THAT resource's
+//!    absence in, naming the identifier the REQUEST supplied for it — whatever
+//!    form that identifier takes (a raw id, an `externalId:` label, a stream
+//!    alias, a workspace name) and whichever operation did the lookup. Most
+//!    resources share one form, the kind followed by the identifier; the
+//!    families with their own sentence are a resource addressed by ARN (where
+//!    the ARN is the dimension the request named), a HIERARCHY (worded as a
+//!    hierarchy that "doesn't exist", so the two association operations, which
+//!    look up the same grouping, must word that absence identically), an ASSET
+//!    addressed by the `externalId:` selector (reported as an external id that
+//!    does not exist, by the bare external id), a COMPOSITE MODEL of an asset
+//!    model (which names the asset model it was looked for in), a time series
+//!    addressed by its `alias` (reported as a `dataAlias` absent from the
+//!    account the lookup ran in) and a GATEWAY (whose read and whose update are
+//!    worded differently) — the families the companion suite next door drives
+//!    through every operation that addresses one.
 //! 2. A uniqueness collision names the DIMENSION of the request that collided
 //!    (`externalId`, `ID`, `name`) rather than an identifier the rejected request
 //!    would have minted, and points its `resourceId` at the resource that already
@@ -57,6 +65,18 @@ const WINDOW: &str = "startDate=2026-01-01T00:00:00Z&endDate=2026-01-02T00:00:00
 /// request body, and the message the rule produces for it.
 type NotFoundRow = (&'static str, &'static str, String, Option<Value>, String);
 
+/// The sentence a time series addressed by its `alias` is reported absent with,
+/// written out by hand here as the oracle: the account the alias was resolved in
+/// — the one every ARN this emulator mints carries — and the alias from the
+/// request.
+fn data_alias_absence(alias: &str) -> String {
+    format!(
+        "dataAlias with accountId AwsAccountId{{value={}}}, \
+         alias PropertyAlias(super=PropertyAlias{{value={alias}}}) not found",
+        engine::EMULATOR_ACCOUNT_ID
+    )
+}
+
 #[tokio::test]
 async fn an_absent_resource_is_stated_as_its_kind_and_the_requested_identifier() {
     let router = router();
@@ -94,7 +114,7 @@ async fn an_absent_resource_is_stated_as_its_kind_and_the_requested_identifier()
             "PUT",
             "/assets/externalId:no_such_asset".to_string(),
             Some(json!({ "assetName": "Whatever" })),
-            "Asset with ID externalId:no_such_asset not found".to_string(),
+            "asset with externalId: no_such_asset doesn't exist.".to_string(),
         ),
         (
             "UpdateAssetProperty, a raw id",
@@ -108,7 +128,7 @@ async fn an_absent_resource_is_stated_as_its_kind_and_the_requested_identifier()
             "PUT",
             format!("/assets/externalId:no_such_asset/properties/{OTHER_UNKNOWN_ID}"),
             Some(json!({})),
-            "Asset with ID externalId:no_such_asset not found".to_string(),
+            "asset with externalId: no_such_asset doesn't exist.".to_string(),
         ),
         (
             "DisassociateTimeSeriesFromAssetProperty, a raw id",
@@ -160,15 +180,17 @@ async fn an_absent_resource_is_stated_as_its_kind_and_the_requested_identifier()
             "GET",
             format!("/asset-models/{model_id}/composite-models/{UNKNOWN_ID}"),
             None,
-            format!("Asset Model Composite Model with ID {UNKNOWN_ID} not found"),
+            format!("CompositeModel: {UNKNOWN_ID} not found for AssetModel: {model_id}"),
         ),
         (
             "DescribeAssetModelCompositeModel, an absent composite model by label",
             "GET",
             format!("/asset-models/{model_id}/composite-models/externalId:no_such_composite"),
             None,
-            "Asset Model Composite Model with ID externalId:no_such_composite not found"
-                .to_string(),
+            format!(
+                "CompositeModel: externalId:no_such_composite not found for \
+                 AssetModel: {model_id}"
+            ),
         ),
         (
             "CreateAssetModelCompositeModel, an absent asset model",
@@ -185,21 +207,24 @@ async fn an_absent_resource_is_stated_as_its_kind_and_the_requested_identifier()
             "GET",
             format!("/20200301/gateways/{UNKNOWN_ID}"),
             None,
-            format!("Gateway with ID {UNKNOWN_ID} not found"),
+            format!(
+                "No gateway with ID {UNKNOWN_ID} was found. Please verify that you supplied \
+                 the correct gateway ID and try again."
+            ),
         ),
         (
             "DescribeTimeSeries, an alias",
             "GET",
             format!("/timeseries/describe?alias={UNKNOWN_ALIAS}"),
             None,
-            format!("Time Series with ID {UNKNOWN_ALIAS} not found"),
+            data_alias_absence(UNKNOWN_ALIAS),
         ),
         (
             "DeleteTimeSeries, an alias",
             "POST",
             format!("/timeseries/delete?alias={UNKNOWN_ALIAS}"),
             None,
-            format!("Time Series with ID {UNKNOWN_ALIAS} not found"),
+            data_alias_absence(UNKNOWN_ALIAS),
         ),
         (
             "DeleteTimeSeries, an asset id",
@@ -461,7 +486,7 @@ async fn the_alias_addressed_write_path_words_an_absent_stream_the_same_way() {
         ),
     ];
     for (case, alias) in &aliases {
-        let expected = format!("Time Series with ID {alias} not found");
+        let expected = data_alias_absence(alias);
         let (status, answered) = call(
             &router,
             "POST",

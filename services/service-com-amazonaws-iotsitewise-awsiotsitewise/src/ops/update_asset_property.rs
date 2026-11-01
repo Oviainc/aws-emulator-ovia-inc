@@ -253,16 +253,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolves through the shared resolver every other handler uses; the property
         // resolves within that asset's materialised property list.
         let asset_id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
-            not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_ASSET,
-                &input.asset_id,
-            ))
+            not_found(crate::state::asset_not_found_message(&input.asset_id))
         })?;
         let asset = store.assets.get(&asset_id).ok_or_else(|| {
-            not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_ASSET,
-                &input.asset_id,
-            ))
+            not_found(crate::state::asset_not_found_message(&input.asset_id))
         })?;
         let at = asset.property_position(&input.property_id).ok_or_else(|| {
             not_found(format!(

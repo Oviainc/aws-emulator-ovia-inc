@@ -410,12 +410,14 @@ async fn unresolvable_labels_and_tokens_are_modelled_refusals() {
             names: Some(absent.to_string()),
         },
         Refusal {
+            // Addressed by the selector, the refusal reports the EXTERNAL ID
+            // that resolved to nothing, by itself.
             case: "asset externalId that names nothing",
             asset: "externalId:no_such_asset".to_string(),
             query: String::new(),
             status: 404,
             code: Some("ResourceNotFoundException"),
-            names: Some("externalId:no_such_asset".to_string()),
+            names: Some("no_such_asset".to_string()),
         },
         Refusal {
             case: "hierarchy id no model declares",

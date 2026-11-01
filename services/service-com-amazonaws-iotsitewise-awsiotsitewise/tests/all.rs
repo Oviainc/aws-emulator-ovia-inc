@@ -24,6 +24,13 @@
 #[path = "all/task_delete.rs"]
 mod task_delete;
 
+// `not_found_refusal_families` is declared HERE, beside the suite above, for the
+// reason its note gives: the sorted list and the END of this file are both where
+// every concurrent iotsitewise change puts a declaration of its own. Fold it into
+// the list once the churn settles.
+#[path = "all/not_found_refusal_families.rs"]
+mod not_found_refusal_families;
+
 // `monitor_resource_grant_sweep` is declared HERE, beside the suite above, for the
 // reason its note gives: the sorted list and the END of this file are both where
 // every concurrent iotsitewise change puts a declaration of its own. Fold it into

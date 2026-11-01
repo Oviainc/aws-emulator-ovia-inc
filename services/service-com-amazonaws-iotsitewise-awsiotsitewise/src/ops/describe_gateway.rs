@@ -193,11 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing.
+/// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing,
+/// in the sentence this service answers a READ of an absent gateway with.
 fn not_found(gateway_id: &str) -> DescribeGatewayError {
     DescribeGatewayError::Modeled(DescribeGatewayErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: crate::state::not_found_message(crate::state::RESOURCE_GATEWAY, gateway_id),
+            message: crate::state::gateway_not_found_message(gateway_id),
         },
     ))
 }

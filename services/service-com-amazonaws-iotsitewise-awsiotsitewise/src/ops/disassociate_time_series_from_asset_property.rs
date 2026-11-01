@@ -235,16 +235,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `externalId:<externalId>`. Both forms name the one stored property, resolved
         // the way every other handler in this crate resolves them.
         let asset_id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
-            not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_ASSET,
-                &input.asset_id,
-            ))
+            not_found(crate::state::asset_not_found_message(&input.asset_id))
         })?;
         let asset = store.assets.get(&asset_id).ok_or_else(|| {
-            not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_ASSET,
-                &input.asset_id,
-            ))
+            not_found(crate::state::asset_not_found_message(&input.asset_id))
         })?;
         let property = asset.property(&input.property_id).ok_or_else(|| {
             not_found(format!(

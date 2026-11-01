@@ -196,10 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The label is either the raw UUID or the `externalId:<externalId>` alias form.
         let asset_id = match input.asset_id.as_deref() {
             Some(label) => Some(store.resolve_asset_id(label).ok_or_else(|| {
-                not_found(crate::state::not_found_message(
-                    crate::state::RESOURCE_ASSET,
-                    label,
-                ))
+                not_found(crate::state::asset_not_found_message(label))
             })?),
             None => None,
         };

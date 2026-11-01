@@ -240,16 +240,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `externalId:<externalId>` alias form. A label that names no stored resource
         // is a modelled refusal, never an unwind.
         let parent_id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
-            not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_ASSET,
-                &input.asset_id,
-            ))
+            not_found(crate::state::asset_not_found_message(&input.asset_id))
         })?;
         let child_id = store.resolve_asset_id(&input.child_asset_id).ok_or_else(|| {
-            not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_ASSET,
-                &input.child_asset_id,
-            ))
+            not_found(crate::state::asset_not_found_message(&input.child_asset_id))
         })?;
 
         // The hierarchy is defined by the PARENT asset's model: it is the model that
@@ -259,10 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&parent_id)
             .map(|asset| asset.asset_model_id.clone())
             .ok_or_else(|| {
-                not_found(crate::state::not_found_message(
-                    crate::state::RESOURCE_ASSET,
-                    &input.asset_id,
-                ))
+                not_found(crate::state::asset_not_found_message(&input.asset_id))
             })?;
         let hierarchy = store
             .asset_models
@@ -312,8 +303,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&child_id)
             .map(|asset| asset.asset_model_id.clone())
             .ok_or_else(|| {
-                not_found(crate::state::not_found_message(
-                    crate::state::RESOURCE_ASSET,
+                not_found(crate::state::asset_not_found_message(
                     &input.child_asset_id,
                 ))
             })?;
