@@ -176,7 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // come from the store, so no id — well-formed or not — is accepted without a
         // job behind it, and only a job that WAS found can reject a token it was not
         // handed out with.
-        let job = match state.third_party_job_mut(&input.job_id, &input.client_token) {
+        // The partner plane's own wording for a job the service is not holding.
+        let job = match state.third_party_job_mut(
+            &input.job_id,
+            &input.client_token,
+            crate::state::third_party_job_not_found_message,
+        ) {
             Ok(job) => job,
             Err(problem) => {
                 let (outcome, error) = match problem {

@@ -323,8 +323,10 @@ async fn a_delete_addresses_the_region_it_was_signed_for() {
 }
 
 /// RULE: everything the service held about the action type goes with it — after the
-/// delete, `PollForJobs` for it is not found and its ARN names no taggable resource;
-/// re-registering the identity starts from the new request alone.
+/// delete its ARN names no taggable resource and it is gone from the listing, while a
+/// job worker still polling it is answered an empty poll rather than a refusal (the
+/// delete marks the custom action deleted); re-registering the identity starts from the
+/// new request alone.
 #[tokio::test]
 async fn a_deleted_action_type_is_no_longer_pollable_or_taggable() {
     let emulator = Emulator::new();
@@ -373,16 +375,13 @@ async fn a_deleted_action_type_is_no_longer_pollable_or_taggable() {
 
     delete_in(&emulator, HOME_REGION, row.case, &row.delete()).await;
 
-    // And none of them does afterwards, each with the error the operation models for
-    // an action type the account does not hold.
-    for (operation, body, expected) in [
-        ("PollForJobs", poll.clone(), "ActionTypeNotFoundException"),
-        (
-            "ListTagsForResource",
-            json!({"resourceArn": arn}),
-            "ResourceNotFoundException",
-        ),
-    ] {
+    // And the resource views do not afterwards, each with the error the operation
+    // models for an action type the account does not hold.
+    for (operation, body, expected) in [(
+        "ListTagsForResource",
+        json!({"resourceArn": arn}),
+        "ResourceNotFoundException",
+    )] {
         let (status, code) = emulator.expect_error(operation, &body).await;
         assert_eq!(
             (status, code.as_str()),
@@ -390,6 +389,14 @@ async fn a_deleted_action_type_is_no_longer_pollable_or_taggable() {
             "{operation} after the delete: expected a 400 {expected}, got {status} {code}"
         );
     }
+    // The job worker is the exception: a poll of the identity it was serving is still
+    // answered, with no jobs, so a worker loop drains instead of failing.
+    let (status, polled) = emulator.call("PollForJobs", &poll).await;
+    assert_eq!(
+        (status, polled.get("jobs")),
+        (200, Some(&json!([]))),
+        "PollForJobs after the delete: expected a 200 with no jobs, got {status} {polled}"
+    );
     let held = held_in(&emulator, HOME_REGION).await;
     assert!(
         held.is_empty(),

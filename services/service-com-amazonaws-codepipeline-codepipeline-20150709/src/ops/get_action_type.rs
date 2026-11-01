@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetActionTypeError::from(GetActionTypeErrorModeled::ActionTypeNotFoundException(
                     ActionTypeNotFoundException {
                         message: Some(
-                            crate::state::action_type_declaration_not_found_message(&key.to_id()),
+                            crate::state::action_type_definition_not_found_message(&key.to_id()),
                         ),
                     },
                 ))

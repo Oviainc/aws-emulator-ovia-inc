@@ -345,11 +345,12 @@ async fn a_partner_is_reported_the_queued_jobs_capped_by_max_batch_size() {
                 "case {case:?}: expected the first {} queued jobs oldest first, got {actual:?}",
                 expected.len()
             );
-            // An empty list is reported as an ABSENT member, never as `[]`.
+            // An empty poll reports an empty LIST, not an absent member.
             if expected.is_empty() {
-                assert!(
-                    response.get("jobs").is_none(),
-                    "case {case:?}: expected no jobs member at all, got {response}"
+                assert_eq!(
+                    response.get("jobs"),
+                    Some(&json!([])),
+                    "case {case:?}: expected an empty jobs list, got {response}"
                 );
             }
         }

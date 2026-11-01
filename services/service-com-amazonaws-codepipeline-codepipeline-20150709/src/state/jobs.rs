@@ -113,7 +113,7 @@ pub fn acknowledge(
     // A job whose action is no longer waiting for a worker is not a job any more, which
     // is the sweep every job-worker operation performs first.
     state.retire_finished_jobs();
-    let job = job_mut(state, job_id)?;
+    let job = job_mut(state, job_id, super::job_not_found_message)?;
     if job.status != JOB_STATUS_QUEUED || !job.admits_nonce(nonce) {
         return Err(JobProblem::InvalidNonce(super::invalid_nonce_message(
             job_id,
@@ -169,7 +169,7 @@ pub fn record_success(
 
     state.retire_finished_jobs();
     let (execution_id, stage, action, pipeline_name, stage_name, action_name) = {
-        let job = job_mut(state, job_id)?;
+        let job = job_mut(state, job_id, super::job_result_not_found_message)?;
         if job.status != JOB_STATUS_IN_PROGRESS {
             return Err(JobProblem::InvalidState(invalid_state_message(
                 job_id,
@@ -227,14 +227,18 @@ pub fn record_success(
     });
 
     let Some(record) = state.executions.get_mut(&execution_id) else {
-        return Err(JobProblem::NotFound(super::job_not_found_message(job_id)));
+        return Err(JobProblem::NotFound(super::job_result_not_found_message(
+            job_id,
+        )));
     };
     let Some(run) = record
         .stages
         .get_mut(stage)
         .and_then(|stage| stage.actions.get_mut(action))
     else {
-        return Err(JobProblem::NotFound(super::job_not_found_message(job_id)));
+        return Err(JobProblem::NotFound(super::job_result_not_found_message(
+            job_id,
+        )));
     };
     run.status = Some(ACTION_SUCCEEDED.to_string());
     run.summary = execution_details
@@ -268,7 +272,7 @@ pub fn record_failure(
 ) -> Result<(), JobProblem> {
     state.retire_finished_jobs();
     let (execution_id, stage, action) = {
-        let job = job_mut(state, job_id)?;
+        let job = job_mut(state, job_id, super::job_result_not_found_message)?;
         if job.status != JOB_STATUS_IN_PROGRESS {
             return Err(JobProblem::InvalidState(invalid_state_message(
                 job_id,
@@ -281,14 +285,18 @@ pub fn record_failure(
     };
 
     let Some(record) = state.executions.get_mut(&execution_id) else {
-        return Err(JobProblem::NotFound(super::job_not_found_message(job_id)));
+        return Err(JobProblem::NotFound(super::job_result_not_found_message(
+            job_id,
+        )));
     };
     let Some(run) = record
         .stages
         .get_mut(stage)
         .and_then(|stage| stage.actions.get_mut(action))
     else {
-        return Err(JobProblem::NotFound(super::job_not_found_message(job_id)));
+        return Err(JobProblem::NotFound(super::job_result_not_found_message(
+            job_id,
+        )));
     };
     run.status = Some(ACTION_FAILED.to_string());
     run.summary = Some(failure.message.clone());
@@ -301,17 +309,25 @@ pub fn record_failure(
     Ok(())
 }
 
-/// The job queued under `job_id`, or the refusal a call naming no job answers.
+/// The job queued under `job_id`, or the refusal a call naming no job answers, worded
+/// as `not_found` states it.
+///
+/// The lookup is one rule for every job-worker operation; which words its refusal
+/// carries belongs to the CALLING operation's family
+/// ([`super::job_not_found_message`] for the acknowledge/details family,
+/// [`super::job_result_not_found_message`] for the put-result family), so the wording
+/// travels in rather than being fixed here.
 fn job_mut<'a>(
     state: &'a mut State,
     job_id: &str,
+    not_found: fn(&str) -> String,
 ) -> Result<&'a mut super::JobRecord, JobProblem> {
     state
         .jobs
         .values_mut()
         .flatten()
         .find(|job| job.job_id == job_id)
-        .ok_or_else(|| JobProblem::NotFound(super::job_not_found_message(job_id)))
+        .ok_or_else(|| JobProblem::NotFound(not_found(job_id)))
 }
 
 /// Why a job cannot take a result: it is not one a worker holds and has still to

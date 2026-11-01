@@ -178,7 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the call carries the `clientToken` it was handed out with. Both refusals
         // come from the store, so no id — well-formed or not — is accepted without a
         // job behind it.
-        let job = match state.third_party_job_mut(&input.job_id, &input.client_token) {
+        // The partner plane's own wording for a job the service is not holding.
+        let job = match state.third_party_job_mut(
+            &input.job_id,
+            &input.client_token,
+            crate::state::third_party_job_not_found_message,
+        ) {
             Ok(job) => job,
             Err(problem) => {
                 let (outcome, error) = match problem {

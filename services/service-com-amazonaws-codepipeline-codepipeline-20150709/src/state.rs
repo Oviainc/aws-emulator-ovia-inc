@@ -20,7 +20,7 @@
 //! [`execution`], the engine that moves it in [`driver`], and the job-worker lifecycle a
 //! `Custom`-owned action waits on in [`jobs`].
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -318,6 +318,17 @@ pub enum ExecutionAdmission {
     AtLimit,
 }
 
+/// How a job worker's poll resolved the `Custom` action type it named
+/// ([`ComAmazonawsCodepipelineCodepipeline20150709State::pollable_action_type`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollResolution {
+    /// The account holds the registration, so the jobs waiting for it are handed out.
+    Held,
+    /// The account registered the identity and has since deleted it: the poll is
+    /// answered, with no jobs, so the worker that was serving it drains.
+    Deleted,
+}
+
 /// The most action types this emulator registers for the account before another
 /// registration is refused.
 ///
@@ -333,6 +344,18 @@ pub enum ExecutionAdmission {
 /// [`ComAmazonawsCodepipelineCodepipeline20150709State::register_action_type`] is the
 /// one way into the map, so the bound holds whatever registers.
 pub const MAX_ACTION_TYPES_PER_ACCOUNT: usize = 1000;
+
+/// How many DELETED custom action-type registrations this emulator remembers, so that
+/// a job worker still polling one of them is answered a poll rather than told its
+/// action type does not exist.
+///
+/// A bound is required for the same reason the registration cap is: the memory grows
+/// by one on every delete and is released only by falling out of it, so without a cap
+/// registering and deleting in a loop would grow the store without limit. Past it the
+/// registration deleted longest ago is forgotten, so an entry can never be added
+/// without one being releasable. AWS publishes no figure for how long a deleted custom
+/// action stays pollable, so this count is this emulator's own bound.
+pub const MAX_DELETED_ACTION_TYPES: usize = 100;
 
 /// The most action-type definitions (`ActionTypeDeclaration`s) this emulator holds
 /// before another `UpdateActionType` call is refused — ACROSS every Region, not per
@@ -487,6 +510,20 @@ pub struct ComAmazonawsCodepipelineCodepipeline20150709State {
     /// and the [`MAX_ACTION_TYPES_PER_ACCOUNT`] bound cannot be bypassed; read it
     /// through `action_type_catalog` or `registered_action_type`.
     action_types: BTreeMap<ActionTypeKey, ActionTypeRecord>,
+    /// The custom action-type registrations this account has DELETED, oldest first,
+    /// each with the record it carried while it was held.
+    ///
+    /// `DeleteCustomActionType` "marks a custom action as deleted": the identity stops
+    /// being one the account HOLDS — it is gone from the catalog, from a read of the
+    /// registrations and from the slot accounting — but a job worker still polling it
+    /// is answered rather than told the action type does not exist, which is what this
+    /// remembers (see
+    /// [`ComAmazonawsCodepipelineCodepipeline20150709State::pollable_action_type`]).
+    ///
+    /// PRIVATE, and bounded by [`MAX_DELETED_ACTION_TYPES`], for the same reason
+    /// `action_types` is: it grows by one on every delete, so without a bound a caller
+    /// could grow the store without limit by registering and deleting.
+    deleted_action_types: VecDeque<(ActionTypeKey, ActionTypeRecord)>,
     /// The action-type DEFINITIONS `UpdateActionType` has stored, keyed by the
     /// Region they were stored in and the identity they belong to — the view of an
     /// action type that `ActionTypeDeclaration` carries ("the parameters for the
@@ -1207,10 +1244,16 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     /// that WAS found can reject the token it was given. `ThirdPartyJobId` carries
     /// no modelled pattern, so the id's form is never what decides this — only
     /// whether a job is queued under it.
+    ///
+    /// `not_found` is the wording the CALLING operation's family states a missing job
+    /// with ([`third_party_job_not_found_message`] for the partner plane's own
+    /// operations): the lookup is one rule, and which words state its refusal belongs
+    /// to the caller.
     pub fn third_party_job_mut(
         &mut self,
         job_id: &str,
         client_token: &str,
+        not_found: fn(&str) -> String,
     ) -> Result<&mut ThirdPartyJobRecord, ThirdPartyJobProblem> {
         let job = self
             .third_party_jobs
@@ -1221,7 +1264,7 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
                 // The message AWS answers a missing job with, built from the
                 // request: the id the caller asked for, and nothing else about the
                 // store.
-                ThirdPartyJobProblem::NotFound(job_not_found_message(job_id))
+                ThirdPartyJobProblem::NotFound(not_found(job_id))
             })?;
         if job.client_token != client_token {
             return Err(ThirdPartyJobProblem::ClientToken(format!(
@@ -1251,8 +1294,51 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     /// Forget the action type registered under `key`, answering whether one was
     /// registered. The release path the bound needs: without it a registration
     /// could never be given back.
+    ///
+    /// The record is REMEMBERED as deleted (`deleted_action_types`, bounded by
+    /// [`MAX_DELETED_ACTION_TYPES`]) rather than dropped: the identity is no longer one
+    /// the account holds, but a job worker still polling it is answered a poll
+    /// ([`Self::pollable_action_type`]). Re-registering the same identity and deleting
+    /// it again leaves ONE memory of it, the newest.
     pub fn forget_action_type(&mut self, key: &ActionTypeKey) -> bool {
-        self.action_types.remove(key).is_some()
+        let Some(record) = self.action_types.remove(key) else {
+            return false;
+        };
+        self.deleted_action_types.retain(|(held, _)| held != key);
+        self.deleted_action_types.push_back((key.clone(), record));
+        // Past the bound the registration deleted longest ago is forgotten, so this
+        // memory can never be added to without one being releasable.
+        while self.deleted_action_types.len() > MAX_DELETED_ACTION_TYPES {
+            self.deleted_action_types.pop_front();
+        }
+        true
+    }
+
+    /// How a job worker's poll resolved the action type it named, and the record it
+    /// resolved to: the registration this account holds under `key`, or — when it holds
+    /// none — the one it deleted.
+    ///
+    /// A `Custom` action type exists only because this account registered it, so a poll
+    /// of an identity it NEVER registered has no action type to report jobs for and is
+    /// refused. An identity it registered and then deleted is a different case: the
+    /// delete MARKS the custom action deleted, and a recorded poll of one is answered
+    /// rather than refused — with no jobs, so the worker that was serving it drains
+    /// instead of failing, which is what "`PollForJobs` for the custom action fails
+    /// after the action is marked for deletion" amounts to for that worker. Only the
+    /// job-worker poll resolves this far; the catalog, a read of the registrations and
+    /// the slot accounting all see a deleted registration as gone.
+    pub fn pollable_action_type(
+        &self,
+        key: &ActionTypeKey,
+    ) -> Option<(PollResolution, &ActionTypeRecord)> {
+        if let Some(record) = self.registered_action_type(key) {
+            return Some((PollResolution::Held, record));
+        }
+        self.deleted_action_types
+            .iter()
+            .rev()
+            .find(|(held, _)| held == key)
+            .map(|(_, record)| (PollResolution::Deleted, record))
     }
 
     /// The record registered under `key`, or `None` when this account registered no
@@ -2692,31 +2778,46 @@ pub fn poll_limit(max_batch_size: Option<i32>) -> usize {
 
 /// What `ActionTypeNotFoundException` states for an action type the ACCOUNT's own
 /// registrations do not carry: the four identifying fields of the action type the
-/// REQUEST named, in the order `ActionTypeId` declares them, and the account the
-/// lookup was scoped to.
+/// REQUEST named, each quoted, labelled in the order `ActionTypeId` declares them, and
+/// the statement that the action type is not available.
 ///
 /// Built from the request, so it is a template over the caller's own values rather
 /// than text naming one particular action type, and the caller can tell from it which
-/// of the four fields it has to correct. This is the wording of the job plane, where
-/// an action type is a REGISTRATION of one account (`PollForJobs` "is valid only for
-/// action types with Custom in the owner field"); the action-type DECLARATION
-/// operations state the same condition the other way, see
-/// [`action_type_declaration_not_found_message`].
+/// of the four fields it has to correct. Nothing about the STORE travels in it — not
+/// the account the lookup was scoped to — because an action type a poll cannot reach
+/// is reported as unavailable to the caller, not as absent from one account.
+///
+/// This is the wording of the job plane, where an action type is a REGISTRATION of one
+/// account (`PollForJobs` "is valid only for action types with Custom in the owner
+/// field"); the action-type DEFINITION operations state the same condition in their
+/// own words, see [`action_type_definition_not_found_message`] (the read path) and
+/// [`action_type_declaration_not_found_message`] (the write path).
 pub fn action_type_not_found_message(id: &ActionTypeId) -> String {
     format!(
-        "ActionType (Category='{}', Owner='{}', Provider='{}', Version='{}') is not \
-         registered in account '{}'",
-        id.category,
-        id.owner,
-        id.provider,
-        id.version,
-        ::engine::emulator_account_id()
+        "ActionType (Category: '{}', Owner: '{}', Provider: '{}', Version: '{}') is not \
+         available",
+        id.category, id.owner, id.provider, id.version
     )
 }
 
-/// What `ActionTypeNotFoundException` states for an action type whose DEFINITION was
-/// addressed — the operations that read and write an `ActionTypeDeclaration`
-/// (`GetActionType`, `UpdateActionType`).
+/// What `ActionTypeNotFoundException` states when an action type's DEFINITION is READ
+/// and no stored definition carries that identity — `GetActionType`.
+///
+/// The read path states the condition over the request's own id with each member
+/// labelled and its value bare, in the order `owner`, `category`, `provider`,
+/// `version`, and closes the sentence with a period. The WRITE path
+/// ([`action_type_declaration_not_found_message`]) words the same condition
+/// differently, which is why the two are separate templates rather than one shared
+/// string: each belongs to the operation family that states it.
+pub fn action_type_definition_not_found_message(id: &ActionTypeId) -> String {
+    format!(
+        "Action type with owner={}, category={}, provider={} and version={} does not exist.",
+        id.owner, id.category, id.provider, id.version
+    )
+}
+
+/// What `ActionTypeNotFoundException` states for an action type whose DEFINITION a
+/// call tried to WRITE — `UpdateActionType`.
 ///
 /// AWS states this condition over the request's own id, naming each of the four
 /// members as `owner=[…], category=[…], provider=[…] and version=[…]` and closing
@@ -2977,10 +3078,36 @@ impl JobRecord {
     }
 }
 
-/// What `JobNotFoundException` states, for every operation that raises it: the id the
-/// caller asked for, and nothing else about the store. One source, so the two job
-/// planes cannot drift on what a missing job is reported as.
+/// What `JobNotFoundException` states where a call asks the service to CONFIRM or
+/// REPORT a job it is not holding — the custom-action acknowledge/details family
+/// (`AcknowledgeJob`, `GetJobDetails`): the id the caller asked for bare, and nothing
+/// else about the store.
+///
+/// One source per family, so the operations of a family cannot drift on what a missing
+/// job is reported as; the family that REPORTS a result words it with the id quoted
+/// ([`job_result_not_found_message`]) and the partner plane closes it with a period
+/// ([`third_party_job_not_found_message`]), so the templates are separate rather than
+/// shared.
 pub fn job_not_found_message(job_id: &str) -> String {
+    format!("Job with id {job_id} does not exist")
+}
+
+/// What `JobNotFoundException` states where a WORKER reports a result for a job the
+/// service is not holding — the put-result family (`PutJobSuccessResult`,
+/// `PutJobFailureResult`): the same statement with the id quoted.
+pub fn job_result_not_found_message(job_id: &str) -> String {
+    format!("Job with id '{job_id}' does not exist")
+}
+
+/// What `JobNotFoundException` states on the THIRD-PARTY job plane — the operations a
+/// partner's worker calls (`AcknowledgeThirdPartyJob`,
+/// `PutThirdPartyJobSuccessResult`, `PutThirdPartyJobFailureResult`): the id quoted,
+/// and the statement closed with a period.
+///
+/// The partner plane states this condition in its own words, which is why it is a
+/// third template beside the two the custom-action plane uses: the wording belongs to
+/// the operation family that answers, so no family may be worded from another's.
+pub fn third_party_job_not_found_message(job_id: &str) -> String {
     format!("Job with id '{job_id}' does not exist.")
 }
 

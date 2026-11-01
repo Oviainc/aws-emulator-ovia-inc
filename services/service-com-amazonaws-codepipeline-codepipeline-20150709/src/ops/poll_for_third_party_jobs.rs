@@ -203,9 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(PollForThirdPartyJobsOutput {
-            // An absent list and an empty one state the same fact, and AWS omits the
-            // member.
-            jobs: (!jobs.is_empty()).then_some(jobs),
+            // The list is always reported, empty when nothing is waiting: a worker
+            // loop reads `jobs` on every answer, so an empty poll is an empty LIST
+            // rather than a missing member.
+            jobs: Some(jobs),
         })
     }
 }

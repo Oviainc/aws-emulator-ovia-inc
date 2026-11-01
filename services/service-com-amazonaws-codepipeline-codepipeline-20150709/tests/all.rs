@@ -47,6 +47,8 @@ mod error_message_rules;
 mod execution_engine;
 #[path = "all/execution_stage_locking.rs"]
 mod execution_stage_locking;
+#[path = "all/job_worker_refusals_and_poll_results.rs"]
+mod job_worker_refusals_and_poll_results;
 #[path = "all/pipeline_lifecycle.rs"]
 mod pipeline_lifecycle;
 #[path = "all/pipeline_state.rs"]

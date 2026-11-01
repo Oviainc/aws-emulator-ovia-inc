@@ -18,7 +18,11 @@
 //!    account registered it (`CreateCustomActionType`), so an id the registry does not
 //!    hold is refused `ActionTypeNotFoundException` (HTTP 400) — the built-in catalog
 //!    holds no `Custom` entry, and a job waiting is not what makes an action type
-//!    exist.
+//!    exist. An id this account registered and then DELETED still resolves here: the
+//!    delete marks the custom action deleted, so the worker still polling it is
+//!    answered — with no jobs, because no job of a deleted custom action is handed out
+//!    again
+//!    ([`crate::state::ComAmazonawsCodepipelineCodepipeline20150709State::pollable_action_type`]).
 //! 3. **`queryParam` selects.** "For an action type with no queryable properties, this
 //!    value must be null or an empty map. For an action type with a queryable property,
 //!    you must supply that property as a key in the map. Only jobs whose action
@@ -248,13 +252,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Rule 2: the action type has to be one this account registered — and rule 3
-        // is checked against that registration's queryable property. At most one
-        // property of an action type is queryable (the registration refuses more).
-        let queryable = {
+        // Rule 2: the action type has to be one this account registered — or one it
+        // registered and has since deleted, which a worker still polling is answered
+        // rather than refused — and rule 3 is checked against that registration's
+        // queryable property. At most one property of an action type is queryable (the
+        // registration refuses more).
+        let (resolution, queryable) = {
             let store = state.lock();
-            let Some(registered) =
-                store.registered_action_type(&crate::state::ActionTypeKey::from_id(action_type))
+            let Some((resolution, registered)) =
+                store.pollable_action_type(&crate::state::ActionTypeKey::from_id(action_type))
             else {
                 return Err(PollForJobsErrorModeled::ActionTypeNotFoundException(
                     ActionTypeNotFoundException {
@@ -263,11 +269,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            registered
+            let queryable = registered
                 .configuration_properties
                 .iter()
                 .find(|property| property.queryable)
-                .map(|property| property.name.clone())
+                .map(|property| property.name.clone());
+            (resolution, queryable)
         };
 
         // Rule 3: what this poll selects on, or the refusal for a `queryParam` the
@@ -286,6 +293,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+
+        // A deleted registration is answered and nothing more: the custom action is
+        // marked deleted, so no job of it is handed to a worker again and the one still
+        // polling drains. The request is still judged by rules 1 and 3 above, so a poll
+        // that could not be served while the registration was held is not served now
+        // either.
+        if resolution == crate::state::PollResolution::Deleted {
+            return Ok(PollForJobsOutput {
+                jobs: Some(Vec::new()),
+            });
+        }
 
         // A job is queued when an execution REACHES a custom action, which is a step
         // the clock owes (see `state::driver`). The request names no pipeline, so the
@@ -314,10 +332,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(PollForJobsOutput {
-            // An absent list and an empty one state the same fact, and AWS omits the
-            // member.
-            jobs: (!leased.is_empty())
-                .then(|| leased.iter().map(crate::state::JobRecord::to_job).collect()),
+            // The list is always reported, empty when nothing is waiting: a worker
+            // loop reads `jobs` on every answer, so an empty poll is an empty LIST
+            // rather than a missing member.
+            jobs: Some(leased.iter().map(crate::state::JobRecord::to_job).collect()),
         })
     }
 }

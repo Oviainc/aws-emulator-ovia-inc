@@ -8,9 +8,11 @@
 //! The round trip, the Region a definition belongs to and the store's bound are pinned
 //! by `action_type_definitions.rs`; what these cases are about is the REFUSAL: the HTTP
 //! status and the error code are the contract, and so is the message, which AWS states
-//! over the request's own id — naming each of the four members and closing with the
-//! sentence that tells a caller an action type is not something an ordinary account
-//! defines for itself — so a caller can tell from it which member it has to correct.
+//! over the request's own id — naming each of the four members — so a caller can tell
+//! from it which member it has to correct. The two operations do NOT share one
+//! sentence: the READ path states the identity's members bare and stops at "does not
+//! exist.", while the WRITE path brackets them and closes with the sentence that tells
+//! a caller an action type is not something an ordinary account defines for itself.
 //!
 //! Every call goes through `MultiServiceRouter::dispatch`, so nothing here can pass by
 //! reading a handler's internals.
@@ -18,7 +20,9 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_codepipeline_codepipeline_20150709::ops::types::ActionTypeId;
-use service_com_amazonaws_codepipeline_codepipeline_20150709::state::action_type_declaration_not_found_message;
+use service_com_amazonaws_codepipeline_codepipeline_20150709::state::{
+    action_type_declaration_not_found_message, action_type_definition_not_found_message,
+};
 
 use crate::pipeline_lifecycle::Emulator;
 
@@ -91,9 +95,9 @@ async fn the_not_found_refusal_is_stated_over_the_requested_identity() {
             "case {case:?}: expected a {NOT_FOUND_STATUS} {NOT_FOUND}, got {status} {response}"
         );
 
-        // The one template every operation that addresses an action type's DEFINITION
-        // states a missing one with, applied to this request.
-        let expected = action_type_declaration_not_found_message(requested);
+        // The template the READ path states a missing definition with, applied to this
+        // request.
+        let expected = action_type_definition_not_found_message(requested);
         let message = response.get("message").and_then(Value::as_str);
         assert_eq!(
             message,
@@ -102,8 +106,7 @@ async fn the_not_found_refusal_is_stated_over_the_requested_identity() {
         );
 
         // Built from the request: it names each member the caller asked about, so no
-        // two rows share a refusal, and it closes with the sentence that says an
-        // action type is not something an ordinary account defines for itself.
+        // two rows share a refusal, and the statement stops at the identity.
         for member in [
             &requested.category,
             &requested.owner,
@@ -115,10 +118,14 @@ async fn the_not_found_refusal_is_stated_over_the_requested_identity() {
                 "case {case:?}: expected the refusal to name {member:?}, got {expected:?}"
             );
         }
-        assert!(
-            expected.ends_with("To create an action type, contact the CodePipeline service team."),
-            "case {case:?}: expected the refusal to close with the service-team sentence, \
-             got {expected:?}"
+        assert_eq!(
+            expected,
+            format!(
+                "Action type with owner={}, category={}, provider={} and version={} does not \
+                 exist.",
+                requested.owner, requested.category, requested.provider, requested.version
+            ),
+            "case {case:?}: the read path states what AWS states for this class"
         );
     }
 
@@ -126,7 +133,7 @@ async fn the_not_found_refusal_is_stated_over_the_requested_identity() {
     // request" means.
     let mut messages: Vec<String> = cases
         .iter()
-        .map(action_type_declaration_not_found_message)
+        .map(action_type_definition_not_found_message)
         .collect();
     let total = messages.len();
     messages.sort();
@@ -138,10 +145,11 @@ async fn the_not_found_refusal_is_stated_over_the_requested_identity() {
     );
 }
 
-/// RULE: the wording belongs to the ERROR CLASS, so `UpdateActionType` states a
-/// missing action type exactly as `GetActionType` does — over the request's own
-/// `actionType.id`, in AWS's `owner`/`category`/`provider`/`version` order, with the
-/// service-team sentence.
+/// RULE: the wording belongs to the operation FAMILY that states it, so
+/// `UpdateActionType` states a missing action type over the request's own
+/// `actionType.id` in AWS's `owner`/`category`/`provider`/`version` order with the
+/// members bracketed and the service-team sentence — and the read path of the same
+/// identity answers its own, shorter statement of the same condition.
 ///
 /// The rows differ along every member the rule generalises over: each `ActionCategory`
 /// the model declares a provider for here, both owners `ActionTypeIdentifier$owner`
@@ -202,12 +210,18 @@ async fn update_action_type_states_a_missing_action_type_the_same_way() {
             "case {case:?}: expected the refusal {expected:?}, got {response}"
         );
 
-        // The same condition, through the other operation of the pair: one wording.
+        // The same condition, through the other operation of the pair: the same error
+        // code, and that family's own wording of it.
+        let read_expected = action_type_definition_not_found_message(requested);
         let (status, read) = get(&emulator, requested).await;
         assert_eq!(
             (status, read.get("message").and_then(Value::as_str)),
-            (NOT_FOUND_STATUS, Some(expected.as_str())),
-            "case {case:?}: both declaration operations state it the same way, got {read}"
+            (NOT_FOUND_STATUS, Some(read_expected.as_str())),
+            "case {case:?}: the read path states it in its own words, got {read}"
+        );
+        assert_ne!(
+            expected, read_expected,
+            "case {case:?}: the two families do not share one sentence"
         );
     }
 }
