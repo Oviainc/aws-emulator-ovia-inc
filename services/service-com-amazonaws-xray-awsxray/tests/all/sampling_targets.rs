@@ -10,9 +10,10 @@
 //! The rules these tables check:
 //!
 //! * a reported rule is answered ONE `SamplingTargetDocument` carrying the
-//!   rule's STORED `FixedRate` (to its full precision) and the reporting
-//!   interval, so a rule created or updated with another rate serves that rate
-//!   from the next call on;
+//!   rule's STORED `FixedRate` (to its full precision), so a rule created or
+//!   updated with another rate serves that rate from the next call on, and the
+//!   reporting interval the share it grants comes with
+//!   (`sampling_target_cadence_and_processed_window.rs` owns that rule);
 //! * a service is told the allocation of a cycle it already took part in, so its
 //!   FIRST report carries no reservoir share at all, and deleting the rule does
 //!   not cancel a share already granted;
@@ -46,7 +47,7 @@ use crate::trace_ingest_and_groups::{Answer, Xray};
 
 /// Now, in seconds of epoch time — the clock a reporting service stamps its
 /// documents with.
-fn now() -> f64 {
+pub(crate) fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock is past the epoch")
@@ -55,7 +56,7 @@ fn now() -> f64 {
 
 /// A 24-character hexadecimal `ClientID`, which is the only length the model
 /// accepts (`@length(min: 24, max: 24)`).
-fn client_id(seed: u32) -> String {
+pub(crate) fn client_id(seed: u32) -> String {
     format!("{seed:024x}")
 }
 
@@ -89,7 +90,7 @@ fn rule_body(
 }
 
 /// `CreateSamplingRule` over the front door.
-async fn create_rule(
+pub(crate) async fn create_rule(
     xray: &Xray,
     name: &str,
     priority: i64,
@@ -105,7 +106,7 @@ async fn create_rule(
 }
 
 /// One `SamplingStatisticsDocument`.
-fn statistics(
+pub(crate) fn statistics(
     rule_name: &str,
     client: &str,
     at: f64,
@@ -124,7 +125,7 @@ fn statistics(
 }
 
 /// `GetSamplingTargets` for the given statistics documents.
-async fn get_targets(xray: &Xray, documents: &[Value]) -> Answer {
+pub(crate) async fn get_targets(xray: &Xray, documents: &[Value]) -> Answer {
     xray.call(
         "/SamplingTargets",
         &json!({ "SamplingStatisticsDocuments": documents }),
@@ -133,7 +134,7 @@ async fn get_targets(xray: &Xray, documents: &[Value]) -> Answer {
 }
 
 /// `GetSamplingTargets` carrying boost statistics beside the sampling ones.
-async fn get_targets_with_boost(
+pub(crate) async fn get_targets_with_boost(
     xray: &Xray,
     documents: &[Value],
     boost_documents: &[Value],
@@ -158,7 +159,7 @@ async fn get_summaries(xray: &Xray, token: Option<&str>) -> Answer {
 }
 
 /// The named list member of an answer, or an empty slice.
-fn list(answer: &Answer, member: &str) -> Vec<Value> {
+pub(crate) fn list(answer: &Answer, member: &str) -> Vec<Value> {
     answer
         .get(member)
         .as_array()
@@ -166,7 +167,7 @@ fn list(answer: &Answer, member: &str) -> Vec<Value> {
 }
 
 /// The target document for `rule_name`, if the answer carries one.
-fn target_for(answer: &Answer, rule_name: &str) -> Option<Value> {
+pub(crate) fn target_for(answer: &Answer, rule_name: &str) -> Option<Value> {
     list(answer, "SamplingTargetDocuments")
         .into_iter()
         .find(|target| target.get("RuleName").and_then(Value::as_str) == Some(rule_name))
@@ -269,7 +270,7 @@ async fn a_reported_rule_is_served_its_stored_rate_and_a_share_only_once_a_cycle
             case.case,
             case.fixed_rate
         );
-        for member in ["ReservoirQuota", "ReservoirQuotaTTL"] {
+        for member in ["ReservoirQuota", "ReservoirQuotaTTL", "Interval"] {
             assert!(
                 target.get(member).is_none_or(Value::is_null),
                 "case {:?}: a first report holds no allocation yet, so {member} must be absent, got {target:?}",
@@ -305,7 +306,7 @@ async fn a_reported_rule_is_served_its_stored_rate_and_a_share_only_once_a_cycle
         assert_eq!(
             interval,
             Some(i64::from(SAMPLING_TARGET_INTERVAL_SECONDS)),
-            "case {:?}: expected Interval {SAMPLING_TARGET_INTERVAL_SECONDS}, got {interval:?}",
+            "case {:?}: a granted share comes with the interval to come back at ({SAMPLING_TARGET_INTERVAL_SECONDS}), got {interval:?}",
             case.case
         );
         // The only service reporting for the rule is allocated the whole pool.

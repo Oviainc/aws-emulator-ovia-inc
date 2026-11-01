@@ -112,20 +112,33 @@ impl Xray {
     }
 
     pub async fn summaries(&self, start: f64, end: f64, token: Option<&str>) -> Answer {
-        let mut body = json!({ "StartTime": start, "EndTime": end });
-        if let Some(token) = token {
-            body["NextToken"] = json!(token);
-        }
-        self.call("/TraceSummaries", &body).await
+        self.query_summaries(start, end, None, token).await
     }
 
     /// `GetTraceSummaries` over `[start, end)` with a filter expression.
     pub async fn filtered(&self, start: f64, end: f64, filter: &str) -> Answer {
-        self.call(
-            "/TraceSummaries",
-            &json!({ "StartTime": start, "EndTime": end, "FilterExpression": filter }),
-        )
-        .await
+        self.query_summaries(start, end, Some(filter), None).await
+    }
+
+    /// `GetTraceSummaries` over `[start, end)`, with an optional filter
+    /// expression and an optional page token: the ONE place the request shape of
+    /// a paged, filtered query lives, so a suite walking pages does not rebuild
+    /// it.
+    pub async fn query_summaries(
+        &self,
+        start: f64,
+        end: f64,
+        filter: Option<&str>,
+        token: Option<&str>,
+    ) -> Answer {
+        let mut body = json!({ "StartTime": start, "EndTime": end });
+        if let Some(filter) = filter {
+            body["FilterExpression"] = json!(filter);
+        }
+        if let Some(token) = token {
+            body["NextToken"] = json!(token);
+        }
+        self.call("/TraceSummaries", &body).await
     }
 
     pub async fn batch_get(&self, ids: &[String], token: Option<&str>) -> Answer {

@@ -22,7 +22,12 @@
 //!   all, so a rule's first report carries none; once one has, every reporting
 //!   service is told its share, which is nothing for a service that joined
 //!   after the division;
-//! * when that share expires and how long to wait before reporting again.
+//! * when that share expires, and when to come back for the next one.
+//!
+//! `Interval` goes WITH the share a document grants: a service that was given
+//! one is told when to ask again, and a document that grants none assigns no
+//! cadence at all, so it carries no interval and the reporting service keeps
+//! the one it came with.
 //!
 //! A statistics document naming a rule the account does not hold is answered in
 //! `UnprocessedStatistics` rather than with an allocation for a rule nobody
@@ -295,7 +300,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     fixed_rate,
                     reservoir_quota,
                     reservoir_quota_ttl: reservoir_quota.map(|_| quota_ttl),
-                    interval: Some(crate::state::SAMPLING_TARGET_INTERVAL_SECONDS),
+                    // `Interval` is "the number of seconds for the service to
+                    // wait before getting sampling targets again": the cadence
+                    // the share this document GRANTS comes with — come back for
+                    // the next share when the one just granted expires. A
+                    // document that grants no share assigns no cadence either,
+                    // so it carries no interval and the reporting service keeps
+                    // the one it came with, whose statistics are then "for the
+                    // last 10 seconds unless the service has been assigned a
+                    // longer reporting interval after a previous call".
+                    interval: reservoir_quota
+                        .map(|_| crate::state::SAMPLING_TARGET_INTERVAL_SECONDS),
                     sampling_boost: None,
                 },
             );
@@ -337,7 +352,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // this service has claimed no share of its reservoir.
                     reservoir_quota: None,
                     reservoir_quota_ttl: None,
-                    interval: Some(crate::state::SAMPLING_TARGET_INTERVAL_SECONDS),
+                    // No share of the reservoir is granted here, so no cadence
+                    // is assigned with one; see above.
+                    interval: None,
                     sampling_boost: None,
                 });
             target.sampling_boost = Some(SamplingBoost {

@@ -6,7 +6,11 @@
 //! [`StartTime`, `EndTime`) and, when the request carries a `FilterExpression`,
 //! the ones that expression selects ([`crate::state::filter`]); each
 //! `TraceSummary` is then built from the persisted segment documents, so a trace
-//! just written by `PutTraceSegments` appears here. A request asking for
+//! just written by `PutTraceSegments` appears here. `TracesProcessedCount`
+//! counts the traces the REQUESTED WINDOW holds — the ones this query took
+//! through the filter, matching or not — so it stays consistent with the
+//! summaries served for that window, is the same on every page of one query,
+//! and reports none for a window holding nothing. A request asking for
 //! behaviour this slice does not implement — sampling —
 //! is REFUSED with `InvalidRequestException` naming what is unsupported, rather
 //! than answered with an unfiltered 200, and so is an inverted time range.
@@ -247,10 +251,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resume = input.next_token.as_deref();
 
-        // PASS ONE, under the lock: which traces the window selects, and how
-        // many were walked. Only ids are taken, so the critical section is one
-        // walk of the keyspace with no caller-supplied work in it.
-        let (candidates, traces_scanned) = {
+        // PASS ONE, under the lock: which traces the window holds, and which of
+        // them this page starts at. Only ids and a count are taken, so the
+        // critical section is one walk of the keyspace with no caller-supplied
+        // work in it.
+        let (candidates, traces_processed) = {
             let store = state.lock();
 
             // A token this service issued names the trace the next page starts
@@ -271,27 +276,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
 
-            // `traces` is a `BTreeMap`, so the walk is in trace-id order and the
-            // token resumes at the first id at or after it, in O(log n).
-            let scan: Box<dyn Iterator<Item = &crate::state::TraceRecord>> = match resume {
-                Some(token) => Box::new(
-                    store
-                        .traces
-                        .range(token.to_string()..)
-                        .map(|(_, trace)| trace),
-                ),
-                None => Box::new(store.traces.values()),
-            };
-            let mut scanned: i64 = 0;
+            // `traces` is a `BTreeMap`, so the walk is in trace-id order and a
+            // page resumes at the first id at or after the token. The whole
+            // keyspace is walked on every page — the token no longer narrows the
+            // walk, because the count below is of the window rather than of the
+            // part of it this page starts at — which is bounded by the stored
+            // trace cap ([`crate::state::MAX_TRACES`]), the same bound the
+            // unpaged walk already had.
+            //
+            // `TracesProcessedCount` is "the total number of traces processed,
+            // including traces that did not match the specified filter
+            // expression": the traces the REQUESTED WINDOW holds. A trace
+            // outside the window was never part of this query, so it is not
+            // counted — the count describes the window asked for, not how much
+            // of the store the walk touched, and a window holding nothing
+            // reports none processed however many traces are stored. It is
+            // counted over the WHOLE window rather than from the resume point,
+            // because the window is the same on every page of one query; and the
+            // filter expression is deliberately not applied to it, because what
+            // the filter selected is `TraceSummaries`.
+            let mut processed: i64 = 0;
             let mut candidates: Vec<String> = Vec::new();
-            for trace in scan {
-                scanned += 1;
+            for trace in store.traces.values() {
                 let instant = window_instant(trace);
-                if instant >= start && instant < end {
+                if instant < start || instant >= end {
+                    continue;
+                }
+                processed = processed.saturating_add(1);
+                if resume.is_none_or(|token| trace.id.as_str() >= token) {
                     candidates.push(trace.id.clone());
                 }
             }
-            (candidates, scanned)
+            (candidates, processed)
         };
 
         // PASS TWO: evaluate the filter expression, one trace per critical
@@ -352,7 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetTraceSummariesOutput {
             trace_summaries: Some(selected),
             approximate_time: Some(now()),
-            traces_processed_count: Some(traces_scanned),
+            traces_processed_count: Some(traces_processed),
             next_token,
         })
     }

@@ -5543,16 +5543,23 @@ pub const SAMPLING_WINDOW_SECONDS: i64 = 10;
 /// `SamplingTargetDocument$Interval`: "the number of seconds for the service to
 /// wait before getting sampling targets again".
 ///
-/// Every service here is left on the reporting window every X-Ray SDK starts on
-/// ([`SAMPLING_WINDOW_SECONDS`]); none is assigned a longer one, which is the
-/// case a `SamplingStatisticsDocument` describes as the default.
+/// Served only on a document that GRANTS a share of a rule's reservoir, which
+/// is what the member is for: the service is told to come back for its next
+/// share when the one it was just granted expires
+/// ([`SAMPLING_ALLOCATION_TTL_SECONDS`]), one reporting window
+/// ([`SAMPLING_WINDOW_SECONDS`]) later. A document that grants no share assigns
+/// no cadence either, so it carries no interval at all and the reporting
+/// service keeps the one it came with — the case a `SamplingStatisticsDocument`
+/// describes as its default, "the last 10 seconds unless the service has been
+/// assigned a longer reporting interval after a previous call".
 pub const SAMPLING_TARGET_INTERVAL_SECONDS: i32 = 10;
 
 /// How long an allocated reservoir quota and a granted sampling boost stay
 /// live, in seconds.
 ///
-/// CHOSEN, not documented: the allocation is granted for the reporting interval
-/// the same response hands back ([`SAMPLING_TARGET_INTERVAL_SECONDS`]), so a
+/// CHOSEN, not documented: the allocation is granted for the interval the same
+/// document assigns the service ([`SAMPLING_TARGET_INTERVAL_SECONDS`]), which is
+/// the reporting window it reports over ([`SAMPLING_WINDOW_SECONDS`]), so a
 /// service that comes back when it was told to is answered the share the cycle
 /// it just took part in computed, and one that goes quiet falls back to the
 /// rule's `FixedRate` instead of holding a share of the pool forever.

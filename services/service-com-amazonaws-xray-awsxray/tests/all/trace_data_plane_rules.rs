@@ -1379,21 +1379,9 @@ async fn a_filter_expression_selects_the_traces_it_matches() {
         let mut processed: Option<i64> = None;
         let mut token: Option<String> = None;
         loop {
-            let got = match &token {
-                None => xray.filtered(WINDOW.0, WINDOW.1, expression).await,
-                Some(next) => {
-                    xray.call(
-                        "/TraceSummaries",
-                        &json!({
-                            "StartTime": WINDOW.0,
-                            "EndTime": WINDOW.1,
-                            "FilterExpression": expression,
-                            "NextToken": next,
-                        }),
-                    )
-                    .await
-                }
-            };
+            let got = xray
+                .query_summaries(WINDOW.0, WINDOW.1, Some(expression), token.as_deref())
+                .await;
             assert_eq!(
                 got.status, 200,
                 "case {expression:?}: a well-formed expression is served, got {got:?}"

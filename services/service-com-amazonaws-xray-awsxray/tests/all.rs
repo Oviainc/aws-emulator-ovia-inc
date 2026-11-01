@@ -83,6 +83,9 @@ mod sampling_rule_deletion;
 #[path = "all/sampling_rules.rs"]
 mod sampling_rules;
 
+#[path = "all/sampling_target_cadence_and_processed_window.rs"]
+mod sampling_target_cadence_and_processed_window;
+
 #[path = "all/sampling_targets.rs"]
 mod sampling_targets;
 

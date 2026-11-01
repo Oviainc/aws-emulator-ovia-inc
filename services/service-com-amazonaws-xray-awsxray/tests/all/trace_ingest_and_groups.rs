@@ -676,10 +676,14 @@ async fn the_time_window_is_half_open_and_selects_on_the_stored_start_time() {
             ids, expected,
             "case {label:?}: window [{start}, {end}) must select {expected:?}, got {ids:?}"
         );
+        // The count is of the traces the REQUESTED WINDOW holds, so it moves
+        // with the window rather than reporting the whole store: a window past
+        // every stored trace reports none processed.
+        let in_window = i64::try_from(expected.len()).expect("the row's trace count fits");
         assert_eq!(
             got.get("TracesProcessedCount").as_i64(),
-            Some(3),
-            "case {label:?}: all three stored traces are scanned, got {:?}",
+            Some(in_window),
+            "case {label:?}: window [{start}, {end}) holds {in_window} trace(s), got {:?}",
             got.get("TracesProcessedCount")
         );
     }
