@@ -20,6 +20,10 @@
 //! name is sent in, which status the cache is in when the delete arrives, and
 //! whether a final snapshot is asked for), so no single recorded request is what
 //! makes them pass.
+//!
+//! The final snapshot a delete takes is the snapshot rule, so what it stores is
+//! asserted by the `serverless_cache_snapshots` suite beside this one; the row
+//! below is only about a `FinalSnapshotName` that cannot name a snapshot at all.
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
@@ -258,7 +262,7 @@ async fn a_delete_this_emulator_cannot_honour_is_refused_and_changes_nothing() {
 
     // The axis: why the delete cannot be honoured — the name resolves no cache
     // (in three forms), the cache is not in a status it can be deleted from, or
-    // the request asks for work this emulator cannot do.
+    // the final snapshot it asks for cannot be named.
     let rows: &[RefusalCase] = &[
         (
             "a name no cache was created under",
@@ -285,10 +289,10 @@ async fn a_delete_this_emulator_cannot_honour_is_refused_and_changes_nothing() {
             "InvalidServerlessCacheStateFault",
         ),
         (
-            "a final snapshot this emulator cannot take",
+            "a final snapshot name no snapshot can be stored under",
             &[
                 ("ServerlessCacheName", "available-cache"),
-                ("FinalSnapshotName", "a-final-snapshot"),
+                ("FinalSnapshotName", "not a name"),
             ],
             400,
             "InvalidParameterValue",

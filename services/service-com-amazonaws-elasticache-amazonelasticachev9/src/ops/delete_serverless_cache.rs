@@ -169,6 +169,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
+        // `FinalSnapshotName` is the "name of the final snapshot to be taken
+        // before the serverless cache is deleted", so it names a snapshot this
+        // call MINTS and is held to the same rules
+        // `CreateServerlessCacheSnapshot` holds one to, in the same order: the
+        // name's form first, then the store's own rule about storing a snapshot
+        // under it (`serverless_cache_snapshot_refusal`) — the name being free,
+        // and the store not being at its quota. This operation models a fault
+        // only for the first, so the bound is reported as the value this call
+        // cannot accept.
+        let final_snapshot_name = match input.final_snapshot_name.as_deref() {
+            Some(requested) => {
+                let snapshot_name = requested.to_ascii_lowercase();
+                if !crate::state::is_valid_snapshot_name(&snapshot_name) {
+                    return Err(invalid_value(format!(
+                        "Invalid value {requested} for FinalSnapshotName: a name must contain \
+                         from 1 to 255 alphanumeric characters or hyphens."
+                    )));
+                }
+                match store.serverless_cache_snapshot_refusal(&snapshot_name) {
+                    Some(crate::state::ServerlessSnapshotRefusal::AlreadyExists(message)) => {
+                        return Err(
+                            DeleteServerlessCacheErrorModeled::ServerlessCacheSnapshotAlreadyExistsFault(
+                                ServerlessCacheSnapshotAlreadyExistsFault {
+                                    message: Some(message),
+                                },
+                            )
+                            .into(),
+                        )
+                    }
+                    Some(crate::state::ServerlessSnapshotRefusal::QuotaExceeded(message)) => {
+                        return Err(invalid_value(format!(
+                            "Invalid value {requested} for FinalSnapshotName: {message}"
+                        )))
+                    }
+                    None => {}
+                }
+                Some(snapshot_name)
+            }
+            None => None,
+        };
+
         // A cache whose removal the clock has already carried through is gone,
         // and one that has become `AVAILABLE` since it was created is available
         // now: the record read below is the one this instant owes.
@@ -206,25 +247,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // `FinalSnapshotName` asks for a snapshot to be TAKEN before the cache
-        // goes, and this slice can take none: the serverless-snapshot operations
-        // (`CreateServerlessCacheSnapshot`, `DescribeServerlessCacheSnapshots`,
-        // …) are scaffolded 501s that own that gap, so the store holds no
-        // serverless cache snapshot for one to appear in. Refusing the member is
-        // the honest answer — a 200 would claim a final snapshot that was never
-        // taken and that no read can find.
-        if let Some(final_snapshot_name) = input.final_snapshot_name.as_deref() {
-            return Err(invalid_value(format!(
-                "Invalid value {final_snapshot_name} for FinalSnapshotName: this emulator takes \
-                 no serverless cache snapshots."
-            )));
-        }
+        // The final snapshot is taken of the cache as it stands NOW, before the
+        // delete begins: "the final snapshot to be taken before the serverless
+        // cache is deleted". It outlives the cache, so a later
+        // `DescribeServerlessCacheSnapshots` still reports it.
+        let final_snapshot = final_snapshot_name.map(|snapshot_name| {
+            crate::state::ServerlessCacheSnapshotRecord::from_cache(
+                cache,
+                crate::state::NewServerlessCacheSnapshot {
+                    name: snapshot_name,
+                    // This request names no KMS key and no tags of its own, so
+                    // the snapshot carries the source cache's key and no tags.
+                    kms_key_id: None,
+                    tags: Vec::new(),
+                    now,
+                },
+            )
+        });
 
         // The cache is leaving: it answers `DELETING` now, and the clock owes its
         // removal, so a caller reading it straight after this call still sees it
         // going away and a later one sees it gone.
         cache.begin_deletion(now);
         let serverless_cache = cache.to_modeled();
+        if let Some(record) = final_snapshot {
+            let stored = store.insert_serverless_cache_snapshot(record);
+            let snapshot_name = stored.name.clone();
+            store.record_event(
+                crate::state::SOURCE_TYPE_SERVERLESS_CACHE_SNAPSHOT,
+                &snapshot_name,
+                "Serverless cache snapshot created",
+                now,
+            );
+        }
         // Deleting a serverless cache is one of the events this service records;
         // see `crate::state::EventRecord`. The log outlives the record, so the
         // events of a deleted cache are still reported.

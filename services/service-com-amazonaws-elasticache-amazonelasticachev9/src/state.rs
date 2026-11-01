@@ -14,13 +14,21 @@
 //! `CreateServerlessCache` mints one, `ModifyServerlessCache` changes it,
 //! `DescribeServerlessCaches` reports it and `DeleteServerlessCache` takes it
 //! away. Its record and its projection into the modelled `ServerlessCache`
-//! shape live here too, so those handlers — and the serverless snapshot
-//! operations, still scaffolded 501s with their own gap issue — write the same
+//! shape live here too, so those handlers write the same
 //! copy the reader reads instead of introducing a
 //! second one. A deleted cache does not vanish at the call: it answers
 //! `DELETING` and the clock owes its removal
 //! ([`ServerlessCacheRecord::pending_deletion`]), the same way a created one is
 //! owed `AVAILABLE`.
+//!
+//! A serverless cache's snapshot is its own resource, held in
+//! [`ServerlessCacheSnapshotRecord`] beside the caches rather than on them,
+//! because it outlives the cache it was taken of:
+//! `CreateServerlessCacheSnapshot` mints one from a stored serverless cache (and
+//! `DeleteServerlessCache`'s `FinalSnapshotName` mints the last one),
+//! `DescribeServerlessCacheSnapshots` reports it, and the copy, export and
+//! delete calls for one are still scaffolded 501s that will read and write this
+//! same copy rather than a second one.
 //!
 //! A snapshot is a copy of a cluster as of the time it was taken:
 //! `CreateSnapshot` mints one from a stored cluster, `CopySnapshot` mints a
@@ -163,6 +171,7 @@ use crate::ops::types::{
     PendingLogDeliveryConfiguration, PendingModifiedValues, ProcessedUpdateAction, RecurringCharge,
     ReplicationGroup, ReplicationGroupPendingModifiedValues, ReservedCacheNode,
     ReservedCacheNodesOffering, ScaleConfig, SecurityGroupMembership, ServerlessCache,
+    ServerlessCacheConfiguration, ServerlessCacheSnapshot,
     ServiceUpdate, Snapshot, Subnet, Tag, UnprocessedUpdateAction, UpdateAction,
     UserGroupPendingChanges, UserGroupsUpdateStatus,
 };
@@ -724,6 +733,11 @@ pub const SOURCE_TYPE_CACHE_CLUSTER: &str = "cache-cluster";
 pub const SOURCE_TYPE_CACHE_SUBNET_GROUP: &str = "cache-subnet-group";
 /// See [`SOURCE_TYPE_CACHE_CLUSTER`].
 pub const SOURCE_TYPE_SERVERLESS_CACHE: &str = "serverless-cache";
+/// See [`SOURCE_TYPE_CACHE_CLUSTER`]. Unlike a cluster's snapshot, a serverless
+/// cache's snapshot IS an event source of its own in the enum, so what happens
+/// to one is recorded under the snapshot rather than under the cache it was
+/// taken from.
+pub const SOURCE_TYPE_SERVERLESS_CACHE_SNAPSHOT: &str = "serverless-cache-snapshot";
 /// See [`SOURCE_TYPE_CACHE_CLUSTER`].
 pub const SOURCE_TYPE_USER: &str = "user";
 /// See [`SOURCE_TYPE_CACHE_CLUSTER`].
@@ -2764,10 +2778,10 @@ impl TaggedResourceKind {
 /// Every segment this service's ARN helpers mint ([`cluster_arn`],
 /// [`subnet_group_arn`], [`parameter_group_arn`], [`snapshot_arn`],
 /// [`replication_group_arn`], [`reservation_arn`], [`serverless_cache_arn`],
-/// [`user_arn`], [`user_group_arn`], [`global_replication_group_arn`]), plus the
-/// two kinds this emulator mints no resource of yet — the EC2-Classic cache
-/// security group and the serverless cache snapshot. A segment in neither list
-/// names no ElastiCache resource at all, which is what [`parse_resource_arn`]
+/// [`serverless_cache_snapshot_arn`], [`user_arn`], [`user_group_arn`],
+/// [`global_replication_group_arn`]), plus the one kind this emulator mints no
+/// resource of yet — the EC2-Classic cache security group. A segment in neither
+/// list names no ElastiCache resource at all, which is what [`parse_resource_arn`]
 /// answers `None` for.
 const RESOURCE_TYPE_SEGMENTS: &[(&str, TaggedResourceKind)] = &[
     ("cluster", TaggedResourceKind::CacheCluster),
@@ -2975,6 +2989,20 @@ pub fn snapshot_page_size(max_records: Option<i32>) -> Result<usize, String> {
         max_records,
         SNAPSHOT_MAX_RECORDS_DEFAULT,
         SNAPSHOT_MAX_RECORDS_MAX,
+    )
+}
+
+/// The page size `DescribeServerlessCacheSnapshots` serves, whose `MaxResults`
+/// documents "The default is 50. The Validation Constraints are a maximum of
+/// 50." — a maximum with no stated minimum, so the smallest page it serves is
+/// one record; see [`SERVERLESS_SNAPSHOT_MAX_RESULTS_DEFAULT`].
+pub fn serverless_snapshot_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    page_size_bounded(
+        max_results,
+        "MaxResults",
+        SERVERLESS_SNAPSHOT_MAX_RESULTS_DEFAULT,
+        1,
+        SERVERLESS_SNAPSHOT_MAX_RESULTS_MAX,
     )
 }
 
@@ -5489,6 +5517,32 @@ pub const SERVERLESS_CACHE_TRANSITION: Duration = CLUSTER_TRANSITION;
 /// the store, for the reason [`CLUSTER_QUOTA`] gives.
 pub const SERVERLESS_CACHE_QUOTA: usize = 150;
 
+/// How many serverless cache snapshots the store holds before a create is
+/// refused with `ServerlessCacheSnapshotQuotaExceededFault`. The emulator's OWN
+/// bound on the store, for the reason [`CLUSTER_QUOTA`] gives.
+pub const SERVERLESS_CACHE_SNAPSHOT_QUOTA: usize = 300;
+
+/// What `ServerlessCacheSnapshot$SnapshotType` reports for a snapshot a
+/// `CreateServerlessCacheSnapshot` took.
+///
+/// The member is "the type of snapshot of serverless cache" and carries no
+/// modelled enum, and a snapshot a caller asked for by name is a manual one —
+/// the word `Snapshot$SnapshotSource` reports a manually created snapshot under
+/// as well ([`SNAPSHOT_SOURCE_MANUAL`]). No automatic snapshot is ever stored,
+/// for the reason that constant gives: ElastiCache would take one during the
+/// source cache's `DailySnapshotTime`, a day after the cache was created at the
+/// earliest.
+pub const SERVERLESS_SNAPSHOT_TYPE_MANUAL: &str = SNAPSHOT_SOURCE_MANUAL;
+
+/// The page a `DescribeServerlessCacheSnapshots` serves when the request names
+/// no `MaxResults`, and the largest page it serves at all: "The default is 50.
+/// The Validation Constraints are a maximum of 50."
+/// (`smithy_query(query="doc", shape="DescribeServerlessCacheSnapshotsRequest",
+/// member="MaxResults")`).
+pub const SERVERLESS_SNAPSHOT_MAX_RESULTS_DEFAULT: i32 = 50;
+/// See [`SERVERLESS_SNAPSHOT_MAX_RESULTS_DEFAULT`].
+pub const SERVERLESS_SNAPSHOT_MAX_RESULTS_MAX: i32 = 50;
+
 /// The largest `SnapshotRetentionLimit` a serverless cache may carry, as
 /// `CreateServerlessCache$SnapshotRetentionLimit` documents it: "The maximum
 /// value allowed is 35 days."
@@ -5607,6 +5661,16 @@ pub const SERVERLESS_MAX_RESULTS_DEFAULT: i32 = 50;
 /// `arn:aws:elasticache:<region>:<account>:serverlesscache:<name>`.
 pub fn serverless_cache_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("serverlesscache:{name}"))
+}
+
+/// The ARN of a serverless cache snapshot:
+/// `arn:aws:elasticache:<region>:<account>:serverlesscachesnapshot:<name>`.
+pub fn serverless_cache_snapshot_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("serverlesscachesnapshot:{name}"),
+    )
 }
 
 /// How many default subnets a serverless cache created in `region` without
@@ -6186,6 +6250,150 @@ impl ServerlessCacheRecord {
             }),
         }
     }
+}
+
+/// One serverless cache snapshot, as this emulator persists it: the source
+/// cache's configuration as it stood when the snapshot was taken, plus the
+/// snapshot's own identity and status.
+///
+/// "This API creates a copy of an entire ServerlessCache at a specific moment in
+/// time", so the configuration below is COPIED out of the source cache record
+/// when the snapshot is taken: a later `ModifyServerlessCache` cannot change
+/// what a snapshot already taken reports, and a `DeleteServerlessCache` cannot
+/// take it away with the cache.
+#[derive(Debug, Clone)]
+pub struct ServerlessCacheSnapshotRecord {
+    /// The snapshot's identity, lowercased —
+    /// `CreateServerlessCacheSnapshot$ServerlessCacheSnapshotName` "is stored as
+    /// a lowercase string".
+    pub name: String,
+    pub arn: String,
+    /// "The ID of the Amazon Web Services Key Management Service (KMS) key of a
+    /// serverless cache snapshot", resolved to the key's own ARN when the
+    /// request named one and otherwise the source cache's key.
+    pub kms_key_id: Option<String>,
+    /// [`SERVERLESS_SNAPSHOT_TYPE_MANUAL`].
+    pub snapshot_type: String,
+    /// The snapshot's current status, spelled as [`STATUS_CREATING`] /
+    /// [`STATUS_AVAILABLE`] do.
+    pub status: String,
+    /// The status change the clock owes this snapshot, if any.
+    pub pending_status: Option<PendingTransition>,
+    /// "The date and time that the source serverless cache's metadata and cache
+    /// data set was obtained for the snapshot."
+    pub created_at: SystemTime,
+    /// The source cache's name, engine and major engine version, which together
+    /// are the `ServerlessCacheConfiguration` the snapshot reports.
+    pub serverless_cache_name: String,
+    pub engine: String,
+    pub major_engine_version: String,
+    /// The tags the create was given. The ONE copy of this snapshot's tags; see
+    /// [`SnapshotRecord::tags`].
+    pub tags: Vec<(String, String)>,
+}
+
+impl ServerlessCacheSnapshotRecord {
+    /// A snapshot of `cache` as it stands now.
+    ///
+    /// A created snapshot is NOT ready: it answers [`STATUS_CREATING`], and the
+    /// clock owes it [`STATUS_AVAILABLE`] once [`SNAPSHOT_TRANSITION`] has
+    /// passed, so a caller reading it straight after the call still sees the
+    /// transient status.
+    pub fn from_cache(cache: &ServerlessCacheRecord, new: NewServerlessCacheSnapshot) -> Self {
+        Self {
+            arn: serverless_cache_snapshot_arn(&cache.region, &new.name),
+            name: new.name,
+            // "The ID of the KMS key used to encrypt the snapshot. Default:
+            // NULL": a snapshot of a cache encrypted with a customer managed key
+            // keeps that key when the request names none, the same way
+            // [`SnapshotRecord::copy_to`] keeps the source snapshot's.
+            kms_key_id: new.kms_key_id.or_else(|| cache.kms_key_id.clone()),
+            snapshot_type: SERVERLESS_SNAPSHOT_TYPE_MANUAL.to_string(),
+            status: STATUS_CREATING.to_string(),
+            pending_status: Some(PendingTransition {
+                due: new.now + SNAPSHOT_TRANSITION,
+                status: STATUS_AVAILABLE.to_string(),
+            }),
+            created_at: new.now,
+            serverless_cache_name: cache.name.clone(),
+            engine: cache.engine.clone(),
+            major_engine_version: cache.major_engine_version.clone(),
+            tags: new.tags,
+        }
+    }
+
+    /// Materialise the status change the clock owes this snapshot, if `now` is
+    /// past its due instant, and hand back the change it made. The one write a
+    /// reporting operation may make; see [`CacheClusterRecord::settle`].
+    pub fn settle(&mut self, now: SystemTime) -> Option<SettledTransition> {
+        let pending = self.pending_status.as_ref()?;
+        if now < pending.due {
+            return None;
+        }
+        let settled = SettledTransition {
+            due: pending.due,
+            from: self.status.clone(),
+            to: pending.status.clone(),
+        };
+        self.status = pending.status.clone();
+        self.pending_status = None;
+        Some(settled)
+    }
+
+    /// This record as the modelled `ServerlessCacheSnapshot`.
+    pub fn to_modeled(&self) -> ServerlessCacheSnapshot {
+        ServerlessCacheSnapshot {
+            serverless_cache_snapshot_name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            kms_key_id: self.kms_key_id.clone(),
+            snapshot_type: Some(self.snapshot_type.clone()),
+            status: Some(self.status.clone()),
+            create_time: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            // "The time that the serverless cache snapshot will expire": only a
+            // snapshot ElastiCache took automatically is kept for a retention
+            // limit and so has an instant it expires at, and none is ever stored
+            // (see [`SERVERLESS_SNAPSHOT_TYPE_MANUAL`]).
+            expiry_time: None,
+            // "The total size of a serverless cache snapshot, in bytes": this
+            // emulator serves no cache data plane, so it holds no data set whose
+            // size it could report rather than invent — the same reason
+            // [`NodeSnapshotRecord::to_modeled`] reports no cache size.
+            bytes_used_for_cache: None,
+            serverless_cache_configuration: Some(ServerlessCacheConfiguration {
+                serverless_cache_name: Some(self.serverless_cache_name.clone()),
+                engine: Some(self.engine.clone()),
+                major_engine_version: Some(self.major_engine_version.clone()),
+            }),
+        }
+    }
+}
+
+/// The validated values a new serverless cache snapshot is built from; see
+/// [`ServerlessCacheSnapshotRecord::from_cache`].
+#[derive(Debug, Clone)]
+pub struct NewServerlessCacheSnapshot {
+    /// The stored (lowercased) `ServerlessCacheSnapshotName`.
+    pub name: String,
+    pub kms_key_id: Option<String>,
+    pub tags: Vec<(String, String)>,
+    pub now: SystemTime,
+}
+
+/// Why a serverless cache snapshot cannot be stored under a name, with the
+/// sentence it is refused in; see
+/// [`ComAmazonawsElasticacheAmazonelasticachev9State::serverless_cache_snapshot_refusal`].
+///
+/// The kind decides which modelled failure the MINTING operation lifts it into:
+/// `CreateServerlessCacheSnapshot` models a fault for each, while
+/// `DeleteServerlessCache` models only the already-exists one, so its
+/// `FinalSnapshotName` reports the bound as the value it cannot accept.
+#[derive(Debug, Clone)]
+pub enum ServerlessSnapshotRefusal {
+    /// A name another snapshot already holds — "must be unique for the customer
+    /// account".
+    AlreadyExists(String),
+    /// The store is at [`SERVERLESS_CACHE_SNAPSHOT_QUOTA`].
+    QuotaExceeded(String),
 }
 
 /// One cache node, as the snapshot of its cluster holds it.
@@ -8189,6 +8397,12 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// Every stored serverless cache, keyed by its (lowercased)
     /// `ServerlessCacheName`, ordered for the same reason.
     pub serverless_caches: BTreeMap<String, ServerlessCacheRecord>,
+    /// Every stored serverless cache snapshot, keyed by its (lowercased)
+    /// `ServerlessCacheSnapshotName` — the resource's identity in this API. A
+    /// `BTreeMap`, so `DescribeServerlessCacheSnapshots` has the stable total
+    /// order its `NextToken` indexes into. A snapshot outlives the cache it was
+    /// taken of, so the records sit beside the caches rather than on them.
+    pub serverless_cache_snapshots: BTreeMap<String, ServerlessCacheSnapshotRecord>,
     /// The counter endpoint DNS labels are minted from.
     pub dns_token_seq: u64,
     /// The reserved-cache-node offerings this service publishes, keyed for the
@@ -8245,6 +8459,7 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
             cache_subnet_groups: BTreeMap::new(),
             user_groups: BTreeMap::new(),
             serverless_caches: BTreeMap::new(),
+            serverless_cache_snapshots: BTreeMap::new(),
             replication_groups: BTreeMap::new(),
             global_replication_groups: BTreeMap::new(),
             cache_parameter_groups: default_parameter_groups(),
@@ -8545,6 +8760,53 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         }
     }
 
+    /// Store `record` and hand back what was stored, for the reason
+    /// [`Self::insert_snapshot`] gives.
+    ///
+    /// Every route into the map asks
+    /// [`Self::serverless_cache_snapshot_refusal`] FIRST, so the store cannot be
+    /// grown past its bound by whichever operation mints the snapshot.
+    pub fn insert_serverless_cache_snapshot(
+        &mut self,
+        record: ServerlessCacheSnapshotRecord,
+    ) -> &ServerlessCacheSnapshotRecord {
+        match self.serverless_cache_snapshots.entry(record.name.clone()) {
+            Entry::Vacant(slot) => slot.insert(record),
+            Entry::Occupied(mut slot) => {
+                slot.insert(record);
+                slot.into_mut()
+            }
+        }
+    }
+
+    /// Why no serverless cache snapshot can be stored under `name`, or `None`
+    /// when one can be.
+    ///
+    /// The ONE bound on this map, so every operation that mints a serverless
+    /// cache snapshot — `CreateServerlessCacheSnapshot` and the
+    /// `FinalSnapshotName` of a `DeleteServerlessCache` — holds to it and
+    /// reports it in the same words: a name is unique for the account, and the
+    /// store holds at most [`SERVERLESS_CACHE_SNAPSHOT_QUOTA`] snapshots. A
+    /// snapshot has no retention limit to expire under, so nothing but this
+    /// bound keeps the map finite.
+    pub fn serverless_cache_snapshot_refusal(
+        &self,
+        name: &str,
+    ) -> Option<ServerlessSnapshotRefusal> {
+        if self.serverless_cache_snapshots.contains_key(name) {
+            return Some(ServerlessSnapshotRefusal::AlreadyExists(format!(
+                "Serverless cache snapshot {name} already exists."
+            )));
+        }
+        if self.serverless_cache_snapshots.len() >= SERVERLESS_CACHE_SNAPSHOT_QUOTA {
+            return Some(ServerlessSnapshotRefusal::QuotaExceeded(format!(
+                "This account already holds the maximum of \
+                 {SERVERLESS_CACHE_SNAPSHOT_QUOTA} serverless cache snapshots."
+            )));
+        }
+        None
+    }
+
     /// The serverless cache `name` names (the stored, lowercased name), with
     /// every change the clock owes it already materialised: a removal a delete
     /// made due, and then any status change — the serverless counterpart of
@@ -8680,6 +8942,7 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             }
         }
         let mut snapshots: Vec<(String, Option<String>, SettledTransition)> = Vec::new();
+        let mut serverless_snapshots: Vec<(String, SettledTransition)> = Vec::new();
         let mut caches: Vec<(String, SettledTransition)> = Vec::new();
         let mut groups: Vec<(String, SettledTransition)> = Vec::new();
         for group in self.replication_groups.values_mut() {
@@ -8699,6 +8962,11 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                     snapshot.cache_cluster_id.clone(),
                     transition,
                 ));
+            }
+        }
+        for snapshot in self.serverless_cache_snapshots.values_mut() {
+            if let Some(transition) = snapshot.settle(now) {
+                serverless_snapshots.push((snapshot.name.clone(), transition));
             }
         }
         // An update action is not an event source either: `SourceType` has no
@@ -8745,6 +9013,16 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 SOURCE_TYPE_CACHE_CLUSTER,
                 cache_cluster_id.as_deref().unwrap_or(&snapshot_name),
                 &format!("Snapshot {snapshot_name}"),
+                &transition,
+            );
+        }
+        // A serverless cache's snapshot is an event source of its own; see
+        // [`SOURCE_TYPE_SERVERLESS_CACHE_SNAPSHOT`].
+        for (name, transition) in serverless_snapshots {
+            self.record_transition(
+                SOURCE_TYPE_SERVERLESS_CACHE_SNAPSHOT,
+                &name,
+                "Serverless cache snapshot",
                 &transition,
             );
         }
@@ -9575,9 +9853,9 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     /// reporting it ([`parameter_group_arn`]) — so for that kind the ARN is
     /// matched against the one built from its own Region field.
     ///
-    /// The kinds this emulator mints no resource of yet (the EC2-Classic cache
-    /// security group, the serverless cache snapshot) can match nothing, which
-    /// is exactly what their not-found faults say.
+    /// The kind this emulator mints no resource of yet (the EC2-Classic cache
+    /// security group) can match nothing, which is exactly what its not-found
+    /// fault says.
     pub fn resource_tags(
         &self,
         resource_arn: &str,
@@ -9619,6 +9897,11 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 .values()
                 .find(|record| record.arn == resource_arn)
                 .map(|record| &record.tags),
+            TaggedResourceKind::ServerlessCacheSnapshot => self
+                .serverless_cache_snapshots
+                .values()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &record.tags),
             TaggedResourceKind::Snapshot => self
                 .snapshots
                 .values()
@@ -9634,8 +9917,7 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 .values()
                 .find(|record| record.arn == resource_arn)
                 .map(|record| &record.tags),
-            TaggedResourceKind::CacheSecurityGroup
-            | TaggedResourceKind::ServerlessCacheSnapshot => None,
+            TaggedResourceKind::CacheSecurityGroup => None,
         };
         found.ok_or_else(|| parts.not_found())
     }
@@ -9685,6 +9967,11 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 .values_mut()
                 .find(|record| record.arn == resource_arn)
                 .map(|record| &mut record.tags),
+            TaggedResourceKind::ServerlessCacheSnapshot => self
+                .serverless_cache_snapshots
+                .values_mut()
+                .find(|record| record.arn == resource_arn)
+                .map(|record| &mut record.tags),
             TaggedResourceKind::Snapshot => self
                 .snapshots
                 .values_mut()
@@ -9700,8 +9987,7 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 .values_mut()
                 .find(|record| record.arn == resource_arn)
                 .map(|record| &mut record.tags),
-            TaggedResourceKind::CacheSecurityGroup
-            | TaggedResourceKind::ServerlessCacheSnapshot => None,
+            TaggedResourceKind::CacheSecurityGroup => None,
         };
         found.ok_or_else(|| parts.not_found())
     }

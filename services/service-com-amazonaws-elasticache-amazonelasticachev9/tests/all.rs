@@ -200,3 +200,9 @@ mod start_migration;
 // admits).
 #[path = "all/refusal_rule_statements.rs"]
 mod refusal_rule_statements;
+
+// Appended for the same reason: the serverless cache snapshot suite
+// (`CreateServerlessCacheSnapshot`, `DescribeServerlessCacheSnapshots` and the
+// final snapshot a `DeleteServerlessCache` takes).
+#[path = "all/serverless_cache_snapshots.rs"]
+mod serverless_cache_snapshots;

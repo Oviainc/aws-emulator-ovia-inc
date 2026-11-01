@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeServerlessCacheSnapshots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeServerlessCacheSnapshots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeServerlessCacheSnapshots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reads this service's state and no longer answers
+//! 501, so it carries no `SCAFFOLDED, NOT IMPLEMENTED:` marker line (that line is
+//! the machine-readable census of the operations that are still stubs,
+//! `grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`). This is still the ONLY
+//! file to touch for `DescribeServerlessCacheSnapshots`.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +165,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeServerlessCacheSnapshots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeServerlessCacheSnapshotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeServerlessCacheSnapshots"))
+        // This is a reporting operation: it reads the stored serverless cache
+        // snapshots. The one write it makes is materialising the status changes
+        // the clock already owed — owed at this instant whether or not anybody
+        // called — through `settle_all`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `MaxResults` documents "The default is 50. The Validation Constraints
+        // are a maximum of 50", so a larger page is refused rather than clamped
+        // (`crate::state::serverless_snapshot_page_size`).
+        let page_size = match crate::state::serverless_snapshot_page_size(input.max_results) {
+            Ok(size) => size,
+            Err(message) => return Err(invalid_value(message)),
+        };
+        // A `NextToken` only ever travels back unchanged, so one this service did
+        // not mint is a bad parameter value rather than an empty page.
+        let resume_from = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_marker(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(invalid_value(format!(
+                        "Invalid value {token} for NextToken."
+                    )))
+                }
+            },
+            None => None,
+        };
+        // `SnapshotType` is "the type of snapshot that is being described". The
+        // member carries no modelled enum and AWS documents no vocabulary for
+        // it, so a value is matched against the type a stored snapshot reports
+        // (`ServerlessCacheSnapshot$SnapshotType`), ignoring ASCII case as this
+        // service's other unconstrained filter vocabularies are: a type no
+        // stored snapshot carries selects nothing rather than being refused.
+        let snapshot_type = input.snapshot_type.as_deref();
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // "The identifier of the serverless cache's snapshot. If this parameter
+        // is specified, only this snapshot is described." The name is stored
+        // lowercased, so the lookup folds the request's case the same way the
+        // store does, and pagination does not apply to a single-resource lookup.
+        if let Some(requested) = input.serverless_cache_snapshot_name.as_deref() {
+            let key = requested.to_ascii_lowercase();
+            let Some(snapshot) = store.serverless_cache_snapshots.get(&key) else {
+                return Err(
+                    DescribeServerlessCacheSnapshotsErrorModeled::ServerlessCacheSnapshotNotFoundFault(
+                        ServerlessCacheSnapshotNotFoundFault {
+                            message: Some(format!(
+                                "Serverless cache snapshot with name {requested} not found."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // The other two filters still apply: a snapshot this request also
+            // asked to be of another cache, or of another type, is not the
+            // snapshot it asked for.
+            let matches = input.serverless_cache_name.as_deref().is_none_or(|cache| {
+                snapshot.serverless_cache_name == cache.to_ascii_lowercase()
+            }) && snapshot_type.is_none_or(|kind| snapshot.snapshot_type.eq_ignore_ascii_case(kind));
+            let described = if matches {
+                vec![snapshot.to_modeled()]
+            } else {
+                Vec::new()
+            };
+            return Ok(DescribeServerlessCacheSnapshotsOutput {
+                next_token: None,
+                serverless_cache_snapshots: Some(described),
+            });
+        }
+
+        // "The identifier of serverless cache. If this parameter is specified,
+        // only snapshots associated with that specific serverless cache are
+        // described." A cache this account does not have associates no
+        // snapshots, which is what the modelled fault refuses — a snapshot
+        // outlives the cache it was taken of, so a name that is a SOURCE of a
+        // stored snapshot is a cache this store knows about.
+        let source = match input.serverless_cache_name.as_deref() {
+            Some(requested) => {
+                let key = requested.to_ascii_lowercase();
+                if !store.serverless_caches.contains_key(&key)
+                    && !store
+                        .serverless_cache_snapshots
+                        .values()
+                        .any(|snapshot| snapshot.serverless_cache_name == key)
+                {
+                    return Err(
+                        DescribeServerlessCacheSnapshotsErrorModeled::ServerlessCacheNotFoundFault(
+                            ServerlessCacheNotFoundFault {
+                                message: Some(format!(
+                                    "Serverless cache with name {requested} not found."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                Some(key)
+            }
+            None => None,
+        };
+
+        let mut page: Vec<ServerlessCacheSnapshot> = Vec::new();
+        let mut next_token = None;
+        for (key, snapshot) in store
+            .serverless_cache_snapshots
+            .iter()
+            .filter(|(key, _)| resume_from.as_ref().is_none_or(|from| *key >= from))
+            .filter(|(_, snapshot)| {
+                source
+                    .as_deref()
+                    .is_none_or(|cache| snapshot.serverless_cache_name == cache)
+            })
+            .filter(|(_, snapshot)| {
+                snapshot_type.is_none_or(|kind| snapshot.snapshot_type.eq_ignore_ascii_case(kind))
+            })
+        {
+            if page.len() == page_size {
+                // More records exist than `MaxResults`, so the response carries
+                // the token the next call resumes from — the key of the first
+                // record this page did not return.
+                next_token = Some(crate::state::encode_marker(key));
+                break;
+            }
+            page.push(snapshot.to_modeled());
+        }
+
+        Ok(DescribeServerlessCacheSnapshotsOutput {
+            next_token,
+            serverless_cache_snapshots: Some(page),
+        })
     }
+}
+
+/// The modelled refusal for a parameter value this operation cannot accept:
+/// `InvalidParameterValueException` ("The value for a parameter is invalid"),
+/// HTTP 400.
+fn invalid_value(message: impl Into<String>) -> DescribeServerlessCacheSnapshotsError {
+    DescribeServerlessCacheSnapshotsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
 }
