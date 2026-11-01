@@ -45,6 +45,8 @@ mod request_only_refusal_order;
 mod resolution_precedes_optional_input;
 #[path = "all/score_denominator.rs"]
 mod score_denominator;
+#[path = "all/seed_part_boundaries.rs"]
+mod seed_part_boundaries;
 #[path = "all/shared_score_seed.rs"]
 mod shared_score_seed;
 #[path = "all/state_roundtrip.rs"]

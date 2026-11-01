@@ -19,6 +19,12 @@
 //! so it is composed in ONE place — [`Seed`] — and every operation scores each stored
 //! entry through it rather than spelling the tuple out again.
 //!
+//! The other half of "a pure function of those inputs" is that inputs which DIFFER
+//! must seed differently: two requests whose inputs are not the same tuple may never
+//! reach the hash as the same bytes, whatever those inputs carry. That is what
+//! [`framed`] buys, and every seed part — the context map's keys and values included —
+//! is composed through it.
+//!
 //! The user/item-specific half comes from SHA-256 over the seed parts (the `sha2`
 //! crate, already a workspace dependency), read as a unit interval. A hash is used
 //! purely as a stable, well-distributed mixing function: it gives a different — but
@@ -30,10 +36,27 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
-/// Byte written between seed parts so that `["ab", "c"]` and `["a", "bc"]` hash
-/// differently. ASCII unit separator, which no modelled input may contain in a
-/// meaningful position.
-const SEED_SEPARATOR: u8 = 0x1f;
+/// `parts` written as ONE string that can be read back as exactly that sequence of
+/// parts: each part prefixed by its BYTE LENGTH and a colon.
+///
+/// A seed is a function of the parts it is built from and of nothing else, so two
+/// different sequences of parts may never present the same bytes to the hash — neither
+/// across parts (`["ab", "c"]` against `["a", "bc"]`) nor across the pairs of a map.
+/// Length framing is what buys that: it is uniquely decodable whatever the parts
+/// contain. A DELIMITER byte could not, because no string this service seeds a score
+/// from restricts which bytes its value may carry — `UserID`, `ItemID` and a `Context`
+/// value are length-bounded with no pattern — so every byte is one a caller may send
+/// inside a part, where it would imitate a boundary between two parts.
+fn framed<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    use std::fmt::Write;
+
+    let mut framed = String::new();
+    for part in parts {
+        // Writing into a `String` is infallible.
+        let _ = write!(framed, "{}:{part}", part.len());
+    }
+    framed
+}
 
 /// The smallest share of an entry's `base_score` any user-specific weight can keep.
 ///
@@ -44,13 +67,10 @@ const SEED_SEPARATOR: u8 = 0x1f;
 /// it is visible.
 const FLOOR_WEIGHT: f64 = 0.5;
 
-/// SHA-256 over `parts`, each part separated by [`SEED_SEPARATOR`].
+/// SHA-256 over `parts`, each part framed by its byte length ([`framed`]).
 pub fn digest(parts: &[&str]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    for part in parts {
-        hasher.update(part.as_bytes());
-        hasher.update([SEED_SEPARATOR]);
-    }
+    hasher.update(framed(parts.iter().copied()).as_bytes());
     hasher.finalize().into()
 }
 
@@ -148,18 +168,22 @@ impl<'a> Seed<'a> {
 
 /// The request's `context` map rendered as one stable seed part.
 ///
-/// Sorted, so an equal map hashes equally however the wire order arrived — the map
-/// is unordered on the wire, and an idempotent call may not depend on its order.
+/// Sorted by key, so an equal map hashes equally however the wire order arrived — the
+/// map is unordered on the wire, and an idempotent call may not depend on its order —
+/// and rendered in the same length framing as every other seed part ([`framed`]), each
+/// key and each value framed on its own. So a value carrying whatever bytes its shape
+/// permits cannot imitate the boundary between two keys, and two maps that differ
+/// render differently.
 fn context_seed(context: Option<&HashMap<String, String>>) -> String {
     let Some(context) = context else {
         return String::new();
     };
-    let mut pairs: Vec<String> = context
+    let mut pairs: Vec<(&str, &str)> = context
         .iter()
-        .map(|(key, value)| format!("{key}={value}"))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
-    pairs.sort();
-    pairs.join(",")
+    pairs.sort_unstable();
+    framed(pairs.into_iter().flat_map(|(key, value)| [key, value]))
 }
 
 /// Rescale `scores` in place into each entry's share of the certainty Amazon
