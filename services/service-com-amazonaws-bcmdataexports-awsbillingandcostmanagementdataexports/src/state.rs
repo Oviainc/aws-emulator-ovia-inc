@@ -946,16 +946,27 @@ fn encode_page_token(kind: PageTokenKind<'_>, key: &str) -> String {
 }
 
 /// The key a token issued by [`encode_page_token`] for `kind` names, or `None` when this
-/// sequence never issued it: not hex, too short to carry a tag, not UTF-8, or carrying a
-/// tag that does not match the sequence and position it claims.
+/// sequence never issued it: not hex, too short to carry a tag, not UTF-8, carrying a tag
+/// that does not match the sequence and position it claims, or spelled any way other than
+/// the ONE spelling [`encode_page_token`] writes.
+///
+/// Decoding the bytes is only the first half of reading a token: `::hex::decode` reads more
+/// spellings than `::hex::encode` writes — it accepts `A-F` as well as the `a-f` the minter
+/// emits — and the tag is computed over the DECODED bytes, so it is identical for every
+/// spelling of one position. A token is therefore kept only when it is, byte for byte, the
+/// token this listing would mint for the position it decodes to: re-minting is what
+/// compares the two, so the accepted spelling is the ENCODER's rather than a second grammar
+/// maintained beside it, and a re-cased copy of an issued token — a string no response of
+/// this service ever carried, so not one a caller could hand back unchanged — is refused
+/// like every other value this listing did not issue.
 fn decode_page_token(kind: PageTokenKind<'_>, token: &str) -> Option<String> {
     let bytes = ::hex::decode(token).ok()?;
     if bytes.len() < PAGE_TOKEN_TAG_LEN {
         return None;
     }
-    let (tag, key) = bytes.split_at(PAGE_TOKEN_TAG_LEN);
+    let (_, key) = bytes.split_at(PAGE_TOKEN_TAG_LEN);
     let key = String::from_utf8(key.to_vec()).ok()?;
-    (page_token_tag(kind, &key) == tag).then_some(key)
+    (encode_page_token(kind, &key) == token).then_some(key)
 }
 
 /// The sentence every listing refuses a `NextToken` it never issued with.

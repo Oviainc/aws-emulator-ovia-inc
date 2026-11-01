@@ -57,6 +57,8 @@ mod not_found_wire_status;
 mod owed_delivery_survives_update;
 #[path = "all/page_token_refusal.rs"]
 mod page_token_refusal;
+#[path = "all/page_token_spelling.rs"]
+mod page_token_spelling;
 #[path = "all/property_gated_columns.rs"]
 mod property_gated_columns;
 #[path = "all/query_column_selection.rs"]

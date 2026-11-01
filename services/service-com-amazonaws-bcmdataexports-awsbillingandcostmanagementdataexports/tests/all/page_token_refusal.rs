@@ -33,7 +33,7 @@ use crate::table_listing::minimal_export_request;
 /// The input member every paginated listing of this service resumes from, and therefore
 /// the member a refusal of a token names (smithy_query operations `ListExports`,
 /// `ListTables`, `ListTagsForResource`, `ListExecutions`, member `NextToken`).
-const PAGE_TOKEN_MEMBER: &str = "NextToken";
+pub(crate) const PAGE_TOKEN_MEMBER: &str = "NextToken";
 
 /// The status the modelled `ValidationException` is answered with (smithy_query shape
 /// `ValidationException`, `@httpError`).
@@ -46,15 +46,19 @@ const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
 /// One row of the table: a paginated listing, and the request members that select what it
 /// pages over (none, for the two listings that page over everything they can see).
-struct Listing {
+///
+/// `pub(crate)` with [`seeded`], [`request`], [`issued_token`] and [`refusal`] so a suite
+/// covering another facet of the SAME shared page-token rule drives the same four listings
+/// through the same harness instead of growing a second copy of it.
+pub(crate) struct Listing {
     /// The operation name, as `X-Amz-Target` names it.
-    operation: &'static str,
+    pub(crate) operation: &'static str,
     /// The members this listing's request needs beyond the paging ones.
-    selector: Vec<(&'static str, String)>,
+    pub(crate) selector: Vec<(&'static str, String)>,
 }
 
 /// A request for `listing` carrying the paging members a case sets.
-fn request(listing: &Listing, max_results: Option<i64>, token: Option<&str>) -> Value {
+pub(crate) fn request(listing: &Listing, max_results: Option<i64>, token: Option<&str>) -> Value {
     let mut body = Map::new();
     for (member, value) in &listing.selector {
         body.insert((*member).to_string(), json!(value));
@@ -75,7 +79,7 @@ fn request(listing: &Listing, max_results: Option<i64>, token: Option<&str>) -> 
 /// The deliveries the service owes the exports it persisted are held out of the way, so
 /// the executions this suite pages over are the ones it wrote (`delivery_executions.rs`
 /// covers the accrual itself).
-async fn seeded() -> (Client, Vec<Listing>) {
+pub(crate) async fn seeded() -> (Client, Vec<Listing>) {
     let (client, engine) = client_and_engine();
 
     let mut arns: Vec<String> = Vec::new();
@@ -120,7 +124,7 @@ async fn seeded() -> (Client, Vec<Listing>) {
 }
 
 /// The token `listing` cuts for a page of one item: a token it really did issue.
-async fn issued_token(client: &Client, listing: &Listing) -> String {
+pub(crate) async fn issued_token(client: &Client, listing: &Listing) -> String {
     let page = client
         .ok(listing.operation, &request(listing, Some(1), None))
         .await;
@@ -140,7 +144,7 @@ async fn issued_token(client: &Client, listing: &Listing) -> String {
 /// plus the requirement sentence that member carries, which is the listing's own. The
 /// STATUS is asserted here rather than returned, so a comparison across listings is not
 /// comparing a constant with itself.
-async fn refusal(
+pub(crate) async fn refusal(
     client: &Client,
     listing: &Listing,
     token: &str,
