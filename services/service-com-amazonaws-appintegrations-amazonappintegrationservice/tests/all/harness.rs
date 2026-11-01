@@ -58,6 +58,7 @@ impl Reply {
 /// in-process through the production router.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -85,10 +86,27 @@ impl Emulator {
         );
         if with_kms {
             router.register_service(service_com_amazonaws_kms_trentservice::EmulatedService::new(
-                engine,
+                Arc::clone(&engine),
             ));
         }
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// The AppIntegrations store this emulator serves from.
+    ///
+    /// Only a suite covering a resource NO operation of this API creates needs it: an
+    /// application association comes into being on the side of the client that
+    /// associates the application, so a case that needs one stored puts it here. Every
+    /// response is still read off the wire.
+    pub(crate) fn appintegrations_state(
+        &self,
+    ) -> engine::ServiceState<
+        service_com_amazonaws_appintegrations_amazonappintegrationservice::state::ComAmazonawsAppintegrationsAmazonappintegrationserviceState,
+    > {
+        service_com_amazonaws_appintegrations_amazonappintegrationservice::state::service_state(
+            &*self.engine,
+        )
+        .expect("the AppIntegrations store is reachable from the engine the router runs on")
     }
 
     /// Send one AppIntegrations request, signed for `region`.

@@ -13,9 +13,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    ApplicationConfig, ApplicationSourceConfig, AuthConfig, DataIntegrationAssociationSummary,
-    DataIntegrationSummary, EventFilter, EventIntegration, ExecutionConfiguration,
-    FileConfiguration, IframeConfig, Publication, ScheduleConfiguration, Subscription,
+    ApplicationAssociationSummary, ApplicationConfig, ApplicationSourceConfig, AuthConfig,
+    DataIntegrationAssociationSummary, DataIntegrationSummary, EventFilter, EventIntegration,
+    ExecutionConfiguration, FileConfiguration, IframeConfig, Publication, ScheduleConfiguration,
+    Subscription,
 };
 
 /// The region an emulated request is treated as having been made in when its
@@ -351,6 +352,44 @@ impl DataIntegrationAssociationRecord {
     }
 }
 
+/// One stored application association: the client an application is associated with,
+/// the application it belongs to, and the ARN this service minted for the association —
+/// so `ListApplicationAssociations` reports persisted records rather than a fixed answer.
+///
+/// Nothing in THIS API creates one: AppIntegrations publishes no create for an
+/// application association (`smithy_query(query="digest")` binds a create for every
+/// other resource of this service and none for this one). The association comes into
+/// being on the side of the client that associates the application, which is why the
+/// record's `client_id` is that client's identifier rather than anything this service
+/// mints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationAssociationRecord {
+    /// The identity of the association, and the last segment of
+    /// [`ApplicationAssociationRecord::arn`].
+    pub id: String,
+    pub arn: String,
+    /// The id of the application this association belongs to, which is how the
+    /// associations of one application are found (see
+    /// [`ComAmazonawsAppintegrationsAmazonappintegrationserviceState::application_associations_of`]).
+    pub application_id: String,
+    pub application_arn: String,
+    pub client_id: String,
+}
+
+impl ApplicationAssociationRecord {
+    /// This record as a `ListApplicationAssociations` summary — the three members that
+    /// shape carries (`smithy_query(query="shape",
+    /// shape="ApplicationAssociationSummary")`: `ApplicationAssociationArn`,
+    /// `ApplicationArn`, `ClientId`).
+    pub fn to_summary(&self) -> ApplicationAssociationSummary {
+        ApplicationAssociationSummary {
+            application_association_arn: Some(self.arn.clone()),
+            application_arn: Some(self.application_arn.clone()),
+            client_id: Some(self.client_id.clone()),
+        }
+    }
+}
+
 /// Why `config` is not a valid `ExecutionConfiguration`, or `None` when it is.
 ///
 /// ONE rule, shared by the create and the update of an association so the two cannot
@@ -493,6 +532,17 @@ pub struct ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
     /// [`MAX_REMEMBERED_ASSOCIATION_CLIENT_TOKENS`] by
     /// [`Self::remember_association_client_token`].
     pub data_integration_association_idempotency: BTreeMap<String, String>,
+    /// Every stored application association, keyed by its id. One map for every
+    /// application's associations rather than one per application, so an association is
+    /// stored exactly once and [`Self::application_associations_of`] is the one way to
+    /// find the ones a given application has. A `BTreeMap` so list order, and therefore
+    /// pagination, is deterministic.
+    ///
+    /// No operation of this API writes it — see [`ApplicationAssociationRecord`] — so no
+    /// request path grows it and it needs no stored-resource ceiling of its own: an
+    /// application this service created has no associations until the client side
+    /// associates it, and `ListApplicationAssociations` reports whatever is stored here.
+    pub application_associations: BTreeMap<String, ApplicationAssociationRecord>,
 }
 
 impl ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
@@ -612,6 +662,17 @@ impl ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
         self.data_integration_associations
             .iter()
             .filter(move |(_, record)| record.data_integration_id == integration_id)
+    }
+
+    /// The associations the application `application_id` has, in the deterministic order
+    /// of the association ids.
+    pub fn application_associations_of<'a>(
+        &'a self,
+        application_id: &'a str,
+    ) -> impl Iterator<Item = (&'a String, &'a ApplicationAssociationRecord)> {
+        self.application_associations
+            .iter()
+            .filter(move |(_, record)| record.application_id == application_id)
     }
 
     /// Whether the data integration `integration_id` has ever been associated, which is
@@ -755,6 +816,25 @@ pub fn data_integration_association_arn(
         ARN_NAMESPACE,
         region,
         &format!("data-integration-association/{integration_id}/{association_id}"),
+    )
+}
+
+/// The ARN of an application association in `region`:
+/// `arn:aws:app-integrations:<region>:<account>:application-association/<application-id>/<association-id>`.
+///
+/// Nested under the application it belongs to, for the same reason as
+/// [`data_integration_association_arn`]: an association exists only as part of one
+/// resource, and the ARN is built from stored ids rather than from anything a caller
+/// sent.
+pub fn application_association_arn(
+    region: &str,
+    application_id: &str,
+    association_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("application-association/{application_id}/{association_id}"),
     )
 }
 
