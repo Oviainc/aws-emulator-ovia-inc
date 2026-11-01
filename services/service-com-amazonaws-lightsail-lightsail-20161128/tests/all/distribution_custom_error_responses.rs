@@ -25,6 +25,13 @@
 //! whether the list arrives on the create or on a later update. The bound on the
 //! list itself is exercised at the largest list one distribution holds and one
 //! entry past it.
+//!
+//! The update path is pinned a second way as well, over GENERATED rows rather
+//! than written ones: every form an entry can take — each subset of the three
+//! members the model documents no default for, crossed with the member it does
+//! documenting it absent or stated — is sent on an update, in a list, in both
+//! orders, and the fill is then shown to be idempotent by re-sending what the
+//! read reported.
 
 use serde_json::{json, Value};
 
@@ -338,6 +345,82 @@ fn full_list() -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// The generated forms an entry can take
+// ---------------------------------------------------------------------------
+
+/// One form an entry of `customErrorResponses` can arrive in: which of the
+/// members the model documents no default for it carries, and what it says about
+/// the one member whose model documents a default.
+#[derive(Clone, Copy, Debug)]
+struct EntryForm {
+    carries_error_code: bool,
+    carries_response_code: bool,
+    carries_response_page_path: bool,
+    /// The `errorCachingMinTTL` the entry states, or `None` for an entry that
+    /// leaves the member out — the case the service fills.
+    stated_ttl: Option<i64>,
+}
+
+/// What an entry says about `errorCachingMinTTL`: nothing, which is what the
+/// documented default answers; zero, which the fill must not read as "nothing";
+/// the shortest window a caller asks for; and a window of a day.
+///
+/// SOURCE: the member is a `long` with no modelled range, so a stated value is
+/// kept whatever it is — see `DistributionCustomErrorResponse$errorCachingMinTTL`
+/// via smithy_query(query="shape",
+/// shape="com.amazonaws.lightsail#DistributionCustomErrorResponse").
+const STATED_TTLS: &[Option<i64>] = &[None, Some(0), Some(1), Some(86_400)];
+
+/// Every form an entry can take: each of the eight subsets of the three members
+/// with no documented default, crossed with each of [`STATED_TTLS`].
+fn entry_forms() -> Vec<EntryForm> {
+    let mut forms = Vec::new();
+    for members in 0..8_u8 {
+        for stated_ttl in STATED_TTLS {
+            forms.push(EntryForm {
+                carries_error_code: members & 1 != 0,
+                carries_response_code: members & 2 != 0,
+                carries_response_page_path: members & 4 != 0,
+                stated_ttl: *stated_ttl,
+            });
+        }
+    }
+    forms
+}
+
+/// The entry `form` is sent as, at position `index` of its list, so no two
+/// entries of one list state the same values.
+fn sent_entry(index: usize, form: EntryForm) -> Value {
+    let mut entry = serde_json::Map::new();
+    if form.carries_error_code {
+        entry.insert("errorCode".to_string(), json!(400 + index as i64));
+    }
+    if form.carries_response_code {
+        entry.insert("responseCode".to_string(), json!(format!("{}", 500 + index)));
+    }
+    if form.carries_response_page_path {
+        entry.insert(
+            "responsePagePath".to_string(),
+            json!(format!("/form-{index}.html")),
+        );
+    }
+    if let Some(ttl) = form.stated_ttl {
+        entry.insert("errorCachingMinTTL".to_string(), json!(ttl));
+    }
+    Value::Object(entry)
+}
+
+/// The entry a read has to report for `form`: exactly the members the request
+/// stated, plus the one member the SERVICE fills — the stated value where the
+/// entry stated one, and the documented default where it did not.
+fn expected_entry(index: usize, form: EntryForm) -> Value {
+    let mut entry = sent_entry(index, form);
+    entry["errorCachingMinTTL"] =
+        json!(form.stated_ttl.unwrap_or(DEFAULT_ERROR_CACHING_MIN_TTL));
+    entry
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -628,4 +711,97 @@ async fn a_list_past_the_bound_is_refused_by_both_operations() {
         read_back, want,
         "case {case:?}: expected the refused update to change nothing, got {read_back:?}"
     );
+}
+
+/// Every form an entry can arrive in is recorded by the same rule on the UPDATE
+/// path: the members the entry stated are reported as stated, the member whose
+/// model documents a default is reported with the stated value or with that
+/// default, and nothing else is invented.
+///
+/// The forms are generated rather than written out, sent in lists at the bound
+/// and in both orders — the fill is per entry, not per position — and then the
+/// list a read reported is sent back as-is, which has to leave the record alone.
+#[tokio::test]
+async fn an_update_fills_the_default_for_every_form_an_entry_takes() {
+    let emulator = stand_up().await;
+    let name = "cer-forms";
+    emulator
+        .ok(
+            "CreateDistribution",
+            create_body(
+                name,
+                Some(json!([{
+                    "errorCode": 404,
+                    "responseCode": "404",
+                    "responsePagePath": "/404.html",
+                    "errorCachingMinTTL": 600,
+                }])),
+            ),
+        )
+        .await;
+    wait_for_distribution_status(&emulator, name, DEPLOYED).await;
+
+    for (chunk_index, chunk) in entry_forms()
+        .chunks(MAX_CUSTOM_ERROR_RESPONSES)
+        .enumerate()
+    {
+        for reversed in [false, true] {
+            let mut forms = chunk.to_vec();
+            if reversed {
+                forms.reverse();
+            }
+            let case = format!(
+                "generated forms {}..{} of an update's list{}",
+                chunk_index * MAX_CUSTOM_ERROR_RESPONSES,
+                chunk_index * MAX_CUSTOM_ERROR_RESPONSES + forms.len(),
+                if reversed { ", reversed" } else { "" }
+            );
+            let sent: Vec<Value> = forms
+                .iter()
+                .enumerate()
+                .map(|(index, form)| sent_entry(index, *form))
+                .collect();
+            let want = Value::Array(
+                forms
+                    .iter()
+                    .enumerate()
+                    .map(|(index, form)| expected_entry(index, *form))
+                    .collect(),
+            );
+
+            emulator
+                .ok(
+                    "UpdateDistribution",
+                    json!({
+                        "distributionName": name,
+                        "customErrorResponses": Value::Array(sent),
+                    }),
+                )
+                .await;
+            let read_back = reported(&distribution(&emulator, name).await);
+            assert_eq!(
+                read_back, want,
+                "case {case:?}: expected the distribution to report {want:?}, got {read_back:?}"
+            );
+
+            // Sending back exactly what the read reported states every member,
+            // so the record it leaves behind is the same one: the fill is only
+            // ever about the member an entry left out.
+            emulator
+                .ok(
+                    "UpdateDistribution",
+                    json!({
+                        "distributionName": name,
+                        "customErrorResponses": want.clone(),
+                    }),
+                )
+                .await;
+            let again = reported(&distribution(&emulator, name).await);
+            assert_eq!(
+                again, want,
+                "case {case:?}: expected re-sending the reported list to change nothing, got \
+                 {again:?}"
+            );
+        }
+    }
 }
