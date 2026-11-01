@@ -8,10 +8,9 @@
 //! it nothing addresses that generated template (`DescribeGeneratedTemplate`,
 //! `GetGeneratedTemplate` and `ListGeneratedTemplates` all stop answering for it) while
 //! every other record is left exactly as it was, and the name it held is free to be created
-//! under again. An address no record of that Region holds is refused 404
-//! `GeneratedTemplateNotFound`, and a record whose generation is still in flight is refused
-//! 429 `ConcurrentResourcesLimitExceeded` — the case that error documents beside its quota —
-//! a refusal that leaves the record intact and lifts as the generation concludes.
+//! under again. The record goes whatever status its generation is in, so a delete of what
+//! the caller has just created is accepted too. An address no record of that Region holds is
+//! refused 404 `GeneratedTemplateNotFound`.
 //!
 //! Three suites, one per face of that rule, each a table whose rows differ along what the
 //! rule generalises over rather than along one recorded case:
@@ -25,9 +24,8 @@
 //!    generated templates: a delete signed for one removes only that Region's record, and
 //!    neither the other Region's ARN nor — once its own record is gone — its name is
 //!    deletable from here.
-//! 3. **The refusals.** A name nothing created, and a record whose generation is still in
-//!    flight: refused without touching the record, and deletable once the clock has
-//!    concluded that generation.
+//! 3. **The refusal, and what is not one.** A name nothing created is refused; a record
+//!    whose generation is still in flight is deleted like any other.
 
 use std::time::Instant;
 
@@ -255,8 +253,9 @@ async fn deleting_a_generated_template_removes_the_record_it_addresses() {
             .unwrap_or_else(|| panic!("case {case:?}: expected a GeneratedTemplateId, got {body}"));
         ids.push(id);
     }
-    // Every generation has to have concluded before a record is deletable: a generation
-    // still in flight is refused, which suite 3 is about.
+    // The generations are left to conclude before the deletions, so each row is deleted out
+    // of a settled store and what the delete leaves behind is read back at a terminal
+    // status; a record still generating is deletable too, which suite 3 is about.
     wait_for_the_generation().await;
 
     let mut remaining: Vec<String> = rows.iter().map(|row| row.name.clone()).collect();
@@ -449,9 +448,8 @@ async fn a_generated_template_is_deletable_only_in_the_region_it_was_created_in(
     }
 }
 
-/// The refusals: an address nothing created, and a record whose generation is still in
-/// flight — refused without touching the record, and deletable once the clock has concluded
-/// the generation.
+/// The refusal, and what is not one: an address nothing created is refused, while a record
+/// whose generation is still in flight is deleted like any other.
 #[tokio::test]
 async fn the_refusals_around_deleting_a_generated_template() {
     let router = router();
@@ -475,9 +473,10 @@ async fn the_refusals_around_deleting_a_generated_template() {
         );
     }
 
-    // A generation still in flight: refused, and the record is left exactly as it was.
-    // Rows spanning the two addresses a delete may use, and both covering resources and
-    // covering none, so the refusal is not about what the generation covers.
+    // A generation still in flight is discarded with its record: the delete is accepted,
+    // and nothing addresses the generated template afterwards. Rows spanning the two
+    // addresses a delete may use, and both covering resources and covering none, so what is
+    // deleted is not about what the generation covers.
     let rows: Vec<(&str, bool, Vec<ListedResource>)> = vec![
         ("in flight, no covered resource, addressed by name", false, Vec::new()),
         (
@@ -508,50 +507,38 @@ async fn the_refusals_around_deleting_a_generated_template() {
             .unwrap_or_else(|| panic!("case {case:?}: expected a GeneratedTemplateId, got {body}"));
         let address = if *by_arn { id.clone() } else { name.clone() };
 
-        let (status, body) = delete_generated_template(&router, &address).await;
-        // Held to the clock: the emulator owes the refusal only while the generation really
-        // is in flight, so a call that lost the race to the conclusion is a 200 instead.
+        // The generation really is still in flight when the delete is sent: the record
+        // reports a non-terminal status right up to the instant the clock concludes it.
+        let (describe_status, described) = describe_generated_template(&router, &name).await;
+        assert_eq!(
+            describe_status, 200,
+            "case {case:?}: DescribeGeneratedTemplate answered {describe_status} with \
+             {described}"
+        );
         if started.elapsed() < generated::GENERATION_DELAY {
             assert_eq!(
-                status, 429,
-                "case {case:?}: expected the in-flight generation refused, got {status} with \
-                 {body}"
-            );
-            assert_eq!(
-                error_code(case, &body),
-                "ConcurrentResourcesLimitExceeded",
-                "case {case:?}: expected the modelled concurrency refusal, got {body}"
-            );
-            // The refusal changed nothing: the record is still there, still in flight.
-            let (status, body) = describe_generated_template(&router, &name).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: expected the refused record intact, got {status} with {body}"
-            );
-            assert_eq!(
-                xml_text(&body, "GeneratedTemplateId").as_deref(),
-                Some(id.as_str()),
-                "case {case:?}: expected the refused record unchanged, got {body}"
-            );
-        } else {
-            assert_eq!(
-                status, 200,
-                "case {case:?}: expected the concluded generation deletable, got {status} with \
-                 {body}"
+                xml_text(&described, "Status").as_deref(),
+                Some(generated::status::CREATE_IN_PROGRESS),
+                "case {case:?}: expected the generation still in flight, got {described}"
             );
         }
 
-        // The refusal keys on a status the clock retires, so it lifts: once the generation
-        // has concluded, the very same delete succeeds and the record is gone.
+        let (status, body) = delete_generated_template(&router, &address).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the in-flight generation deletable, got {status} with \
+             {body}"
+        );
+        assert!(
+            xml_text(&body, "Code").is_none(),
+            "case {case:?}: expected a successful response, got {body}"
+        );
+
+        // Nothing addresses it afterwards, by either address — and the generation it was
+        // discarded in the middle of never comes back once its conclusion falls due.
+        assert_not_addressable(&router, case, &name).await;
+        assert_not_addressable(&router, case, &id).await;
         wait_for_the_generation().await;
-        if status != 200 {
-            let (status, body) = delete_generated_template(&router, &address).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: expected the delete accepted once the generation concluded, got \
-                 {status} with {body}"
-            );
-        }
         assert_not_addressable(&router, case, &name).await;
         assert_not_addressable(&router, case, &id).await;
     }

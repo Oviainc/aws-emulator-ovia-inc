@@ -747,10 +747,16 @@ async fn the_record_a_read_addresses() {
             "GeneratedTemplateNotFound",
             "case {case:?}: expected the modelled not-found refusal, got {body}"
         );
+        // The refusal's whole message, worded by the component that serves this surface
+        // (the template `generated_template_refusals.rs` pins), naming the address this
+        // request asked for and the id this response reports.
+        let message = xml_text(&body, "Message").unwrap_or_default();
+        let request_id = crate::generated_template_refusals::reported_request_id(case, &body);
+        let expected =
+            crate::generated_template_refusals::not_found_message(&address, &request_id);
         assert_eq!(
-            xml_text(&body, "Message").as_deref(),
-            Some(generated::does_not_exist(&address).as_str()),
-            "case {case:?}: expected the refusal to name what was asked for, got {body}"
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
     }
 

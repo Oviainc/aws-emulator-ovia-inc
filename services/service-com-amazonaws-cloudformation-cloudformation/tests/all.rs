@@ -101,6 +101,8 @@ mod generated_template_coverage;
 mod generated_template_deletion;
 #[path = "all/generated_template_reads.rs"]
 mod generated_template_reads;
+#[path = "all/generated_template_refusals.rs"]
+mod generated_template_refusals;
 #[path = "all/generated_template_updates.rs"]
 mod generated_template_updates;
 #[path = "all/generated_templates.rs"]

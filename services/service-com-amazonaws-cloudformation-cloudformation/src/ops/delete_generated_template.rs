@@ -8,10 +8,9 @@
 //! again and the quotas its record counted against are freed with it
 //! ([`crate::state::generated_template`] holds the record and those quotas).
 //!
-//! A generation that is still in flight is not the caller's to discard — that is the case
-//! the modelled `ConcurrentResourcesLimitExceededException` documents beside its quota — and
-//! an address no record of the request's Region holds is refused
-//! `GeneratedTemplateNotFoundException`.
+//! The record goes whatever status its generation is in, so a generation still in flight is
+//! discarded with the record it belongs to; the only address this refuses is one no record
+//! of the request's Region holds, with `GeneratedTemplateNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -167,8 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         let mut store = state.lock();
-        // Settled FIRST, so the in-flight refusal below is about the generations really
-        // still running at this instant rather than ones the clock has already concluded.
+        // Settled FIRST, so this delete acts on the store as the clock already leaves it:
+        // the conclusion of a generation was owed at this instant whether or not anybody
+        // called, and the records this delete does not address keep it.
         store.settle(::std::time::SystemTime::now());
 
         // "The name or Amazon Resource Name (ARN) of a generated template": either address
@@ -185,30 +185,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        // "This error is also returned if a generated template that is in an InProgress or
-        // Pending status is attempted to be updated or deleted": a generation still in
-        // flight is refused, and because the refusal keys on a status the clock retires, it
-        // lifts on its own once that generation concludes. The message opens with the
-        // documented sentence of this error class — the same one `create_generated_template`
-        // answers for the quota itself — and then names the record this request addressed
-        // and the status the store holds it in.
-        if template.is_in_flight() {
-            return Err(
-                DeleteGeneratedTemplateErrorModeled::ConcurrentResourcesLimitExceededException(
-                    ConcurrentResourcesLimitExceededException {
-                        message: Some(format!(
-                            "No more than {} generated templates can be in an InProgress or \
-                             Pending status at one time. Generated template {} is in {} \
-                             status",
-                            crate::state::generated_template::MAX_CONCURRENT_GENERATIONS,
-                            template.generated_template_name,
-                            template.status
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
+        // The modelled `ConcurrentResourcesLimitExceededException` meters the generations
+        // being STARTED — "no more than 5 generated templates can be in an InProgress or
+        // Pending status at one time" is a quota on starting one more — and a delete starts
+        // none, so nothing here can exceed it: the record is discarded whatever status its
+        // own generation is in, and a caller that deletes what it has just created is
+        // answered the empty 200 rather than a throttling-class refusal that would never
+        // clear.
 
         // The record IS the generated template, so the deletion removes it: unlike a deleted
         // stack — whose summary, template and resources CloudFormation documents keeping for

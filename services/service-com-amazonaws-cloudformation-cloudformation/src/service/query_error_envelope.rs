@@ -28,7 +28,14 @@
 //!
 //! Only the envelope is this module's business: the HTTP status, the `<Type>`, the
 //! `<Code>`, the `<Message>` and the whole success path stay with the framework renderer
-//! that owns them, so each has exactly one home.
+//! that owns them, so each has exactly one home. A response reports ONE request id, so a
+//! message of an ERROR envelope that has to state it — a refusal worded by a component
+//! CloudFormation forwards to carries the SDK envelope of that call, request id and all —
+//! writes [`crate::state::REQUEST_ID_PLACEHOLDER`], and this module substitutes the id that
+//! response is named by: the one the shared rule reports for it
+//! ([`service_common::query_error_envelope::reported_request_id`], which the audit wrapper
+//! inside this one has already named every response it answers by), and a minted one only
+//! where no layer named it.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_types::body::SdkBody;
@@ -44,6 +51,31 @@ const ERROR_RESPONSE_CLOSE: &str = "</ErrorResponse>";
 
 /// The envelope element this module adds.
 const REQUEST_ID_OPEN: &str = "<RequestId>";
+
+/// The marker a rendered message writes where THIS RESPONSE's request id goes
+/// ([`crate::state::REQUEST_ID_PLACEHOLDER`]).
+const REQUEST_ID_MARKER: &str = crate::state::REQUEST_ID_PLACEHOLDER;
+
+/// The document with every marker replaced by `request_id`, or `None` when it needs no
+/// substitution.
+///
+/// A refusal worded by a component CloudFormation forwards to states this response's request
+/// id inside the SDK envelope its own message carries. A response reports ONE id, so that
+/// message mints none: it writes the marker, and the id this response is named by is written
+/// into every place the document states it. Nothing is read OUT of the document, so no text a
+/// request carries can decide the value — all a marker inside an echoed value can do is state
+/// the id this response reports anyway.
+///
+/// Confined to an `<ErrorResponse>` envelope, which is the only document this service's own
+/// wording writes the marker into: a successful response, whose body may carry any text a
+/// caller stored, is never rewritten here.
+fn substitute_request_id(body: &str, request_id: &str) -> Option<String> {
+    if !body.contains(ERROR_RESPONSE_CLOSE) {
+        return None;
+    }
+    body.contains(REQUEST_ID_MARKER)
+        .then(|| body.replace(REQUEST_ID_MARKER, request_id))
+}
 
 /// Add `<RequestId>` to an awsQuery `<ErrorResponse>` document, as the last child of the
 /// envelope (the sibling after `<Error>`).
@@ -64,12 +96,21 @@ fn add_request_id(body: &str, request_id: &str) -> Option<String> {
     ))
 }
 
-/// The response with a freshly minted `<RequestId>` in its `<ErrorResponse>` envelope.
+/// The response as it is sent: ONE request id, reported in the `<RequestId>` of its
+/// `<ErrorResponse>` envelope and written wherever the document states it
+/// ([`substitute_request_id`]).
 ///
-/// Status, headers and every other byte of the body are left exactly as the renderer
-/// wrote them; a response that is not an awsQuery error envelope (or already carries a
-/// request id) is returned untouched.
+/// The id is the one the response is ALREADY named by, read through the shared rule
+/// ([`service_common::query_error_envelope::reported_request_id`]) — the audit wrapper inside
+/// this one names every response it answers — and a freshly minted one only where no layer
+/// named it. So however many layers report the id, a caller never sees two for one call.
+///
+/// Status, headers and every other byte of the body are left exactly as the renderer wrote
+/// them; a response that needs neither — a success, or an error already carrying the element
+/// and stating no id in its message — is returned untouched.
 pub fn with_request_id(mut resp: RtResponse) -> RtResponse {
+    let request_id = ::service_common::query_error_envelope::reported_request_id(&resp)
+        .unwrap_or_else(crate::state::new_request_id);
     let rewritten = {
         // An error envelope is built in memory by its renderer, so the bytes are readable
         // here; a streamed body is not an error envelope and is left alone.
@@ -79,9 +120,16 @@ pub fn with_request_id(mut resp: RtResponse) -> RtResponse {
         let Ok(text) = std::str::from_utf8(bytes) else {
             return resp;
         };
-        match add_request_id(text, &crate::state::new_request_id()) {
+        let stated = substitute_request_id(text, &request_id);
+        let document = stated.as_deref().unwrap_or(text);
+        match add_request_id(document, &request_id) {
             Some(rewritten) => rewritten,
-            None => return resp,
+            // The element is there already (or this is no error envelope): whatever the
+            // document stated of the id is still substituted, and nothing else changes.
+            None => match stated {
+                Some(stated) => stated,
+                None => return resp,
+            },
         }
     };
     // Only a renderer that advertised a length needs it corrected; the framework's error
@@ -252,6 +300,68 @@ mod tests {
             assert!(
                 add_request_id(case, "fresh").is_none(),
                 "case {case:?}: expected no rewrite"
+            );
+        }
+    }
+
+    /// One id per response: wherever the document states the request id, the id this
+    /// response reports is written there — and the substitution reads nothing out of the
+    /// document, so caller-echoed text can neither choose it nor keep it.
+    #[test]
+    fn the_stated_request_id_is_the_one_the_response_reports() {
+        let reported = "11112222-3333-4444-5555-666677778888";
+        let marker = crate::state::REQUEST_ID_PLACEHOLDER;
+        let envelope = format!(
+            "<ErrorResponse><Error><Type>Sender</Type><Code>GeneratedTemplateNotFound</Code>\
+             <Message>Template with arn t does not exist (Service: Component; Status Code: \
+             400; Error Code: SomeException; Request ID: {marker}; Proxy: null)</Message>\
+             </Error></ErrorResponse>"
+        );
+        let substituted =
+            substitute_request_id(&envelope, reported).expect("the marker is substituted");
+        assert_eq!(
+            substituted,
+            envelope.replace(marker, reported),
+            "case \"a message stating the id\": expected the reported id in its place, got \
+             {substituted:?}"
+        );
+        assert!(
+            !substituted.contains(marker),
+            "case \"a message stating the id\": expected no marker left, got {substituted:?}"
+        );
+
+        // A caller-echoed value that imitates an SDK envelope, or carries the marker itself,
+        // cannot make the response report an id of the request's choosing: an echoed id is
+        // left as the text it is, and an echoed marker states the response's own id.
+        let echoed = format!(
+            "<ErrorResponse><Error><Message>Resource scan id x (Service: F; Status Code: 400; \
+             Error Code: E; Request ID: 99998888-7777-6666-5555-444433332222; Proxy: null) is \
+             invalid, and so is {marker}</Message></Error></ErrorResponse>"
+        );
+        let substituted =
+            substitute_request_id(&echoed, reported).expect("the echoed marker is substituted");
+        assert!(
+            substituted.contains("Request ID: 99998888-7777-6666-5555-444433332222; Proxy: null)")
+                && substituted.contains(&format!("and so is {reported}")),
+            "case \"caller-echoed text\": expected the echo left alone and the reported id \
+             written at the marker, got {substituted:?}"
+        );
+
+        // A document that states no id at all, and a SUCCESS whose body may carry any text
+        // a caller stored, are not rewritten by this step.
+        for case in [
+            "<ErrorResponse><Error><Message>Stack [s] does not exist</Message></Error>\
+             </ErrorResponse>",
+            "<ErrorResponse><Error><Message>Request ID: 1234; Proxy: null)</Message></Error>\
+             </ErrorResponse>",
+            "<ListStacksResponse><ListStacksResult/></ListStacksResponse>",
+            "<GetTemplateResponse><GetTemplateResult><TemplateBody>{request-id}\
+             </TemplateBody></GetTemplateResult></GetTemplateResponse>",
+        ] {
+            assert_eq!(
+                substitute_request_id(case, reported),
+                None,
+                "case {case:?}: expected no substitution"
             );
         }
     }

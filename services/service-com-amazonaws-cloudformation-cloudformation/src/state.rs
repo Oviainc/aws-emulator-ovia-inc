@@ -6285,6 +6285,16 @@ pub fn new_request_id() -> String {
     new_identifier("request")
 }
 
+/// What a message that must state THIS RESPONSE's request id writes in its place.
+///
+/// A message is worded where the refusal is decided, and the id a response reports is minted
+/// where the response is finished ([`crate::service::query_error_envelope`]): a response
+/// reports ONE request id, so the message cannot mint a second one of its own. It writes this
+/// marker instead, and that layer substitutes every occurrence of it with the id it reports —
+/// so the message and the envelope can never disagree, and nothing a request carries decides
+/// the value.
+pub const REQUEST_ID_PLACEHOLDER: &str = "{request-id}";
+
 /// The verbs a stack operation's resource-failure summary is worded with
 /// ([`resource_failure_summary`]): what the operation was doing to the resources it could
 /// not carry through.

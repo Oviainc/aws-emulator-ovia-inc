@@ -56,9 +56,17 @@
 //! `DeleteGeneratedTemplate` removes the record it addresses from the store, so the name and
 //! the quotas it held are free again and no read answers for it afterwards: nothing in this
 //! feature reports a generated template that was deleted, unlike a deleted stack, whose
-//! summary and template stay addressable for a retention window. A record whose generation
-//! is still in flight ([`StoredGeneratedTemplate::is_in_flight`]) is refused instead, which
-//! is the other case the modelled `ConcurrentResourcesLimitExceededException` documents.
+//! summary and template stay addressable for a retention window. A delete DISCARDS the
+//! record whatever status its generation is in — a generation still in flight
+//! ([`StoredGeneratedTemplate::is_in_flight`]) goes with the record it belongs to, since
+//! there is nothing left for it to conclude onto — and the only address it refuses is one no
+//! record of the request's Region holds.
+//!
+//! ## Refusing one
+//!
+//! Every refusal of this surface is worded by the component that serves it, so the message a
+//! client reads is that component's sentence followed by the SDK envelope of the call into it
+//! ([`does_not_exist`], [`already_exists`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -461,17 +469,79 @@ pub struct GenerationProgress {
     pub resources_pending: i32,
 }
 
-/// The message answered when a request names a generated template this account and Region
-/// holds no record of, built from what the request named.
-pub fn does_not_exist(name_or_id: &str) -> String {
-    format!("Generated template {name_or_id} cannot be found")
+/// The component that serves this surface, as the SDK envelope of one of its refusals names
+/// the service that answered.
+///
+/// Template generation is not served by CloudFormation's own front end: the operations of
+/// this feature are forwarded to a component of their own, and a refusal of this surface
+/// therefore reaches a client as that component's sentence wrapped in the SDK's envelope for
+/// the call into it, naming the component rather than CloudFormation.
+const GENERATION_COMPONENT: &str = "CfnTemplateGenerationServiceLambda";
+
+/// The status the envelope of a refusal of this surface states.
+///
+/// The envelope states the status of the CALL INTO [`GENERATION_COMPONENT`], which is the
+/// client-error status that component answers a refused request with — not the status
+/// CloudFormation maps the modelled error onto for its own caller, which is the one the
+/// response itself carries (a not-found is 404 on the wire and 400 in the envelope).
+const GENERATION_COMPONENT_REFUSAL_STATUS: u16 = 400;
+
+/// The exception name the envelope states for a refusal of an address no record holds: the
+/// modelled error's SHAPE name, which is what the SDK of the call into the component reports
+/// — the awsQuery `<Code>` of the response this emulator sends is the model's own
+/// `GeneratedTemplateNotFound`, and the two are separate values.
+const NOT_FOUND_EXCEPTION: &str = "GeneratedTemplateNotFoundException";
+
+/// The exception name the envelope states for a refusal of a name a record already holds.
+const ALREADY_EXISTS_EXCEPTION: &str = "AlreadyExistsException";
+
+/// `sentence` followed by the envelope the AWS SDK appends to a refusal of this surface:
+/// `(Service: <component>; Status Code: <status>; Error Code: <exception>; Request ID: <id>;
+/// Proxy: null)`.
+///
+/// `exception` is the name of the modelled error being worded. The request id is the only
+/// per-run field, and it belongs to the RESPONSE rather than to this sentence: the marker
+/// [`crate::state::REQUEST_ID_PLACEHOLDER`] stands in for it here and the layer that finishes
+/// the response substitutes the one id that response reports. Nothing else of the request is
+/// interpolated.
+fn with_component_envelope(sentence: &str, exception: &str) -> String {
+    format!(
+        "{sentence} (Service: {GENERATION_COMPONENT}; Status Code: \
+         {GENERATION_COMPONENT_REFUSAL_STATUS}; Error Code: {exception}; Request ID: {}; \
+         Proxy: null)",
+        crate::state::REQUEST_ID_PLACEHOLDER
+    )
 }
 
-/// The message of the modelled `AlreadyExistsException` ("the resource with the name
+/// The sentence of the refusal answered when a request names a generated template this
+/// account and Region holds no record of: fixed text apart from the identifier the request
+/// supplied, which the sentence names whichever of the two addresses it is.
+fn does_not_exist_sentence(name_or_id: &str) -> String {
+    format!("Template with arn {name_or_id} does not exist")
+}
+
+/// The whole message answered when a request names a generated template this account and
+/// Region holds no record of: the sentence above plus the envelope every refusal of this
+/// surface carries ([`with_component_envelope`]).
+pub fn does_not_exist(name_or_id: &str) -> String {
+    with_component_envelope(&does_not_exist_sentence(name_or_id), NOT_FOUND_EXCEPTION)
+}
+
+/// The sentence of the modelled `AlreadyExistsException` ("the resource with the name
 /// requested already exists") for a generated template name a record already holds — the
-/// name a create asks for, or the one an update asks to rename a record to.
+/// name a create asks for, or the one an update asks to rename a record to. Fixed text apart
+/// from the name the request asked for.
+fn already_exists_sentence(generated_template_name: &str) -> String {
+    format!("Template with name {generated_template_name} already exists.")
+}
+
+/// The whole message of that refusal: the sentence above plus the envelope
+/// ([`with_component_envelope`]).
 pub fn already_exists(generated_template_name: &str) -> String {
-    format!("Generated template [{generated_template_name}] already exists")
+    with_component_envelope(
+        &already_exists_sentence(generated_template_name),
+        ALREADY_EXISTS_EXCEPTION,
+    )
 }
 
 /// The message of the modelled `LimitExceededException` ("the quota for the resource has
