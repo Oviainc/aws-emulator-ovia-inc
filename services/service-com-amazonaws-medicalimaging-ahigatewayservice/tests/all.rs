@@ -87,6 +87,8 @@ mod regional_isolation;
 mod relational_refusal_values;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/search_sort_key_page_token.rs"]
+mod search_sort_key_page_token;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/study_update_membership.rs"]

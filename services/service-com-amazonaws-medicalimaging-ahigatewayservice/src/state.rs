@@ -2358,12 +2358,18 @@ pub fn encode_page_token(marker: &str, instant: SystemTime, resource_id: &str) -
 
 /// Read one NUMBER a continuation payload carries, spelled exactly as this service spells
 /// one: ASCII digits only, so a signed, space-padded or empty text that `str::parse` would
-/// otherwise accept is not honoured as part of a position.
+/// otherwise accept is not honoured as part of a position, and no digit ahead of the first
+/// significant one, since every number this service writes into a payload is written by
+/// its plain decimal rendering — which pads nothing, so only zero itself is spelled with a
+/// leading zero.
 ///
 /// Shared by every codec below, because a payload half this service did not write is not a
 /// position in any of their collections.
 fn page_token_number(text: &str) -> Option<u64> {
     if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if text.len() > 1 && text.starts_with('0') {
         return None;
     }
     text.parse().ok()

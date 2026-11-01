@@ -43,7 +43,11 @@
 //! [`crate::state::encode_keyed_page_token`]) and is marked with the data store, the
 //! order it was minted under AND the filters it was minted under, so a token honoured
 //! under another sort or another set of filters — which would silently skip or repeat
-//! image sets — is refused instead.
+//! image sets — is refused instead. The key itself is read back only when it is spelled
+//! as this service writes one for that sort field ([`SortKey::parse`]): resuming at a key
+//! no key writer ever wrote would walk past every image set the search matched and end the
+//! caller's walk having reported none of them, which is the same skip the marker check
+//! exists to prevent.
 //!
 //! Only the image sets the data store still HOLDS are searchable: a retired one keeps
 //! nothing but the properties `GetImageSet` reports of a tombstone, so there is no
@@ -542,7 +546,15 @@ impl SortKey {
                 let (secs, nanos) = crate::state::parse_page_token_instant(text)?;
                 Some(Self::Instant(i64::try_from(secs).ok()?, nanos))
             }
-            SortField::StudyDateAndTime => Some(Self::Text(text.to_string())),
+            // A study rank is the stored DATE and the stored TIME joined by
+            // [`STUDY_RANK_SEPARATOR`] ([`study_rank`]), so a text carrying no separator at
+            // all is no rank this service ever wrote and is not honoured as a position —
+            // resuming at one would walk past every image set the search matched. Either
+            // half may hold any text a stored DICOM attribute holds, so the separator's
+            // presence is the whole of what the writer guarantees.
+            SortField::StudyDateAndTime => text
+                .contains(STUDY_RANK_SEPARATOR)
+                .then(|| Self::Text(text.to_string())),
         }
     }
 }

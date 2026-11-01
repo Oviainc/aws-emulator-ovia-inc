@@ -279,7 +279,10 @@ pub(crate) async fn search(
 }
 
 /// The image set identifiers one answer reports, in the order it reported them.
-fn reported_ids(answer: &Answer) -> Vec<String> {
+///
+/// `pub(crate)` because `crate::search_sort_key_page_token` asserts the ORDER a resumed
+/// search reports its image sets in, which is read off an answer the same way.
+pub(crate) fn reported_ids(answer: &Answer) -> Vec<String> {
     answer
         .field(&["imageSetsMetadataSummaries"])
         .as_array()
