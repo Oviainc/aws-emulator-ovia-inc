@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAttacks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAttacks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAttacks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: it pages over the attacks Shield detected against the account, as the
+//! attack log in [`crate::state`] holds them, narrowed by the resources and the time
+//! ranges the call names.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +169,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAttacks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAttacksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAttacks"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAttacksErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some(
+                        "the shield emulator is mounted on an engine that holds no state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `MaxResults` is the greatest number of summaries to report; the model documents
+        // the default as 20, which is also what a caller naming no page size gets. A
+        // `MaxResults` of 0 — which the member's `@range(0..10000)` admits — is read the
+        // same way rather than as an empty page, as every listing of this service does.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results > 0 => max_results,
+            _ => crate::state::DEFAULT_LIST_MAX_RESULTS,
+        } as usize;
+
+        // The token is read before the store is: a token this listing did not issue says
+        // nothing about the account, so it is refused on its own terms. This operation
+        // models no pagination-token error, so the refusal is the parameter one, naming
+        // the member that carried the value.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(TOKEN_KIND, token) {
+                Some(position) => Some(position),
+                None => {
+                    return Err(invalid_parameter(
+                        NEXT_TOKEN_MEMBER,
+                        crate::state::INVALID_PAGINATION_TOKEN_MESSAGE,
+                    ));
+                }
+            },
+        };
+
+        // A pure read of the account's attack log, in the order it detected them. The
+        // coordinate a token carries is the attack's own position in that log, not its
+        // place in the page's selection: attacks are only ever appended, so a position
+        // keeps naming the same attack, and resuming is "the attacks logged after this
+        // one that the call selects" whatever the call's filters are.
+        let guard = state.lock();
+        let matching: Vec<(usize, &crate::state::AttackRecord)> = guard
+            .attacks
+            .iter()
+            .enumerate()
+            .filter(|(logged_at, _)| {
+                resume_after.is_none_or(|last| *logged_at as u64 > last)
+            })
+            .filter(|(_, attack)| {
+                attacked_resource_requested(attack, input.resource_arns.as_deref())
+            })
+            .filter(|(_, attack)| {
+                in_requested_range(Some(attack.start_time), input.start_time.as_ref())
+                    && in_requested_range(attack.end_time, input.end_time.as_ref())
+            })
+            .collect();
+
+        // A token the selection has already run past is the last page rather than an
+        // error: the attacks logged before it are behind the caller.
+        let page = &matching[..matching.len().min(page_size)];
+
+        Ok(ListAttacksOutput {
+            attack_summaries: Some(
+                page.iter()
+                    .map(|(_, attack)| attack.to_summary())
+                    .collect(),
+            ),
+            // Omitted on the last page: the `@paginated` contract is that an absent
+            // token ends the iteration.
+            next_token: (matching.len() > page.len())
+                .then(|| {
+                    page.last().map(|(logged_at, _)| {
+                        crate::state::encode_page_token(TOKEN_KIND, *logged_at as u64)
+                    })
+                })
+                .flatten(),
+        })
     }
+}
+
+/// The listing an issued token belongs to, so a token from another listing — or from a
+/// future encoding — is refused rather than half-understood.
+const TOKEN_KIND: &str = "attacks";
+
+/// The input member a refused pagination token arrived on.
+const NEXT_TOKEN_MEMBER: &str = "NextToken";
+
+/// The modelled `InvalidParameterException` (HTTP 400) this operation refuses a request
+/// with, naming the member whose value was wrong.
+fn invalid_parameter(member: &str, message: &str) -> ListAttacksError {
+    ListAttacksErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.to_string()),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: message.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// Whether the attack hit a resource this call asked about.
+///
+/// `ListAttacksRequest$ResourceArns` is a filter over the resources that were attacked:
+/// "If you leave this blank, all applicable resources for this account will be
+/// included", so a call naming none — or naming an empty list — narrows nothing.
+fn attacked_resource_requested(
+    attack: &crate::state::AttackRecord,
+    resource_arns: Option<&[String]>,
+) -> bool {
+    match resource_arns {
+        None => true,
+        Some(requested) => {
+            requested.is_empty() || requested.contains(&attack.resource_arn)
+        }
+    }
+}
+
+/// Whether an instant the attack carries falls inside a `TimeRange` the call named.
+///
+/// A `TimeRange` is `[FromInclusive, ToExclusive)` — the half-open reading this service
+/// already reports attack statistics over — and a bound the call leaves out does not
+/// constrain that side. An attack that carries no such instant at all (an attack still
+/// under way has no end time) is outside every range a call asks for, since there is no
+/// instant of it to place.
+fn in_requested_range(instant: Option<::std::time::SystemTime>, range: Option<&TimeRange>) -> bool {
+    let Some(range) = range else {
+        return true;
+    };
+    let Some(instant) = instant else {
+        return false;
+    };
+    let key = |at: ::aws_smithy_types::DateTime| (at.secs(), at.subsec_nanos());
+    let instant = key(::aws_smithy_types::DateTime::from(instant));
+    range
+        .from_inclusive
+        .is_none_or(|from| instant >= key(from))
+        && range.to_exclusive.is_none_or(|to| instant < key(to))
 }

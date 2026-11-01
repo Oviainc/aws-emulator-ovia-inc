@@ -15,6 +15,8 @@
 mod shield_attack_statistics;
 #[path = "all/shield_drt_access.rs"]
 mod shield_drt_access;
+#[path = "all/shield_list_attacks.rs"]
+mod shield_list_attacks;
 #[path = "all/shield_protection_groups_tags_and_account.rs"]
 mod shield_protection_groups_tags_and_account;
 #[path = "all/shield_subscription_and_protections.rs"]

@@ -19,10 +19,11 @@ use ::aws_smithy_types::date_time::Format as DateTimeFormat;
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    ApplicationLayerAutomaticResponseConfiguration, AttackStatisticsDataItem, AttackVolume,
-    AttackVolumeStatistics, EmergencyContact, Limit, Protection, ProtectionGroup,
-    ProtectionGroupArbitraryPatternLimits, ProtectionGroupLimits, ProtectionGroupPatternTypeLimits,
-    ProtectionLimits, Subscription, SubscriptionLimits, Tag, PROTECTED_RESOURCE_TYPE_VALUES,
+    ApplicationLayerAutomaticResponseConfiguration, AttackStatisticsDataItem, AttackSummary,
+    AttackVectorDescription, AttackVolume, AttackVolumeStatistics, EmergencyContact, Limit,
+    Protection, ProtectionGroup, ProtectionGroupArbitraryPatternLimits, ProtectionGroupLimits,
+    ProtectionGroupPatternTypeLimits, ProtectionLimits, Subscription, SubscriptionLimits, Tag,
+    PROTECTED_RESOURCE_TYPE_VALUES,
 };
 
 /// The `SubscriptionState` an account with a live Shield Advanced subscription is in.
@@ -459,8 +460,8 @@ impl ProtectionGroupEntry {
 ///
 /// Shield detects attacks rather than being asked to create them, so no modelled
 /// operation writes a record here; the attack log is the single place every attack
-/// reader of this service (`DescribeAttackStatistics`, and `ListAttacks` /
-/// `DescribeAttack` once they are implemented) derives its answer from, so an account
+/// reader of this service (`DescribeAttackStatistics` and `ListAttacks`, and
+/// `DescribeAttack` once it is implemented) derives its answer from, so an account
 /// with no detected attacks and one with several are the same code path.
 #[derive(Debug, Clone)]
 pub struct AttackRecord {
@@ -483,6 +484,34 @@ pub struct AttackRecord {
     /// The peak requests per second observed, set for an application-level attack —
     /// `AttackVolume$RequestsPerSecond` is "included for application level attacks".
     pub max_requests_per_second: Option<f64>,
+    /// The attack types Shield observed in this attack, each an `AttackVectorDescription`
+    /// `VectorType` (for example `UDP_TRAFFIC`); empty for an attack whose traffic was
+    /// attributed to no vector.
+    pub attack_vectors: Vec<String>,
+}
+
+impl AttackRecord {
+    /// This record as the modelled `AttackSummary` a listing answers with
+    /// (`AttackSummary`: "Summarizes all DDoS attacks for a specified time period").
+    ///
+    /// `EndTime` is "the end time of the attack", so it is reported only for an attack
+    /// that has ended; an attack still under way carries none.
+    pub fn to_summary(&self) -> AttackSummary {
+        AttackSummary {
+            attack_id: Some(self.attack_id.clone()),
+            resource_arn: Some(self.resource_arn.clone()),
+            start_time: Some(DateTime::from(self.start_time)),
+            end_time: self.end_time.map(DateTime::from),
+            attack_vectors: Some(
+                self.attack_vectors
+                    .iter()
+                    .map(|vector_type| AttackVectorDescription {
+                        vector_type: vector_type.clone(),
+                    })
+                    .collect(),
+            ),
+        }
+    }
 }
 
 /// How many calendar years back the attack statistics window reaches, as

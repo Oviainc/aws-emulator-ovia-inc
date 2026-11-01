@@ -123,6 +123,7 @@ impl Emulator {
             max_bits_per_second: seed.bits_per_second,
             max_packets_per_second: seed.packets_per_second,
             max_requests_per_second: seed.requests_per_second,
+            attack_vectors: Vec::new(),
         });
     }
 
