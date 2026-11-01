@@ -21,6 +21,8 @@ mod catalog_reads;
 mod certificate_resolution_and_redirect_protocol;
 #[path = "all/declared_action_set.rs"]
 mod declared_action_set;
+#[path = "all/describe_input_bounds.rs"]
+mod describe_input_bounds;
 #[path = "all/ip_targets.rs"]
 mod ip_targets;
 #[path = "all/listener_lifecycle_certificates_and_rules.rs"]

@@ -8,6 +8,10 @@
 //! operation's `@paginated(inputToken: Marker, outputToken: NextMarker, items:
 //! LoadBalancers)` trait declares.
 //!
+//! A selector naming more load balancers than one call may describe
+//! ([`LOAD_BALANCERS_PER_CALL`]) is refused on the request's own shape, before any
+//! lookup: a bad request is never reported as a missing resource.
+//!
 //! It reports; the only state it writes is the move out of `provisioning` the clock
 //! already made due (see [`crate::state::ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State::settle`]).
 //!
@@ -73,6 +77,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How many load balancers one call may ask this read about, however they are named.
+///
+/// `LoadBalancerArns`' own documentation fixes it — "You can specify up to 20 load
+/// balancers in a single call" — and the model declares no length constraint for either
+/// selector, so the bound lives here and is enforced on the request rather than on what
+/// the store happens to hold.
+const LOAD_BALANCERS_PER_CALL: usize = 20;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,6 +160,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // which this service has no store on — so nothing is implemented for it.
             crate::scaffolded::Scaffolded::not_implemented("DescribeLoadBalancers")
         })?;
+
+        // The request's own shape is judged BEFORE anything is looked up: a selector past
+        // the per-call bound is a request this API never accepts, whatever the store
+        // holds, so it must not be answered as a missing resource. What the bound counts
+        // is the load balancers the call asks about — an ARN and a name each name one.
+        let asked_about = input.load_balancer_arns.iter().flatten().count()
+            + input.names.iter().flatten().count();
+        if asked_about > LOAD_BALANCERS_PER_CALL {
+            return Err(too_many_load_balancers(asked_about));
+        }
+
         let now = std::time::SystemTime::now();
 
         let mut guard = state.lock();
@@ -201,6 +224,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_marker,
         })
     }
+}
+
+/// The refusal for a call asking about more load balancers than one call may describe.
+///
+/// The model declares no error shape for the bound, so the code is this service's own
+/// `ValidationError`, and the wording is the service's: the limit is fixed and the count
+/// is the one the request carried.
+fn too_many_load_balancers(asked_about: usize) -> DescribeLoadBalancersError {
+    crate::scaffolded::Scaffolded::validation_error(format!(
+        "Up to {LOAD_BALANCERS_PER_CALL} load balancers can be described at a time, but \
+         {asked_about} were specified"
+    ))
 }
 
 /// The modelled refusal for a `Names` entry no load balancer in state carries: the names

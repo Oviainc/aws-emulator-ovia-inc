@@ -7,6 +7,12 @@
 //! state carries is the matching not-found refusal) and paged by
 //! `PageSize`/`Marker`. This is the read-back for `CreateTargetGroup`.
 //!
+//! The three filters select in three different ways, so a request carrying more than
+//! one of them, or asking about more target groups than one call may describe
+//! ([`TARGET_GROUPS_PER_CALL`]), is refused on the request's own shape before any
+//! lookup: a bad request is never answered as a missing resource, and never with a
+//! report.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -75,6 +81,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How many target groups one call may ask this read about, however they are named.
+///
+/// The model declares no length constraint for either selector, so the bound lives here
+/// and is enforced on the request rather than on what the store happens to hold.
+const TARGET_GROUPS_PER_CALL: usize = 20;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -151,6 +163,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // which this service has no store on — so nothing is implemented for it.
             crate::scaffolded::Scaffolded::not_implemented("DescribeTargetGroups")
         })?;
+
+        // The request's own shape is judged BEFORE anything is looked up, so a request
+        // this API never accepts cannot be answered as a missing resource — or, worse,
+        // with a report of target groups the caller did not ask for.
+        //
+        // The two selectors and the attachment filter each select a different set, so a
+        // request may carry at most one of them…
+        let selectors = [
+            input.names.iter().flatten().next().is_some(),
+            input.target_group_arns.iter().flatten().next().is_some(),
+            input.load_balancer_arn.is_some(),
+        ]
+        .into_iter()
+        .filter(|carried| *carried)
+        .count();
+        if selectors > 1 {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "Target group names, target group ARNs, and a load balancer ARN cannot be \
+                 specified at the same time",
+            ));
+        }
+        // …and whichever of the two lists it carries names at most the per-call bound of
+        // target groups.
+        let asked_about = input.target_group_arns.iter().flatten().count()
+            + input.names.iter().flatten().count();
+        if asked_about > TARGET_GROUPS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "You cannot describe more than '{TARGET_GROUPS_PER_CALL}' target groups at a time"
+            )));
+        }
 
         let guard = state.lock();
 
