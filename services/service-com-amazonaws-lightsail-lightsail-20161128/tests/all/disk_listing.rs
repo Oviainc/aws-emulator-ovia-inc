@@ -9,21 +9,23 @@
 //! handlers and the awsJson error envelope are all exercised rather than
 //! bypassed.
 //!
-//! The rule under test: a listing reports every record the store holds of that
-//! resource type, each entry exactly as the single-record read reports it, in the
-//! store's own name order, carried one page at a time, with `nextPageToken`
-//! NAMING the first record of the page after it while records remain and ABSENT
-//! on the last page — and, being a read, it reports the same records however
-//! often it is called.
+//! The rule under test: a listing reports the records the store holds of that
+//! resource type IN THE REGION THE REQUEST WAS MADE IN, each entry exactly as the
+//! single-record read reports it, in the store's own name order, carried one page
+//! at a time, with `nextPageToken` NAMING the first record of the page after it
+//! while records remain and ABSENT on the last page — and, being a read, it
+//! reports the same records however often it is called. Every case here holds its
+//! disks in one Region, the one every call of this suite is served in; the Region
+//! scope itself is the subject of `disk_listing_region_scope.rs`.
 //!
 //! The rows span what that rule generalises over: how many disks the account
 //! holds (none, one, exactly a page, one past a page, several pages and a
 //! remainder), the creation order against the reported order (every row is
 //! created in reverse name order, so a listing that merely echoed the creation
 //! sequence would fail), and the size, zone and tags each record was asked for —
-//! so the server-assigned members that are DERIVED from them (IOPS, location,
-//! the region in the ARN) differ from entry to entry and a canned body could not
-//! satisfy them.
+//! so the server-assigned members that are DERIVED from them (IOPS, the location
+//! and the region the ARN carries) are computed per entry and a canned body could
+//! not satisfy them.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -50,11 +52,13 @@ const SIZES_IN_GB: &[i64] = &[8, 16, 33, 64, 128, 1024];
 // Driving the service
 // ---------------------------------------------------------------------------
 
-/// Every availability zone the service itself publishes, in report order.
+/// Every availability zone the service itself publishes for the Region every call
+/// of this suite is served in, in report order.
 ///
 /// SOURCE: the service's own Region catalog — `GetRegions` with
-/// `includeAvailabilityZones` — so no zone is hand-written in this suite and the
-/// rows span the zones (and so the regions) the service actually serves.
+/// `includeAvailabilityZones`, which reports the zones of the Region the request
+/// was made in — so no zone is hand-written in this suite and the rows span the
+/// zones that Region actually serves.
 async fn published_zones(emulator: &Emulator) -> Vec<String> {
     let body = emulator
         .ok("GetRegions", json!({"includeAvailabilityZones": true}))
@@ -255,8 +259,8 @@ struct Created {
 }
 
 /// Create this row's disks, IN REVERSE NAME ORDER, each in its own zone out of the
-/// published catalog, at its own size and with its own tag, and wait until every
-/// one is `available`.
+/// zones this request's Region publishes, at its own size and with its own tag,
+/// and wait until every one is `available`.
 async fn create_row(emulator: &Emulator, row: &Row) -> Vec<Created> {
     let zones = published_zones(emulator).await;
 

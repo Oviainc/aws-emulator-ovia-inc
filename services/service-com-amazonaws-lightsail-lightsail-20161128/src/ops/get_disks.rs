@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDisks
-//! Reports the block storage disks the account holds, one page at a time, each
-//! entry read out of the same stored record `GetDisk` reports.
+//! Reports the block storage disks the account holds in the region the request
+//! was made in, one page at a time, each entry read out of the same stored
+//! record `GetDisk` reports.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -161,24 +162,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // This operation reports what the account holds and takes nothing but a
-        // page token, so nothing here reads the request metadata.
-        let _ = ctx;
+        // A disk is a LOCATED record and this listing is scoped to one region —
+        // "all block storage disks in your AWS account and region" — so the
+        // region the request is signed for selects which stored records answer.
+        // A disk's own region is the one the `availabilityZone` its create named
+        // belongs to, which is what the stored location carries, so no record
+        // has to be re-derived here.
+        let region = crate::state::request_region(ctx.parts());
 
         // `pageToken` NAMES the disk a page starts at — the name the previous page
-        // reported as its `nextPageToken` — so a page is the stored disks from
-        // that one onward in the store's own total order. Naming the disk rather
-        // than carrying an index means a disk created or deleted between two pages
-        // cannot make the walk skip or repeat another one, and a token naming no
-        // disk is refused rather than resumed at the next name after it. An absent
-        // — or empty — token asks for the first page. The walk itself is the ONE
-        // page walk every listing of this service shares
+        // reported as its `nextPageToken` — so a page is this region's stored
+        // disks from that one onward in the store's own total order. Naming the
+        // disk rather than carrying an index means a disk created or deleted
+        // between two pages cannot make the walk skip or repeat another one, and a
+        // token naming no disk of this region is refused rather than resumed at the
+        // next name after it. An absent — or empty — token asks for the first page.
+        // The walk itself is the ONE page walk every listing of this service shares
         // (`crate::state::resource_page`).
         let page_token = input.page_token.filter(|token| !token.is_empty());
 
         crate::state::with_state(&*self.engine, |store| {
             let (disks, next_page_token) = crate::state::resource_page(
-                crate::state::records_from(&store.disks, page_token.as_deref()),
+                // The store keys disks by name alone — the identifier every disk
+                // operation takes — so this region's records are selected on the
+                // walk, which is what the shared page walk takes a filter for:
+                // the page size counts the disks reported and the next page opens
+                // at the first disk of this region after them.
+                crate::state::records_from(&store.disks, page_token.as_deref())
+                    .filter(|(_, disk)| disk.location.region_name == region),
                 page_token.as_deref(),
                 crate::state::DISK_PAGE_SIZE,
                 // The SAME view `GetDisk` reports: one stored record read by two
@@ -187,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .ok_or_else(|| invalid_page_token(page_token.as_deref().unwrap_or_default()))?;
             Ok(GetDisksOutput {
-                // An account with no disks reports an empty list, not an absent
+                // A region holding no disks reports an empty list, not an absent
                 // one: the caller asked what it has, and the answer is
                 // "nothing".
                 disks: Some(disks),

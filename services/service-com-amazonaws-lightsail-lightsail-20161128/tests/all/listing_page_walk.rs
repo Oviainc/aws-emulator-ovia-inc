@@ -23,8 +23,10 @@
 //!
 //! The rows span the listings that rule holds for: a listing of records keyed by
 //! name alone, one of records whose identity includes the Region they were created
-//! in, one whose request NARROWS which records it reports, one that reports names
-//! rather than records, and one whose record names the service mints itself. Each
+//! in, one keyed by name alone whose own documentation scopes it to the Region the
+//! request is made in, one whose request NARROWS which records it reports, one that
+//! reports names rather than records, and one whose record names the service mints
+//! itself. Each
 //! row's store holds one record past a page — the smallest store that makes the
 //! walk issue a token — and each is walked under a TABLE of tokens a caller can
 //! send: none, empty, below every name, on a name, just past a name, on the last
@@ -119,8 +121,8 @@ enum Listing {
 
 /// One row: the listing, the operation that answers it, the output member that
 /// carries the page, the member of a reported record that carries the name a page
-/// token names, the page size the handler uses, and the Region the records belong
-/// to when their identity includes one.
+/// token names, the page size the handler uses, and the Region the listing is
+/// scoped to when it is scoped to one.
 #[derive(Debug, Clone, Copy)]
 struct Row {
     listing: Listing,
@@ -145,13 +147,16 @@ const ROWS: &[Row] = &[
         page_size: state::INSTANCE_PAGE_SIZE,
         region: None,
     },
+    // `GetDisks` reports "all block storage disks in your AWS account and
+    // region", so this row's records are created in — and the listing read in —
+    // one Region away from the default.
     Row {
         listing: Listing::Disks,
         operation: "GetDisks",
         member: "disks",
         name_member: Some("name"),
         page_size: state::DISK_PAGE_SIZE,
-        region: None,
+        region: Some(REGIONAL_ROW_REGION),
     },
     Row {
         listing: Listing::DiskSnapshots,
@@ -327,14 +332,38 @@ async fn create_instance(emulator: &Emulator, name: &str) {
         .await;
 }
 
-/// Create the block storage disk a row's snapshots are taken of.
-async fn create_disk(emulator: &Emulator, name: &str) {
+/// Create the block storage disk a row's snapshots are taken of, in `zone`.
+///
+/// A disk's Region is the one the zone it was created in belongs to, never the
+/// one the request was signed for, so a row whose listing is read in a Region
+/// names a zone OF that Region.
+async fn create_disk_in(emulator: &Emulator, name: &str, zone: &str) {
     emulator
         .ok(
             "CreateDisk",
-            json!({"diskName": name, "availabilityZone": ZONE, "sizeInGb": 8}),
+            json!({"diskName": name, "availabilityZone": zone, "sizeInGb": 8}),
         )
         .await;
+}
+
+/// Create the block storage disk a row's snapshots are taken of, in the default
+/// Region's zone every resource of this suite that names no Region uses.
+async fn create_disk(emulator: &Emulator, name: &str) {
+    create_disk_in(emulator, name, ZONE).await;
+}
+
+/// The first Availability Zone the service's own Region catalog publishes for
+/// `region` — so no zone of a Region other than the default one is hand-written
+/// here.
+fn first_zone_of(region: &str) -> String {
+    state::REGION_SPECS
+        .iter()
+        .find(|spec| spec.name == region)
+        .unwrap_or_else(|| panic!("case stocking a row in {region}: expected the Region catalog to publish it"))
+        .zone_names()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case stocking a row in {region}: expected {region} to publish a zone"))
 }
 
 /// Create the disk snapshot a row's exports are made from, and wait
@@ -472,8 +501,12 @@ async fn stock(emulator: &Emulator, row: &Row, count: usize) -> Option<Vec<Strin
             }
         }
         Listing::Disks => {
+            let zone = match row.region {
+                Some(region) => first_zone_of(region),
+                None => ZONE.to_string(),
+            };
             for name in names.iter().rev() {
-                create_disk(emulator, name).await;
+                create_disk_in(emulator, name, &zone).await;
             }
         }
         Listing::DiskSnapshots => {
@@ -949,9 +982,9 @@ async fn every_resource_listing_pages_through_the_one_shared_walk() {
             }
         }
 
-        // A listing of records whose identity includes a Region reports that
-        // Region's records alone: the walk leaves the Region behind at the first
-        // record of the next one.
+        // A listing scoped to a Region reports that Region's records alone:
+        // whether the Region is part of the key or selected on the walk, a
+        // caller in another Region is told it holds none of them.
         if row.region.is_some() {
             let elsewhere = Row {
                 region: Some(OTHER_REGION),

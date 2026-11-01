@@ -133,6 +133,8 @@ mod disk_delete;
 mod disk_detach;
 #[path = "all/disk_listing.rs"]
 mod disk_listing;
+#[path = "all/disk_listing_region_scope.rs"]
+mod disk_listing_region_scope;
 #[path = "all/disk_restore_from_auto_snapshot.rs"]
 mod disk_restore_from_auto_snapshot;
 #[path = "all/disk_restore_from_snapshot.rs"]

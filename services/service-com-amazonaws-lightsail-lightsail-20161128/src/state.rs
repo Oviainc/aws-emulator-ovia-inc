@@ -13883,6 +13883,15 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// Every block storage disk, keyed by its disk name — the identifier every
     /// disk operation takes. A `BTreeMap` so `GetDisks` walks a stable, total
     /// order and a page token can name the next disk.
+    ///
+    /// The key is the name ALONE, not the `(region, name)` pair a bucket and a
+    /// load balancer are held under, because every modelled disk operation
+    /// addresses a disk by `diskName` and nothing else. The disk is still a
+    /// LOCATED record — its [`StoredDisk::location`] carries the region of the
+    /// `availabilityZone` its create named — and the one listing of it is scoped
+    /// to a region ("all block storage disks in your AWS account and region"), so
+    /// `GetDisks` selects that region's records on the walk rather than the key
+    /// doing it.
     pub disks: BTreeMap<String, StoredDisk>,
     /// Every disk snapshot, keyed by its snapshot name — the identifier every
     /// disk snapshot operation takes. A `BTreeMap` so `GetDiskSnapshots` walks a
