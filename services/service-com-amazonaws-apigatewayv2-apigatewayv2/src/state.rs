@@ -4520,11 +4520,13 @@ pub fn portal_preview_url(endpoint: &wire::EndpointConfigurationResponse) -> Str
 /// fourteen-character ids AWS publishes for its endpoint hosted zones.
 const HOSTED_ZONE_ID_LEN: usize = 13;
 
-/// A hosted zone id DERIVED from the parts that decide WHICH endpoint it belongs to.
+/// A hosted zone id DERIVED from the parts that decide WHICH endpoint it belongs to — the
+/// fallback for an endpoint whose published id this service does not carry.
 ///
 /// AWS assigns ONE opaque hosted zone id per service endpoint per Region and publishes no
-/// formula for it, so this derives a stable id from those parts rather than carrying a
-/// table of real ones it could not keep true. The mixing is
+/// formula for it, so an id it publishes is CARRIED verbatim where this service has it
+/// ([`CLOUDFRONT_HOSTED_ZONE_ID`], [`PORTAL_DOMAIN_HOSTED_ZONES`]) and derived from those
+/// parts otherwise, rather than invented afresh per read. The mixing is
 /// [`::service_common::stable_hex_id`] — the tree's one derived-id mixer, reproducible
 /// across builds — uppercased and cut to the published LENGTH: a leading `Z` and
 /// [`HOSTED_ZONE_ID_LEN`] characters, which the mixer renders as uppercase hexadecimal
@@ -4540,14 +4542,57 @@ fn derived_hosted_zone_id(parts: &[&str]) -> String {
     format!("Z{mixed}")
 }
 
+/// One Region's hosted zone for the domains API Gateway generates and manages for a
+/// developer portal: the zone, and the Region it is the zone OF.
+#[derive(Debug)]
+pub struct PortalDomainHostedZone {
+    pub region: &'static str,
+    pub hosted_zone_id: &'static str,
+}
+
+/// The hosted zones AWS PUBLISHES for portal default domains, one entry per Region.
+///
+/// Every portal in a Region is served on the one domain API Gateway generates and manages
+/// there (`EndpointConfigurationResponse$PortalDefaultDomainName`), so the zone an alias
+/// record for it targets is a fact about the REGION: AWS answers the same id for every
+/// portal created in that Region and for every read of it, as the recorded AWS answers for
+/// `us-west-2` show. AWS ASSIGNS the id and publishes no formula for it — the same as the
+/// one it publishes for a CloudFront distribution ([`CLOUDFRONT_HOSTED_ZONE_ID`]) — so the
+/// ids it publishes are CARRIED here rather than computed, and a Region this table does not
+/// name falls back to [`derived_hosted_zone_id`] (see
+/// [`portal_domain_hosted_zone_id`]).
+///
+/// `tests/all/portal_hosted_zone.rs` keeps its OWN copy of these ids and asserts the two
+/// agree Region for Region, so an entry here always has a published AWS answer behind it
+/// and a Region added to either belongs in both.
+pub const PORTAL_DOMAIN_HOSTED_ZONES: &[PortalDomainHostedZone] = &[PortalDomainHostedZone {
+    region: "us-west-2",
+    hosted_zone_id: "Z091913938PZVWK6ZMXI7",
+}];
+
+/// The published hosted zone of the portal default domain in `region`, or `None` for a
+/// Region [`PORTAL_DOMAIN_HOSTED_ZONES`] carries no published id for.
+pub fn published_portal_domain_hosted_zone_id(region: &str) -> Option<&'static str> {
+    PORTAL_DOMAIN_HOSTED_ZONES
+        .iter()
+        .find(|zone| zone.region == region)
+        .map(|zone| zone.hosted_zone_id)
+}
+
 /// The hosted zone id of the portal domain
 /// (`EndpointConfigurationResponse$PortalDomainHostedZoneId`), the zone an alias record
 /// for the portal's domain points at.
 ///
-/// The member is REQUIRED on the modelled response, so a portal always reports one; it is
-/// one id per Region, derived by [`derived_hosted_zone_id`].
+/// The member is REQUIRED on the modelled response, so a portal always reports one, and it
+/// is one id per Region: the id AWS publishes for the Region
+/// ([`published_portal_domain_hosted_zone_id`]) wherever this service carries it, since a
+/// caller writes a Route 53 alias record against that zone and a zone id of this emulator's
+/// own names no zone their account can reach. A Region with no published id carried here
+/// still reports one id of its own, derived by [`derived_hosted_zone_id`], so the member
+/// keeps its per-Region invariance and its stability everywhere.
 pub fn portal_domain_hosted_zone_id(region: &str) -> String {
-    derived_hosted_zone_id(&[region])
+    published_portal_domain_hosted_zone_id(region)
+        .map_or_else(|| derived_hosted_zone_id(&[region]), str::to_string)
 }
 
 /// The `EndpointType` whose domain is fronted by a CloudFront distribution rather than by

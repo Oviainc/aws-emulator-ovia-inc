@@ -107,6 +107,8 @@ mod model_template;
 mod portal_data_plane;
 #[path = "all/portal_deletion.rs"]
 mod portal_deletion;
+#[path = "all/portal_hosted_zone.rs"]
+mod portal_hosted_zone;
 #[path = "all/portal_lifecycle.rs"]
 mod portal_lifecycle;
 #[path = "all/portal_pagination.rs"]
