@@ -2104,8 +2104,10 @@ pub fn matches_filters<'r>(
 /// whether the token it was handed is empty, not by whether the member is there. See
 /// [`resume_token`] for the other half of that contract on the way in.
 ///
-/// `kind` names the listing the token belongs to, so a token one listing issued is not
-/// accepted by the other (see [`encode_page_token`]).
+/// `kind` names the listing the token belongs to and `region` the endpoint serving
+/// this page, so a token one listing issued is not accepted by the other and a token
+/// one Region's endpoint issued is not accepted by another's (see
+/// [`encode_page_token`]).
 ///
 /// Both bounds here are the server's own: `page_size` (see [`page_size`]) sizes the
 /// page, so nothing a caller sends sizes an allocation, and [`MAX_SCAN_ENTRIES`]
@@ -2114,6 +2116,7 @@ pub fn matches_filters<'r>(
 /// so paging still visits every record exactly once.
 pub fn paginate<'a, T>(
     kind: &str,
+    region: &str,
     entries: impl Iterator<Item = (&'a String, &'a T)>,
     page_size: usize,
     keep: impl Fn(&T) -> bool,
@@ -2125,7 +2128,7 @@ pub fn paginate<'a, T>(
         // then does the token name a record — an exhausted listing reports the empty
         // string it started as.
         if page.len() == page_size || examined == MAX_SCAN_ENTRIES {
-            next_token = encode_page_token(kind, key);
+            next_token = encode_page_token(kind, region, key);
             break;
         }
         if keep(record) {
@@ -2163,26 +2166,39 @@ pub const MANAGER_PAGE_TOKEN_KIND: &str = "configuration-manager";
 pub const CONFIGURATION_PAGE_TOKEN_KIND: &str = "configuration";
 
 /// A page token naming the record the NEXT page starts at, tagged with the listing
-/// that issued it.
+/// that issued it and with the Region whose endpoint issued it.
+///
+/// A listing resumes a walk of records scoped to ONE listing and ONE Region, so a
+/// token is only meaningful to the endpoint and the listing that minted it: both are
+/// part of the token, which is what lets [`decode_page_token`] refuse a token issued
+/// elsewhere instead of resuming this Region's walk at a record belonging to another
+/// one and skipping everything that sorts before it. Every Region's records share one
+/// store key order ([`ComAmazonawsSsmquicksetupQuicksetupState::managers`]), so a
+/// foreign token's key is a position in that shared order rather than in the
+/// requesting Region's own.
 ///
 /// Hex-encoded rather than handed back in the clear, which makes the token opaque to
-/// a caller rather than secret: it carries nothing but the listing's name and a store
-/// key. The tag is what lets [`decode_page_token`] refuse a token the OTHER listing
-/// issued (whose key names a record of a different kind) as well as caller-crafted
-/// text. Hex is inside both `StartingToken` patterns
+/// a caller rather than secret: it carries nothing but the listing's name, the
+/// Region's name and a store key. Hex is inside both `StartingToken` patterns
 /// (`^[A-Za-z0-9+=@_\/\s-]*$` and the `ListConfigurations` variant) and well inside
-/// their 1024-character bound — a tag and an ARN encode to about 250 characters.
-pub fn encode_page_token(kind: &str, key: &str) -> String {
-    ::hex::encode(format!("{kind}\u{1f}{key}"))
+/// their 1024-character bound — a tag, a Region and an ARN encode to about 270
+/// characters.
+pub fn encode_page_token(kind: &str, region: &str, key: &str) -> String {
+    ::hex::encode(format!("{kind}\u{1f}{region}\u{1f}{key}"))
 }
 
-/// The store key a page token names, or `None` when the token is not one `kind`'s
-/// listing issued.
-pub fn decode_page_token(kind: &str, token: &str) -> Option<String> {
+/// The store key a page token names, or `None` when the token is not one this
+/// listing (`kind`) issued through the endpoint of `region` — a token of the other
+/// listing, a token of another Region's endpoint, or caller-crafted text.
+///
+/// `region` carries no `\u{1f}` ([`request_region`] admits only `[A-Za-z0-9-]`), so
+/// the tagged prefix a token is accepted under names exactly one listing and one
+/// Region.
+pub fn decode_page_token(kind: &str, region: &str, token: &str) -> Option<String> {
     let decoded = ::hex::decode(token).ok()?;
     let decoded = String::from_utf8(decoded).ok()?;
     decoded
-        .strip_prefix(&format!("{kind}\u{1f}"))
+        .strip_prefix(&format!("{kind}\u{1f}{region}\u{1f}"))
         .map(str::to_string)
 }
 

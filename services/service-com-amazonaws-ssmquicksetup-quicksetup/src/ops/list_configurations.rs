@@ -179,14 +179,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A token this operation did not issue is refused rather than silently read as
-        // "start from the beginning", which would re-serve a page the caller already had.
-        // The empty token an exhausted listing reports names no record, so it reads as
-        // no token at all (see [`crate::state::resume_token`]).
+        // A token this operation did not issue through THIS Region's endpoint is
+        // refused rather than silently read as a position in this Region's listing: a
+        // token carries a key in the store's shared order, so resuming at one another
+        // endpoint minted would skip every configuration of this Region that sorts
+        // before it, and no later page would ever visit them. Reading it as "start from
+        // the beginning" is wrong for the same reason in reverse — it would re-serve a
+        // page the caller already had. The empty token an exhausted listing reports
+        // names no record, so it reads as no token at all (see
+        // [`crate::state::resume_token`]).
         let start = match crate::state::resume_token(input.starting_token.as_deref()) {
             Some(token) => Some(
                 crate::state::decode_page_token(
                     crate::state::CONFIGURATION_PAGE_TOKEN_KIND,
+                    &region,
                     token,
                 )
                 .ok_or_else(|| {
@@ -246,6 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // first configuration.
         let (page, next_token) = crate::state::paginate(
             crate::state::CONFIGURATION_PAGE_TOKEN_KIND,
+            &region,
             store.configurations.range(start.unwrap_or_default()..),
             crate::state::page_size(input.max_items),
             |configuration| {

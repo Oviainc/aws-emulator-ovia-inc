@@ -43,6 +43,8 @@ mod list_tags_for_resource;
 mod manager_not_found_message;
 #[path = "all/manager_region_scope.rs"]
 mod manager_region_scope;
+#[path = "all/page_token_region_scope.rs"]
+mod page_token_region_scope;
 #[path = "all/pagination_tokens.rs"]
 mod pagination_tokens;
 #[path = "all/partial_parameter_updates.rs"]
