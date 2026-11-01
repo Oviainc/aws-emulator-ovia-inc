@@ -297,7 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "using the same client token and parameters" succeeds without performing any
         // action, and that "if the parameters aren't identical, the retry fails" — so
         // EVERY member the create persists takes part in the comparison, against the
-        // values as they were stored (the action normalised the same way).
+        // values as they were stored (the action and the match normalised the same way).
         let token = input
             .client_token
             .as_deref()
@@ -311,7 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 && existing.listener_id == listener.id
                 && existing.service_id == service_id
                 && existing.priority == input.priority
-                && existing.r#match == input.r#match
+                && existing.r#match == crate::state::normalized_rule_match(&input.r#match)
                 && existing.action == crate::state::normalized_rule_action(&input.action)
                 && existing.tags == input.tags.clone().unwrap_or_default();
             if !identical {
@@ -348,7 +348,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service answers this conflict with.
         if let Some(taken_by) = store.rule_with_priority(&listener.id, input.priority) {
             return Err(conflict(
-                format!("Rule with priority {} already exist!", input.priority),
+                crate::state::duplicate_priority_message(input.priority),
                 taken_by.id.clone(),
             ));
         }
@@ -381,7 +381,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             listener_id: listener.id.clone(),
             service_id: service_id.clone(),
             priority: input.priority,
-            r#match: input.r#match.clone(),
+            // Stored with the HTTP criteria's collections materialised, so every later
+            // read reports the same match.
+            r#match: crate::state::normalized_rule_match(&input.r#match),
             // Stored with the weight default the `weight` member documents filled in,
             // so every later read reports the same action.
             action: crate::state::normalized_rule_action(&input.action),

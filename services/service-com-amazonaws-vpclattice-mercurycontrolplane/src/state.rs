@@ -478,7 +478,9 @@ pub struct Rule {
     /// `RulePriority`. "Each rule for a specific listener must have a unique priority"
     /// (the `priority` member's own documentation), so this is unique per `listener_id`.
     pub priority: i32,
-    /// The modelled `RuleMatch` exactly as the create sent it.
+    /// The modelled `RuleMatch` as it was PERSISTED: the match the caller sent after
+    /// [`normalized_rule_match`] materialised its collections, so every read reports the
+    /// same match.
     pub r#match: crate::ops::types::RuleMatch,
     /// The rule's action, stored as the modelled union after [`normalized_rule_action`]
     /// filled in the documented weight default.
@@ -958,6 +960,32 @@ pub fn normalized_rule_action(
         }
     }
     action
+}
+
+/// The match as it is PERSISTED: the caller's match with every collection its HTTP
+/// criteria carry materialised, so a rule stores a LIST of header matches — an empty one
+/// when the request configured none — rather than the absence of a list.
+///
+/// A rule's match is reported back as it is stored, and AWS reports an HTTP match's
+/// `headerMatches` as a present list whether or not any header match is configured: a
+/// client that reads the list to decide whether header matching is in force gets a list
+/// either way. The member is optional on INPUT (and its `@length` bounds only constrain
+/// the entries a caller submits), so materialising it belongs to what gets stored, which
+/// keeps every projection of a rule's match — the create's own answer, a read and an
+/// update's answer — agreeing with one another. SOURCE: recorded AWS behaviour; the model
+/// states no projection rule for the member.
+pub fn normalized_rule_match(
+    r#match: &crate::ops::types::RuleMatch,
+) -> crate::ops::types::RuleMatch {
+    let mut r#match = r#match.clone();
+    match &mut r#match {
+        crate::ops::types::RuleMatch::httpMatch(http) => {
+            if http.header_matches.is_none() {
+                http.header_matches = Some(Vec::new());
+            }
+        }
+    }
+    r#match
 }
 
 /// The most `@idempotencyToken` -> resource-id entries this service remembers.
@@ -1746,6 +1774,23 @@ pub fn duplicate_name_in_resource_message(
         kind.message_name(),
         scope.scope_name()
     )
+}
+
+/// AWS's conflict message for a write refused because a rule of the listener already has
+/// the priority at issue — "Each rule for a specific listener must have a unique
+/// priority" (the `priority` member's own documentation), restated by `RuleUpdate`'s as
+/// "A listener can't have multiple rules with the same priority".
+///
+/// SOURCE: recorded AWS behaviour (409 `ConflictException`, from a rule create at a
+/// priority another rule holds and from a batch update moving a rule onto one). The
+/// construction — the wording over the priority that already exists — is the
+/// requirement; which priority that is belongs to the refusal, and each caller passes
+/// it: a create names the priority it asked for, which is the one the blocking rule
+/// holds, while a batch update names the priority of the rule its refused entry named.
+/// Every path that refuses the collision reports it through here so their wording cannot
+/// drift apart.
+pub fn duplicate_priority_message(priority: i32) -> String {
+    format!("Rule with priority {priority} already exist!")
 }
 
 /// AWS's conflict message for a listener create that would bind a port another listener

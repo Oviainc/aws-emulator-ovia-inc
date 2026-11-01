@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchUpdateRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchUpdateRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchUpdateRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the service and the listener, refuses the call when an entry's
+//! priority is not free once the whole batch is applied (so two rules may exchange their
+//! priorities in one call), writes each applicable entry onto the stored
+//! [`crate::state::Rule`] and reports the applied entries under `successful` and the ones
+//! naming no rule of this listener under `unsuccessful`. `GetRule` reads the same records
+//! back.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +122,47 @@ impl From<BatchUpdateRuleErrorModeled> for BatchUpdateRuleError {
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted resource of `kind`, built by the
+/// service's shared error construction ([`crate::state::resource_not_found`]): AWS's
+/// not-found message over the submitted identifier, and the kind's resource-type token.
+fn not_found(identifier: &str, kind: crate::state::ResourceKind) -> BatchUpdateRuleError {
+    BatchUpdateRuleErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        kind, identifier,
+    ))
+    .into()
+}
+
+/// The `failureCode` of an entry naming no rule of this listener.
+///
+/// A per-entry failure carries the wire name of the modelled exception the single-rule
+/// path answers the SAME refusal with, so a caller reading `unsuccessful` sees the code
+/// it would have seen had it sent that entry on its own.
+const FAILURE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The answer for an entry the batch applied — every member read off the record that was
+/// just written, so it cannot disagree with what `GetRule` reports next.
+fn success_of(rule: &crate::state::Rule) -> RuleUpdateSuccess {
+    RuleUpdateSuccess {
+        arn: Some(rule.arn.clone()),
+        id: Some(rule.id.clone()),
+        name: Some(rule.name.clone()),
+        is_default: Some(rule.is_default),
+        r#match: Some(rule.r#match.clone()),
+        priority: Some(rule.priority),
+        action: Some(rule.action.clone()),
+    }
+}
+
+/// The answer for an entry the batch did not apply: the identifier the caller submitted
+/// for it, the code of the matching modelled refusal, and that refusal's own message.
+fn failure(rule_identifier: &str, code: &str, message: String) -> RuleUpdateFailure {
+    RuleUpdateFailure {
+        rule_identifier: Some(rule_identifier.to_string()),
+        failure_code: Some(code.to_string()),
+        failure_message: Some(message),
+    }
+}
+
 /// The `BatchUpdateRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +199,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchUpdateRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchUpdateRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // The modelled constraints the boundary CAN check — `rules`' `@length(1, 10)`,
+        // each entry's `priority` `@range(1, 2000)`, the identifier patterns and the
+        // match's own traits — are refused before this handler runs.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchUpdateRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Both identifiers are modelled as either the bare id or the resource's ARN, and
+        // a listener is a resource OF its service: one naming nothing this store holds
+        // under the other is a 404 for the whole call, since no entry of the batch could
+        // name a rule of it.
+        let Some(service_id) = crate::state::id_from_identifier(
+            &input.service_identifier,
+            crate::state::PREFIX_SERVICE,
+        )
+        .filter(|id| store.services.contains_key(id)) else {
+            return Err(not_found(
+                &input.service_identifier,
+                crate::state::ResourceKind::Service,
+            ));
+        };
+        let Some(listener_id) = crate::state::id_from_identifier(
+            &input.listener_identifier,
+            crate::state::PREFIX_LISTENER,
+        )
+        .filter(|id| {
+            store
+                .listeners
+                .get(id)
+                .is_some_and(|listener| listener.service_id == service_id)
+        }) else {
+            return Err(not_found(
+                &input.listener_identifier,
+                crate::state::ResourceKind::Listener,
+            ));
+        };
+
+        // An entry naming no rule of this listener cannot be applied, but it does not
+        // refuse the batch: it is reported under `unsuccessful` while its siblings go
+        // through. `targets[i]` holds the rule entry `i` will be written onto.
+        let mut failures: Vec<RuleUpdateFailure> = Vec::new();
+        let mut targets: Vec<Option<String>> = Vec::with_capacity(input.rules.len());
+        for update in &input.rules {
+            // A rule is a resource OF its listener: one stored under a different listener
+            // is not reachable through this one.
+            let target = crate::state::id_from_identifier(
+                &update.rule_identifier,
+                crate::state::PREFIX_RULE,
+            )
+            .filter(|id| {
+                store
+                    .rules
+                    .get(id)
+                    .is_some_and(|rule| rule.listener_id == listener_id)
+            });
+            if target.is_none() {
+                // The entry carries the code and the message the single-rule path refuses
+                // the same identifier with: this service's not-found construction over the
+                // identifier the caller submitted for that entry.
+                failures.push(failure(
+                    &update.rule_identifier,
+                    FAILURE_NOT_FOUND,
+                    crate::state::ResourceKind::Rule.not_found_message(&update.rule_identifier),
+                ));
+            }
+            targets.push(target);
+        }
+
+        // A value a documented service rule refuses is refused for the whole call, the
+        // way the single-rule path refuses the same value: the batch is a batch of
+        // updates, not a channel for storing one the service would not accept.
+        for update in &input.rules {
+            if let Some(violation) = update
+                .action
+                .as_ref()
+                .and_then(|action| crate::state::check_rule_action(action).err())
+            {
+                return Err(BatchUpdateRuleErrorModeled::ValidationException(
+                    crate::state::service_rule_exception(&violation),
+                )
+                .into());
+            }
+        }
+
+        // "Each rule for a specific listener must have a unique priority" (the `priority`
+        // member's own documentation; `RuleUpdate`'s restates it as "A listener can't
+        // have multiple rules with the same priority"), so an entry's priority has to be
+        // one no OTHER rule of the listener holds once the whole batch is applied. A batch
+        // is read as one change, which is what lets two rules exchange their priorities in
+        // a single call ("This can be useful when bulk updating or swapping rule
+        // priority"), while an entry whose priority a rule the batch does not move would
+        // still hold conflicts with that rule's state: the call is refused with the
+        // modelled 409 and stores nothing. Entries are examined in request order and the
+        // first conflict is the one reported.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchUpdateRule"))
+        // SOURCE: recorded AWS behaviour — a batch that exchanges two rules' priorities is
+        // served, and one moving a rule onto a priority another rule keeps is refused with
+        // this conflict over the rule the entry named.
+        let current: std::collections::HashMap<String, i32> = store
+            .rules
+            .values()
+            .filter(|rule| rule.listener_id == listener_id)
+            .map(|rule| (rule.id.clone(), rule.priority))
+            .collect();
+        let mut planned = current.clone();
+        for (index, update) in input.rules.iter().enumerate() {
+            if let (Some(rule_id), Some(priority)) = (&targets[index], update.priority) {
+                planned.insert(rule_id.clone(), priority);
+            }
+        }
+        let mut refused: Option<&String> = None;
+        for (index, update) in input.rules.iter().enumerate() {
+            let (Some(rule_id), Some(priority)) = (&targets[index], update.priority) else {
+                continue;
+            };
+            if planned
+                .iter()
+                .any(|(other, holds)| other != rule_id && *holds == priority)
+            {
+                refused = Some(rule_id);
+                break;
+            }
+        }
+        if let Some(rule_id) = refused {
+            // The conflict is reported over the rule the refused entry named, at the
+            // priority that rule holds — the priority that, as the message puts it,
+            // already exists. SOURCE: recorded AWS behaviour for this refusal.
+            return Err(BatchUpdateRuleErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::ResourceKind::Rule,
+                    rule_id,
+                    crate::state::duplicate_priority_message(
+                        current.get(rule_id).copied().unwrap_or_default(),
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // The applied entries are written onto the stored records, in request order, and
+        // each answer is read back off the record that was just written.
+        let mut successful: Vec<RuleUpdateSuccess> = Vec::new();
+        for (index, update) in input.rules.iter().enumerate() {
+            let Some(rule_id) = targets[index].as_ref() else {
+                continue;
+            };
+            let Some(rule) = store.rules.get_mut(rule_id) else {
+                continue;
+            };
+            let mut changed = false;
+            if let Some(priority) = update.priority {
+                rule.priority = priority;
+                changed = true;
+            }
+            if let Some(r#match) = &update.r#match {
+                rule.r#match = crate::state::normalized_rule_match(r#match);
+                changed = true;
+            }
+            if let Some(action) = &update.action {
+                rule.action = crate::state::normalized_rule_action(action);
+                changed = true;
+            }
+            // An update is an update: a rule this call changed carries this instant as
+            // its `lastUpdatedAt`. An entry that supplies no member changes nothing, so
+            // it leaves the timestamp where it is.
+            if changed {
+                rule.last_updated_at = now;
+            }
+            successful.push(success_of(rule));
+        }
+
+        // Both lists are reported in request order, and both are present: a caller reads
+        // the length of each to tell how the batch went.
+        Ok(BatchUpdateRuleOutput {
+            successful: Some(successful),
+            unsuccessful: Some(failures),
+        })
     }
 }

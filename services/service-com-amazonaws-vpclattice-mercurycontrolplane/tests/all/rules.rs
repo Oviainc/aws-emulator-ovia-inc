@@ -19,7 +19,9 @@
 //!    (`…:service/svc-…/listener/listener-…/rule/rule-…`) built from the request's
 //!    region and the emulator's account; the record is persisted, and `GetRule` by the
 //!    bare id and by the ARN both report exactly what was stored — including the
-//!    `match` it was created with, `isDefault` false and its timestamps.
+//!    `match`, whose HTTP criteria carry `headerMatches` as a present list (the empty
+//!    one when the request configured no header match), `isDefault` false and its
+//!    timestamps.
 //! 2. "Each rule for a specific listener must have a unique priority": a second create
 //!    taking a priority another rule of the SAME listener holds is a 409
 //!    `ConflictException`, while that priority under another listener is fine.
@@ -133,8 +135,12 @@ async fn creating_rules_persists_them_and_both_identifier_forms_read_them_back()
     let (service_id, _) = a_service(&lattice, "rule-host").await;
     let listener_id = a_listener(&lattice, &service_id, "rule-host-listener").await;
 
-    // (case, request body, the action the stored rule must report)
-    let cases: Vec<(&str, serde_json::Value, serde_json::Value)> = vec![
+    // (case, request body, the match the stored rule must report, the action it must
+    // report). A rule's HTTP match is reported with its `headerMatches` present — the
+    // empty list when the request configured no header match — so the match in the
+    // answer is not always the one the request spelled out.
+    type Row = (&'static str, serde_json::Value, serde_json::Value, serde_json::Value);
+    let cases: Vec<Row> = vec![
         (
             "exact path, fixed response 404, lowest priority",
             serde_json::json!({
@@ -146,6 +152,12 @@ async fn creating_rules_persists_them_and_both_identifier_forms_read_them_back()
                     },
                 },
                 "action": { "fixedResponse": { "statusCode": 404 } },
+            }),
+            serde_json::json!({
+                "httpMatch": {
+                    "pathMatch": { "match": { "exact": "/orders" }, "caseSensitive": true },
+                    "headerMatches": [],
+                },
             }),
             serde_json::json!({ "fixedResponse": { "statusCode": 404 } }),
         ),
@@ -164,6 +176,13 @@ async fn creating_rules_persists_them_and_both_identifier_forms_read_them_back()
                     "forward": {
                         "targetGroups": [{ "targetGroupIdentifier": target_group("1") }],
                     },
+                },
+            }),
+            serde_json::json!({
+                "httpMatch": {
+                    "method": "GET",
+                    "pathMatch": { "match": { "prefix": "/api/" } },
+                    "headerMatches": [],
                 },
             }),
             // `weight`'s own documentation: "If there's only one target group
@@ -199,6 +218,16 @@ async fn creating_rules_persists_them_and_both_identifier_forms_read_them_back()
                     },
                 },
             }),
+            // Header matches the request DID configure are reported as sent.
+            serde_json::json!({
+                "httpMatch": {
+                    "headerMatches": [
+                        { "name": "x-version", "match": { "exact": "v2" } },
+                        { "name": "x-tenant", "match": { "prefix": "acme" }, "caseSensitive": false },
+                        { "name": "x-trace", "match": { "contains": "abc" } },
+                    ],
+                },
+            }),
             serde_json::json!({
                 "forward": {
                     "targetGroups": [
@@ -217,6 +246,7 @@ async fn creating_rules_persists_them_and_both_identifier_forms_read_them_back()
                 "action": { "fixedResponse": { "statusCode": 500 } },
                 "tags": { "team": "platform" },
             }),
+            serde_json::json!({ "httpMatch": { "headerMatches": [] } }),
             serde_json::json!({ "fixedResponse": { "statusCode": 500 } }),
         ),
         (
@@ -236,6 +266,9 @@ async fn creating_rules_persists_them_and_both_identifier_forms_read_them_back()
                     },
                 },
             }),
+            serde_json::json!({
+                "httpMatch": { "method": "POST", "headerMatches": [] },
+            }),
             // The documented default covers the single-target-group case only, so an
             // omitted weight beside a sibling stays absent.
             serde_json::json!({
@@ -249,7 +282,7 @@ async fn creating_rules_persists_them_and_both_identifier_forms_read_them_back()
         ),
     ];
 
-    for (case, body, expected_action) in cases {
+    for (case, body, expected_match, expected_action) in cases {
         let created = create_rule(&lattice, &service_id, &listener_id, body.clone()).await;
         assert_eq!(
             created.status, 201,
@@ -279,8 +312,8 @@ async fn creating_rules_persists_them_and_both_identifier_forms_read_them_back()
             body["priority"], created.body
         );
         assert_eq!(
-            created.body["match"], body["match"],
-            "case {case:?}: expected the match it was created with, got {}",
+            created.body["match"], expected_match,
+            "case {case:?}: expected the stored match {expected_match}, got {}",
             created.body
         );
         assert_eq!(
@@ -320,8 +353,8 @@ async fn creating_rules_persists_them_and_both_identifier_forms_read_them_back()
                 body["priority"], read.body
             );
             assert_eq!(
-                read.body["match"], body["match"],
-                "case {case:?} read by {form}: expected the stored match, got {}",
+                read.body["match"], expected_match,
+                "case {case:?} read by {form}: expected the stored match {expected_match}, got {}",
                 read.body
             );
             assert_eq!(
