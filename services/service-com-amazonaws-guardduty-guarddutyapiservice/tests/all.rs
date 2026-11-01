@@ -157,6 +157,8 @@ mod member_creation;
 mod member_deletion;
 #[path = "all/member_detector_configuration.rs"]
 mod member_detector_configuration;
+#[path = "all/member_detector_empty_report.rs"]
+mod member_detector_empty_report;
 #[path = "all/member_detector_organization_managed_switches.rs"]
 mod member_detector_organization_managed_switches;
 #[path = "all/member_invitation.rs"]

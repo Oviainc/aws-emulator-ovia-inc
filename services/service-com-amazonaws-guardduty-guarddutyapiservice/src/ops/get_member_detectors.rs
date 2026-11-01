@@ -8,6 +8,10 @@
 //! the service cannot understand is refused with `BadRequestException`. A pure report:
 //! nothing here writes to the store.
 //!
+//! The two lists PARTITION the distinct accounts the request named, so a request naming
+//! no associated member is answered 200 with `members` present and EMPTY — see the
+//! comment on the answer below.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -202,6 +206,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The two lists PARTITION the distinct accounts the request named: there is a
+        // configuration to report for an account this administrator administers and a
+        // reason to report for every other one, so `configurations` is EMPTY exactly
+        // when the request named no associated member. That empty list is the answer,
+        // not a refusal: these accounts were not PROCESSED, which is what
+        // `UnprocessedAccounts` reports, and the service answers 200 with no
+        // configuration and one unprocessed row per account. The `len 1..50` the model
+        // declares on this output list (`MemberDataSourceConfigurations`, against the
+        // sibling `Members`' `len 0..50`) is a declared constraint on the shape's
+        // values and not a floor the service refuses a request to stay above — and the
+        // alternative, reporting a configuration for an account the administrator does
+        // not administer, would invent data sources the caller then takes for an
+        // inventory.
         Ok(GetMemberDetectorsOutput {
             member_data_source_configurations: configurations,
             unprocessed_accounts: unprocessed,
