@@ -7,7 +7,9 @@
 //! account-and-region-wide scope when it names none — and `DescribeLoggingOptions`
 //! reads that same scope back. Both reach the one stored setting through
 //! `crate::state`'s `logging_options_for` / `set_logging_options`, so neither
-//! keeps a copy of its own.
+//! keeps a copy of its own, and both resolve a named workspace against the
+//! workspace registry first, so the pair cannot disagree about which scopes
+//! exist.
 //!
 //! ## Shape of an operation
 //!
@@ -173,7 +175,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // word on the scope it names and says nothing about any other, so repeating
         // the same put is idempotent. The instant is what bounds the store: see
         // `crate::state::set_logging_options`.
-        state.lock().set_logging_options(
+        let mut store = state.lock();
+
+        // A `workspaceName` the request names is resolved FIRST, as every
+        // workspace-scoped entry point in this crate resolves the workspace before
+        // the setting or resource scoped to it: the workspace registry is the one
+        // place that says which workspaces exist, and the logging scope of a
+        // workspace is forgotten with it, so a scope named for a workspace this
+        // store holds no record of is state nothing could ever reach or clean up. A
+        // request naming no workspace addresses the account-and-region-wide scope,
+        // which belongs to no workspace and so resolves nothing.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            if !store.workspaces.contains_key(workspace) {
+                return Err(not_found(crate::state::RESOURCE_WORKSPACE, workspace));
+            }
+        }
+
+        store.set_logging_options(
             input.workspace_name.as_deref(),
             input.logging_options,
             ::std::time::SystemTime::now(),
@@ -181,6 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(PutLoggingOptionsOutput {})
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` for the resource of `kind` the request
+/// named: the workspace whose logging options were to be set, which this service
+/// holds no record of.
+fn not_found(kind: &str, identifier: &str) -> PutLoggingOptionsError {
+    PutLoggingOptionsError::Modeled(PutLoggingOptionsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(kind, identifier),
+        },
+    ))
 }
 
 /// HTTP 400 `InvalidRequestException` carrying `message`.

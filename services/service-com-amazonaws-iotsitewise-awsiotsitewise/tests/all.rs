@@ -639,6 +639,11 @@ mod list_pipelines;
 mod list_searches;
 #[path = "all/logging_options.rs"]
 mod logging_options;
+// In the sorted list, beside the sibling logging suites rather than appended
+// after it: the END of this file is where every concurrent iotsitewise change
+// appends a declaration of its own.
+#[path = "all/logging_options_workspace_scope.rs"]
+mod logging_options_workspace_scope;
 // In the sorted list, in its alphabetical place beside the other portal suite,
 // rather than appended after the list: the END of this file is where every
 // concurrent iotsitewise change appends a declaration of its own, and each

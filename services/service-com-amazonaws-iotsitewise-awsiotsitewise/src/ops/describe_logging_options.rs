@@ -5,7 +5,9 @@
 //! Reports the logging options of exactly one scope — the workspace the request
 //! names, or the account-and-region-wide scope when it names none — as the last
 //! `PutLoggingOptions` on that scope set them, and `crate::state`'s
-//! `DEFAULT_LOGGING_LEVEL` while nothing has set any. A pure read: nothing is
+//! `DEFAULT_LOGGING_LEVEL` while nothing has set any. A named workspace is
+//! resolved against the workspace registry first, so a scope belonging to no
+//! workspace this service holds reports that absence. A pure read: nothing is
 //! stored for an unconfigured scope.
 //!
 //! ## Shape of an operation
@@ -155,13 +157,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let _ = ctx;
 
+        let store = state.lock();
+
+        // A `workspaceName` the request names is resolved FIRST, as every
+        // workspace-scoped entry point in this crate resolves the workspace before
+        // the setting or resource scoped to it: the workspace registry is the one
+        // place that says which workspaces exist, so a workspace this store holds
+        // no record of has no logging options to report and is the same absence
+        // every other workspace-scoped operation of this service reports. A request
+        // naming no workspace addresses the account-and-region-wide scope, which
+        // belongs to no workspace and so resolves nothing.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            if !store.workspaces.contains_key(workspace) {
+                return Err(not_found(crate::state::RESOURCE_WORKSPACE, workspace));
+            }
+        }
+
         // Whatever the last put on THIS scope stored, or the never-configured
         // default — read through the store, so the answer follows the setting
         // instead of being fabricated here.
-        let logging_options = state
-            .lock()
-            .logging_options_for(input.workspace_name.as_deref());
+        let logging_options = store.logging_options_for(input.workspace_name.as_deref());
 
         Ok(DescribeLoggingOptionsOutput { logging_options })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` for the resource of `kind` the request
+/// named: the workspace whose logging options were asked for, which this service
+/// holds no record of.
+fn not_found(kind: &str, identifier: &str) -> DescribeLoggingOptionsError {
+    DescribeLoggingOptionsError::Modeled(
+        DescribeLoggingOptionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: crate::state::not_found_message(kind, identifier),
+        }),
+    )
 }

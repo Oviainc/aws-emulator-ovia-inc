@@ -11,6 +11,10 @@
 //! store rather than from a value of its own, so the answer follows whatever last
 //! wrote that scope and reading never changes what a later caller sees.
 //!
+//! Every workspace scope these cases address is opened first, so what each one
+//! reports is about the SETTING; the refusal a workspace nobody opened earns is
+//! the sibling `logging_options_workspace_scope` suite's subject.
+//!
 //! Where the sibling `logging_options` suite drives the setting through the two
 //! modelled operations, these cases seed the store DIRECTLY and read it back over
 //! the wire: a handler that answered from anything but the shared store — a
@@ -31,7 +35,7 @@ use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{service_state, DEF
 use service_com_amazonaws_iotsitewise_awsiotsitewise::EmulatedService;
 
 use crate::asset_lifecycle::router_with_engine;
-use crate::logging_options::{describe, put_level, reported_level, scope_label};
+use crate::logging_options::{describe, open_scopes, put_level, reported_level, scope_label};
 
 /// Every scope form, each seeded in the store with a level of its own, reads back
 /// through the describe: the operation reports the stored setting of the scope the
@@ -54,6 +58,15 @@ async fn describe_reports_the_level_the_store_holds_for_the_scope_it_addresses()
         (Some("Plant_1-east"), "ERROR"),
         (Some(&longest_name), "INFO"),
     ];
+    // A workspace scope is reported only for a workspace this service holds, so
+    // the rows addressing one open it first; `not-seeded` below is open too, so
+    // that what it reports is about the SETTING and not about the workspace.
+    let addressed: Vec<Option<&str>> = seeded
+        .iter()
+        .map(|(scope, _)| *scope)
+        .chain([Some("not-seeded")])
+        .collect();
+    open_scopes(&router, &addressed).await;
     for (scope, level) in seeded {
         assert_ne!(
             level, DEFAULT_LOGGING_LEVEL,
@@ -116,6 +129,7 @@ async fn describe_follows_the_last_write_to_the_scope() {
     // Source: `smithy_query(query="shape", shape="LoggingLevel")`, whose values are
     // ["ERROR", "INFO", "OFF"] — the generated table this iterates is pinned
     // against that list by the sibling `logging_options` suite.
+    open_scopes(&router, &[Some("rewritten")]).await;
     for scope in [None, Some("rewritten")] {
         for level in LOGGING_LEVEL_VALUES {
             state.lock().set_logging_options(
@@ -153,6 +167,7 @@ async fn describing_a_scope_stores_nothing_for_it() {
     let state = service_state(&*engine).expect("the iotsitewise store");
 
     let scopes: [Option<&str>; 4] = [None, Some("one"), Some("two"), Some("three")];
+    open_scopes(&router, &scopes).await;
     let empty = state.lock().logging_options.len();
     assert_eq!(
         empty, 0,
@@ -251,6 +266,9 @@ async fn a_second_service_on_the_same_engine_reports_the_same_setting() {
         (Some("shared"), "ERROR"),
         (Some("shared-too"), "OFF"),
     ];
+    // Opened through the first service, on the engine both share.
+    let addressed: Vec<Option<&str>> = cases.iter().map(|(scope, _)| *scope).collect();
+    open_scopes(&writer, &addressed).await;
 
     for (scope, level) in cases {
         let (status, response) = put_level(&writer, scope, level).await;

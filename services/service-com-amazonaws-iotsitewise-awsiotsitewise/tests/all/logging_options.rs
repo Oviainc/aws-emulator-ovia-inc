@@ -10,15 +10,25 @@
 //! describe of that scope reports exactly what the last put stored, a scope no
 //! put has named reports the disabled level, and a level outside the modelled
 //! `LoggingLevel` set is refused rather than stored.
+//!
+//! A workspace scope belongs to a workspace this service holds, so every case
+//! addressing one opens it first ([`open_scopes`]); that the scope of a workspace
+//! nobody opened is refused instead is the sibling
+//! `logging_options_workspace_scope` suite's subject.
+
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_iotsitewise_awsiotsitewise::ops::types::LOGGING_LEVEL_VALUES;
+use service_com_amazonaws_iotsitewise_awsiotsitewise::ops::types::{
+    LoggingOptions, LOGGING_LEVEL_VALUES,
+};
 use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{
     service_state, DEFAULT_LOGGING_LEVEL, MAX_LOGGING_SCOPES,
 };
 
 use crate::asset_lifecycle::{call, error_code, router, router_with_engine};
+use crate::support::ensure_workspace;
 
 /// Every value the modelled `LoggingLevel` enum accepts, written out here as an
 /// oracle independent of the crate under test.
@@ -67,6 +77,22 @@ pub(crate) fn reported_level(body: &Value) -> &str {
     body["loggingOptions"]["level"].as_str().unwrap_or("")
 }
 
+/// Open the workspace behind every scope in `scopes`, leaving the account-wide
+/// scope (`None`) alone: it belongs to no workspace.
+///
+/// Both logging operations resolve a `workspaceName` they carry through the
+/// workspace registry before the setting scoped to it, so a case that means to
+/// exercise the SETTING opens the workspaces it addresses first. `pub(crate)` for
+/// the reason the helpers above are: the sibling suites address the same scopes.
+pub(crate) async fn open_scopes(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    scopes: &[Option<&str>],
+) {
+    for name in scopes.iter().flatten() {
+        ensure_workspace(router, name).await;
+    }
+}
+
 /// The scope a case addresses, spelled as it reads in a case label.
 pub(crate) fn scope_label(workspace: Option<&str>) -> String {
     match workspace {
@@ -103,6 +129,7 @@ async fn every_modelled_level_reads_back_on_every_scope() {
     // the punctuation its pattern allows, and the 64-character maximum).
     let long_name = "w".repeat(64);
     let scopes: [Option<&str>; 4] = [None, Some("a"), Some("Plant_1-east"), Some(&long_name)];
+    open_scopes(&router, &scopes).await;
 
     for scope in scopes {
         for level in MODELLED_LEVELS {
@@ -138,6 +165,7 @@ async fn an_unconfigured_scope_reports_the_disabled_level_and_stays_that_way() {
     let router = router();
 
     let scopes: [Option<&str>; 3] = [None, Some("never-set"), Some("other")];
+    open_scopes(&router, &scopes).await;
     for scope in scopes {
         for attempt in 1..=2 {
             let (status, body) = describe(&router, scope).await;
@@ -187,6 +215,9 @@ async fn each_scope_keeps_its_own_options() {
         (Some("plant-c"), "INFO"),
     ];
 
+    let addressed: Vec<Option<&str>> = assignments.iter().map(|(scope, _)| *scope).collect();
+    open_scopes(&router, &addressed).await;
+
     for (scope, level) in assignments {
         let (status, body) = put_level(&router, scope, level).await;
         assert_eq!(
@@ -233,6 +264,7 @@ async fn each_scope_keeps_its_own_options() {
 #[tokio::test]
 async fn repeating_a_put_changes_nothing() {
     let router = router();
+    open_scopes(&router, &[Some("repeated")]).await;
 
     for level in MODELLED_LEVELS {
         for attempt in 1..=3 {
@@ -327,72 +359,91 @@ async fn a_workspace_name_outside_the_modelled_form_is_refused() {
     );
 }
 
-/// The store of scopes is bounded: puts naming ever-fresh workspaces never grow
-/// it past `MAX_LOGGING_SCOPES`, an evicted scope reverts to the disabled level
-/// (what it reported before anything set it), and the account-and-region-wide
-/// scope — exempt from the eviction — keeps its options throughout.
+/// The store of scopes is bounded: it never grows past `MAX_LOGGING_SCOPES`, an
+/// evicted scope reverts to the disabled level (what it reported before anything
+/// set it), and the account-and-region-wide scope — exempt from the eviction —
+/// keeps its options throughout.
+///
+/// The scopes the wire can address belong to workspaces this service holds, and
+/// the registry holds fewer of them than the bound, so the overflow is driven
+/// against the store that carries the bound: the fillers below are stamped
+/// strictly LATER than the puts above, which makes the put-configured scopes the
+/// least recently set ones and so the first the eviction drops.
 #[tokio::test]
 async fn the_scope_store_is_bounded_and_keeps_the_newest_scopes() {
     let (router, engine) = router_with_engine();
+    let state = service_state(&*engine).expect("the iotsitewise store");
+
+    let configured: [&str; 3] = ["oldest", "middle", "newest"];
+    let scopes: Vec<Option<&str>> = configured.iter().map(|name| Some(*name)).collect();
+    open_scopes(&router, &scopes).await;
 
     let (status, body) = put_level(&router, None, "INFO").await;
     assert_eq!(status, 200, "seed the account-wide scope: {status} {body}");
-
-    // One more workspace scope than the store keeps, so the eviction has to run.
-    let overflow = MAX_LOGGING_SCOPES + 1;
-    for index in 0..overflow {
-        let (status, body) = put_level(&router, Some(&format!("w{index}")), "ERROR").await;
+    for name in configured {
+        let (status, body) = put_level(&router, Some(name), "ERROR").await;
         assert_eq!(
             status, 200,
-            "put ERROR on workspace w{index}: got {status} {body}"
+            "put ERROR on workspace {name}: got {status} {body}"
         );
     }
 
-    let held = service_state(&*engine)
-        .expect("the iotsitewise store")
-        .lock()
-        .logging_options
-        .len();
+    // One more scope than the store keeps, so the eviction has to run.
+    let later = SystemTime::now() + Duration::from_secs(60);
+    {
+        let mut store = state.lock();
+        for index in 0..MAX_LOGGING_SCOPES {
+            store.set_logging_options(
+                Some(&format!("filler{index}")),
+                LoggingOptions {
+                    level: "OFF".to_string(),
+                },
+                later + Duration::from_secs(index as u64),
+            );
+        }
+    }
+
+    let held = state.lock().logging_options.len();
     assert!(
         held <= MAX_LOGGING_SCOPES,
-        "after {overflow} workspace puts the store holds {held} scopes, past the \
-         {MAX_LOGGING_SCOPES} bound"
+        "after {MAX_LOGGING_SCOPES} scopes were set past the bound the store holds {held} \
+         scopes, past the {MAX_LOGGING_SCOPES} bound"
     );
 
     // The scope set last is still there, and the account-wide one was never a
     // candidate for eviction.
-    let newest = format!("w{}", overflow - 1);
-    let (_, body) = describe(&router, Some(&newest)).await;
+    let newest_filler = format!("filler{}", MAX_LOGGING_SCOPES - 1);
+    let surviving = state
+        .lock()
+        .logging_options
+        .get(&newest_filler)
+        .map(|record| record.options.level.clone());
     assert_eq!(
-        reported_level(&body),
-        "ERROR",
-        "the most recently set scope {newest} after the eviction: got {body}"
+        surviving.as_deref(),
+        Some("OFF"),
+        "the most recently set scope {newest_filler} after the eviction: got {surviving:?}"
     );
     let (_, body) = describe(&router, None).await;
     assert_eq!(
         reported_level(&body),
         "INFO",
-        "the account-wide scope after {overflow} workspace puts: got {body}"
+        "the account-wide scope after the store was filled past its bound: got {body}"
     );
 
-    // Every scope the store dropped answers as an unconfigured one again, and the
-    // overflow guarantees at least one was dropped.
-    let mut evicted = 0;
-    for index in 0..overflow {
-        let (_, body) = describe(&router, Some(&format!("w{index}"))).await;
-        let level = reported_level(&body);
-        assert!(
-            level == "ERROR" || level == DEFAULT_LOGGING_LEVEL,
-            "workspace w{index} reports {level}, which is neither the level it was set \
-             to nor the unconfigured default"
+    // Every scope the store dropped answers as an unconfigured one again — the
+    // three set first, which the fillers' later instants put at the front of the
+    // eviction order.
+    for name in configured {
+        let (status, body) = describe(&router, Some(name)).await;
+        assert_eq!(
+            status, 200,
+            "describe the evicted workspace {name}: got {status} {body}"
         );
-        if level == DEFAULT_LOGGING_LEVEL {
-            evicted += 1;
-        }
+        assert_eq!(
+            reported_level(&body),
+            DEFAULT_LOGGING_LEVEL,
+            "the evicted workspace scope {name} must report the unconfigured default \
+             {DEFAULT_LOGGING_LEVEL} again: got {body}"
+        );
     }
-    assert!(
-        evicted >= overflow - MAX_LOGGING_SCOPES,
-        "{overflow} workspace puts past a {MAX_LOGGING_SCOPES} bound dropped only \
-         {evicted} scopes"
-    );
 }
