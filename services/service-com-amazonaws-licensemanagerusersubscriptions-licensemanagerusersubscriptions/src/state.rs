@@ -3048,9 +3048,9 @@ pub fn paginate<T: Clone>(
 /// resumes at.
 ///
 /// Hex is an encoding, not a secret — a client can decode one. What makes a cursor
-/// trustworthy here is the `kind` check in [`decode_page_token`]: a token is only honoured
-/// by the list that minted it, so a forged or stale one is refused rather than applied to
-/// a different list.
+/// trustworthy here is that [`decode_page_token`] honours only a token this function
+/// minted for the same list, so a forged or stale one is refused rather than applied to a
+/// different list or to a position no page handed out.
 fn encode_page_token(kind: &str, offset: usize) -> String {
     ::hex::encode(format!("{kind}:{offset}"))
 }
@@ -3058,6 +3058,15 @@ fn encode_page_token(kind: &str, offset: usize) -> String {
 /// Decode a cursor minted by [`encode_page_token`] for the same list.
 ///
 /// The offset is split off the END, so a list identity may itself contain `:`.
+///
+/// A token is honoured only when it is, byte for byte, one [`encode_page_token`] mints for
+/// this list — the decoder accepts exactly the spellings the minter writes and no others.
+/// That matters because both layers it reads through are wider than the minter: `hex`
+/// decodes upper- and mixed-case digits, and `usize`'s `FromStr` accepts a leading `+` and
+/// any number of leading zeros, so a decode that stopped at "it parsed" would serve a page
+/// for a cursor no page of any list ever handed out. Re-minting the cursor from what was
+/// decoded and comparing it with what arrived is what rejects every such spelling at once,
+/// without this function having to enumerate them.
 fn decode_page_token(kind: &str, token: &str) -> Result<usize, StateError> {
     let invalid = || StateError::Validation("NextToken is not a valid pagination token".to_string());
     let decoded = ::hex::decode(token).map_err(|_| invalid())?;
@@ -3066,7 +3075,11 @@ fn decode_page_token(kind: &str, token: &str) -> Result<usize, StateError> {
     if token_kind != kind {
         return Err(invalid());
     }
-    offset.parse::<usize>().map_err(|_| invalid())
+    let offset = offset.parse::<usize>().map_err(|_| invalid())?;
+    if encode_page_token(kind, offset) != token {
+        return Err(invalid());
+    }
+    Ok(offset)
 }
 
 /// A deterministic rendering of a filter set, for the list identity a pagination cursor

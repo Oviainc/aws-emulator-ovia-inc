@@ -55,6 +55,8 @@ mod license_servers_behind_an_endpoint;
 mod list_instances;
 #[path = "all/optional_settings_registration.rs"]
 mod optional_settings_registration;
+#[path = "all/page_tokens_are_only_what_the_minter_writes.rs"]
+mod page_tokens_are_only_what_the_minter_writes;
 #[path = "all/pending_transition_comes_with_the_record.rs"]
 mod pending_transition_comes_with_the_record;
 #[path = "all/product_subscription_teardown.rs"]
