@@ -48,7 +48,7 @@ use crate::identity_provider_subscriptions::{
 
 /// A SECOND VPC of the same account, with one subnet and one security group of its own:
 /// resources that exist, and that still cannot be mixed with another VPC's.
-const OTHER_VPC: &str = "vpc-aaaabbbbccccdddd0";
+pub(crate) const OTHER_VPC: &str = "vpc-aaaabbbbccccdddd0";
 pub(crate) const OTHER_VPC_SUBNET: &str = "subnet-bbbbbbbbbbbbbbbbb";
 pub(crate) const OTHER_VPC_SECURITY_GROUP: &str = "sg-bbbbbbbb";
 

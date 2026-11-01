@@ -22,10 +22,13 @@
 //!
 //! The table below drives the WRITE STEP (`update_live_settings`, the one the handler runs
 //! after its hop) with another update already accepted over the wire in between, which is
-//! exactly the window the hop opens. Its rows differ along what the rule generalises over:
-//! which member the update in flight names, which member the accepted update changed, and
-//! whether folding onto the moved-on value still has a result at all. The contention test
-//! then drives two whole operations over the wire in parallel, where the window is real.
+//! exactly the window the hop opens, and with the settings held then as the base the
+//! resolution was made against — the base each of the handler's attempts re-reads. Its rows
+//! differ along what the rule generalises over: which member the update in flight names,
+//! which member the accepted update changed, and whether folding onto the moved-on value
+//! still has a result at all. The contention test then drives two whole operations over the
+//! wire in parallel, where the window is real. That a write whose base moved stores nothing
+//! at all is the sibling `settings_write_stores_what_resolved` suite's rule.
 //!
 //! Every wire call goes through the router's `dispatch`, so each request is deserialized,
 //! constraint-checked, handled and serialized exactly as a client's would be.
@@ -34,8 +37,9 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubscriptions::ops::types::Settings;
 use service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubscriptions::state::{
-    StateError, IDENTITY_PROVIDER_NOT_VALID,
+    SettingsWrite, StateError, IDENTITY_PROVIDER_NOT_VALID,
 };
 use service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubscriptions::ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState as ServiceState;
 
@@ -93,6 +97,19 @@ async fn registered(h: &Harness, product: &str, case: &str) -> String {
     .to_string()
 }
 
+/// The `Settings` the store holds for the registration `arn` names — the base the write
+/// step is given, which is the one the handler's resolution is made against.
+pub(crate) fn held_settings(h: &Harness, arn: &str, case: &str) -> Settings {
+    let store = h.engine.state::<ServiceState>();
+    let store = store.lock();
+    store
+        .identity_providers
+        .get(arn)
+        .unwrap_or_else(|| panic!("case {case:?}: the store holds no registration {arn}"))
+        .settings
+        .clone()
+}
+
 /// The settings the store holds for the registration `arn` names, as the comparison pair.
 fn stored_settings(h: &Harness, arn: &str, case: &str) -> (Vec<String>, String) {
     let store = h.engine.state::<ServiceState>();
@@ -109,7 +126,7 @@ fn stored_settings(h: &Harness, arn: &str, case: &str) -> (Vec<String>, String) 
 
 /// The settings `ListIdentityProviders` REPORTS for the registration `arn` names, as the
 /// comparison pair — the read-back every accepted write is proved through.
-async fn listed_settings(h: &Harness, arn: &str, case: &str) -> (Vec<String>, String) {
+pub(crate) async fn listed_settings(h: &Harness, arn: &str, case: &str) -> (Vec<String>, String) {
     let listed = list_providers(h, &json!({})).await;
     let body = listed.ok(case);
     let summary = body["IdentityProviderSummaries"]
@@ -322,11 +339,13 @@ async fn an_update_is_folded_onto_the_settings_held_when_it_writes() {
 
         // The write step of the update in flight, which is where the handler lands once its
         // resolution answers.
+        let base = held_settings(&h, &arn, row.case);
         let result = {
             let store = h.engine.state::<ServiceState>();
             let mut store = store.lock();
             store.update_live_settings(
                 &arn,
+                &base,
                 &owned(row.in_flight.add_subnets),
                 &owned(row.in_flight.remove_subnets),
                 row.in_flight.security_group_id,
@@ -337,9 +356,18 @@ async fn an_update_is_folded_onto_the_settings_held_when_it_writes() {
         match row.expected {
             WriteTime::Stored(subnets, security_group_id) => {
                 let expected = pair(subnets, security_group_id);
-                let summary = result.unwrap_or_else(|error| {
+                let written = result.unwrap_or_else(|error| {
                     panic!("case {:?}: expected the write to store {expected:?}, it was refused with {error:?}", row.case)
                 });
+                let summary = match written {
+                    SettingsWrite::Stored(summary) => *summary,
+                    SettingsWrite::Moved(held) => panic!(
+                        "case {:?}: expected the write to store {expected:?} onto the base it \
+                         was resolved against, it reported the settings moved to {:?}",
+                        row.case,
+                        (held.subnets, held.security_group_id)
+                    ),
+                };
                 let answered = (
                     summary.settings.subnets.clone(),
                     summary.settings.security_group_id.clone(),
@@ -412,6 +440,9 @@ async fn an_update_does_not_write_a_registration_that_is_being_torn_down() {
         "case {case:?}: the deregistration answers the non-terminal status it tears down in"
     );
     let before = stored_settings(&h, &arn, case);
+    // The base the resolution was made against: unchanged here, so the refusal below is the
+    // liveness rule's and nothing else.
+    let base = held_settings(&h, &arn, case);
 
     // The write step the handler reaches once its resolution answers: refused, and nothing
     // of the payload is stored on the registration being torn down.
@@ -426,6 +457,7 @@ async fn an_update_does_not_write_a_registration_that_is_being_torn_down() {
         let error = store
             .update_live_settings(
                 &arn,
+                &base,
                 &owned(payload.add_subnets),
                 &owned(payload.remove_subnets),
                 payload.security_group_id,
@@ -459,7 +491,7 @@ async fn an_update_does_not_write_a_registration_that_is_being_torn_down() {
 
 /// A second handle on the SAME emulator: the router and the engine behind it are shared, so
 /// two tasks driving two handles are two clients of one emulator rather than two emulators.
-fn handle(h: &Harness) -> Harness {
+pub(crate) fn handle(h: &Harness) -> Harness {
     Harness {
         router: h.router.clone(),
         engine: Arc::clone(&h.engine),

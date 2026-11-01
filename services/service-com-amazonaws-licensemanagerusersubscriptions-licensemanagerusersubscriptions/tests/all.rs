@@ -73,6 +73,8 @@ mod resource_resolution_refusals;
 mod settings_network_resolution;
 #[path = "all/settings_update_writes_at_write_time.rs"]
 mod settings_update_writes_at_write_time;
+#[path = "all/settings_write_stores_what_resolved.rs"]
+mod settings_write_stores_what_resolved;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/subscription_product_names_the_subscription.rs"]

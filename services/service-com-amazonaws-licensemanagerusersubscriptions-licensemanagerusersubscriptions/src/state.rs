@@ -510,6 +510,31 @@ pub struct IdentityProviderRecord {
     pub deregistered_due_at: Option<SystemTime>,
 }
 
+/// What a settings write came to under the lock that writes
+/// ([`ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::update_live_settings`]).
+#[derive(Debug, Clone)]
+pub enum SettingsWrite {
+    /// Stored: the settings the write landed on are the settings its resolution was made
+    /// against, so the value now in the store is the value that resolved. The summary is
+    /// the record as the write left it, boxed so this value is not the size of a whole
+    /// summary whichever way the write went.
+    Stored(Box<IdentityProviderSummary>),
+    /// NOT stored: the registration's settings moved after they were read for the
+    /// resolution, so folding the payload onto them would store a configuration nothing
+    /// resolved. These are the settings the store holds now — the base a fresh resolution
+    /// has to be made against.
+    Moved(Settings),
+}
+
+/// Whether two `Settings` are the same configuration: the same subnets in the same order,
+/// and the same security group.
+///
+/// `Settings` is a wire shape with no equality of its own, and its two members are all the
+/// configuration a registration carries.
+fn same_settings(one: &Settings, other: &Settings) -> bool {
+    one.subnets == other.subnets && one.security_group_id == other.security_group_id
+}
+
 /// An EC2 instance that provides user-based subscriptions.
 ///
 /// An instance is not created by an API of this service: it enters the service's view
@@ -2108,14 +2133,15 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     }
 
     /// Fold an `UpdateSettings` payload onto the settings the registration `arn` holds AT
-    /// THIS MOMENT, store the result, and answer the summary of the record as the write
-    /// left it.
+    /// THIS MOMENT, store the result and answer the summary of the record as the write left
+    /// it — but ONLY while the settings held now are `resolved_from`, the ones the caller's
+    /// network resolution was made against.
     ///
     /// The WRITE half of `UpdateIdentityProviderSettings`, which runs after that operation
     /// has resolved the network its payload would store against the account's own Amazon
     /// EC2 — a hop, so the lock the write takes is not the lock the read before it was
-    /// taken under, and the store can have moved in between. BOTH decisions a write makes
-    /// therefore happen here, under the one lock that writes:
+    /// taken under, and the store can have moved in between. All three decisions a write
+    /// makes therefore happen here, under the one lock that writes:
     ///
     /// * the registration is resolved by this store's single liveness rule
     ///   ([`live_identity_provider_mut`](Self::live_identity_provider_mut), the writing form
@@ -2123,13 +2149,20 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     ///   applied to a registration whose deregistration was accepted while the resolution
     ///   was in flight — a reference that stopped resolving is refused exactly as one that
     ///   never resolved, which is what every operation acting on a registration does;
+    /// * the settings held now are compared with the ones the resolution was made against,
+    ///   and a write whose base MOVED stores nothing and answers
+    ///   [`SettingsWrite::Moved`] carrying the settings held now, because the value it would
+    ///   store composes the payload with settings no resolution of this request ever saw —
+    ///   the caller resolves that base and comes back;
     /// * the payload is folded onto the settings the record carries NOW rather than onto a
     ///   snapshot read earlier ([`apply_update_settings`]), so an update accepted in between
     ///   is something this one adds to instead of something it overwrites.
     ///
-    /// The fold is of the PAYLOAD's own ids, which the resolution covered; what it folds
-    /// them onto is settings some accepted write already resolved, so the configuration
-    /// stored here is one the account's network carries.
+    /// Together, the value stored is exactly the value the resolution covered: the whole
+    /// configuration — the payload's ids AND the ones already held — was resolved against
+    /// the account's network, so no accepted write leaves a registration carrying a
+    /// configuration that resolution would refuse (subnets of two VPCs, or a security group
+    /// of neither).
     ///
     /// `Err(StateError::ProviderNotRegistered)` when `arn` names no live registration, and
     /// the payload's own refusals when the fold against the current settings has no result
@@ -2137,13 +2170,17 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     pub fn update_live_settings(
         &mut self,
         arn: &str,
+        resolved_from: &Settings,
         add_subnets: &[String],
         remove_subnets: &[String],
         security_group_id: Option<&str>,
-    ) -> Result<IdentityProviderSummary, StateError> {
+    ) -> Result<SettingsWrite, StateError> {
         let record = self
             .live_identity_provider_mut(arn)
             .ok_or(StateError::ProviderNotRegistered)?;
+        if !same_settings(&record.settings, resolved_from) {
+            return Ok(SettingsWrite::Moved(record.settings.clone()));
+        }
         // The fold reads the settings the record carries and yields the whole value to
         // store, so the registration resolved above is the one written: there is no second
         // lookup to disagree with it.
@@ -2154,7 +2191,9 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             security_group_id,
         )?;
         record.settings = updated;
-        Ok(identity_provider_summary(record))
+        Ok(SettingsWrite::Stored(Box::new(identity_provider_summary(
+            record,
+        ))))
     }
 
     /// The `ProductUserArn` of the subscription a request addresses by the members that
