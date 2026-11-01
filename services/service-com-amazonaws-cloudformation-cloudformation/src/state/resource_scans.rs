@@ -527,6 +527,23 @@ impl StoredResourceScan {
         !self.is_in_flight()
     }
 
+    /// The scan's count of listed resources BROKEN DOWN BY TYPE: how many of the rows it
+    /// listed each distinct resource type among them accounts for.
+    ///
+    /// The same rows [`Self::resources_scanned`] counts and [`Self::resource_types`] takes
+    /// the distinct types of, grouped instead of totalled — so the breakdown and the two
+    /// totals cannot disagree about one scan — keyed by type name, which orders it the way
+    /// the type list is ordered and makes the read deterministic.
+    pub fn resources_scanned_by_type(&self) -> BTreeMap<&str, usize> {
+        let mut by_type: BTreeMap<&str, usize> = BTreeMap::new();
+        for resource in &self.resources {
+            *by_type
+                .entry(resource.resource_type.as_str())
+                .or_insert(0) += 1;
+        }
+        by_type
+    }
+
     /// Whether the types the scan found are readable: "resource types are only available for
     /// scans with a `Status` set to `COMPLETE` or `FAILED`", which leaves out a scan still
     /// running and one whose results have expired.

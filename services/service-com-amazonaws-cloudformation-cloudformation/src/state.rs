@@ -6230,6 +6230,23 @@ pub fn new_identifier_digits(seed: &str, digits: usize) -> String {
     digest[..digits.min(digest.len())].to_string()
 }
 
+/// The lowercase-hexadecimal digest of `value`, as `digits` characters: the STABLE
+/// identifier of something whose identity IS that value, where [`new_identifier_digits`]
+/// mints a fresh one on every call.
+///
+/// Same digest, same shape, same `sha2`/`hex` dependencies — only the input differs: nothing
+/// per-call goes into it, so the same value answers the same identifier in every Region, on
+/// every read and across restarts. It is an identifier, never a secret.
+///
+/// Never more than the digest's own 64 characters, so a caller cannot ask for digits nothing
+/// computed.
+pub fn stable_identifier_digits(value: &str, digits: usize) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    let digest = ::hex::encode(Sha256::digest(value.as_bytes()));
+    digest[..digits.min(digest.len())].to_string()
+}
+
 /// Mint a stack id: `arn:aws:cloudformation:<region>:<account>:stack/<name>/<uuid>`,
 /// the form CloudFormation gives a stack. The account segment comes from the
 /// emulator-wide [`::emulator_server::emulator_arn`] helper.

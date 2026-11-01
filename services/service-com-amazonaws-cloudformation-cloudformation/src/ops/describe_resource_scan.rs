@@ -12,6 +12,15 @@
 //! the resource types "only available for scans with a `Status` set to `COMPLETE` or
 //! `FAILED`", so a scan still running reports its progress rather than partial results.
 //!
+//! NOTE ON THE MODEL: `ResourceTypeSummaries` (a list of `ResourceTypeSummary`, each carrying
+//! the `ResourceType` it counts and how many resources of that type the scan listed) was ADDED
+//! to `DescribeResourceScanOutput` in this service's `smithy-model/` copy, along with those two
+//! shapes. The shipped model declares no such member while AWS answers this read with the
+//! element present — empty while the scan has no per-type result to report — as the recorded
+//! wire responses for this operation show, on the read of a scan in flight and on the read of
+//! the same scan once it concluded. The emulator serialises what AWS puts on the wire, so the
+//! member is modelled here; nothing else in the shipped model was changed for it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -67,6 +76,8 @@
 //!   An example is
 //!   arn:aws:cloudformation:us-east-1:123456789012:resourceScan/f5b490f7-7ed4-428a-aa06-31ff25db0772
 //!   .
+//! * `ResourceTypeSummaries` (ResourceTypeSummaries) — The resource types the scan read, one
+//!   summary per type, with how many resources of that type it listed.
 //! * `ResourceTypes` (ResourceTypes) — The list of resource types for the specified scan.
 //!   Resource types are only available for scans with a Status set to COMPLETE or FAILED .
 //! * `ResourcesRead` (ResourcesRead) — The number of resources that were read. This is only
@@ -195,6 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         let counts = scan.counts_are_available();
+        let types_are_available = scan.types_are_available();
         Ok(DescribeResourceScanOutput {
             resource_scan_id: Some(scan.resource_scan_id.clone()),
             status: Some(scan.status.clone()),
@@ -208,7 +220,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // member is PRESENT, as an empty element, for a scan whose status admits it and
             // whose rows carry no type, and absent only while the status withholds it. A
             // client iterating the list sees the same shape either way.
-            resource_types: scan.types_are_available().then(|| scan.resource_types()),
+            resource_types: types_are_available.then(|| scan.resource_types()),
+            // The per-resource-type breakdown of the same rows `ResourceTypes` reports the
+            // distinct types of and `ResourcesScanned` totals: one summary per type, with how
+            // many of the scan's listed resources that type accounts for. The element is
+            // PRESENT whatever the scan's status — empty for a scan with no per-type result to
+            // report, which is every scan whose status withholds the types and every scan that
+            // listed nothing — so a client iterating the breakdown sees the same shape
+            // throughout the scan's life.
+            resource_type_summaries: Some(if types_are_available {
+                scan.resources_scanned_by_type()
+                    .into_iter()
+                    .map(|(resource_type, scanned)| ResourceTypeSummary {
+                        resource_type: Some(resource_type.to_string()),
+                        // The store holds far fewer resources than `i32::MAX`, as the total
+                        // count below does.
+                        resources_scanned: Some(i32::try_from(scanned).unwrap_or(i32::MAX)),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }),
             resources_scanned: counts
                 // The store holds far fewer resources than `i32::MAX`
                 // (`crate::state::MAX_CONCURRENT_RESOURCES` bounds them), so the saturating

@@ -13,7 +13,10 @@
 //! ([`crate::state::ComAmazonawsCloudformationCloudformationState::extensions_in`]) and
 //! the public extensions Amazon Web Services publishes, which are in every account's
 //! registry without anybody registering them
-//! ([`crate::state::registry::aws_published_all`]) — and nothing is invented: a request
+//! ([`crate::state::registry::aws_published_all`]: the resource types it provides and the
+//! extensions it has PUBLISHED, which are Hooks as well as resource types, so the public
+//! catalogue is no more one KIND of extension than the private one is) — and nothing is
+//! invented: a request
 //! that matches no record answers an empty list rather than a fabricated one.
 //!
 //! A record is reported at its DEFAULT version, since the request names none: that is the
@@ -250,7 +253,10 @@ fn in_category(extension: &StoredExtension, category: &str) -> bool {
 ///
 /// `publisher` is the publisher registration behind the record's `PublisherId`, where this
 /// store holds one: the identity a publisher was verified by is a property of that
-/// registration rather than of the extension.
+/// registration rather than of the extension. A record this registry PUBLISHES carries the
+/// id of a publisher no call registered, so the publisher behind it is read back from the
+/// registry's own catalogue of publishers ([`registry::published_publisher`]) — one rule,
+/// two places a publisher record can live.
 fn type_summary(
     extension: &StoredExtension,
     version: &StoredTypeVersion,
@@ -258,7 +264,10 @@ fn type_summary(
 ) -> TypeSummary {
     let private = extension.is_private();
     let third_party = extension.is_public_third_party();
-    let activated = extension.is_activated == Some(true);
+    let catalogued = extension
+        .publisher_id
+        .as_deref()
+        .and_then(registry::published_publisher);
     TypeSummary {
         r#type: Some(extension.type_kind.clone()),
         // For an extension activated under an alias this is the alias, which is what the
@@ -277,8 +286,12 @@ fn type_summary(
         // "When the specified extension version was registered. This applies only to:
         // private extensions you have registered in your account; public extensions you
         // have activated in your account with auto-update specified. For all other
-        // extension types, CloudFormation returns null."
-        last_updated: (private || extension.auto_update == Some(true))
+        // extension types, CloudFormation returns null." A record a PUBLISHER published is
+        // reported with that instant too, whether or not this account activated it: the
+        // recorded public listing carries `LastUpdated` on a public Hook whose
+        // `IsActivated` is false, so a record with a publisher behind it reports when the
+        // version it is held at entered the registry.
+        last_updated: (private || extension.auto_update == Some(true) || third_party)
             .then_some(version.last_updated)
             .flatten()
             .map(crate::state::timestamp),
@@ -289,14 +302,24 @@ fn type_summary(
             .then(|| extension.publisher_id.clone())
             .flatten(),
         // "The type of account used as the identity provider when registering this
-        // publisher with CloudFormation", which the publisher's own registration is what
-        // carries; the publisher NAME is not part of that registration, so it stays absent
-        // rather than invented.
+        // publisher with CloudFormation", which the publisher's own record is what carries:
+        // the registration this account wrote, or the catalogue's record of the publisher
+        // whose extensions this registry publishes.
         publisher_identity: third_party
-            .then(|| publisher.and_then(|publisher| publisher.identity_provider()))
+            .then(|| {
+                publisher
+                    .and_then(|publisher| publisher.identity_provider())
+                    .or(catalogued.map(|catalogued| catalogued.identity_provider))
+            })
             .flatten()
             .map(str::to_string),
-        publisher_name: None,
+        // "The publisher name, as defined in the public profile for that publisher in the
+        // service used to verify the publisher identity": part of the publisher's record
+        // too, which a `RegisterPublisher` registration does not carry and the catalogue
+        // does.
+        publisher_name: third_party
+            .then(|| catalogued.map(|catalogued| catalogued.publisher_name.to_string()))
+            .flatten(),
         // "For public extensions that have been activated for this account and Region, the
         // type name of the public extension."
         original_type_name: (!private)
@@ -309,9 +332,13 @@ fn type_summary(
             .then(|| version.public_version_number.clone())
             .flatten(),
         // "For public extensions that have been activated for this account and Region, the
-        // latest version of the public extension that is available. For any extensions
-        // other than activated third-party extensions, CloudFormation returns null."
-        latest_public_version: (third_party && activated)
+        // latest version of the public extension that is available." Reported for a public
+        // third-party record whether or not this account activated it, for the same reason
+        // `LastUpdated` is: the recorded public listing carries `LatestPublicVersion` on a
+        // public Hook whose `IsActivated` is false. A public record with no publisher
+        // behind it was published by nobody, so it has no latest published version to
+        // report.
+        latest_public_version: third_party
             .then(|| extension.latest_public_version.clone())
             .flatten(),
         // "Whether the extension is activated for this account and Region. This applies

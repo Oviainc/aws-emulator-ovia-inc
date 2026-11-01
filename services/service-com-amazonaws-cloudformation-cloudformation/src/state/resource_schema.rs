@@ -39,6 +39,9 @@
 //!   and nothing here tells the two apart;
 //! * no `primaryIdentifier`, because which PROPERTY holds the physical id `Ref` returns
 //!   is not something the return-value catalogue records;
+//! * no `handlers`, because what a handler of one of these types requires — the permissions
+//!   [`schema_handler_permissions`] reads back out of a schema that declares them — is not
+//!   something the return-value catalogue records either;
 //! * no `description`, which is prose about the type that this emulator holds nowhere —
 //!   the same reason the record's own `Description` member stays absent.
 //!
@@ -83,6 +86,47 @@ fn document(type_name: &str, published: &[&str]) -> Value {
         document.insert("sourceUrl".to_string(), Value::String(source_url));
     }
     Value::Object(document)
+}
+
+/// The permissions the HANDLERS of an extension require, read out of the schema that defines
+/// it — what `DescribeType` reports as `SchemaHandlerPermissions`.
+///
+/// A resource provider definition schema declares its handlers under `handlers`, one entry per
+/// handler (`create`, `read`, `update`, `delete`, `list`), and each entry declares the
+/// `permissions` that handler needs — "the permissions required for the handler to run"
+/// (the provider definition meta-schema [`PROVIDER_DEFINITION_META_SCHEMA`] this registry
+/// holds its schemas against). The permissions of an extension are therefore the union of
+/// those lists, read off the schema the registry holds for the version being described rather
+/// than held a second time beside it, and sorted so one document always reads back as the same
+/// set.
+///
+/// The answer is a SET, possibly empty: an extension whose schema declares no handler — which
+/// is every extension this registry derives a schema for ([`resource_type_schema`] documents
+/// what such a document carries and what it deliberately does not) — and one the registry
+/// holds no schema for at all both require no handler permission, which is what the empty set
+/// says.
+pub fn schema_handler_permissions(schema: Option<&str>) -> Vec<String> {
+    let mut permissions: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
+    let handlers = schema
+        .and_then(|schema| ::serde_json::from_str::<Value>(schema).ok())
+        .as_ref()
+        .and_then(|document| document.get("handlers"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for handler in handlers.values() {
+        let declared = handler
+            .get("permissions")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for permission in declared {
+            if let Some(permission) = permission.as_str() {
+                permissions.insert(permission.to_string());
+            }
+        }
+    }
+    permissions.into_iter().collect()
 }
 
 /// Define one published property under `into`.

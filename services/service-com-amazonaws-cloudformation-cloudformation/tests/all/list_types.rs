@@ -31,6 +31,7 @@ use service_com_amazonaws_cloudformation_cloudformation::state::publisher::{
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::registry::{
     deprecated_status, provisioning_type, public_type_arn, registry_type, type_arn, visibility,
+    PUBLIC_EXTENSION_CATALOG,
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::template::IMPLEMENTED_RESOURCE_TYPES;
 use service_com_amazonaws_cloudformation_cloudformation::state::{encode_next_token, PageOf};
@@ -129,16 +130,42 @@ async fn walk_names(
     panic!("case {members:?}: the listing did not end within {PAGE_LIMIT} pages");
 }
 
-/// The Amazon-Web-Services-published resource types of the registry, in the order the
-/// listing must report them (by type name).
+/// The Amazon-Web-Services-published extensions of the registry, in the order the listing
+/// must report them (by type name).
 ///
-/// Source: `crate::state::template::IMPLEMENTED_RESOURCE_TYPES`, the catalogue
-/// `crate::state::registry::aws_published` answers single reads from — so this suite and
+/// Source: `crate::state::template::IMPLEMENTED_RESOURCE_TYPES` (the resource types Amazon
+/// Web Services provides a record for here) and
+/// `crate::state::registry::PUBLIC_EXTENSION_CATALOG` (the extensions it has PUBLISHED,
+/// which are of another kind) — the two catalogues
+/// `crate::state::registry::aws_published` answers single reads from, so this suite and
 /// `extension_registry.rs` cannot disagree about which published extensions exist.
 fn published_catalog() -> Vec<String> {
     let mut names: Vec<String> = IMPLEMENTED_RESOURCE_TYPES
         .iter()
         .map(|name| name.to_string())
+        .chain(
+            PUBLIC_EXTENSION_CATALOG
+                .iter()
+                .map(|published| published.type_name.to_string()),
+        )
+        .collect();
+    names.sort();
+    names
+}
+
+/// The published catalogue, narrowed to the extensions of ONE kind: what a listing filtered
+/// by that `Type` must report of it.
+fn published_catalog_of_kind(type_kind: &str) -> Vec<String> {
+    let mut names: Vec<String> = IMPLEMENTED_RESOURCE_TYPES
+        .iter()
+        .filter(|_| type_kind == registry_type::RESOURCE)
+        .map(|name| name.to_string())
+        .chain(
+            PUBLIC_EXTENSION_CATALOG
+                .iter()
+                .filter(|published| published.type_kind == type_kind)
+                .map(|published| published.type_name.to_string()),
+        )
         .collect();
     names.sort();
     names
@@ -245,20 +272,41 @@ fn list_cases() -> Vec<ListCase> {
             listed: public_names(),
         },
         ListCase {
-            case: "Visibility=PUBLIC with Type=RESOURCE, which every public record is",
+            // The public records of the seeded registry are resource types, as are the
+            // resource types Amazon Web Services provides; the extensions it PUBLISHES are
+            // of another kind, so this narrowing leaves them out.
+            case: "Visibility=PUBLIC with Type=RESOURCE",
             members: vec![
                 ("Visibility", visibility::PUBLIC),
                 ("Type", registry_type::RESOURCE),
             ],
-            listed: public_names(),
+            listed: {
+                let mut listed = published_catalog_of_kind(registry_type::RESOURCE);
+                listed.push(ACTIVATED_PUBLIC.to_string());
+                listed.push(PUBLIC_NO_PUBLISHER.to_string());
+                listed.sort();
+                listed
+            },
         },
         ListCase {
+            // The other side of the same narrowing: the Hooks the registry publishes are
+            // public records too, and they are the only public records of their kind.
+            case: "Visibility=PUBLIC with Type=HOOK: the Hooks the registry publishes",
+            members: vec![
+                ("Visibility", visibility::PUBLIC),
+                ("Type", registry_type::HOOK),
+            ],
+            listed: published_catalog_of_kind(registry_type::HOOK),
+        },
+        ListCase {
+            // Nothing publishes a public MODULE here — a module is authored by its
+            // publisher — so the kind narrows the public listing to nothing.
             case: "Visibility=PUBLIC with Type=MODULE, which no public record is",
             members: vec![
                 ("Visibility", visibility::PUBLIC),
                 ("Type", registry_type::MODULE),
             ],
-            listed: Vec::new(),
+            listed: published_catalog_of_kind(registry_type::MODULE),
         },
         ListCase {
             // "AWS_TYPES: extensions available for use from Amazon" — the public records
@@ -269,7 +317,11 @@ fn list_cases() -> Vec<ListCase> {
                 ("Filters.Category", "AWS_TYPES"),
             ],
             listed: {
-                let mut listed = published_catalog();
+                // The resource types Amazon Web Services PROVIDES carry no publisher id,
+                // which is what puts them in this category; the extensions it published
+                // belong to the publisher that published them, so they are in THIRD_PARTY
+                // below.
+                let mut listed = published_catalog_of_kind(registry_type::RESOURCE);
                 listed.push(PUBLIC_NO_PUBLISHER.to_string());
                 listed.sort();
                 listed
@@ -294,7 +346,15 @@ fn list_cases() -> Vec<ListCase> {
                 ("Visibility", visibility::PUBLIC),
                 ("Filters.Category", "THIRD_PARTY"),
             ],
-            listed: names(&[ACTIVATED_PUBLIC]),
+            listed: {
+                // Every public record a PUBLISHER published, which is what carrying a
+                // publisher id states — the activated third-party record of the fixture,
+                // and the extensions this registry publishes.
+                let mut listed = published_catalog_of_kind(registry_type::HOOK);
+                listed.push(ACTIVATED_PUBLIC.to_string());
+                listed.sort();
+                listed
+            },
         },
         ListCase {
             // The same category under PRIVATE: "this includes private extensions

@@ -17,7 +17,11 @@
 //!
 //! The first is Amazon Web Services: the public extensions it publishes are in every
 //! account's registry without anybody registering them, which [`aws_published`] is — the
-//! resource types this emulator provisions, reported as the public extensions they are.
+//! resource types this emulator provisions, reported as the public extensions they are, and
+//! the extensions it has PUBLISHED to the registry ([`PUBLIC_EXTENSION_CATALOG`]), which are
+//! Hooks rather than resource types and which belong to the publisher that published them.
+//! So the public half of this registry is no more one KIND of extension than the private
+//! half is.
 //!
 //! The second is this account's own registry WRITERS — `RegisterType` and `ActivateType`
 //! (which add an extension version), `SetTypeConfiguration` (`ConfigurationSchema`),
@@ -1099,7 +1103,14 @@ pub const AWS_PUBLISHED_VERSION_ID: &str = "00000001";
 /// ([`crate::state::resource_schema`]), derived from the properties the type publishes. The
 /// description
 /// and the documentation URL are NOT known here, so they stay absent rather than invented.
+/// The record a single read of the Amazon-Web-Services-published registry answers with: the
+/// resource type this emulator provisions, or the extension this registry publishes
+/// ([`PUBLIC_EXTENSION_CATALOG`]) — both of which a listing reports too
+/// ([`aws_published_all`]), so the two reads cannot disagree about one extension.
 pub fn aws_published(region: &str, type_kind: &str, type_name: &str) -> Option<StoredExtension> {
+    if let Some(published) = published_catalog_entry(type_kind, type_name) {
+        return Some(published_catalog_record(region, published));
+    }
     if type_kind != registry_type::RESOURCE
         || !crate::state::template::IMPLEMENTED_RESOURCE_TYPES.contains(&type_name)
     {
@@ -1109,17 +1120,202 @@ pub fn aws_published(region: &str, type_kind: &str, type_name: &str) -> Option<S
 }
 
 /// Every Amazon-Web-Services-published public extension the registry of this Region holds,
-/// in the order the catalogue carries them.
+/// in the order the catalogues carry them.
 ///
 /// The same records [`aws_published`] answers one at a time, for a read that reports what
 /// the registry HOLDS rather than one extension a request named: both are built by
-/// [`aws_published_record`], so the listing and the single read cannot disagree about one
-/// of them.
+/// [`aws_published_record`] and [`published_catalog_record`], so the listing and the single
+/// read cannot disagree about one of them.
+///
+/// The registry's public catalogue is not one KIND of extension: the resource types Amazon
+/// Web Services provides, and the extensions it PUBLISHES
+/// ([`PUBLIC_EXTENSION_CATALOG`]), are both in it.
 pub fn aws_published_all(region: &str) -> Vec<StoredExtension> {
     crate::state::template::IMPLEMENTED_RESOURCE_TYPES
         .iter()
         .map(|type_name| aws_published_record(region, type_name))
+        .chain(
+            PUBLIC_EXTENSION_CATALOG
+                .iter()
+                .map(|published| published_catalog_record(region, published)),
+        )
         .collect()
+}
+
+/// One PUBLIC extension the registry of every account and Region holds because Amazon Web
+/// Services PUBLISHED it, rather than because it provides the resource type
+/// ([`aws_published_record`]).
+///
+/// A published extension belongs to the publisher that published it, which is what makes it
+/// a public THIRD-PARTY record here ([`StoredExtension::is_public_third_party`]): its
+/// publisher id, publisher name and verified identity are reported for it, while the
+/// resource types Amazon Web Services provides carry no publisher id at all ("extensions
+/// provided by Amazon Web Services are not assigned a publisher ID").
+#[derive(Debug, Clone, Copy)]
+pub struct PublishedExtension {
+    /// [`registry_type`]: the kind of extension.
+    pub type_kind: &'static str,
+    /// The extension's own name, in the form the modelled `TypeName` states.
+    pub type_name: &'static str,
+    /// The public name of the publisher that published it, which is what
+    /// [`published_publisher`] reads back and what its `PublisherId` is derived from.
+    pub publisher_name: &'static str,
+    /// `Description`, "the description of the extension".
+    pub description: &'static str,
+}
+
+/// The public extensions this registry holds that are NOT resource types: the HOOKS Amazon
+/// Web Services publishes to the CloudFormation registry, which a client enumerating the
+/// public registry sees beside the resource types.
+///
+/// Source: the Hook types the CloudFormation Hooks documentation publishes by name — a Guard
+/// Hook, which evaluates Guard rules against a stack operation's targets, and a Lambda Hook,
+/// which hands those targets to a Lambda function. This service's own model names the first
+/// of them (`GetHookResultOutput$TypeName`: "if you activate AWS::Hooks::GuardHook with a
+/// type name alias"), which is why the registry can report a record for it rather than
+/// inventing one.
+///
+/// It carries no MODULE: a module is a package of template fragments its PUBLISHER authors
+/// ("for modules, `company_or_organization::service::type::MODULE`",
+/// `RegisterTypeInput$TypeName`), so a MODULE record enters this registry when a
+/// registration or an activation writes one — and such a record is listed and described
+/// through the very same code path these are.
+pub const PUBLIC_EXTENSION_CATALOG: &[PublishedExtension] = &[
+    PublishedExtension {
+        type_kind: registry_type::HOOK,
+        type_name: "AWS::Hooks::GuardHook",
+        publisher_name: AWS_PUBLISHER_NAME,
+        description: "Evaluates the targets of a stack operation against a set of \
+                      CloudFormation Guard rules.",
+    },
+    PublishedExtension {
+        type_kind: registry_type::HOOK,
+        type_name: "AWS::Hooks::LambdaHook",
+        publisher_name: AWS_PUBLISHER_NAME,
+        description: "Invokes a Lambda function to evaluate the targets of a stack \
+                      operation.",
+    },
+];
+
+/// The public name of the publisher Amazon Web Services publishes its own extensions under.
+const AWS_PUBLISHER_NAME: &str = "Amazon Web Services";
+
+/// What this registry knows about the publisher an extension of
+/// [`PUBLIC_EXTENSION_CATALOG`] was published by, beyond the id the record carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogPublisher {
+    /// `PublisherName`, "the publisher name, as defined in the public profile for that
+    /// publisher in the service used to verify the publisher identity".
+    pub publisher_name: &'static str,
+    /// `PublisherIdentity`, "the type of account used as the identity provider when
+    /// registering this publisher with CloudFormation" ([`crate::state::publisher`]).
+    pub identity_provider: &'static str,
+}
+
+/// The publisher of a catalogued public extension, read back by the `PublisherId` its record
+/// carries; `None` for any other id.
+///
+/// A publisher is a record of its OWN, so the name and the verified identity a summary
+/// reports are read back from the publisher rather than held a second time on every
+/// extension it published. These publishers registered before any account read this registry
+/// — their extensions are in it without anybody activating them — so the registration is the
+/// catalogue's rather than one `RegisterPublisher` wrote, which
+/// [`crate::state::ComAmazonawsCloudformationCloudformationState::publisher`] answers for.
+/// Each is verified through its Amazon Web Services Marketplace account, which is the
+/// identity provider a registration that supplied no source-control connection reports
+/// ([`crate::state::publisher::StoredPublisher::identity_provider`]).
+pub fn published_publisher(publisher_id: &str) -> Option<CatalogPublisher> {
+    PUBLIC_EXTENSION_CATALOG
+        .iter()
+        .map(|published| published.publisher_name)
+        .find(|publisher_name| published_publisher_id(publisher_name) == publisher_id)
+        .map(|publisher_name| CatalogPublisher {
+            publisher_name,
+            identity_provider: crate::state::publisher::identity_provider::AWS_MARKETPLACE,
+        })
+}
+
+/// The `PublisherId` this registry holds the publisher `publisher_name` under.
+///
+/// DERIVED from the publisher's name rather than minted per call: a publisher id is stable
+/// ("this publisher ID applies to your account in all Amazon Web Services Regions") and no
+/// call registered these publishers, so the same name resolves the same id in every Region
+/// and on every read — which is what lets [`published_publisher`] read the publisher back
+/// out of an id a response handed a client. The 32 hexadecimal digits of the digest satisfy
+/// the modelled `PublisherId` (`@length(1..40)`, `@pattern("^[0-9a-zA-Z]{12,40}$")`), the
+/// same form [`crate::state::new_publisher_id`] mints for a registration.
+pub fn published_publisher_id(publisher_name: &str) -> String {
+    crate::state::stable_identifier_digits(publisher_name, 32)
+}
+
+/// The record a catalogued public extension ([`PUBLIC_EXTENSION_CATALOG`]) is reported as.
+///
+/// It carries what is known about a published extension: it is `PUBLIC` and `LIVE`, it
+/// belongs to the publisher that published it, its description is the catalogue's, and the
+/// public version this registry holds it at is the first one a publication is assigned
+/// ([`FIRST_PUBLIC_VERSION_NUMBER`]) — which is also the latest available version of it,
+/// since the registry holds that one publication. `IsActivated` is false: an activation is
+/// what puts a public extension to use in an account and Region, and nothing here has
+/// activated it. Its registration instants are the instant this registry came into being
+/// ([`REGISTRY_GENESIS`]), the way the provided resource types' are.
+///
+/// What it deliberately does NOT carry: a `Schema`, because the document that defines a
+/// published extension comes from the handler package its publisher registered and no
+/// package was uploaded here; a provisioning behaviour, which is a resource type's
+/// ("for resource types, the provisioning behavior of the resource type"); and a source or
+/// documentation URL, which the catalogue does not record.
+fn published_catalog_record(region: &str, published: &PublishedExtension) -> StoredExtension {
+    let arn = public_type_arn(region, published.type_kind, published.type_name);
+    let version = StoredTypeVersion {
+        version_id: AWS_PUBLISHED_VERSION_ID.to_string(),
+        arn: arn.clone(),
+        description: Some(published.description.to_string()),
+        schema: None,
+        provisioning_type: None,
+        deprecated_status: deprecated_status::LIVE.to_string(),
+        type_tests_status: None,
+        type_tests_status_description: None,
+        source_url: None,
+        documentation_url: None,
+        public_version_number: Some(FIRST_PUBLIC_VERSION_NUMBER.to_string()),
+        execution_role_arn: None,
+        logging_config: None,
+        required_activated_types: Vec::new(),
+        time_created: Some(*REGISTRY_GENESIS),
+        last_updated: Some(*REGISTRY_GENESIS),
+        // Nobody can test a public extension, so no conclusion is ever owed on one.
+        pending_tests: None,
+    };
+    StoredExtension {
+        type_kind: published.type_kind.to_string(),
+        type_name: published.type_name.to_string(),
+        arn,
+        region: region.to_string(),
+        visibility: visibility::PUBLIC.to_string(),
+        // "For public extensions, both those provided by Amazon Web Services and published
+        // by third parties, CloudFormation returns null."
+        default_version_id: None,
+        configuration_schema: None,
+        publisher_id: Some(published_publisher_id(published.publisher_name)),
+        // Nothing was activated under an alias: the local name IS the public name.
+        original_type_name: None,
+        original_type_arn: None,
+        latest_public_version: Some(FIRST_PUBLIC_VERSION_NUMBER.to_string()),
+        is_activated: Some(false),
+        // `AutoUpdate` is a property of an ACTIVATION, and nothing activated this record.
+        auto_update: None,
+        // Nothing has configured it: a configuration is what `SetTypeConfiguration` writes.
+        configurations: Vec::new(),
+        versions: vec![version],
+    }
+}
+
+/// The catalogued public extension of `type_kind` named `type_name`, if this registry
+/// publishes one ([`PUBLIC_EXTENSION_CATALOG`]).
+fn published_catalog_entry(type_kind: &str, type_name: &str) -> Option<&'static PublishedExtension> {
+    PUBLIC_EXTENSION_CATALOG
+        .iter()
+        .find(|published| published.type_kind == type_kind && published.type_name == type_name)
 }
 
 /// [`aws_published`], for a request that named the extension by ARN.
@@ -1131,6 +1327,11 @@ pub fn aws_published_all(region: &str) -> Vec<StoredExtension> {
 pub fn aws_published_by_arn(region: &str, arn: &str) -> Option<StoredExtension> {
     if public_arn_region(arn) != Some(region) {
         return None;
+    }
+    if let Some(published) = PUBLIC_EXTENSION_CATALOG.iter().find(|published| {
+        public_type_arn(region, published.type_kind, published.type_name) == arn
+    }) {
+        return Some(published_catalog_record(region, published));
     }
     let type_name = crate::state::template::IMPLEMENTED_RESOURCE_TYPES
         .iter()

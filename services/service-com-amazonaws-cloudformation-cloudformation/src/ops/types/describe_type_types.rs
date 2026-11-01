@@ -25,6 +25,7 @@ pub struct DescribeTypeInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.cloudformation#DescribeTypeOutput")]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeTypeOutput {
+    pub schema_handler_permissions: Option<Vec<String>>,
     pub arn: Option<String>,
     pub r#type: Option<String>,
     pub type_name: Option<String>,

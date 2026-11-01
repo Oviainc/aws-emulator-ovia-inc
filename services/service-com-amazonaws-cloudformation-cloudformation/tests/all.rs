@@ -201,6 +201,8 @@ mod rds_proxy_stack_resources;
 mod rds_stack_resources;
 #[path = "all/refusals_name_their_modelled_taxonomy.rs"]
 mod refusals_name_their_modelled_taxonomy;
+#[path = "all/registry_and_scan_read_members.rs"]
+mod registry_and_scan_read_members;
 #[path = "all/refused_stack_deletion.rs"]
 mod refused_stack_deletion;
 #[path = "all/regional_stack_namespace.rs"]

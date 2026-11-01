@@ -39,6 +39,16 @@
 //! `AutoUpdate` belong to public third-party extensions. Nothing is written: this is a
 //! reporting operation.
 //!
+//! NOTE ON THE MODEL: `SchemaHandlerPermissions` (a list of strings) was ADDED to
+//! `DescribeTypeOutput` in this service's `smithy-model/` copy. The shipped model declares no
+//! such member while AWS answers this read with the element present — empty for an extension
+//! whose schema declares no handler permission — as the recorded wire responses for this
+//! operation show. The emulator serialises what AWS puts on the wire, so the member is
+//! modelled here; nothing else in the shipped model was changed for it. What it reports is
+//! read out of the schema the registry holds for the described version
+//! ([`crate::state::resource_schema::schema_handler_permissions`]), so the permissions and
+//! the `Schema` they come from cannot disagree.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
@@ -183,6 +193,8 @@
 //! * `Schema` (TypeSchema, len 1..16777216) — The schema that defines the extension. For more
 //!   information, see Resource type schema in the CloudFormation Command Line Interface (CLI)
 //!   User Guide and the CloudFormation Hooks User Guide.
+//! * `SchemaHandlerPermissions` (SchemaHandlerPermissions) — The permissions the handlers
+//!   declared in the extension's schema require.
 //! * `SourceUrl` (OptionalSecureUrl, len 0..4096) — The URL of the source code for the
 //!   extension.
 //! * `TimeCreated` (Timestamp) — When the specified private extension version was registered
@@ -370,6 +382,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let named_no_version = matches!(wanted, Wanted::Default);
 
         Ok(DescribeTypeOutput {
+            // The permissions the extension's handlers require, read out of the schema that
+            // defines it: the element is PRESENT whatever the record is — empty for an
+            // extension whose schema declares no handler, and for one the registry holds no
+            // schema for — so a client inspecting them sees the same shape for every
+            // extension.
+            schema_handler_permissions: Some(
+                crate::state::resource_schema::schema_handler_permissions(
+                    version.schema.as_deref(),
+                ),
+            ),
             // The ARN of what was described — this version's own ARN, the one `TestType`
             // documents handing back "into DescribeType to monitor the current test
             // status".
