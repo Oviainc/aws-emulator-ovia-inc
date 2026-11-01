@@ -769,6 +769,22 @@ fn is_wildcard_principal(value: &str) -> bool {
     !partition.is_empty() && (resource == "root" || resource == "*")
 }
 
+/// How a `JSON_SYNTAX_ERROR` finding words itself: one FIXED sentence whose only
+/// variable parts are WHERE the document stopped being JSON.
+///
+/// The three numbers are that position in the modelled `Position` coordinates — offset
+/// from 0, line from 1, column from 0
+/// (`smithy_query(query="shape",shape="Position")`) — so the sentence states exactly
+/// what the finding's own `locations[].span.start` carries and the two cannot disagree.
+/// No parser's diagnostic reaches the wire: the wording is the service's, and a parser
+/// swapped underneath changes only which position is reported.
+fn json_syntax_error_details(position: &Position) -> String {
+    format!(
+        "Fix the JSON syntax error at index {} line {} column {}.",
+        position.offset, position.line, position.column
+    )
+}
+
 /// The byte offset a `serde_json` error position names: its line is counted from 1 and
 /// its column is the 1-based character position on that line.
 fn offset_of(document: &str, line: usize, column: usize) -> usize {
@@ -824,14 +840,7 @@ fn policy_findings(
             .chars()
             .next()
             .map_or(start, |character| start + character.len_utf8());
-        linter.flag(
-            FINDING_TYPE_ERROR,
-            JSON_SYNTAX_ERROR,
-            format!(
-                "The policy document is not valid JSON: {error}. Fix the JSON syntax so that the policy can be parsed."
-            ),
-            vec![doc.location(Vec::new(), JsonRange { start, end })],
-        );
+        linter.flag_json_syntax_error(JsonRange { start, end });
         return Ok(linter.report());
     }
 
@@ -839,29 +848,15 @@ fn policy_findings(
     {
         Err(error) => {
             // The parser reports where it gave up; that range IS the finding's span.
-            let range = error.range();
-            linter.flag(
-                FINDING_TYPE_ERROR,
-                JSON_SYNTAX_ERROR,
-                format!(
-                    "The policy document is not valid JSON: {error}. Fix the JSON syntax so that the policy can be parsed."
-                ),
-                vec![doc.location(Vec::new(), range)],
-            );
+            linter.flag_json_syntax_error(error.range());
         }
         Ok(parsed) => match parsed.value {
-            None => linter.flag(
-                FINDING_TYPE_ERROR,
-                JSON_SYNTAX_ERROR,
-                "The policy document is empty. Provide a JSON policy document.".to_string(),
-                vec![doc.location(
-                    Vec::new(),
-                    JsonRange {
-                        start: 0,
-                        end: document.len(),
-                    },
-                )],
-            ),
+            // A document holding no JSON value at all stops being JSON at its very first
+            // position, and is reported as the same syntax error there.
+            None => linter.flag_json_syntax_error(JsonRange {
+                start: 0,
+                end: document.len(),
+            }),
             Some(root) => linter.lint_policy(&root),
         },
     }
@@ -953,6 +948,21 @@ impl Linter<'_> {
             details,
             locations,
         });
+    }
+
+    /// Report that the document is not JSON, at the `range` the reader stopped at.
+    ///
+    /// The ONE place a `JSON_SYNTAX_ERROR` finding is built, so the sentence and the span
+    /// are taken from the same position whichever reader rejected the document.
+    fn flag_json_syntax_error(&mut self, range: JsonRange) {
+        let location = self.doc.location(Vec::new(), range);
+        let details = json_syntax_error_details(&location.span.start);
+        self.flag(
+            FINDING_TYPE_ERROR,
+            JSON_SYNTAX_ERROR,
+            details,
+            vec![location],
+        );
     }
 
     /// Whether the policy is attached to a principal (so it must name resources) as

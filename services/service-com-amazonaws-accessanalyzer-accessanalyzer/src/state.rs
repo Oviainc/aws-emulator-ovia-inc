@@ -839,11 +839,14 @@ pub fn policy_generation_quota_exceeded(principal_arn: &str) -> ServiceQuotaExce
 /// and this 400 are every error they declare), so a `jobId` this account and Region never
 /// minted is refused as a field validation of `jobId` — which is also the member a client
 /// has to correct.
+///
+/// AWS words it as `Invalid jobId: ` + the submitted id + ` does not exist`: fixed text
+/// either side of the only variable part, the `jobId` the request named. Every operation
+/// that resolves a job renders this ONE template, so a client that can only tell "no such
+/// job" from the message (there being no distinct error code) reads the same sentence
+/// whichever of them it called.
 pub fn policy_generation_not_found(job_id: &str) -> ValidationException {
-    field_validation_exception(
-        "jobId",
-        format!("jobId must name a policy generation job, but was {job_id}"),
-    )
+    field_validation_exception("jobId", format!("Invalid jobId: {job_id} does not exist"))
 }
 
 /// The 400 for a cancel of a job that is no longer running.
@@ -1747,27 +1750,64 @@ pub fn validate_tag_count(member: &str, resulting: usize) -> Result<(), Validati
     Ok(())
 }
 
+/// How THIS service words a constraint violation it has its own sentence for, or `None`
+/// for one it leaves to the validating walk.
+///
+/// A value outside its member's modelled `@pattern` is refused with Access Analyzer's own
+/// short sentence: the fixed `Invalid `, the member's wire name, `: `, and the value the
+/// request carried. The pattern itself never reaches the text — it is an internal detail
+/// of the model, and the sentence exists to name the parameter a client has to correct.
+///
+/// Every other kind of violation (a bound, a length, an enumerated set) keeps the clause
+/// the walk states, which is also what the request boundary renders for the same
+/// violation, so nothing is reworded here without a recorded sentence to word it from.
+fn service_violation_message(
+    violation: &::aws_smithy_schema_server::constraints::Violation,
+) -> Option<String> {
+    match (&violation.kind, violation.value.as_deref()) {
+        (
+            ::aws_smithy_schema_server::constraints::ViolationKind::Pattern(_),
+            Some(rejected),
+        ) => Some(format!("Invalid {}: {rejected}", violation.path)),
+        _ => None,
+    }
+}
+
+/// One violation as this service states it: its own sentence where it has one, else the
+/// walk's clause.
+fn violation_message(violation: &::aws_smithy_schema_server::constraints::Violation) -> String {
+    service_violation_message(violation).unwrap_or_else(|| violation.message())
+}
+
 /// This service's modelled `ValidationException` for the violations a modelled-constraint
 /// walk reported.
 ///
 /// For a member whose constraint traits this service enforces ITSELF (so that the refusal
 /// carries the modelled `reason`, which the framework's pre-handler envelope cannot), the
 /// walk is [`::aws_smithy_schema_server::constraints::validate`] — the same code the
-/// boundary runs — so the clause and the envelope are worded identically whichever side
-/// refused. `fieldList` names every member that failed.
+/// boundary runs. `fieldList` names every member that failed, each with the same sentence
+/// this service would state for it on its own.
+///
+/// `message` is the service's own sentence for the first violation it words itself
+/// ([`service_violation_message`]); only when it words none of them does the refusal fall
+/// back to the walk's multi-violation envelope.
 pub fn constraint_validation_exception(
     violations: &[::aws_smithy_schema_server::constraints::Violation],
 ) -> ValidationException {
+    let message = violations
+        .iter()
+        .find_map(service_violation_message)
+        .or_else(|| ::aws_smithy_schema_server::envelope(violations))
+        .unwrap_or_else(|| "invalid request".to_string());
     ValidationException {
-        message: ::aws_smithy_schema_server::envelope(violations)
-            .unwrap_or_else(|| "invalid request".to_string()),
+        message,
         reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
         field_list: Some(
             violations
                 .iter()
                 .map(|violation| ValidationExceptionField {
                     name: violation.path.clone(),
-                    message: violation.message(),
+                    message: violation_message(violation),
                 })
                 .collect(),
         ),
