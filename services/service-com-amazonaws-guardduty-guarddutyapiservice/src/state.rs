@@ -6480,24 +6480,40 @@ impl Listing {
 
     /// The token that asks this listing to resume at `position`.
     fn token_at(&self, position: usize) -> String {
-        format!(
-            "{tag}{position:0width$x}",
-            tag = self.tag(),
-            width = LISTING_POSITION_WIDTH
-        )
+        token_spelling(&self.tag(), position)
     }
 
     /// The position `token` names in THIS listing, or `None` when it is not a token
     /// this listing issued.
+    ///
+    /// A token is OPAQUE: the one string that resolves to a position is the one
+    /// [`Self::token_at`] writes for it, so every other way of spelling that same
+    /// position — a position padded to another width, a hexadecimal digit in upper
+    /// case, a sign in front of it — resolves to nothing, exactly like a token
+    /// belonging to another listing. This is what makes the token reader accept
+    /// nothing but what the token minter wrote: the two cannot drift, because the
+    /// reader decides by SPELLING the candidate position again and comparing.
     fn position_in(&self, token: &str) -> Option<usize> {
-        let (tag, position) = token.split_at_checked(LISTING_TAG_WIDTH)?;
-        let names_this_listing = tag == self.tag();
-        let is_a_position = !position.is_empty() && position.chars().all(|c| c.is_ascii_hexdigit());
-        if !names_this_listing || !is_a_position {
+        let tag = self.tag();
+        let (carried, position) = token.split_at_checked(LISTING_TAG_WIDTH)?;
+        if carried != tag {
             return None;
         }
-        usize::from_str_radix(position, 16).ok()
+        // `from_str_radix` is the lax step — it reads spellings this listing never
+        // writes — so its answer is only a CANDIDATE until the round trip below
+        // confirms this listing would have written exactly `token` for it.
+        let position = usize::from_str_radix(position, 16).ok()?;
+        (token_spelling(&tag, position) == token).then_some(position)
     }
+}
+
+/// How a token is SPELLED: the listing's `tag` followed by `position` in hexadecimal,
+/// zero-padded to [`LISTING_POSITION_WIDTH`].
+///
+/// The one place the spelling is written, so the token a report issues and the token
+/// it accepts are the same string by construction.
+fn token_spelling(tag: &str, position: usize) -> String {
+    format!("{tag}{position:0width$x}", width = LISTING_POSITION_WIDTH)
 }
 
 /// Take one page out of the ordered key list `listing` identifies.
@@ -6505,9 +6521,10 @@ impl Listing {
 /// `token` is one THIS listing issued: it carries the listing's identity beside the
 /// number of entries already returned, and the only thing a caller may do with it
 /// is hand it back to the same listing. `Err(token)` means the token was not one
-/// this listing issued: it does not resolve at all, it belongs to another listing,
-/// or it points past the end of the list, which a listing never hands out (it
-/// answers the last page with no `NextToken`).
+/// this listing issued: it does not resolve at all, it is another SPELLING of a
+/// position than the one a token carries, it belongs to another listing, or it
+/// points past the end of the list, which a listing never hands out (it answers
+/// the last page with no `NextToken`).
 pub fn paginate(
     listing: &Listing,
     keys: &[String],
