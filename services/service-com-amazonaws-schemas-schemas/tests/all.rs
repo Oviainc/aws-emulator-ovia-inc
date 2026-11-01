@@ -51,6 +51,8 @@ mod empty_response_framing;
 mod empty_result_statuses;
 #[path = "all/empty_schema_version.rs"]
 mod empty_schema_version;
+#[path = "all/empty_scope.rs"]
+mod empty_scope;
 #[path = "all/error_body_codes.rs"]
 mod error_body_codes;
 #[path = "all/export_reads_the_stored_schema.rs"]

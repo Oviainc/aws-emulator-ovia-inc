@@ -152,9 +152,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Scope` is documented as "Local or AWS to limit responses to your custom
         // registries, or the ones provided by AWS" — so it LIMITS a listing that
         // otherwise reports both: a caller's own registries and the service-owned
-        // ones. Any other value is not a scope.
+        // ones. Any value that is not a scope is refused.
         let selected_scope = match input.scope.as_deref() {
-            None => None,
+            // A member the request omitted and one it sent with no characters in it
+            // both name NO scope, and naming no scope limits nothing, so the two are
+            // served the same listing: every registry. This is the reading the rest
+            // of this service already gives a selecting value that specifies nothing
+            // — the `registryNamePrefix` below that every stored name starts with, a
+            // `NextToken` that names no position, a `Keywords` value that carries no
+            // keyword — and the model puts no length bound on the member, so a
+            // request may legitimately carry one.
+            None | Some("") => None,
             Some(scope) if scope.eq_ignore_ascii_case("local") => {
                 Some(crate::state::RegistryScope::Local)
             }
