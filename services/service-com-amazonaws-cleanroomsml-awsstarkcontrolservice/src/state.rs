@@ -6,15 +6,20 @@
 //! ML's resource chain: `CreateTrainingDataset` mints a training dataset,
 //! `CreateAudienceModel` trains a model from one, the Get operations report them,
 //! the List operation pages over them and the Delete operations release them.
-//! The two records below are the one copy of each resource every one of those
-//! handlers reads and writes, plus the `TrainingDatasetSummary` projection the
-//! list operation returns.
+//! The records below are the one copy of each resource every one of those
+//! handlers reads and writes, plus the summary projections the list operations
+//! return.
+//!
+//! The ML input channel is the collaboration-scoped link of the same chain: a
+//! channel is created under a membership, and every member of the collaboration
+//! that membership belongs to can list the channels it holds.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ConflictException, Dataset, ResourceNotFoundException, TrainingDatasetSummary,
+    CollaborationMLInputChannelSummary, ConflictException, Dataset, PayerConfiguration,
+    ResourceNotFoundException, TrainingDatasetSummary,
 };
 
 /// The region a minted ARN names when the request carries no SigV4 credential
@@ -64,12 +69,36 @@ pub const AUDIENCE_MODEL_CREATING: &str = "CREATE_PENDING";
 /// and the only status `TrainingDatasetStatus` models at all.
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 
+/// The largest page `ListCollaborationMLInputChannels` serves, and the page size
+/// it uses when the request names no `maxResults`:
+/// `ListCollaborationMLInputChannelsRequest$maxResults` is modelled
+/// `@range(min: 1, max: 100)`.
+pub const ML_INPUT_CHANNEL_PAGE_LIMIT: i32 = 100;
+
 /// A status change the clock owes a resource: the instant it falls due, and the
 /// status the resource carries from then on.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
     pub due: SystemTime,
     pub status: String,
+}
+
+/// Materialise the status change `pending` owes `status`, if `now` is past its
+/// due instant — the one place a clock-owed transition is settled, whichever
+/// record holds it.
+///
+/// Only the status moves: a resource's `updateTime` reports the last call that
+/// changed it, and the work this settles was started by the call that set the
+/// transition, which already set that time.
+fn settle_pending(status: &mut String, pending: &mut Option<PendingTransition>, now: SystemTime) {
+    let Some(transition) = pending.as_ref() else {
+        return;
+    };
+    if now < transition.due {
+        return;
+    }
+    *status = transition.status.clone();
+    *pending = None;
 }
 
 /// One Clean Rooms ML training dataset, as this emulator persists it.
@@ -141,19 +170,68 @@ pub struct AudienceModel {
 impl AudienceModel {
     /// Materialise the status change the clock owes this model, if `now` is past
     /// its due instant.
-    ///
-    /// Only `status` moves: `update_time` reports the last call that changed the
-    /// model, and the training this settles was started by the create, which
-    /// already set it.
     pub fn settle(&mut self, now: SystemTime) {
-        let Some(pending) = self.pending.as_ref() else {
-            return;
-        };
-        if now < pending.due {
-            return;
+        settle_pending(&mut self.status, &mut self.pending, now);
+    }
+}
+
+/// One Clean Rooms ML input channel, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct MlInputChannel {
+    /// The `MLInputChannelArn` this record is keyed by.
+    pub arn: String,
+    /// The region the create was signed for, which the ARN names. A regional
+    /// endpoint reports only its own region's resources, so this is the scope
+    /// every read of this record is checked against.
+    pub region: String,
+    /// The membership the channel was created under, which its ARN names.
+    pub membership_identifier: String,
+    /// The collaboration that membership belongs to. It is the scope
+    /// `ListCollaborationMLInputChannels` reports in: a channel is visible to
+    /// that call only through the collaboration it was created in.
+    pub collaboration_identifier: String,
+    pub name: String,
+    /// The configured model algorithm associations the channel was created
+    /// from, which `ConfiguredModelAlgorithmAssociationArnList` bounds to one
+    /// entry.
+    pub configured_model_algorithm_associations: Vec<String>,
+    pub description: Option<String>,
+    pub payer_configuration: Option<PayerConfiguration>,
+    /// The account of the member that created the channel.
+    pub creator_account_id: String,
+    /// One of `MLInputChannelStatus`'s values.
+    pub status: String,
+    /// The status change the clock owes this channel, if any.
+    pub pending: Option<PendingTransition>,
+    pub create_time: SystemTime,
+    pub update_time: SystemTime,
+}
+
+impl MlInputChannel {
+    /// Materialise the status change the clock owes this channel, if `now` is
+    /// past its due instant.
+    pub fn settle(&mut self, now: SystemTime) {
+        settle_pending(&mut self.status, &mut self.pending, now);
+    }
+
+    /// The `CollaborationMLInputChannelSummary` projection
+    /// `ListCollaborationMLInputChannels` returns.
+    pub fn to_collaboration_summary(&self) -> CollaborationMLInputChannelSummary {
+        CollaborationMLInputChannelSummary {
+            create_time: ::aws_smithy_types::DateTime::from(self.create_time),
+            update_time: ::aws_smithy_types::DateTime::from(self.update_time),
+            membership_identifier: self.membership_identifier.clone(),
+            collaboration_identifier: self.collaboration_identifier.clone(),
+            name: self.name.clone(),
+            configured_model_algorithm_associations: self
+                .configured_model_algorithm_associations
+                .clone(),
+            ml_input_channel_arn: self.arn.clone(),
+            status: self.status.clone(),
+            creator_account_id: self.creator_account_id.clone(),
+            description: self.description.clone(),
+            payer_configuration: self.payer_configuration.clone(),
         }
-        self.status = pending.status.clone();
-        self.pending = None;
     }
 }
 
@@ -167,6 +245,10 @@ pub struct ComAmazonawsCleanroomsmlAwsstarkcontrolserviceState {
     pub training_datasets: BTreeMap<String, TrainingDataset>,
     /// Every audience model, keyed by its ARN.
     pub audience_models: BTreeMap<String, AudienceModel>,
+    /// Every ML input channel, keyed by its ARN, which gives the
+    /// collaboration- and membership-scoped lists the one stable total order
+    /// their pagination tokens index into.
+    pub ml_input_channels: BTreeMap<String, MlInputChannel>,
     /// The counter the resource segment of every minted ARN comes from.
     resource_id_seq: u64,
 }
@@ -242,14 +324,28 @@ pub fn audience_model_arn(id: &str, region: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("audience-model/{id}"))
 }
 
-/// True when `value` is shaped like a `TrainingDatasetArn`
-/// (`^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:training-dataset/[-a-zA-Z0-9_/.]+$`).
+/// The ARN of the ML input channel with resource id `id`, created under the
+/// membership `membership_identifier` names, in `region`.
 ///
-/// The boundary validator already refuses a modelled `TrainingDatasetArn`
-/// member, so this is for a value the model does not constrain to that
-/// pattern — a `ListTrainingDatasets` `nextToken`, which this service's
-/// pagination carries a training dataset ARN in.
-pub fn is_training_dataset_arn(value: &str) -> bool {
+/// `MLInputChannelArn` nests the channel under its membership
+/// (`membership/{uuid}/ml-input-channel/{id}`), so the membership a channel
+/// belongs to is readable from its ARN.
+pub fn ml_input_channel_arn(membership_identifier: &str, id: &str, region: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("membership/{membership_identifier}/ml-input-channel/{id}"),
+    )
+}
+
+/// The resource portion of `value` when it is shaped like a Clean Rooms ML ARN
+/// (`^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:` and a non-empty
+/// remainder), and `None` otherwise.
+///
+/// Every ARN shape in this service shares that prefix and differs only in the
+/// resource portion, so each predicate below checks the prefix through this and
+/// then its own resource.
+fn cleanrooms_ml_arn_resource(value: &str) -> Option<&str> {
     let mut fields = value.splitn(6, ':');
     let (Some("arn"), Some(partition), Some(service), Some(region), Some(account), Some(resource)) = (
         fields.next(),
@@ -259,7 +355,7 @@ pub fn is_training_dataset_arn(value: &str) -> bool {
         fields.next(),
         fields.next(),
     ) else {
-        return false;
+        return None;
     };
     let partition_tail_ok = partition
         .strip_prefix("aws")
@@ -269,15 +365,70 @@ pub fn is_training_dataset_arn(value: &str) -> bool {
             .bytes()
             .all(|b| b == b'-' || b.is_ascii_lowercase() || b.is_ascii_digit());
     let account_ok = account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit());
-    let resource_ok = resource
-        .strip_prefix("training-dataset/")
-        .is_some_and(|id| {
-            !id.is_empty()
-                && id.bytes().all(|b| {
-                    b == b'-' || b == b'_' || b == b'/' || b == b'.' || b.is_ascii_alphanumeric()
-                })
-        });
-    partition_tail_ok && service == ARN_SERVICE && region_ok && account_ok && resource_ok
+    (partition_tail_ok && service == ARN_SERVICE && region_ok && account_ok).then_some(resource)
+}
+
+/// True when `id` is shaped like the resource id Clean Rooms ML ARNs carry,
+/// `[-a-zA-Z0-9_/.]+`.
+fn is_arn_resource_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.bytes().all(|b| {
+            b == b'-' || b == b'_' || b == b'/' || b == b'.' || b.is_ascii_alphanumeric()
+        })
+}
+
+/// True when `value` is shaped like a modelled `UUID`
+/// (`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`), the form
+/// every collaboration and membership identifier in this service carries.
+fn is_uuid(value: &str) -> bool {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let mut groups = value.split('-');
+    for width in GROUPS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        let hex = group
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+        if group.len() != width || !hex {
+            return false;
+        }
+    }
+    groups.next().is_none()
+}
+
+/// True when `value` is shaped like a `TrainingDatasetArn`
+/// (`^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:training-dataset/[-a-zA-Z0-9_/.]+$`).
+///
+/// The boundary validator already refuses a modelled `TrainingDatasetArn`
+/// member, so this is for a value the model does not constrain to that
+/// pattern — a `ListTrainingDatasets` `nextToken`, which this service's
+/// pagination carries a training dataset ARN in.
+pub fn is_training_dataset_arn(value: &str) -> bool {
+    cleanrooms_ml_arn_resource(value).is_some_and(|resource| {
+        resource
+            .strip_prefix("training-dataset/")
+            .is_some_and(is_arn_resource_id)
+    })
+}
+
+/// True when `value` is shaped like an `MLInputChannelArn`
+/// (`^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:membership/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ml-input-channel/[-a-zA-Z0-9_/.]+$`).
+///
+/// As with [`is_training_dataset_arn`], this is for a value the model does not
+/// constrain to that pattern — the `nextToken` of a list that pages over ML
+/// input channels, which carries the ARN the next page resumes at.
+pub fn is_ml_input_channel_arn(value: &str) -> bool {
+    let Some(resource) = cleanrooms_ml_arn_resource(value) else {
+        return false;
+    };
+    let Some(nested) = resource.strip_prefix("membership/") else {
+        return false;
+    };
+    let Some((membership_identifier, id)) = nested.split_once("/ml-input-channel/") else {
+        return false;
+    };
+    is_uuid(membership_identifier) && is_arn_resource_id(id)
 }
 
 /// The region this request was signed for — what a minted ARN names.

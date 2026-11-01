@@ -88,18 +88,21 @@ fn label(value: &str) -> String {
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
-struct Answer {
-    status: u16,
-    body: Value,
+///
+/// `pub(crate)` because the sibling suites of this integration-test crate drive the
+/// router through the same harness rather than copying it.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The wire error code (`__type`), or the empty string on a success.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.body["__type"].as_str().unwrap_or_default()
     }
 
-    fn at(&self, member: &str) -> Value {
+    pub(crate) fn at(&self, member: &str) -> Value {
         self.body
             .pointer(&format!("/{member}"))
             .cloned()
@@ -111,7 +114,7 @@ impl Answer {
     }
 }
 
-async fn signed_call(
+pub(crate) async fn signed_call(
     router: &MultiServiceRouter,
     region: &str,
     method: &str,
@@ -269,7 +272,7 @@ fn matches_arn_pattern(value: &str, resource: &str, region: &str) -> bool {
 /// RFC 3339 string `@timestampFormat("date-time")` asks for; which of the two the
 /// protocol layer renders is not this service's choice, so every case here compares
 /// INSTANTS and accepts both forms.
-fn timestamp_seconds(value: &Value) -> f64 {
+pub(crate) fn timestamp_seconds(value: &Value) -> f64 {
     if let Some(seconds) = value.as_f64() {
         return seconds;
     }
@@ -284,7 +287,7 @@ fn timestamp_seconds(value: &Value) -> f64 {
 }
 
 /// True when `value` is a modelled `Timestamp` in either wire form.
-fn is_timestamp(value: &Value) -> bool {
+pub(crate) fn is_timestamp(value: &Value) -> bool {
     value.as_f64().is_some()
         || value.as_str().is_some_and(|text| {
             ::aws_smithy_types::DateTime::from_str(
