@@ -47,7 +47,11 @@
 //!   answers with the identity source the first call created, and the same token
 //!   with different parameters is a `ConflictException`.
 //! * `configuration` (Configuration) **required** — the Cognito user pool or the
-//!   OIDC provider this identity source points at.
+//!   OIDC provider this identity source points at. A Cognito user pool source
+//!   carrying no `groupConfiguration` is stored mapping its groups to
+//!   [`crate::state::DEFAULT_COGNITO_GROUP_ENTITY_TYPE`], the default that
+//!   member's own documentation states, so every read reports the entity type an
+//!   authorization call against the source maps its groups to.
 //! * `policyStoreId` (PolicyStoreId, len 1..200, pattern ^[a-zA-Z0-9-/_]*$) **required** —
 //!   the store's id, or `policy-store-alias/<name>` naming it.
 //! * `principalEntityType` (PrincipalEntityType, len 1..200, pattern ^.*$) — the

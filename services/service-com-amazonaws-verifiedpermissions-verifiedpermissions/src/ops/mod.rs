@@ -436,7 +436,8 @@ pub enum IdentityProviderDescription<'a> {
         user_pool_arn: &'a str,
         /// `clientIds`, absent when the request carried none.
         client_ids: Option<&'a [String]>,
-        /// `groupConfiguration.groupEntityType`, when the request set one.
+        /// `groupConfiguration.groupEntityType`, when the request set one; the
+        /// translation resolves an absent one to the service's default.
         group_entity_type: Option<&'a str>,
     },
     /// `openIdConnectConfiguration`: an OIDC provider outside the emulator.
@@ -609,6 +610,14 @@ fn listed(values: Option<&[String]>) -> Vec<String> {
 /// does not exist is refused instead of stored; an OIDC `issuer` names a provider
 /// outside the emulator and is accepted as given.
 ///
+/// It is also where a member the SERVICE decides for an absent request member is
+/// resolved, so state holds the value and every reader reports it: a Cognito user
+/// pool source whose write carried no `groupConfiguration` is stored mapping its
+/// groups to [`crate::state::DEFAULT_COGNITO_GROUP_ENTITY_TYPE`]. An OIDC
+/// `groupConfiguration` has no default to resolve to — its `groupClaim` names the
+/// claim groups arrive in and only the caller can say which that is — so an OIDC
+/// source that configured none maps no groups.
+///
 /// The `Err` names the member the caller has to fix, for the modelled
 /// `ValidationException`'s `fieldList`: the check reports the member relative to
 /// the configuration, and the pointer is rooted here at `C::MEMBER_PATH` — the
@@ -637,7 +646,14 @@ pub fn persisted_identity_source_configuration<
                     user_pool_id,
                     region,
                     client_ids: listed(client_ids),
-                    group_entity_type: group_entity_type.map(str::to_string),
+                    // A user pool source maps its groups to SOME entity type
+                    // whatever the write said, so the service's own default is
+                    // resolved here — as `principalEntityType`'s is — and
+                    // persisted, rather than applied again by each reader of the
+                    // stored source.
+                    group_entity_type: group_entity_type
+                        .unwrap_or(crate::state::DEFAULT_COGNITO_GROUP_ENTITY_TYPE)
+                        .to_string(),
                 },
             ))
         }

@@ -120,7 +120,8 @@ async fn identity_source_round_trips_every_configuration_it_was_created_with() {
     let cases: Vec<(&str, Value, &str, Value, Value)> = vec![
         (
             // No principalEntityType: the create's optional member resolves to
-            // the service's default, because every read requires one.
+            // the service's default, because every read requires one. No
+            // groupConfiguration either, which resolves the same way.
             "cognito-minimal",
             json!({ "configuration": { "cognitoUserPoolConfiguration": { "userPoolArn": arn } } }),
             "AWS::Cognito",
@@ -129,6 +130,7 @@ async fn identity_source_round_trips_every_configuration_it_was_created_with() {
                     "userPoolArn": arn,
                     "clientIds": [],
                     "issuer": issuer,
+                    "groupConfiguration": { "groupEntityType": "AWS::CognitoGroup" },
                 }
             }),
             json!({

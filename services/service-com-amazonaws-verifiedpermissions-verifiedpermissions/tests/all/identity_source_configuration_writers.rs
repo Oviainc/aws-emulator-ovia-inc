@@ -27,6 +27,7 @@ use crate::harness::{
     call, error_code, field_list, ok, router, store_with_validation_off, user_pool_arn,
 };
 use crate::identity_source_refusal_pointers::POOL_ARN_IN_CONFIGURATION;
+use service_com_amazonaws_verifiedpermissions_verifiedpermissions::state::DEFAULT_COGNITO_GROUP_ENTITY_TYPE;
 
 /// The region every request in this suite is signed for, from the harness, so a
 /// Cognito pool ARN and the emulator agree on the region.
@@ -124,13 +125,17 @@ async fn both_writers_store_one_provider_description_the_same_way() {
     let cases: Vec<(&str, Value, Value, Value)> = vec![
         (
             // No optional member at all: `clientIds` is absent on the request
-            // and a list on every read, so it is stored — and reported — empty.
+            // and a list on every read, so it is stored — and reported — empty,
+            // and a user pool source that named no `groupConfiguration` is
+            // stored — and reported — mapping its groups to the service's own
+            // default entity type.
             "cognito: no optional member",
             json!({ "cognitoUserPoolConfiguration": { "userPoolArn": arn } }),
             json!({ "cognitoUserPoolConfiguration": {
                 "userPoolArn": arn,
                 "clientIds": [],
                 "issuer": issuer,
+                "groupConfiguration": { "groupEntityType": DEFAULT_COGNITO_GROUP_ENTITY_TYPE },
             } }),
             json!({
                 "clientIds": [],
@@ -151,6 +156,7 @@ async fn both_writers_store_one_provider_description_the_same_way() {
                 "userPoolArn": arn,
                 "clientIds": [],
                 "issuer": issuer,
+                "groupConfiguration": { "groupEntityType": DEFAULT_COGNITO_GROUP_ENTITY_TYPE },
             } }),
             json!({
                 "clientIds": [],

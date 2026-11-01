@@ -76,16 +76,6 @@ const GROUPS_CLAIM: &str = "cognito:groups";
 /// (RFC 6749 §3.3), so it maps to a SET of strings rather than to one string.
 const SCOPE_CLAIM: &str = "scope";
 
-/// The Cedar entity type an Amazon Cognito user pool source's GROUPS carry when the
-/// identity source configured none, from `CognitoGroupConfiguration$groupEntityType`'s own
-/// model documentation: "the name of the schema entity type that's mapped to the user pool
-/// group. Defaults to `AWS::CognitoGroup`." The member is required inside an optional
-/// structure, so an absent group configuration is that default — the same shape of rule
-/// [`super::DEFAULT_COGNITO_PRINCIPAL_ENTITY_TYPE`] states for the principal's own type,
-/// and what makes a user pool's group claim a hierarchy whether or not the store named a
-/// type for it.
-pub const DEFAULT_COGNITO_GROUP_ENTITY_TYPE: &str = "AWS::CognitoGroup";
-
 /// The claims this service READS to decide whether a token is valid and whose principal
 /// it names, and which are therefore not mapped to principal attributes: the registered
 /// JWT claims the validation uses, the two claims naming the app client and the token's
@@ -526,11 +516,16 @@ fn principal_entity(
 ///
 /// A group claim becomes a PARENT of the principal only where the source says which entity
 /// type its groups are, because an entity needs a type to be one at all. An Amazon Cognito
-/// user pool source always has one — its own default
-/// ([`DEFAULT_COGNITO_GROUP_ENTITY_TYPE`]) where the store configured none — while an
-/// OpenID Connect source maps groups only when it configured a `groupConfiguration`, which
-/// is also what names the claim they arrive in: a user pool populates
-/// [`GROUPS_CLAIM`], and an OpenID Connect provider whichever claim its `groupClaim` names.
+/// user pool source always has one — the type the write of the source named, or the
+/// service's own default ([`super::DEFAULT_COGNITO_GROUP_ENTITY_TYPE`]) resolved into the
+/// stored source where it named none — while an OpenID Connect source maps groups only
+/// when it configured a `groupConfiguration`, which is also what names the claim they
+/// arrive in: a user pool populates [`GROUPS_CLAIM`], and an OpenID Connect provider
+/// whichever claim its `groupClaim` names.
+///
+/// Either way the type comes out of STATE and is not defaulted here, so the type an
+/// authorization call maps a group to is the one every read of the identity source
+/// reports.
 struct GroupMapping<'s> {
     claim: &'s str,
     entity_type: &'s str,
@@ -545,9 +540,7 @@ fn group_mapping(source: &IdentitySource) -> Option<GroupMapping<'_>> {
             ..
         }) => Some(GroupMapping {
             claim: GROUPS_CLAIM,
-            entity_type: group_entity_type
-                .as_deref()
-                .unwrap_or(DEFAULT_COGNITO_GROUP_ENTITY_TYPE),
+            entity_type: group_entity_type.as_str(),
             prefix: Some(user_pool_id.as_str()),
         }),
         IdentitySourceConfiguration::OpenIdConnect(OpenIdConnectSource {

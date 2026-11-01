@@ -106,6 +106,20 @@ pub const MAX_IDENTITY_SOURCES_PER_STORE: usize = 100;
 /// [`IdentitySource::principal_entity_type`].
 pub const DEFAULT_COGNITO_PRINCIPAL_ENTITY_TYPE: &str = "AWS::Cognito";
 
+/// The Cedar entity type a Cognito identity source's GROUPS carry when the write
+/// of the source carried no `groupConfiguration`.
+///
+/// `CognitoGroupConfiguration$groupEntityType` is required inside an OPTIONAL
+/// structure and its own model documentation states the default — "the name of
+/// the schema entity type that's mapped to the user pool group. Defaults to
+/// `AWS::CognitoGroup`" — so a write that named no group configuration leaves
+/// the source mapping its user pool's groups to this type. It is the same shape
+/// of rule [`DEFAULT_COGNITO_PRINCIPAL_ENTITY_TYPE`] states for the principal's
+/// own type, and it is resolved by the same writer
+/// ([`crate::ops::persisted_identity_source_configuration`]) so that the value
+/// the authorization path maps groups to is the value every read reports.
+pub const DEFAULT_COGNITO_GROUP_ENTITY_TYPE: &str = "AWS::CognitoGroup";
+
 /// The region used for a request that carries no SigV4 credential scope — the
 /// region every AWS SDK defaults to when none is configured.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -568,7 +582,7 @@ impl IdentitySourceConfiguration {
                     ("provider", Some("cognito")),
                     ("userPoolArn", Some(cognito.user_pool_arn.as_str())),
                     ("clientIds", Some(client_ids.as_str())),
-                    ("groupEntityType", cognito.group_entity_type.as_deref()),
+                    ("groupEntityType", Some(cognito.group_entity_type.as_str())),
                 ])
             }
             Self::OpenIdConnect(oidc) => {
@@ -624,8 +638,14 @@ pub struct CognitoUserPoolSource {
     pub user_pool_id: String,
     pub region: String,
     pub client_ids: Vec<String>,
-    /// `groupConfiguration.groupEntityType`, when the request set one.
-    pub group_entity_type: Option<String>,
+    /// The RESOLVED `groupConfiguration.groupEntityType`: the type the write
+    /// named, or [`DEFAULT_COGNITO_GROUP_ENTITY_TYPE`] when it named no group
+    /// configuration at all. A user pool source always maps its groups to some
+    /// entity type, so this is one stored value every reader of the source —
+    /// the reads that report `groupConfiguration` and the authorization path
+    /// that builds the group entities and refuses supplied entities of their
+    /// type — reaches instead of defaulting again on its own.
+    pub group_entity_type: String,
 }
 
 impl CognitoUserPoolSource {

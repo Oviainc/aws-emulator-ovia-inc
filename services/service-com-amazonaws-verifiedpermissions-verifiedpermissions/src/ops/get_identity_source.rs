@@ -13,6 +13,13 @@
 //! plus `/.well-known/openid-configuration`); see
 //! [`crate::state::CognitoUserPoolSource`].
 //!
+//! Every other member is read out of state as it was stored, including
+//! `configuration.cognitoUserPoolConfiguration.groupConfiguration`: a user pool
+//! source maps its groups to the entity type the write named or to the service's
+//! own default ([`crate::state::DEFAULT_COGNITO_GROUP_ENTITY_TYPE`], resolved at
+//! write time), so that structure is reported for every Cognito source and names
+//! the type an authorization call against the source maps its groups to.
+//!
 //! ## Input
 //!
 //! * `identitySourceId` (IdentitySourceId, len 1..200, pattern ^[a-zA-Z0-9-]*$) **required**
@@ -98,10 +105,13 @@ pub(crate) fn configuration_detail(
                 user_pool_arn: cognito.user_pool_arn.clone(),
                 client_ids: cognito.client_ids.clone(),
                 issuer: cognito.issuer(),
-                group_configuration: cognito.group_entity_type.as_ref().map(|entity_type| {
-                    CognitoGroupConfigurationDetail {
-                        group_entity_type: Some(entity_type.clone()),
-                    }
+                // A user pool source always maps its groups to an entity type —
+                // the one the write named or the service's own default, resolved
+                // and stored by the write — so the containing structure is
+                // reported for every such source, carrying the type the
+                // authorization path maps that pool's groups to.
+                group_configuration: Some(CognitoGroupConfigurationDetail {
+                    group_entity_type: Some(cognito.group_entity_type.clone()),
                 }),
             })
         }

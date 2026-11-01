@@ -270,6 +270,10 @@ async fn an_updated_identity_source_is_read_back_as_the_new_provider() {
                 // empty.
                 "clientIds": [],
                 "issuer": cognito_issuer,
+                // A user pool source that named no `groupConfiguration` maps its
+                // groups to the service's default entity type, which the write
+                // resolved and every read reports.
+                "groupConfiguration": { "groupEntityType": "AWS::CognitoGroup" },
             } }),
             // `principalEntityType` is absent from the update, so the value the
             // create stored is unchanged — a read requires it.
