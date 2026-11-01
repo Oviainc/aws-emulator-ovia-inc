@@ -24,6 +24,13 @@ mod prefix_lists;
 // every new ec2 suite inserts its lines.
 #[path = "all/get_managed_prefix_list_entries.rs"]
 mod get_managed_prefix_list_entries;
+// What `DescribeIpamPools` reports out of the IPAM pool store: every member the create stored,
+// how the id list, the documented filters and the page size narrow it, what it refuses, and the
+// state move the clock owes a pool it is read through. Declared after the suite above rather
+// than directly beside `prefix_lists`: that anchor is where every new ec2 suite inserts its
+// lines, so these two sit one block further down with context between them.
+#[path = "all/describe_ipam_pools.rs"]
+mod describe_ipam_pools;
 // The entries (rules) of a network ACL: what `CreateNetworkAclEntry` stores on a stored ACL
 // and in which order, what `DeleteNetworkAclEntry` takes off it, and the not-found answer
 // every read of a `DeleteNetworkAcl`-ed ACL gets. Declared beside `prefix_lists` for the
