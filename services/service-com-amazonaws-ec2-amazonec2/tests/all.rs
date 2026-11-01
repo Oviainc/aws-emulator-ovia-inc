@@ -535,6 +535,10 @@ mod default_network_per_region;
 mod delete_carrier_gateway;
 #[path = "all/delete_coip_pool.rs"]
 mod delete_coip_pool;
+// What `DeleteNetworkAcl` takes out of the store: the one ACL its id names, the blockers the
+// operation documents, and the store a refused or dry-run delete leaves untouched.
+#[path = "all/delete_network_acl.rs"]
+mod delete_network_acl;
 #[path = "all/delete_network_interface.rs"]
 mod delete_network_interface;
 #[path = "all/delete_security_group.rs"]
