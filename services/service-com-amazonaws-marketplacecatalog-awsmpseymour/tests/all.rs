@@ -61,6 +61,8 @@ mod modelled_member_lengths;
 mod page_size_rule;
 #[path = "all/page_token_rule.rs"]
 mod page_token_rule;
+#[path = "all/page_token_spelling.rs"]
+mod page_token_spelling;
 #[path = "all/request_validation.rs"]
 mod request_validation;
 #[path = "all/reserved_tag_keys.rs"]

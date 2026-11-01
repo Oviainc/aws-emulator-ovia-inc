@@ -3594,9 +3594,18 @@ pub fn encode_page_token(prefix: &str, offset: usize) -> String {
 
 /// The offset a `NextToken` this service issued for `prefix` resumes at, or
 /// `None` for a token it never issued.
+///
+/// Reading the digits is not enough to accept a token: `usize::from_str_radix`
+/// also reads spellings [`encode_page_token`] never writes — a leading `+`,
+/// leading zeros, uppercase hexadecimal digits — and the modelled `NextToken`
+/// pattern admits all of them, so they would reach here. A token names a page
+/// only when it is, character for character, the token this service mints for
+/// the offset it carries; every other spelling names no page, exactly like a
+/// non-hexadecimal one.
 pub fn decode_page_token(prefix: &str, token: &str) -> Option<usize> {
     let rest = token.strip_prefix(prefix)?.strip_prefix('-')?;
-    usize::from_str_radix(rest, 16).ok()
+    let offset = usize::from_str_radix(rest, 16).ok()?;
+    (encode_page_token(prefix, offset) == token).then_some(offset)
 }
 
 /// How long a details value this service stores and reports may be.
