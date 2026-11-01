@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the terminal `DELETED` status, which every operation that would
         // change it answers for as gone — and this service's not-found texts
         // name no identifier.
-        let target = store
+        let mut target = store
             .tags_for_mutation(&input.resource_arn)
             .map_err(|not_found| {
                 TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
@@ -165,46 +165,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
-        let crate::state::MutableTags {
-            tags,
-            max_tags,
-            noun,
-        } = target;
-        merge_tags(tags, input.tags, max_tags, noun)?;
+        // The merge itself — by key, all-or-nothing, and bounded by the cap the
+        // resolver reported for this kind of resource — is
+        // [`crate::state::MutableTags::merge`], so this wire and the
+        // data-transformation endpoint's REST tagging surface cannot merge or
+        // refuse on different terms.
+        target
+            .merge(input.tags.into_iter().map(|tag| (tag.key, tag.value)))
+            .map_err(|refused| {
+                TagResourceErrorModeled::ValidationException(ValidationException {
+                    message: Some(refused),
+                })
+            })?;
         Ok(TagResourceOutput {})
     }
-}
-
-/// Merge `requested`, by key, onto the `stored` tags of one resource, or refuse
-/// when the result would carry more than `max` tags.
-///
-/// Merging is all-or-nothing: the resulting tag set is bounded, so a stream of
-/// calls with fresh keys cannot grow a record without limit. The modelled
-/// `TagList` bound caps ONE request; `max` caps the resource, and `noun` names
-/// the kind of resource it caps in the refusal.
-fn merge_tags(
-    stored: &mut ::std::collections::BTreeMap<String, String>,
-    requested: Vec<Tag>,
-    max: usize,
-    noun: &str,
-) -> Result<(), TagResourceError> {
-    let merged = stored
-        .keys()
-        .map(String::as_str)
-        .chain(requested.iter().map(|tag| tag.key.as_str()))
-        .collect::<::std::collections::BTreeSet<&str>>()
-        .len();
-    if merged > max {
-        return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-            message: Some(format!(
-                "A {noun} carries at most {max} tags; this request would leave {merged}"
-            )),
-        })
-        .into());
-    }
-
-    for tag in requested {
-        stored.insert(tag.key, tag.value);
-    }
-    Ok(())
 }

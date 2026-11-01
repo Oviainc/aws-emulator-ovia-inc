@@ -86,9 +86,14 @@ impl HealthLake {
         decoded(response)
     }
 
-    /// Dispatch one REST request carrying no `X-Amz-Target`: a FHIR interaction or a
-    /// `/validate-source` call, exactly as a signed client sends it.
-    async fn rest(
+    /// Dispatch one REST request carrying no `X-Amz-Target`: a FHIR interaction, a
+    /// `/validate-source` call or a tagging call on `/tags` or `/untag`, exactly as a
+    /// signed client sends it.
+    ///
+    /// `pub(crate)` so the sibling suites drive a non-RPC surface through this one
+    /// harness rather than each building its own router — `tests/all/rest_tagging_surface.rs`
+    /// sends the data-transformation endpoint's tagging requests through it.
+    pub(crate) async fn rest(
         &self,
         method: &str,
         uri: &str,

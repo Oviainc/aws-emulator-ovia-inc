@@ -21,12 +21,15 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. THIS service uses it for two things. First, HealthLake serves two
+//!   correctly. THIS service uses it for two things. First, HealthLake serves three
 //!   surfaces that are not awsJson1_0 RPC calls and carry no `X-Amz-Target` at all —
 //!   a data store's FHIR REST data plane ([`fhir_rest`], on the path a
-//!   `DatastoreEndpoint` publishes) and the data-transformation endpoint's
-//!   `/validate-source` check ([`validate_source`]); neither is a modelled operation,
-//!   so the generated routing table cannot name either, and this seam routes them by
+//!   `DatastoreEndpoint` publishes), the data-transformation endpoint's
+//!   `/validate-source` check ([`validate_source`]) and that endpoint's REST tagging
+//!   surface ([`rest_tagging`], `/tags` and `/untag`); the first is not a modelled
+//!   operation at all and the others are modelled outside the closure of the service
+//!   shape this crate serves, so the generated routing table cannot name any of them,
+//!   and this seam routes them by
 //!   HTTP method and path, which is how a REST surface is addressed. Second, every
 //!   other request is handed to the input-validation gate described below, which lets
 //!   the generated routing table serve it from there.
@@ -81,6 +84,7 @@
 
 pub mod fhir_rest;
 pub mod non_rpc;
+pub mod rest_tagging;
 pub mod synthea;
 pub mod validate_source;
 
@@ -193,6 +197,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     fhir_rest: fhir_rest::FhirRestDataPlane<Eng>,
     /// Serves `POST /validate-source`, which is stateless.
     validate_source: validate_source::ValidateSource,
+    /// Serves the data-transformation endpoint's REST tagging surface — `GET`/`POST
+    /// /tags/{ResourceArn}` and `POST /untag/{ResourceArn}`. Held on the service for
+    /// the reason [`fhir_rest`] is, and owns the shared engine so the tags it writes
+    /// are the ones the awsJson tagging operations read.
+    rest_tagging: rest_tagging::RestTagging<Eng>,
     /// The input-validation gate for each modelled operation, keyed by the routing key
     /// the protocol resolves for it (the operation's own `NAME`). Built once, in `new`.
     input_validation: HashMap<&'static str, Box<dyn ErasedOperation>>,
@@ -206,6 +215,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             fhir_rest: fhir_rest::FhirRestDataPlane::new(Arc::clone(&engine)),
             validate_source: validate_source::ValidateSource::new(),
+            rest_tagging: rest_tagging::RestTagging::new(Arc::clone(&engine)),
             entry: crate::ServiceDefinition::new(engine),
             input_validation: input_validation_gates::<Eng>(),
         }
@@ -412,16 +422,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Two HealthLake surfaces are not awsJson1_0 RPC calls: a data store's FHIR
-        // REST endpoint and the data-transformation endpoint's `/validate-source`
-        // check. Both are addressed by path and HTTP method and carry no
+        // Three HealthLake surfaces are not awsJson1_0 RPC calls: a data store's FHIR
+        // REST endpoint, and on the data-transformation endpoint the
+        // `/validate-source` check and the REST tagging surface (`/tags` and
+        // `/untag`). Each is addressed by path and HTTP method and carries no
         // `X-Amz-Target`, so the protocol's routing key cannot name them and the
         // framework would otherwise refuse them at the codec with `400
         // SerializationException`. They are routed FIRST, because this seam is the one
         // place a service can name a request the model's routing key cannot.
         //
         // A request that DOES name an RPC target is an RPC call whatever its path, so
-        // it is left to the modelled path below: these two surfaces are non-RPC by
+        // it is left to the modelled path below: these surfaces are non-RPC by
         // construction.
         if req.headers().get("x-amz-target").is_none() {
             let path = non_rpc::request_path(req.uri());
@@ -430,6 +441,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             }
             if req.method() == "POST" && non_rpc::addresses_validate_source(path) {
                 return Some(&self.validate_source);
+            }
+            if rest_tagging::addressed_tagging(req.method(), req.uri()).is_some() {
+                return Some(&self.rest_tagging);
             }
         }
         // Otherwise, put this service's input-validation gate in front of the modelled

@@ -149,51 +149,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The modelled `AmazonResourceName` pattern admits BOTH of this
-        // service's resource forms, and both carry tags, so the ARN is resolved
-        // to whichever resource it names; an ARN of neither form names nothing,
-        // and this service's not-found texts name no identifier.
-        let resolved = crate::state::tagged_resource_from_arn(&input.resource_arn);
-
         let mut store = state.lock();
         // Settle first, so this reader agrees with Describe/List/Delete about
         // which records still exist: a record whose retention has run out is
         // reaped at the same instant for every one of them.
         store.settle_lifecycle();
-        // Whichever resource it is, the stored record's own ARN must equal the
-        // one the caller handed in, so an ARN naming another partition, region
-        // or account resolves to nothing even when its id segment happens to
-        // match a local one.
-        let (tags, not_found) = match resolved {
-            Some(crate::state::TaggedResource::Datastore(id)) => (
-                store
-                    .datastores
-                    .get(id)
-                    .filter(|datastore| datastore.arn == input.resource_arn)
-                    .map(crate::state::Datastore::tag_list),
-                crate::state::DATASTORE_NOT_FOUND_MESSAGE,
-            ),
-            Some(crate::state::TaggedResource::Profile(id)) => (
-                store
-                    .profiles
-                    .get(id)
-                    .filter(|profile| profile.arn == input.resource_arn)
-                    .map(crate::state::DataTransformationProfile::tag_list),
-                crate::state::PROFILE_NOT_FOUND_MESSAGE,
-            ),
-            // Unreachable through the wire — the modelled pattern is enforced
-            // before this handler runs — but an ARN of neither form names no
-            // resource, so it is answered the same way a missing one is.
-            None => (None, crate::state::DATASTORE_NOT_FOUND_MESSAGE),
-        };
-        let Some(tags) = tags else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(not_found.to_string()),
-                },
-            )
-            .into());
-        };
+        // The modelled `AmazonResourceName` pattern admits BOTH of this
+        // service's resource forms, and both carry tags, so the ARN is resolved
+        // to whichever resource it names through the ONE resolver the reporting
+        // tagging operations share
+        // ([`crate::state::ComAmazonawsHealthlakeHealthlakeState::tags_for_report`],
+        // also what the data-transformation endpoint's REST
+        // `GET /tags/{ResourceArn}` reports from): it requires the stored
+        // record's own ARN to equal the one the caller handed in, so an ARN
+        // naming another partition, region or account resolves to nothing even
+        // when its id segment happens to match a local one, and this service's
+        // not-found texts name no identifier.
+        let tags = store.tags_for_report(&input.resource_arn).map_err(|not_found| {
+            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(not_found.to_string()),
+            })
+        })?;
 
         Ok(ListTagsForResourceOutput { tags: Some(tags) })
     }

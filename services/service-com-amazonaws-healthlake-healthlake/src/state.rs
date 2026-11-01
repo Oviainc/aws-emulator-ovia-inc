@@ -50,7 +50,7 @@
 //! transformation job reads and writes Amazon S3 rather than a data store, so
 //! no record reaps one.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
@@ -2000,6 +2000,45 @@ impl ComAmazonawsHealthlakeHealthlakeState {
         }
     }
 
+    /// The tags a READER reports for the resource `arn` names, or the sentence
+    /// that states which resource was not found.
+    ///
+    /// The reporting counterpart of [`Self::tags_for_mutation`], and the ONE
+    /// place a tag REPORT resolves its `ResourceArn`, so every wire that reports
+    /// a resource's tags — the awsJson `ListTagsForResource` and the
+    /// data-transformation endpoint's REST `GET /tags/{ResourceArn}` — resolves
+    /// and refuses on identical terms. Whichever resource the ARN names, the
+    /// stored record's own ARN must equal the one the caller handed in, so an ARN
+    /// naming another partition, region or account resolves to nothing even when
+    /// its id segment happens to match a local one.
+    ///
+    /// Unlike a mutation, a report does NOT exclude a data store that has reached
+    /// the terminal [`DatastoreStatus::Deleted`] status: the record lingers for
+    /// [`DELETED_RETENTION`] precisely so a reader can still observe it. Call
+    /// [`Self::settle_lifecycle`] first, so this reader agrees with
+    /// Describe/List/Delete about which records still exist.
+    pub fn tags_for_report(&self, arn: &str) -> Result<Vec<Tag>, &'static str> {
+        match tagged_resource_from_arn(arn) {
+            Some(TaggedResource::Datastore(id)) => self
+                .datastores
+                .get(id)
+                .filter(|datastore| datastore.arn == arn)
+                .map(Datastore::tag_list)
+                .ok_or(DATASTORE_NOT_FOUND_MESSAGE),
+            Some(TaggedResource::Profile(id)) => self
+                .profiles
+                .get(id)
+                .filter(|profile| profile.arn == arn)
+                .map(DataTransformationProfile::tag_list)
+                .ok_or(PROFILE_NOT_FOUND_MESSAGE),
+            // Unreachable through the awsJson wire — the modelled
+            // `AmazonResourceName` pattern is enforced before a handler runs —
+            // but an ARN of neither resource form names no resource, so it is
+            // answered the same way a missing one is.
+            None => Err(DATASTORE_NOT_FOUND_MESSAGE),
+        }
+    }
+
     /// Reap every terminal record NOW, whatever its retention: the answer to a
     /// full store, taken before a create is refused, so a caller that deletes
     /// what it created can always create again.
@@ -2579,6 +2618,59 @@ pub struct MutableTags<'a> {
     pub tags: &'a mut BTreeMap<String, String>,
     pub max_tags: usize,
     pub noun: &'static str,
+}
+
+impl MutableTags<'_> {
+    /// Merge `requested`, by key, onto the resource's stored tags, or refuse
+    /// with the sentence that states the cap when the result would carry more
+    /// than [`Self::max_tags`] of them.
+    ///
+    /// Merging is all-or-nothing: the resulting tag set is bounded, so a stream
+    /// of calls with fresh keys cannot grow a record without limit. The modelled
+    /// tag collection's own bound caps ONE request; this caps the RESOURCE, and
+    /// [`Self::noun`] names the kind of resource it caps in the refusal.
+    ///
+    /// The ONE place a tag merge is written, so every wire that merges tags onto
+    /// a resource of this service — the awsJson `TagResource` and the
+    /// data-transformation endpoint's REST `POST /tags/{ResourceArn}` — merges
+    /// and refuses on identical terms.
+    pub fn merge<I: IntoIterator<Item = (String, String)>>(
+        &mut self,
+        requested: I,
+    ) -> Result<(), String> {
+        let requested: Vec<(String, String)> = requested.into_iter().collect();
+        let merged = self
+            .tags
+            .keys()
+            .map(String::as_str)
+            .chain(requested.iter().map(|(key, _value)| key.as_str()))
+            .collect::<BTreeSet<&str>>()
+            .len();
+        if merged > self.max_tags {
+            return Err(format!(
+                "A {} carries at most {} tags; this request would leave {merged}",
+                self.noun, self.max_tags
+            ));
+        }
+
+        for (key, value) in requested {
+            self.tags.insert(key, value);
+        }
+        Ok(())
+    }
+
+    /// Remove the tags `keys` names from the resource's stored tags.
+    ///
+    /// Removal is BY KEY and idempotent: only the keys named go, a key the
+    /// resource does not carry leaves the stored set as it was, and nothing else
+    /// about the record changes — so repeating a request answers the same way
+    /// and reports the same set. Shared by every wire that untags a resource of
+    /// this service, for the reason [`Self::merge`] is.
+    pub fn remove_keys<K: AsRef<str>, I: IntoIterator<Item = K>>(&mut self, keys: I) {
+        for key in keys {
+            self.tags.remove(key.as_ref());
+        }
+    }
 }
 
 /// The resource a HealthLake `AmazonResourceName` names, or `None` when the ARN

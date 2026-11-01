@@ -54,7 +54,7 @@ use smithy_server_runtime::{
     BoxFuture, ErasedOperation, OperationContext, Service, Violation, ViolationKind,
 };
 
-use super::non_rpc::bounded;
+use super::non_rpc::{bounded, modelled_error};
 
 /// The path this endpoint publishes, as the first (and only) segment of the request
 /// URI, from the modelled `@http(uri: "/validate-source")`. The
@@ -92,10 +92,6 @@ const MAX_SOURCE_FILE_BYTES: usize = 10_485_760;
 /// The media type the validation report is returned as. The report is not a FHIR
 /// resource, so it carries the service's ordinary JSON media type.
 const JSON_CONTENT_TYPE: &str = "application/json";
-
-/// The media type this service's awsJson1_0 envelope travels as, which the modelled
-/// errors below answer in.
-const AWS_JSON_CONTENT_TYPE: &str = "application/x-amz-json-1.0";
 
 /// The `ValidationSeverity` every finding this validator produces carries.
 ///
@@ -372,8 +368,8 @@ fn report_response(source_format: &str, findings: &[Finding]) -> RtResponse {
 /// `message`: this service answers a refusal from its MODELLED error shape (see the
 /// "Why this file validates input" note in [`crate::service`]) so an SDK surfaces the
 /// sentence instead of an empty message. `ValidateSource` has no generated module in
-/// this crate to carry that shape, so the envelope is written here, exactly as
-/// [`unreadable_body`] writes the modelled server fault.
+/// this crate to carry that shape, so the envelope comes from
+/// [`super::non_rpc::modelled_error`], which every non-RPC surface answers through.
 fn validation_exception(message: &str) -> RtResponse {
     modelled_error(400, "ValidationException", message)
 }
@@ -391,24 +387,6 @@ fn unreadable_body() -> RtResponse {
         "InternalServerException",
         "The server could not read the submitted document from the request body",
     )
-}
-
-/// One modelled error of this service, as its awsJson1_0 envelope renders one: the
-/// shape NAME in `__type` — the spelling every other error of this crate carries,
-/// from the framework's own renderer — and the shape's own `Message` member.
-fn modelled_error(status: u16, shape: &str, message: &str) -> RtResponse {
-    let body = ::serde_json::json!({
-        "__type": shape,
-        "Message": message,
-    });
-    let mut response = RtResponse::new(
-        StatusCode::try_from(status).expect("the status is a constant of this module"),
-        SdkBody::from(body.to_string()),
-    );
-    response
-        .headers_mut()
-        .insert("content-type", AWS_JSON_CONTENT_TYPE);
-    response
 }
 
 /// Everything structurally wrong with `body` as a C-CDA document, in document order.

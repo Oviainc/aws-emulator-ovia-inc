@@ -73,6 +73,8 @@ mod publish_data_transformation_profile;
 mod resource_tagging;
 #[path = "all/resource_untagging.rs"]
 mod resource_untagging;
+#[path = "all/rest_tagging_surface.rs"]
+mod rest_tagging_surface;
 #[path = "all/restore_fhir_datastore.rs"]
 mod restore_fhir_datastore;
 #[path = "all/seen_client_token_is_ignored.rs"]

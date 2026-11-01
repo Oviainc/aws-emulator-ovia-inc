@@ -154,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the terminal `DELETED` status, which every operation that would
         // change it answers for as gone — and this service's not-found texts
         // name no identifier.
-        let target = store
+        let mut target = store
             .tags_for_mutation(&input.resource_arn)
             .map_err(|not_found| {
                 UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
@@ -162,13 +162,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
-        // Removal is BY KEY and idempotent: only the keys named go, a key the
-        // resource does not carry leaves the stored set as it was, and nothing
-        // else about the record changes — so repeating a request answers the
-        // same way and reports the same set.
-        for key in &input.tag_keys {
-            target.tags.remove(key);
-        }
+        // Removal is BY KEY and idempotent, and that rule is
+        // [`crate::state::MutableTags::remove_keys`] — shared with the
+        // data-transformation endpoint's REST `POST /untag/{ResourceArn}`, so
+        // the two wires remove exactly the same way.
+        target.remove_keys(&input.tag_keys);
         Ok(UntagResourceOutput {})
     }
 }

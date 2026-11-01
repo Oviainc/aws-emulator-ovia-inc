@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What this service's two NON-RPC surfaces share: how a request's path and query are
-//! read, and how a message echoes a value the caller chose.
+//! What this service's NON-RPC surfaces share: how a request's path and query are
+//! read, how a message echoes a value the caller chose, and how a modelled error of
+//! this service is rendered outside the generated operations.
 //!
-//! HealthLake serves two surfaces that are not awsJson1_0 RPC calls — a data store's
-//! FHIR REST data plane ([`super::fhir_rest`]) and the data-transformation endpoint's
-//! `/validate-source` check ([`super::validate_source`]) — and both are addressed by
-//! HTTP method and path rather than by `X-Amz-Target`. The readers below are what
+//! HealthLake serves surfaces that are not awsJson1_0 RPC calls — a data store's
+//! FHIR REST data plane ([`super::fhir_rest`]) and, on the data-transformation
+//! endpoint, the `/validate-source` check ([`super::validate_source`]) and the REST
+//! tagging surface ([`super::rest_tagging`]) — and each is addressed by HTTP method
+//! and path rather than by `X-Amz-Target`. The readers below are what
 //! [`super::EmulatedService::override_operation`] routes them with, and what their
 //! handlers then read their own inputs with, so the routing decision and the handler
 //! cannot read a request differently.
+
+use aws_smithy_runtime_api::http::{Response as RtResponse, StatusCode};
+use aws_smithy_types::body::SdkBody;
 
 /// The most characters of a caller-supplied value a message from these surfaces
 /// echoes, so a request cannot amplify itself into an arbitrarily long response.
@@ -74,6 +79,33 @@ pub(crate) fn bounded(value: &str) -> String {
         Some((end, _)) => format!("{}…", &trimmed[..end]),
         None => trimmed.to_string(),
     }
+}
+
+/// The media type this service's awsJson1_0 envelope travels as, which the modelled
+/// errors below answer in.
+const AWS_JSON_CONTENT_TYPE: &str = "application/x-amz-json-1.0";
+
+/// One modelled error of this service, as its awsJson1_0 envelope renders one: the
+/// shape NAME in `__type` — the spelling every other error of this crate carries,
+/// from the framework's own renderer — and the shape's own `Message` member.
+///
+/// The non-RPC surfaces have no generated module to carry their modelled error
+/// shapes, so this is where they are written; it is `pub(crate)` and shared so a
+/// refusal from one of them is indistinguishable, in shape, from a refusal of any
+/// other HealthLake operation.
+pub(crate) fn modelled_error(status: u16, shape: &str, message: &str) -> RtResponse {
+    let body = ::serde_json::json!({
+        "__type": shape,
+        "Message": message,
+    });
+    let mut response = RtResponse::new(
+        StatusCode::try_from(status).expect("the status is a constant of a caller of this module"),
+        SdkBody::from(body.to_string()),
+    );
+    response
+        .headers_mut()
+        .insert("content-type", AWS_JSON_CONTENT_TYPE);
+    response
 }
 
 #[cfg(test)]
