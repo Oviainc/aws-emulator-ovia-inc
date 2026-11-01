@@ -63,6 +63,8 @@ mod page_size_rule;
 mod page_token_rule;
 #[path = "all/page_token_spelling.rs"]
 mod page_token_spelling;
+#[path = "all/pair_uniqueness_under_every_intent.rs"]
+mod pair_uniqueness_under_every_intent;
 #[path = "all/request_validation.rs"]
 mod request_validation;
 #[path = "all/reserved_tag_keys.rs"]
