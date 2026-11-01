@@ -22,7 +22,9 @@
 //! an id, [`ComAmazonawsAiopsAiopsState::groups_in_region_from`]).
 //!
 //! What an id looks like is likewise decided once, in [`is_group_id`], from the one
-//! modelled pattern segment that states it.
+//! modelled pattern segment that states it, and an ARN is split into its fields once,
+//! in [`arn_fields`] — so the identifier resolver and the cross-account rule read the
+//! same grammar and cannot disagree about what an ARN is.
 //!
 //! This service is REGIONAL — its endpoints are `aiops.<region>.<dns-suffix>`
 //! (`smithy_query(query="service_info")`) — so every regional endpoint serves only the
@@ -1340,25 +1342,44 @@ pub fn policy_document_rejection(policy: &str) -> Option<String> {
     })
 }
 
+/// The literal first field every ARN opens with.
+const ARN_FIRST_FIELD: &str = "arn";
+
+/// The six colon-separated fields of `candidate` —
+/// `arn:<partition>:<service>:<region>:<account>:<resource>` — or `None` when it is not
+/// in that form at all: fewer than six fields, or a first field that is not literally
+/// `arn`.
+///
+/// ONE definition of "split an ARN" for this module: every rule of this service that
+/// reads a field out of an ARN — the service namespace and resource an identifier names
+/// ([`group_id_from_arn`]) and the account a cross-account source role names
+/// ([`arn_account_id`]) — splits it here and differs only in which of the fields it then
+/// requires, so a change to what this service accepts as an ARN is made exactly once.
+///
+/// The resource portion may itself hold `:` (`…:type:id`), so only the leading fields
+/// are split off and the last field keeps every colon it carries.
+fn arn_fields(candidate: &str) -> Option<[&str; 6]> {
+    let mut split = candidate.splitn(6, ':');
+    let fields = [
+        split.next()?,
+        split.next()?,
+        split.next()?,
+        split.next()?,
+        split.next()?,
+        split.next()?,
+    ];
+    (fields[0] == ARN_FIRST_FIELD).then_some(fields)
+}
+
 /// The account id field of `arn`, or `None` when `arn` is not an ARN carrying one.
 ///
-/// An ARN is `arn:partition:service:region:account:resource`, and the resource
-/// portion may itself hold `:`, so only the first five fields are split off.
-///
-/// The account is the FIFTH field of a complete ARN, so all six have to be present for
-/// one to be read: a string with fewer fields carries no account id — its last field is
-/// a resource, a region or a service name — and answers `None` rather than having
-/// whatever sits in the fourth position read as an account. An ARN whose account field
-/// is empty, as a resource owned by no account spells it, carries none either.
+/// The account is the FIFTH field of a complete ARN ([`arn_fields`]), so all six have to
+/// be present for one to be read: a string with fewer fields carries no account id — its
+/// last field is a resource, a region or a service name — and answers `None` rather than
+/// having whatever sits in the fourth position read as an account. An ARN whose account
+/// field is empty, as a resource owned by no account spells it, carries none either.
 pub fn arn_account_id(arn: &str) -> Option<&str> {
-    let mut fields = arn.strip_prefix("arn:")?.splitn(5, ':');
-    let (_partition, _service, _region, account, _resource) = (
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-    );
+    let [_arn, _partition, _service, _region, account, _resource] = arn_fields(arn)?;
     (!account.is_empty()).then_some(account)
 }
 
@@ -1411,19 +1432,11 @@ pub fn is_group_id(text: &str) -> bool {
 
 /// The id segment of an investigation-group ARN, or `None` when `identifier` is not
 /// an ARN of this service's investigation-group resource.
+///
+/// The service namespace is the THIRD field of a complete ARN and the resource the
+/// SIXTH, both read off the one split ([`arn_fields`]).
 pub fn group_id_from_arn(identifier: &str) -> Option<&str> {
-    if !identifier.starts_with("arn:") {
-        return None;
-    }
-    let mut fields = identifier.splitn(6, ':');
-    let (_arn, _partition, service, _region, _account, resource) = (
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-    );
+    let [_arn, _partition, service, _region, _account, resource] = arn_fields(identifier)?;
     if service != ARN_SERVICE {
         return None;
     }
