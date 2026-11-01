@@ -3,9 +3,13 @@
 //! @op GetAutomationRule
 //!
 //! IMPLEMENTED. Looks the rule up by ARN and reports every field the store holds
-//! for it. An ARN no rule has is `ResourceNotFoundException` (404); one that does
-//! not satisfy the modelled `RuleArn` pattern is refused at the boundary as
-//! `InvalidParameterValueException` (400) — see `src/service.rs`.
+//! for it. A well-formed `RuleArn` that no rule has is
+//! `ResourceNotFoundException` (404); a `ruleArn` that names no automation rule
+//! of this service at all — a string outside the modelled `RuleArn` form — never
+//! reaches this handler: it is refused `AccessDeniedException` (403) by the
+//! authorization seam in `src/service.rs`, which judges the resource string as
+//! supplied ahead of the modelled-constraint walk, so that walk's
+//! `InvalidParameterValueException` (400) is never the answer for `ruleArn`.
 //!
 //! ## Shape of an operation
 //!

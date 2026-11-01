@@ -6,10 +6,13 @@
 //! rule up by the ARN in `resourceArn` and reports exactly the tag list the store
 //! holds for that rule — the tags a create carried, as later changed by the
 //! tagging operations — so two consecutive calls on an unchanged rule answer the
-//! same thing and nothing is written. An ARN no rule has is
-//! `ResourceNotFoundException` (404); one that does not satisfy the modelled
-//! `RuleArn` pattern is refused at the boundary as `InvalidParameterValueException`
-//! (400) — see `src/service.rs`.
+//! same thing and nothing is written. A well-formed `RuleArn` that no rule has is
+//! `ResourceNotFoundException` (404); a `resourceArn` that names no automation
+//! rule of this service at all — a string outside the modelled `RuleArn` form —
+//! never reaches this handler: it is refused `AccessDeniedException` (403) by the
+//! authorization seam in `src/service.rs`, which judges the resource string as
+//! supplied ahead of the modelled-constraint walk, so that walk's
+//! `InvalidParameterValueException` (400) is never the answer for `resourceArn`.
 //!
 //! ## Shape of an operation
 //!

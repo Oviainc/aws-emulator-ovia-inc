@@ -103,6 +103,8 @@ mod recommended_action_summaries;
 mod recommended_actions;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
+#[path = "all/resource_arn_refusal_order.rs"]
+mod resource_arn_refusal_order;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/resource_tags.rs"]
