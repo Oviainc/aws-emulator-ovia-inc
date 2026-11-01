@@ -152,6 +152,13 @@ fn absent_stage_arn(id: &str) -> String {
     format!("arn:aws:ivs:{REGION}:{ACCOUNT}:stage/{id}")
 }
 
+/// A well-formed public-key ARN, for the rows that call an operation this emulator has
+/// not implemented: the ARN satisfies the modelled `PublicKeyArn` pattern, so the request
+/// reaches the handler rather than the boundary validator.
+fn public_key_arn(id: &str) -> String {
+    format!("arn:aws:ivs:{REGION}:{ACCOUNT}:public-key/{id}")
+}
+
 /// The one message rule every not-found refusal of this service follows.
 fn not_found_message(identifier: &str) -> String {
     format!("Resource: {identifier} not found")
@@ -329,8 +336,8 @@ async fn every_refused_call_states_its_code_its_text_and_the_request_it_answers(
         },
         RefusalCase {
             case: "an operation this emulator has not implemented",
-            operation: "ListPublicKeys",
-            request: json!({}),
+            operation: "DeletePublicKey",
+            request: json!({ "arn": public_key_arn("neverImported") }),
             status: 501,
             code: "NotImplemented",
             message: None,
@@ -624,7 +631,11 @@ async fn every_response_names_the_one_request_it_answers() {
             "CreateParticipantToken",
             json!({ "stageArn": stage, "duration": 20_161 }),
         ),
-        ("a scaffolded operation", "ListPublicKeys", json!({})),
+        (
+            "a scaffolded operation",
+            "DeletePublicKey",
+            json!({ "arn": public_key_arn("neverImported3") }),
+        ),
     ];
 
     let mut seen: Vec<String> = Vec::new();

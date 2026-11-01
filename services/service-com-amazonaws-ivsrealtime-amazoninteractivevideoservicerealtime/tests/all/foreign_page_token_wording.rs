@@ -138,7 +138,7 @@ struct Listing {
 /// required members come from `smithy_query(query="operation",operation="ListStages,
 /// ListStorageConfigurations,ListEncoderConfigurations,ListIngestConfigurations,
 /// ListCompositions,ListStageSessions,ListParticipants,ListParticipantEvents,
-/// ListParticipantReplicas")`.
+/// ListParticipantReplicas,ListPublicKeys")`.
 fn listings(stage_arn: &str) -> Vec<Listing> {
     vec![
         Listing {
@@ -183,6 +183,10 @@ fn listings(stage_arn: &str) -> Vec<Listing> {
                 "sourceStageArn": stage_arn,
                 "participantId": PARTICIPANT_ID,
             }),
+        },
+        Listing {
+            operation: "ListPublicKeys",
+            required: json!({}),
         },
     ]
 }

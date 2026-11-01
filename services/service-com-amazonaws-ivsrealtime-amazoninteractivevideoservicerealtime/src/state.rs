@@ -8,7 +8,8 @@
 //! grouped into (`GetParticipant`, `ListParticipants`), the occurrences during one of
 //! those sessions (`ListParticipantEvents`), the compositions a stage is composed
 //! into (`StartComposition`, `GetComposition`, `StopComposition`) and the public keys a
-//! customer signs its own participant tokens with (`ImportPublicKey`, `GetPublicKey`) all
+//! customer signs its own participant tokens with (`ImportPublicKey`, `GetPublicKey`,
+//! `ListPublicKeys`) all
 //! read and write the records below, so the records, the id minting they share and the
 //! modelled defaults they apply live here rather than in any one operation's file.
 
@@ -30,7 +31,8 @@ use crate::ops::types::{
     IngestConfigurationSummary, InternalServerException, LayoutConfiguration, Participant,
     ParticipantRecordingHlsConfiguration, ParticipantReplica, ParticipantSummary,
     ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration, PublicKey,
-    RecordingConfiguration, RedundantIngestCredential, ResourceNotFoundException,
+    PublicKeySummary, RecordingConfiguration, RedundantIngestCredential,
+    ResourceNotFoundException,
     S3DestinationConfiguration, S3StorageConfiguration,
     ServiceQuotaExceededException, Stage, StageEndpoints, StageSession, StageSessionSummary,
     StageSummary,
@@ -419,7 +421,8 @@ pub const NO_ACTIVE_SESSION_ID: &str = "";
 /// results to return. Default: 50.") and states the same default on
 /// `ListParticipantsRequest$maxResults`, `ListParticipantReplicasRequest$maxResults`,
 /// `ListParticipantEventsRequest$maxResults` and `ListStageSessionsRequest$maxResults`,
-/// so those listings page by it.
+/// and the same again on `ListPublicKeysRequest$maxResults`, so those listings page by
+/// it.
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 50;
 
 /// Total size an `attributes` map may reach, on every shape of this service that
@@ -1122,6 +1125,10 @@ const ENCODER_CONFIGURATION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-encoder-conf
 /// so a token issued by one listing names no position in another and is refused there.
 const INGEST_CONFIGURATION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-ingest-configuration-after:";
 
+/// The same marker for a `ListPublicKeys` page, kept distinct from the others so a token
+/// issued by one listing names no position in another and is refused there.
+const PUBLIC_KEY_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-public-key-after:";
+
 /// One stage, as `CreateStage` persisted it and `GetStage` / `ListStages` report it.
 #[derive(Debug, Clone)]
 pub struct StageRecord {
@@ -1553,6 +1560,23 @@ impl PublicKeyRecord {
             fingerprint: Some(self.fingerprint.clone()),
             // Always reported, empty map included: `tags` is how a caller reads the tags
             // back, exactly as on a stage.
+            tags: Some(self.tags.clone()),
+        }
+    }
+
+    /// The modelled `PublicKeySummary` this record reports in a `ListPublicKeys` page.
+    ///
+    /// `PublicKeySummary` carries three of the five members `PublicKey` does — `arn`,
+    /// `name` and `tags`, and neither `publicKeyMaterial` nor `fingerprint`
+    /// (`smithy_query(query="shape",shape="PublicKey,PublicKeySummary")`) — and each is
+    /// projected off this one record, so a summary and a read answer alike on every
+    /// member both carry.
+    pub fn to_summary(&self) -> PublicKeySummary {
+        PublicKeySummary {
+            arn: Some(self.arn.clone()),
+            // The same members of the same record [`Self::to_public_key`] reports, so a
+            // summary and a read answer alike.
+            name: Some(self.name.clone()),
             tags: Some(self.tags.clone()),
         }
     }
@@ -4181,6 +4205,19 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
         configurations
     }
 
+    /// Every public key of `region` in import order — the order `ListPublicKeys` pages
+    /// over, so a key imported or deleted mid-pagination cannot shift a later page onto
+    /// an already-returned one.
+    pub fn public_keys_in_order(&self, region: &str) -> Vec<&PublicKeyRecord> {
+        let mut public_keys: Vec<&PublicKeyRecord> = self
+            .public_keys
+            .values()
+            .filter(|record| in_request_region(&record.arn, region))
+            .collect();
+        public_keys.sort_by_key(|record| record.sequence);
+        public_keys
+    }
+
     /// Every session the stage `stage_arn` has had, in start order — the order
     /// `ListStageSessions` pages over, so a session opening or ending mid-pagination
     /// cannot shift a later page onto an already-returned one. A stage `region`'s view
@@ -5499,6 +5536,35 @@ pub fn decode_storage_configuration_page_token(
 ) -> Option<u64> {
     decode_after(
         STORAGE_CONFIGURATION_PAGE_TOKEN_PREFIX,
+        &[region],
+        NO_FILTERS,
+        issued_through,
+        token,
+    )
+}
+
+/// [`encode_page_token`] for a `ListPublicKeys` page: the import sequence the next page
+/// of public keys resumes after, under that listing's own marker and over the region
+/// whose view the page reported.
+pub fn encode_public_key_page_token(region: &str, after_sequence: u64) -> String {
+    encode_after(
+        PUBLIC_KEY_PAGE_TOKEN_PREFIX,
+        &[region],
+        NO_FILTERS,
+        after_sequence,
+    )
+}
+
+/// The import sequence a public-key `nextToken` resumes after, or `None` when the token
+/// was not issued by [`encode_public_key_page_token`] for that same scope — a token of
+/// another listing or of another region included.
+pub fn decode_public_key_page_token(
+    region: &str,
+    issued_through: u64,
+    token: &str,
+) -> Option<u64> {
+    decode_after(
+        PUBLIC_KEY_PAGE_TOKEN_PREFIX,
         &[region],
         NO_FILTERS,
         issued_through,

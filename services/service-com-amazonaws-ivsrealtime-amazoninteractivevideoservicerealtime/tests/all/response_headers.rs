@@ -235,6 +235,13 @@ fn absent_stage_arn(id: &str) -> String {
     format!("arn:aws:ivs:{REGION}:{ACCOUNT}:stage/{id}")
 }
 
+/// A well-formed public-key ARN, for the row that calls a still-scaffolded operation: the
+/// ARN satisfies the modelled `PublicKeyArn` pattern, so the request reaches the handler
+/// and the 501 is the scaffold's rather than a boundary refusal.
+fn public_key_arn(id: &str) -> String {
+    format!("arn:aws:ivs:{REGION}:{ACCOUNT}:public-key/{id}")
+}
+
 /// RULE, first and second readings: every response class this service answers carries the
 /// five unconditional headers, each with the endpoint's own value, and none of them grants
 /// an origin under the default browser-facing policy.
@@ -322,8 +329,8 @@ async fn every_response_class_carries_the_endpoints_header_policy() {
         ),
         (
             "a scaffolded operation",
-            "ListPublicKeys",
-            json!({}),
+            "DeletePublicKey",
+            json!({ "arn": public_key_arn("neverImported") }),
             501,
         ),
     ];

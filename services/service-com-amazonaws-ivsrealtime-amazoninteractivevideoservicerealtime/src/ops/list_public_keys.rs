@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPublicKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPublicKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPublicKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +63,9 @@
 //!   this action.
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
 //!   by an Amazon Web Services service.
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   a shape this SERVICE models that this operation does not list, so an unreachable
+//!   shared store is a modelled server failure rather than a panic.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -84,13 +78,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninter
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListPublicKeysError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivsrealtime#ListPublicKeys")]
+// here — hence the `ListPublicKeysError` alias below. `InternalServerException` — a shape
+// this SERVICE models and that this operation does not list — is widened in through
+// `extra_errors`, giving this handler the modelled server failure the service's other
+// listings answer an unreachable store with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivsrealtime#ListPublicKeys",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListPublicKeysErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServerException(InternalServerException),
     ValidationException(ValidationException),
 }
 
@@ -145,18 +144,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPublicKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPublicKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPublicKeys"))
+        // A pure read over the stored public keys (`@readonly` in the model, and "Gets
+        // summary information about all public keys in your account, in the AWS region
+        // where the API request is processed"); nothing is written, and the page is this
+        // request's own region's view of the account.
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(ListPublicKeysErrorModeled::InternalServerException)
+        })?;
+
+        // A `nextToken` this listing did not issue names no position, so it is refused
+        // rather than read as "start from the beginning" — the rule every listing of this
+        // service applies to its own token, under this listing's own marker and over the
+        // region whose view this page reports.
+        // How far the store's page positions go, so the codec reads a position only out of
+        // a token this listing could have issued.
+        let issued_through = state.lock().issued_through();
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                crate::state::decode_public_key_page_token(&region, issued_through, token)
+                    .ok_or_else(|| {
+                        crate::state::validation_failed(
+                            ListPublicKeysErrorModeled::ValidationException,
+                            // The one rule this service words a foreign page token with,
+                            // shared with its other listings.
+                            crate::state::foreign_page_token_message(Self::NAME),
+                        )
+                    })?,
+            ),
+        };
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            // "Maximum number of results to return. Default: 50." — the documented default
+            // this service's listings share ([`crate::state::DEFAULT_LIST_PAGE_SIZE`]).
+            .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE)
+            // Unreachable defence, not an accepted-and-adjusted input: the modelled
+            // `MaxPublicKeyResults` range (1..100) refuses a non-positive `maxResults`
+            // with a 400 before this handler runs. It is here only so a page size of zero
+            // can never make pagination loop forever.
+            .max(1);
+
+        let store = state.lock();
+        let remaining: Vec<&crate::state::PublicKeyRecord> = store
+            .public_keys_in_order(&region)
+            .into_iter()
+            .filter(|record| resume_after.is_none_or(|after| record.sequence > after))
+            .collect();
+        let public_keys: Vec<PublicKeySummary> = remaining
+            .iter()
+            .take(page_size)
+            .map(|record| record.to_summary())
+            .collect();
+        // A token only when a key is left over, and it names the position this page ended
+        // at: the last page carries none.
+        let next_token = (remaining.len() > page_size).then(|| {
+            crate::state::encode_public_key_page_token(&region, remaining[page_size - 1].sequence)
+        });
+
+        Ok(ListPublicKeysOutput {
+            public_keys,
+            next_token,
+        })
     }
 }
