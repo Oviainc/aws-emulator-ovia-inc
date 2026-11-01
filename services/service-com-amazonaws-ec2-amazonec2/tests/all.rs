@@ -490,6 +490,13 @@ mod describe_snapshots;
 // insert their two lines, and these two lost two serialized squash merges at the head.
 #[path = "all/security_group_references.rs"]
 mod security_group_references;
+// What `DeleteCoipCidr` takes out of one customer-owned address pool's ranges, what it
+// reports back, and the requests that resolve to no range at all. Declared HERE, beside the
+// `coip_pools` fixtures its rows are written against, rather than in the `delete_*` block
+// below: that block invites every concurrent `delete_*` suite to insert its two lines in the
+// same few lines of context, and this one lost repeated serialized squash merges there.
+#[path = "all/delete_coip_cidr.rs"]
+mod delete_coip_cidr;
 #[path = "all/coip_pools.rs"]
 mod coip_pools;
 #[path = "all/confirm_product_instance.rs"]

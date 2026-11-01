@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCoipCidr
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCoipCidr`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCoipCidr::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the range of customer-owned IP addresses `Cidr` names out of the pool `CoipPoolId`
+//! names and reports the range it removed. The answer is the record the removal took out of
+//! the store, so a range a later `DescribeCoipPools` no longer lists for that pool is
+//! exactly the range this call answered with; a `CoipPoolId` that resolves to no pool of the
+//! account, a `Cidr` that is no address range at all, and a range the pool does not hold are
+//! each refused rather than answered as a delete that did nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +133,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCoipCidr` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCoipCidrErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — a CoIP pool
+        // carries no Region member (its `PoolArn` was built when the pool was created), so
+        // nothing here depends on the Region the request was signed for. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`DeleteCoipCidrRequest$DryRun`). Every caller of this emulator is permitted, so a
+        // dry run reports that outcome and neither reads nor writes the store — the answer
+        // `DeleteCoipPool` and `GetCoipPoolUsage` give their own flag, so it does not depend
+        // on whether the pool or the range the request names exists.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The store, with the "mounted on an engine that holds no state" case already turned
+        // into the server error every handler of this crate answers it with.
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+
+        // "The ID of the customer-owned address pool" (`DeleteCoipCidrRequest$CoipPoolId`):
+        // the pool the range is taken out of, resolved BEFORE the range, so a client can tell
+        // "no such pool" from "that pool holds no such range". An id that resolves to no pool
+        // of the account is refused through the crate's one reader of that failure,
+        // `state::coip_pool_id_does_not_exist`, which is what decides HOW the value failed —
+        // `InvalidPoolID.Malformed` for a value that is no pool id at all,
+        // `InvalidParameterValue` for one whose digit count EC2 never mints, and
+        // `InvalidPoolID.NotFound` for a well-formed id naming no pool — so this operation
+        // answers a bad `CoipPoolId` exactly as `DeleteCoipPool` and `GetCoipPoolUsage` do.
+        let pool_id = input.coip_pool_id.as_str();
+        let pool = store
+            .coip_pools
+            .get_mut(pool_id)
+            .ok_or_else(|| state::coip_pool_id_does_not_exist(pool_id))?;
+        // Both members the answer carries beyond the range itself are facts of the POOL, so
+        // they are read off the stored pool rather than built from the request: the pool id as
+        // the store spells it, and "The ID of the local gateway route table"
+        // (`CoipPool$LocalGatewayRouteTableId`), which is where `GetCoipPoolUsage` reads it
+        // from too.
+        let reported_pool_id = pool.pool_id.clone();
+        let local_gateway_route_table_id = pool.local_gateway_route_table_id.clone();
+
+        // "A customer-owned IP address range that you want to delete"
+        // (`DeleteCoipCidrRequest$Cidr`). A value that is no address range at all covers no
+        // addresses, so it names no range of any pool and is refused as a bad parameter rather
+        // than as a range this pool happens not to hold. A range IS the addresses it covers,
+        // so it is resolved in canonical form — an IPv4 block with its host bits cleared,
+        // read by the crate's one reader of an IPv4 range, because a customer-owned address is
+        // IPv4 (`CoipAddressUsage$CoIp`) and the API publishes no size rule for a CoIP range
+        // to hold it to.
+        let cidr = input.cidr.as_str();
+        let canonical = state::canonical_ipv4_cidr(cidr).map_err(|_| invalid_cidr(cidr))?;
+
+        // The range leaves the pool here, and taking it out is also what RESOLVES it: the pool
+        // is already known to exist, so nothing taken means that pool holds no range covering
+        // those addresses, which is refused with the code this service already answers an
+        // address range it holds nothing for (`state::invalid_cidr_not_found`) rather than
+        // answered as a delete that did nothing. A second delete of the same range therefore
+        // gets that same refusal, which is how a caller tells the deletion it performed from
+        // one it did not. The range LEAVES the pool rather than lingering, so a later
+        // `DescribeCoipPools` does not report it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCoipCidr"))
+        // The refused value is named as the REQUEST spelled it, bounded by the same ceiling
+        // the malformed-value refusal uses: a value that parsed as a block can still be
+        // arbitrarily long, because a prefix length may be written with any number of leading
+        // zeros.
+        let removed = pool
+            .pool_cidrs
+            .as_mut()
+            .and_then(|ranges| {
+                let at = ranges
+                    .iter()
+                    .position(|stored| names_range(stored, &canonical))?;
+                Some(ranges.remove(at))
+            })
+            .ok_or_else(|| state::invalid_cidr_not_found(&echoed_cidr(cidr)))?;
+        // The characters the range held go back to the store's byte budget on exactly the
+        // terms `crate::state::coip_pool_payload_bytes` charged them for the pool: a range
+        // costs its own characters, so a pool that gains and loses one leaves the budget where
+        // it started.
+        store.release_stored_bytes(removed.len());
+
+        // "Information about a range of customer-owned IP addresses"
+        // (`DeleteCoipCidrResult$CoipCidr`): the range as it was STORED, so the caller sees
+        // the range that was removed rather than a value built from the request.
+        Ok(DeleteCoipCidrOutput {
+            coip_cidr: Some(CoipCidr {
+                cidr: Some(removed),
+                coip_pool_id: reported_pool_id,
+                local_gateway_route_table_id,
+            }),
+        })
     }
+}
+
+/// Whether the address range a pool `stored` is the range `canonical` names.
+///
+/// A CIDR block names the addresses it covers, so the comparison is between canonical forms
+/// (`crate::state::canonical_ipv4_cidr`): one range is one answer however either spelling set
+/// its host bits. A stored value that is no address range at all covers no addresses, so it
+/// is the range no request names.
+fn names_range(stored: &str, canonical: &str) -> bool {
+    crate::state::canonical_ipv4_cidr(stored).is_ok_and(|range| range == canonical)
+}
+
+/// The most characters of a refused `Cidr` this operation's messages repeat back.
+///
+/// A message names the range the request could not resolve, and that is the request's own
+/// bytes — `DeleteCoipCidrRequest$Cidr` is a bare string the model puts no `@length` on — so
+/// the echo is bounded here the way `crate::state::MAX_ECHOED_COIP_POOL_ID_CHARS` bounds a
+/// refused pool id's. Far above the longest IPv4 CIDR block (`255.255.255.255/32`), so a real
+/// range is always named in full.
+pub const MAX_ECHOED_CIDR_CHARS: usize = 64;
+
+/// A `Cidr` from the REQUEST, as a refusal may name it: its first [`MAX_ECHOED_CIDR_CHARS`]
+/// characters.
+///
+/// Every refusal of this operation names the value through here, the readable ones included:
+/// a prefix length may be written with any number of leading zeros, so a value that PARSES as
+/// a block is no shorter than one that does not.
+fn echoed_cidr(cidr: &str) -> String {
+    cidr.chars().take(MAX_ECHOED_CIDR_CHARS).collect()
+}
+
+/// Refuse a `Cidr` that is not an address range at all: HTTP 400 `InvalidParameterValue`, in
+/// the one wording this service answers a rejected parameter VALUE with ("Value (…) for
+/// parameter … is invalid. This is not a valid CIDR block.", the sentence
+/// `crate::state::require_local_gateway_route_destination` answers a destination that is not
+/// an address prefix with).
+///
+/// A value that covers no addresses names no range of ANY pool, which is a malformed request
+/// rather than a pool that happens not to hold it — the distinction
+/// `crate::state::invalid_cidr_not_found` is the other half of.
+fn invalid_cidr(cidr: &str) -> DeleteCoipCidrError {
+    crate::state::invalid_parameter_value(format!(
+        "Value ({}) for parameter cidr is invalid. This is not a valid CIDR block.",
+        echoed_cidr(cidr)
+    ))
 }
