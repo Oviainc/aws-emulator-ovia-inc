@@ -184,8 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the source Capacity Reservation containing the interruptible allocation
         // to modify" (`$CapacityReservationId`): an id the account holds no reservation for is
-        // an error, not a change to nothing.
-        let source = state::require_known_capacity_reservation(&store, &input.capacity_reservation_id)?;
+        // an error, not a change to nothing. The id is read by SHAPE — the reading this
+        // operation is recorded applying, where a `cr-` id of that shape the account holds no
+        // reservation under, the all-zero placeholder included, is reported NOT FOUND rather
+        // than malformed.
+        let source =
+            state::require_capacity_reservation_by_id_shape(&store, &input.capacity_reservation_id)?;
         let source_id = input.capacity_reservation_id.clone();
         let source_state = source.state_at(now).to_string();
 

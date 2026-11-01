@@ -26260,16 +26260,12 @@ pub fn require_well_formed_capacity_reservation_id<E>(
 /// The record of the Capacity Reservation a Capacity Block EXTENSION operation names, or
 /// the refusal for an id that operation cannot resolve.
 ///
-/// Reads the id by the SHAPE every EC2 resource id takes
-/// ([`prefixed_id_is_well_formed`]) rather than by the stricter issued-id reading
-/// [`require_known_capacity_reservation`] applies, so a value of that shape the account
-/// holds no reservation under — the all-zero placeholder included — is reported NOT FOUND
-/// rather than malformed. Which of the two readings an operation applies is a fact of that
-/// operation, recorded on both sides: a recorded `DescribeCapacityBlockExtensionOfferings`
-/// naming the all-zero `cr-` id is answered
-/// [`INVALID_CAPACITY_RESERVATION_ID_NOT_FOUND`], where a recorded
-/// `MoveCapacityReservationInstances` naming a `cr-` id EC2 could not have issued is
-/// answered [`INVALID_CAPACITY_RESERVATION_ID_MALFORMED`].
+/// Reads the id by SHAPE, through [`require_capacity_reservation_by_id_shape`], rather than
+/// by the stricter issued-id reading [`require_known_capacity_reservation`] applies, so a
+/// value of that shape the account holds no reservation under — the all-zero placeholder
+/// included — is reported NOT FOUND rather than malformed: a recorded
+/// `DescribeCapacityBlockExtensionOfferings` naming the all-zero `cr-` id is answered
+/// [`INVALID_CAPACITY_RESERVATION_ID_NOT_FOUND`].
 ///
 /// Region-scoped like [`require_capacity_reservation_in_region`], and for the same reason:
 /// a Capacity Block extension is offered "in the Amazon Web Services Region that you're
@@ -26280,6 +26276,35 @@ pub fn require_extendable_capacity_reservation<'store, E>(
     zones: &[AvailabilityZoneRecord],
     capacity_reservation_id: &str,
 ) -> Result<&'store CapacityReservationRecord, crate::scaffolded::Scaffolded<E>> {
+    let record = require_capacity_reservation_by_id_shape(store, capacity_reservation_id)?;
+    if !capacity_reservation_is_in_region(&record.view, zones) {
+        return Err(invalid_capacity_reservation_id_not_found(
+            capacity_reservation_id,
+        ));
+    }
+    Ok(record)
+}
+
+/// The record of the Capacity Reservation `capacity_reservation_id` names, read by the SHAPE
+/// every EC2 resource id takes ([`prefixed_id_is_well_formed`]) rather than by the stricter
+/// issued-id reading [`require_known_capacity_reservation`] applies: a value of that shape
+/// the account holds no reservation under — the all-zero placeholder included — is reported
+/// [`INVALID_CAPACITY_RESERVATION_ID_NOT_FOUND`], and only a value outside the shape is
+/// refused [`INVALID_CAPACITY_RESERVATION_ID_MALFORMED`], before any lookup.
+///
+/// Which of the two readings an operation applies is a fact of that OPERATION, recorded on
+/// both sides, so the choice is made where the operation resolves its id rather than here:
+/// a recorded `DescribeCapacityBlockExtensionOfferings` and the recorded interruptible
+/// allocation pair (`CreateInterruptibleCapacityReservationAllocation`,
+/// `UpdateInterruptibleCapacityReservationAllocation`) each report the all-zero `cr-` id
+/// NOT FOUND and so read ids here, where a recorded `MoveCapacityReservationInstances`,
+/// `CancelCapacityReservation` and `GetCapacityReservationUsage` refuse an id EC2 could not
+/// have issued as malformed and so read ids through
+/// [`require_known_capacity_reservation`].
+pub fn require_capacity_reservation_by_id_shape<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    capacity_reservation_id: &str,
+) -> Result<&'store CapacityReservationRecord, crate::scaffolded::Scaffolded<E>> {
     if !prefixed_id_is_well_formed(CAPACITY_RESERVATION_ID_PREFIX, capacity_reservation_id) {
         return Err(invalid_capacity_reservation_id_malformed(
             capacity_reservation_id,
@@ -26288,7 +26313,6 @@ pub fn require_extendable_capacity_reservation<'store, E>(
     store
         .capacity_reservations
         .get(capacity_reservation_id)
-        .filter(|record| capacity_reservation_is_in_region(&record.view, zones))
         .ok_or_else(|| invalid_capacity_reservation_id_not_found(capacity_reservation_id))
 }
 

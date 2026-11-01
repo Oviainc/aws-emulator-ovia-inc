@@ -10,10 +10,12 @@
 //!
 //! The rules under test:
 //!
-//! 1. An allocation is made FROM a stored Capacity Reservation: a well-formed id the
-//!    account holds no reservation for is refused with
-//!    `InvalidCapacityReservationId.NotFound`, and a value outside the id form EC2 issues
-//!    with `InvalidCapacityReservationId.Malformed` before any lookup.
+//! 1. An allocation is made FROM a stored Capacity Reservation: an id of the `cr-`
+//!    resource-id SHAPE the account holds no reservation for — the all-zero placeholder
+//!    included — is reported `InvalidCapacityReservationId.NotFound`, and only a value
+//!    outside that shape is refused `InvalidCapacityReservationId.Malformed`, before any
+//!    lookup. That rule is covered across BOTH allocation operations in
+//!    [`super::interruptible_allocation_capacity_reservation_ids`].
 //! 2. "Your Capacity Reservation must be in active state with no end date set and have
 //!    available capacity for allocation"
 //!    (`CreateInterruptibleCapacityReservationAllocationRequest$CapacityReservationId`): a
@@ -246,10 +248,10 @@ fn stored_count(engine: &engine::InMemoryEngine) -> usize {
 // The allocation is made from a STORED source reservation
 // ---------------------------------------------------------------------------
 
-/// An id the account holds no Capacity Reservation for is refused — a WELL-FORMED one with
-/// `InvalidCapacityReservationId.NotFound` and a value outside the id form EC2 issues with
-/// `InvalidCapacityReservationId.Malformed`, before any lookup — and nothing is written for
-/// either.
+/// An id the account holds no Capacity Reservation for is refused — one of the `cr-`
+/// resource-id SHAPE with `InvalidCapacityReservationId.NotFound` and a value outside that
+/// shape with `InvalidCapacityReservationId.Malformed`, before any lookup — and nothing is
+/// written for either.
 #[tokio::test]
 async fn an_unknown_source_is_refused_whatever_the_id_looks_like() {
     let (router, engine) = super::ec2_query::emulator();
@@ -260,12 +262,13 @@ async fn an_unknown_source_is_refused_whatever_the_id_looks_like() {
 
     // The rows differ in the FORM of the id: the long id form EC2 issues, the null id, the
     // short form, a leading digit above zero, another resource's id, a known id with a
-    // suffix, and something that is not an id at all.
+    // suffix, and something that is not an id at all. The first four are of the `cr-`
+    // resource-id shape, so each is LOOKED UP and reported not found.
     let cases: [(&str, &str); 7] = [
         (UNKNOWN_CAPACITY_RESERVATION_ID, "NotFound"),
-        ("cr-00000000000000000", "Malformed"),
-        ("cr-12345678", "Malformed"),
-        ("cr-1234567890abcdef0", "Malformed"),
+        ("cr-00000000000000000", "NotFound"),
+        ("cr-12345678", "NotFound"),
+        ("cr-1234567890abcdef0", "NotFound"),
         ("cb-00000000000000001", "Malformed"),
         (&format!("{known}x"), "Malformed"),
         ("not-an-id", "Malformed"),

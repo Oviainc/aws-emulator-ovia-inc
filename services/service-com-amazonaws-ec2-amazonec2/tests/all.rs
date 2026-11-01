@@ -93,6 +93,13 @@ mod copy_snapshot;
 // serialized squash merges to the lines just below `prefix_lists`.
 #[path = "all/verified_access_instance_logging.rs"]
 mod verified_access_instance_logging;
+// How the interruptible-allocation pair screens a Capacity Reservation id: the shape it reads
+// one by, the not-found answer every value of that shape gets and the malformed answer every
+// value outside it gets, across both operations. Declared HERE rather than in sorted position
+// or beside `prefix_lists`, for the reason the note at the top of this file gives: both of
+// those are the contended regions every new ec2 suite inserts its lines into.
+#[path = "all/interruptible_allocation_capacity_reservation_ids.rs"]
+mod interruptible_allocation_capacity_reservation_ids;
 // What `CreateTransitGatewayConnect` computes a Connect attachment from — the transport
 // attachment it names, that attachment's own transit gateway, the requested tunnel protocol
 // and tags — the `pending` -> `available` move the clock owes it, and what it refuses.
