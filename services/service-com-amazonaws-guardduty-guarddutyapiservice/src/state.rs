@@ -2294,6 +2294,20 @@ pub const S3_OBJECT_KEY_MEMBER: &str = "s3Object.key";
 pub const OBJECT_MALWARE_SCAN_WITHOUT_PLAN_MESSAGE: &str =
     "The request is rejected because the S3 bucket does not have a Malware Protection plan configured.";
 
+/// The message an object scan is refused with when the bucket's plan limits its
+/// scanning to object prefixes and the key the request names is under none of
+/// them.
+///
+/// "The S3 object will be scanned only if it belongs to any of the specified
+/// object prefixes"
+/// (`smithy_query(query="doc",shape="CreateS3BucketResource",member="ObjectPrefixes")`),
+/// so an object outside the plan's prefixes is not an object that plan scans.
+/// Built from the REQUEST — the condition the caller broke — and, like
+/// [`OBJECT_MALWARE_SCAN_WITHOUT_PLAN_MESSAGE`], naming neither the key nor the
+/// prefixes the plan holds.
+pub const OBJECT_MALWARE_SCAN_OUTSIDE_PREFIXES_MESSAGE: &str =
+    "The request is rejected because the S3 object key does not belong to any of the object prefixes configured in the Malware Protection plan.";
+
 /// The `MalwareProtectionPlanStatus` a plan GuardDuty accepted reports: the plan
 /// is in force and nothing is wrong with it. The enum's other two members
 /// (`WARNING`, `ERROR` — `smithy_query(shape="MalwareProtectionPlanStatus")`) both
@@ -5159,6 +5173,27 @@ pub struct MalwareProtectionPlan {
 }
 
 impl MalwareProtectionPlan {
+    /// Is `key` an object this plan scans — does it fall inside the plan's
+    /// configured scope?
+    ///
+    /// The scope is [`Self::object_prefixes`]: "The S3 object will be scanned only
+    /// if it belongs to any of the specified object prefixes"
+    /// (`smithy_query(query="doc",shape="CreateS3BucketResource",member="ObjectPrefixes")`),
+    /// so a key is in scope when it STARTS WITH one of them — an S3 object key
+    /// belongs to a prefix exactly when the prefix is a prefix of the key, compared
+    /// byte for byte with no case folding, trimming or separator fixing, because an
+    /// S3 key is an opaque sequence of characters and `a/b` and `A/B` are two
+    /// different objects. An EMPTY list configures no restriction and so covers the
+    /// whole bucket, which is what both an absent prefix list and an explicitly
+    /// empty one ask for.
+    pub fn scans_object_key(&self, key: &str) -> bool {
+        self.object_prefixes.is_empty()
+            || self
+                .object_prefixes
+                .iter()
+                .any(|prefix| key.starts_with(prefix.as_str()))
+    }
+
     /// Record one accepted object scan against this plan, dropping the oldest
     /// entries past [`MAX_OBJECT_MALWARE_SCANS_PER_PLAN`].
     ///
