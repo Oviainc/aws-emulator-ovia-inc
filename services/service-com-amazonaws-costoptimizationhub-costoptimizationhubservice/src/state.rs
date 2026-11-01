@@ -279,14 +279,28 @@ impl Preferences {
     }
 }
 
-/// The monthly price of one resource, split the way `ResourcePricing` models it:
-/// the cost before any discount, plus the discount amounts that apply to it.
+/// The monthly price of one resource configuration, split the way
+/// `ResourcePricing` models it: the cost before any discount, plus the discount
+/// amounts that apply to it.
+///
+/// The discounts are of two kinds, kept apart because a `savingsEstimationMode`
+/// treats them differently: the three itemized amounts are discounts that
+/// ALREADY apply to the resource whatever the caller does with the
+/// recommendation, while [`Pricing::commitment_purchase_discount`] is the
+/// discount adopting the recommendation would itself create.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Pricing {
     pub cost_before_discounts: f64,
     pub savings_plans_discount: f64,
     pub reserved_instances_discount: f64,
     pub other_discount: f64,
+    /// The savings-plans discount that exists only once the recommended action
+    /// is ADOPTED: what the commitment a purchase recommendation recommends
+    /// buying takes off the usage it covers. Unlike the discounts above, it is
+    /// not one the resource carries today, so it is part of what the recommended
+    /// configuration costs under EVERY savings estimation mode
+    /// ([`Pricing::cost_for_mode`]).
+    pub commitment_purchase_discount: f64,
 }
 
 impl Pricing {
@@ -297,38 +311,77 @@ impl Pricing {
             savings_plans_discount: 0.0,
             reserved_instances_discount: 0.0,
             other_discount: 0.0,
+            commitment_purchase_discount: 0.0,
         }
     }
 
-    /// A price with a savings-plan discount applied to it.
+    /// A price with an EXISTING savings-plan discount applied to it: one the
+    /// resource carries today, which a discounted view nets out.
     const fn discounted(cost_before_discounts: f64, savings_plans_discount: f64) -> Self {
         Self {
-            cost_before_discounts,
             savings_plans_discount,
-            reserved_instances_discount: 0.0,
-            other_discount: 0.0,
+            ..Self::list(cost_before_discounts)
         }
     }
 
-    pub fn discounts_total(&self) -> f64 {
+    /// The price of a configuration whose savings-plans discount is the one
+    /// BUYING the recommended commitment creates: the usage costs
+    /// `cost_before_discounts` at public pricing and the commitment takes
+    /// `commitment_purchase_discount` off it, so the configuration costs the
+    /// difference — the commitment — to whoever adopts the recommendation.
+    const fn purchased_commitment(
+        cost_before_discounts: f64,
+        commitment_purchase_discount: f64,
+    ) -> Self {
+        Self {
+            commitment_purchase_discount,
+            ..Self::list(cost_before_discounts)
+        }
+    }
+
+    /// The discounts the resource carries TODAY, independently of the
+    /// recommendation: the ones a discounted view nets out.
+    pub fn existing_discounts_total(&self) -> f64 {
         self.savings_plans_discount + self.reserved_instances_discount + self.other_discount
+    }
+
+    /// Every discount the price carries, existing or created by adopting the
+    /// recommendation.
+    pub fn discounts_total(&self) -> f64 {
+        self.existing_discounts_total() + self.commitment_purchase_discount
+    }
+
+    /// The savings-plans discount to itemize for this price: a discount the
+    /// resource carries today and one buying the recommended commitment would
+    /// create are both savings-plans discounts, so itemizing them together keeps
+    /// the itemized amounts accounting for the whole difference between the cost
+    /// before and the cost after discounts.
+    pub fn savings_plans_discount_total(&self) -> f64 {
+        self.savings_plans_discount + self.commitment_purchase_discount
     }
 
     pub fn cost_after_discounts(&self) -> f64 {
         round_cents(self.cost_before_discounts - self.discounts_total())
     }
 
-    /// The cost to report under a `savingsEstimationMode`: after discounts when
-    /// the mode is `AfterDiscounts`, otherwise the undiscounted cost (which is
-    /// what `BeforeDiscounts` names). The mode is the account's EFFECTIVE one
-    /// ([`Preferences::effective_savings_estimation_mode`]), so an account that
-    /// has expressed no preference is reported under the service's default.
+    /// The cost to report under a `savingsEstimationMode`: the configuration's
+    /// cost at public pricing, less the discount adopting the recommendation
+    /// creates, and — under `AfterDiscounts` only — less the discounts the
+    /// resource already carries, which is what `BeforeDiscounts` leaves in.
+    ///
+    /// The mode selects which EXISTING discounts are netted out of the figures;
+    /// it never decides whether the recommended action's own discount counts,
+    /// because that discount is the benefit being estimated rather than one the
+    /// estimate is taken before or after. The mode is the account's EFFECTIVE
+    /// one ([`Preferences::effective_savings_estimation_mode`]), so an account
+    /// that has expressed no preference is reported under the service's default.
     pub fn cost_for_mode(&self, mode: Option<&str>) -> f64 {
-        if mode == Some(AFTER_DISCOUNTS) {
-            self.cost_after_discounts()
+        let existing = if mode == Some(AFTER_DISCOUNTS) {
+            self.existing_discounts_total()
         } else {
-            round_cents(self.cost_before_discounts)
-        }
+            0.0
+        };
+        round_cents(self.cost_before_discounts - self.commitment_purchase_discount - existing)
     }
 }
 
@@ -404,7 +457,11 @@ impl StoredRecommendation {
     }
 
     /// What adopting the recommendation saves per month under `mode`: the
-    /// difference between the current and the recommended resource's cost.
+    /// difference between what the resource costs today and what it would cost
+    /// in the recommended configuration — including, for a recommendation whose
+    /// action is buying a commitment, the discount that commitment creates,
+    /// which is the whole benefit being estimated
+    /// ([`Pricing::cost_for_mode`]).
     pub fn monthly_savings(&self, mode: Option<&str>) -> f64 {
         round_cents(
             self.current_pricing.cost_for_mode(mode) - self.recommended_pricing.cost_for_mode(mode),
@@ -845,7 +902,7 @@ fn resource_cost_calculation(pricing: &Pricing) -> ResourceCostCalculation {
             estimated_cost_before_discounts: Some(round_cents(pricing.cost_before_discounts)),
             estimated_net_unused_amortized_commitments: None,
             estimated_discounts: Some(EstimatedDiscounts {
-                savings_plans_discount: Some(round_cents(pricing.savings_plans_discount)),
+                savings_plans_discount: Some(round_cents(pricing.savings_plans_discount_total())),
                 reserved_instances_discount: Some(round_cents(pricing.reserved_instances_discount)),
                 other_discount: Some(round_cents(pricing.other_discount)),
             }),
@@ -1510,8 +1567,13 @@ fn seed_recommendations() -> Vec<StoredRecommendation> {
             implementation_effort: "VeryLow".to_string(),
             restart_needed: false,
             rollback_possible: false,
+            // Buying the recommended commitment is what creates this row's
+            // discount: the eligible usage costs 1_314.00 a month on demand and
+            // the commitment covers it for 876.00, so adopting the
+            // recommendation saves the difference under every savings
+            // estimation mode.
             current_pricing: Pricing::list(1_314.0),
-            recommended_pricing: Pricing::discounted(1_314.0, 438.0),
+            recommended_pricing: Pricing::purchased_commitment(1_314.0, 438.0),
             recommendation_lookback_period_in_days: 60,
             cost_calculation_lookback_period_in_days: 60,
             currency_code: CURRENCY_CODE.to_string(),
@@ -1596,12 +1658,12 @@ mod tests {
     use super::*;
 
     /// What a stored `savingsEstimationMode` does to a row's money members:
-    /// `AfterDiscounts` reports the cost net of every discount the price
-    /// carries, and every other state of the preference — `BeforeDiscounts`,
-    /// or no preference at all, which is served under the same mode
-    /// ([`DEFAULT_SAVINGS_ESTIMATION_MODE`]) — reports the undiscounted cost.
-    /// Asserted on the stored prices directly; the wire behaviour of each mode
-    /// is `tests/all/cost_optimization_hub.rs`.
+    /// `AfterDiscounts` reports the cost net of every discount the resource
+    /// already carries, and every other state of the preference —
+    /// `BeforeDiscounts`, or no preference at all, which is served under the
+    /// same mode ([`DEFAULT_SAVINGS_ESTIMATION_MODE`]) — reports the cost with
+    /// those discounts left in. Asserted on the stored prices directly; the
+    /// wire behaviour of each mode is `tests/all/cost_optimization_hub.rs`.
     #[test]
     fn the_mode_decides_whether_discounts_are_subtracted() {
         let pricing = Pricing {
@@ -1609,6 +1671,7 @@ mod tests {
             savings_plans_discount: 20.0,
             reserved_instances_discount: 5.0,
             other_discount: 3.03,
+            commitment_purchase_discount: 0.0,
         };
 
         // (the stored mode, the cost it reports)
@@ -1626,6 +1689,108 @@ mod tests {
                 (actual - expected).abs() < 0.005,
                 "case {mode:?}: expected cost {expected}, got {actual}"
             );
+        }
+    }
+
+    /// One row of the table in
+    /// [`a_discount_the_recommendation_creates_counts_under_every_mode`]: the
+    /// case, the current and the recommended price, and what each state of the
+    /// preference reports as `(mode, monthly cost, monthly saving)`.
+    type SavingsCase = (
+        &'static str,
+        Pricing,
+        Pricing,
+        [(Option<&'static str>, f64, f64); 3],
+    );
+
+    /// The discount adopting a recommendation would CREATE is part of what the
+    /// recommended configuration costs under every savings estimation mode, so a
+    /// recommendation whose whole benefit is that discount saves the same amount
+    /// in every mode, while the discounts a resource already carries are netted
+    /// out only by the discounted mode.
+    ///
+    /// The table spans what the rule generalises over: whether the recommended
+    /// configuration's discount is one the resource already carries or one
+    /// buying a commitment creates (or both at once), whether the current
+    /// resource carries a discount of its own, and each state of the preference.
+    #[test]
+    fn a_discount_the_recommendation_creates_counts_under_every_mode() {
+        let cases: [SavingsCase; 4] = [
+            (
+                "a commitment purchase: the recommended configuration is the \
+                 commitment, and nothing is discounted today",
+                Pricing::list(1_200.0),
+                Pricing::purchased_commitment(1_200.0, 400.0),
+                [
+                    (None, 1_200.0, 400.0),
+                    (Some(BEFORE_DISCOUNTS), 1_200.0, 400.0),
+                    (Some(AFTER_DISCOUNTS), 1_200.0, 400.0),
+                ],
+            ),
+            (
+                "a commitment purchase on usage that already carries a discount",
+                Pricing::discounted(1_200.0, 120.0),
+                Pricing {
+                    savings_plans_discount: 120.0,
+                    ..Pricing::purchased_commitment(1_200.0, 400.0)
+                },
+                [
+                    // Before discounts the existing 120.00 is left in on both
+                    // sides and cancels; after discounts it is netted out of
+                    // both, so either way the saving is the commitment's.
+                    (None, 1_200.0, 400.0),
+                    (Some(BEFORE_DISCOUNTS), 1_200.0, 400.0),
+                    (Some(AFTER_DISCOUNTS), 1_080.0, 400.0),
+                ],
+            ),
+            (
+                "a rightsizing whose both sides carry an existing discount",
+                Pricing::discounted(280.32, 28.03),
+                Pricing::discounted(140.16, 14.02),
+                [
+                    (None, 280.32, 140.16),
+                    (Some(BEFORE_DISCOUNTS), 280.32, 140.16),
+                    (Some(AFTER_DISCOUNTS), 252.29, 126.15),
+                ],
+            ),
+            (
+                "an undiscounted upgrade",
+                Pricing::list(50.0),
+                Pricing::list(40.0),
+                [
+                    (None, 50.0, 10.0),
+                    (Some(BEFORE_DISCOUNTS), 50.0, 10.0),
+                    (Some(AFTER_DISCOUNTS), 50.0, 10.0),
+                ],
+            ),
+        ];
+
+        for (case, current, recommended, expectations) in cases {
+            for (mode, expected_cost, expected_savings) in expectations {
+                let cost = current.cost_for_mode(mode);
+                let savings = round_cents(cost - recommended.cost_for_mode(mode));
+                assert!(
+                    (cost - expected_cost).abs() < 0.005,
+                    "case {case:?} {mode:?}: expected cost {expected_cost}, got {cost}"
+                );
+                assert!(
+                    (savings - expected_savings).abs() < 0.005,
+                    "case {case:?} {mode:?}: expected saving {expected_savings}, got {savings}"
+                );
+            }
+            // Whatever the mode, the itemized discounts still account for the
+            // whole difference between the cost before and after discounts.
+            for pricing in [current, recommended] {
+                let itemized = pricing.savings_plans_discount_total()
+                    + pricing.reserved_instances_discount
+                    + pricing.other_discount;
+                let after = round_cents(pricing.cost_before_discounts - itemized);
+                assert!(
+                    (after - pricing.cost_after_discounts()).abs() < 0.005,
+                    "case {case:?}: expected the itemized discounts to leave {}, got {after}",
+                    pricing.cost_after_discounts()
+                );
+            }
         }
     }
 

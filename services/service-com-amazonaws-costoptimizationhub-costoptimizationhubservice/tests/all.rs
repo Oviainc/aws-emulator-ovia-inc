@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_scoped_reads.rs"]
 mod account_scoped_reads;
+#[path = "all/commitment_purchase_savings.rs"]
+mod commitment_purchase_savings;
 #[path = "all/cost_optimization_hub.rs"]
 mod cost_optimization_hub;
 #[path = "all/enrollment_read_scope_gate.rs"]
