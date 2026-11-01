@@ -1,10 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: codeartifact.describe-repository-missing-permission-denied codeartifact.codeartifact-publish-with-mismatched-asset-sha256-rejected-and-version-absent codeartifact.deploy-domain-behaves-after-cfn-create codeartifact.deploy-repository-behaves-with-external-connection
+Issue-Trace-Ids: codeartifact.describe-repository-missing-permission-denied codeartifact.deploy-domain-behaves-after-cfn-create codeartifact.deploy-repository-behaves-with-external-connection
 Issue-Shape-Id: com.amazonaws.codeartifact#CodeArtifactControlPlaneService
 Issue-Key: codeartifact.describe-repository-missing-permission-denied|_error#21|AssertionError|raise AssertionError(f"expected the call to be denied, but it SUCCEEDED and returned {result!r}")
-Issue-Key: codeartifact.codeartifact-publish-with-mismatched-asset-sha256-rejected-and-version-absent|run#15|AssertionError|assert code == "ValidationException", (
 Issue-Key: codeartifact.deploy-domain-behaves-after-cfn-create|_deploy_cfn#3|KeyError|outputs = {o["OutputKey"]: o["OutputValue"] for o in stacks[0].get("Outputs", [])}
 Issue-Key: codeartifact.deploy-repository-behaves-with-external-connection|_deploy_cfn#4|KeyError|outputs = {o["OutputKey"]: o["OutputValue"] for o in stacks[0].get("Outputs", [])}
 Issue-Commit: 0c5145d1821481e15376cbd37da6da62f6188e28
@@ -72,3 +71,47 @@ Cause 2:
 Cause 3:
 1. cloudformation.create_stack with a template declaring AWS::CodeArtifact::Domain (and AWS::CodeArtifact::Repository) and an Output whose Value is !GetAtt Domain.Name.
 2. Wait for CREATE_COMPLETE, then describe_stacks and read Stacks[0]['Outputs'] -> each entry has OutputKey but no OutputValue.
+
+## Resolution
+
+Causes 1 and 3 are implemented and pinned by tests; cause 2 is NOT implemented and stays
+open work, recorded here so it remains discoverable:
+
+- Cause 1 (CodeArtifact control-plane reads are not authorized) is implemented: the IAM
+  decision lives in
+  `services/service-com-amazonaws-codeartifact-codeartifactcontrolplaneservice/src/service/authorization.rs`
+  and is taken at the top of every handler that addresses a repository,
+  `src/ops/describe_repository.rs` among them, so a principal allowed by neither its own
+  identity policies nor the repository's permissions policy is refused with the modelled
+  `AccessDeniedException` (403).
+- Cause 3 (CloudFormation stack Outputs for CodeArtifact resources carry no value, and the
+  resources exist in no service) is implemented: both resource types are now provisioned in
+  CodeArtifact through its own API and carry their published return values
+  (`services/service-com-amazonaws-cloudformation-cloudformation/src/state/provisioner.rs`
+  and `.../src/state/template.rs`), covered by
+  `core/router/tests/all/cloudformation_provisions_codeartifact_resources.rs`.
+- Cause 2 (a `PublishPackageVersion` whose `assetSHA256` disagrees with the uploaded bytes
+  is answered `403 SignatureDoesNotMatch` instead of the modelled `400
+  ValidationException`) is BLOCKED in the read-only core. The handler half is already
+  right: `src/ops/publish_package_version.rs` hashes the received bytes, compares them with
+  the declared digest and raises `ValidationException` with AWS's sentence, storing
+  nothing — it is simply never reached. The request is refused before any service code
+  runs, by `fn payload` in `vendor/server/src/request_authentication.rs` ("a declared hash
+  is not trusted, the body is hashed instead", so a declared `x-amz-content-sha256` is
+  honoured only when it is a marker containing `-`), called from the signature check
+  `vendor/smithy-server-runtime/src/multi_service_router.rs` runs for the MODELLED
+  operation before its `run`. A client signs the canonical request with the
+  `x-amz-content-sha256` value it sent, so a member-bound digest that disagrees with the
+  body makes the emulator's recomputed signature differ. No service seam reaches that
+  decision: `can_handle` never sees the body, and `override_refusal` can only reword a
+  refusal already decided. The core change needed is in that `payload` function: take a
+  declared `x-amz-content-sha256` that is a 64-character lowercase hex digest as the signed
+  payload hash (`SignableBody::Precomputed`) rather than re-deriving it from the body, as
+  AWS does. With that one change the request authenticates and the comparison already
+  written in the handler answers the modelled 400. The cause is carried on its own, with
+  the replay key it owns and the core change it needs, by the open issue this change files
+  beside it:
+  `issues/things-that-do-not-work/20261101T084500Z-codeartifact-publishpackageversion-digest-mismatch-refused-as-signaturedoesnotmatch.md`,
+  so it stays open work and remains discoverable. Only causes 1 and 3's traces and keys are
+  kept in the header above: cause 2's trace id and `Issue-Key` live in that open issue, so a
+  still-failing key is not recorded here as working.

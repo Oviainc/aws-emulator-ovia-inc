@@ -20,8 +20,13 @@
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
-// the sorted `s…` span (where every ssm suite would land) are both regions concurrently
-// landing suites add their line to.
+// the sorted `c…` span (where every cloudformation suite lands) are both regions
+// concurrently landing suites add their line to.
+#[path = "all/cloudformation_provisions_codeartifact_resources.rs"]
+mod cloudformation_provisions_codeartifact_resources;
+// Declared in this same head region, for the reason the entry above records: the appended
+// tail and the sorted `s…` span (where every ssm suite would land) are both regions
+// concurrently landing suites add their line to.
 #[path = "all/ssm_securestring_ciphertext_decrypts_in_kms.rs"]
 mod ssm_securestring_ciphertext_decrypts_in_kms;
 // Declared here, at the head, for the reason the entry above records: the appended tail and

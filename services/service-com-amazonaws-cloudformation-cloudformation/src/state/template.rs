@@ -1826,16 +1826,17 @@ const MAX_IDENTITY_ROUNDS: usize = 4;
 /// Whether a resource type's published identifier is a function of ANOTHER resource of the
 /// template, so it can only be computed once that resource's identity is known.
 ///
-/// Four of the catalogued types are: an Amazon ECS service's ARN carries the CLUSTER that
+/// Five of the catalogued types are: an Amazon ECS service's ARN carries the CLUSTER that
 /// hosts it (`service/<cluster>/<name>`), an ELBv2 listener's and listener rule's ARNs nest
-/// inside the ARN of the load balancer and the listener their declaration names, and an
-/// Amazon S3 Vectors index's nests inside the ARN of the vector bucket its declaration
-/// names. Every other type's return values are functions of its own name and its own
-/// declared properties, so one pass computes them.
+/// inside the ARN of the load balancer and the listener their declaration names, an Amazon
+/// S3 Vectors index's nests inside the ARN of the vector bucket its declaration names, and a
+/// CodeArtifact repository's nests inside the DOMAIN its declaration names
+/// (`repository/<domain>/<name>`). Every other type's return values are functions of its own
+/// name and its own declared properties, so one pass computes them.
 fn identity_depends_on_another_resource(resource_type: &str) -> bool {
     matches!(
         resource_type,
-        ECS_SERVICE | ELB_LISTENER | ELB_LISTENER_RULE | S3VECTORS_INDEX
+        ECS_SERVICE | ELB_LISTENER | ELB_LISTENER_RULE | S3VECTORS_INDEX | CODEARTIFACT_REPOSITORY
     )
 }
 
@@ -2490,6 +2491,18 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // model), which a generated name is already inside — letters, digits and the hyphen
         // are all admitted — but may be longer than.
         CODECOMMIT_REPOSITORY => rules(100, Characters::AsGenerated),
+        // CodeArtifact `CreateDomain.domain`: `DomainName`, `@length(min: 2, max: 50)` with
+        // pattern `^[a-z][a-z0-9\-]{0,48}[a-z0-9]$` (CodeArtifact's own Smithy model), which
+        // admits no upper case and requires an alphanumeric at the end. The LEADING
+        // character that pattern requires is a letter, which a generated name starts with
+        // because a stack name does (`[a-zA-Z][-a-zA-Z0-9]*`) and the lower-casing keeps it
+        // one; `within` itself only trims the edges to an alphanumeric.
+        CODEARTIFACT_DOMAIN => rules(50, Characters::LowercaseAlphanumeric),
+        // CodeArtifact `CreateRepository.repository`: `RepositoryName`,
+        // `@length(min: 2, max: 100)` with pattern `^[A-Za-z0-9][A-Za-z0-9._\-]{1,99}$` (that
+        // same model), which a generated name is already inside — letters, digits and the
+        // hyphen are all admitted — but may be longer than.
+        CODEARTIFACT_REPOSITORY => rules(100, Characters::AsGenerated),
         // CodePipeline `PipelineDeclaration.name`: `PipelineName`,
         // `@length(min: 1, max: 100)` (CodePipeline's own Smithy model).
         "AWS::CodePipeline::Pipeline" => rules(100, Characters::AsGenerated),
@@ -3067,6 +3080,8 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     CLOUDFRONT_RESPONSE_HEADERS_POLICY,
     "AWS::CloudWatch::Alarm",
     CLOUDWATCH_METRIC_STREAM,
+    CODEARTIFACT_DOMAIN,
+    CODEARTIFACT_REPOSITORY,
     CODEBUILD_REPORT_GROUP,
     COGNITO_USER_POOL,
     "AWS::DynamoDB::Table",
@@ -3228,6 +3243,54 @@ fn return_values(
         // publishes names that same pool; making that identity the id the owning service
         // mints is the business of the open issue on service-assigned physical ids
         // (`20261023T114649Z-cloudformation-outputs-carry-no-outputvalue-failed-resources-never`).
+        // "Ref returns the Amazon Resource Name (ARN) of the domain"; Fn::GetAtt: Arn,
+        // Name, Owner. This is the type `super::provisioning` creates in CodeArtifact
+        // itself, which then answers with the domain's own ARN and owning account — the same
+        // values this computes, since both are built from the one account id this emulator
+        // mints and the domain's name, which is how CodeArtifact keys a domain (`domain_arn`
+        // in that service's own state module).
+        CODEARTIFACT_DOMAIN => {
+            let arn = ::emulator_server::emulator_arn(
+                CODEARTIFACT_ARN_NAMESPACE,
+                region,
+                &format!("domain/{name}"),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert("Name".to_string(), name.to_string());
+            attributes.insert(
+                "Owner".to_string(),
+                ::emulator_server::emulator_account_id().to_string(),
+            );
+            (arn, attributes)
+        }
+        // "Ref returns the Amazon Resource Name (ARN) of the repository"; Fn::GetAtt: Arn,
+        // DomainOwner, Name. A repository ARN NESTS inside the domain that holds it
+        // (`repository/<domain>/<name>`), so it is built on the domain the declaration's
+        // `DomainName` names — a declaration that names none leaves the repository with
+        // CloudFormation's own generated identity rather than an ARN built on a domain
+        // nothing named, exactly as an index of no vector bucket does.
+        CODEARTIFACT_REPOSITORY => {
+            let domain = properties
+                .get("DomainName")
+                .and_then(|value| text(value, scope, 0, budget));
+            attributes.insert(
+                "DomainOwner".to_string(),
+                ::emulator_server::emulator_account_id().to_string(),
+            );
+            attributes.insert("Name".to_string(), name.to_string());
+            match domain {
+                Some(domain) => {
+                    let arn = ::emulator_server::emulator_arn(
+                        CODEARTIFACT_ARN_NAMESPACE,
+                        region,
+                        &format!("repository/{domain}/{name}"),
+                    );
+                    attributes.insert("Arn".to_string(), arn.clone());
+                    (arn, attributes)
+                }
+                None => (name.to_string(), attributes),
+            }
+        }
         COGNITO_USER_POOL => {
             let host = format!("{COGNITO_IDP_ARN_NAMESPACE}.{region}.{URL_SUFFIX}");
             attributes.insert(
@@ -4482,6 +4545,8 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         "AWS::CloudWatch::Alarm" => &["Arn"],
         CODEBUILD_REPORT_GROUP => &["Arn"],
         CLOUDWATCH_METRIC_STREAM => &["Arn"],
+        CODEARTIFACT_DOMAIN => &["Arn", "Name", "Owner"],
+        CODEARTIFACT_REPOSITORY => &["Arn", "DomainOwner", "Name"],
         COGNITO_USER_POOL => &["Arn", "ProviderName", "ProviderURL"],
         FIS_EXPERIMENT_TEMPLATE => &["Id"],
         CLOUDFRONT_DISTRIBUTION => &["DomainName", "Id"],
@@ -4975,6 +5040,31 @@ pub const CODEBUILD_ARN_NAMESPACE: &str = "codebuild";
 /// repository's git transport on, which no pattern here could mint — and the provisioner
 /// records them on the resource.
 pub const CODECOMMIT_REPOSITORY: &str = "AWS::CodeCommit::Repository";
+
+/// An AWS CodeArtifact domain's resource type (that model:
+/// `awsService.cloudFormationName: CodeArtifact`). This is the type `super::provisioning`
+/// creates in CodeArtifact itself, through that service's own `CreateDomain`.
+///
+/// It carries a [`return_values`] arm because its `Ref` is NOT its name: "Ref returns the
+/// Amazon Resource Name (ARN) of the domain", and the name is one of the three values
+/// `Fn::GetAtt` reads off it (`Arn`, `Name`, `Owner` — the type's read-only properties).
+/// That is what a repository's own declaration names the domain holding it by, since a
+/// `Ref` to the domain would hand `CreateRepository` an ARN rather than the domain name
+/// that call takes.
+pub const CODEARTIFACT_DOMAIN: &str = "AWS::CodeArtifact::Domain";
+
+/// An AWS CodeArtifact repository's resource type, under the same namespace, created
+/// through that service's own `CreateRepository` in the domain its declaration names.
+///
+/// Its `Ref` is its ARN too ("Ref returns the Amazon Resource Name (ARN) of the
+/// repository"), and its published attributes are `Arn`, `DomainOwner` and `Name`. The
+/// `DomainName` a declaration states is a create-only PROPERTY rather than one of them.
+pub const CODEARTIFACT_REPOSITORY: &str = "AWS::CodeArtifact::Repository";
+
+/// CodeArtifact's ARN namespace, which its own model carries as `awsService.arnNamespace`
+/// (`codeartifact`) — the service segment of a domain's and a repository's ARN, and the
+/// one that service's own state module builds both ARNs under.
+const CODEARTIFACT_ARN_NAMESPACE: &str = "codeartifact";
 
 /// The type of an Amazon Cognito user-pool group: the cognito-idp model carries
 /// `awsService.cloudFormationName: Cognito`.
@@ -7655,6 +7745,9 @@ mod tests {
                 // The vector bucket an `AWS::S3Vectors::Index` declares its index in,
                 // whose ARN that index's own ARN nests inside.
                 "VectorBucketName": "a-vector-bucket",
+                // The CodeArtifact domain an `AWS::CodeArtifact::Repository` declares its
+                // repository in, whose ARN that repository's own ARN nests inside.
+                "DomainName": "a-domain",
             }),
             condition: None,
             declaration: Value::Null,

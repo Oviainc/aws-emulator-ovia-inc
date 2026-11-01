@@ -462,8 +462,8 @@ use super::template::{
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
     APIGATEWAYV2_STAGE, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT, BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, CLOUDWATCH_DASHBOARD,
-    CLOUDWATCH_METRIC_STREAM, CODEBUILD_REPORT_GROUP, CODECOMMIT_REPOSITORY,
-    CODEDEPLOY_APPLICATION,
+    CLOUDWATCH_METRIC_STREAM, CODEARTIFACT_DOMAIN, CODEARTIFACT_REPOSITORY,
+    CODEBUILD_REPORT_GROUP, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_SECURITY_GROUP, EC2_SUBNET,
     EC2_VOLUME, EC2_VPC,
@@ -702,6 +702,13 @@ pub(super) enum Provisioner {
     ApiGatewayV2Deployment,
     ApiGatewayV2Authorizer,
     CodeCommitRepository,
+    /// `AWS::CodeArtifact::Domain`: a CodeArtifact domain, which `CreateDomain` creates
+    /// under the name the template states and `DeleteDomain` removes.
+    CodeArtifactDomain,
+    /// `AWS::CodeArtifact::Repository`: a repository IN such a domain, which
+    /// `CreateRepository` creates there and `DeleteRepository` removes — with every external
+    /// connection its declaration asks for associated, which is a call of its own.
+    CodeArtifactRepository,
     SesConfigurationSet,
     /// `AWS::SES::ReceiptRuleSet`: a receipt rule set of Amazon SES, which
     /// `CreateReceiptRuleSet` creates empty and `DeleteReceiptRuleSet` deletes.
@@ -822,6 +829,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         APIGATEWAYV2_DEPLOYMENT => Some(Provisioner::ApiGatewayV2Deployment),
         APIGATEWAYV2_AUTHORIZER => Some(Provisioner::ApiGatewayV2Authorizer),
         CODECOMMIT_REPOSITORY => Some(Provisioner::CodeCommitRepository),
+        CODEARTIFACT_DOMAIN => Some(Provisioner::CodeArtifactDomain),
+        CODEARTIFACT_REPOSITORY => Some(Provisioner::CodeArtifactRepository),
         SES_CONFIGURATION_SET => Some(Provisioner::SesConfigurationSet),
         SES_RECEIPT_RULE_SET => Some(Provisioner::SesReceiptRuleSet),
         SES_RECEIPT_RULE => Some(Provisioner::SesReceiptRule),
@@ -1173,6 +1182,12 @@ impl Provisioner {
             }
             Self::CodeCommitRepository => {
                 create_codecommit_repository(ctx, region, resource, propagated).await
+            }
+            Self::CodeArtifactDomain => {
+                create_codeartifact_domain(ctx, region, resource, propagated).await
+            }
+            Self::CodeArtifactRepository => {
+                create_codeartifact_repository(ctx, region, resource, propagated).await
             }
             Self::CodeBuildReportGroup => {
                 create_codebuild_report_group(ctx, region, resource, propagated).await
@@ -1933,6 +1948,22 @@ impl Provisioner {
             Self::CodeCommitRepository => {
                 delete_codecommit_repository(ctx, region, physical_resource_id).await
             }
+            // Neither CodeArtifact type is addressed by its physical id: each type's `Ref`
+            // is the resource's ARN, so the names its delete takes come off the resource's
+            // own record ([`declared_name`], [`codeartifact_property`]).
+            Self::CodeArtifactDomain => {
+                delete_codeartifact_domain(ctx, region, &declared_name(resource)).await
+            }
+            Self::CodeArtifactRepository => {
+                delete_codeartifact_repository(
+                    ctx,
+                    region,
+                    &codeartifact_property(resource, CODEARTIFACT_DOMAIN_PROPERTY),
+                    &codeartifact_property(resource, CODEARTIFACT_DOMAIN_OWNER_PROPERTY),
+                    &declared_name(resource),
+                )
+                .await
+            }
             // The delete addresses the group by the ARN CodeBuild keyed it by, which the
             // resource's own record carries.
             Self::CodeBuildReportGroup => {
@@ -2254,6 +2285,10 @@ impl Provisioner {
             }
             Self::CodeCommitRepository => {
                 describe_codecommit_repository(ctx, region, physical_resource_id).await
+            }
+            Self::CodeArtifactDomain => describe_codeartifact_domain(ctx, region, resource).await,
+            Self::CodeArtifactRepository => {
+                describe_codeartifact_repository(ctx, region, resource).await
             }
             // Read back by the same ARN the delete addresses the group by.
             Self::CodeBuildReportGroup => {
@@ -5848,10 +5883,7 @@ fn inline_policies(properties: &Value) -> &[Value] {
 /// The `ManagedPolicyArns` a role declaration carries, each as the ARN text
 /// `AttachRolePolicy` takes.
 fn managed_policy_arns(properties: &Value) -> Vec<String> {
-    declared_list(properties, "ManagedPolicyArns")
-        .iter()
-        .filter_map(scalar_text)
-        .collect()
+    declared_text_list(properties, "ManagedPolicyArns")
 }
 
 /// One list-valued property of a declaration, as a slice — empty for a property the
@@ -5861,6 +5893,20 @@ fn declared_list<'a>(properties: &'a Value, property: &str) -> &'a [Value] {
         .get(property)
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice)
+}
+
+/// The NAMES one list-valued property states, in the order the declaration writes them —
+/// [`declared_list`] read as the text each entry is ([`scalar_text`]).
+///
+/// The one reading of a list of names, so the arms that take one (a role's managed policy
+/// ARNs, a user's groups, a CodeArtifact repository's upstreams and external connections)
+/// cannot read the same declaration differently. An entry that is no single value is not a
+/// name and contributes nothing.
+fn declared_text_list(properties: &Value, property: &str) -> Vec<String> {
+    declared_list(properties, property)
+        .iter()
+        .filter_map(scalar_text)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -6293,10 +6339,7 @@ fn declared_login_profile(properties: &Value) -> Option<(String, Option<bool>)> 
 /// The groups an `AWS::IAM::User` declaration lists, each the friendly name
 /// `AddUserToGroup` takes.
 fn declared_groups(properties: &Value) -> Vec<String> {
-    declared_list(properties, "Groups")
-        .iter()
-        .filter_map(scalar_text)
-        .collect()
+    declared_text_list(properties, "Groups")
 }
 
 /// Create the user an `AWS::IAM::User` declares, with its path, its permissions boundary,
@@ -7773,6 +7816,45 @@ fn reported_as_properties(detail: &Value, members: &[(&str, &str)]) -> Value {
         }
     }
     Value::Object(reported)
+}
+
+/// One answered detail document as the resource's ATTRIBUTES, as `(attribute, member)`
+/// pairs: the owning service's own value for each attribute the type's published return
+/// values name.
+///
+/// A member the answer does not carry, or carries empty, contributes nothing — the resource
+/// keeps whatever value CloudFormation's naming rules computed for that attribute rather
+/// than taking an empty one. The ONE implementation of that reading, so two arms handed the
+/// same answer cannot report it differently.
+fn reported_attributes(detail: &Value, attributes: &[(&str, &str)]) -> BTreeMap<String, String> {
+    attributes
+        .iter()
+        .filter_map(|(attribute, member)| {
+            let value = detail.get(*member).and_then(scalar_text)?;
+            (!value.is_empty()).then(|| ((*attribute).to_string(), value))
+        })
+        .collect()
+}
+
+/// Report the refusal that failed a create SEQUENCE, having removed what the sequence had
+/// already created.
+///
+/// A type whose resource is more than one call (a repository AND its external connections, a
+/// domain AND its permissions policy) fails the whole resource when a later call is refused,
+/// and what the earlier calls created is removed first: the stack records no physical id for
+/// a resource whose create failed, so nothing else would ever delete it. `removal` is what
+/// the owning service answered for that removal — a removal it refused TOO is named in the
+/// message, so the resource left behind is diagnosable — and `noun` is what the resource is
+/// called in that sentence. The wording is here once, so two arms reporting a failed
+/// mid-sequence create cannot word it differently.
+fn rolled_back(refusal: Refusal, removal: Result<(), Refusal>, noun: &str) -> Refusal {
+    match removal {
+        Ok(()) => refusal,
+        Err(failure) => Refusal {
+            code: refusal.code.clone(),
+            message: format!("{refusal}; the {noun} it created was left behind: {failure}"),
+        },
+    }
 }
 
 /// One property value with every member name inside it in LOWER CAMEL case, which is how
@@ -10025,11 +10107,11 @@ fn declared_ip_set_descriptors(properties: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// The NAME a resource record declares, for a type whose PHYSICAL id is the identifier the
-/// owning service minted: the `Name` the record's attribute carries, which is the name the
+/// The NAME a resource record declares, for a type whose PHYSICAL id is not that name: the
+/// identifier the owning service minted, or the resource's ARN where that is what the type's
+/// `Ref` returns. It is the `Name` the record's attribute carries, which is the name the
 /// template asked for or the `<stack>-<logical id>-<suffix>` name CloudFormation generated
-/// for it — never the physical id, which for such a type is the service's own identifier
-/// once the create went through.
+/// for it — never the physical id.
 ///
 /// A record with no such attribute (one whose attribute budget was spent) falls back to the
 /// physical id, which before the create IS that computed name. Shared by every arm in that
@@ -21276,26 +21358,15 @@ async fn create_codecommit_repository(
         if let Err(refusal) =
             call_codecommit(ctx, region, "PutRepositoryTriggers", &request).await
         {
-            delete_codecommit_repository(ctx, region, &name)
-                .await
-                .map_err(|failure| Refusal {
-                    code: refusal.code.clone(),
-                    message: format!(
-                        "{refusal}; the repository it created was left behind: {failure}"
-                    ),
-                })?;
-            return Err(refusal);
+            let removal = delete_codecommit_repository(ctx, region, &name).await;
+            return Err(rolled_back(refusal, removal, "repository"));
         }
     }
 
-    let attributes = CODECOMMIT_REPORTED_ATTRIBUTES
-        .iter()
-        .filter_map(|(attribute, member)| {
-            let value = metadata.get(*member).and_then(scalar_text)?;
-            (!value.is_empty()).then(|| ((*attribute).to_string(), value))
-        })
-        .collect();
-    Ok(Created::attributes(attributes))
+    Ok(Created::attributes(reported_attributes(
+        &metadata,
+        CODECOMMIT_REPORTED_ATTRIBUTES,
+    )))
 }
 
 /// The triggers a declaration asks for, as the `RepositoryTriggersList`
@@ -21368,6 +21439,429 @@ async fn call_codecommit(
         request,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// AWS CodeArtifact: AWS::CodeArtifact::Domain / AWS::CodeArtifact::Repository
+// ---------------------------------------------------------------------------
+
+/// CodeArtifact's signing name, from its model (`sigv4Name: codeartifact`, service shape
+/// `CodeArtifactControlPlaneService`), which speaks `restJson1` — so its calls ride on
+/// [`call_rest_json`], each on the URI its own operation's `@http` binding declares.
+const CODEARTIFACT_SIGNING_NAME: &str = "codeartifact";
+
+/// The URIs the CodeArtifact operations a stack makes are bound to, as that model's `@http`
+/// traits declare them. Each of them names the resource it addresses in QUERY parameters
+/// rather than in the path (`domain`, `domain-owner`, `repository`, `external-connection`),
+/// which is what [`codeartifact_uri`] writes.
+const CODEARTIFACT_DOMAIN_URI: &str = "/v1/domain";
+/// See [`CODEARTIFACT_DOMAIN_URI`].
+const CODEARTIFACT_REPOSITORY_URI: &str = "/v1/repository";
+/// See [`CODEARTIFACT_DOMAIN_URI`].
+const CODEARTIFACT_EXTERNAL_CONNECTION_URI: &str = "/v1/repository/external-connection";
+/// See [`CODEARTIFACT_DOMAIN_URI`]. `PutDomainPermissionsPolicy` binds NO member to the
+/// query string — its `domain` travels in the body with the document.
+const CODEARTIFACT_DOMAIN_POLICY_URI: &str = "/v1/domain/permissions/policy";
+/// See [`CODEARTIFACT_DOMAIN_URI`].
+const CODEARTIFACT_REPOSITORY_POLICY_URI: &str = "/v1/repository/permissions/policy";
+
+/// The error code CodeArtifact answers for a domain or a repository it does not hold
+/// (`ResourceNotFoundException`, the modelled 404 of its reads and of `DeleteRepository`).
+const CODEARTIFACT_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The `AWS::CodeArtifact::Domain` properties `CreateDomain` takes under its own member
+/// name, as `(property, member)` pairs.
+///
+/// Source: AWS's CloudFormation resource reference for the type against that call's
+/// `encryptionKey` member. `DomainName` is not here because it is the one value
+/// CloudFormation decides and that call binds to its `domain` query parameter, `Tags` is not
+/// because the member spells a tag's halves in lower camel case, and
+/// `PermissionsPolicyDocument` is not because it is no member of that create at all.
+const CODEARTIFACT_DOMAIN_MEMBERS: &[(&str, &str)] = &[("EncryptionKey", "encryptionKey")];
+
+/// The `AWS::CodeArtifact::Repository` properties `CreateRepository` takes under its own
+/// member name.
+///
+/// `RepositoryName`, `DomainName` and `DomainOwner` are not here because that call binds
+/// each of them to a query parameter; `Upstreams` is not because the type publishes a list
+/// of repository NAMES while the member is a list of `UpstreamRepository` structures
+/// ([`declared_upstreams`]); `ExternalConnections` and `PermissionsPolicyDocument` are not
+/// because neither is a member of that create at all.
+const CODEARTIFACT_REPOSITORY_MEMBERS: &[(&str, &str)] = &[("Description", "description")];
+
+/// The property whose document IS the resource's own permissions policy, which
+/// `PutDomainPermissionsPolicy` / `PutRepositoryPermissionsPolicy` writes.
+const CODEARTIFACT_POLICY_PROPERTY: &str = "PermissionsPolicyDocument";
+
+/// The property whose list names the repositories a declaration puts UPSTREAM of its own.
+const CODEARTIFACT_UPSTREAMS_PROPERTY: &str = "Upstreams";
+
+/// The property whose list names the external connections to associate with the repository,
+/// which `AssociateExternalConnection` adds one at a time.
+const CODEARTIFACT_EXTERNAL_CONNECTIONS_PROPERTY: &str = "ExternalConnections";
+
+/// The property naming the DOMAIN a repository is declared in — half of the pair every
+/// CodeArtifact call on a repository addresses it by.
+const CODEARTIFACT_DOMAIN_PROPERTY: &str = "DomainName";
+
+/// The property naming the account that owns that domain, which a declaration states only
+/// for a domain of another account.
+const CODEARTIFACT_DOMAIN_OWNER_PROPERTY: &str = "DomainOwner";
+
+/// The `DomainDescription` members CodeArtifact answers a create with, under the attribute
+/// names this type's published return values give them (`Arn`, `Name`, `Owner`).
+///
+/// They are reported back as the resource's attributes rather than kept as computed: the ARN
+/// is the one that service itself keyed the domain by, and the owner is the account it
+/// recorded for it.
+const CODEARTIFACT_DOMAIN_REPORTED_ATTRIBUTES: &[(&str, &str)] =
+    &[("Arn", "arn"), ("Name", "name"), ("Owner", "owner")];
+
+/// The `RepositoryDescription` members it answers a repository create with, under that
+/// type's published attribute names (`Arn`, `DomainOwner`, `Name`).
+const CODEARTIFACT_REPOSITORY_REPORTED_ATTRIBUTES: &[(&str, &str)] = &[
+    ("Arn", "arn"),
+    ("DomainOwner", "domainOwner"),
+    ("Name", "name"),
+];
+
+/// The members `DescribeDomain` reports under this type's own property names, as
+/// `(property, member)` pairs, for drift detection.
+///
+/// `Tags` is left out for the reason it is everywhere else here — the tags a resource
+/// carries change independently of its declaration — and `PermissionsPolicyDocument` because
+/// a domain's policy is answered by `GetDomainPermissionsPolicy`, a read of its own, and a
+/// property the read does not report is not evidence of anything ([`super::drift`]).
+const CODEARTIFACT_DOMAIN_REPORTED_PROPERTIES: &[(&str, &str)] =
+    &[("DomainName", "name"), ("EncryptionKey", "encryptionKey")];
+
+/// The members `DescribeRepository` reports under this type's own property names.
+///
+/// `Upstreams` and `ExternalConnections` are left out: the read reports each as a list of
+/// structures (`UpstreamRepositoryInfo`, `RepositoryExternalConnectionInfo`) while the type
+/// publishes a list of plain names, so the two documents could not be compared without
+/// inventing a reading of one of them.
+const CODEARTIFACT_REPOSITORY_REPORTED_PROPERTIES: &[(&str, &str)] = &[
+    ("RepositoryName", "name"),
+    ("DomainName", "domainName"),
+    ("DomainOwner", "domainOwner"),
+    ("Description", "description"),
+];
+
+/// One CodeArtifact URI: the operation's path with the resource it addresses in the query
+/// parameters that operation's model binds those members to, each value percent-encoded
+/// ([`percent_encoded`]) so a name reaches the called operation as one value.
+///
+/// A pair whose value is empty is left out, which is how a member a declaration states
+/// nothing for (`domain-owner`) is not sent at all.
+fn codeartifact_uri(path: &str, parameters: &[(&str, &str)]) -> String {
+    let query: Vec<String> = parameters
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(name, value)| format!("{name}={}", percent_encoded(value)))
+        .collect();
+    if query.is_empty() {
+        return path.to_string();
+    }
+    format!("{path}?{}", query.join("&"))
+}
+
+/// One declared property of a CodeArtifact resource as the text its calls carry: the value
+/// the record's resolved properties hold ([`property`], this module's one spelling rule for
+/// reading a declared scalar), else the attribute the same declaration gave the resource,
+/// else `""` for a declaration that states none — which is how a member a declaration
+/// states nothing for (`domain-owner`) is left out of the request.
+fn codeartifact_property(resource: &StoredResource, name: &str) -> String {
+    property(resource, name)
+        .or_else(|| resource.attributes.get(name).cloned())
+        .unwrap_or_default()
+}
+
+/// The permissions policy a declaration attaches, as the `policyDocument` STRING those two
+/// calls take: the type publishes the property as a policy DOCUMENT, while the member is a
+/// string — so [`document_text`]'s rule applies, the one every other policy arm here reads a
+/// declared document by. `None` for a declaration that attaches none.
+fn declared_permissions_policy(properties: &Map<String, Value>) -> Option<String> {
+    properties
+        .get(CODEARTIFACT_POLICY_PROPERTY)
+        .and_then(document_text)
+        .filter(|document| !document.is_empty())
+}
+
+/// The upstream repositories a declaration asks for, as the `UpstreamRepositoryList`
+/// `CreateRepository` takes: the type publishes a list of repository NAMES
+/// ([`declared_text_list`]), while that member is a list of
+/// `UpstreamRepository{repositoryName}`.
+fn declared_upstreams(properties: &Value) -> Vec<Value> {
+    declared_text_list(properties, CODEARTIFACT_UPSTREAMS_PROPERTY)
+        .into_iter()
+        .map(|name| serde_json::json!({ "repositoryName": name }))
+        .collect()
+}
+
+/// Create the domain an `AWS::CodeArtifact::Domain` declares, and attach the permissions
+/// policy it declares to it — so a client that deployed the stack and then calls
+/// `codeartifact describe-domain` with the name the stack publishes reads the domain back
+/// rather than a `ResourceNotFoundException`.
+///
+/// "Ref returns the Amazon Resource Name (ARN) of the domain", so the resource's physical id
+/// is NOT the handle CodeArtifact addresses a domain by: the domain is created under the NAME
+/// the declaration asked for, which is this type's published `Name` attribute and the value
+/// `CreateDomain` binds to its `domain` query parameter.
+///
+/// `PermissionsPolicyDocument` is no member of that create: "Sets a resource policy on a
+/// domain" is what attaches one, so the declared document reaches CodeArtifact through that
+/// call on the domain just created — the same second call a client makes. The resource the
+/// template declares is the domain AND that policy, so a document CodeArtifact refuses fails
+/// the resource, and the domain this arm already created is removed before that refusal
+/// propagates (the stack records no physical id for a resource whose create failed, so
+/// nothing else would ever delete it).
+///
+/// The domain carries the tags the declaration asks for plus the stack's own ([`tags_of`]),
+/// as the `[{key, value}]` list that model's own `Tag` shape spells.
+async fn create_codeartifact_domain(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let domain = declared_name(resource);
+    let mut request = Map::new();
+    copy_members(&properties, CODEARTIFACT_DOMAIN_MEMBERS, &mut request);
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), tags_as_list(&tags, LOWER_CASED_TAG));
+    }
+    let uri = codeartifact_uri(CODEARTIFACT_DOMAIN_URI, &[("domain", &domain)]);
+    let answered =
+        call_codeartifact(ctx, region, "POST", &uri, Some(&Value::Object(request))).await?;
+
+    if let Some(document) = declared_permissions_policy(&properties) {
+        let policy = serde_json::json!({ "domain": domain, "policyDocument": document });
+        if let Err(refusal) = call_codeartifact(
+            ctx,
+            region,
+            "PUT",
+            CODEARTIFACT_DOMAIN_POLICY_URI,
+            Some(&policy),
+        )
+        .await
+        {
+            let removal = delete_codeartifact_domain(ctx, region, &domain).await;
+            return Err(rolled_back(refusal, removal, "domain"));
+        }
+    }
+
+    Ok(Created::attributes(reported_attributes(
+        &reported_member(&answered, "domain"),
+        CODEARTIFACT_DOMAIN_REPORTED_ATTRIBUTES,
+    )))
+}
+
+/// Delete the domain a stack created, addressed by its NAME.
+///
+/// `DeleteDomain` models no does-not-exist error at all, and a domain CodeArtifact no longer
+/// holds is already in the state the delete asks for, so that call says so itself. A domain
+/// that still holds repositories is its own refusal, which is reported as the failure it is:
+/// a stack deletes a repository before the domain that holds it, so the only way to reach it
+/// is a repository something else created there.
+async fn delete_codeartifact_domain(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    domain: &str,
+) -> Result<(), Refusal> {
+    let uri = codeartifact_uri(CODEARTIFACT_DOMAIN_URI, &[("domain", domain)]);
+    call_codeartifact(ctx, region, "DELETE", &uri, None).await?;
+    Ok(())
+}
+
+/// The domain's configuration as CodeArtifact reports it, for drift detection. One it no
+/// longer holds (`ResourceNotFoundException`, judged on the CODE and never on a message that
+/// carries the request's own name) was deleted.
+async fn describe_codeartifact_domain(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let uri = codeartifact_uri(
+        CODEARTIFACT_DOMAIN_URI,
+        &[("domain", &declared_name(resource))],
+    );
+    match call_codeartifact(ctx, region, "GET", &uri, None).await {
+        Ok(answer) => Ok(Some(reported_as_properties(
+            &reported_member(&answer, "domain"),
+            CODEARTIFACT_DOMAIN_REPORTED_PROPERTIES,
+        ))),
+        Err(refusal) if refusal.code == CODEARTIFACT_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Create the repository an `AWS::CodeArtifact::Repository` declares, in the domain its
+/// declaration names, and associate every external connection it declares with it.
+///
+/// "Ref returns the Amazon Resource Name (ARN) of the repository", so — as for a domain — the
+/// physical id is not the handle CodeArtifact addresses one by: a repository is addressed by
+/// the PAIR its create fixes, the domain and the repository's own name, both of which
+/// `CreateRepository` binds to query parameters.
+///
+/// `ExternalConnections` and `PermissionsPolicyDocument` are no members of that create:
+/// "Adds an existing external connection to a repository" and "Sets the resource policy on a
+/// repository" are what apply them, so each declared connection and the declared document
+/// reach CodeArtifact through those calls on the repository just created — the same further
+/// calls a client makes. The resource the template declares is the repository AND those, so
+/// one CodeArtifact refuses fails the resource and the repository this arm already created is
+/// removed before that refusal propagates.
+///
+/// The repository carries the tags the declaration asks for plus the stack's own, and the
+/// attributes it reports are the ones CodeArtifact answered with — the ARN that service keyed
+/// the repository by and the account it recorded as the owner of its domain.
+async fn create_codeartifact_repository(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let repository = declared_name(resource);
+    let domain = codeartifact_property(resource, CODEARTIFACT_DOMAIN_PROPERTY);
+    let owner = codeartifact_property(resource, CODEARTIFACT_DOMAIN_OWNER_PROPERTY);
+    let addressed: &[(&str, &str)] = &[
+        ("domain", &domain),
+        ("domain-owner", &owner),
+        ("repository", &repository),
+    ];
+
+    let mut request = Map::new();
+    copy_members(&properties, CODEARTIFACT_REPOSITORY_MEMBERS, &mut request);
+    let upstreams = declared_upstreams(&resource.properties);
+    if !upstreams.is_empty() {
+        request.insert("upstreams".to_string(), Value::Array(upstreams));
+    }
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), tags_as_list(&tags, LOWER_CASED_TAG));
+    }
+    let uri = codeartifact_uri(CODEARTIFACT_REPOSITORY_URI, addressed);
+    let answered =
+        call_codeartifact(ctx, region, "POST", &uri, Some(&Value::Object(request))).await?;
+    // Each further call answers with the repository as it stands, so the attributes the
+    // resource reports are the ones the LAST of them described.
+    let mut described = reported_member(&answered, "repository");
+
+    for connection in declared_text_list(
+        &resource.properties,
+        CODEARTIFACT_EXTERNAL_CONNECTIONS_PROPERTY,
+    ) {
+        let mut parameters = addressed.to_vec();
+        parameters.push(("external-connection", &connection));
+        let uri = codeartifact_uri(CODEARTIFACT_EXTERNAL_CONNECTION_URI, &parameters);
+        // That operation's input is entirely in the query string, so the body it takes is
+        // an empty document rather than nothing.
+        let empty = Value::Object(Map::new());
+        match call_codeartifact(ctx, region, "POST", &uri, Some(&empty)).await {
+            Ok(answer) => described = reported_member(&answer, "repository"),
+            Err(refusal) => {
+                let removal = delete_codeartifact_repository(
+                    ctx, region, &domain, &owner, &repository,
+                )
+                .await;
+                return Err(rolled_back(refusal, removal, "repository"));
+            }
+        }
+    }
+
+    if let Some(document) = declared_permissions_policy(&properties) {
+        let uri = codeartifact_uri(CODEARTIFACT_REPOSITORY_POLICY_URI, addressed);
+        let policy = serde_json::json!({ "policyDocument": document });
+        if let Err(refusal) = call_codeartifact(ctx, region, "PUT", &uri, Some(&policy)).await {
+            let removal =
+                delete_codeartifact_repository(ctx, region, &domain, &owner, &repository).await;
+            return Err(rolled_back(refusal, removal, "repository"));
+        }
+    }
+
+    Ok(Created::attributes(reported_attributes(
+        &described,
+        CODEARTIFACT_REPOSITORY_REPORTED_ATTRIBUTES,
+    )))
+}
+
+/// Delete the repository a stack created, addressed by the domain and the name it was
+/// created under. One CodeArtifact no longer holds (`ResourceNotFoundException`, judged on
+/// the CODE) is already in the state the delete asks for.
+async fn delete_codeartifact_repository(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    domain: &str,
+    owner: &str,
+    repository: &str,
+) -> Result<(), Refusal> {
+    let uri = codeartifact_uri(
+        CODEARTIFACT_REPOSITORY_URI,
+        &[
+            ("domain", domain),
+            ("domain-owner", owner),
+            ("repository", repository),
+        ],
+    );
+    match call_codeartifact(ctx, region, "DELETE", &uri, None).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == CODEARTIFACT_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The repository's configuration as CodeArtifact reports it, for drift detection. One it no
+/// longer holds — or one whose DOMAIN it no longer holds, which answers the same code — was
+/// deleted.
+async fn describe_codeartifact_repository(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let uri = codeartifact_uri(
+        CODEARTIFACT_REPOSITORY_URI,
+        &[
+            (
+                "domain",
+                &codeartifact_property(resource, CODEARTIFACT_DOMAIN_PROPERTY),
+            ),
+            (
+                "domain-owner",
+                &codeartifact_property(resource, CODEARTIFACT_DOMAIN_OWNER_PROPERTY),
+            ),
+            ("repository", &declared_name(resource)),
+        ],
+    );
+    match call_codeartifact(ctx, region, "GET", &uri, None).await {
+        Ok(answer) => Ok(Some(reported_as_properties(
+            &reported_member(&answer, "repository"),
+            CODEARTIFACT_REPOSITORY_REPORTED_PROPERTIES,
+        ))),
+        Err(refusal) if refusal.code == CODEARTIFACT_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Call one CodeArtifact operation on the restJson1 wire its model declares.
+async fn call_codeartifact(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    method: &'static str,
+    uri: &str,
+    request: Option<&Value>,
+) -> Result<Value, Refusal> {
+    call_rest_json(ctx, CODEARTIFACT_SIGNING_NAME, region, method, uri, request).await
 }
 
 // ---------------------------------------------------------------------------
