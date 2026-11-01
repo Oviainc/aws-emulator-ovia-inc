@@ -13,7 +13,9 @@
 //! * its `eventSource` ([`EVENT_SOURCE`]);
 //! * the Region its records are filed in ([`EVENT_REGION`]) and the account the call was
 //!   served for;
-//! * the members whose values its records WITHHOLD, and how ([`OMITTED_MEMBERS`]); and
+//! * the members whose values its records WITHHOLD, and how ([`OMITTED_MEMBERS`]);
+//! * which of its refusals are decided BEFORE the operation runs, whose records carry no
+//!   request parameters at all ([`AuditedService::stopped_at_authorization`]); and
 //! * which operations REPORT state and which CHANGE it — the one fact a record cannot read
 //!   off a request, so it is stated per operation in [`audited_table`].
 //!
@@ -85,6 +87,15 @@ pub const OMITTED_MEMBERS: &[&str] = &[
     "PrivateKey",
     "AddPrivateKey",
 ];
+
+/// The error code this service answers an authorization refusal with, as the record names
+/// it: the fault shape's own name, which for this refusal is the code IAM uses on the wire
+/// too (`crate::scaffolded::Scaffolded::shape_name`).
+const ACCESS_DENIED_SHAPE_NAME: &str = "AccessDenied";
+
+/// The status that refusal carries (`crate::scaffolded::Scaffolded::http_status`): the one
+/// AWS answers an authorization refusal with.
+const ACCESS_DENIED_STATUS: u16 = 403;
 
 /// What this service contributes to the record of each call it serves.
 ///
@@ -160,7 +171,46 @@ impl<Eng: Send + Sync + 'static> AuditedService for IamAudit<Eng> {
     fn omitted_members(&self) -> &'static [&'static str] {
         OMITTED_MEMBERS
     }
+
+    fn stopped_at_authorization(
+        &self,
+        operation: &str,
+        shape_name: &str,
+        http_status: u16,
+    ) -> bool {
+        // This service authorizes its OWN API: every call it serves is decided against the
+        // calling principal's identity-based policies by one gate
+        // ([`crate::state::authorization`]) BEFORE the operation reads or writes anything,
+        // and the refusal that gate answers is this code with this status. So a call refused
+        // this way reached no operation, and its record carries neither the parameters it
+        // would have been dispatched with nor any response elements — while every refusal an
+        // operation reaches of its own keeps them, because that call WAS dispatched:
+        // the refusals carrying another code (an entity that is not there, a name the
+        // account already holds, a quota) and the operations below, which answer this one
+        // themselves.
+        shape_name == ACCESS_DENIED_SHAPE_NAME
+            && http_status == ACCESS_DENIED_STATUS
+            && !REFUSED_AFTER_DISPATCH.contains(&operation)
+    }
 }
+
+/// The operations whose HANDLER answers an authorization refusal of its own, after the gate
+/// has already admitted the call — so the call was dispatched, and its record carries the
+/// parameters it was dispatched with like any other dispatched call's.
+///
+/// SOURCE, for adding an entry: a handler that builds the refusal itself
+/// (`crate::scaffolded::Scaffolded::access_denied`) instead of letting the authorization
+/// gate raise it.
+const REFUSED_AFTER_DISPATCH: &[&str] = &[
+    // The old password the change presented is not the one in force: a check against the
+    // login profile the handler had already read, not a decision about what the caller may
+    // do.
+    "ChangePassword",
+    // The account is not the management account of the organization the entity path names:
+    // the requirement this operation's own documentation states, decided against the
+    // organization the store holds after the gate admitted the call.
+    "GenerateOrganizationsAccessReport",
+];
 
 /// The account's management-event log in the shared engine.
 ///

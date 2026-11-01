@@ -719,6 +719,39 @@ where
     }
 }
 
+/// The `requestParameters` a record carries for a call, given whether the serving API
+/// STOPPED that call AT AUTHORIZATION — refused it for want of permission before the
+/// operation acted on the request at all.
+///
+/// Such a call is recorded with no request parameters and no response elements, JSON `null`
+/// for both: the parameters report what a call that was authorized and DISPATCHED carried,
+/// so the record of a refusal says that a caller asked for an action it may not perform and
+/// not what the body of the refused request held. That is the contrast a reader of event
+/// history separates the two by — parameters present on a call the service acted on, absent
+/// on one stopped at the permission check — and it is what keeps a denied request's own
+/// input out of the audit trail.
+///
+/// Every other call records `parameters` as it carried them, a failure the OPERATION
+/// answered included (a resource that is not there, a document that does not admit the
+/// request, a quota): such a call was dispatched, and what it was dispatched with is what a
+/// reader auditing it needs.
+///
+/// WHICH refusals are the first kind is the serving API's own fact and not this function's
+/// (see [`crate::audited_operation::AuditedService::stopped_at_authorization`]): two
+/// services answer the same status for refusals decided in different places, one before the
+/// operation runs and one by the operation itself.
+#[must_use]
+pub fn recorded_request_parameters(
+    parameters: serde_json::Value,
+    stopped_at_authorization: bool,
+) -> serde_json::Value {
+    if stopped_at_authorization {
+        serde_json::Value::Null
+    } else {
+        parameters
+    }
+}
+
 /// One resource an event refers to: the pair CloudTrail reports in an event's
 /// `Resources`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -928,7 +961,9 @@ pub struct ServedApiCall {
     pub user_agent: Option<String>,
     /// The resources the call acted on.
     pub resources: Vec<AuditedResource>,
-    /// The request's parameters, as the event's `requestParameters`.
+    /// The request's parameters, as the event's `requestParameters` — JSON null for a call
+    /// that was not dispatched at all, which is what
+    /// [`recorded_request_parameters`] answers for one stopped at authorization.
     pub request_parameters: serde_json::Value,
     /// The response's values, as the event's `responseElements`; `None` for a call that
     /// failed or that returns nothing.

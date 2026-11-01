@@ -3072,6 +3072,12 @@ pub struct ServedCall<'a> {
 /// No secret is written: a provider token, an OpenID token and a vended session are the
 /// caller's own and are left out of both `requestParameters` and `responseElements` by
 /// the handler that fills them.
+///
+/// A call this service stopped at AUTHORIZATION records neither the parameters nor the
+/// response elements, as every recorder in this tree does
+/// ([`service_common::management_events::recorded_request_parameters`]): the record of such
+/// a call says that a caller asked for something it may not do, not what the refused
+/// request held.
 pub fn record_served_call<Eng: Send + Sync + 'static, T, E>(
     engine: &Eng,
     parts: &http::request::Parts,
@@ -3091,6 +3097,15 @@ pub fn record_served_call<Eng: Send + Sync + 'static, T, E>(
     };
     let (error_code, error_message) =
         ::service_common::management_events::recorded_failure(outcome);
+    // Whether this service's PERMISSION CHECK stopped the call: its gate
+    // ([`authorization::denied`]) is placed before an implemented handler reads or writes
+    // anything, and the refusal it answers is the only one carrying this code and status —
+    // every other refusal of this service is one an operation reached while serving the
+    // call, so that call was dispatched and its record keeps what it carried.
+    let stopped_at_authorization = outcome.as_ref().err().is_some_and(|error| {
+        error.shape_name() == crate::scaffolded::ACCESS_DENIED_CODE
+            && error.http_status() == crate::scaffolded::ACCESS_DENIED_STATUS
+    });
     let caller = ::service_common::management_events::recorded_caller(parts);
     let session = recorded_session(engine, caller.access_key_id.as_deref());
     log.lock().record(
@@ -3133,7 +3148,10 @@ pub fn record_served_call<Eng: Send + Sync + 'static, T, E>(
                 })
                 .into_iter()
                 .collect(),
-            request_parameters: call.request_parameters.clone(),
+            request_parameters: ::service_common::management_events::recorded_request_parameters(
+                call.request_parameters.clone(),
+                stopped_at_authorization,
+            ),
             response_elements: call.response_elements.clone(),
             error_code,
             error_message,

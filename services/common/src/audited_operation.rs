@@ -20,7 +20,9 @@
 //! * `requestParameters` / `responseElements` are the built input and output rendered
 //!   against their own schemas ([`crate::management_events::recorded_shape`]), so a
 //!   member whose value the serving API withholds is redacted or left out rather than
-//!   stored;
+//!   stored — and a call STOPPED AT AUTHORIZATION records neither, because the parameters
+//!   report what a call that was authorized and dispatched carried
+//!   ([`crate::management_events::recorded_request_parameters`]);
 //! * `errorCode` / `errorMessage` come from the error channel the caller was answered
 //!   through ([`crate::management_events::recorded_failure`]), so a failed call records
 //!   the fault SHAPE's name;
@@ -69,7 +71,8 @@ use smithy_server_runtime::{
 };
 
 use crate::management_events::{
-    recorded_failure, recorded_shape, RecordedSession, ServedApiCall, WithheldFromRecord,
+    recorded_failure, recorded_request_parameters, recorded_shape, RecordedSession, ServedApiCall,
+    WithheldFromRecord,
 };
 use crate::query_error_envelope::named_request;
 
@@ -200,6 +203,37 @@ pub trait AuditedService: Send + Sync + 'static {
         None
     }
 
+    /// Whether a failure answered with this error identity is the refusal this service's
+    /// PERMISSION CHECK answers BEFORE the operation acts on the request — the one failure
+    /// whose record carries no `requestParameters` and no `responseElements`, because the
+    /// request reached no operation to be dispatched with them
+    /// ([`crate::management_events::recorded_request_parameters`]).
+    ///
+    /// The default is NONE, which is the honest answer for a service that decides
+    /// permission while serving a call: a refusal the OPERATION reached — a resource that is
+    /// not there, a trust or resource policy that does not admit the request, a quota, a
+    /// credential the operation checked — is a call that WAS dispatched, so its record
+    /// carries what it was dispatched with. A service states this only for the refusal its
+    /// own pre-dispatch gate answers, because WHERE a refusal is decided is a fact about
+    /// that service and not about the status: two services answer the same 403 for refusals
+    /// decided in different places.
+    ///
+    /// `operation` is the modelled name of the operation the call was made to, because
+    /// which refusals a service decides before dispatch can be the OPERATION's fact rather
+    /// than the error code's: one code covers both a gate's decision and a refusal a
+    /// particular handler reaches of its own. `shape_name` and `http_status` are the error's
+    /// own, exactly as the record reports them
+    /// ([`crate::management_events::recorded_failure`]).
+    fn stopped_at_authorization(
+        &self,
+        operation: &str,
+        shape_name: &str,
+        http_status: u16,
+    ) -> bool {
+        let _ = (operation, shape_name, http_status);
+        false
+    }
+
     /// The members this service's records leave OUT entirely: no key for them at all,
     /// rather than a key carrying the redaction literal.
     ///
@@ -310,6 +344,13 @@ impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
             _ => None,
         };
         let (error_code, error_message) = recorded_failure(outcome);
+        // WHERE the refusal was decided, which the serving service answers: a call its
+        // permission check stopped reached no operation, so there is nothing it was
+        // dispatched with to record.
+        let stopped_at_authorization = outcome.as_ref().err().is_some_and(|error| {
+            self.service
+                .stopped_at_authorization(O::NAME, error.shape_name(), error.http_status())
+        });
         let caller = crate::management_events::recorded_caller(ctx.parts());
         // The session the credential belongs to, when the call was made with one: a session
         // knows its own principal type, id and name, so those come from it rather than from
@@ -343,7 +384,13 @@ impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
             user_agent: crate::management_events::recorded_user_agent(ctx.parts()),
             resources: self.service.resources(O::NAME, request_parameters, &region),
             aws_region: region,
-            request_parameters: request_parameters.clone(),
+            // The parameters the call was DISPATCHED with, and none for a call the
+            // permission check stopped before it was dispatched at all (see
+            // [`recorded_request_parameters`]).
+            request_parameters: recorded_request_parameters(
+                request_parameters.clone(),
+                stopped_at_authorization,
+            ),
             response_elements,
             error_code,
             error_message,

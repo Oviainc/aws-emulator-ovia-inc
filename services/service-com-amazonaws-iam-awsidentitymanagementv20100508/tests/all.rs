@@ -207,6 +207,8 @@ mod published_managed_policy_reads;
 mod published_policy_families;
 #[path = "all/range_refusal_wording.rs"]
 mod range_refusal_wording;
+#[path = "all/refused_call_audit_parameters.rs"]
+mod refused_call_audit_parameters;
 #[path = "all/request_condition_context.rs"]
 mod request_condition_context;
 #[path = "all/resource_tag_condition_context.rs"]
