@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // kind" and "not a destination" are malformed requests rather than missing
         // resources, and neither is answered by the DryRun arm below.
         if !state::local_gateway_route_table_id_is_well_formed(route_table_id) {
-            return Err(state::invalid_route_table_id_for_local_gateway_route(
+            return Err(state::invalid_local_gateway_route_table_id_malformed(
                 route_table_id,
             ));
         }
@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused with the table's own `NotFound` code whatever the destination turns out
         // to be, so a client can tell "no such route table" from "no route for that
         // destination".
-        state::require_known_route_table_for_local_gateway_route(&store, route_table_id)?;
+        state::require_known_local_gateway_route_table(&store, route_table_id)?;
         let route = store
             .local_gateway_route(route_table_id, destination.key())
             .cloned()

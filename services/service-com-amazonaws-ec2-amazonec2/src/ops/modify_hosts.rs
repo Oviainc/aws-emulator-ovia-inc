@@ -160,7 +160,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             INVALID_HOST_ID_MALFORMED, INVALID_PARAMETER_VALUE, MAX_RESOURCE_IDS,
             host_instance_family, host_is_released, instance_family_is_modelled,
             instance_type_is_modelled, invalid_request, missing_parameter, require_service_state,
-            unresolvable_host_ids_message,
+            unresolvable_host_ids_message, unsupported_host_instance_family,
+            unsupported_host_instance_type,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it — the host
@@ -198,20 +199,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
             (Some(instance_type), None) => {
+                // Hardware EC2 does not offer makes the host CONFIGURATION this call asks
+                // for impossible, so it carries the configuration refusal `AllocateHosts`
+                // answers for the same value ([`crate::state::unsupported_host_instance_type`])
+                // rather than a parameter refusal inviting a retry.
                 if !instance_type_is_modelled(instance_type) {
-                    return Err(Scaffolded::invalid_parameter_value(format!(
-                        "Invalid value '{instance_type}' for instanceType. \
-                         EC2 offers no such instance type"
-                    )));
+                    return Err(unsupported_host_instance_type(instance_type));
                 }
                 Some(SupportedInstances::OneType(instance_type))
             }
             (None, Some(instance_family)) => {
                 if !instance_family_is_modelled(instance_family) {
-                    return Err(Scaffolded::invalid_parameter_value(format!(
-                        "Invalid value '{instance_family}' for instanceFamily. \
-                         EC2 offers no instance type in such a family"
-                    )));
+                    return Err(unsupported_host_instance_family(instance_family));
                 }
                 Some(SupportedInstances::WholeFamily(instance_family))
             }

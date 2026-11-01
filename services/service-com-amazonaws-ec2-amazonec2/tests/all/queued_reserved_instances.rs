@@ -18,7 +18,9 @@
 //!   `reserved-instances-id-invalid` for an id the account holds no Reserved Instance for,
 //!   `reserved-instances-not-in-queued-state` for one whose Reserved Instance is in any
 //!   other state. That per-id channel is the whole point of the operation's output, so
-//!   neither case fails the call.
+//!   neither case fails the call, and each entry's `error.message` is the FIXED sentence
+//!   that code carries — the entry's own `reservedInstancesId` is where the caller reads
+//!   WHICH id failed, so the message names no value of the request and no stored state.
 //! * A value that is not a Reserved Instances id at all — an id is the hyphenated form of
 //!   a UUID, not EC2's `<prefix>-<hex>` form — is a parameter EC2 cannot read, so the
 //!   whole call is refused with `InvalidParameterValue` and nothing in the batch is
@@ -28,7 +30,8 @@
 use std::time::{Duration, SystemTime};
 
 use ec2::ops::delete_queued_reserved_instances::{
-    RESERVED_INSTANCES_ID_INVALID, RESERVED_INSTANCES_NOT_IN_QUEUED_STATE,
+    RESERVED_INSTANCES_ID_INVALID, RESERVED_INSTANCES_ID_INVALID_MESSAGE,
+    RESERVED_INSTANCES_NOT_IN_QUEUED_STATE, RESERVED_INSTANCES_NOT_IN_QUEUED_STATE_MESSAGE,
 };
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, MAX_STORED_RESERVED_INSTANCES,
@@ -62,9 +65,15 @@ const ONE_YEAR_SECONDS: i64 = 365 * 24 * 60 * 60;
 struct Deletions {
     /// The `ReservedInstancesId` of each `SuccessfulQueuedPurchaseDeletions` entry.
     deleted: Vec<String>,
-    /// The `ReservedInstancesId` and error `Code` of each
+    /// The `ReservedInstancesId`, error `Code` and error `Message` of each
     /// `FailedQueuedPurchaseDeletions` entry.
-    failed: Vec<(String, String)>,
+    failed: Vec<(String, String, String)>,
+}
+
+/// The `(id, code, message)` one failed entry must carry: this channel's message is FIXED
+/// text per code, so a row names the code and the sentence that code's entries carry.
+fn failure(id: &str, code: &str, message: &str) -> (String, String, String) {
+    (id.to_string(), code.to_string(), message.to_string())
 }
 
 /// One purchase to seed in a table row: its instance type, its Availability Zone (`None`
@@ -108,10 +117,14 @@ fn deletions(case: &str, body: &str) -> Deletions {
         .into_iter()
         .map(|item| {
             let id = child_text(item, "reservedInstancesId").unwrap_or_default();
-            let code = child(item, "error")
+            let error = child(item, "error");
+            let code = error
                 .and_then(|error| child_text(error, "code"))
                 .unwrap_or_default();
-            (id, code)
+            let message = error
+                .and_then(|error| child_text(error, "message"))
+                .unwrap_or_default();
+            (id, code, message)
         })
         .collect();
     Deletions { deleted, failed }
@@ -285,12 +298,13 @@ async fn a_queued_purchase_is_deleted_and_stops_being_queued() {
             "case {case:?}: expected HTTP 200 from the repeat, got {status} with body {body}"
         );
         let repeat = deletions(case, &body);
-        let expected: Vec<(String, String)> = seeded
+        let expected: Vec<(String, String, String)> = seeded
             .iter()
             .map(|id| {
-                (
-                    id.clone(),
-                    RESERVED_INSTANCES_NOT_IN_QUEUED_STATE.to_string(),
+                failure(
+                    id,
+                    RESERVED_INSTANCES_NOT_IN_QUEUED_STATE,
+                    RESERVED_INSTANCES_NOT_IN_QUEUED_STATE_MESSAGE,
                 )
             })
             .collect();
@@ -347,9 +361,15 @@ async fn an_id_that_names_no_reserved_instance_is_reported_as_a_failed_deletion(
              {status} with body {body}"
         );
         let results = deletions(case, &body);
-        let expected: Vec<(String, String)> = ids
+        let expected: Vec<(String, String, String)> = ids
             .iter()
-            .map(|id| ((*id).to_string(), RESERVED_INSTANCES_ID_INVALID.to_string()))
+            .map(|id| {
+                failure(
+                    id,
+                    RESERVED_INSTANCES_ID_INVALID,
+                    RESERVED_INSTANCES_ID_INVALID_MESSAGE,
+                )
+            })
             .collect();
         assert_eq!(
             results.failed, expected,
@@ -415,9 +435,10 @@ async fn only_a_queued_reserved_instance_has_a_purchase_to_delete() {
         }
         assert_eq!(
             results.failed,
-            vec![(
-                id.clone(),
-                RESERVED_INSTANCES_NOT_IN_QUEUED_STATE.to_string()
+            vec![failure(
+                &id,
+                RESERVED_INSTANCES_NOT_IN_QUEUED_STATE,
+                RESERVED_INSTANCES_NOT_IN_QUEUED_STATE_MESSAGE
             )],
             "case {case:?}: expected '{RESERVED_INSTANCES_NOT_IN_QUEUED_STATE}', got {:?} / {:?}",
             results.failed,

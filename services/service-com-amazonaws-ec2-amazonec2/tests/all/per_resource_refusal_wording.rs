@@ -13,20 +13,24 @@
 //! * a class whose sentence names the resource in ITS OWN words keeps those words, whichever
 //!   operation answers it: the transit gateway family's `<Resource> <id> was deleted or does
 //!   not exist.` for the attachments the transit gateway owns as resources, the endpoint
-//!   service's `VpcEndpointService Id`, the network interface's `interface ID`, and
-//!   `Invalid LocalGateway Route Table id <id>` for the operations whose subject is a route of
-//!   a local gateway route table;
+//!   service's `VpcEndpointService Id`, and the network interface's `interface ID`;
 //! * where EC2 answers ONE refusal class with two sentences, each operation keeps the one its
 //!   own validator words: a client VPN attachment — the Client VPN endpoint's resource, not the
-//!   transit gateway's — and the describe of a local gateway route table keep the service's
-//!   shared `<kind> ID '<id>'` templates, and the rows drive both halves of each split;
+//!   transit gateway's — keeps the service's shared `<kind> ID '<id>'` template, and so does
+//!   every reader of a local gateway route table id bar `CreateLocalGatewayRoute`, whose own
+//!   validator answers `Invalid LocalGateway Route Table id <id>`; the rows drive both halves
+//!   of each split;
 //! * a class whose sentence interpolates the request's value does so in that class's own
 //!   QUOTING and POSITION — unquoted and in the middle for the attachment, single-quoted for
 //!   the address and the interface, unquoted and last for the route table;
 //! * a class whose sentence interpolates NOTHING repeats nothing back: the malformed
 //!   attachment id, the pair of members `AllocateHosts` may not both be given, and the range
 //!   IPAM does not manage are each refused with fixed text, so the value the caller sent must
-//!   be absent from the message.
+//!   be absent from the message;
+//! * a request for a Dedicated Host CONFIGURATION EC2 cannot provide is a different class from
+//!   a parameter it could not read: it carries `InvalidHostConfiguration` and that class's
+//!   `The instance <type|family> '<value>' is not supported.`, through both operations that
+//!   configure a host.
 //!
 //! The rows differ along what the rule generalises over — the RESOURCE class, the OPERATION
 //! that answers it (every class whose refusal lives in one shared writer is driven through
@@ -40,7 +44,7 @@
 //! documentation, so no row names an address that belongs to anybody.
 
 use service_com_amazonaws_ec2_amazonec2::state::{
-    INVALID_ADDRESS_NOT_FOUND, INVALID_AMI_ID_MALFORMED,
+    INVALID_ADDRESS_NOT_FOUND, INVALID_AMI_ID_MALFORMED, INVALID_HOST_CONFIGURATION,
     INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_MALFORMED, INVALID_NETWORK_INTERFACE_ID_MALFORMED,
     INVALID_REQUEST, INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
     INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND, INVALID_VPC_ENDPOINT_SERVICE_ID_NOT_FOUND,
@@ -332,22 +336,27 @@ fn malformed_image_rows() -> Vec<Row> {
 
 /// Class 8: a value that is no local gateway route table id at all.
 ///
-/// Two sentences, one per VALIDATOR: an operation whose subject is a ROUTE of the table words
-/// it with a fixed prefix and the id UNQUOTED and last, while the describe of the tables and
-/// the operations that associate a resource WITH one keep the service's
+/// Two sentences, one per VALIDATOR: `CreateLocalGatewayRoute` words it with a fixed prefix and
+/// the id UNQUOTED and last, while every other reader of this id — the search and the delete of
+/// a route, the describe of the tables themselves — keeps the service's
 /// `The <kind> ID '<id>' is malformed` shape. The rows drive both, over the same values, so the
 /// split is pinned rather than assumed.
 fn malformed_route_table_rows() -> Vec<Row> {
-    let actions: [ActionFieldWording; 3] = [
-        (
-            "SearchLocalGatewayRoutes",
-            "LocalGatewayRouteTableId",
-            route_wording,
-        ),
+    let actions: [ActionFieldWording; 4] = [
         (
             "CreateLocalGatewayRoute",
             "LocalGatewayRouteTableId",
-            route_wording,
+            create_route_wording,
+        ),
+        (
+            "SearchLocalGatewayRoutes",
+            "LocalGatewayRouteTableId",
+            table_wording,
+        ),
+        (
+            "DeleteLocalGatewayRoute",
+            "LocalGatewayRouteTableId",
+            table_wording,
         ),
         (
             "DescribeLocalGatewayRouteTables",
@@ -378,15 +387,65 @@ fn malformed_route_table_rows() -> Vec<Row> {
         .collect()
 }
 
-/// The sentence the local gateway ROUTE operations' validator words a malformed route table id
+/// The sentence `CreateLocalGatewayRoute`'s own validator words a malformed route table id
 /// with.
-fn route_wording(id: &str) -> String {
+fn create_route_wording(id: &str) -> String {
     format!("Invalid LocalGateway Route Table id {id}")
 }
 
-/// The sentence the table's own operations word the same class with.
+/// The sentence every other reader of this id words the same class with.
 fn table_wording(id: &str) -> String {
     format!("The local-gateway-route-table ID '{id}' is malformed")
+}
+
+/// Class 10: a Dedicated Host configured for hardware EC2 does not offer, through both
+/// operations that configure one.
+///
+/// A configuration EC2 cannot provide is its own class — `InvalidHostConfiguration`, not the
+/// `InvalidParameterValue` of a value a parameter cannot take — and its sentence names the
+/// MEMBER's resource (an instance type or an instance family) and the value the request sent.
+fn unsupported_host_configuration_rows() -> Vec<Row> {
+    // Rows: a size no family offers, a value that is no instance type at all, an instance
+    // family given where a type belongs, a family no offered type belongs to, and a whole
+    // instance type given where a family belongs.
+    let values: [(&'static str, &'static str); 5] = [
+        ("InstanceType", "m5.enormous"),
+        ("InstanceType", "not-an-instance-type"),
+        ("InstanceType", "m5"),
+        ("InstanceFamily", "zz9"),
+        ("InstanceFamily", "m5.large"),
+    ];
+    let mut rows = Vec::new();
+    for (member, value) in values {
+        let message = if member == "InstanceType" {
+            format!("The instance type '{value}' is not supported.")
+        } else {
+            format!("The instance family '{value}' is not supported.")
+        };
+        rows.push(Row {
+            case: format!("AllocateHosts for the unoffered {member} {value}"),
+            action: "AllocateHosts",
+            params: vec![
+                p(member, value),
+                p("AvailabilityZone", &zone_name(0)),
+                p("Quantity", "1"),
+            ],
+            code: INVALID_HOST_CONFIGURATION,
+            message: message.clone(),
+            withheld: None,
+        });
+        rows.push(Row {
+            case: format!("ModifyHosts for the unoffered {member} {value}"),
+            action: "ModifyHosts",
+            // No host of this account is named: the configuration the request asks for is
+            // refused before any host id is read, so the id below is never resolved.
+            params: vec![p(member, value), p("HostId.1", "h-0a1b2c3d4e5f60718")],
+            code: INVALID_HOST_CONFIGURATION,
+            message,
+            withheld: None,
+        });
+    }
+    rows
 }
 
 /// Class 9: a range IPAM does not manage. The sentence is fixed and names no range, so no row
@@ -418,6 +477,7 @@ fn rows() -> Vec<Row> {
     rows.extend(malformed_image_rows());
     rows.extend(malformed_route_table_rows());
     rows.extend(cidr_not_in_ipam_rows());
+    rows.extend(unsupported_host_configuration_rows());
     rows
 }
 

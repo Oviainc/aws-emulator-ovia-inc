@@ -179,7 +179,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             availability_zones_in_region, host_limit_exceeded, host_payload_bytes,
             instance_family_is_modelled, instance_family_of, instance_type_is_modelled,
             invalid_request, request_region, require_service_state, system_time_to_date_time,
-            tag_list_bytes, tags_from_specifications, ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF,
+            tag_list_bytes, tags_from_specifications, unsupported_host_instance_family,
+            unsupported_host_instance_type, ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF,
             ALLOWS_MULTIPLE_INSTANCE_TYPES_ON, AMD_SEV_SNP_DISABLED,
             DEDICATED_HOST_TAGGABLE_RESOURCE, DEFAULT_AUTO_PLACEMENT, DEFAULT_HOST_RECOVERY,
             HOST_STATE_AVAILABLE, MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
@@ -267,11 +268,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
             (Some(instance_type), None) => {
+                // A type EC2 does not offer makes this host CONFIGURATION impossible rather
+                // than inviting a retry with another value for the parameter, so it is refused
+                // with the configuration code and that refusal's own sentence
+                // ([`crate::state::unsupported_host_instance_type`]).
                 if !instance_type_is_modelled(instance_type) {
-                    return Err(Scaffolded::invalid_parameter_value(format!(
-                        "Invalid value '{instance_type}' for instanceType. \
-                         EC2 offers no such instance type"
-                    )));
+                    return Err(unsupported_host_instance_type(instance_type));
                 }
                 (
                     Some(instance_type.to_string()),
@@ -279,11 +281,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             }
             (None, Some(instance_family)) => {
+                // The other way one request configures one host, refused the same way: a
+                // family no offered instance type belongs to is a host nothing could ever
+                // launch on.
                 if !instance_family_is_modelled(instance_family) {
-                    return Err(Scaffolded::invalid_parameter_value(format!(
-                        "Invalid value '{instance_family}' for instanceFamily. \
-                         EC2 offers no instance type in such a family"
-                    )));
+                    return Err(unsupported_host_instance_family(instance_family));
                 }
                 (None, instance_family.to_string())
             }

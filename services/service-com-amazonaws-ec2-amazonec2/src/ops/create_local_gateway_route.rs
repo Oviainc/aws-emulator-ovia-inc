@@ -174,12 +174,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "The request must contain the parameter localGatewayRouteTableId",
             ));
         }
-        // Something that is not a `LocalGatewayRoutetableId` at all is refused through the
-        // ROUTE operations' form check for that id — the same one the resolver below makes
-        // before it looks the id up, and the one that words the refusal as this operation's
-        // own validator does — so this operation's earlier reading of the FORM cannot drift
-        // from the resolver's.
-        state::require_well_formed_route_table_id_for_local_gateway_route(route_table_id)?;
+        // Something that is not a `LocalGatewayRoutetableId` at all is refused through THIS
+        // operation's form check for that id — the same one the resolver below makes before it
+        // looks the id up, and the one that words the refusal as this operation's own validator
+        // does — so this operation's earlier reading of the FORM cannot drift from the
+        // resolver's.
+        state::require_well_formed_route_table_id_for_create_local_gateway_route(route_table_id)?;
         // "Creates a static route for the specified local gateway route table": the route is
         // named by the destination it matches, read by the crate's one reader of that pair of
         // members, so this operation refuses a destination exactly as the modify and delete
@@ -250,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account holds no table for leaves nothing to create a route in whatever the target
         // turns out to be, and a client can tell "no such route table" from "no such
         // target".
-        state::require_known_route_table_for_local_gateway_route(&store, route_table_id)?;
+        state::require_known_route_table_for_create_local_gateway_route(&store, route_table_id)?;
         // The target next: the route sends traffic to it, so an id the account holds no such
         // resource for is refused with that resource's own `.NotFound` rather than stored as
         // a route pointing at nothing. The virtual interface group is resolved through the

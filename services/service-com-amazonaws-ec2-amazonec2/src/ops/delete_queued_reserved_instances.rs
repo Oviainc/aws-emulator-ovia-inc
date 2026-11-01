@@ -108,11 +108,24 @@ use crate::state::{
 /// that per-item channel is why the operation models the code at all.
 pub const RESERVED_INSTANCES_ID_INVALID: &str = "reserved-instances-id-invalid";
 
+/// The sentence the per-item [`RESERVED_INSTANCES_ID_INVALID`] failure carries, as the
+/// recorded response words it: entirely FIXED text that names no value of the request — the
+/// entry's own `reservedInstancesId` member is where the caller reads which id the failure is
+/// about, so the message classifies the failure and repeats nothing back.
+pub const RESERVED_INSTANCES_ID_INVALID_MESSAGE: &str = "Reserved instances id is invalid.";
+
 /// `DeleteQueuedReservedInstancesErrorCode`'s `reserved-instances-not-in-queued-state`:
 /// the Reserved Instance exists, but its state is not
 /// [`crate::state::RESERVED_INSTANCE_STATE_QUEUED`], so it carries no queued purchase to
 /// delete.
 pub const RESERVED_INSTANCES_NOT_IN_QUEUED_STATE: &str = "reserved-instances-not-in-queued-state";
+
+/// The sentence the per-item [`RESERVED_INSTANCES_NOT_IN_QUEUED_STATE`] failure carries: the
+/// modelled code stated as a sentence, in the shape the recorded sibling
+/// ([`RESERVED_INSTANCES_ID_INVALID_MESSAGE`]) establishes for this channel — fixed text,
+/// naming no value of the request and no state read out of the store.
+pub const RESERVED_INSTANCES_NOT_IN_QUEUED_STATE_MESSAGE: &str =
+    "Reserved instances not in queued state.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -151,16 +164,19 @@ impl From<DeleteQueuedReservedInstancesErrorModeled> for DeleteQueuedReservedIns
 /// `code` is a `&'static str` so it can only be one of the
 /// `DeleteQueuedReservedInstancesErrorCode` members this module names
 /// ([`RESERVED_INSTANCES_ID_INVALID`] / [`RESERVED_INSTANCES_NOT_IN_QUEUED_STATE`]), never
-/// text from a request.
+/// text from a request, and so is `message`: this channel's sentences are fixed text per code
+/// ([`RESERVED_INSTANCES_ID_INVALID_MESSAGE`] /
+/// [`RESERVED_INSTANCES_NOT_IN_QUEUED_STATE_MESSAGE`]), which is what lets a client classify
+/// each entry of the batch by its message.
 fn failed_deletion(
     reserved_instances_id: &str,
     code: &'static str,
-    message: String,
+    message: &'static str,
 ) -> FailedQueuedPurchaseDeletion {
     FailedQueuedPurchaseDeletion {
         error: Some(DeleteQueuedReservedInstancesError2 {
             code: Some(code.to_string()),
-            message: Some(message),
+            message: Some(message.to_string()),
         }),
         reserved_instances_id: Some(reserved_instances_id.to_string()),
     }
@@ -242,7 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 failed.push(failed_deletion(
                     reserved_instances_id,
                     RESERVED_INSTANCES_ID_INVALID,
-                    format!("The Reserved Instances ID '{reserved_instances_id}' does not exist"),
+                    RESERVED_INSTANCES_ID_INVALID_MESSAGE,
                 ));
                 continue;
             };
@@ -251,10 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 failed.push(failed_deletion(
                     reserved_instances_id,
                     RESERVED_INSTANCES_NOT_IN_QUEUED_STATE,
-                    format!(
-                        "The Reserved Instance '{reserved_instances_id}' is in state \
-                         '{held}', which carries no queued purchase to delete"
-                    ),
+                    RESERVED_INSTANCES_NOT_IN_QUEUED_STATE_MESSAGE,
                 ));
                 continue;
             }

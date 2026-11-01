@@ -22,14 +22,14 @@ use std::sync::Arc;
 
 use ec2::ops::types::{AUTO_PLACEMENT_VALUES, HOST_MAINTENANCE_VALUES, HOST_RECOVERY_VALUES};
 use ec2::state::{
-    ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF, ALLOWS_MULTIPLE_INSTANCE_TYPES_ON, INVALID_HOST_ID_MALFORMED,
-    INVALID_PARAMETER_VALUE, INVALID_REQUEST, MAX_RESOURCE_IDS, MISSING_PARAMETER,
-    availability_zones_in_region, unresolvable_host_ids_message,
+    ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF, ALLOWS_MULTIPLE_INSTANCE_TYPES_ON, INVALID_HOST_CONFIGURATION,
+    INVALID_HOST_ID_MALFORMED, INVALID_PARAMETER_VALUE, INVALID_REQUEST, MAX_RESOURCE_IDS,
+    MISSING_PARAMETER, availability_zones_in_region, unresolvable_host_ids_message,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{element, elements, error_code, indexed, unescaped};
+use super::ec2_query::{element, elements, error_code, error_message, indexed, unescaped};
 
 /// The Region every call here is signed for; the zones the hosts are allocated into are
 /// derived from it.
@@ -854,8 +854,10 @@ async fn an_instance_type_and_an_instance_family_together_are_refused() {
     }
 }
 
-/// A value that names no hardware EC2 offers is refused before any host is read: the catalog
-/// both members are checked against is the modelled `InstanceType` enum.
+/// A value that names no hardware EC2 offers asks for a host CONFIGURATION EC2 cannot
+/// provide, so it is refused before any host is read, with the configuration code and that
+/// class's own sentence: the catalog both members are checked against is the modelled
+/// `InstanceType` enum.
 #[tokio::test]
 async fn a_value_outside_the_modelled_catalog_is_refused() {
     // Rows: a size no family offers, a value that is not an instance type at all, a family no
@@ -878,8 +880,18 @@ async fn a_value_outside_the_modelled_catalog_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            INVALID_PARAMETER_VALUE,
-            "case {case:?}: expected the code {INVALID_PARAMETER_VALUE}, got {body}"
+            INVALID_HOST_CONFIGURATION,
+            "case {case:?}: expected the code {INVALID_HOST_CONFIGURATION}, got {body}"
+        );
+        let expected_message = if member == "InstanceType" {
+            format!("The instance type '{value}' is not supported.")
+        } else {
+            format!("The instance family '{value}' is not supported.")
+        };
+        let answered = error_message(&body);
+        assert_eq!(
+            answered, expected_message,
+            "case {case:?}: expected the message {expected_message:?}, got {answered:?}"
         );
 
         let after = described_all(&router, case, &allocated).await;

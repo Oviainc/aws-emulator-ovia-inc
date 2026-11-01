@@ -386,7 +386,7 @@ fn route_table_arn(route_table_id: &str) -> String {
 /// it is asked about is refused with `InvalidLocalGatewayRouteTableID.NotFound` rather than
 /// answered with an empty set, while something that is not an id of this resource at all is
 /// refused as `.Malformed` before any lookup (the order the crate's one reader of this id
-/// documents, shared with the create, modify and delete of a route).
+/// documents, shared with the delete of a route and the describe of the tables themselves).
 #[tokio::test]
 async fn an_account_with_no_route_table_refuses_every_id_it_can_read() {
     let (router, _engine) = super::ec2_query::emulator();
@@ -408,17 +408,17 @@ async fn an_account_with_no_route_table_refuses_every_id_it_can_read() {
         (
             "lgw-00000000000000001",
             "InvalidLocalGatewayRouteTableID.Malformed",
-            "Invalid LocalGateway Route Table id lgw-00000000000000001",
+            "The local-gateway-route-table ID 'lgw-00000000000000001' is malformed",
         ),
         (
             "lgwrtb-00000000000000001",
             "InvalidLocalGatewayRouteTableID.Malformed",
-            "Invalid LocalGateway Route Table id lgwrtb-00000000000000001",
+            "The local-gateway-route-table ID 'lgwrtb-00000000000000001' is malformed",
         ),
         (
             "not-a-route-table-id",
             "InvalidLocalGatewayRouteTableID.Malformed",
-            "Invalid LocalGateway Route Table id not-a-route-table-id",
+            "The local-gateway-route-table ID 'not-a-route-table-id' is malformed",
         ),
     ];
     for (route_table_id, code, expected_message) in cases {

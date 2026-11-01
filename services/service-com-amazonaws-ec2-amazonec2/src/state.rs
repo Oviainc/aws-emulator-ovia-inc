@@ -13547,12 +13547,11 @@ pub fn cidr_block_is_well_formed(value: &str) -> bool {
 /// `InvalidLocalGatewayRouteTableID.Malformed`, `The local-gateway-route-table ID '<id>' is
 /// malformed`, built from the request's own value.
 ///
-/// EC2's per-operation validators do NOT word this one refusal class the same way, so there is
-/// no single sentence for this resource: the operations that associate a resource WITH a table,
-/// and the describe of the tables themselves, answer this one, while the operations whose
-/// subject is a ROUTE of the table answer
-/// [`invalid_route_table_id_for_local_gateway_route`]'s instead. Which an operation answers is
-/// a fact of that operation's validator, kept in two writers rather than in one blanket one.
+/// This is the sentence EVERY operation that reads a `LocalGatewayRouteTableId` answers, bar
+/// one: `CreateLocalGatewayRoute`'s own validator words it differently
+/// ([`invalid_route_table_id_for_create_local_gateway_route`]), as the recorded refusals of the
+/// two show. Which sentence an operation answers is a fact of that operation's validator, and
+/// only the operation whose recorded refusal differs carries its own writer.
 pub fn invalid_local_gateway_route_table_id_malformed<E>(id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_MALFORMED,
@@ -13564,16 +13563,17 @@ pub fn invalid_local_gateway_route_table_id_malformed<E>(id: &str) -> Scaffolded
     )
 }
 
-/// Refuse something that is not a local gateway route table id at all, for an operation whose
-/// subject is a ROUTE of that table: HTTP 400 `InvalidLocalGatewayRouteTableID.Malformed`.
+/// Refuse something that is not a local gateway route table id at all, for
+/// `CreateLocalGatewayRoute`: HTTP 400 `InvalidLocalGatewayRouteTableID.Malformed`.
 ///
 /// `Invalid LocalGateway Route Table id <id>` — a fixed prefix naming the resource in the prose
 /// spelling [`invalid_local_gateway_route_table_id_not_found`] uses, then the id the REQUEST
-/// sent, UNQUOTED and last, bounded by [`echoed_resource_id`]. The sentence the route
-/// operations' own validator words this refusal with; the table's other operations keep
-/// [`invalid_local_gateway_route_table_id_malformed`]'s, which is what their recorded refusals
-/// carry.
-pub fn invalid_route_table_id_for_local_gateway_route<E>(id: &str) -> Scaffolded<E> {
+/// sent, UNQUOTED and last, bounded by [`echoed_resource_id`]. The sentence THAT operation's
+/// recorded refusal carries, and the only operation of this resource that does not word the
+/// class with the service's shared [`invalid_local_gateway_route_table_id_malformed`] sentence,
+/// which every other reader of this id — the search and the delete of a route included — is
+/// recorded answering.
+pub fn invalid_route_table_id_for_create_local_gateway_route<E>(id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_MALFORMED,
         400,
@@ -13584,35 +13584,33 @@ pub fn invalid_route_table_id_for_local_gateway_route<E>(id: &str) -> Scaffolded
     )
 }
 
-/// Refuse a `LocalGatewayRouteTableId` an operation whose subject is a ROUTE of the table
-/// cannot resolve: a malformed one with that validator's own sentence
-/// ([`invalid_route_table_id_for_local_gateway_route`]) before an unknown one with the
+/// Refuse a `LocalGatewayRouteTableId` `CreateLocalGatewayRoute` cannot resolve: a malformed one
+/// with that operation's own sentence
+/// ([`invalid_route_table_id_for_create_local_gateway_route`]) before an unknown one with the
 /// resource's single `NotFound` sentence, the order [`require_well_formed_id`] documents.
 ///
-/// The ONE place the route operations resolve their route table, so the create, the delete and
-/// the search of a route refuse the same id the same way. The resolution itself is
-/// [`require_known_local_gateway_route_table_worded`]'s, shared with the table's own
-/// operations, so only the sentence differs between the two.
-pub fn require_known_route_table_for_local_gateway_route<E>(
+/// The resolution itself is [`require_known_local_gateway_route_table_worded`]'s, shared with
+/// every other reader of this id, so only the malformed sentence is this operation's own.
+pub fn require_known_route_table_for_create_local_gateway_route<E>(
     store: &ComAmazonawsEc2Amazonec2State,
     id: &str,
 ) -> Result<(), Scaffolded<E>> {
     require_known_local_gateway_route_table_worded(
         store,
         id,
-        invalid_route_table_id_for_local_gateway_route,
+        invalid_route_table_id_for_create_local_gateway_route,
     )
 }
 
-/// The form check [`require_known_route_table_for_local_gateway_route`] makes before it looks an
-/// id up, for a route operation that has to read the request's own FORM earlier — a `DryRun` is
+/// The form check [`require_known_route_table_for_create_local_gateway_route`] makes before it
+/// looks an id up, for the create's own earlier reading of the request's FORM — a `DryRun` is
 /// answered only once that form has been read.
-pub fn require_well_formed_route_table_id_for_local_gateway_route<E>(
+pub fn require_well_formed_route_table_id_for_create_local_gateway_route<E>(
     id: &str,
 ) -> Result<(), Scaffolded<E>> {
     require_well_formed_local_gateway_route_table_id_worded(
         id,
-        invalid_route_table_id_for_local_gateway_route,
+        invalid_route_table_id_for_create_local_gateway_route,
     )
 }
 
@@ -13634,9 +13632,9 @@ pub fn invalid_local_gateway_route_table_id_not_found<E>(id: &str) -> Scaffolded
 ///
 /// The one form check [`require_known_local_gateway_route_table`] itself makes before it
 /// looks an id up, so an operation that needs it earlier asks the same question of the same
-/// reader. The ROUTE operations ask it through
-/// [`require_well_formed_route_table_id_for_local_gateway_route`], which differs only in the
-/// sentence their validator words the refusal with.
+/// reader. `CreateLocalGatewayRoute` asks it through
+/// [`require_well_formed_route_table_id_for_create_local_gateway_route`], which differs only in
+/// the sentence its own validator words the refusal with.
 pub fn require_well_formed_local_gateway_route_table_id<E>(id: &str) -> Result<(), Scaffolded<E>> {
     require_well_formed_local_gateway_route_table_id_worded(
         id,
@@ -13659,15 +13657,16 @@ fn require_well_formed_local_gateway_route_table_id_worded<E>(
     Ok(())
 }
 
-/// Refuse a `LocalGatewayRouteTableId` an operation whose subject is the TABLE, or an
-/// association with it, cannot resolve: a malformed one before an unknown one, the order
+/// Refuse a `LocalGatewayRouteTableId` an operation other than `CreateLocalGatewayRoute` cannot
+/// resolve — the table's own operations, an association with it, and the search and the delete
+/// of a route in it: a malformed one before an unknown one, the order
 /// [`require_well_formed_id`] documents.
 ///
 /// The ONE place those operations resolve a local gateway route table id, so each refuses the
-/// same id the same way; the contract [`require_known_instance`] writes out for instances. The
-/// operations whose subject is a ROUTE of the table resolve it through
-/// [`require_known_route_table_for_local_gateway_route`] instead, which shares this resolution
-/// and differs only in the sentence it words a malformed id with.
+/// same id the same way; the contract [`require_known_instance`] writes out for instances.
+/// `CreateLocalGatewayRoute` resolves it through
+/// [`require_known_route_table_for_create_local_gateway_route`] instead, which shares this
+/// resolution and differs only in the sentence it words a malformed id with.
 pub fn require_known_local_gateway_route_table<E>(
     store: &ComAmazonawsEc2Amazonec2State,
     id: &str,
@@ -30540,6 +30539,50 @@ pub const INVALID_HOST_ID_NOT_FOUND: &str = "InvalidHostID.NotFound";
 /// `InvalidHostID.Malformed` (HTTP 400): the request named something that is not a host id
 /// at all, so there is nothing to look up.
 pub const INVALID_HOST_ID_MALFORMED: &str = "InvalidHostID.Malformed";
+
+/// `InvalidHostConfiguration` (HTTP 400): the request asks for a Dedicated Host configuration
+/// EC2 cannot provide, rather than for a parameter it could not read.
+///
+/// The code the recorded refusal of a host configured for hardware EC2 does not offer carries.
+/// The two say different things to a client: this one means the configuration asked for is
+/// impossible, while `InvalidParameterValue` invites a retry with another value for the
+/// parameter — so a configuration refusal carries this code and the retry and reporting logic
+/// branching on it takes the right arm.
+pub const INVALID_HOST_CONFIGURATION: &str = "InvalidHostConfiguration";
+
+/// Refuse a Dedicated Host configured for an instance type EC2 does not offer: HTTP 400
+/// [`INVALID_HOST_CONFIGURATION`], `The instance type '<instanceType>' is not supported.`
+///
+/// The sentence the recorded refusal carries: fixed text with the `InstanceType` the REQUEST
+/// sent single-quoted in it, bounded by [`echoed_resource_id`] like every other echoed value.
+/// The ONE writer of this refusal, so the operations that configure a host for an instance
+/// type — the allocate and the modify — cannot word it two ways.
+pub fn unsupported_host_instance_type<E>(instance_type: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_HOST_CONFIGURATION,
+        400,
+        format!(
+            "The instance type '{}' is not supported.",
+            echoed_resource_id(instance_type)
+        ),
+    )
+}
+
+/// Refuse a Dedicated Host configured for an instance family no instance type EC2 offers
+/// belongs to: HTTP 400 [`INVALID_HOST_CONFIGURATION`], the same sentence
+/// [`unsupported_host_instance_type`] carries with the member's own resource named — the
+/// `InstanceFamily` member is the other way one request configures one host, and an
+/// unsupported value of it makes the same configuration impossible.
+pub fn unsupported_host_instance_family<E>(instance_family: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_HOST_CONFIGURATION,
+        400,
+        format!(
+            "The instance family '{}' is not supported.",
+            echoed_resource_id(instance_family)
+        ),
+    )
+}
 
 /// The prefix EC2 names its Apple-hardware instance families with: `mac1`, `mac2`,
 /// `mac2-m2pro`. The families themselves are read off the modelled `InstanceType` enum

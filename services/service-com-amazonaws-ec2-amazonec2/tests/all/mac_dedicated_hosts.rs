@@ -658,13 +658,16 @@ async fn allocate_hosts_refuses_a_request_it_cannot_satisfy() {
             "MissingParameter",
         ),
         (
+            // Hardware EC2 does not offer makes the host CONFIGURATION impossible rather
+            // than inviting a retry with another value for the parameter, so these three
+            // rows carry `InvalidHostConfiguration`.
             "an instance type EC2 does not offer",
             vec![
                 p("InstanceType", "mac9.metal"),
                 p("AvailabilityZone", zone.clone()),
                 p("Quantity", "1"),
             ],
-            "InvalidParameterValue",
+            "InvalidHostConfiguration",
         ),
         (
             "an instance family EC2 does not offer",
@@ -673,7 +676,7 @@ async fn allocate_hosts_refuses_a_request_it_cannot_satisfy() {
                 p("AvailabilityZone", zone.clone()),
                 p("Quantity", "1"),
             ],
-            "InvalidParameterValue",
+            "InvalidHostConfiguration",
         ),
         (
             "an instance type given where a family belongs",
@@ -682,7 +685,7 @@ async fn allocate_hosts_refuses_a_request_it_cannot_satisfy() {
                 p("AvailabilityZone", zone.clone()),
                 p("Quantity", "1"),
             ],
-            "InvalidParameterValue",
+            "InvalidHostConfiguration",
         ),
         (
             "no zone at all",
