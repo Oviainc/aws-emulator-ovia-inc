@@ -162,6 +162,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
 
+        // "The new dashboard definition, as specified in a JSON literal": a body
+        // that is not a JSON document states no definition, and installing it on
+        // the dashboard would let a later read answer with one no IoT SiteWise
+        // Monitor client could render. The same check the create of this member
+        // makes, so neither write path can store a definition the other would
+        // refuse — and made before the request is resolved against the store,
+        // because a malformed request is refused whatever the store holds.
+        crate::state::check_json_document("dashboardDefinition", &input.dashboard_definition)
+            .map_err(invalid_request)?;
+
         // `clientToken` makes this update idempotent, as the member documents: "A
         // unique case-sensitive identifier that you can provide to ensure the
         // idempotency of the request." A RETRY carries the token of the call it
@@ -228,6 +238,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(UpdateDashboardOutput {})
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message` — the client-input
+/// error this operation declares, the way every sibling handler reports a
+/// malformed request.
+fn invalid_request(message: String) -> UpdateDashboardError {
+    UpdateDashboardError::Modeled(UpdateDashboardErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
 }
 
 /// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing, in

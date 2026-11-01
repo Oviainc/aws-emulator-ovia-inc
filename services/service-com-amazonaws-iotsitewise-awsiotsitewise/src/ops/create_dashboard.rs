@@ -191,6 +191,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_tag_key(tag_key).map_err(invalid_request)?;
         }
 
+        // "The dashboard definition specified in a JSON literal": a body that is
+        // not a JSON document states no definition, and storing it would let a
+        // later read answer with one no IoT SiteWise Monitor client could render.
+        // The modelled length bounds and pattern are enforced before this handler
+        // runs and neither can express the JSON form, so this — like the write of
+        // this crate's other member whose documentation names the JSON form — is
+        // the member's own documented form, checked here.
+        crate::state::check_json_document("dashboardDefinition", &input.dashboard_definition)
+            .map_err(invalid_request)?;
+
         let mut store = state.lock();
 
         // `clientToken` makes the create idempotent, as the member documents: "A

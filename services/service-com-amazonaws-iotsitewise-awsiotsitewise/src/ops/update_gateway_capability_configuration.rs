@@ -197,12 +197,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // capability": a body that is not a JSON document defines no configuration,
         // and storing it would let a later read answer with something no gateway
         // could apply. The modelled length bounds are already enforced before this
-        // handler runs; this is the member's own documented form.
-        if ::serde_json::from_str::<::serde_json::Value>(&input.capability_configuration).is_err() {
-            return Err(invalid_request(
-                "The capabilityConfiguration must be a JSON document.".to_string(),
-            ));
-        }
+        // handler runs; this is the member's own documented form, checked through
+        // the one function every member of this service whose documentation names
+        // the JSON form is read by.
+        crate::state::check_json_document(
+            "capabilityConfiguration",
+            &input.capability_configuration,
+        )
+        .map_err(invalid_request)?;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

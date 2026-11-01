@@ -271,7 +271,10 @@ const PROJECTS: &str = "/projects";
 
 /// Create a portal and `count` projects in it, and return the project ids: a
 /// dashboard is created IN a project, so these are the containers the rows name.
-async fn seed_projects(router: &MultiServiceRouter, count: usize) -> Vec<String> {
+///
+/// `pub(crate)` so the sibling dashboard suites reach it rather than growing a
+/// second copy of this seeding.
+pub(crate) async fn seed_projects(router: &MultiServiceRouter, count: usize) -> Vec<String> {
     let (status, portal) = call(
         router,
         "POST",

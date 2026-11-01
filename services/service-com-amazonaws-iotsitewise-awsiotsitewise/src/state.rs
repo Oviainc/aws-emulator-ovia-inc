@@ -8174,6 +8174,24 @@ pub fn check_tag_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse a caller-supplied value for a member whose modelled documentation
+/// states the value IS JSON — a dashboard's definition literal, a gateway
+/// capability's configuration document — unless it parses as a JSON document.
+///
+/// Such a member is held verbatim and reported back verbatim, so a body that is
+/// no JSON document defines nothing the client that later reads it could render
+/// or apply. No modelled constraint can express the JSON form — the length
+/// bounds and patterns the boundary validator enforces before a handler runs say
+/// nothing about it — so it is the handler's to check, and one function so every
+/// member the documented form holds for is answered the same way. `member` is
+/// the member's wire name, which is what the refusal names.
+pub fn check_json_document(member: &str, value: &str) -> Result<(), String> {
+    if ::serde_json::from_str::<::serde_json::Value>(value).is_err() {
+        return Err(format!("The {member} must be a JSON document."));
+    }
+    Ok(())
+}
+
 /// The canonical ARN of a gateway in `region`, in the form `CreateGateway`
 /// documents: `arn:${Partition}:iotsitewise:${Region}:${Account}:gateway/${GatewayId}`.
 pub fn gateway_arn(region: &str, gateway_id: &str) -> String {
@@ -9801,7 +9819,9 @@ pub struct DashboardRecord {
     pub name: String,
     pub description: Option<String>,
     /// The dashboard definition JSON literal, held exactly as the last write
-    /// stated it: the service stores the literal and reports it back unparsed.
+    /// stated it: the service stores the literal and reports it back unparsed,
+    /// so each write path checks the member's documented form — see
+    /// [`check_json_document`] — before a value reaches here.
     pub definition: String,
     pub creation_date: SystemTime,
     pub last_update_date: SystemTime,
