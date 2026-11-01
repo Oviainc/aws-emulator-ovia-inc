@@ -47,6 +47,12 @@ mod protection_status_policy_scope_page;
 #[path = "all/narrowed_page_token_scoping.rs"]
 mod narrowed_page_token_scoping;
 
+// Declared beside it, and for the same reason: this suite's name sorts right
+// into the contended region of the list below. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
+#[path = "all/protection_status_page_token_scoping.rs"]
+mod protection_status_page_token_scoping;
+
 // Declared beside it, and for the same reason: the sorted list below is the
 // contended region every late-sorting fms suite lands in.
 #[path = "all/third_party_firewall_association.rs"]

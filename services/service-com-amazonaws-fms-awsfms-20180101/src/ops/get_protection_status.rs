@@ -257,16 +257,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A token this service did not mint, or one minted for ANOTHER policy's
-        // page or for another collection narrowed by this same policy, names no
-        // boundary in this policy's attacks: a boundary of this page is a key
-        // [`crate::state::shield_attack_key`] writes, which carries the policy's
-        // prefix AND the instant and attack id that follow it
-        // ([`crate::state::decode_shield_attack_page_token`]).
+        // A token this service did not mint names no page boundary — and neither
+        // does one it minted for ANOTHER selection of the inventory. This page is
+        // SELECTED by FOUR request members, not by the policy alone: the policy
+        // whose attacks are reported, the member account whose attacked resources
+        // are reported, and the two bounds of the queried period, all of which
+        // narrow the very iterator the boundary below is minted from. A boundary
+        // of it is therefore an attack key stamped with that whole selection
+        // ([`crate::state::encode_shield_attack_page_token`]): a bare key, a key
+        // stamped with another selection — another account, another period — one
+        // minted for another policy or for another collection narrowed by this
+        // same policy, and a token whose decoded key is no attack key of this
+        // policy at all are all refused as a bad request rather than used as an
+        // arbitrary lower bound, because resuming from one would silently drop
+        // every attack of THIS selection sorting below it and report the
+        // remainder — or an empty document — as a complete page. The modelled
+        // `InvalidInputException` is exactly "the parameters of the request were
+        // invalid".
         let prefix = crate::state::shield_attack_key_prefix(&input.policy_id);
         let start = match input.next_token.as_deref() {
             Some(token) => {
-                match crate::state::decode_shield_attack_page_token(&input.policy_id, token) {
+                match crate::state::decode_shield_attack_page_token(
+                    &input.policy_id,
+                    input.member_account_id.as_deref(),
+                    input.start_time,
+                    input.end_time,
+                    token,
+                ) {
                     Some(start) => Some(start),
                     None => {
                         return Err(GetProtectionStatusErrorModeled::InvalidInputException(
@@ -337,10 +354,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .to_string();
         // A token only when an attack is left AFTER this page, so the last page
         // carries none. It is the next attack's own key, which is where the
-        // following page resumes.
-        let next_token = remaining
-            .next()
-            .map(|attack| crate::state::encode_key_token(&attack.key()));
+        // following page resumes, stamped with the selection this page was served
+        // under — the token names a boundary of THAT selection and of no other.
+        let next_token = remaining.next().map(|attack| {
+            crate::state::encode_shield_attack_page_token(
+                &input.policy_id,
+                input.member_account_id.as_deref(),
+                input.start_time,
+                input.end_time,
+                &attack.key(),
+            )
+        });
 
         Ok(GetProtectionStatusOutput {
             admin_account_id: Some(admin.account_id.clone()),

@@ -1131,37 +1131,127 @@ pub fn shield_attack_key_prefix(policy_id: &str) -> String {
     format!("{policy_id}#")
 }
 
-/// Decode a `PaginationToken` produced by [`encode_key_token`] for the attacks
-/// recorded under `policy_id`, yielding the whole store key the next page of that
-/// policy's attacks resumes at.
+/// Whether `key` is a key [`shield_attack_key`] writes for an attack recorded
+/// under `policy_id`.
 ///
-/// `None` when the token was not produced by this service, or was produced for
-/// another collection: the policy's prefix alone does NOT identify this page,
-/// because the other listing this service narrows by a `PolicyId`
-/// (`ListComplianceStatus`) stamps its boundaries with the very same policy
-/// ([`encode_scoped_page_token`]), so a boundary of that page carries this
-/// prefix too while naming an account rather than an attack. An account id sorts
-/// arbitrarily among the zero-padded instants these keys carry, so resuming from
-/// one would silently drop the attacks below it and report the remainder — or
-/// nothing at all — as a complete page.
-///
-/// What tells the two apart is the key's own FORM: a boundary of this page is a
-/// key [`shield_attack_key`] would write, so the decoded value is taken apart
-/// into the instant and the attack id it names and then written back through
-/// that same function — nothing else is a key of this page, and the check cannot
+/// The key's own FORM is what decides, so the value is taken apart into the
+/// instant and the attack id it names and then written back through that same
+/// function — nothing else is a key of this policy's range, and the check cannot
 /// drift from the writer. The split is at the FIRST separator after the instant,
 /// which leaves any further one with the attack id; the round trip is what
 /// decides, so a key of this policy's range is accepted however its id reads.
-pub fn decode_shield_attack_page_token(policy_id: &str, token: &str) -> Option<String> {
-    let decoded = decode_key_token(token)?;
-    let (instant, attack_id) = decoded
-        .strip_prefix(&shield_attack_key_prefix(policy_id))?
-        .split_once('#')?;
-    let (seconds, nanos) = instant.split_once('.')?;
-    let started_at = SystemTime::UNIX_EPOCH
-        .checked_add(Duration::from_secs(seconds.parse().ok()?))?
-        .checked_add(Duration::from_nanos(nanos.parse().ok()?))?;
-    (shield_attack_key(policy_id, started_at, attack_id) == decoded).then_some(decoded)
+fn is_shield_attack_key(policy_id: &str, key: &str) -> bool {
+    let Some((instant, attack_id)) = key
+        .strip_prefix(&shield_attack_key_prefix(policy_id))
+        .and_then(|rest| rest.split_once('#'))
+    else {
+        return false;
+    };
+    let Some((seconds, nanos)) = instant.split_once('.') else {
+        return false;
+    };
+    let started_at = seconds
+        .parse()
+        .ok()
+        .and_then(|seconds| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+        .zip(nanos.parse().ok())
+        .and_then(|(seconds, nanos)| seconds.checked_add(Duration::from_nanos(nanos)));
+    started_at.is_some_and(|started_at| shield_attack_key(policy_id, started_at, attack_id) == key)
+}
+
+/// One bound of the queried period as a page stamp writes it: the instant's
+/// exact nanosecond count ([`epoch_nanos`]), so two requests naming the SAME
+/// instant in different `TimeStamp` formats select — and stamp — one page. An
+/// absent bound, which constrains that side not at all, writes as the empty
+/// string, a form no instant writes.
+fn period_bound_selector(bound: Option<::aws_smithy_types::DateTime>) -> String {
+    bound.map_or_else(String::new, |bound| epoch_nanos(bound).to_string())
+}
+
+/// The page scope a boundary of ONE page of a policy's recorded attacks is
+/// stamped with: the four request members that SELECT the attacks that page
+/// reports — the policy they were recorded under, the member account whose
+/// attacked resources are reported, and the two bounds of the queried period.
+///
+/// All four are needed, and no subset of them identifies the page: a different
+/// account's resources were attacked at different instants, and a different
+/// period holds a different stretch of the inventory, so an attack of one
+/// selection may be absent from another or sort after attacks that other
+/// selection does hold. None of the four can contain the separator
+/// [`scoped_page_key`] joins with — a `PolicyId` is `^[a-z0-9A-Z-]{36}$`, an
+/// `AWSAccountId` is `^[0-9]+$`, and a bound writes as a signed integer — so the
+/// stamp is unambiguous. An absent member is the empty string, which none of
+/// them can carry.
+fn shield_attack_page_scope(
+    policy_id: &str,
+    member_account_id: Option<&str>,
+    start: Option<::aws_smithy_types::DateTime>,
+    end: Option<::aws_smithy_types::DateTime>,
+) -> String {
+    scoped_page_key(
+        policy_id,
+        &scoped_page_key(
+            member_account_id.unwrap_or_default(),
+            &scoped_page_key(
+                &period_bound_selector(start),
+                &period_bound_selector(end),
+            ),
+        ),
+    )
+}
+
+/// Encode a page boundary (the store key of the attack the next page resumes at)
+/// of the attacks ONE `GetProtectionStatus` request selects, as an opaque
+/// `PaginationToken`.
+///
+/// The stamp is what lets [`decode_shield_attack_page_token`] tell a boundary of
+/// THIS selection's page from one minted for another member account or another
+/// queried period; the encoding is [`encode_scoped_page_token`]'s, so these
+/// tokens stay inside the modelled `PaginationToken` pattern and length and stay
+/// opaque to a caller.
+pub fn encode_shield_attack_page_token(
+    policy_id: &str,
+    member_account_id: Option<&str>,
+    start: Option<::aws_smithy_types::DateTime>,
+    end: Option<::aws_smithy_types::DateTime>,
+    key: &str,
+) -> String {
+    encode_scoped_page_token(
+        &shield_attack_page_scope(policy_id, member_account_id, start, end),
+        key,
+    )
+}
+
+/// Decode a `PaginationToken` produced by
+/// [`encode_shield_attack_page_token`] for the attacks the policy, the member
+/// account and the queried period select, yielding the whole store key the next
+/// page of that selection resumes at.
+///
+/// `None` when the token was not produced by this service, or was produced for
+/// ANOTHER selection of the inventory: an attack of another selection's page is
+/// either absent from this one or sorts past attacks this one does hold, so
+/// resuming from it would silently drop them and report a short page — or an
+/// empty one — as a complete page. The policy alone does NOT identify this page,
+/// and neither would the policy's key prefix: the other listing this service
+/// narrows by a `PolicyId` (`ListComplianceStatus`) stamps its boundaries with
+/// the very same policy ([`encode_scoped_page_token`]), and the same policy's
+/// attacks are a different page under every account and period.
+///
+/// The decoded boundary must still be a key of this policy's attacks
+/// ([`is_shield_attack_key`]), the shape check this page class adds on top of
+/// the shared token-to-key step.
+pub fn decode_shield_attack_page_token(
+    policy_id: &str,
+    member_account_id: Option<&str>,
+    start: Option<::aws_smithy_types::DateTime>,
+    end: Option<::aws_smithy_types::DateTime>,
+    token: &str,
+) -> Option<String> {
+    let decoded = decode_scoped_page_token(
+        &shield_attack_page_scope(policy_id, member_account_id, start, end),
+        token,
+    )?;
+    is_shield_attack_key(policy_id, &decoded).then_some(decoded)
 }
 
 /// `PolicyComplianceStatusType` of a member account none of whose resources
@@ -3749,9 +3839,9 @@ pub const ADMINS_MANAGING_ACCOUNT_PAGE: &str = "ListAdminsManagingAccount";
 /// collection does hold, and resuming from it there would silently drop them.
 /// Carrying the collection beside the key is what lets
 /// [`decode_account_page_token`] tell a boundary of THIS collection from one of
-/// another — the same discipline the listings whose store key already begins
-/// with the collection it belongs to apply to that key's prefix
-/// ([`shield_attack_key_prefix`], [`third_party_firewall_policy_key_prefix`]).
+/// another — the same discipline the listing whose store key already begins
+/// with the collection it belongs to applies to that key's prefix
+/// ([`third_party_firewall_policy_key_prefix`]).
 pub fn encode_account_page_token(scope: &str, account_id: &str) -> String {
     encode_scoped_page_token(scope, account_id)
 }
@@ -3794,9 +3884,9 @@ fn scoped_page_key(scope: &str, key: &str) -> String {
 /// absent there, or sort after items that collection does hold, so resuming from
 /// it would silently drop them. Carrying the collection is what lets
 /// [`decode_scoped_page_token`] tell a token minted for THIS page from one
-/// minted for another — the same check the listings whose store key already
-/// begins with the selecting member make against that key's prefix
-/// ([`shield_attack_key_prefix`], [`third_party_firewall_policy_key_prefix`]).
+/// minted for another — the same check the listing whose store key already
+/// begins with the selecting member makes against that key's prefix
+/// ([`third_party_firewall_policy_key_prefix`]).
 ///
 /// Hex for the same reasons as [`encode_key_token`], which does the encoding:
 /// the token stays inside the modelled `PaginationToken` pattern and length, and

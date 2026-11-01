@@ -60,7 +60,11 @@ const ABOVE_MAX_MAX_RESULTS: i64 = 101;
 /// Unix seconds, which is the form Firewall Manager documents as the default for
 /// its `TimeStamp` members ("the default used by Firewall Manager is Unix time
 /// in seconds").
-const BASE_SECS: u64 = 1_767_225_600;
+///
+/// `pub(crate)` so a sibling suite in this test target places its own attacks and
+/// query bounds around the SAME instant through this one constant rather than a
+/// second copy of it.
+pub(crate) const BASE_SECS: u64 = 1_767_225_600;
 
 /// A second Region, to assert the administrator gate's answer does not depend on
 /// which Region the request addresses.
@@ -71,14 +75,20 @@ const OTHER_REGION: &str = "eu-central-1";
 const UNKNOWN_POLICY_ID: &str = "99999999-8888-7777-6666-555555555555";
 
 /// `BASE_SECS` plus `offset_secs` seconds and `offset_millis` milliseconds.
-fn at(offset_secs: u64, offset_millis: u64) -> SystemTime {
+///
+/// `pub(crate)` so a sibling suite in this test target derives an attack's
+/// instant the one way this suite does.
+pub(crate) fn at(offset_secs: u64, offset_millis: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH
         + Duration::from_secs(BASE_SECS + offset_secs)
         + Duration::from_millis(offset_millis)
 }
 
 /// The same instant as a request bound carries it on the wire: Unix seconds.
-fn stamp(offset_secs: u64) -> Value {
+///
+/// `pub(crate)` so a sibling suite in this test target writes a query bound the
+/// one way this suite does.
+pub(crate) fn stamp(offset_secs: u64) -> Value {
     json!(BASE_SECS + offset_secs)
 }
 
