@@ -9,7 +9,9 @@
 //! `BridgeFlowOutput` the service materialises for it, which no request configures. So this
 //! operation completes its write through
 //! [`crate::state::ComAmazonawsMediaconnectMediaconnectState::sync_bridge_flow_outputs`],
-//! exactly as CreateFlow and UpdateFlowSource do.
+//! exactly as CreateFlow and UpdateFlowSource do — and admits those sources first, a bridge
+//! holding no more outputs than its own type declares
+//! ([`crate::state::ComAmazonawsMediaconnectMediaconnectState::flow_source_bridge_output_rejection`]).
 //!
 //! ## Shape of an operation
 //!
@@ -303,6 +305,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 source.protocol.as_deref(),
                 source.ingest_port,
             ) {
+                return Err(bad_request(rejection));
+            }
+        }
+
+        // Each source this request points at a bridge gives that bridge one output of its
+        // own, and a bridge holds no more outputs than its own type declares — so the
+        // sources of this batch are counted per bridge and admitted by the bridge they
+        // name, through the one place this crate decides a bridge's output count
+        // (`crate::state`), before anything is stored.
+        for (bridge_arn, (prefix, adding)) in
+            crate::state::requested_gateway_bridge_counts(&input.sources)
+        {
+            if let Some(rejection) =
+                store.flow_source_bridge_output_rejection(&prefix, bridge_arn, adding)
+            {
                 return Err(bad_request(rejection));
             }
         }

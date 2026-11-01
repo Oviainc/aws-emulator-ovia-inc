@@ -489,6 +489,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // Each source this request points at a bridge gives that bridge one output of its
+        // own, and a bridge holds no more outputs than its own type declares — so the
+        // sources of this create are counted per bridge and admitted by the bridge they
+        // name, through the one place this crate decides a bridge's output count
+        // (`crate::state`), so a create stores no source the add path would refuse.
+        for (bridge_arn, (prefix, adding)) in
+            crate::state::requested_gateway_bridge_counts(&requested_sources)
+        {
+            if let Some(rejection) =
+                store.flow_source_bridge_output_rejection(&prefix, bridge_arn, adding)
+            {
+                return Err(bad_request(rejection));
+            }
+        }
+
         // A flow's identity is the ARN this operation mints, and that ARN carries a
         // per-flow generated id as well as the name (`flow:1-<id>:<name>`), so two flows
         // may share a name and still be distinct resources. The model declares no

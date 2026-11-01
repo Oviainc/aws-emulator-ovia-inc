@@ -243,3 +243,5 @@ mod router_maintenance_reschedule;
 mod router_route_region_scope;
 #[path = "all/flow_source_ingest_endpoint.rs"]
 mod flow_source_ingest_endpoint;
+#[path = "all/bridge_flow_output_capacity.rs"]
+mod bridge_flow_output_capacity;

@@ -112,7 +112,15 @@ pub(crate) async fn bridge_feeding_a_flow(emulator: &Emulator, name: &str) -> St
         json!({
             "name": name,
             "placementArn": gateway_arn,
-            "ingressGatewayBridge": { "maxBitrate": 20_000_000, "maxOutputs": 2 },
+            // `IngressGatewayBridge$MaxOutputs` bounds the flow outputs this bridge is
+            // given when cloud flows take it as their source, so this fixture declares as
+            // many as this crate lets any bridge hold: the suites that point flow sources
+            // at it are about their own rules, and the bound itself is
+            // `crate::bridge_output_admission`'s subject.
+            "ingressGatewayBridge": {
+                "maxBitrate": 20_000_000,
+                "maxOutputs": mc::MAX_BRIDGE_OUTPUTS as i64,
+            },
             "sources": [{ "networkSource": {
                 "multicastIp": "224.0.1.1",
                 "name": "net-a",

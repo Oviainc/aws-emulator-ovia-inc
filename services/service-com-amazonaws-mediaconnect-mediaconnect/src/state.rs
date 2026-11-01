@@ -616,6 +616,36 @@ pub fn bridge_output_capacity(ingress_max_outputs: Option<i32>) -> usize {
     }
 }
 
+/// Why a bridge whose own type declares `ingress_max_outputs` cannot end up holding
+/// `held + adding` outputs, or `None` when it can — the count half of the rule, worded
+/// once so every path that decides how many outputs a bridge holds states the same bound
+/// for the same reason.
+///
+/// `adding` is zero for a request that moves the BOUND rather than the output count (an
+/// UpdateBridge lowering `IngressGatewayBridge$MaxOutputs` under the outputs the bridge
+/// already holds), exactly as the source-count rule reads a request that only moves the
+/// failover state ([`source_failover_bound_rejection`]).
+///
+/// Both kinds of output count against the one capacity, because the capacity is on the
+/// BRIDGE: the network outputs a request configures ([`request_bridge_output_rejection`])
+/// and the flow outputs the service materialises for the flow sources that name the bridge
+/// ([`ComAmazonawsMediaconnectMediaconnectState::flow_source_bridge_output_rejection`]).
+pub fn bridge_output_count_rejection(
+    ingress_max_outputs: Option<i32>,
+    held: usize,
+    adding: usize,
+) -> Option<String> {
+    let capacity = bridge_output_capacity(ingress_max_outputs);
+    let total = held + adding;
+    if total <= capacity {
+        return None;
+    }
+    Some(format!(
+        "A bridge holds at most {capacity} output(s); this request would leave it with \
+         {total} ({held} already stored, {adding} requested)."
+    ))
+}
+
 /// Why a bridge cannot take `adding` more outputs a REQUEST configures on top of the
 /// `held` it already holds, or `None` when it can. `ingress_max_outputs` is the bridge's
 /// own type, as [`bridge_output_capacity`] reads it.
@@ -633,7 +663,8 @@ pub fn bridge_output_capacity(ingress_max_outputs: Option<i32>) -> usize {
 ///   cloud flow takes the bridge as its source (`SetGatewayBridgeSourceRequest`), and
 ///   none a request carries; and
 /// * a bridge that does take them holds no more outputs than its own type declares
-///   ([`bridge_output_capacity`]), which for a cloud-to-ground bridge is the bound this
+///   ([`bridge_output_count_rejection`], which reads the capacity off
+///   [`bridge_output_capacity`]), which for a cloud-to-ground bridge is the bound this
 ///   crate applies to every bridge, its `EgressGatewayBridge` declaring no output count.
 ///
 /// A request that configures no output at all admits nothing, so it is nothing this
@@ -660,14 +691,7 @@ pub fn request_bridge_output_rejection(
                 .to_string(),
         );
     }
-    let capacity = bridge_output_capacity(ingress_max_outputs);
-    if held + adding > capacity {
-        return Some(format!(
-            "This bridge holds at most {capacity} outputs; it already holds {held} and this \
-             request adds {adding}."
-        ));
-    }
-    None
+    bridge_output_count_rejection(ingress_max_outputs, held, adding)
 }
 
 /// How many sources a bridge whose source failover config is `config` may hold:
@@ -2684,6 +2708,33 @@ pub fn output_request_reference_rejection(
         request.vpc_interface_attachment.as_ref(),
         vpc_interfaces,
     )
+}
+
+/// How many of the flow sources `requests` would point at each bridge, keyed by the ARN of
+/// the bridge, each with the request member that nests the FIRST entry naming it
+/// (`Sources[0]`, say).
+///
+/// The batch is counted TOGETHER, because what the bridge's declared maximum bounds is the
+/// outputs it ends up holding: a request naming one bridge twice asks that bridge for two
+/// of its outputs, so one batch cannot leave a bridge where a sequence of single adds could
+/// not (see
+/// [`ComAmazonawsMediaconnectMediaconnectState::flow_source_bridge_output_rejection`],
+/// which this is read by, from every operation that stores a LIST of this shape —
+/// CreateFlow's `Source` / `Sources` and AddFlowSources).
+pub fn requested_gateway_bridge_counts(
+    requests: &[SetSourceRequest],
+) -> BTreeMap<&str, (String, usize)> {
+    let mut counts: BTreeMap<&str, (String, usize)> = BTreeMap::new();
+    for (index, request) in requests.iter().enumerate() {
+        let Some(bridge_source) = request.gateway_bridge_source.as_ref() else {
+            continue;
+        };
+        let entry = counts
+            .entry(bridge_source.bridge_arn.as_str())
+            .or_insert_with(|| (format!("Sources[{index}]"), 0));
+        entry.1 += 1;
+    }
+    counts
 }
 
 /// Why the source `request` cannot be stored on a flow whose media streams are named
@@ -7018,6 +7069,57 @@ impl ComAmazonawsMediaconnectMediaconnectState {
             .count()
     }
 
+    /// Why `adding` more flow sources cannot be pointed at the bridge `bridge_arn`, or
+    /// `None` when they can. `prefix` is the request member that nests the source
+    /// (`Sources[0]`, say; see [`qualified_member`]), exactly as
+    /// [`Self::source_bridge_reference_rejection`] reads it.
+    ///
+    /// A flow source that names a bridge gives that bridge exactly one output — the
+    /// `BridgeFlowOutput` [`Self::sync_bridge_flow_outputs`] materialises for it — and a
+    /// bridge holds no more outputs than its own type declares, which for a ground-to-cloud
+    /// bridge is its REQUIRED `IngressGatewayBridge$MaxOutputs` ("the maximum number of
+    /// outputs on the ingress bridge"). These are precisely the outputs that declaration
+    /// bounds, a bridge of that direction taking none a request configures
+    /// ([`bridge_output_capacity`]), so a request that would leave the bridge holding more
+    /// of them than it declares is refused — through the one function every count of a
+    /// bridge's outputs is decided by ([`bridge_output_count_rejection`]), so the flow-source
+    /// side, the request-configured side and the declaration side cannot drift apart.
+    ///
+    /// `adding` is how many flow sources the request NEWLY points at the bridge: a request
+    /// that restates the bridge a stored source already names asks for no further output, so
+    /// it is never refused for the output that source already has.
+    ///
+    /// Every operation that writes a flow source (CreateFlow's `Source` / `Sources`,
+    /// AddFlowSources, UpdateFlowSource) asks HERE before it writes, with
+    /// `BadRequestException` — the error the model describes as the one for "a semantic
+    /// error" in the request — so nothing is stored for a request the bridge has no room
+    /// for. A bridge this store does not hold bounds nothing: that reference is refused by
+    /// [`Self::source_bridge_reference_rejection`] instead.
+    pub fn flow_source_bridge_output_rejection(
+        &self,
+        prefix: &str,
+        bridge_arn: &str,
+        adding: usize,
+    ) -> Option<String> {
+        if adding == 0 {
+            return None;
+        }
+        let bridge = self.bridges.get(bridge_arn)?;
+        let detail = bridge_output_count_rejection(
+            bridge
+                .ingress_gateway_bridge
+                .as_ref()
+                .map(|ingress| ingress.max_outputs),
+            bridge.outputs.len(),
+            adding,
+        )?;
+        let member = qualified_member(prefix, "GatewayBridgeSource.BridgeArn");
+        Some(format!(
+            "{member} {bridge_arn:?} names a bridge with no room for the flow output a \
+             source naming it is given. {detail}"
+        ))
+    }
+
     /// Make the flow outputs the stored bridges hold exactly the ones the account's cloud
     /// flows ask for: one per flow source that names a bridge this store holds.
     ///
@@ -7043,6 +7145,11 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     /// IDEMPOTENT: an output already materialised for a flow source keeps the name it was
     /// materialised under, so repeated calls neither duplicate nor rename one. A network
     /// output a request configured is left alone, whichever bridge holds it.
+    ///
+    /// The outputs this materialises are ADMITTED before the write that asks for them: a
+    /// bridge holds no more outputs than its own type declares, so every one of those
+    /// operations asks [`Self::flow_source_bridge_output_rejection`] first and nothing is
+    /// stored for a flow source a bridge has no room for.
     pub fn sync_bridge_flow_outputs(&mut self) {
         // What the flows ask for, read FIRST against the store as it stands — the bridges
         // cannot be rewritten while it is read. The flows and their sources are walked in

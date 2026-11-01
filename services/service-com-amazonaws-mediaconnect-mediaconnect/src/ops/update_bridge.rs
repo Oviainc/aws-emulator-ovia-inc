@@ -324,6 +324,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(rejection));
         }
 
+        // A bridge holds no more outputs than its own type declares, and this request moves
+        // the DECLARATION rather than the output count: the `IngressGatewayBridge$MaxOutputs`
+        // the bridge ENDS UP with is checked against the outputs it already holds — for a
+        // ground-to-cloud bridge, the flow outputs created for the flow sources that name
+        // it — through the one function every count of a bridge's outputs is decided by
+        // (`crate::state::bridge_output_count_rejection`), the same one the flow-source and
+        // the add paths read. A request that does not touch the declaration is never refused
+        // for the outputs already in the store.
+        let output_bound_rejection = input.ingress_gateway_bridge.as_ref().and_then(|_| {
+            crate::state::bridge_output_count_rejection(
+                ingress_gateway_bridge
+                    .as_ref()
+                    .map(|ingress| ingress.max_outputs),
+                bridge.outputs.len(),
+                0,
+            )
+        });
+        if let Some(rejection) = output_bound_rejection {
+            return Err(bad_request(rejection));
+        }
+
         // `SourcePriority$PrimarySource` is "the name of the source you choose as the
         // primary source", so it has to name a source the bridge has — resolved through
         // the one function every path that writes a source priority resolves it with

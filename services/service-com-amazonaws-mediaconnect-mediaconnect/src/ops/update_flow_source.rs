@@ -496,6 +496,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(rejection));
         }
 
+        // A source fed by a bridge gives that bridge one output of its own, and a bridge
+        // holds no more outputs than its own type declares — so the bridge this request
+        // would point the source at has to have room for it, read through the one place
+        // this crate decides a bridge's output count (`crate::state`). Only a reference
+        // this request MOVES asks for a further output: a request that restates the bridge
+        // the source already names asks for none, and is never refused for the output that
+        // source already has.
+        if let Some(bridge_arn) = input
+            .gateway_bridge_source
+            .as_ref()
+            .and_then(|bridge_source| bridge_source.bridge_arn.as_deref())
+        {
+            let already_named = updated
+                .gateway_bridge_source
+                .as_ref()
+                .is_some_and(|bridge_source| bridge_source.bridge_arn == bridge_arn);
+            if let Some(rejection) = store.flow_source_bridge_output_rejection(
+                "",
+                bridge_arn,
+                usize::from(!already_named),
+            ) {
+                return Err(bad_request(rejection));
+            }
+        }
+
         // A Zixi source listens on one port, and the model states which: "if the protocol
         // of the source is Zixi, the port must be set to 2088"
         // (`UpdateFlowSourceRequest$IngestPort`). The protocol the SOURCE would be on once
