@@ -41,9 +41,115 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+use crate::state::{
+    text_size_limit_exceeded, DISPLAY_LANGUAGE_CODE_VALUE_SET, MAX_TEXT_BYTES,
+};
+
+/// The error code this service answers an input-constraint violation with when
+/// it keeps the framework's class — the same code (and HTTP 400) the framework
+/// would have named, restated here because a reworded refusal replaces the code
+/// and the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The error class the service answers a request whose text is larger than the
+/// documented limit with (`smithy_query operation=TranslateText`).
+const TEXT_SIZE_LIMIT_EXCEEDED: &str = "TextSizeLimitExceededException";
+
+/// The dotted path of the member carrying the text one translation request
+/// translates, as a refusal names it.
+const TEXT_MEMBER_PATH: &str = "text";
+
+/// The size, in bytes, of the value a refusal echoed.
+///
+/// The framework caps the value it echoes into a refusal message and states the
+/// full byte length of what it elided, so the size of the value the REQUEST
+/// carried survives in the refusal either way: as that stated length, or — for a
+/// value short enough to be echoed whole — as the echo's own length.
+fn echoed_byte_length(echoed: &str) -> usize {
+    echoed
+        .strip_suffix(" bytes]")
+        .and_then(|head| head.rsplit_once("... ["))
+        .and_then(|(_, digits)| digits.parse::<usize>().ok())
+        .unwrap_or(echoed.len())
+}
+
+/// The violation reporting that a request's text is longer than the documented
+/// limit allows, if any.
+///
+/// The limit AWS documents for that member counts BYTES, so a request past it is
+/// this service's own size refusal rather than a shape-constraint rejection; the
+/// member's character-length bound is the only form the model can state it in,
+/// and a request that trips it has necessarily passed the byte limit too.
+fn oversize_text(violations: &[Violation]) -> Option<&Violation> {
+    violations.iter().find(|violation| {
+        violation.path == TEXT_MEMBER_PATH
+            && matches!(violation.kind, ViolationKind::MaxLength(max)
+                if usize::try_from(max).is_ok_and(|bound| bound == MAX_TEXT_BYTES))
+    })
+}
+
+/// The accepted-value set of an enum this service renders in its own order,
+/// matched by the set of values the violation carries rather than by the member
+/// that happened to carry it, so every member targeting that enum reads alike.
+fn service_value_order(allowed: &[String]) -> Option<&'static [&'static str]> {
+    let same_set = allowed.len() == DISPLAY_LANGUAGE_CODE_VALUE_SET.len()
+        && DISPLAY_LANGUAGE_CODE_VALUE_SET
+            .iter()
+            .all(|value| allowed.iter().any(|declared| declared == value));
+    same_set.then_some(DISPLAY_LANGUAGE_CODE_VALUE_SET)
+}
+
+/// One clause for one violated member.
+///
+/// Only the accepted-value set of an out-of-enum value is reworded, and only in
+/// its ORDER: the set a refusal states is the one the service emits, which is
+/// part of the fixed text of that message. Every other class keeps the
+/// framework's clause verbatim.
+fn violation_clause(violation: &Violation) -> String {
+    let ViolationKind::EnumValue(allowed) = &violation.kind else {
+        return violation.message();
+    };
+    match service_value_order(allowed) {
+        Some(ordered) => format!(
+            "Value '{}' at '{}' failed to satisfy constraint: Member must satisfy enum \
+             value set: [{}]",
+            violation.value.as_deref().unwrap_or_default(),
+            violation.path,
+            ordered.join(", ")
+        ),
+        None => violation.message(),
+    }
+}
+
+/// The `ValidationException` message for a framework refusal: the same
+/// `<N> validation error(s) detected: ` envelope the framework renders, over one
+/// clause per violated member.
+///
+/// `None` when no violation is one this service words differently, which
+/// declines the refusal and keeps the framework's wording verbatim rather than
+/// re-deriving it here.
+fn validation_envelope(violations: &[Violation]) -> Option<String> {
+    let reworded = violations.iter().any(|violation| {
+        matches!(&violation.kind, ViolationKind::EnumValue(allowed)
+            if service_value_order(allowed).is_some())
+    });
+    if !reworded {
+        return None;
+    }
+    let clauses: Vec<String> = violations.iter().map(violation_clause).collect();
+    match clauses.as_slice() {
+        [only] => Some(format!("1 validation error detected: {only}")),
+        many => Some(format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        )),
+    }
+}
 
 /// The `com-amazonaws-translate-awsshinefrontendservice-20170701` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +204,33 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Two classes are not this service's generic input-constraint refusal:
+        //
+        // - a translation request carrying more text than the service allows,
+        //   which is a modelled size refusal of that operation and names its own
+        //   error class, the limit and the size the request sent;
+        // - an out-of-enum value, whose accepted-value set this service states in
+        //   its own order.
+        //
+        // Everything else — including an authentication refusal, which is not an
+        // input-constraint failure at all — keeps the framework's code and
+        // wording.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        if let Some(violation) = oversize_text(violations) {
+            let bytes = echoed_byte_length(violation.value.as_deref().unwrap_or_default());
+            return Some(Refused {
+                code: TEXT_SIZE_LIMIT_EXCEEDED.to_string(),
+                message: text_size_limit_exceeded(bytes).message.unwrap_or_default(),
+            });
+        }
+        Some(Refused {
+            code: VALIDATION_EXCEPTION.to_string(),
+            message: validation_envelope(violations)?,
+        })
     }
 
     fn override_routing_error(

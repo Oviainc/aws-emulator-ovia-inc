@@ -31,12 +31,12 @@ const REGION: &str = "us-east-1";
 
 /// The account id every ARN this emulator mints carries
 /// (`engine::mock_account_id`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The only `MergeStrategy` the model declares.
 const OVERWRITE: &str = "OVERWRITE";
 
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::default();
     router.register_service(EmulatedService::new(engine));
@@ -52,7 +52,11 @@ fn authorization() -> String {
     )
 }
 
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let payload = Bytes::from(serde_json::to_vec(body).expect("the request body serializes"));
     let request = http::Request::builder()
         .method("POST")
@@ -74,7 +78,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// The error code `awsJson1_1` puts in `__type`.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -84,7 +88,7 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-fn message(body: &Value) -> String {
+pub(crate) fn message(body: &Value) -> String {
     for member in ["message", "Message"] {
         if let Some(text) = body.get(member).and_then(Value::as_str) {
             return text.to_string();
@@ -93,7 +97,7 @@ fn message(body: &Value) -> String {
     String::new()
 }
 
-fn string_at(body: &Value, pointer: &str) -> String {
+pub(crate) fn string_at(body: &Value, pointer: &str) -> String {
     body.pointer(pointer)
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -120,7 +124,7 @@ fn revision_of(file: &[u8]) -> String {
     hex::encode(Sha256::digest(file)).chars().take(16).collect()
 }
 
-fn expected_arn(name: &str, file: &[u8]) -> String {
+pub(crate) fn expected_arn(name: &str, file: &[u8]) -> String {
     format!(
         "arn:aws:translate:{REGION}:{ACCOUNT}:terminology/{name}/{}",
         revision_of(file)
@@ -135,7 +139,7 @@ fn import_body(name: &str, file: &[u8], format: &str, directionality: Option<&st
     json!({"Name": name, "MergeStrategy": OVERWRITE, "TerminologyData": data})
 }
 
-async fn import(
+pub(crate) async fn import(
     router: &MultiServiceRouter,
     name: &str,
     file: &[u8],
@@ -152,7 +156,7 @@ async fn import(
 
 /// The CSV terminology the issue's workflow imports: a header row of language
 /// codes and one term per later row.
-const EN_FR_CSV: &[u8] = b"en,fr\nhello,bonjour\ngoodbye,au revoir\n";
+pub(crate) const EN_FR_CSV: &[u8] = b"en,fr\nhello,bonjour\ngoodbye,au revoir\n";
 
 /// The same shape tab-separated.
 const EN_ES_TSV: &[u8] = b"en\tes\nhello\thola\n";
@@ -315,9 +319,10 @@ async fn terminology_lifecycle_is_served_from_stored_state() {
     .await;
     assert_eq!(status, 404, "TranslateText answered {missing}");
     assert_eq!(error_code(&missing), "ResourceNotFoundException");
-    assert!(
-        message(&missing).contains("has not been found"),
-        "the refusal carries the wording the model documents, got {missing}"
+    assert_eq!(
+        message(&missing),
+        format!("The Terminology for {ACCOUNT} no-such-terms was not found"),
+        "the refusal names the terminology the request asked for, got {missing}"
     );
 
     // Deleted: every reader agrees it is gone.

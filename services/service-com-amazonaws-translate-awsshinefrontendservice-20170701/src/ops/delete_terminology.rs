@@ -44,7 +44,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{service_state, terminology_not_found};
+use crate::state::{service_state, terminology_not_found, TERMINOLOGY_METADATA_RESOURCE};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,8 +145,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         if store.terminologies.remove(&input.name).is_none() {
+            // A delete addresses the resource's metadata record, which is the
+            // resource this refusal names.
             return Err(DeleteTerminologyErrorModeled::ResourceNotFoundException(
-                terminology_not_found(),
+                terminology_not_found(TERMINOLOGY_METADATA_RESOURCE, &input.name),
             )
             .into());
         }

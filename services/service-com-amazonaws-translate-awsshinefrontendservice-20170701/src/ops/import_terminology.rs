@@ -81,8 +81,8 @@ use std::collections::BTreeMap;
 use crate::state::{
     auxiliary_data_location, canonical_language, content_revision, counted,
     invalid_parameter_value, request_region, service_state, terminology_arn,
-    terminology_properties, TermEntry, Terminology, FORMAT_CSV, FORMAT_TMX, FORMAT_TSV,
-    MAX_TAGS_PER_RESOURCE, MAX_TERMINOLOGY_FILE_BYTES, MAX_STORED_TERMINOLOGIES,
+    terminology_properties, too_many_tags, TermEntry, Terminology, FORMAT_CSV, FORMAT_TMX,
+    FORMAT_TSV, MAX_TAGS_PER_RESOURCE, MAX_TERMINOLOGY_FILE_BYTES, MAX_STORED_TERMINOLOGIES,
     MAX_TERM_TEXT_CHARS, MAX_TERMS_PER_TERMINOLOGY,
 };
 
@@ -439,17 +439,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(requested) = tags.as_ref() {
             if requested.len() > MAX_TAGS_PER_RESOURCE {
                 return Err(ImportTerminologyErrorModeled::TooManyTagsException(
-                    TooManyTagsException {
-                        message: Some(format!(
-                            "You have added too many tags to this resource. The maximum is \
-                             {MAX_TAGS_PER_RESOURCE} tags."
-                        )),
-                        resource_arn: Some(terminology_arn(
-                            &region,
-                            &input.name,
-                            &content_revision(&file),
-                        )),
-                    },
+                    too_many_tags(&terminology_arn(
+                        &region,
+                        &input.name,
+                        &content_revision(&file),
+                    )),
                 )
                 .into());
             }

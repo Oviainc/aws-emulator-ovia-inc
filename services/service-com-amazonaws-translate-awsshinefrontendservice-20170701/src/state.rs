@@ -20,7 +20,8 @@ use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     EncryptionKey, InvalidParameterValueException, ResourceNotFoundException, Tag, Term,
-    TerminologyDataLocation, TerminologyProperties,
+    TerminologyDataLocation, TerminologyProperties, TextSizeLimitExceededException,
+    TooManyTagsException, UnsupportedLanguagePairException,
 };
 
 /// The ARN namespace this service stamps into every resource ARN: `translate`
@@ -105,7 +106,34 @@ pub const MAX_TERMINOLOGIES_PER_TRANSLATION: usize = 1;
 
 /// How many tags one resource carries: "You have added too many tags to this
 /// resource. The maximum is 50 tags" (`smithy_query shape=TooManyTagsException`).
+/// The tag list a request carries is bounded far wider than that by the model
+/// (`TagList` is `length 0..200`), so this quota is the operation's own rule
+/// rather than a shape constraint: the boundary walk admits the request and the
+/// handler refuses it.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The longest `Text` one translation request may carry, in BYTES: "The text
+/// string can be a maximum of 10,000 bytes long. Depending on your character
+/// set, this may be fewer than 10,000 characters"
+/// (`smithy_query shape=TranslateTextRequest member=Text`).
+///
+/// The documented limit counts BYTES, which no character-length shape
+/// constraint expresses, so the size of a request's text is the operation's own
+/// rule and its own modelled refusal.
+pub const MAX_TEXT_BYTES: usize = 10_000;
+
+/// The values `DisplayLanguageCode` declares (`smithy_query
+/// shape=DisplayLanguageCode`), in the order this service renders an
+/// accepted-value set into a constraint-violation message.
+///
+/// The set is the model's; the ORDER is the service's own — neither sorted nor
+/// the model's declaration order — and it is part of the fixed text of that
+/// message, so a caller parsing the accepted values out of a refusal reads the
+/// list the service really emits. `tests/all/rejection_paths.rs` pins this list
+/// to the same ten codes the model declares, so it can only ever differ from
+/// the model in order.
+pub const DISPLAY_LANGUAGE_CODE_VALUE_SET: &[&str] =
+    &["de", "zh-TW", "pt", "ko", "en", "it", "fr", "zh", "es", "ja"];
 
 /// `MaxResultsInteger`'s ceiling, which is also the page size a listing uses
 /// when the request names none (`range 1..500`).
@@ -346,6 +374,28 @@ pub struct ComAmazonawsTranslateAwsshinefrontendservice20170701State {
     pub terminologies: BTreeMap<String, Terminology>,
 }
 
+impl ComAmazonawsTranslateAwsshinefrontendservice20170701State {
+    /// The stored terminology an ARN names, or `None` when this account holds
+    /// none with that ARN.
+    ///
+    /// The tagging operations address a resource by ARN rather than by name, so
+    /// they resolve it against the ARN each record already carries — the same
+    /// one every read reports it by, revision segment included, so an ARN from a
+    /// superseded import names no resource.
+    pub fn terminology_for_arn(&self, arn: &str) -> Option<&Terminology> {
+        self.terminologies
+            .values()
+            .find(|record| record.arn == arn)
+    }
+
+    /// The `Name` of the terminology an ARN names, which is the key a mutating
+    /// tagging call reaches the record through.
+    pub fn terminology_name_for_arn(&self, arn: &str) -> Option<String> {
+        self.terminology_for_arn(arn)
+            .map(|record| record.name.clone())
+    }
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -509,13 +559,39 @@ pub fn page_size(requested: Option<i32>) -> usize {
     usize::try_from(size).unwrap_or(1)
 }
 
-/// The `ResourceNotFoundException` the terminology operations answer for a name
-/// no import stored.
+/// The resource a not-found message names when the request asked for the
+/// terminology ITSELF — the record a read or a translation resolves.
+pub const TERMINOLOGY_RESOURCE: &str = "Terminology";
+
+/// The resource a not-found message names when the request asked to REMOVE the
+/// terminology, which addresses its metadata record rather than its content.
+pub const TERMINOLOGY_METADATA_RESOURCE: &str = "TerminologyMetadata";
+
+/// The `ResourceNotFoundException` a terminology operation answers for a name no
+/// import stored: which resource of this account, under which name, was not
+/// there.
 ///
-/// The wording is the sentence the model documents for this error class, which
-/// carries no variable part (`smithy_query shape=ResourceNotFoundException`);
-/// which name was asked for is already in the caller's own request.
-pub fn terminology_not_found() -> ResourceNotFoundException {
+/// `resource` is the operation's own resource word — [`TERMINOLOGY_RESOURCE`] for
+/// a call that resolves the terminology, [`TERMINOLOGY_METADATA_RESOURCE`] for
+/// one that deletes it — so a caller can tell a missing terminology from missing
+/// terminology metadata, and `name` is the one the request asked for.
+pub fn terminology_not_found(resource: &str, name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "The {resource} for {} {name} was not found",
+            ::engine::emulator_account_id()
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` a call that addresses a resource by ARN
+/// answers when this account holds no resource with that ARN.
+///
+/// Such a call names no resource name to report back, so the wording is the
+/// sentence the model documents for the error class
+/// (`smithy_query shape=ResourceNotFoundException`); the ARN the caller asked
+/// for is already in its own request.
+pub fn resource_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(
             "The resource you are looking for has not been found. Review the resource \
@@ -523,6 +599,43 @@ pub fn terminology_not_found() -> ResourceNotFoundException {
              needs before retrying the revised request."
                 .to_string(),
         ),
+    }
+}
+
+/// The `TextSizeLimitExceededException` a request whose `Text` is larger than
+/// [`MAX_TEXT_BYTES`] is refused with: the limit the service allows and the size
+/// this request sent, both as byte counts.
+pub fn text_size_limit_exceeded(bytes: usize) -> TextSizeLimitExceededException {
+    TextSizeLimitExceededException {
+        message: Some(format!(
+            "Input text size exceeds limit. Max length of request text allowed is \
+             {MAX_TEXT_BYTES} bytes while in this request the text size is {bytes} bytes"
+        )),
+    }
+}
+
+/// The `UnsupportedLanguagePairException` a translation the service does not
+/// perform is refused with: the message names the pair that was rejected, and
+/// the same two codes travel in the shape's own members.
+///
+/// The codes are the RESOLVED ones — for a request that asked the service to
+/// determine the source language, the code it resolved the source to — so the
+/// refusal reports the pair the service actually judged.
+pub fn unsupported_language_pair(source: &str, target: &str) -> UnsupportedLanguagePairException {
+    UnsupportedLanguagePairException {
+        message: Some(format!("Unsupported language pair: {source} to {target}.")),
+        source_language_code: Some(source.to_string()),
+        target_language_code: Some(target.to_string()),
+    }
+}
+
+/// The `TooManyTagsException` a request that would leave a resource holding more
+/// than [`MAX_TAGS_PER_RESOURCE`] tags is refused with. One wording for the one
+/// error class, whichever operation reached the limit.
+pub fn too_many_tags(resource_arn: &str) -> TooManyTagsException {
+    TooManyTagsException {
+        message: Some("Allowable tag limit for resource exceeded".to_string()),
+        resource_arn: Some(resource_arn.to_string()),
     }
 }
 

@@ -99,22 +99,15 @@ use super::types::*;
 
 use crate::state::{
     applied_term, is_supported_language, language_for_detector_code, service_state,
-    terminology_not_found, AUTO_LANGUAGE_CODE, MAX_APPLIED_TERMS,
-    MAX_TERMINOLOGIES_PER_TRANSLATION, MAX_TRANSLATED_TEXT_CHARS,
+    terminology_not_found, text_size_limit_exceeded, unsupported_language_pair,
+    AUTO_LANGUAGE_CODE, MAX_APPLIED_TERMS, MAX_TERMINOLOGIES_PER_TRANSLATION, MAX_TEXT_BYTES,
+    MAX_TRANSLATED_TEXT_CHARS, TERMINOLOGY_RESOURCE,
 };
 
 /// The marker a synthetic translation carries, so a caller can never mistake
 /// this emulator's output for a real translation. The target language is part of
 /// it, which is what makes the output differ per requested pair.
 const SYNTHETIC_MARKER: &str = "mt";
-
-/// The sentence the model documents for `UnsupportedLanguagePairException`,
-/// which carries no variable part (`smithy_query
-/// shape=UnsupportedLanguagePairException`); the pair itself travels in that
-/// shape's own `SourceLanguageCode` and `TargetLanguageCode` members.
-const UNSUPPORTED_LANGUAGE_PAIR: &str =
-    "Amazon Translate does not support translation from the language of the source text \
-     into the requested target language.";
 
 /// One requested terminology, resolved against the store: the stored record's
 /// name and the `(source text, target text)` pairs it provides for this
@@ -240,7 +233,10 @@ fn marker(
 /// and the same text always resolves the same way. Text the detector cannot
 /// place at all is the service's documented low-confidence failure; a language
 /// it places but Amazon Translate does not translate is an unsupported pair.
-fn detect_source_language(text: &str) -> Result<String, TranslateTextError> {
+fn detect_source_language(
+    text: &str,
+    target_language_code: &str,
+) -> Result<String, TranslateTextError> {
     let detected = ::whatlang::detect_lang(text).ok_or_else(|| {
         TranslateTextErrorModeled::DetectedLanguageLowConfidenceException(
             DetectedLanguageLowConfidenceException {
@@ -255,12 +251,11 @@ fn detect_source_language(text: &str) -> Result<String, TranslateTextError> {
     language_for_detector_code(detected.code())
         .map(ToString::to_string)
         .ok_or_else(|| {
+            // The text is in a language this service does not translate, so
+            // there is no supported code to report the source as: the pair the
+            // request asked for is what it is refused by.
             TranslateTextErrorModeled::UnsupportedLanguagePairException(
-                UnsupportedLanguagePairException {
-                    message: Some(UNSUPPORTED_LANGUAGE_PAIR.to_string()),
-                    source_language_code: Some(AUTO_LANGUAGE_CODE.to_string()),
-                    target_language_code: None,
-                },
+                unsupported_language_pair(AUTO_LANGUAGE_CODE, target_language_code),
             )
             .into()
         })
@@ -348,6 +343,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The documented size limit counts the request text's BYTES, so it is
+        // checked here rather than by the member's character-length constraint,
+        // and it is checked first: the size of the request is decided before
+        // anything in it is resolved.
+        if input.text.len() > MAX_TEXT_BYTES {
+            return Err(TranslateTextErrorModeled::TextSizeLimitExceededException(
+                text_size_limit_exceeded(input.text.len()),
+            )
+            .into());
+        }
+
         let requested_terminologies = input.terminology_names.unwrap_or_default();
         // "You can use one custom terminology resource in your translation
         // request."
@@ -368,7 +374,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // text itself, so the resolved code is computed from the text rather
         // than echoed back from the request.
         let source_language_code = if input.source_language_code == AUTO_LANGUAGE_CODE {
-            detect_source_language(&input.text)?
+            detect_source_language(&input.text, &input.target_language_code)?
         } else {
             input.source_language_code.clone()
         };
@@ -381,11 +387,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             || !is_supported_language(&target_language_code)
         {
             return Err(TranslateTextErrorModeled::UnsupportedLanguagePairException(
-                UnsupportedLanguagePairException {
-                    message: Some(UNSUPPORTED_LANGUAGE_PAIR.to_string()),
-                    source_language_code: Some(source_language_code),
-                    target_language_code: Some(target_language_code),
-                },
+                unsupported_language_pair(&source_language_code, &target_language_code),
             )
             .into());
         }
@@ -395,9 +397,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut resolved = Vec::new();
             for name in &requested_terminologies {
                 let record = store.terminologies.get(name).ok_or_else(|| {
-                    TranslateTextErrorModeled::ResourceNotFoundException(
-                        terminology_not_found(),
-                    )
+                    TranslateTextErrorModeled::ResourceNotFoundException(terminology_not_found(
+                        TERMINOLOGY_RESOURCE,
+                        name,
+                    ))
                 })?;
                 let mut pairs: Vec<(String, String)> = record
                     .term_pairs(&source_language_code, &target_language_code)

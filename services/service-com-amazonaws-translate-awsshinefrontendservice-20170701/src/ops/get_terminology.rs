@@ -71,6 +71,7 @@ use super::types::*;
 use crate::state::{
     auxiliary_data_location, invalid_parameter_value, request_region, service_state,
     terminology_data_location, terminology_not_found, terminology_properties,
+    TERMINOLOGY_RESOURCE,
 };
 
 /// The member a refusal about the requested format names.
@@ -156,7 +157,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let record = store.terminologies.get(&input.name).ok_or_else(|| {
-            GetTerminologyErrorModeled::ResourceNotFoundException(terminology_not_found())
+            GetTerminologyErrorModeled::ResourceNotFoundException(terminology_not_found(
+                TERMINOLOGY_RESOURCE,
+                &input.name,
+            ))
         })?;
 
         // "If you don't specify this parameter, Amazon Translate returns a file
