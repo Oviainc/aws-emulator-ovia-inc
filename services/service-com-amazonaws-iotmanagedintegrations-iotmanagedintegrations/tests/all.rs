@@ -53,6 +53,8 @@ mod managed_thing_read_side_attributes;
 mod not_found_messages;
 #[path = "all/notification_configuration_lifecycle.rs"]
 mod notification_configuration_lifecycle;
+#[path = "all/ota_task_configuration_delete_isolation.rs"]
+mod ota_task_configuration_delete_isolation;
 #[path = "all/ota_task_configuration_lifecycle.rs"]
 mod ota_task_configuration_lifecycle;
 #[path = "all/ota_task_configuration_not_found_messages.rs"]
