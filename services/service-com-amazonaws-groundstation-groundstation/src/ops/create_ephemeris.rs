@@ -5,7 +5,7 @@
 //! ## What this operation stores
 //!
 //! An ephemeris is admitted in `VALIDATING` and the service owes it the move out of that
-//! status: to `INVALID` when its supplied data describes no usable validity range, else to
+//! status: to `INVALID` when its supplied data breaks a rule the model states for it, else to
 //! `ENABLED` or `DISABLED` according to the request's `enabled`, and to `EXPIRED` once its
 //! expiration time passes. The verdict is taken here, from the data as supplied, and
 //! materialised by `state::settle_due_ephemerides` when it falls due — see

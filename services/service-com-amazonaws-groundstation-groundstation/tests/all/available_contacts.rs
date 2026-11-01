@@ -86,13 +86,22 @@ pub(crate) struct Segment {
 }
 
 impl Segment {
-    /// This segment as the request body carries it. The azimuth is the same for every point:
-    /// what decides a pass is the ELEVATION, which is what the suite varies.
-    fn body(&self) -> Value {
+    /// This segment as the request body carries it, with its angles measured in
+    /// `angle_unit`. The azimuth is the same for every point: what decides a pass is the
+    /// ELEVATION, which is what the suite varies — but it is spelled in the segment's own
+    /// unit, since an `az` has to lie inside the range that unit documents (-180 to 360
+    /// degrees, -π to 2π radians — `smithy_query(query="doc", shape="TimeAzEl",
+    /// member="az")`).
+    fn body(&self, angle_unit: &str) -> Value {
+        let az = if angle_unit == "RADIAN" {
+            AZIMUTH_DEGREES.to_radians()
+        } else {
+            AZIMUTH_DEGREES
+        };
         let points: Vec<Value> = self
             .points
             .iter()
-            .map(|(dt, el)| json!({"dt": dt, "az": 120.0, "el": el}))
+            .map(|(dt, el)| json!({"dt": dt, "az": az, "el": el}))
             .collect();
         json!({
             "referenceEpoch": self.reference_epoch,
@@ -102,11 +111,18 @@ impl Segment {
     }
 }
 
+/// The azimuth every point of this suite's pointing data carries, in degrees: one bearing,
+/// well inside the range either unit admits, so no row's answer turns on the azimuth.
+const AZIMUTH_DEGREES: f64 = 120.0;
+
 /// An `azEl` ephemeris body: pointing angles for `ground_station`, measured in `angle_unit`
 /// (an `AngleUnits` value — `smithy_query(query="shape", shape="AngleUnits")`), carrying
 /// `segments`.
 pub(crate) fn az_el(ground_station: &str, angle_unit: &str, segments: &[Segment]) -> Value {
-    let list: Vec<Value> = segments.iter().map(Segment::body).collect();
+    let list: Vec<Value> = segments
+        .iter()
+        .map(|segment| segment.body(angle_unit))
+        .collect();
     json!({"azEl": {
         "groundStation": ground_station,
         "data": {"azElData": {"angleUnit": angle_unit, "azElSegmentList": list}},

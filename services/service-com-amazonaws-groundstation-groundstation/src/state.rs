@@ -3491,6 +3491,14 @@ pub fn ephemeris_in_use_for_update_message(contact_ids: &[String]) -> String {
 /// `VALIDATION_ERROR` (`smithy_query(query="shape", shape="EphemerisInvalidReason")`).
 pub const EPHEMERIS_TIME_RANGE_INVALID: &str = "TIME_RANGE_INVALID";
 
+/// Why an ephemeris whose supplied pointing data describes no usable trajectory did not
+/// validate: the `EphemerisInvalidReason` the model documents as "provided ephemeris defines
+/// invalid spacecraft trajectory" (`smithy_query(query="shape",
+/// shape="EphemerisInvalidReason")`), which is what the pointing data itself being unusable
+/// is — as against [`EPHEMERIS_TIME_RANGE_INVALID`], documented for the "start, end, or
+/// expiration time(s)" the data declares.
+pub const EPHEMERIS_TRAJECTORY_INVALID: &str = "TRAJECTORY_INVALID";
+
 /// The priority an ephemeris is created with when the request names none: the model's own
 /// documentation of `CreateEphemerisRequest$priority` — "Higher numbers take precedence.
 /// The default is 1. Must be 1 or greater." (`smithy_query(query="doc",
@@ -3728,19 +3736,135 @@ pub fn ephemeris_validity_end(data: &EphemerisData) -> Option<DateTime> {
         .map(DateTime::from_secs_f64)
 }
 
+/// The azimuth-elevation segments `data` carries INLINE, or `None` when it carries none to
+/// examine — because it is of another type, or names an Amazon S3 object this emulator does
+/// not fetch.
+fn inline_az_el_segments(data: &EphemerisData) -> Option<&AzElSegments> {
+    match data {
+        EphemerisData::azEl(az_el) => match &az_el.data {
+            AzElSegmentsData::azElData(segments) => Some(segments),
+            AzElSegmentsData::s3Object(_) => None,
+        },
+        EphemerisData::Tle(_) | EphemerisData::Oem(_) => None,
+    }
+}
+
 /// Why the data `data` supplies cannot be used, as an `EphemerisInvalidReason`, or `None`
 /// when nothing in it is wrong.
 ///
-/// A validity range must run forwards: one whose end does not follow its start describes
-/// no interval at all, so the data is refused as [`EPHEMERIS_TIME_RANGE_INVALID`] rather
-/// than enabled. This is the verdict of the validation `CreateEphemeris` starts, applied
-/// when that validation falls due ([`EPHEMERIS_VALIDATION_SETTLES_AFTER`]).
+/// Data the model states a rule for and that breaks it describes no usable trajectory, so it
+/// is refused rather than enabled — every such rule, not one of them:
+///
+/// * a validity range must run forwards: one whose end does not follow its start describes
+///   no interval at all;
+/// * the segments of an az/el set "must be in chronological order with no overlaps"
+///   (`smithy_query(query="doc", shape="AzElSegments", member="azElSegmentList")`), so each
+///   one's validity begins no earlier than the one before it ends — two segments that touch
+///   at an instant describe one continuous span and do not overlap;
+/// * a segment's points "must be in ascending order with no duplicates" by `dt`
+///   (`smithy_query(query="doc", shape="TimeAzEl", member="dt")`), which is what makes them
+///   a trajectory rather than a bag of directions;
+/// * an angle must lie inside the range its unit documents ([`angle_ranges`]).
+///
+/// The first two are faults of the times the data declares and the last two of the pointing
+/// data itself, which is how the verdict is spelled: [`EPHEMERIS_TIME_RANGE_INVALID`] or
+/// [`EPHEMERIS_TRAJECTORY_INVALID`], following what the model documents each reason for.
+///
+/// This is the verdict of the validation `CreateEphemeris` starts, applied when that
+/// validation falls due ([`EPHEMERIS_VALIDATION_SETTLES_AFTER`]).
 pub fn ephemeris_invalid_reason(data: &EphemerisData) -> Option<&'static str> {
-    ephemeris_validity_ranges(data)
+    if ephemeris_validity_ranges(data)
         .iter()
         .any(|(start, end)| end <= start)
-        .then_some(EPHEMERIS_TIME_RANGE_INVALID)
+    {
+        return Some(EPHEMERIS_TIME_RANGE_INVALID);
+    }
+    let segments = inline_az_el_segments(data)?;
+    if segments_out_of_order(segments) {
+        return Some(EPHEMERIS_TIME_RANGE_INVALID);
+    }
+    pointing_data_unusable(segments).then_some(EPHEMERIS_TRAJECTORY_INVALID)
 }
+
+/// Whether the segments of `segments` are NOT in chronological order with no overlaps: true
+/// when any of them begins before the one before it ends.
+///
+/// One comparison answers both halves of that rule — a segment placed out of order begins
+/// before its predecessor ends just as an overlapping one does — and it is a comparison of
+/// the validity ranges the segments DECLARE, which is the span each one's data is declared to
+/// cover.
+fn segments_out_of_order(segments: &AzElSegments) -> bool {
+    segments.az_el_segment_list.windows(2).any(|pair| {
+        pair[1].valid_time_range.start_time.as_secs_f64()
+            < pair[0].valid_time_range.end_time.as_secs_f64()
+    })
+}
+
+/// Whether the pointing data `segments` carries describes no usable trajectory: true when any
+/// segment's points are not strictly ascending in `dt`, or when any angle lies outside the
+/// range its unit documents.
+///
+/// A unit the service knows no range for leaves every angle unplaceable, so that data
+/// describes no trajectory either. No request reaches it: `angleUnit` is a modelled value set
+/// (`AngleUnits`), so a token outside it fails the model's own rules before the handler runs.
+fn pointing_data_unusable(segments: &AzElSegments) -> bool {
+    let Some((azimuth, elevation)) = angle_ranges(&segments.angle_unit) else {
+        return true;
+    };
+    segments.az_el_segment_list.iter().any(|segment| {
+        segment
+            .az_el_list
+            .windows(2)
+            .any(|pair| pair[1].dt <= pair[0].dt)
+            || segment.az_el_list.iter().any(|point| {
+                !in_closed_range(point.az, azimuth) || !in_closed_range(point.el, elevation)
+            })
+    })
+}
+
+/// Whether `value` lies inside the closed range `(low, high)`. A value that is not a number
+/// lies in no range, so it is outside this one.
+///
+/// A plain comparison, unlike the frequency test this crate already carries
+/// ([`in_any_band`]): that one admits a tolerance either side, because a frequency written in
+/// another `FrequencyUnits` is compared after conversion, while an angle is compared in the
+/// unit its own segments declare and the model's bounds are exact.
+fn in_closed_range(value: f64, (low, high): (f64, f64)) -> bool {
+    value >= low && value <= high
+}
+
+/// The ranges an `az` and an `el` may hold when the angles are measured in the `AngleUnits`
+/// value `angle_unit`, as `(azimuth, elevation)` CLOSED ranges; `None` for a unit this
+/// service knows no range for.
+///
+/// The bounds are the model's own, per unit: an azimuth is "`DEGREE_ANGLE`: -180 to 360
+/// degrees" or "`RADIAN`: -π to 2π radians" and an elevation "`DEGREE_ANGLE`: -90 to 90
+/// degrees" or "`RADIAN`: -π/2 to π/2 radians" (`smithy_query(query="doc", shape="TimeAzEl",
+/// member="az")` / `member="el"`). They are the same angles in either unit, which is why one
+/// table carries both: a conversion is not applied to the data, since "all angles in all
+/// segments must use the same unit" (`smithy_query(query="doc", shape="AzElSegments",
+/// member="angleUnit")`) and that unit is the one every angle read from them is reported in.
+fn angle_ranges(angle_unit: &str) -> Option<((f64, f64), (f64, f64))> {
+    match angle_unit {
+        ANGLE_UNIT_DEGREE_ANGLE => Some(((-180.0, 360.0), (-90.0, 90.0))),
+        ANGLE_UNIT_RADIAN => Some((
+            (-::std::f64::consts::PI, ::std::f64::consts::TAU),
+            (
+                -::std::f64::consts::FRAC_PI_2,
+                ::std::f64::consts::FRAC_PI_2,
+            ),
+        )),
+        _ => None,
+    }
+}
+
+/// The `AngleUnits` value that measures a pointing angle in degrees, and the one that
+/// measures it in radians: the two values of that enum (`smithy_query(query="shape",
+/// shape="AngleUnits")`).
+pub const ANGLE_UNIT_DEGREE_ANGLE: &str = "DEGREE_ANGLE";
+
+/// See [`ANGLE_UNIT_DEGREE_ANGLE`].
+pub const ANGLE_UNIT_RADIAN: &str = "RADIAN";
 
 /// The elevation at which a satellite crosses a ground station's horizon, in either unit
 /// an `AzElSegments` measures its angles in: ZERO.
@@ -5671,8 +5795,8 @@ impl ComAmazonawsGroundstationGroundstationState {
     /// changes nothing a later caller could otherwise have seen.
     ///
     /// Validation lands the ephemeris on the verdict taken when it was created
-    /// ([`ephemeris_invalid_reason`]): [`EPHEMERIS_INVALID`] when its data describes no
-    /// usable validity range, else [`EPHEMERIS_ENABLED`] or [`EPHEMERIS_DISABLED`]
+    /// ([`ephemeris_invalid_reason`]): [`EPHEMERIS_INVALID`] when its data breaks a rule the
+    /// model states for it, else [`EPHEMERIS_ENABLED`] or [`EPHEMERIS_DISABLED`]
     /// according to what the caller asked for. Expiration then overrides either of those
     /// two, and an ephemeris that did not validate stays `INVALID`: there is nothing of
     /// it to expire.
@@ -6009,10 +6133,7 @@ fn az_el_segments_for<'a>(
     if az_el.ground_station != ground_station {
         return None;
     }
-    match &az_el.data {
-        AzElSegmentsData::azElData(segments) => Some(segments),
-        AzElSegmentsData::s3Object(_) => None,
-    }
+    inline_az_el_segments(&ephemeris.supplied_data)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
