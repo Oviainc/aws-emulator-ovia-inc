@@ -131,6 +131,10 @@ mod function_concurrency_removal;
 mod function_concurrency_reported_member;
 #[path = "all/function_configuration.rs"]
 mod function_configuration;
+#[path = "all/function_configuration_quotas.rs"]
+mod function_configuration_quotas;
+#[path = "all/function_last_update_status_reason.rs"]
+mod function_last_update_status_reason;
 #[path = "all/function_lifecycle.rs"]
 mod function_lifecycle;
 #[path = "all/function_recursion_config.rs"]

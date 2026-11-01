@@ -363,6 +363,54 @@ pub const DEFAULT_TIMEOUT_SECONDS: i32 = 3;
 /// larger value, naming the member and the bound it failed.
 pub const MAX_TIMEOUT_SECONDS: i32 = 900;
 
+/// The largest `MemorySize` a function may carry, in MB: AWS's published Lambda quota
+/// "Function memory allocation: 128 MB to 10,240 MB, in 1-MB increments".
+///
+/// The model's `MemorySize` range is wider (128..32768), so this is the narrower of the
+/// two and the one a request is refused against, exactly as [`MAX_TIMEOUT_SECONDS`] is
+/// for `Timeout`.
+pub const MAX_MEMORY_SIZE_MB: i32 = 10_240;
+
+/// How one over-quota member is refused: the sentence it carries.
+///
+/// Both quotas are NARROWER than the ranges this model declares (`Timeout` 1..5400,
+/// `MemorySize` 128..32768), so the request walk's boundary validator lets an over-quota
+/// value through and the handler is the only place that can refuse it: every operation
+/// that accepts either member judges it here, before anything is stored, so a
+/// configuration no function could run is never persisted and a later read never reports
+/// one.
+///
+/// Each member keeps the wording the service answers for its own ceiling: the `Timeout`
+/// clause quotes the rejected value and names the member path and the bound, while the
+/// `MemorySize` sentence names the member. Neither carries the `N validation error(s)
+/// detected: ` envelope the boundary walk builds when it aggregates the violations of one
+/// request, because neither of these is a bound the model declares for that walk to
+/// collect (see [`pattern_violation_message`] for the refusals that are) — but both state
+/// a bound on the VALUE of a member, so both are answered through the same channel that
+/// walk answers through: a 400 `ValidationException`
+/// ([`crate::scaffolded::Scaffolded::validation`]).
+///
+/// Answers `None` when both members are inside their quota.
+#[must_use]
+pub fn configuration_quota_refusal(
+    timeout: Option<i32>,
+    memory_size: Option<i32>,
+) -> Option<String> {
+    if let Some(timeout) = timeout.filter(|seconds| *seconds > MAX_TIMEOUT_SECONDS) {
+        return Some(format!(
+            "Value '{timeout}' at 'timeout' failed to satisfy constraint: Member must have \
+             value less than or equal to {MAX_TIMEOUT_SECONDS}"
+        ));
+    }
+    if memory_size.is_some_and(|megabytes| megabytes > MAX_MEMORY_SIZE_MB) {
+        return Some(format!(
+            "'MemorySize' value failed to satisfy constraint: Member must have value less \
+             than or equal to {MAX_MEMORY_SIZE_MB}"
+        ));
+    }
+    None
+}
+
 /// The `LogFormat` a function gets when the caller names none: "The default log format is
 /// plain text", as AWS documents for the member (the model carries only its `JSON | Text`
 /// enum).
@@ -2948,6 +2996,33 @@ impl FunctionRecord {
     /// of what is stored.
     #[must_use]
     pub fn configuration(&self, version: &str, config: &FunctionConfig) -> CreateFunctionOutput {
+        // `LastUpdateStatus` is "The status of the last update that was performed on the
+        // function", and the update `UpdateFunctionConfiguration` describes is applied to
+        // the UNPUBLISHED version only ("You can't modify the configuration of a published
+        // version, only the unpublished version"). A published version froze its
+        // configuration before any such update began, so it is not the thing being updated
+        // and reports the settled status rather than the in-flight one.
+        let last_update_status = if version == VERSION_LATEST {
+            self.last_update_status.clone()
+        } else {
+            self.last_update_status.as_ref().map(|status| {
+                if status == LAST_UPDATE_STATUS_IN_PROGRESS {
+                    LAST_UPDATE_STATUS_SUCCESSFUL.to_string()
+                } else {
+                    status.clone()
+                }
+            })
+        };
+        // "The LastUpdateStatus, LastUpdateStatusReason, and LastUpdateStatusReasonCode
+        // fields in the response from GetFunctionConfiguration indicate when the update is
+        // complete": the three members report ONE thing, so the reason and its code are
+        // reported exactly while the status is the in-flight one, and the work in flight is
+        // the same provisioning of a new instance of the function that creation performs
+        // ("When you update a function, Lambda provisions an instance of the function and
+        // its supporting resources"), which is what [`STATE_REASON_CODE_CREATING`] and its
+        // sentence name. A settled or failed status has no work in flight to report, so it
+        // carries neither member.
+        let update_in_flight = last_update_status.as_deref() == Some(LAST_UPDATE_STATUS_IN_PROGRESS);
         CreateFunctionOutput {
             function_name: Some(config.name.clone()),
             function_arn: Some(self.versioned_arn(version)),
@@ -3006,25 +3081,11 @@ impl FunctionRecord {
             state: Some(self.reported_state(version)),
             state_reason: self.state_reason.clone(),
             state_reason_code: self.state_reason_code.clone(),
-            last_update_status: if version == VERSION_LATEST {
-                self.last_update_status.clone()
-            } else {
-                // `LastUpdateStatus` is "The status of the last update that was
-                // performed on the function", and the update
-                // `UpdateFunctionConfiguration` describes is applied to the UNPUBLISHED
-                // version only ("You can't modify the configuration of a published
-                // version, only the unpublished version"). A published version froze its
-                // configuration before any such update began, so it is not the thing
-                // being updated and reports the settled status rather than the in-flight
-                // one.
-                self.last_update_status.as_ref().map(|status| {
-                    if status == LAST_UPDATE_STATUS_IN_PROGRESS {
-                        LAST_UPDATE_STATUS_SUCCESSFUL.to_string()
-                    } else {
-                        status.clone()
-                    }
-                })
-            },
+            last_update_status,
+            last_update_status_reason: update_in_flight
+                .then(|| STATE_REASON_CREATING.to_string()),
+            last_update_status_reason_code: update_in_flight
+                .then(|| STATE_REASON_CODE_CREATING.to_string()),
             package_type: Some(config.package_type.clone()),
             architectures: Some(config.architectures.clone()),
             ephemeral_storage: Some(EphemeralStorage {

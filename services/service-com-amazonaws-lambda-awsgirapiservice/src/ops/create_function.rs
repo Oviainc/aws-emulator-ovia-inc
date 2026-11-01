@@ -407,10 +407,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let code = package_code(&package_type, &input)?;
 
-        // AWS's published Lambda quota "Function timeout: 900 seconds (15 minutes)" is
-        // narrower than the model's `Timeout` range (1..5400), so the wider bound the
-        // boundary validator checked is not the whole constraint; the request is refused
-        // here against the published one, naming the member and the bound it failed.
+        // AWS's published Lambda quotas "Function timeout: 900 seconds (15 minutes)" and
+        // "Function memory allocation: 128 MB to 10,240 MB" are narrower than the model's
+        // `Timeout` (1..5400) and `MemorySize` (128..32768) ranges, so the wider bounds the
+        // boundary validator checked are not the whole constraint; the request is refused
+        // here against the published ones by the single rule both operations that accept
+        // these members apply (`crate::state::configuration_quota_refusal`), before
+        // anything is written.
         //
         // A function the request configures for DURABLE execution defaults to that
         // published maximum instead of the documented 3 seconds: a durable function's own
@@ -426,12 +429,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::DEFAULT_TIMEOUT_SECONDS
         };
         let timeout = input.timeout.unwrap_or(default_timeout);
-        if timeout > crate::state::MAX_TIMEOUT_SECONDS {
-            return Err(invalid_parameter(format!(
-                "1 validation error detected: Value '{timeout}' at 'timeout' failed to satisfy \
-                 constraint: Member must have value less than or equal to {}",
-                crate::state::MAX_TIMEOUT_SECONDS
-            )));
+        // Both clauses state a bound on the VALUE of a member, so both are answered the
+        // way the framework's own constraint walk answers one.
+        if let Some(message) =
+            crate::state::configuration_quota_refusal(Some(timeout), input.memory_size)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
         let now = ::std::time::SystemTime::now();

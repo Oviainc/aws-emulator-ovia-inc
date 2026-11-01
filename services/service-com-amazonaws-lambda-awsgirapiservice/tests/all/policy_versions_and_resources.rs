@@ -205,11 +205,12 @@ async fn create_function_refuses_a_timeout_past_the_published_quota() {
                 answer.status,
                 String::from_utf8_lossy(&answer.body)
             );
+            // The clause states a bound on the VALUE of a member, so it is answered the
+            // way the framework's own constraint walk answers one
+            // (`function_configuration_quotas.rs` pins both quota channels).
             assert!(
-                answer
-                    .error_code()
-                    .contains("InvalidParameterValueException"),
-                "case {}: expected InvalidParameterValueException, got {}",
+                answer.error_code().contains("ValidationException"),
+                "case {}: expected ValidationException, got {}",
                 case.name,
                 answer.error_code()
             );

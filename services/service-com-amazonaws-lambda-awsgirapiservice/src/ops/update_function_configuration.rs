@@ -381,6 +381,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // AWS's published Lambda quotas on `Timeout` (900 seconds) and `MemorySize`
+        // (10,240 MB) are narrower than the ranges this model declares, so an over-quota
+        // value reaches the handler and is refused here by the single rule every operation
+        // that accepts these members applies — judged on the REQUEST, before the record is
+        // read or touched, so a configuration no function could run is never applied and
+        // the refusal does not depend on what the function's state happens to be. Both
+        // clauses state a bound on the VALUE of a member, so both are answered the way the
+        // framework's own constraint walk answers one.
+        if let Some(message) =
+            crate::state::configuration_quota_refusal(input.timeout, input.memory_size)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
 

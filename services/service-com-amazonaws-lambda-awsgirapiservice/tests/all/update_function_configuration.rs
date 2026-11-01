@@ -51,8 +51,15 @@ const OTHER_ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exe
 const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
 /// The members every update is expected to change, whatever else it names: a fresh
-/// revision, a fresh `LastModified`, and the in-flight update status.
-const VOLATILE_MEMBERS: [&str; 3] = ["RevisionId", "LastModified", "LastUpdateStatus"];
+/// revision, a fresh `LastModified`, and the in-flight update status with the reason and
+/// reason code that report the work that status covers.
+const VOLATILE_MEMBERS: [&str; 5] = [
+    "RevisionId",
+    "LastModified",
+    "LastUpdateStatus",
+    "LastUpdateStatusReason",
+    "LastUpdateStatusReasonCode",
+];
 
 /// The member DERIVED from `Runtime`, so a row that replaces the runtime moves it too
 /// without naming it: `RuntimeVersionConfig` reports "the ARN of the runtime version you
@@ -234,8 +241,11 @@ struct Case {
 /// count of settings named at once. The recorded defect named `Description` and
 /// `MemorySize`; every other row is the same rule on a different member.
 ///
-/// The published bounds come from the model: `Timeout` is `@range(min: 1, max: 5400)` and
-/// `MemorySize` is `@range(min: 128, max: 32768)`, so both are exercised at each end.
+/// The published bounds are the narrower of the model's range and AWS's published quota:
+/// `Timeout` is `@range(min: 1, max: 5400)` under a 900-second quota and `MemorySize` is
+/// `@range(min: 128, max: 32768)` under a 10,240 MB quota, so both are exercised at each
+/// end of what the service admits (`function_configuration_quotas.rs` covers the refusals
+/// past the quota).
 /// The enum values come from the model's own enums (`Runtime`, `TracingMode`, `LogFormat`,
 /// `ApplicationLogLevel`, `SystemLogLevel`, `SnapStartApplyOn`).
 fn cases() -> Vec<Case> {
@@ -261,8 +271,8 @@ fn cases() -> Vec<Case> {
         Case {
             label: "timeout-at-maximum",
             package: Package::Zip,
-            patch: json!({ "Timeout": 5400 }),
-            expected: json!({ "Timeout": 5400 }),
+            patch: json!({ "Timeout": 900 }),
+            expected: json!({ "Timeout": 900 }),
         },
         Case {
             label: "memory-at-minimum",
@@ -273,8 +283,8 @@ fn cases() -> Vec<Case> {
         Case {
             label: "memory-at-maximum",
             package: Package::Zip,
-            patch: json!({ "MemorySize": 32768 }),
-            expected: json!({ "MemorySize": 32768 }),
+            patch: json!({ "MemorySize": 10240 }),
+            expected: json!({ "MemorySize": 10240 }),
         },
         Case {
             label: "two-settings-at-once",
@@ -521,7 +531,7 @@ async fn a_named_setting_is_replaced_and_every_other_setting_is_left_alone() {
             );
         }
 
-        // ...and every member it does not name is exactly what it was, bar the three an
+        // ...and every member it does not name is exactly what it was, bar the ones an
         // update always moves.
         for (name_of, was) in members(&baseline) {
             if case.expected.get(&name_of).is_some()
@@ -593,8 +603,10 @@ async fn a_named_setting_is_replaced_and_every_other_setting_is_left_alone() {
              persisted, got {status} {read_back}"
         );
 
-        // Once the clock has made the update due, the only member that moves is the
-        // status the model says indicates "when the update is complete".
+        // Once the clock has made the update due, the only members that move are the
+        // status the model says indicates "when the update is complete" and the reason
+        // pair that reports the work that status covers: a settled update has no work in
+        // flight left to give a reason for.
         make_update_due(&engine);
         let (status, settled) = get_configuration(&router, name, None).await;
         assert_eq!(
@@ -609,6 +621,8 @@ async fn a_named_setting_is_replaced_and_every_other_setting_is_left_alone() {
         );
         let mut expected_settled = members(&updated);
         expected_settled.insert("LastUpdateStatus".to_string(), json!("Successful"));
+        expected_settled.remove("LastUpdateStatusReason");
+        expected_settled.remove("LastUpdateStatusReasonCode");
         assert_eq!(
             members(&settled),
             expected_settled,
