@@ -22,15 +22,18 @@
 //! 2. `MaxResults` bounds ONE page and the `NextToken` beside it resumes exactly where
 //!    that page stopped, so the pages of one walk cover the region's integrations once
 //!    each, in the store's order; a page with nothing left beyond it carries no token;
-//! 3. a `NextToken` carrying anything this operation could not have issued — an id that is
+//! 3. `MaxResults` is held to the range its own shape declares: each published bound is
+//!    served, and a value past either bound is refused with the modelled 400 and reports
+//!    no page at all;
+//! 4. a `NextToken` carrying anything this operation could not have issued — an id that is
 //!    not of the form this service mints one in — is refused with the modelled 400 rather
 //!    than silently answering a page, while a well-formed id the store no longer holds
 //!    stays a POSITION: the walk resumes strictly after it;
-//! 4. a listing is a pure read: it leaves the store exactly as it was;
-//! 5. `DeleteS3TableIntegration` retires the one integration its `Arn` names in the
+//! 5. a listing is a pure read: it leaves the store exactly as it was;
+//! 6. `DeleteS3TableIntegration` retires the one integration its `Arn` names in the
 //!    caller's region, after which neither a read nor a listing reports it, and the
 //!    other integrations are untouched;
-//! 6. an `Arn` that names no integration in the caller's region — a retired one, one
+//! 7. an `Arn` that names no integration in the caller's region — a retired one, one
 //!    of another region, one of another account or partition — is refused with the
 //!    modelled 400 and retires nothing.
 
@@ -350,6 +353,96 @@ async fn max_results_bounds_a_page_and_next_token_resumes_after_it() {
             expected_pages.max(1)
         );
     }
+}
+
+/// `MaxResults` is served at each bound its own shape publishes and refused past either
+/// one, and a refused call reports no page and leaves the collection alone.
+#[tokio::test]
+async fn max_results_is_served_at_each_published_bound_and_refused_past_it() {
+    // The bounds are the ones `ListS3TableIntegrationsMaxResults` declares:
+    // smithy_query(query="shape",shape="ListS3TableIntegrationsMaxResults") reports
+    // range 1..100. The rows are each bound, one step past each bound, and the values
+    // beyond any page a caller could ask for.
+    const MIN_MAX_RESULTS: i64 = 1;
+    const MAX_MAX_RESULTS: i64 = 100;
+    let count = 3usize;
+    let emulator = emulator();
+    fill(&emulator, HOME_REGION, count, "MaxResults bounds").await;
+    let (everything, _) = walk(&emulator, HOME_REGION, None, "MaxResults bounds").await;
+
+    for served in [MIN_MAX_RESULTS, MAX_MAX_RESULTS] {
+        let case = format!("MaxResults {served}, a published bound");
+        let (page, next) = list(
+            &emulator,
+            HOME_REGION,
+            &json!({ "MaxResults": served }),
+            &case,
+        )
+        .await;
+        let expected_len = (served as usize).min(count);
+        assert_eq!(
+            page.len(),
+            expected_len,
+            "case {case:?}: expected {expected_len} summaries, got {page:?}"
+        );
+        assert_eq!(
+            page.as_slice(),
+            &everything[..expected_len],
+            "case {case:?}: expected the page to be the first {expected_len} of the listing's own \
+             order, got {page:?}"
+        );
+        assert_eq!(
+            next.is_some(),
+            expected_len < count,
+            "case {case:?}: a NextToken follows a page only when something is left beyond it, got \
+             {next:?}"
+        );
+    }
+
+    for refused in [
+        MIN_MAX_RESULTS - 1,
+        MAX_MAX_RESULTS + 1,
+        -1,
+        i64::from(i32::MAX),
+    ] {
+        let case = format!("MaxResults {refused}, outside the modelled range");
+        let (status, response) = call(
+            &emulator,
+            HOME_REGION,
+            "/ListS3TableIntegrations",
+            &json!({ "MaxResults": refused }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the modelled 400, got {status} {response:?}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {response:?}"
+        );
+        assert!(
+            response.get("IntegrationSummaries").is_none(),
+            "case {case:?}: expected a refusal to report no page, got {response:?}"
+        );
+    }
+
+    // The refusals neither stored nor retired anything, so the collection still reads
+    // back exactly as it did.
+    let (after, _) = walk(&emulator, HOME_REGION, None, "MaxResults bounds").await;
+    assert_eq!(
+        after, everything,
+        "case {:?}: expected the refused calls to leave the collection alone, got {after:?}",
+        "MaxResults bounds"
+    );
+    assert_eq!(
+        stored_count(&emulator),
+        count,
+        "case {:?}: expected {count} records after the refusals, got {}",
+        "MaxResults bounds",
+        stored_count(&emulator)
+    );
 }
 
 /// A `NextToken` this operation did not issue is refused with the modelled 400, and a
