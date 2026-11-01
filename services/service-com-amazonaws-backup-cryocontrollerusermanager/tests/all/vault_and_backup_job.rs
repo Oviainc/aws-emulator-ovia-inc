@@ -77,6 +77,20 @@ pub(crate) async fn call(
     path: &str,
     body: Option<&str>,
 ) -> (u16, Value) {
+    let (status, _errortype, parsed) = call_reported(router, method, path, body).await;
+    (status, parsed)
+}
+
+/// The SAME request, with the error shape the response NAMES to a client
+/// (`x-amzn-errortype`, how restJson1 resolves an error shape) beside the status
+/// and the body; `"<unset>"` when the header is absent, which is what a
+/// successful answer carries.
+pub(crate) async fn call_reported(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> (u16, String, Value) {
     let mut builder = http::Request::builder()
         .method(method)
         .uri(format!("http://localhost{path}"))
@@ -90,13 +104,18 @@ pub(crate) async fn call(
     let request = builder.body(payload).expect("a well-formed test request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let errortype = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map_or_else(|| "<unset>".to_string(), str::to_string);
     let bytes = response.into_body();
     let parsed = if bytes.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
-    (status, parsed)
+    (status, errortype, parsed)
 }
 
 /// The wire error code of an error response (`__type`), or `"<none>"`.

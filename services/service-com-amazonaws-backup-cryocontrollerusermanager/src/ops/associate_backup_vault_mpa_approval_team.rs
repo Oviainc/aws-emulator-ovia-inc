@@ -7,6 +7,11 @@
 //! `CreateRestoreAccessBackupVault` requires one of, since the team is what
 //! approves access to the recovery points an air-gapped vault holds.
 //!
+//! A team can only be put in charge of a vault that supports multi-party
+//! approval, and only a value that names a team names one at all, so a request
+//! that fails either is refused as the VALUE of the member that names the team:
+//! `MpaApprovalTeamArn` is what the caller has to change.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -180,13 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // The model types `MpaApprovalTeamArn` as `ARN` with no pattern, so the
-        // framework cannot refuse a value that is not one; AWS does, rather
-        // than recording a team reference that names nothing. The check and its
-        // sentence are `crate::state`'s, shared with every other member this
-        // service types as an ARN.
-        if let Some(refusal) =
-            crate::state::rejected_arn("MpaApprovalTeamArn", &input.mpa_approval_team_arn)
-        {
+        // framework admits the ARN of anything at all; only the ARN of an
+        // approval team names a team, and the form one takes is the service
+        // that MINTS teams' to state, so the check and the refusal are
+        // `crate::state`'s — shared with every other member this service types
+        // as the ARN of one kind of resource.
+        if let Some(refusal) = crate::state::rejected_mpa_approval_team_arn(
+            "MpaApprovalTeamArn",
+            &input.mpa_approval_team_arn,
+        ) {
             return Err(
                 AssociateBackupVaultMpaApprovalTeamErrorModeled::InvalidParameterValueException(
                     refusal,
@@ -210,11 +217,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let vault = store.visible_vault_mut(&input.backup_vault_name, None)?;
         // Multi-party approval is a facility of a LOGICALLY AIR-GAPPED vault:
         // it governs access to the recovery points such a vault holds, so a
-        // vault of any other type supports no team at all.
+        // vault of any other type supports no team at all — and the member that
+        // cannot be honoured is the one that names the team, which is what the
+        // refusal reports (`Context`), exactly as for a value that is not a
+        // team ARN at all. Both are one answer: this team cannot be put in
+        // charge of this vault.
         if vault.vault_type != crate::state::VAULT_TYPE_LOGICALLY_AIR_GAPPED_BACKUP_VAULT {
             return Err(
                 AssociateBackupVaultMpaApprovalTeamErrorModeled::InvalidParameterValueException(
-                    crate::state::unsupported_vault_type(),
+                    crate::state::rejected_parameter("MpaApprovalTeamArn"),
                 )
                 .into(),
             );
@@ -225,3 +236,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(AssociateBackupVaultMpaApprovalTeamOutput)
     }
 }
+

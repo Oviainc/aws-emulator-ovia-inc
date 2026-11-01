@@ -805,24 +805,31 @@ async fn a_source_vault_that_cannot_grant_restore_access_is_refused() {
             "case {label:?} ({source_arn}): the refusal must state the condition, got {refused:?}"
         );
     }
-    // Nothing was stored against either vault by any of those refusals.
-    for source in ["grantor-vault", "plain-vault"] {
-        let (status, page) = list_restore_access(&router, source, "").await;
-        assert_eq!(
-            (status, entries(&page).len()),
-            (200, 0),
-            "case \"after the refusals, {source}\": a refused create must store nothing, got \
-             {status} {page:?}"
-        );
-    }
-    // A vault of a type that grants no restore access is told so by name.
+    // Nothing was stored against the source by any of those refusals. Only an
+    // air-gapped vault is listed here: a vault of another type answers the
+    // listing with its own type refusal, which
+    // `vault_type_and_parameter_refusals.rs` pins.
+    let (status, page) = list_restore_access(&router, "grantor-vault", "").await;
+    assert_eq!(
+        (status, entries(&page).len()),
+        (200, 0),
+        "case \"after the refusals\": a refused create must store nothing, got {status} {page:?}"
+    );
+    // A vault of a type that grants no restore access is told so with that
+    // condition's own token and sentence.
     let body = json!({"SourceBackupVaultArn": vault_arn("plain-vault")}).to_string();
     let (_, refused) = create_restore_access(&router, &body).await;
     assert_eq!(
-        refused.get("Message").and_then(Value::as_str),
-        Some("Operation not supported for the provided vault type"),
-        "case \"a plain vault as the source\": expected the condition's own sentence, got \
-         {refused:?}"
+        (
+            refused.get("Code").and_then(Value::as_str),
+            refused.get("Message").and_then(Value::as_str),
+        ),
+        (
+            Some("ERROR_4134"),
+            Some("Provided backup vault does not support this operation."),
+        ),
+        "case \"a plain vault as the source\": expected the condition's own token and \
+         sentence, got {refused:?}"
     );
 }
 
@@ -993,15 +1000,28 @@ async fn listing_and_revoking_resolve_the_source_vault_first() {
         "case \"listing a source this account does not hold\": expected 403 \
          AccessDeniedException, got {status} {denied:?}"
     );
-    for source in ["visible-source", "plain-source"] {
-        let (status, page) = list_restore_access(&router, source, "").await;
-        assert_eq!(
-            (status, entries(&page).len()),
-            (200, 0),
-            "case \"listing {source}\": a source with no restore access vault answers an empty \
-             page, got {status} {page:?}"
-        );
-    }
+    let (status, page) = list_restore_access(&router, "visible-source", "").await;
+    assert_eq!(
+        (status, entries(&page).len()),
+        (200, 0),
+        "case \"listing visible-source\": a source with no restore access vault answers an \
+         empty page, got {status} {page:?}"
+    );
+    // A vault of a type that can hold NONE is a different answer from a source
+    // that holds none: the route is scoped to air-gapped vaults, so it is
+    // refused for its type (`vault_type_and_parameter_refusals.rs` pins the
+    // token and the sentence).
+    let (status, refused) = list_restore_access(&router, "plain-source", "").await;
+    assert_eq!(
+        (
+            status,
+            error_code(&refused).as_str(),
+            refused.get("RestoreAccessBackupVaults").cloned(),
+        ),
+        (400, "InvalidParameterValueException", None),
+        "case \"listing plain-source\": a vault type that can hold no restore access vault \
+         must be refused rather than listed, got {status} {refused:?}"
+    );
 
     // An ARN belonging to ANOTHER source's restore access vault is absent as
     // far as this source is concerned.

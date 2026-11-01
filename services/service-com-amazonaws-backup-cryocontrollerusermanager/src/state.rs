@@ -85,6 +85,23 @@ pub const ENCRYPTION_KEY_TYPE_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED_KMS_KEY
 /// The ARN namespace of the KMS keys a vault is encrypted with.
 const KMS_ARN_NAMESPACE: &str = "kms";
 
+/// The ARN namespace of the multi-party approval teams an
+/// `MpaApprovalTeamArn` names.
+const MPA_ARN_NAMESPACE: &str = "mpa";
+
+/// The resource type an approval team's ARN carries within
+/// [`MPA_ARN_NAMESPACE`], as the ARN of a team this service is given names it:
+/// `approval-team/<team>`.
+const MPA_APPROVAL_TEAM_RESOURCE_PREFIX: &str = "approval-team/";
+
+/// The number of digits an AWS account id carries, which every ARN that names
+/// an account states.
+const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The longest region name an approval team's ARN states, as the owning
+/// service's `ApprovalTeamArn` pattern bounds it (`[a-z0-9-]{1,20}`).
+const MAX_MPA_ARN_REGION_LENGTH: usize = 20;
+
 /// The least `ChangeableForDays` accepts, as the model documents it: "Backup
 /// enforces a 72-hour cooling-off period before Vault Lock takes effect and
 /// becomes immutable. Therefore, you must set `ChangeableForDays` to 3 or
@@ -543,6 +560,62 @@ pub fn backup_vault_arn_parts(value: &str) -> Option<BackupVaultArnParts> {
     })
 }
 
+/// The region and the account a multi-party approval team's ARN names, or
+/// `None` when `value` is not one.
+///
+/// The form is the one the service that MINTS a team declares for it —
+/// `arn:aws(-<partition>)?:mpa:<region>:<12 digit account>:approval-team/<team>`
+/// with the team made of letters, digits, `.`, `_` and `-`
+/// (`smithy_query(query="shape", shape="ApprovalTeamArn",
+/// model_path="services/service-com-amazonaws-mpa-awsfluffycoreservice/smithy-model/com-amazonaws-mpa-awsfluffycoreservice.json")`)
+/// — not a form this service invents: a member that names ONE resource of ONE
+/// service is only an ARN of that resource, and this service's model types
+/// `MpaApprovalTeamArn` as `ARN` with no pattern, so the framework admits the
+/// ARN of anything at all.
+pub fn mpa_approval_team_arn_parts(value: &str) -> Option<(&str, &str)> {
+    let mut fields = value.split(':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some(MPA_ARN_NAMESPACE),
+        Some(region),
+        Some(account_id),
+        Some(resource),
+        None,
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return None;
+    };
+    let partition_named = partition == "aws"
+        || partition
+            .strip_prefix("aws-")
+            .is_some_and(|suffix| !suffix.is_empty());
+    let region_named = (1..=MAX_MPA_ARN_REGION_LENGTH).contains(&region.len())
+        && region
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    let account_named =
+        account_id.len() == ACCOUNT_ID_DIGITS && account_id.chars().all(|c| c.is_ascii_digit());
+    let team_named = resource
+        .strip_prefix(MPA_APPROVAL_TEAM_RESOURCE_PREFIX)
+        .is_some_and(|team| {
+            !team.is_empty()
+                && team
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        });
+    (partition_named && region_named && account_named && team_named)
+        .then_some((region, account_id))
+}
+
 // ===========================================================================
 // This service's error vocabulary
 // ===========================================================================
@@ -564,11 +637,41 @@ pub fn backup_vault_arn_parts(value: &str) -> Option<BackupVaultArnParts> {
 // it is a constant here and not a format string.
 
 /// The sentence AWS states for "this vault's TYPE does not support the
-/// operation that was called on it" — fixed, since it names no part of the
-/// request. Restore access is a facility of a logically air-gapped vault, so a
-/// source vault of any other type cannot grant it.
+/// multi-party approval call that was made on it" — fixed, since it names no
+/// part of the request.
+///
+/// Kept as the vocabulary of the condition, for the operation that STATES it:
+/// `DisassociateBackupVaultMpaApprovalTeam`, which carries no member naming a
+/// team, so its refusal can only speak of the vault
+/// (`20261029T175130Z-backup-aws-backup-recovery-point-restore-job-mpa-and`
+/// records that wording and is the issue that implements it). The association,
+/// which does carry one, reports the member it cannot honour instead
+/// ([`rejected_parameter`]).
 pub const MESSAGE_UNSUPPORTED_VAULT_TYPE: &str =
     "Operation not supported for the provided vault type";
+
+/// `Code` AWS fills in for "a member of the request carries a value this
+/// service cannot accept". ONE token for the whole class: which member was
+/// rejected is reported in `Context`, not in the token.
+pub const ERROR_CODE_INVALID_PARAMETER_VALUE: &str = "INVALID_PARAMETER_VALUE";
+
+/// `Code` for "the source vault a restore access create names is of a type that
+/// cannot grant restore access".
+pub const ERROR_CODE_SOURCE_VAULT_UNSUPPORTED: &str = "ERROR_4134";
+/// The sentence AWS states for that condition — fixed: neither the vault nor
+/// its type appears in it.
+pub const MESSAGE_SOURCE_VAULT_UNSUPPORTED: &str =
+    "Provided backup vault does not support this operation.";
+
+/// `Code` for "the vault named by a call that only a logically air-gapped vault
+/// answers is of another type".
+pub const ERROR_CODE_VAULT_TYPE_INVALID: &str = "ERROR_3936";
+/// The sentence AWS states for that condition — fixed: the accepted type it
+/// names is the `VaultType` enum's own token
+/// ([`VAULT_TYPE_LOGICALLY_AIR_GAPPED_BACKUP_VAULT`]), not a value of the
+/// request.
+pub const MESSAGE_VAULT_TYPE_NOT_AIR_GAPPED: &str =
+    "The vault type is invalid. Accepted type is LOGICALLY_AIR_GAPPED_BACKUP_VAULT.";
 
 /// The sentence AWS states for "the `RestoreAccessBackupVaultArn` the request
 /// carries does not name a restore access backup vault of the named source
@@ -699,11 +802,57 @@ pub fn vault_already_exists() -> AlreadyExistsException {
     }
 }
 
-/// The modelled refusal for a call whose named vault is of a type that does not
-/// support it — see [`MESSAGE_UNSUPPORTED_VAULT_TYPE`].
+/// The modelled refusal for a multi-party approval call whose named vault is of
+/// a type that supports none — see [`MESSAGE_UNSUPPORTED_VAULT_TYPE`] for which
+/// call states it and why. No `Code`: this condition has no observed token.
+///
+/// A vault-type precondition whose token AWS states builds its own exception
+/// instead — the source vault of a restore access create
+/// ([`source_vault_unsupported`]) and the vault of a call only a logically
+/// air-gapped vault answers ([`vault_type_not_air_gapped`]) — since each
+/// condition carries its own token and its own sentence.
 pub fn unsupported_vault_type() -> InvalidParameterValueException {
     InvalidParameterValueException {
         message: Some(MESSAGE_UNSUPPORTED_VAULT_TYPE.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a MEMBER of the request whose value is not one this
+/// service can accept, named by the member it rejected.
+///
+/// ONE builder for the class, so no operation answers it with a sentence of its
+/// own: AWS reports the class's own `Code`
+/// ([`ERROR_CODE_INVALID_PARAMETER_VALUE`]), carries the rejected member's name
+/// in `Context` — the member a client reads to learn WHICH input to fix — and
+/// states a sentence whose only variable part is that same member name.
+pub fn rejected_parameter(member: &str) -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        code: Some(ERROR_CODE_INVALID_PARAMETER_VALUE.to_string()),
+        message: Some(format!("Parameter {member} is invalid.")),
+        context: Some(member.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a restore access create whose source vault is of a
+/// type that cannot grant restore access — see
+/// [`MESSAGE_SOURCE_VAULT_UNSUPPORTED`], with the condition's own token.
+pub fn source_vault_unsupported() -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        code: Some(ERROR_CODE_SOURCE_VAULT_UNSUPPORTED.to_string()),
+        message: Some(MESSAGE_SOURCE_VAULT_UNSUPPORTED.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a call that only a logically air-gapped vault
+/// answers naming a vault of another type — see
+/// [`MESSAGE_VAULT_TYPE_NOT_AIR_GAPPED`], with the condition's own token.
+pub fn vault_type_not_air_gapped() -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        code: Some(ERROR_CODE_VAULT_TYPE_INVALID.to_string()),
+        message: Some(MESSAGE_VAULT_TYPE_NOT_AIR_GAPPED.to_string()),
         ..Default::default()
     }
 }
@@ -938,20 +1087,38 @@ pub fn rejected_window_minutes(
 /// The modelled refusal for a member the model types as `ARN` with no pattern
 /// whose value is not one, or `None` when it is.
 ///
-/// ONE check and ONE sentence for every such member in this service, for the
-/// reason given on [`rejected_window_minutes`]; see [`is_arn`] for what being
-/// one means.
+/// ONE check for every such member in this service, for the reason given on
+/// [`rejected_window_minutes`]; see [`is_arn`] for what being one means. The
+/// refusal itself is the class's own ([`rejected_parameter`]), so the member
+/// whose value was rejected is the only thing that varies between two of them.
 pub fn rejected_arn(member: &str, value: &str) -> Option<InvalidParameterValueException> {
     if is_arn(value) {
         return None;
     }
-    Some(InvalidParameterValueException {
-        message: Some(format!(
-            "{member} must be an ARN of the form \
-             arn:<partition>:<service>:<region>:<account>:<resource>"
-        )),
-        ..Default::default()
-    })
+    Some(rejected_parameter(member))
+}
+
+/// The modelled refusal for a member that names an MPA APPROVAL TEAM by ARN
+/// whose value is not the ARN of a team at all, or `None` when it has the form
+/// of one.
+///
+/// A sibling of [`rejected_backup_vault_arn`] for the same narrower rule: the
+/// model types the member as `ARN` with no pattern, but only one resource of one
+/// service can be named by it, so a value that is the ARN of something else is a
+/// parameter value AWS refuses rather than a team it looks for. See
+/// [`mpa_approval_team_arn_parts`] for the form, which is the owning service's.
+///
+/// Whether a team of that form EXISTS is not decided here: that is the owning
+/// service's to answer, so the operation asks it (see
+/// `crate::ops::associate_backup_vault_mpa_approval_team`) and answers this same
+/// refusal when the answer is that it does not.
+pub fn rejected_mpa_approval_team_arn(
+    member: &str,
+    value: &str,
+) -> Option<InvalidParameterValueException> {
+    mpa_approval_team_arn_parts(value)
+        .is_none()
+        .then(|| rejected_parameter(member))
 }
 
 /// The modelled refusal for a member that names a BACKUP VAULT by ARN whose
@@ -972,7 +1139,7 @@ pub fn rejected_backup_vault_arn(
 /// The fields a backup-vault ARN names, or the modelled refusal for a value
 /// that is not one.
 ///
-/// The same check and the same sentence as [`rejected_backup_vault_arn`] — that
+/// The same check and the same refusal as [`rejected_backup_vault_arn`] — that
 /// one is this one's refusal half — for a caller that goes on to USE the parsed
 /// fields, so the parse and the refusal cannot drift apart and neither needs a
 /// second parse that could fail.
@@ -980,13 +1147,7 @@ pub fn resolved_backup_vault_arn(
     member: &str,
     value: &str,
 ) -> Result<BackupVaultArnParts, InvalidParameterValueException> {
-    backup_vault_arn_parts(value).ok_or_else(|| InvalidParameterValueException {
-        message: Some(format!(
-            "{member} must be the ARN of a backup vault, of the form \
-             arn:<partition>:backup:<region>:<account>:backup-vault:<name>"
-        )),
-        ..Default::default()
-    })
+    backup_vault_arn_parts(value).ok_or_else(|| rejected_parameter(member))
 }
 
 /// The modelled refusal for a `MaxResults` outside
@@ -1013,8 +1174,8 @@ pub fn rejected_max_results(max_results: Option<i32>) -> Option<InvalidParameter
 /// The modelled refusal for a `RecoveryPointSelection` AWS does not accept, or
 /// `None` when every member of the selection is one it does.
 ///
-/// ONE check and ONE sentence for the selection in this service, for the reason
-/// given on [`rejected_window_minutes`]: the members target unpatterned `string`
+/// ONE check for the selection in this service, for the reason given on
+/// [`rejected_window_minutes`]: the members target unpatterned `string`
 /// shapes, so the framework's boundary validator passes anything, while each one
 /// still has a form it must take —
 ///
@@ -1022,29 +1183,25 @@ pub fn rejected_max_results(max_results: Option<i32>) -> Option<InvalidParameter
 ///   `BackupVaultName` pattern ([`is_modelled_vault_name`]) names no vault this
 ///   service could hold;
 /// * `ResourceIdentifiers` names protected resources, which are addressed by ARN
-///   ([`rejected_arn`], whose sentence is shared with every other ARN-valued
-///   member);
-/// * a `DateRange` bound after `now` selects recovery points that cannot exist:
-///   "Both values are required. Future DateTime values are not permitted" (the
-///   model doc for `DateRange`).
+///   ([`rejected_arn`]);
+///
+/// and a member whose value is not of that form is refused as the VALUE of that
+/// member ([`rejected_parameter`]), like every other such member of this
+/// service. A `DateRange` bound after `now` is a different condition — not a
+/// malformed value but one that selects recovery points which cannot exist:
+/// "Both values are required. Future DateTime values are not permitted" (the
+/// model doc for `DateRange`).
 pub fn rejected_recovery_point_selection(
     selection: &RecoveryPointSelection,
     now: SystemTime,
 ) -> Option<InvalidParameterValueException> {
     for name in selection.vault_names.iter().flatten() {
         if !is_modelled_vault_name(name) {
-            return Some(InvalidParameterValueException {
-                message: Some(format!(
-                    "RecoveryPointSelection VaultNames entry {name} is not a backup vault name"
-                )),
-                ..Default::default()
-            });
+            return Some(rejected_parameter("VaultNames"));
         }
     }
     for identifier in selection.resource_identifiers.iter().flatten() {
-        if let Some(refusal) =
-            rejected_arn("RecoveryPointSelection ResourceIdentifiers", identifier)
-        {
+        if let Some(refusal) = rejected_arn("ResourceIdentifiers", identifier) {
             return Some(refusal);
         }
     }

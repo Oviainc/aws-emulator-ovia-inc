@@ -190,22 +190,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model types `EncryptionKeyArn` as `ARN` with no pattern, so the
         // framework cannot refuse a malformed one; AWS does, rather than
-        // storing a key reference that names nothing.
-        if input
+        // storing a key reference that names nothing. The check and the refusal
+        // are `crate::state`'s, shared with every other member this service
+        // types as an ARN.
+        let refusal = input
             .encryption_key_arn
             .as_deref()
-            .is_some_and(|arn| !crate::state::is_arn(arn))
-        {
+            .and_then(|arn| crate::state::rejected_arn("EncryptionKeyArn", arn));
+        if let Some(refusal) = refusal {
             return Err(
                 CreateLogicallyAirGappedBackupVaultErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(
-                            "EncryptionKeyArn must be an ARN of the form \
-                             arn:<partition>:<service>:<region>:<account>:<resource>"
-                                .to_string(),
-                        ),
-                        ..Default::default()
-                    },
+                    refusal,
                 )
                 .into(),
             );

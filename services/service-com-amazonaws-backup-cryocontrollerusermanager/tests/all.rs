@@ -47,3 +47,5 @@ mod vault_lock_refusal_order;
 mod vault_read_projection;
 #[path = "all/vault_read_visibility.rs"]
 mod vault_read_visibility;
+#[path = "all/vault_type_and_parameter_refusals.rs"]
+mod vault_type_and_parameter_refusals;

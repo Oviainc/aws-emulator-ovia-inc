@@ -202,22 +202,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model types `ByResourceArn` as `ARN` with no pattern, so the
         // framework cannot refuse a malformed one; AWS does, rather than
-        // answering an empty page for a filter it could never match.
-        if input
+        // answering an empty page for a filter it could never match. The check
+        // and the refusal are `crate::state`'s, shared with every other member
+        // this service types as an ARN.
+        let refusal = input
             .by_resource_arn
             .as_deref()
-            .is_some_and(|arn| !crate::state::is_arn(arn))
-        {
+            .and_then(|arn| crate::state::rejected_arn("ByResourceArn", arn));
+        if let Some(refusal) = refusal {
             return Err(
                 ListRecoveryPointsByBackupVaultErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(
-                            "ByResourceArn must be an ARN of the form \
-                             arn:<partition>:<service>:<region>:<account>:<resource>"
-                                .to_string(),
-                        ),
-                        ..Default::default()
-                    },
+                    refusal,
                 )
                 .into(),
             );

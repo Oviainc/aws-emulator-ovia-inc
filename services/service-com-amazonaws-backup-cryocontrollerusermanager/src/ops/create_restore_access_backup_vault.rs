@@ -229,11 +229,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Restore access is a facility of a LOGICALLY AIR-GAPPED vault — this
         // operation "provides temporary access to recovery points in a
         // logically air-gapped backup vault" (model doc) — so a source vault of
-        // any other type cannot grant it.
+        // any other type cannot grant it, which AWS reports with that
+        // condition's own token and sentence.
         if source_vault.vault_type != crate::state::VAULT_TYPE_LOGICALLY_AIR_GAPPED_BACKUP_VAULT {
             return Err(
                 CreateRestoreAccessBackupVaultErrorModeled::InvalidParameterValueException(
-                    crate::state::unsupported_vault_type(),
+                    crate::state::source_vault_unsupported(),
                 )
                 .into(),
             );

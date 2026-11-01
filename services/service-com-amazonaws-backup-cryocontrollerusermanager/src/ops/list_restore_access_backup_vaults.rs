@@ -8,6 +8,10 @@
 //! `RevokeRestoreAccessBackupVault` removes them from, so a vault this page
 //! reports is exactly one those two agree exists.
 //!
+//! Only a logically air-gapped vault can hold any: the route is scoped to that
+//! type, so a named vault of another type is refused for its type instead of
+//! being answered with the empty page a vault that merely holds none gets.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -182,10 +186,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in `state::visible_vault`, shared with every other vault-scoped
         // read; this input models no `BackupVaultAccountId`, so the vault is
         // resolved in the caller's own account.
-        let source_arn = store
-            .visible_vault(&input.backup_vault_name, None)?
-            .arn
-            .clone();
+        let source_vault = store.visible_vault(&input.backup_vault_name, None)?;
+        let source_arn = source_vault.arn.clone();
+        let source_type = source_vault.vault_type.clone();
+        // Only a logically air-gapped vault can hold restore access vaults —
+        // this operation is bound to
+        // `/logically-air-gapped-backup-vaults/{BackupVaultName}/restore-access-backup-vaults`
+        // (model `@http`) — so a vault of any other type is refused for its
+        // TYPE before anything is listed, rather than answered with the empty
+        // page a vault that simply has none gets: the two are not the same
+        // answer.
+        if source_type != crate::state::VAULT_TYPE_LOGICALLY_AIR_GAPPED_BACKUP_VAULT {
+            return Err(
+                ListRestoreAccessBackupVaultsErrorModeled::InvalidParameterValueException(
+                    crate::state::vault_type_not_air_gapped(),
+                )
+                .into(),
+            );
+        }
         // The ONE place the source link is resolved, shared with the revoke, so
         // a vault this page reports is exactly one the revoke can find.
         let matching = store.restore_access_vaults_of(&source_arn);
