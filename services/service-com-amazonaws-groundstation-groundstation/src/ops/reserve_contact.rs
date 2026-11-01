@@ -225,23 +225,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The store this emulator keeps is bounded, so a caller cannot grow it without
-        // limit; past the bound a reservation is refused the way the service refuses one
-        // that runs past an account limit. Checked after the request itself, so what the
-        // caller hears is what is wrong with the request.
-        if guard.contacts.len() >= crate::state::MAX_RECORDS_PER_STORE {
-            return Err(ReserveContactErrorModeled::ResourceLimitExceededException(
-                ResourceLimitExceededException {
-                    message: Some(format!(
-                        "this account already holds the maximum of {} contacts",
-                        crate::state::MAX_RECORDS_PER_STORE
-                    )),
-                    parameter_name: None,
-                },
-            )
-            .into());
-        }
-
         // What the reservation points the antenna at is resolved before anything is
         // stored: a program track is flown from an ephemeris of this account, so one
         // naming an ephemeris this account does not hold — or one of another form than
@@ -316,6 +299,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The store this emulator keeps is bounded, so a caller cannot grow it without
+        // limit; past the bound a reservation is refused the way the service refuses one
+        // that runs past an account limit. Checked after every gate above, each of which
+        // judges the request itself — the references it names, the window it asks for and
+        // the placement that window needs — so what the caller hears is what is wrong with
+        // the request, and a reservation that could never succeed is never answered with a
+        // limit a later retry might lift.
+        if guard.contacts.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(ReserveContactErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} contacts",
+                        crate::state::MAX_RECORDS_PER_STORE
+                    )),
+                    parameter_name: None,
+                },
+            )
+            .into());
+        }
+
         let contact_id = crate::state::new_uuid();
         let contact = crate::state::Contact {
             contact_id: contact_id.clone(),

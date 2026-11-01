@@ -29,6 +29,8 @@ mod antenna_inventory;
 mod availability_search_references;
 #[path = "all/available_contacts.rs"]
 mod available_contacts;
+#[path = "all/capacity_refusal_precedence.rs"]
+mod capacity_refusal_precedence;
 #[path = "all/config_defaults_and_references.rs"]
 mod config_defaults_and_references;
 #[path = "all/config_listing.rs"]

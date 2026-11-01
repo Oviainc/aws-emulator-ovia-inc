@@ -226,22 +226,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Versions are numbered without a gap from the first, so the modelled maximum
-        // `versionId` is also how many versions one contact can have: past it there is
-        // no `versionId` left to answer with.
-        if contact.latest_version_id() >= crate::state::MAX_CONTACT_VERSIONS {
-            return Err(UpdateContactErrorModeled::ResourceLimitExceededException(
-                ResourceLimitExceededException {
-                    message: Some(format!(
-                        "this contact already holds the maximum of {} versions",
-                        crate::state::MAX_CONTACT_VERSIONS
-                    )),
-                    parameter_name: None,
-                },
-            )
-            .into());
-        }
-
         // Accepted so far as the contact itself goes. What the request points the antenna
         // at is resolved before anything is stored: a program track is flown from an
         // ephemeris of this account, so one naming an ephemeris this account does not hold
@@ -265,6 +249,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::satellite_reference_fault`).
         if let Some(error) = guard.satellite_reference_fault(input.satellite_arn.as_deref()) {
             return Err(UpdateContactErrorModeled::ResourceNotFoundException(error).into());
+        }
+
+        // Versions are numbered without a gap from the first, so the modelled maximum
+        // `versionId` is also how many versions one contact can have: past it there is
+        // no `versionId` left to answer with. Judged after the gates above, each of which
+        // judges the request itself, so a request nothing could make succeed is answered
+        // with what is wrong with it rather than with a limit a caller might think a
+        // retry would clear.
+        if contact.latest_version_id() >= crate::state::MAX_CONTACT_VERSIONS {
+            return Err(UpdateContactErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    message: Some(format!(
+                        "this contact already holds the maximum of {} versions",
+                        crate::state::MAX_CONTACT_VERSIONS
+                    )),
+                    parameter_name: None,
+                },
+            )
+            .into());
         }
 
         // Accepted: the contact takes a new version, carrying what this request named
