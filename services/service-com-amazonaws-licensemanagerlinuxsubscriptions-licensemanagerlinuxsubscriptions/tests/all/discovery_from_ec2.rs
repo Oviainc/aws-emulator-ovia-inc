@@ -51,7 +51,7 @@ const INSTANCES: &str = "/subscription/ListLinuxSubscriptionInstances";
 /// A second Region, so the `SourceRegions` rule is asserted over more than one Region's
 /// inventory. `REGION` is the one every call here is signed for, which makes it the home
 /// Region; this is only a Region instances run in.
-const OTHER_REGION: &str = "us-east-1";
+pub const OTHER_REGION: &str = "us-east-1";
 
 /// How long EC2 is given to bring an instance to a state its own clock owes it — a launch
 /// to `running`, a stop to `stopped`, a termination to `terminated`. Nothing in the emulator
@@ -59,8 +59,8 @@ const OTHER_REGION: &str = "us-east-1";
 const EC2_BUDGET: Duration = Duration::from_secs(15);
 
 /// The `InstanceState$Name` values this suite names.
-const STATE_RUNNING: &str = "running";
-const STATE_STOPPED: &str = "stopped";
+pub const STATE_RUNNING: &str = "running";
+pub const STATE_STOPPED: &str = "stopped";
 const STATE_TERMINATED: &str = "terminated";
 
 /// `ProductCode$ProductCodeType` of a code bought through the Marketplace
@@ -86,26 +86,26 @@ pub struct Ami {
     /// Standard`, `Linux/UNIX`, `Windows`), plus the BYOL platform of a Red Hat image an
     /// account brings its own subscription for (Amazon EC2 User Guide, "Understand AMI
     /// billing information").
-    platform_details: &'static str,
+    pub platform_details: &'static str,
     /// The billing code that platform bills under (`Image$UsageOperation`). Only that the
     /// discovered instance reports its AMI's OWN value is asserted, never a mapping from
     /// it, so these only have to differ from one another.
-    usage_operation: &'static str,
+    pub usage_operation: &'static str,
     /// Whether this is a Windows AMI — "this value is set to `windows` for Windows AMIs;
     /// otherwise, it is blank" (`Image$Platform`).
     windows: bool,
     /// The Marketplace product code the AMI carries, for an image whose licensing is bought
     /// through the Marketplace (`Image$ProductCodes`).
-    product_code: Option<&'static str>,
+    pub product_code: Option<&'static str>,
     /// How many instances the account launches from it.
     instances: usize,
     /// The `(Subscription$Name, Subscription$Type)` discovery must report for those
     /// instances — `None` for an AMI that bills no Linux subscription at all.
-    subscription: Option<(&'static str, &'static str)>,
+    pub subscription: Option<(&'static str, &'static str)>,
 }
 
 /// The AMIs the fleet of the first case is launched from.
-const AMIS: &[Ami] = &[
+pub const AMIS: &[Ami] = &[
     Ami {
         case: "Red Hat Enterprise Linux, two instances",
         platform_details: "Red Hat Enterprise Linux",
@@ -260,8 +260,31 @@ impl Fleet {
 
     /// Launch `count` instances from `image_id` in `region`, through EC2 itself, and answer
     /// the ids it minted once EC2 reports every one of them `running`.
-    async fn launch(&self, region: &str, image_id: &str, count: usize) -> Vec<String> {
+    pub async fn launch(&self, region: &str, image_id: &str, count: usize) -> Vec<String> {
         let ids = self.launch_now(region, image_id, count).await;
+        for id in &ids {
+            self.settled_in(region, id, STATE_RUNNING).await;
+        }
+        ids
+    }
+
+    /// Launch `count` instances from `image_id` in `region` AS `instance_type`
+    /// (`RunInstancesRequest$InstanceType`) and answer the ids EC2 minted once it reports
+    /// every one of them `running`.
+    ///
+    /// The form a case whose rule is about the instance TYPE a discovered record carries
+    /// uses: a launch that names none leaves the type to EC2, so a case filtering on one
+    /// asks for the type it then selects by.
+    pub async fn launch_as(
+        &self,
+        region: &str,
+        image_id: &str,
+        instance_type: &str,
+        count: usize,
+    ) -> Vec<String> {
+        let ids = self
+            .run(region, image_id, Some(instance_type), count)
+            .await;
         for id in &ids {
             self.settled_in(region, id, STATE_RUNNING).await;
         }
@@ -275,11 +298,25 @@ impl Fleet {
     /// `terminated`, so a case whose rule is about WHICH instances a pass writes — not what
     /// `Status` they report — does not have to wait that span out per Region.
     pub async fn launch_now(&self, region: &str, image_id: &str, count: usize) -> Vec<String> {
+        self.run(region, image_id, None, count).await
+    }
+
+    /// Launch `count` instances from `image_id` in `region`, as `instance_type` when the
+    /// caller asked for one, and answer the ids EC2 minted — the ONE launch every form
+    /// above goes through, so a case cannot reach EC2 a second way.
+    async fn run(
+        &self,
+        region: &str,
+        image_id: &str,
+        instance_type: Option<&str>,
+        count: usize,
+    ) -> Vec<String> {
         let requested = i32::try_from(count).expect("a small instance count");
         let launched = self
             .ec2(region)
             .run_instances()
             .image_id(image_id)
+            .set_instance_type(instance_type.map(::aws_sdk_ec2::types::InstanceType::from))
             .min_count(requested)
             .max_count(requested)
             .send()
@@ -301,7 +338,7 @@ impl Fleet {
     }
 
     /// Stop `instance_id` through EC2 itself and wait until it reports it stopped.
-    async fn stop(&self, region: &str, instance_id: &str) {
+    pub async fn stop(&self, region: &str, instance_id: &str) {
         self.ec2(region)
             .stop_instances()
             .instance_ids(instance_id)
@@ -357,7 +394,7 @@ impl Fleet {
     /// The account EC2 says owns `instance_id` (`Reservation$OwnerId`) — what a discovered
     /// instance's `AccountID` has to agree with, read from the owner rather than written
     /// here.
-    async fn owner_of(&self, region: &str, instance_id: &str) -> String {
+    pub async fn owner_of(&self, region: &str, instance_id: &str) -> String {
         self.ec2(region)
             .describe_instances()
             .instance_ids(instance_id)
@@ -410,7 +447,7 @@ impl Fleet {
     }
 
     /// `ListLinuxSubscriptions` with `body`.
-    async fn subscriptions(&self, body: &Value) -> Reply {
+    pub async fn subscriptions(&self, body: &Value) -> Reply {
         call_in_region(&self.h, REGION, SUBSCRIPTIONS, body).await
     }
 
@@ -439,7 +476,7 @@ fn member(entry: &Value, name: &str, case: &str) -> String {
 }
 
 /// The subscriptions a `ListLinuxSubscriptions` body reports, as `(name, type, count)`.
-fn reported_subscriptions(reply: &Reply, case: &str) -> Vec<(String, String, i64)> {
+pub fn reported_subscriptions(reply: &Reply, case: &str) -> Vec<(String, String, i64)> {
     entries(reply, "Subscriptions", case)
         .iter()
         .map(|entry| {
@@ -456,7 +493,7 @@ fn reported_subscriptions(reply: &Reply, case: &str) -> Vec<(String, String, i64
 }
 
 /// The instances a `ListLinuxSubscriptionInstances` body reports, by `InstanceID`.
-fn reported_instance_ids(reply: &Reply, case: &str) -> Vec<String> {
+pub fn reported_instance_ids(reply: &Reply, case: &str) -> Vec<String> {
     entries(reply, "Instances", case)
         .iter()
         .map(|entry| member(entry, "InstanceID", case))
