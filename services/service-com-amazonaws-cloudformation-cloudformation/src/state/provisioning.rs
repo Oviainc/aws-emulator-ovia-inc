@@ -432,22 +432,28 @@ pub struct Materialised {
     /// per-resource event records.
     pub transitions: Vec<ResourceTransition>,
     /// The resources this deployment CREATED whose owning service does not report them
-    /// ready yet: the create was accepted and the identifier is assigned, but the resource
-    /// is not usable, so CloudFormation holds its creation — and the operation — open until
-    /// that service says it is ([`super::stabilising`]).
+    /// ready yet, and the ones it DELETED whose owning service still holds them: the call
+    /// was accepted and has not been carried out, so CloudFormation holds the resource — and
+    /// the operation — open until that service says otherwise
+    /// ([`super::stabilising`]).
     pub stabilising: Vec<Stabilising>,
 }
 
-/// One resource whose creation an owning service accepted and has not finished.
+/// One resource whose creation an owning service accepted and has not finished, or whose
+/// deletion it accepted and has not finished.
 ///
 /// What the stack needs in order to go on asking that service about it: which resource it
-/// is, and the state that service reported when the create answered.
+/// is, which answer ends the wait, and the state that service reported when the call
+/// answered.
 #[derive(Debug, Clone)]
 pub struct Stabilising {
+    /// Which of that service's answers ends this wait
+    /// ([`super::stabilising::Awaited`]): the resource is ready, or the resource is gone.
+    pub awaited: super::stabilising::Awaited,
     pub logical_id: String,
     pub resource_type: String,
-    /// The identifier the owning service assigned, which the readiness read addresses the
-    /// resource by.
+    /// The identifier the owning service assigned, which the read that ends the wait
+    /// addresses the resource by.
     pub physical_resource_id: String,
     /// That service's own word for the state the resource is in, as its API spells it.
     pub reported_state: String,
@@ -472,19 +478,35 @@ pub(super) enum Readiness {
     Failed(String),
 }
 
-/// Ask the services that own a Region's still-creating resources whether they are ready
-/// yet, and record what they answer.
+/// What the service that owns a resource says about a resource it has been asked to DELETE:
+/// whether it still holds the resource.
+///
+/// Answered by the type's own arm ([`super::provisioner::Provisioner::removal`]) from that
+/// service's own read, so it is never a status this crate guessed. A type whose delete takes
+/// the resource away — which is most of them — answers [`Self::Gone`] without asking
+/// anything.
+#[derive(Debug, Clone)]
+pub(super) enum Removal {
+    /// That service no longer holds the resource, so its deletion is finished.
+    Gone,
+    /// Not yet: the state that service reports the resource being removed in right now.
+    Pending(String),
+}
+
+/// Ask the services that own a Region's still-creating and still-deleting resources whether
+/// they are done yet, and record what they answer.
 ///
 /// This is the other half of [`super::stabilising`]: a resource whose owning service
-/// accepted the create without reporting the resource ready holds its stack's operation
-/// open, and what ENDS that wait is that service's own answer about the resource — which
-/// only a call to it can give. `settle` cannot make that call (it runs under the store
-/// lock, and a read of this store cannot reach another service), so the operations that
-/// REPORT a stack's progress ask here, before they take the lock: a client polling a
-/// stack's resources is exactly the caller that needs the answer.
+/// accepted the create without reporting the resource ready, or accepted the delete while
+/// still holding the resource, holds its stack's operation open, and what ENDS that wait is
+/// that service's own answer about the resource — which only a call to it can give. `settle`
+/// cannot make that call (it runs under the store lock, and a read of this store cannot reach
+/// another service), so the operations that REPORT a stack's progress ask here, before they
+/// take the lock: a client polling a stack's resources is exactly the caller that needs the
+/// answer.
 ///
 /// What this records was owed at the instant the owning service reached it, whether or not
-/// anybody called: the resource became ready then, and a wait that has run out
+/// anybody called: the resource became ready, or went away, then, and a wait that has run out
 /// ([`super::stabilising::StabilisationBarrier::has_expired`]) failed then. The one thing it
 /// changes in another service is what that failure owes: a failed create is rolled back, so
 /// the resources it had made are removed again — the same work
@@ -522,12 +544,26 @@ pub async fn advance_stabilisations(
     };
     for (stack_id, barriers) in waiting {
         for barrier in barriers {
+            // WHICH of the owning service's answers ends this wait: that the resource it
+            // created is ready, or that the resource it deleted is gone. A removal that is
+            // still in flight holds the operation exactly as a creation that is still coming
+            // up does, so the two answers are read as the one thing they both are — whether
+            // the call that service accepted has been carried out.
             let readiness = match provisioner_for(&barrier.resource_type) {
-                Some(provisioner) => {
-                    provisioner
-                        .readiness(ctx, region, &barrier.physical_resource_id)
+                Some(provisioner) => match barrier.awaited {
+                    super::stabilising::Awaited::Ready => {
+                        provisioner
+                            .readiness(ctx, region, &barrier.physical_resource_id)
+                            .await
+                    }
+                    super::stabilising::Awaited::Gone => provisioner
+                        .removal(ctx, region, &barrier.physical_resource_id)
                         .await
-                }
+                        .map(|removal| match removal {
+                            Removal::Gone => Readiness::Ready,
+                            Removal::Pending(state) => Readiness::Pending(state),
+                        }),
+                },
                 // Nothing owns the type any more, so there is nothing to ask: the wait is
                 // over, because what opened it was that provisioner's answer.
                 None => Ok(Readiness::Ready),
@@ -544,16 +580,16 @@ pub async fn advance_stabilisations(
                 };
                 let taken = match readiness {
                     Ok(Readiness::Ready) => {
-                        stack.release_stabilisation(&barrier.logical_id, now);
+                        stack.release_stabilisation(&barrier, now);
                         None
                     }
-                    // Still coming up: the wait holds, unless it has run out — which is the
-                    // instant the resource's creation failed.
+                    // Still coming up, or still being removed: the wait holds, unless it has
+                    // run out — which is the instant the call the wait was for failed.
                     Ok(Readiness::Pending(state)) => {
                         if barrier.has_expired(now) {
                             stack.fail_stabilisation(
                                 now,
-                                &barrier.logical_id,
+                                &barrier,
                                 &barrier.not_stabilised_reason(&state),
                             )
                         } else {
@@ -563,7 +599,7 @@ pub async fn advance_stabilisations(
                     // That service says the resource will not come up, so waiting the window
                     // out would report a resource as creating that nothing is creating.
                     Ok(Readiness::Failed(reason)) => {
-                        stack.fail_stabilisation(now, &barrier.logical_id, &reason)
+                        stack.fail_stabilisation(now, &barrier, &reason)
                     }
                     // The service could not be asked at all. One unanswered read is not
                     // evidence about the resource — a service is allowed to throttle or be
@@ -573,7 +609,7 @@ pub async fn advance_stabilisations(
                         if barrier.has_expired(now) {
                             stack.fail_stabilisation(
                                 now,
-                                &barrier.logical_id,
+                                &barrier,
                                 &handler_failure_reason(
                                     provisioner_for(&barrier.resource_type),
                                     &refusal,
@@ -610,6 +646,10 @@ pub async fn advance_stabilisations(
             };
             stack.schedule_resource_events(&deleted.transitions);
             stack.record_materialised_resources(deleted.resources);
+            // A resource whose owning service accepted the delete and still holds it holds
+            // this rollback open, exactly as the resource that failed to come up held the
+            // operation this rollback follows.
+            stack.record_stabilisations(&deleted.removing, SystemTime::now());
             if let Some(failure) = deleted.failure {
                 stack.fail_transition(SystemTime::now(), super::status::ROLLBACK_FAILED, failure);
             }
@@ -1006,6 +1046,7 @@ pub async fn reconcile(
                         // resource; the gate this records is what holds it back until the
                         // owning service reports the resource ready.
                         outcome.stabilising.push(Stabilising {
+                            awaited: super::stabilising::Awaited::Ready,
                             logical_id: resource.logical_id.clone(),
                             resource_type: resource.resource_type.clone(),
                             physical_resource_id: resource.physical_resource_id.clone(),
@@ -1160,6 +1201,7 @@ pub async fn reconcile(
         .await;
         deleted.resources.append(&mut removed.resources);
         deleted.transitions.append(&mut removed.transitions);
+        deleted.removing.append(&mut removed.removing);
         deleted.failure = removed.failure;
     }
     // A resource an owning service refused to delete still exists there, so the stack
@@ -1175,6 +1217,11 @@ pub async fn reconcile(
     // The removals happened after the creates above, which is the order they are reported
     // in.
     outcome.transitions.extend(deleted.transitions);
+    // ...and a resource an owning service has accepted the delete of without having removed
+    // it yet holds this deployment open exactly as a resource it is still bringing up does:
+    // the update is not complete while the resource it replaced is still there
+    // ([`super::stabilising`]).
+    outcome.stabilising.extend(deleted.removing);
     outcome
 }
 
@@ -1363,6 +1410,14 @@ pub struct Deleted {
     /// per-resource event records, exactly as [`Materialised::transitions`] carries a
     /// deployment's.
     pub transitions: Vec<ResourceTransition>,
+    /// The resources whose deletion the owning service ACCEPTED while still holding them:
+    /// the call went through and the resource is not gone yet, so the operation that deleted
+    /// it is held open until that service no longer holds it
+    /// ([`super::stabilising`]) — a stack operation is never reported complete while a
+    /// resource it deleted is still there. Recorded by the operation that drove the teardown
+    /// ([`super::StoredStack::record_stabilisations`]), exactly as
+    /// [`Materialised::stabilising`] is.
+    pub removing: Vec<Stabilising>,
 }
 
 /// What a teardown does with a resource the service that owns it REFUSES to delete.
@@ -1409,6 +1464,11 @@ pub enum OnRefusal {
 /// `DELETE_SKIPPED`, `Snapshot` is the owning service's delete taking a final snapshot
 /// ([`final_snapshot_identifier`]), and `Delete` — the default, and what a walk that does not
 /// read the attribute does — is the delete this walk has always made.
+///
+/// A resource whose owning service ACCEPTED the delete without having removed the resource
+/// yet is reported in [`Deleted::removing`]: the operation that drove this teardown holds its
+/// completion on those, so no stack operation is reported complete while a resource it
+/// deleted is still there.
 pub async fn delete(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -1517,6 +1577,7 @@ async fn delete_pass(
         resources: resources.to_vec(),
         failure: None,
         transitions: Vec::new(),
+        removing: Vec::new(),
     };
     // Newest first, over the indices of the set being reported back, so each resource's
     // record is updated in place as its deletion succeeds.
@@ -1586,6 +1647,37 @@ async fn delete_pass(
         };
         match deleted {
             Ok(()) => {
+                // The delete was ACCEPTED; whether the resource is gone is the owning
+                // service's to say. A type whose delete that service documents as
+                // asynchronous leaves the resource in a state it is still being removed from
+                // and answers which one ([`super::provisioner::Provisioner::removal`]), and
+                // the operation is then held open until that service no longer holds it
+                // ([`super::stabilising`]) — CloudFormation does not report an operation
+                // complete while a resource it deleted is still there. An unanswered read is
+                // no evidence that the resource is still there, so it opens no wait: the
+                // delete itself went through.
+                let removal = match owner {
+                    Some(provisioner) => {
+                        provisioner
+                            .removal(
+                                ctx,
+                                region,
+                                &outcome.resources[index].physical_resource_id,
+                            )
+                            .await
+                    }
+                    None => Ok(Removal::Gone),
+                };
+                if let Ok(Removal::Pending(state)) = removal {
+                    let resource = &outcome.resources[index];
+                    outcome.removing.push(Stabilising {
+                        awaited: super::stabilising::Awaited::Gone,
+                        logical_id: resource.logical_id.clone(),
+                        resource_type: resource.resource_type.clone(),
+                        physical_resource_id: resource.physical_resource_id.clone(),
+                        reported_state: state,
+                    });
+                }
                 outcome.resources[index].materialised = false;
                 let resource = &outcome.resources[index];
                 outcome.transitions.push(ResourceTransition::finished(
@@ -1709,6 +1801,9 @@ pub async fn unwind(
                     transition.status != super::resource_status::DELETE_FAILED
                 })
                 .collect();
+        // The waits the earlier attempts opened are the deletions they carried through, and
+        // they stand: this attempt is about the resources those passes could NOT delete.
+        let mut removing = ::std::mem::take(&mut outcome.removing);
         outcome = delete_pass(
             ctx,
             region,
@@ -1721,6 +1816,8 @@ pub async fn unwind(
         .await;
         transitioned.append(&mut outcome.transitions);
         outcome.transitions = transitioned;
+        removing.append(&mut outcome.removing);
+        outcome.removing = removing;
     }
     outcome
 }

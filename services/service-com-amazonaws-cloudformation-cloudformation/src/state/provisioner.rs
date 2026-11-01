@@ -451,8 +451,8 @@ use serde_json::{Map, Value};
 
 use super::provisioning::{
     call_json_rpc, call_query, call_rest_json, call_rest_xml, percent_encoded, xml_element,
-    xml_entry_map, xml_leaf, xml_scalar_children, Created, Readiness, Refusal, AWS_JSON_1_0,
-    AWS_JSON_1_1,
+    xml_entry_map, xml_leaf, xml_scalar_children, Created, Readiness, Refusal, Removal,
+    AWS_JSON_1_0, AWS_JSON_1_1,
 };
 use super::template::{
     ACMPCA_CERTIFICATE, ACMPCA_CERTIFICATE_AUTHORITY, ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION,
@@ -1452,6 +1452,48 @@ impl Provisioner {
                 domain_name_readiness(ctx, region, physical_resource_id).await
             }
             _ => Ok(Readiness::Ready),
+        }
+    }
+
+    /// Whether the service that owns the resource this provisioner DELETED has finished
+    /// removing it — read from that service, never decided here.
+    ///
+    /// The mirror of [`Self::readiness`], and stated per type for the same reason: most
+    /// deletes take the resource away, so most types answer [`Removal::Gone`] without asking
+    /// anything, while a type whose delete its own service documents as asynchronous leaves
+    /// the resource in a state it is still being removed from. For such a type this is what
+    /// CloudFormation holds the stack operation open on ([`super::stabilising`]) — asked once
+    /// where the delete answered, and again by
+    /// [`super::provisioning::advance_stabilisations`] until that service no longer holds the
+    /// resource — so no operation is reported complete while a resource it deleted is still
+    /// there.
+    ///
+    /// `Err` is the owning service's own refusal of the READ, which says nothing about the
+    /// resource: the caller decides what an unanswered read means.
+    pub(super) async fn removal(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        physical_resource_id: &str,
+    ) -> Result<Removal, Refusal> {
+        match self {
+            // "DeleteDeliveryStream is an asynchronous API. When an API request to
+            // DeleteDeliveryStream succeeds, the Firehose stream is marked for deletion, and
+            // it goes into the DELETING state … Removal of a Firehose stream that is in the
+            // DELETING state is a low priority operation for the service", so the stream is
+            // still there when the delete answers and the deletion is finished once Amazon
+            // Data Firehose no longer holds it.
+            Self::FirehoseDeliveryStream => {
+                delivery_stream_removal(ctx, region, physical_resource_id).await
+            }
+            // "DeleteStream is an asynchronous operation … After a DeleteStream request, the
+            // specified stream is in the DELETING state until Kinesis Data Streams completes
+            // the deletion", so the stream is still there when the delete answers and the
+            // deletion is finished once that service no longer holds it.
+            Self::KinesisStream => {
+                kinesis_stream_removal(ctx, region, physical_resource_id).await
+            }
+            _ => Ok(Removal::Gone),
         }
     }
 
@@ -2555,6 +2597,39 @@ async fn delivery_stream_readiness(
     }
 }
 
+/// The `DeliveryStreamStatus` a stream whose deletion Amazon Data Firehose has accepted is
+/// reported in: "When an API request to DeleteDeliveryStream succeeds, the Firehose stream is
+/// marked for deletion, and it goes into the DELETING state" (`DeleteDeliveryStream`).
+const DELIVERY_STREAM_DELETING: &str = "DELETING";
+
+/// Whether Amazon Data Firehose has finished removing the stream a stack deleted.
+///
+/// "Removal of a Firehose stream that is in the DELETING state is a low priority operation
+/// for the service. A stream may remain in the DELETING state for several minutes"
+/// (`DeleteDeliveryStream`), so a stream it still reports is one the removal has not reached
+/// yet, and the deletion is finished when that service answers that it holds no such stream.
+/// A stream reported in any OTHER status is one no delete of this stack's is going to remove
+/// — a client of that service created it again under the same name — so there is nothing left
+/// to wait for either.
+async fn delivery_stream_removal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Removal, Refusal> {
+    let Some(description) = describe_delivery_stream(ctx, region, physical_resource_id).await?
+    else {
+        return Ok(Removal::Gone);
+    };
+    let status = description
+        .get("DeliveryStreamStatus")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if status == DELIVERY_STREAM_DELETING {
+        return Ok(Removal::Pending(status.to_string()));
+    }
+    Ok(Removal::Gone)
+}
+
 /// The stream's configuration as Amazon Data Firehose reports it, for drift detection.
 /// A stream it no longer has (`ResourceNotFoundException`) was deleted.
 async fn describe_delivery_stream(
@@ -2922,6 +2997,31 @@ async fn kinesis_stream_readiness(
             "Amazon Kinesis Data Streams reports stream {physical_resource_id} as {other}"
         ))),
     }
+}
+
+/// Whether Amazon Kinesis Data Streams has finished removing the stream a stack deleted.
+///
+/// "DeleteStream is an asynchronous operation … After a DeleteStream request, the specified
+/// stream is in the DELETING state until Kinesis Data Streams completes the deletion", so a
+/// stream it reports `DELETING` is one the removal has not reached yet, and the deletion is
+/// finished when that service answers that it holds no such stream. A stream reported in any
+/// OTHER status is one no delete of this stack's is going to remove — a client of that
+/// service created it again under the same name — so there is nothing left to wait for
+/// either.
+async fn kinesis_stream_removal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Removal, Refusal> {
+    let Some(summary) = describe_kinesis_stream_summary(ctx, region, physical_resource_id).await?
+    else {
+        return Ok(Removal::Gone);
+    };
+    let status = kinesis_stream_status(&summary);
+    if status == KINESIS_STREAM_DELETING {
+        return Ok(Removal::Pending(status));
+    }
+    Ok(Removal::Gone)
 }
 
 /// Delete the stream a stack created, addressed by its NAME — this resource's physical id,

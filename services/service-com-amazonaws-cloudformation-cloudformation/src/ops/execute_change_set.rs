@@ -675,6 +675,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .await;
             let mut store = state.lock();
             if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
+                // A resource whose owning service accepted the delete and still holds it
+                // holds this rollback open ([`crate::state::stabilising`]): it is not
+                // reported complete while a resource it removed is still there.
+                stack.record_stabilisations(
+                    &deleted.removing,
+                    ::std::time::SystemTime::now(),
+                );
                 stack.schedule_resource_events(&deleted.transitions);
                 stack.record_materialised_resources(deleted.resources);
                 if let Some(failure) = deleted.failure {

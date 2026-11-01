@@ -399,6 +399,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
+            // A resource whose owning service accepted the delete and still holds it holds
+            // this deletion open ([`crate::state::stabilising`]): the stack is not reported
+            // DELETE_COMPLETE while a resource it deleted is still there.
+            stack.record_stabilisations(&deleted.removing, now);
             // The resources' own transitions come BEFORE the stack's terminal event: the
             // event stream is what the deletion did, in the order it did it.
             stack.schedule_resource_events(&deleted.transitions);

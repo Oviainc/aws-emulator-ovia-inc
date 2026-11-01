@@ -322,9 +322,10 @@ pub mod generated_template;
 /// create or an update, and the signals `SignalResource` releases it with.
 pub mod wait_conditions;
 
-/// The create-time stabilisation of one stack operation: the resources whose owning
-/// service has answered the create but does not report the resource ready yet, which hold
-/// the operation open until it does.
+/// The stabilisation of one stack operation: the resources whose owning service has
+/// answered the create but does not report the resource ready yet, and the ones whose
+/// delete it has answered while still holding them, which hold the operation open until it
+/// reports otherwise.
 pub mod stabilising;
 
 /// The stack sets this account and Region holds, and the stack instances each one carries,
@@ -354,7 +355,8 @@ pub const STATUS_TRANSITION_DELAY: Duration = Duration::from_millis(500);
 ///
 /// Chosen, exactly as [`STATUS_TRANSITION_DELAY`] is, and the ceiling BOTH of this
 /// service's open waits are bounded by: the one for a resource whose owning service has not
-/// reported it ready ([`stabilising::CREATE_STABILISATION_WINDOW`]) and the one for the
+/// reported it ready, or gone ([`stabilising::CREATE_STABILISATION_WINDOW`],
+/// [`stabilising::REMOVAL_STABILISATION_WINDOW`]), and the one for the
 /// success signals a resource's declaration waits for
 /// ([`wait_conditions::MAX_HELD_TIMEOUT`]). Long enough that every span the services of
 /// this emulator owe a resource falls due inside it many times over, and that a client
@@ -1597,12 +1599,15 @@ pub struct StoredStack {
     /// unsatisfied, and `SignalResource` is what satisfies one.
     pub wait_conditions: Vec<wait_conditions::WaitConditionBarrier>,
     /// The resources of the operation in flight whose owning service accepted the create
-    /// but does not report the resource ready yet ([`stabilising`]).
+    /// but does not report the resource ready yet, and the ones whose delete it accepted
+    /// while still holding them ([`stabilising`]).
     ///
     /// An unreleased barrier means the operation's completion is NOT owed by the clock
-    /// yet, for the same reason an unsatisfied wait condition does: the resource it holds
-    /// is reported `*_IN_PROGRESS` — under the identifier its owning service already
-    /// assigned — and [`Self::settle`] holds the pending transition back.
+    /// yet, for the same reason an unsatisfied wait condition does, and
+    /// [`Self::settle`] holds the pending transition back. A barrier held for a resource
+    /// being CREATED also reports that resource `*_IN_PROGRESS`, under the identifier its
+    /// owning service already assigned; one held for a resource being DELETED reports
+    /// nothing, because the stack no longer records that physical resource at all.
     /// [`provisioning::advance_stabilisations`] is what reads the owning service's answer
     /// and releases one.
     pub stabilisations: Vec<stabilising::StabilisationBarrier>,
@@ -2371,11 +2376,12 @@ impl StoredStack {
             .map(|barrier| barrier.logical_id().to_string())
             // A resource whose owning service has not reported it ready yet is gated the
             // same way a wait condition is: what ENDS its creation is that service's
-            // answer, not the span the walk was laid out across.
+            // answer, not the span the walk was laid out across. A wait for a resource this
+            // operation DELETED gates nothing here — the stack stopped recording that
+            // physical resource when the delete was accepted, so there is no event of it
+            // left to hold.
             .chain(
-                self.stabilisations
-                    .iter()
-                    .map(|barrier| barrier.logical_id.clone()),
+                self.coming_up().map(|barrier| barrier.logical_id.clone()),
             )
             .collect();
         let planned = {
@@ -2503,8 +2509,10 @@ impl StoredStack {
             })
             .collect();
         // A resource held for its owning service to report it ready finished when that
-        // service was first seen to report it: the instant the barrier was released.
-        for barrier in &self.stabilisations {
+        // service was first seen to report it: the instant the barrier was released. A wait
+        // for a resource the operation DELETED gates no event — the stack stopped recording
+        // that physical resource — so it finishes nothing here.
+        for barrier in self.coming_up() {
             if let Some(at) = barrier.released_at {
                 released.insert(barrier.logical_id.clone(), at);
             }
@@ -2748,9 +2756,10 @@ impl StoredStack {
         }
         if self.waiting_for_stabilisation() {
             // A resource the operation created is not ready in the service that owns it
-            // yet, so the operation's completion is not owed either: what releases it is
-            // that service's own answer ([`provisioning::advance_stabilisations`]), which a
-            // read of the store cannot ask for.
+            // yet, or one it deleted is still held there, so the operation's completion is
+            // not owed either: what releases it is that service's own answer
+            // ([`provisioning::advance_stabilisations`]), which a read of the store cannot
+            // ask for.
             return;
         }
         if self.owed_rollback.is_some() {
@@ -3075,14 +3084,16 @@ impl StoredStack {
     }
 
     /// Record the resources of the operation in flight whose owning service accepted the
-    /// create but does not report the resource ready yet ([`stabilising`]).
+    /// call about them without having carried it out: a create that does not report the
+    /// resource ready, and a delete that leaves that service still holding it
+    /// ([`stabilising`]).
     ///
-    /// Called by the operation that drove the deployment, BEFORE it schedules the
-    /// per-resource events: each of these resources is gated, so the transition that ENDS
-    /// its creation is not stamped until the owning service reports it ready
-    /// ([`Self::schedule_resource_events`]).
+    /// Called by the operation that drove the deployment or the teardown, BEFORE it
+    /// schedules the per-resource events: a resource being CREATED is gated, so the
+    /// transition that ENDS its creation is not stamped until the owning service reports it
+    /// ready ([`Self::schedule_resource_events`]).
     ///
-    /// The wait runs from the instant the operation that created the resource started,
+    /// The wait runs from the instant the operation that acted on the resource started,
     /// which is what the resource's own `*_IN_PROGRESS` event is stamped with too.
     pub fn record_stabilisations(
         &mut self,
@@ -3099,6 +3110,7 @@ impl StoredStack {
         for stabilising in pending {
             self.stabilisations
                 .push(stabilising::StabilisationBarrier::open(
+                    stabilising.awaited,
                     stabilising.logical_id.clone(),
                     stabilising.resource_type.clone(),
                     stabilising.physical_resource_id.clone(),
@@ -3108,17 +3120,17 @@ impl StoredStack {
         }
     }
 
-    /// Whether the operation in flight is still waiting for a resource it created to be
-    /// ready in the service that owns it.
+    /// Whether the operation in flight is still waiting for the service that owns one of its
+    /// resources to report that resource ready, or gone.
     pub fn waiting_for_stabilisation(&self) -> bool {
         self.stabilisations
             .iter()
             .any(|barrier| !barrier.released())
     }
 
-    /// The resources of the operation in flight whose creation is still open, as the
-    /// readiness read addresses them — nothing of the store, so the caller can ask their
-    /// owning services with the lock released.
+    /// The resources of the operation in flight whose create or delete is still open, as the
+    /// read that ends each wait addresses them — nothing of the store, so the caller can ask
+    /// their owning services with the lock released.
     pub fn open_stabilisations(&self) -> Vec<stabilising::StabilisationBarrier> {
         self.stabilisations
             .iter()
@@ -3127,31 +3139,50 @@ impl StoredStack {
             .collect()
     }
 
-    /// Record that the service owning `logical_id` reports the resource ready, and make the
-    /// operation's terminal status due where that was the last resource it was waiting for.
+    /// The waits of the operation in flight that are for a resource it CREATED.
+    ///
+    /// These are the waits a READ of the stack reports something about: such a resource is
+    /// reported `*_IN_PROGRESS` under the identifier its owning service assigned
+    /// ([`Self::reported_resources`]) and its own terminal event is held back
+    /// ([`Self::schedule_resource_events`]). A wait for a resource the operation DELETED
+    /// holds the operation and nothing else, because the stack stopped recording that
+    /// physical resource when the owning service accepted the delete.
+    fn coming_up(&self) -> impl Iterator<Item = &stabilising::StabilisationBarrier> {
+        self.stabilisations
+            .iter()
+            .filter(|barrier| barrier.awaited == stabilising::Awaited::Ready)
+    }
+
+    /// Record that the service owning the resource `barrier` is held for has given the answer
+    /// that wait was for, and make the operation's terminal status due where that was the
+    /// last resource it was waiting for.
     ///
     /// The barrier HELD a conclusion the operation's own clock had already made due
     /// ([`STATUS_TRANSITION_DELAY`], stamped when the operation began): it never postponed
     /// it. So releasing the last barrier restores that instant rather than starting a fresh
     /// span — the conclusion stands at the LATER of the instant the operation's own span
-    /// elapsed and the instant the resource was ready, which is the first instant at which
-    /// every part of it had happened. `now` is when the owning service was seen to report the
-    /// resource ready, and a release is only ever recorded from a call that asked it
+    /// elapsed and the instant the owning service gave its answer, which is the first instant
+    /// at which every part of it had happened. `now` is when that service was seen to give
+    /// it, and a release is only ever recorded from a call that asked
     /// ([`provisioning::advance_stabilisations`]), which is the one thing a read of this
-    /// store cannot do — so a read that asks and learns the resource came up long ago
-    /// reports the conclusion the clock owed from then, instead of charging the caller
-    /// another span for having been the one to notice. The barriers stay on the stack until
-    /// [`Self::settle`] completes it, so the resources the operation created go on being
-    /// reported while it finishes.
-    pub fn release_stabilisation(&mut self, logical_id: &str, now: SystemTime) {
-        let Some(barrier) = self
+    /// store cannot do — so a read that asks and learns the resource came up, or went away,
+    /// long ago reports the conclusion the clock owed from then, instead of charging the
+    /// caller another span for having been the one to notice. The barriers stay on the stack
+    /// until [`Self::settle`] completes it, so the resources the operation created go on
+    /// being reported while it finishes.
+    pub fn release_stabilisation(
+        &mut self,
+        barrier: &stabilising::StabilisationBarrier,
+        now: SystemTime,
+    ) {
+        let Some(held) = self
             .stabilisations
             .iter_mut()
-            .find(|barrier| barrier.logical_id == logical_id && !barrier.released())
+            .find(|held| held.is_the_same_wait(barrier) && !held.released())
         else {
             return;
         };
-        barrier.released_at = Some(now);
+        held.released_at = Some(now);
         if self.waiting_for_stabilisation() {
             return;
         }
@@ -3160,15 +3191,16 @@ impl StoredStack {
         }
     }
 
-    /// Record that the creation of `logical_id` could not be carried through — the owning
-    /// service reports the resource failed, or the wait for it to be ready ran out — and
-    /// answer the resources the ROLLBACK of a failed create now has to remove, or `None`
-    /// where this failure owes no such removal.
+    /// Record that what `barrier` was waiting for could not be carried through — the owning
+    /// service reports the resource failed, or the wait ran out — and answer the resources
+    /// the ROLLBACK of a failed create now has to remove, or `None` where this failure owes
+    /// no such removal.
     ///
-    /// The resource's own terminal event becomes that failure rather than the completion the
-    /// walk had planned for it, so the event stream says which resource did not come up and
-    /// why, and the stack takes the failed status of the operation in flight exactly as it
-    /// does when an owning service refuses a create outright.
+    /// For a resource being CREATED, its own terminal event becomes that failure rather than
+    /// the completion the walk had planned for it, so the event stream says which resource
+    /// did not come up and why; for one being DELETED, what the owning service had already
+    /// answered stands. Either way the stack takes the failed status of the operation in
+    /// flight, exactly as it does when an owning service refuses the call outright.
     ///
     /// A failed operation does not stop there. "ROLLBACK — Roll back the stack creation.
     /// This is the default": a failed CREATE removes what it had made, which is the work this
@@ -3181,7 +3213,7 @@ impl StoredStack {
     pub fn fail_stabilisation(
         &mut self,
         now: SystemTime,
-        logical_id: &str,
+        barrier: &stabilising::StabilisationBarrier,
         reason: &str,
     ) -> Option<Vec<StoredResource>> {
         // Nothing is owed for a barrier this stack is no longer holding, or for one whose
@@ -3192,19 +3224,35 @@ impl StoredStack {
             || !self
                 .stabilisations
                 .iter()
-                .any(|barrier| barrier.logical_id == logical_id && !barrier.released())
+                .any(|held| held.is_the_same_wait(barrier) && !held.released())
         {
             return None;
         }
+        let logical_id = barrier.logical_id.as_str();
         let failed_status = failed_status_of(&self.status);
         let updating = self.status == status::UPDATE_IN_PROGRESS;
         let creating = self.status == status::CREATE_IN_PROGRESS;
-        // The RESOURCE was being CREATED whatever the enclosing operation is — a barrier is
-        // only ever opened by the create of a resource the stack did not have — so its own
-        // event is the failed CREATE, while the STACK takes the failed status of the
-        // operation in flight.
-        self.fail_planned_resource_event(logical_id, resource_status::CREATE_FAILED, reason);
-        let summary = resource_failure_summary(failed_action::CREATE, [logical_id]);
+        // WHICH action on the resource did not go through, which is what the stack's summary
+        // reports it failed for.
+        let action = match barrier.awaited {
+            // The resource was being CREATED whatever the enclosing operation is — a wait
+            // for a resource to be ready is only ever opened by the create of a resource the
+            // stack did not have — so its own event is the failed CREATE, which the walk had
+            // planned as a completion and the gate held back.
+            stabilising::Awaited::Ready => {
+                self.fail_planned_resource_event(
+                    logical_id,
+                    resource_status::CREATE_FAILED,
+                    reason,
+                );
+                failed_action::CREATE
+            }
+            // The resource was being DELETED, and what the owning service answered about
+            // that delete was recorded when it answered: what did not happen is the removal,
+            // so no event of the resource is rewritten.
+            stabilising::Awaited::Gone => failed_action::DELETE,
+        };
+        let summary = resource_failure_summary(action, [logical_id]);
         self.fail_transition(now, failed_status, summary.clone());
         if self.disable_rollback {
             return None;
@@ -3424,12 +3472,14 @@ impl StoredStack {
     /// wait: the resource IS reported, under the identifier that service already assigned,
     /// at `*_IN_PROGRESS` — so a client can resolve the resource through the owning service
     /// while the stack goes on waiting for it, and never reads it as complete before it is.
+    /// A wait for a resource the operation DELETED reports nothing here: the stack stopped
+    /// recording that physical resource when its owning service accepted the delete.
     pub fn reported_resources(&self) -> Vec<DeployedResource> {
         let Some(opened_at) = self
             .wait_conditions
             .iter()
             .map(|barrier| barrier.opened_at)
-            .chain(self.stabilisations.iter().map(|barrier| barrier.opened_at))
+            .chain(self.coming_up().map(|barrier| barrier.opened_at))
             .min()
         else {
             return self.resources.clone();
@@ -3469,8 +3519,7 @@ impl StoredStack {
                     )
                 });
             let gated = waiting_at.or_else(|| {
-                self.stabilisations
-                    .iter()
+                self.coming_up()
                     .find(|barrier| {
                         !barrier.released()
                             && barrier.logical_id == deployed.resource.logical_id

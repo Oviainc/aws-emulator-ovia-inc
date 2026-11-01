@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The CREATE-time STABILISATION of one stack operation: the resources whose owning
-//! service has answered the create but does not report the resource ready yet.
+//! The STABILISATION of one stack operation: the resources whose owning service has
+//! answered the call the operation made about them without having carried it out yet — a
+//! create that does not report the resource ready, and a delete that does not report the
+//! resource gone.
 //!
 //! ## The rule this module implements
 //!
@@ -15,16 +17,25 @@
 //! reads a resource as created therefore reads a resource that can serve traffic, and a
 //! stack is not reported complete while one of its resources cannot.
 //!
-//! What ENDS the wait is the owning service's own answer, read through that service's own
-//! API ([`super::provisioner::Provisioner::readiness`]) — never a status this crate
-//! guesses. The wait is bounded ([`CREATE_STABILISATION_WINDOW`]): a resource the owning
-//! service has not brought up inside it fails the resource, and the stack rolls back,
-//! exactly as a create the service refused outright does. So no template can leave a stack
-//! in progress for ever.
+//! A DELETE is the same relation read backwards, and the same services answer it the same
+//! way: an accepted delete leaves the resource in a state it is still being removed from, so
+//! CloudFormation does not report the operation that deleted it complete on the strength of
+//! the accepted call either — the stack stays `*_IN_PROGRESS` until the service that owns
+//! the resource no longer holds it. A client that reads a stack operation as complete
+//! therefore finds every resource that operation deleted gone in the service that owned it.
 //!
-//! This module is the model of that wait, and nothing else. [`StabilisationBarrier`] is one
-//! resource's: what the create left, the instant the wait began, and the instant the owning
-//! service was first seen to report the resource ready.
+//! What ENDS either wait is the owning service's own answer, read through that service's own
+//! API ([`super::provisioner::Provisioner::readiness`] for a create,
+//! [`super::provisioner::Provisioner::removal`] for a delete) — never a status this crate
+//! guesses. The wait is bounded ([`CREATE_STABILISATION_WINDOW`],
+//! [`REMOVAL_STABILISATION_WINDOW`]): a resource the owning service has not brought up, or
+//! has not let go of, inside it fails the resource, and the stack rolls back, exactly as a
+//! call that service refused outright does. So no template can leave a stack in progress for
+//! ever.
+//!
+//! This module is the model of those waits, and nothing else. [`StabilisationBarrier`] is
+//! one resource's: which answer it waits for ([`Awaited`]), what the call left, the instant
+//! the wait began, and the instant the owning service was first seen to give that answer.
 //! [`super::StoredStack::settle`] will not complete an operation that still holds an
 //! unreleased barrier, and what releases one is
 //! [`super::provisioning::advance_stabilisations`].
@@ -37,9 +48,9 @@
 //! ## Bounds
 //!
 //! One barrier per resource of the operation in flight whose create answered "not ready
-//! yet", so the set is bounded by the resources a stack may hold
-//! ([`super::MAX_CONCURRENT_RESOURCES`]), and every barrier is dropped when the operation
-//! that opened it concludes.
+//! yet" and one per resource whose delete answered "not gone yet", so the set is bounded by
+//! twice the resources a stack may hold ([`super::MAX_CONCURRENT_RESOURCES`]), and every
+//! barrier is dropped when the operation that opened it concludes.
 
 use std::time::{Duration, SystemTime};
 
@@ -56,36 +67,65 @@ use std::time::{Duration, SystemTime};
 /// ever bring up fails the stack inside a client's poll loop instead of outliving it.
 pub const CREATE_STABILISATION_WINDOW: Duration = super::MAX_HELD_WAIT;
 
-/// One resource of the operation in flight whose creation is still open: the owning service
-/// accepted the create and does not report the resource ready yet.
+/// The longest it holds ONE resource's deletion open waiting for the service that owns it to
+/// report the resource gone.
+///
+/// The same ceiling, for the same reason read backwards: every removal span the services of
+/// this emulator owe a deleted resource falls due inside it many times over, and a resource
+/// nothing is ever going to remove fails the stack inside a client's poll loop instead of
+/// holding the operation for ever.
+pub const REMOVAL_STABILISATION_WINDOW: Duration = super::MAX_HELD_WAIT;
+
+/// Which answer from the owning service a barrier is waiting for.
+///
+/// The two are asked of different APIs of that service and mean opposite things, so the
+/// barrier carries which one it is rather than leaving it to be guessed from the operation:
+/// one stack operation can hold both about the same logical resource at once, when it
+/// REPLACES one — the new physical resource is coming up while the old one is being removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Awaited {
+    /// The resource the operation CREATED is reported ready
+    /// ([`super::provisioner::Provisioner::readiness`]).
+    Ready,
+    /// The resource the operation DELETED is no longer held by that service
+    /// ([`super::provisioner::Provisioner::removal`]).
+    Gone,
+}
+
+/// One resource of the operation in flight that is still open: the owning service accepted
+/// the create and does not report the resource ready yet, or accepted the delete and still
+/// holds the resource.
 #[derive(Debug, Clone)]
 pub struct StabilisationBarrier {
+    /// Which of the owning service's answers ends this wait.
+    pub awaited: Awaited,
     /// The logical id the template declares the resource under, which is what the stack's
     /// events and per-resource reads name it by.
     pub logical_id: String,
-    /// `StackResource$ResourceType`, which is what says WHICH service's readiness answer
-    /// ends this wait.
+    /// `StackResource$ResourceType`, which is what says WHICH service's answer ends this
+    /// wait.
     pub resource_type: String,
-    /// The identifier the owning service assigned, which the readiness read addresses the
-    /// resource by — and which CloudFormation already reports for the resource while the
-    /// wait holds.
+    /// The identifier the owning service assigned, which the read that ends this wait
+    /// addresses the resource by — and which CloudFormation already reports for the resource
+    /// while a creation's wait holds.
     pub physical_resource_id: String,
-    /// The state that service reported the resource in when the create answered, as its own
+    /// The state that service reported the resource in when the call answered, as its own
     /// API spells it. Carried so the failure a wait that runs out reports says what the
     /// resource was still in.
     pub reported_state: String,
-    /// The instant the operation that created the resource started, which the wait runs
+    /// The instant the operation that acted on the resource started, which the wait runs
     /// from — and which the resource's own `*_IN_PROGRESS` event and reported timestamp
     /// carry, so one instant is the whole of what the stack says about this resource.
     pub opened_at: SystemTime,
-    /// The instant the owning service was first seen to report the resource ready, or
-    /// `None` while it does not.
+    /// The instant the owning service was first seen to give the answer this barrier waits
+    /// for, or `None` while it does not.
     pub released_at: Option<SystemTime>,
 }
 
 impl StabilisationBarrier {
-    /// Open the wait for a resource whose create `now` answered.
+    /// Open the wait for a resource whose create or delete `now` answered.
     pub fn open(
+        awaited: Awaited,
         logical_id: String,
         resource_type: String,
         physical_resource_id: String,
@@ -93,6 +133,7 @@ impl StabilisationBarrier {
         now: SystemTime,
     ) -> Self {
         Self {
+            awaited,
             logical_id,
             resource_type,
             physical_resource_id,
@@ -102,15 +143,32 @@ impl StabilisationBarrier {
         }
     }
 
-    /// Whether the owning service has reported the resource ready, so the operation may
-    /// proceed.
+    /// Whether this barrier and `other` are the same wait: the same answer awaited about the
+    /// same physical resource of the same logical one.
+    ///
+    /// What identifies a wait, because a logical id alone does not: an operation that
+    /// REPLACES a resource holds one wait for the new physical resource coming up and one
+    /// for the old one being removed, both under that logical id, and each is released by
+    /// its own answer.
+    pub fn is_the_same_wait(&self, other: &Self) -> bool {
+        self.awaited == other.awaited
+            && self.logical_id == other.logical_id
+            && self.physical_resource_id == other.physical_resource_id
+    }
+
+    /// Whether the owning service has given the answer this barrier waits for, so the
+    /// operation may proceed.
     pub fn released(&self) -> bool {
         self.released_at.is_some()
     }
 
-    /// The instant the wait gives up.
+    /// The instant the wait gives up, which is the window of the answer it waits for.
     pub fn deadline(&self) -> SystemTime {
-        self.opened_at + CREATE_STABILISATION_WINDOW
+        let window = match self.awaited {
+            Awaited::Ready => CREATE_STABILISATION_WINDOW,
+            Awaited::Gone => REMOVAL_STABILISATION_WINDOW,
+        };
+        self.opened_at + window
     }
 
     /// Whether the wait has run out at `now`, which fails the resource it is holding.
@@ -118,10 +176,10 @@ impl StabilisationBarrier {
         self.deadline() <= now
     }
 
-    /// Why the resource failed, for a wait that ran out: which resource did not come up,
-    /// and the state the service that owns it was still reporting.
+    /// Why the resource failed, for a wait that ran out: which resource did not reach what
+    /// was waited for, and the state the service that owns it was still reporting.
     ///
-    /// `state` is that service's latest answer, which is not always the one the create left
+    /// `state` is that service's latest answer, which is not always the one the call left
     /// ([`Self::reported_state`]).
     pub fn not_stabilised_reason(&self, state: &str) -> String {
         let state = if state.is_empty() {
@@ -129,8 +187,12 @@ impl StabilisationBarrier {
         } else {
             state
         };
+        let awaited = match self.awaited {
+            Awaited::Ready => "created",
+            Awaited::Gone => "deleted",
+        };
         format!(
-            "{} {} was still {state} when the wait for it to be created ran out",
+            "{} {} was still {state} when the wait for it to be {awaited} ran out",
             self.resource_type, self.physical_resource_id
         )
     }

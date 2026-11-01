@@ -155,6 +155,12 @@ mod bedrock_model_invocation_logging_pass_role;
 // concurrently landing suites add their line to.
 #[path = "all/cloudformation_firehose_stream_stabilisation.rs"]
 mod cloudformation_firehose_stream_stabilisation;
+// Declared beside the suite above rather than in the head region: both are regions
+// concurrently landing suites add their line to, and this one pins the other half of that
+// suite's rule — a stack operation is not reported complete while a resource it DELETED is
+// still held by the service that owned it.
+#[path = "all/cloudformation_resource_removal_stabilisation.rs"]
+mod cloudformation_resource_removal_stabilisation;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions
 // concurrently landing suites add their line to.

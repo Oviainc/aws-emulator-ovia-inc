@@ -1036,7 +1036,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             // A resource whose owning service has not reported it ready yet holds this
             // operation open ([`crate::state::stabilising`]), which is what withholds the
-            // transition that would report the resource created.
+            // transition that would report the resource created — and so does one whose
+            // delete that service accepted while still holding it, which is what keeps the
+            // update from completing while a resource it replaced or dropped is still there.
             stack.record_stabilisations(&materialised.stabilising, ::std::time::SystemTime::now());
             // The resources' own transitions come BEFORE the stack's terminal event: the
             // event stream is what the update did, in the order it did it.
