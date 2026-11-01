@@ -217,6 +217,8 @@ mod read_response_member_sets;
 mod refusal_message_texts;
 #[path = "all/refused_create_clock.rs"]
 mod refused_create_clock;
+#[path = "all/refused_destination_and_scan_settings_clock.rs"]
+mod refused_destination_and_scan_settings_clock;
 #[path = "all/refused_mutation_clock.rs"]
 mod refused_mutation_clock;
 #[path = "all/request_region_partition_bounds.rs"]
