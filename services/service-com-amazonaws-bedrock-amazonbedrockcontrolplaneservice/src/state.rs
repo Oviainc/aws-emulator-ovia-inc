@@ -88,7 +88,10 @@
 //! is the hash the read reports — and, beside that draft, every numbered version
 //! `ops/create_automated_reasoning_policy_version.rs` cuts from it, which the same read
 //! reports when the ARN it is given carries that version's number, unchanged by any later
-//! write to the draft. `ops/export_automated_reasoning_policy_version.rs` reads the
+//! write to the draft. `ops/list_automated_reasoning_policies.rs` reports those same
+//! revisions as summaries — every policy's draft, or the revisions of the one policy an ARN
+//! filter names — so a listing reports what a read of each revision finds.
+//! `ops/export_automated_reasoning_policy_version.rs` reads the
 //! DEFINITION of whichever of those revisions the ARN names, so what a revision was written
 //! with is what the export reports.
 //!
