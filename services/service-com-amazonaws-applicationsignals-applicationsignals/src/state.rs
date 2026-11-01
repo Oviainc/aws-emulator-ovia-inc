@@ -4340,6 +4340,152 @@ fn assessed_severity(budget_status: &str) -> &'static str {
     }
 }
 
+/// The `length` bound `MetricDataQuery.Id` carries
+/// (`smithy_query(query="shape", shape="MetricDataQuery")`, member `Id`: `length 1..255`),
+/// which a reported id has to stay inside however it was derived.
+const MAX_METRIC_ID_LENGTH: usize = 255;
+
+/// Several independently scoped `MetricDataQueries` arrays, reported as ONE such array.
+///
+/// `MetricDataQuery.Id` "must be unique within a `MetricDataQueries` array"
+/// (`smithy_query(query="shape", shape="MetricDataQuery")`, member `Id`), and each stored
+/// array is a `MetricDataQueries` of its own — so its ids are unique only within itself and
+/// two of them may use one id while each still satisfies the rule. Reporting them in a
+/// single array makes that one array the scope the rule is stated for, so a query whose id
+/// an earlier reported query already took is reported under a fresh id derived from its own
+/// ([`unique_metric_query_id`]) rather than repeated: the id is "a short name used to tie
+/// this object to the results in the response", so a repeated one leaves a client keying the
+/// reported queries by it holding one query where the objective stores two.
+///
+/// An id is also how the other queries of the SAME stored array refer to a query in a math
+/// expression ("a math expression can use the `Id` of the other metrics or queries to refer
+/// to those metrics"), so a renamed id is rewritten in those references
+/// ([`with_renamed_query_references`]): the reported array then describes the metric math
+/// its source arrays describe, rather than expressions pointing at another array's query.
+///
+/// Nothing else about a query changes, and the order is the source arrays' own, each array's
+/// queries in the order it holds them.
+fn merged_metric_data_queries(sources: &[&[MetricDataQuery]]) -> Vec<MetricDataQuery> {
+    let mut merged: Vec<MetricDataQuery> = Vec::new();
+    let mut taken: BTreeSet<String> = BTreeSet::new();
+    for source in sources {
+        // The ids of a whole source array are settled BEFORE its expressions are rewritten:
+        // an expression may refer to a query that appears after it in its own array, so the
+        // renaming has to be known for the array as a whole.
+        let mut renamed: BTreeMap<String, String> = BTreeMap::new();
+        let mut reported: Vec<String> = Vec::with_capacity(source.len());
+        for query in source.iter() {
+            let id = unique_metric_query_id(&query.id, &taken);
+            if id != query.id {
+                renamed.insert(query.id.clone(), id.clone());
+            }
+            taken.insert(id.clone());
+            reported.push(id);
+        }
+        for (query, id) in source.iter().zip(reported) {
+            merged.push(MetricDataQuery {
+                id,
+                expression: query
+                    .expression
+                    .as_deref()
+                    .map(|expression| with_renamed_query_references(expression, &renamed)),
+                ..query.clone()
+            });
+        }
+    }
+    merged
+}
+
+/// `id`, or the first id derived from it that no query reported in the same array has
+/// ([`merged_metric_data_queries`]).
+///
+/// A derived id keeps the original as its stem and appends an underscore and the number of
+/// the occurrence, so an id that met the member's documented character rules ("the valid
+/// characters are letters, numbers, and underscore. The first character must be a lowercase
+/// letter") still meets them, and it stays inside the member's own length bound
+/// ([`MAX_METRIC_ID_LENGTH`]) — the stem gives way to the suffix rather than the reported id
+/// outgrowing the bound.
+fn unique_metric_query_id(id: &str, taken: &BTreeSet<String>) -> String {
+    if !taken.contains(id) {
+        return id.to_string();
+    }
+    let mut occurrence = 2usize;
+    loop {
+        let suffix = format!("_{occurrence}");
+        let stem: String = id
+            .chars()
+            .take(MAX_METRIC_ID_LENGTH.saturating_sub(suffix.chars().count()))
+            .collect();
+        let candidate = format!("{stem}{suffix}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+        occurrence += 1;
+    }
+}
+
+/// `expression` with every reference to a renamed query id replaced by the id that query is
+/// reported under ([`merged_metric_data_queries`]).
+///
+/// A reference is a whole name in the expression, so a name is substituted only when the
+/// renaming names it exactly — `m1` in `SUM(m1)` is the query `m1`, while the `m1` inside
+/// `m10` or inside a quoted metric name is not. Only a name beginning with a lowercase
+/// letter can be a reference, which is what the id's own doc requires of one ("the first
+/// character must be a lowercase letter"), so a number literal and an expression function
+/// are left as they are.
+///
+/// The expression itself is neither interpreted nor validated here: the only things read out
+/// of it are where one name begins and ends and whether it stands inside a quoted literal,
+/// and every other character is copied through unchanged, so what is reported is the stored
+/// expression with its references brought along rather than one this read rebuilt.
+fn with_renamed_query_references(expression: &str, renamed: &BTreeMap<String, String>) -> String {
+    if renamed.is_empty() {
+        return expression.to_string();
+    }
+    let mut rewritten = String::with_capacity(expression.len());
+    let mut name = String::new();
+    let mut quote: Option<char> = None;
+    for character in expression.chars() {
+        if let Some(open) = quote {
+            rewritten.push(character);
+            if character == open {
+                quote = None;
+            }
+            continue;
+        }
+        if character.is_ascii_alphanumeric() || character == '_' {
+            name.push(character);
+            continue;
+        }
+        push_metric_query_name(&mut rewritten, &mut name, renamed);
+        if character == '\'' || character == '"' {
+            quote = Some(character);
+        }
+        rewritten.push(character);
+    }
+    push_metric_query_name(&mut rewritten, &mut name, renamed);
+    rewritten
+}
+
+/// One complete name read out of an expression, appended to the rewritten expression under
+/// the id it is reported as when the renaming names it
+/// ([`with_renamed_query_references`]).
+fn push_metric_query_name(
+    rewritten: &mut String,
+    name: &mut String,
+    renamed: &BTreeMap<String, String>,
+) {
+    if name.is_empty() {
+        return;
+    }
+    let reference = name
+        .starts_with(|character: char| character.is_ascii_lowercase())
+        .then(|| renamed.get(name.as_str()))
+        .flatten();
+    rewritten.push_str(reference.map_or(name.as_str(), String::as_str));
+    name.clear();
+}
+
 /// The metric graph a DETAILED finding carries for one assessed objective: "metric data
 /// queries and time range information that provides context for audit findings through
 /// relevant performance metrics" (`smithy_query(shape="MetricGraph")`).
@@ -4349,24 +4495,26 @@ fn assessed_severity(budget_status: &str) -> &'static str {
 /// request-based one — so the graph names the metrics the assessment is evaluated from
 /// rather than a catalogue this read made up, and the range is the window the request asked
 /// to be audited over.
+///
+/// Those are SEVERAL stored arrays reported as ONE, so they are combined by
+/// [`merged_metric_data_queries`], which is what keeps the reported array's ids unique.
 fn assessed_metric_graph(
     slo: &ServiceLevelObjective,
     window_start: &DateTime,
     window_end: &DateTime,
 ) -> MetricGraph {
-    let mut queries: Vec<MetricDataQuery> = Vec::new();
+    let mut sources: Vec<&[MetricDataQuery]> = Vec::new();
     if let Some(sli) = slo.sli.as_ref() {
-        queries.extend(sli.sli_metric.metric_data_queries.iter().cloned());
+        sources.push(&sli.sli_metric.metric_data_queries);
     }
     if let Some(request_based_sli) = slo.request_based_sli.as_ref() {
         let metric = &request_based_sli.request_based_sli_metric;
-        queries.extend(metric.total_request_count_metric.iter().cloned());
-        queries.extend(
-            monitored_request_count_queries(&metric.monitored_request_count_metric)
-                .iter()
-                .cloned(),
-        );
+        sources.push(&metric.total_request_count_metric);
+        sources.push(monitored_request_count_queries(
+            &metric.monitored_request_count_metric,
+        ));
     }
+    let queries = merged_metric_data_queries(&sources);
     MetricGraph {
         // An absent fact is an absent member: an objective whose indicator holds no query
         // contributes no query rather than an empty list.

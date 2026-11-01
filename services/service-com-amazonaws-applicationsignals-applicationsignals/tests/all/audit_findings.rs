@@ -1058,6 +1058,248 @@ async fn an_objective_is_assessed_only_over_a_window_it_monitored() {
     }
 }
 
+/// One `MetricDataQuery` that is a metric math expression over the other queries of its own
+/// array, rather than a metric of its own.
+fn expression_query(id: &str, expression: &str) -> Value {
+    json!({ "Id": id, "Expression": expression, "ReturnData": true })
+}
+
+/// A request-based SLI config over the `checkout` service, with the two query arrays a
+/// request-based indicator states its metric through.
+fn request_based_config(total: Value, good: Value) -> Value {
+    json!({
+        "RequestBasedSliConfig": {
+            "RequestBasedSliMetricConfig": {
+                "KeyAttributes": service_entity("checkout"),
+                "TotalRequestCountMetric": total,
+                "MonitoredRequestCountMetric": { "GoodCountMetric": good }
+            }
+        }
+    })
+}
+
+/// Every query one metric graph reports, as its `Id` and the metric or expression it names,
+/// in the order the graph reports them.
+fn reported_queries(graph: &Value) -> Vec<(String, String)> {
+    graph["MetricDataQueries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|query| {
+            let source = query["Expression"]
+                .as_str()
+                .or_else(|| query["MetricStat"]["Metric"]["MetricName"].as_str())
+                .unwrap_or("<no metric or expression>");
+            (
+                query["Id"].as_str().unwrap_or("<no Id>").to_string(),
+                source.to_string(),
+            )
+        })
+        .collect()
+}
+
+/// One row of [`one_metric_graph_reports_every_query_under_a_distinct_id`]: the case, the
+/// indicator config the objective is stored with, and the `Id` and the metric or expression
+/// of every query the graph is expected to report for it.
+type GraphRow = (&'static str, Value, Vec<(String, String)>);
+
+/// A DETAILED finding reports the queries of SEVERAL stored arrays in ONE
+/// `MetricDataQueries`, and `MetricDataQuery.Id` "must be unique within a
+/// `MetricDataQueries` array" (`smithy_query(query="shape", shape="MetricDataQuery")`,
+/// member `Id`) — so every query the graph reports keeps a distinct `Id`, one taken by an
+/// earlier reported query giving way to a derived one, and a math expression referring to a
+/// query by its id refers to the id that query is reported under.
+///
+/// The rows differ along the collision: none at all (one array, and two arrays with distinct
+/// ids), one id shared by the two arrays, a shared id whose derived form is itself stored, a
+/// renamed query a sibling expression refers to, names a renamed id is only a prefix of or
+/// is quoted inside, and an id already at the member's `length 1..255` maximum.
+#[tokio::test]
+async fn one_metric_graph_reports_every_query_under_a_distinct_id() {
+    // The member's own maximum (`MetricId`: `length 1..255`), so a derived id has to give up
+    // stem characters to stay inside it.
+    const MAX_ID: usize = 255;
+    let long_id: String = "m".repeat(MAX_ID);
+    let derived_long_id = format!("{}_2", "m".repeat(MAX_ID - 2));
+
+    let rows: Vec<GraphRow> = vec![
+        (
+            "a period-based objective's single array",
+            json!({
+                "SliConfig": {
+                    "SliMetricConfig": {
+                        "KeyAttributes": service_entity("checkout"),
+                        "MetricDataQueries": [
+                            metric_query("m1", "ApplicationSignals", "Latency"),
+                            expression_query("e1", "m1 * 100")
+                        ]
+                    }
+                }
+            }),
+            vec![
+                ("m1".to_string(), "Latency".to_string()),
+                ("e1".to_string(), "m1 * 100".to_string()),
+            ],
+        ),
+        (
+            "two arrays with distinct ids",
+            request_based_config(
+                json!([metric_query("total", "ApplicationSignals", "Request")]),
+                json!([metric_query("good", "ApplicationSignals", "Success")]),
+            ),
+            vec![
+                ("total".to_string(), "Request".to_string()),
+                ("good".to_string(), "Success".to_string()),
+            ],
+        ),
+        (
+            "two arrays sharing one id",
+            request_based_config(
+                json!([metric_query("m1", "ApplicationSignals", "Request")]),
+                json!([metric_query("m1", "ApplicationSignals", "Success")]),
+            ),
+            vec![
+                ("m1".to_string(), "Request".to_string()),
+                ("m1_2".to_string(), "Success".to_string()),
+            ],
+        ),
+        (
+            "a shared id whose derived form is itself stored",
+            request_based_config(
+                json!([
+                    metric_query("m1", "ApplicationSignals", "Request"),
+                    metric_query("m1_2", "ApplicationSignals", "Error")
+                ]),
+                json!([metric_query("m1", "ApplicationSignals", "Success")]),
+            ),
+            vec![
+                ("m1".to_string(), "Request".to_string()),
+                ("m1_2".to_string(), "Error".to_string()),
+                ("m1_3".to_string(), "Success".to_string()),
+            ],
+        ),
+        (
+            "an expression over a renamed query of its own array",
+            request_based_config(
+                json!([metric_query("m1", "ApplicationSignals", "Request")]),
+                json!([
+                    metric_query("m1", "ApplicationSignals", "Success"),
+                    expression_query("e1", "SUM(m1) / 2")
+                ]),
+            ),
+            vec![
+                ("m1".to_string(), "Request".to_string()),
+                ("m1_2".to_string(), "Success".to_string()),
+                ("e1".to_string(), "SUM(m1_2) / 2".to_string()),
+            ],
+        ),
+        (
+            "a name the renamed id is only a prefix of",
+            request_based_config(
+                json!([metric_query("m1", "ApplicationSignals", "Request")]),
+                json!([
+                    metric_query("m1", "ApplicationSignals", "Success"),
+                    metric_query("m10", "ApplicationSignals", "Fault"),
+                    expression_query("e1", "m1 + m10")
+                ]),
+            ),
+            vec![
+                ("m1".to_string(), "Request".to_string()),
+                ("m1_2".to_string(), "Success".to_string()),
+                ("m10".to_string(), "Fault".to_string()),
+                ("e1".to_string(), "m1_2 + m10".to_string()),
+            ],
+        ),
+        (
+            "a renamed id quoted inside an expression",
+            request_based_config(
+                json!([metric_query("m1", "ApplicationSignals", "Request")]),
+                json!([
+                    metric_query("m1", "ApplicationSignals", "Success"),
+                    expression_query("e1", "SEARCH('{ApplicationSignals} m1', 'Sum', 60) + m1")
+                ]),
+            ),
+            vec![
+                ("m1".to_string(), "Request".to_string()),
+                ("m1_2".to_string(), "Success".to_string()),
+                (
+                    "e1".to_string(),
+                    "SEARCH('{ApplicationSignals} m1', 'Sum', 60) + m1_2".to_string(),
+                ),
+            ],
+        ),
+        (
+            "a shared id already at the member's maximum length",
+            request_based_config(
+                json!([metric_query(&long_id, "ApplicationSignals", "Request")]),
+                json!([metric_query(&long_id, "ApplicationSignals", "Success")]),
+            ),
+            vec![
+                (long_id.clone(), "Request".to_string()),
+                (derived_long_id.clone(), "Success".to_string()),
+            ],
+        ),
+    ];
+
+    for (case, indicator, expected) in rows {
+        // One objective per row on its own store, so the audit answers with exactly the
+        // finding of the objective the row stored.
+        let router = router();
+        let mut body = json!({ "Name": "checkout-objective" });
+        for (member, value) in indicator.as_object().expect("an indicator config object") {
+            body[member] = value.clone();
+        }
+        create_slo(&router, case, body).await;
+
+        let now = now_seconds();
+        let (start, end) = (now - 3_600, now + 3_600);
+        let (status, answer) = audit(
+            &router,
+            &format!("StartTime={start}&EndTime={end}"),
+            vec![target(
+                "service",
+                json!({ "Service": service_entity("checkout") }),
+            )],
+            json!({ "DetailLevel": "DETAILED" }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {answer:?}"
+        );
+        let graph = &answer["AuditFindings"][0]["MetricGraph"];
+        let reported = reported_queries(graph);
+        let reported: Vec<(&str, &str)> = reported
+            .iter()
+            .map(|(id, source)| (id.as_str(), source.as_str()))
+            .collect();
+        let expected: Vec<(&str, &str)> = expected
+            .iter()
+            .map(|(id, source)| (id.as_str(), source.as_str()))
+            .collect();
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected the graph to report {expected:?}, got {graph:?}"
+        );
+        let ids: std::collections::BTreeSet<&str> =
+            reported.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids.len(),
+            reported.len(),
+            "case {case:?}: expected every reported Id to be distinct, got {graph:?}"
+        );
+        for (id, _) in &reported {
+            assert!(
+                (1..=MAX_ID).contains(&id.chars().count()),
+                "case {case:?}: expected every reported Id inside the member's length bound, \
+                 got one of {} characters in {graph:?}",
+                id.chars().count()
+            );
+        }
+    }
+}
+
 /// A page carries at most `MaxResults` findings, the cursor walks every finding exactly
 /// once, and a token this service did not issue for this projection is refused.
 #[tokio::test]
