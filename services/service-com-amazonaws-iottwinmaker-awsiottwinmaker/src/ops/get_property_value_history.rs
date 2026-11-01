@@ -17,7 +17,13 @@
 //! workspace, entity or component type is a `ResourceNotFoundException`; a
 //! component an EXISTING entity does not have is a bad reference rather than a
 //! missing resource, so it is the modelled `ValidationException`
-//! ([`crate::state::component_not_found_message`]).
+//! ([`crate::state::component_not_found_message`]). That SCOPE is resolved
+//! BEFORE the request's own page and shaping members — the page size, the time
+//! direction, the window and the interpolation — so a read naming a scope this
+//! service does not hold is refused for the scope, with the status a caller
+//! branches on and a message naming what could not be resolved, whatever else
+//! the request carries; this service's listings resolve them in that same
+//! order.
 //!
 //! The window is `startTime`/`endTime` — the ISO 8601 members — or the
 //! deprecated `startDateTime`/`endDateTime` they replaced, and both of its
@@ -223,24 +229,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it: a workspace created through another Region's endpoint is not in
         // it, so it holds no history to report.
         let region = crate::state::request_region(ctx.parts());
-        // The page size served, under the rule every paginated operation of
-        // this service shares: THIS member documents a minimum of 1 and the
-        // service's default of 25, so an explicit zero is refused and a request
-        // that names none is served that default.
-        let page_size = crate::state::page_size(
-            input.max_results,
-            crate::state::PageSizeRule::minimum_one(crate::state::DEFAULT_PAGE_SIZE),
-        )
-        .map_err(invalid)?;
-        let descending = time_order(&input)?;
-        let window = Window::of(&input)?;
-        let interpolation = Interpolation::of(&input, &window)?;
 
         // Everything the answer is computed from is read under the store's lock
         // and OWNED, so the resampling, ordering and paging below touch nothing
         // another request is writing. The read is bounded by
         // [`MAX_COMPONENTS_IN_SCOPE`] and [`MAX_VALUES_READ`].
-        let mut series = {
+        let (mut series, page_size, descending, interpolation) = {
             let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
                 GetPropertyValueHistoryErrorModeled::InternalServerException(
                     InternalServerException {
@@ -251,6 +245,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let state = state.lock();
             let state = state.region(&region);
 
+            // The SCOPE is resolved before the request's own members, so a read
+            // naming a workspace, entity, component or component type this
+            // service does not hold is refused for THAT — with the status a
+            // caller branches on and a message naming what could not be
+            // resolved — whatever page or shaping members the request also
+            // carries; the page size, the time direction, the window and the
+            // interpolation are decided only once the scope stands, the order
+            // `ListProperties` and this service's listings resolve them in.
             let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
                 return Err(not_found(crate::state::workspace_not_found_message(
                     &input.workspace_id,
@@ -260,7 +262,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let components = scope(workspace, &input)?;
             let selected = selected_properties(workspace, &components, &input)?;
             let filters = value_filters(workspace, &components, &input)?;
-            read_series(&components, &selected, &filters, &window)?
+
+            // The page size served, under the rule every paginated operation of
+            // this service shares: THIS member documents a minimum of 1 and the
+            // service's default of 25, so an explicit zero is refused and a
+            // request that names none is served that default.
+            let page_size = crate::state::page_size(
+                input.max_results,
+                crate::state::PageSizeRule::minimum_one(crate::state::DEFAULT_PAGE_SIZE),
+            )
+            .map_err(invalid)?;
+            let descending = time_order(&input)?;
+            // The window and the interpolation are what the read below selects
+            // and resamples by, so they are settled here, where that read is.
+            let window = Window::of(&input)?;
+            let interpolation = Interpolation::of(&input, &window)?;
+
+            (
+                read_series(&components, &selected, &filters, &window)?,
+                page_size,
+                descending,
+                interpolation,
+            )
         };
 
         // Bounded by construction — at most [`MAX_VALUES_READ`] values, each

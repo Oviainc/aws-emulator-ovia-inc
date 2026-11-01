@@ -122,6 +122,9 @@ mod harness;
 #[path = "all/history_page_token_scope.rs"]
 mod history_page_token_scope;
 
+#[path = "all/history_refusal_order.rs"]
+mod history_refusal_order;
+
 #[path = "all/max_results_zero_page.rs"]
 mod max_results_zero_page;
 
