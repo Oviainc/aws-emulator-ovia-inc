@@ -58,7 +58,9 @@ aws-sdk-kinesis = { version = "1", default-features = false }
 # the very store `ListMetrics`/`GetMetricStatistics` read.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 # The IAM store a target's `RoleArn` is resolved against, to decide whether
-# EventBridge may assume that role and make the target's API call under it.
+# EventBridge may assume that role and make the target's API call under it — and
+# the identity the access key id a client's `PutEvents` presents speaks for,
+# together with that identity's own policies (`state::authorization`).
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]

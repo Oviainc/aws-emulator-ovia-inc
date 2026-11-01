@@ -40,6 +40,8 @@ Issue-Commit: a59989a9f63c403b66485a4e93f54ab6df22c2a6
 
 # EventBridge never delivers a matched event to any target, CloudFront emits no events of its own, PutEvents is unauthorized, and CFN-declared rules/functions are not provisioned (4 causes)
 
+> _STATUS: cause 3 is fixed — `PutEvents` is authorized the way AWS authorizes any call on a resource, against the calling principal's identity-based policies and the bus's resource policy together, so a principal with no grant is refused with `AccessDeniedException` and nothing of its request is published. Cause 1 is fixed for the delivery that never happened at all: a queue target's `SqsParameters.MessageGroupId` now travels with the `sqs:SendMessage` each matched event is delivered by, which is what a FIFO (or fair) queue requires of every message it takes. The OTHER three causes — a target's own resource-based policy never being evaluated, the checks whose effect only a running Lambda deployment package can produce, CloudFront emitting no `aws.cloudfront` events, and CloudFormation registering no `AWS::Lambda::Function` — are re-filed with their replay keys as `issues/things-that-do-not-work/20261023T140640Z-cloudfront-events-3-of-the-4-causes-remain-open.md`, so none of them is recorded as working._
+
 > _Note: this issue was identified against the code base at commit `a59989a9f63c403b66485a4e93f54ab6df22c2a6`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

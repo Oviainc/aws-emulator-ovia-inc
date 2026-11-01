@@ -4,10 +4,15 @@
 //! Publishes events onto an event bus, routes each one, and delivers it to the
 //! targets of every rule it matched.
 //!
-//! A publication onto a bus is AUTHORIZED against that bus's own resource policy
-//! before any entry of the request is published: a statement of it that
-//! explicitly denies the calling identity `events:PutEvents` on the bus refuses
-//! the publication ([`crate::state::caller_publication_refusal`]), and because an
+//! A publication onto a bus is AUTHORIZED before any entry of the request is
+//! published: publishing is the action `events:PutEvents` on the bus the entry
+//! names, so the calling principal's identity-based policies and that bus's own
+//! resource policy decide it together
+//! ([`crate::state::authorization::publication_denial`]) — a publication neither
+//! of them permits is refused, as is one either of them explicitly denies, while
+//! the account's own published credential (which holds no identity-based policies,
+//! and which an emulated service publishing its own events through the in-process
+//! callback signs with) is refused only by an explicit deny. Because an
 //! authorization verdict is about the REQUEST rather than about one entry, the
 //! whole request is refused with `AccessDeniedException` and nothing of it is
 //! published — not even an entry whose own `Source` no statement names. The
@@ -267,21 +272,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // PASS 1b — AUTHORIZE the publication, before an `EventId` is minted for
-        // any entry. Publishing onto an event bus is an action the bus's own
-        // resource policy governs ("the policy that enables the external account
-        // to send events to your account", `DescribeEventBus$Policy`), so a
-        // statement of that policy explicitly denying this caller
-        // `events:PutEvents` on that bus refuses the publication — and the
-        // refusal is on the REQUEST, which is where an authorization verdict
-        // lands: the operation's per-entry failure channel reports what is wrong
-        // with an entry, not who may publish. So nothing of the request is
-        // published, not even an entry whose own `Source` no statement names.
+        // any entry. Publishing onto an event bus is the action
+        // `events:PutEvents` on that bus, so it is authorized against the calling
+        // principal's identity-based policies and the bus's own resource policy
+        // ("the policy that enables the external account to send events to your
+        // account", `DescribeEventBus$Policy`) together: a publication neither of
+        // them permits, and one either of them explicitly denies, is refused —
+        // and the refusal is on the REQUEST, which is where an authorization
+        // verdict lands: the operation's per-entry failure channel reports what
+        // is wrong with an entry, not who may publish. So nothing of the request
+        // is published, not even an entry whose own `Source` no statement names.
         //
         // The decision is taken per entry, because the condition keys a
         // statement scopes itself by are properties of the EVENT
         // ([`crate::state::PUBLICATION_CONDITION_KEYS`]), and the first entry it
         // refuses refuses the whole request.
-        if let Some(message) = publication_refused(&state, &region, &screened) {
+        if let Some(message) = publication_refused(&*self.engine, &state, ctx, &region, &screened) {
             return Err(PutEventsErrorModeled::AccessDeniedException(AccessDeniedException {
                 message: Some(message),
             })
@@ -685,27 +691,36 @@ fn all_entries_incomplete(screened: &[Screened]) -> Option<&'static str> {
     first
 }
 
-/// The refusal a resource policy of a bus this request publishes onto states
-/// against it, or `None` when no bus the request names denies this caller the
-/// publication.
+/// The refusal the policies in force state against this request, or `None` when
+/// every accepted entry's publication is one the calling principal may make.
+///
+/// The decision is [`crate::state::authorization::publication_denial`]: the
+/// caller's own identity-based policies and the bus's resource policy together.
+/// WHO the caller is comes from the access key id the request was signed with
+/// (`crate::state::authorization::request_caller`), resolved before this store is
+/// locked so no other service's store is reached while this one's guard is held.
 ///
 /// The documents are READ under the store's guard and nothing is decided while
 /// it is held: one document per DISTINCT bus the request's accepted entries name
 /// (at most `Entries`' modelled ten). A bus this account does not hold carries no
-/// policy, so it refuses nothing — the same reading routing takes of an entry
-/// naming one.
+/// policy, so its publication is decided by the identity half alone — the same
+/// reading routing takes of an entry naming one.
 ///
 /// Each accepted entry is then decided on its own, in the request's order,
 /// because the condition keys a statement scopes itself by are properties of the
 /// EVENT ([`crate::state::publication_condition_context`]); the first entry the
-/// policy denies is the refusal the whole request carries. The entry's `Detail`
-/// is parsed only when its bus actually has a policy, so a publication onto a
-/// bus nobody has installed a statement on costs nothing here.
-fn publication_refused(
+/// policies deny is the refusal the whole request carries. The entry's `Detail`
+/// is parsed only when there is a document to decide against, so a publication
+/// the account's own credential makes onto a bus nobody has installed a
+/// statement on costs nothing here.
+fn publication_refused<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     state: &::engine::ServiceState<crate::state::ComAmazonawsEventbridgeAwseventsState>,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     screened: &[Screened],
 ) -> Option<String> {
+    let caller = crate::state::authorization::request_caller(engine, ctx);
     let mut policies: ::std::collections::BTreeMap<String, Option<String>> =
         ::std::collections::BTreeMap::new();
     {
@@ -721,16 +736,17 @@ fn publication_refused(
             });
         }
     }
-    if policies.values().all(Option::is_none) {
+    // Nothing to decide: the account's own credential carries no identity-based
+    // documents, and no bus this request names carries a resource policy, so
+    // there is no statement that could say anything about the publication.
+    if caller.decided_by_no_document() && policies.values().all(Option::is_none) {
         return None;
     }
     for slot in screened {
         let Screened::Accepted(accepted) = slot else {
             continue;
         };
-        let Some(policy) = policies.get(&accepted.bus).and_then(Option::as_deref) else {
-            continue;
-        };
+        let policy = policies.get(&accepted.bus).and_then(Option::as_deref);
         let detail = accepted
             .detail
             .as_deref()
@@ -740,9 +756,10 @@ fn publication_refused(
             accepted.detail_type.as_deref(),
             detail.as_ref(),
         );
-        let refusal = crate::state::caller_publication_refusal(
-            Some(policy),
+        let refusal = crate::state::authorization::publication_denial(
+            &caller,
             &crate::state::event_bus_arn(region, &accepted.bus),
+            policy,
             &context,
         );
         if refusal.is_some() {
@@ -1239,6 +1256,12 @@ pub(crate) struct CompiledTarget {
     /// `KinesisParameters`, for which "the default is to use the `eventId` as
     /// the partition key" (see [`kinesis_partition_key`]).
     partition_key_path: Option<String>,
+    /// `SqsParameters$MessageGroupId`: "the ID of the message group to use as the
+    /// target", carried on the `SendMessage` a queue target is delivered by —
+    /// which is what a FIFO (or fair) queue requires of every message it takes.
+    /// `None` for a target carrying no `SqsParameters`, which is every standard
+    /// queue: such a message belongs to no group.
+    message_group_id: Option<String>,
 }
 
 /// What a target's `InputTransformer` renders with: the paths to extract from
@@ -1342,6 +1365,11 @@ impl CompiledRule {
                         .kinesis_parameters
                         .as_ref()
                         .map(|parameters| parameters.partition_key_path.clone()),
+                    message_group_id: target
+                        .raw
+                        .sqs_parameters
+                        .as_ref()
+                        .and_then(|parameters| parameters.message_group_id.clone()),
                 })
                 .collect(),
         })
@@ -2071,6 +2099,16 @@ impl TargetKind {
                     .send_message()
                     .queue_url(queue)
                     .message_body(body);
+                // "Contains the message group ID to use when the target is an
+                // Amazon SQS fair or FIFO queue" (`Target$SqsParameters`): such a
+                // queue takes no message without one, so the group the target
+                // names travels with the delivery. No deduplication id goes with
+                // it — "if you specify a fair or FIFO queue as a target, the queue
+                // must have content-based deduplication enabled", so the queue
+                // derives one from the body.
+                if let Some(message_group_id) = &target.message_group_id {
+                    request = request.message_group_id(message_group_id);
+                }
                 // "An X-Ray trace header … that contains the trace-id
                 // associated with the event" travels WITH the event: a queue
                 // carries it as the one message system attribute Amazon SQS

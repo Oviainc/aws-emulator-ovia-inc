@@ -20,7 +20,9 @@
 //! [`ComAmazonawsEventbridgeAwseventsState::invocations`]. Whether EventBridge
 //! may invoke a target at all is decided against the account's OWN IAM records
 //! ([`delivery_refusal`]) and, for a publication onto an event bus, against that
-//! bus's own resource policy ([`publication_refusal`]). Each match is counted on
+//! bus's own resource policy ([`publication_refusal`]) — and a publication a
+//! CLIENT makes against that policy together with the calling principal's own
+//! identity-based policies ([`authorization::publication_denial`]). Each match is counted on
 //! the matched rule's own `MatchedEvents` and `TriggeredRules` metrics
 //! ([`count_rule_matches`]) and what came of each
 //! handover is counted on the
@@ -3838,9 +3840,11 @@ pub fn delivery_refusal(
     };
     Some((
         NO_PERMISSIONS.to_string(),
-        format!(
-            "User: {} is not authorized to perform: {action} on resource: {resource} {reason}",
-            assumed_role_principal(role_arn, &role.role_name, attempt)
+        not_authorized(
+            &assumed_role_principal(role_arn, &role.role_name, attempt),
+            action,
+            resource,
+            &reason,
         ),
     ))
 }
@@ -4018,20 +4022,40 @@ pub fn envelope_publication_context(
 /// grants nothing
 /// (`::service_common::iam_authorization::not_authorized_by_resource_policy`),
 /// stated once here so both publication gates of this service — the one in front
-/// of a client's `PutEvents` ([`caller_publication_refusal`]) and the one in
-/// front of a bus-to-bus forward ([`publication_refusal`]) — word a deny
+/// of a client's `PutEvents` ([`authorization::publication_denial`]) and the one
+/// in front of a bus-to-bus forward ([`publication_refusal`]) — word a deny
 /// identically.
 fn explicit_resource_policy_deny(principal: &str, action: &str, resource: &str) -> String {
-    format!(
-        "User: {principal} is not authorized to perform: {action} on resource: {resource} \
-         with an explicit deny in a resource-based policy"
+    not_authorized(
+        principal,
+        action,
+        resource,
+        "with an explicit deny in a resource-based policy",
     )
 }
 
-/// The IAM principal every request to this emulator speaks for — the one the
-/// account holds and `sts:GetCallerIdentity` reports — which is the principal a
-/// publication a CLIENT makes is authorized as, and the one an authorization
-/// refusal names.
+/// The sentence AWS refuses a call with when the policies in force do not permit
+/// it: who was refused, which action, on which resource, and the clause naming
+/// the document that withheld the grant.
+///
+/// Every authorization refusal of this service is built here — the ones a
+/// delivery earns ([`delivery_refusal`]), the one a bus's own policy states
+/// ([`explicit_resource_policy_deny`]) and the one a client's publication earns
+/// ([`authorization::publication_denial`]) — so the three cannot drift in
+/// wording. Only the closing clause differs between them, because the three ask
+/// for different remedies.
+fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} \
+         {reason}"
+    )
+}
+
+/// The IAM principal a request that presents the account's OWN published
+/// credential speaks for — the one `sts:GetCallerIdentity` reports for it — which
+/// is the identity such a publication is authorized as
+/// ([`authorization::request_caller`] resolves the general case, for every
+/// credential) and the one an authorization refusal of it names.
 ///
 /// Read from the shared definition, so this service refuses in the name of the
 /// same principal every other service of this emulator names.
@@ -4040,54 +4064,14 @@ pub fn caller_principal() -> String {
     ::service_common::caller_principal::ambient_user_arn()
 }
 
-/// Why the event bus `bus_arn` names does not accept a publication THIS CALLER
-/// makes onto it, given that bus's resource policy `policy`, or `None` when the
-/// policy shows nothing against it.
-///
-/// A client's `PutEvents` is a publication onto the bus the entry names, so it is
-/// authorized against that bus's own resource policy exactly as a bus-to-bus
-/// forward is ([`publication_refusal`]) — the difference is only the identity it
-/// is made as, which for a client request is [`caller_principal`] rather than a
-/// rule target's role session. The statements are evaluated with the
-/// publication's own condition context ([`publication_condition_context`]), so a
-/// statement scoped to one event's `Source` decides that event and no other.
-///
-/// What is refused is an explicit DENY and nothing else, for the reason
-/// [`publication_refusal`] gives: within one account "the resource-based policy
-/// and the identity-based policy are evaluated together, and access is granted if
-/// either allows it", so a policy that states nothing about the publication
-/// withholds nothing from the account's own principal.
-#[must_use]
-pub fn caller_publication_refusal(
-    policy: Option<&str>,
-    bus_arn: &str,
-    context: &[(String, String)],
-) -> Option<String> {
-    let document = policy?;
-    let caller = caller_principal();
-    // Every spelling a statement may name the caller by. The ACCOUNT's spellings
-    // are included because this decides a deny, and a statement that denies an
-    // account refuses each of its principals — the same reading
-    // [`publication_principals`] takes.
-    let mut principals = vec![caller.clone()];
-    principals.extend(::service_common::iam_authorization::account_principals(
-        &caller,
-    ));
-    let request =
-        ::service_common::iam_authorization::Request::new(PUT_EVENTS_ACTION, bus_arn, &principals)
-            .with_context(context)
-            .with_published_keys(&PUBLICATION_CONDITION_KEYS);
-    if ::service_common::iam_authorization::resource_decision(document, &request)
-        != ::service_common::iam_authorization::Decision::Denied
-    {
-        return None;
-    }
-    Some(explicit_resource_policy_deny(
-        &caller,
-        PUT_EVENTS_ACTION,
-        bus_arn,
-    ))
-}
+/// Whether the policies in force let a CLIENT's publication onto an event bus go
+/// ahead, and who that client is: a client's `PutEvents` is the action
+/// [`PUT_EVENTS_ACTION`] on the bus its entry names, so it is authorized against
+/// the calling principal's identity-based policies and that bus's own resource
+/// policy together ([`authorization::publication_denial`]) — where a bus-to-bus
+/// forward, made as a target's role rather than as a client,
+/// is [`publication_refusal`].
+pub mod authorization;
 
 /// Every spelling of the identity a publication is made as that a resource
 /// policy may name it by: the role itself, the SESSION of that role the

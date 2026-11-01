@@ -96,10 +96,39 @@ pub(crate) fn emulator() -> Emulator {
     Emulator { router, engine }
 }
 
+/// The access key id every call below presents unless a suite names another one: the
+/// account holds no record of it, so it resolves to the ambient identity — the account's
+/// own published credential.
+pub(crate) const AMBIENT_KEY: &str = "AKIDTESTTESTTEST";
+
 /// One `awsJson` RPC call against the service whose signing name is
 /// `signing_name` — the credential scope is what routes it.
 async fn rpc(
     emulator: &Emulator,
+    signing_name: &str,
+    target_prefix: &str,
+    json_version: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
+    rpc_as(
+        emulator,
+        AMBIENT_KEY,
+        signing_name,
+        target_prefix,
+        json_version,
+        operation,
+        body,
+    )
+    .await
+}
+
+/// [`rpc`] presenting `access_key_id`, which is what selects the principal the request
+/// speaks for: a key `iam:CreateAccessKey` minted speaks for the user it was minted for.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn rpc_as(
+    emulator: &Emulator,
+    access_key_id: &str,
     signing_name: &str,
     target_prefix: &str,
     json_version: &str,
@@ -118,7 +147,7 @@ async fn rpc(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTEST/20260101/{REGION}/{signing_name}/\
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/{signing_name}/\
                  aws4_request, SignedHeaders=host, Signature=0000"
             ),
         )
@@ -150,6 +179,25 @@ pub(crate) async fn events(
 
 pub(crate) async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
     rpc(emulator, "sqs", "AmazonSQS", "1.0", operation, body).await
+}
+
+/// An EventBridge call presenting `access_key_id` rather than the ambient key.
+pub(crate) async fn events_as(
+    emulator: &Emulator,
+    access_key_id: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
+    rpc_as(
+        emulator,
+        access_key_id,
+        "events",
+        "AWSEvents",
+        "1.1",
+        operation,
+        body,
+    )
+    .await
 }
 
 pub(crate) async fn sfn(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
