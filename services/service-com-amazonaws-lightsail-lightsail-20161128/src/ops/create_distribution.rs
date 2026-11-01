@@ -354,12 +354,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // issued — the same rule `AttachCertificateToDistribution` applies
             // to the attachment it makes, asked of the store's one owner of it.
             // Checked BEFORE the first write, so a refused request creates no
-            // distribution naming a certificate that secures nothing.
-            if let Some(certificate_name) = &input.certificate_name {
-                store
-                    .issued_certificate(certificate_name)
-                    .map_err(|refusal| certificate_refusal(certificate_name, refusal))?;
-            }
+            // distribution naming a certificate that secures nothing. What it
+            // answers is the ATTACHMENT itself: the certificate the request
+            // names together with the domains it covers, because
+            // `certificateName` is "the name of the SSL/TLS certificate that
+            // you want to attach to the distribution" and an attached
+            // certificate is what the distribution accepts HTTPS traffic for
+            // the domains of.
+            let attachment = match &input.certificate_name {
+                None => None,
+                Some(certificate_name) => Some(
+                    store
+                        .issued_certificate(certificate_name)
+                        .map_err(|refusal| certificate_refusal(certificate_name, refusal))?
+                        .distribution_attachment(),
+                ),
+            };
 
             let id = store.mint_uuid();
             // A new distribution is not serving yet: the clock owes it
@@ -369,7 +379,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
                 crate::state::DISTRIBUTION_STATUS_DEPLOYED,
             );
-            store.insert_distribution(crate::state::StoredDistribution {
+            let mut distribution = crate::state::StoredDistribution {
                 name: name.clone(),
                 arn: crate::state::distribution_arn(&id),
                 support_code: crate::state::support_code(&id),
@@ -386,17 +396,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Nothing has moved this distribution between bundles yet, so
                 // its one monthly bundle change is still available.
                 bundle_updated_at_ms: None,
-                // The certificate the request named is recorded as asked for,
-                // after the store confirmed it is one a distribution may serve
-                // HTTPS traffic with.
+                // A request that named no certificate leaves the distribution
+                // serving the default one, so it names no certificate of its
+                // own and publishes no alternate domain name. The attachment a
+                // request that DID name one asks for is applied below, through
+                // the crate's one owner of that pair.
                 // `AttachCertificateToDistribution` /
                 // `DetachCertificateFromDistribution` are what change it later.
-                certificate_name: input.certificate_name.clone(),
-                // The alternate domain names of a distribution are the domains
-                // of its attached certificate, and
-                // `AttachCertificateToDistribution` is what attaches one and
-                // publishes them — so a distribution this call created reports
-                // none of its own.
+                certificate_name: None,
                 alternative_domain_names: Vec::new(),
                 origin: Origin {
                     name: Some(origin_name.clone()),
@@ -423,7 +430,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A new distribution has cached nothing yet, so nothing has
                 // been reset: `ResetDistributionCache` is what records one.
                 latest_cache_reset: None,
-            });
+            };
+            // The certificate the request named, recorded as the attachment it
+            // asked for — the same one `AttachCertificateToDistribution` and
+            // `UpdateDistribution` make — so a distribution that names a
+            // certificate publishes the domains that certificate covers,
+            // whichever door made the attachment.
+            if let Some(attachment) = attachment {
+                distribution.attach_certificate(attachment);
+            }
+            store.insert_distribution(distribution);
             let view = store
                 .distribution(&name)
                 .expect("the distribution this call just stored is in the store")

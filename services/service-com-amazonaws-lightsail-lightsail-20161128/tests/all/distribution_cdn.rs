@@ -778,10 +778,19 @@ fn assert_record(row: &Row, distribution: &Value, balancer_dns: &str, created_af
         "case {case}: a distribution that has never been moved between bundles can be, \
          got {distribution:?}"
     );
+    // The domains a distribution accepts HTTPS traffic for are the ones the
+    // certificate it names covers, and a distribution that names no certificate
+    // of its own publishes none. Every certificate these rows name is requested
+    // for `<certificate name>.example.com` alone — see `create_row_certificates`.
+    let expected_domains: Vec<Value> = row
+        .certificate_name
+        .map(|name| vec![json!(format!("{name}.example.com"))])
+        .unwrap_or_default();
     assert_eq!(
         distribution["alternativeDomainNames"],
-        json!([]),
-        "case {case}: a created distribution has no alternate domain names of its own, got {:?}",
+        Value::Array(expected_domains.clone()),
+        "case {case}: expected the domains of the certificate the create named, \
+         {expected_domains:?}, got {:?}",
         distribution["alternativeDomainNames"]
     );
 }

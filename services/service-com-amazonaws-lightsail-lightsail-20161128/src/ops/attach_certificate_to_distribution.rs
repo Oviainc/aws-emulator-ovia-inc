@@ -206,14 +206,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // HTTPS traffic the distribution could accept with it), are both
             // refused by the store's one owner of that rule — the same rule
             // `CreateDistribution` applies to the certificate its request names.
-            let certificate = store
+            // What it answers is the attachment itself, the certificate together
+            // with the domains it publishes on the distribution: "After the
+            // certificate is attached, your distribution accepts HTTPS traffic
+            // for all of the domains that are associated with the certificate."
+            let attachment = store
                 .issued_certificate(&certificate_name)
-                .map_err(|refusal| certificate_refusal(&certificate_name, refusal))?;
-            // The domains the attachment publishes on the distribution: "After
-            // the certificate is attached, your distribution accepts HTTPS
-            // traffic for all of the domains that are associated with the
-            // certificate."
-            let alternative_domain_names = certificate.domain_names();
+                .map_err(|refusal| certificate_refusal(&certificate_name, refusal))?
+                .distribution_attachment();
 
             // The attachment itself, on the one distribution the name
             // addresses — a name this account holds no distribution under is
@@ -236,8 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &distribution_name,
                 )
             })?;
-            distribution.certificate_name = Some(certificate_name.clone());
-            distribution.alternative_domain_names = alternative_domain_names;
+            distribution.attach_certificate(attachment);
             distribution.status = crate::state::DISTRIBUTION_STATUS_IN_PROGRESS;
             // This rollout replaces any the distribution was still owed: a
             // configuration change starts the deployment again, so the instant

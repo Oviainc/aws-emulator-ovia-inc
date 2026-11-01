@@ -144,7 +144,7 @@ const ROWS: &[Row] = &[
         wait_deployed: true,
     },
     Row {
-        case: "a certificate the create named, which published no domains",
+        case: "a certificate the create named, whose domains the create published",
         distribution_name: "create-detach-cdn",
         bundle_id: "small_1_0",
         origin_name: "detach-origin-create",
@@ -152,7 +152,10 @@ const ROWS: &[Row] = &[
         domain: "create.detach.example.com",
         alternatives: &["www.create.detach.example.com"],
         attached_by: AttachedBy::CreateTime,
-        published_before: &[],
+        published_before: &[
+            "create.detach.example.com",
+            "www.create.detach.example.com",
+        ],
         wait_deployed: true,
     },
     Row {

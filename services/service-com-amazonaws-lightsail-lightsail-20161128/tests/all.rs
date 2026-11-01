@@ -159,6 +159,8 @@ mod distribution_cdn;
 mod distribution_certificate_attachment;
 #[path = "all/distribution_certificate_detach.rs"]
 mod distribution_certificate_detach;
+#[path = "all/distribution_create_certificate_domains.rs"]
+mod distribution_create_certificate_domains;
 #[path = "all/distribution_create_certificate_validation.rs"]
 mod distribution_create_certificate_validation;
 #[path = "all/distribution_custom_error_page_path.rs"]

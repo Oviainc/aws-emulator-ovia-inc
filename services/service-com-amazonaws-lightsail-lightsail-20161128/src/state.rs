@@ -12946,6 +12946,20 @@ impl StoredCertificate {
         names
     }
 
+    /// This certificate as the attachment a distribution serves HTTPS traffic
+    /// through: the name the distribution reports as its `certificateName`,
+    /// together with every domain this certificate covers.
+    ///
+    /// Read off ONE certificate at once, so the two halves of the attachment
+    /// cannot come from different places, and applied by
+    /// [`StoredDistribution::attach_certificate`].
+    pub fn distribution_attachment(&self) -> DistributionCertificateAttachment {
+        DistributionCertificateAttachment {
+            certificate_name: self.name.clone(),
+            alternative_domain_names: self.domain_names(),
+        }
+    }
+
     /// This record as the modelled `CertificateSummary`.
     ///
     /// `in_use_resource_count` is how many resources the certificate is attached
@@ -13490,7 +13504,41 @@ pub struct StoredDistribution {
     pub latest_cache_reset: Option<StoredCacheReset>,
 }
 
+/// The attachment of one SSL/TLS certificate to a distribution: the certificate
+/// the distribution names, and the domains it accepts HTTPS traffic for.
+///
+/// The pair travels as ONE value — built from the certificate itself by
+/// [`StoredCertificate::distribution_attachment`] and applied by
+/// [`StoredDistribution::attach_certificate`] — so no caller can record the
+/// certificate without the domains it covers.
+#[derive(Debug, Clone)]
+pub struct DistributionCertificateAttachment {
+    /// The certificate's own name, as this account addresses it.
+    certificate_name: String,
+    /// Every domain that certificate covers, from
+    /// [`StoredCertificate::domain_names`].
+    alternative_domain_names: Vec<String>,
+}
+
 impl StoredDistribution {
+    /// Record the SSL/TLS certificate `attachment` on this distribution, so it
+    /// names that certificate and publishes every domain the certificate covers
+    /// — the ONE owner of that rule.
+    ///
+    /// The domains a distribution accepts HTTPS traffic for come from the
+    /// certificate attached to it ("your distribution accepts HTTPS traffic for
+    /// all of the domains that are associated with the certificate"), so making
+    /// the attachment writes BOTH members, never one without the other. Every
+    /// operation that attaches one — the create that names a certificate for a
+    /// new distribution as much as the attach and the update that set one later
+    /// — asks here, so the attachment cannot drift between them. A distribution
+    /// holds ONE attached certificate, so this replaces whatever was attached
+    /// before.
+    pub fn attach_certificate(&mut self, attachment: DistributionCertificateAttachment) {
+        self.certificate_name = Some(attachment.certificate_name);
+        self.alternative_domain_names = attachment.alternative_domain_names;
+    }
+
     /// Release the SSL/TLS certificate this distribution serves HTTPS traffic
     /// with, so it names none and publishes none of that certificate's domains —
     /// the ONE owner of that rule.
@@ -13500,12 +13548,10 @@ impl StoredDistribution {
     /// from the certificate attached to it ("your distribution accepts HTTPS
     /// traffic for all of the domains that are associated with the
     /// certificate"), so releasing the attachment clears BOTH members, never
-    /// one without the other. Every operation that releases the attachment asks
-    /// here, so the release cannot drift between them. (The reverse direction —
-    /// a certificate the request named at CREATE time, which
-    /// `CreateDistribution` records without publishing its domains — is that
-    /// operation's own business, not this release's.) Idempotent: a
-    /// distribution that has no certificate attached already
+    /// one without the other — the exact reverse of
+    /// [`Self::attach_certificate`]. Every operation that releases the
+    /// attachment asks here, so the release cannot drift between them.
+    /// Idempotent: a distribution that has no certificate attached already
     /// satisfies it.
     pub fn detach_certificate(&mut self) {
         self.certificate_name = None;

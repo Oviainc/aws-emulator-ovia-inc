@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 // standing up a second one.
 use crate::disk_attachment::create_running_instance;
 use crate::distribution_certificate_attachment::{
-    certificate, create_certificate, wait_for_issued_certificate,
+    certificate, create_certificate, string_list, wait_for_issued_certificate,
 };
 use crate::instance_lifecycle::{error_code, Emulator};
 
@@ -413,7 +413,10 @@ const SERVED: &[Served] = &[
 
 /// RULE: the same check serves the create that names a certificate this account
 /// holds and has had issued — the stored distribution reports that name on every
-/// later read, and the certificate counts the one distribution naming it.
+/// later read, publishes the domains that certificate covers, and the
+/// certificate counts the one distribution naming it. The domains themselves,
+/// and the parity with the attach and the update, are
+/// `distribution_create_certificate_domains.rs`'s.
 #[tokio::test]
 async fn creating_a_distribution_naming_an_issued_certificate_is_served() {
     let emulator = Emulator::new();
@@ -444,17 +447,25 @@ async fn creating_a_distribution_naming_an_issued_certificate_is_served() {
             "case {case}: expected the certificate the create named to be {want:?}, got \
              {created:?}"
         );
-        // The domains a certificate covers are published on the distribution by
-        // `AttachCertificateToDistribution`, which is the operation that makes
-        // the attachment, so a create publishes none — pinned in
-        // `distribution_certificate_attachment.rs`.
-        let published = created["alternativeDomainNames"]
-            .as_array()
-            .map(Vec::len)
+        // The domains the create published: a certificate the request names is
+        // the one "you want to attach to the distribution", and an attached
+        // certificate is what the distribution accepts HTTPS traffic for the
+        // domains of, so the create publishes exactly the domains that
+        // certificate covers — its `domainName` first, then its alternate
+        // domains — and a create that names no certificate publishes none.
+        let want_domains: Vec<String> = served
+            .certificate
+            .map(|(_, domain, alternatives)| {
+                let mut domains = vec![domain.to_string()];
+                domains.extend(alternatives.iter().map(|name| (*name).to_string()));
+                domains
+            })
             .unwrap_or_default();
+        let published = string_list(&created["alternativeDomainNames"]);
         assert_eq!(
-            published, 0,
-            "case {case}: expected a create to publish no alternate domain name, got {created:?}"
+            published, want_domains,
+            "case {case}: expected the create to publish the domains of the certificate it \
+             named, {want_domains:?}, got {created:?}"
         );
 
         // The round trip: what the create stored is what a later read reports.
@@ -472,6 +483,12 @@ async fn creating_a_distribution_naming_an_issued_certificate_is_served() {
             stored["certificateName"].as_str(),
             want,
             "case {case}: expected the read to report the certificate {want:?}, got {stored:?}"
+        );
+        let stored_domains = string_list(&stored["alternativeDomainNames"]);
+        assert_eq!(
+            stored_domains, want_domains,
+            "case {case}: expected the read to report the domains {want_domains:?} the create \
+             published, got {stored:?}"
         );
 
         if let Some((name, _, _)) = served.certificate {

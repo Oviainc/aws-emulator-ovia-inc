@@ -359,16 +359,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // account holds and one the certificate authority has already issued
             // — the same rule `AttachCertificateToDistribution` and
             // `CreateDistribution` apply, asked of the store's one owner of it.
-            // The domains the attachment publishes are the certificate's: the
-            // distribution "accepts HTTPS traffic for all of the domains that are
+            // What it answers is the attachment itself, because the domains the
+            // attachment publishes are the certificate's: the distribution
+            // "accepts HTTPS traffic for all of the domains that are
             // associated with the certificate".
-            let attached_domain_names = match &input.certificate_name {
+            let attachment = match &input.certificate_name {
                 None => None,
                 Some(certificate_name) => Some(
                     store
                         .issued_certificate(certificate_name)
                         .map_err(|refusal| certificate_refusal(certificate_name, refusal))?
-                        .domain_names(),
+                        .distribution_attachment(),
                 ),
             };
 
@@ -444,25 +445,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(default_root_object) = input.default_root_object {
                 distribution.default_root_object = Some(default_root_object);
             }
-            match (input.certificate_name, attached_domain_names) {
+            match attachment {
                 // A certificate of the account, with the domains it covers — the
-                // same attachment `AttachCertificateToDistribution` makes.
-                (Some(certificate_name), Some(domain_names)) => {
-                    distribution.certificate_name = Some(certificate_name);
-                    distribution.alternative_domain_names = domain_names;
+                // same attachment `AttachCertificateToDistribution` and
+                // `CreateDistribution` make, through the crate's one owner of
+                // that pair.
+                Some(attachment) => {
+                    distribution.attach_certificate(attachment);
                 }
                 // "Indicates whether the default SSL/TLS certificate is attached
                 // to the distribution. [...] When true, the distribution uses the
                 // default domain name" — so the distribution stops naming a
                 // certificate of its own, and with it the domains that
                 // certificate published.
-                _ if input.use_default_certificate == Some(true) => {
+                None if input.use_default_certificate == Some(true) => {
                     distribution.detach_certificate();
                 }
                 // A request that names no certificate and does not ask for the
                 // default one says nothing about the certificate, so the
                 // distribution keeps the one it is serving HTTPS traffic with.
-                _ => {}
+                None => {}
             }
 
             // Changing a distribution's configuration IS a rollout to the edge
