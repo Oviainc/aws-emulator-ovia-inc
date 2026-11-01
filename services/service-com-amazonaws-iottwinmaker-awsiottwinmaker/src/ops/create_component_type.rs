@@ -28,10 +28,12 @@
 //! * the workspace already holds
 //!   [`crate::state::MAX_COMPONENT_TYPES_PER_WORKSPACE`] component types the
 //!   caller created — the modelled `ServiceQuotaExceededException`;
-//! * a property definition of a component type that extends nothing carries no
-//!   `dataType` — a `ValidationException`, because `dataType` is required on
-//!   the `PropertyDefinitionResponse` a read reports and there is no parent
-//!   definition to inherit it from;
+//! * a property definition carries no `dataType` and inherits none — the
+//!   component type extends nothing, or no component type on its `extendsFrom`
+//!   chain declares that property with a `dataType` — a `ValidationException`,
+//!   because `dataType` is required on the `PropertyDefinitionResponse` a read
+//!   reports, so there would be nothing to resolve it from (the rule
+//!   [`crate::state::Workspace::stranded_property_definition`]);
 //! * a reference the request DECLARES does not resolve — an `extendsFrom` or
 //!   `compositeComponentTypes[*].componentTypeId` id naming a component type
 //!   the service does not hold, inheritance that names the component type being
@@ -54,10 +56,10 @@
 //!   inheritance cycle no chain can be walked up, which is why the two members
 //!   differ on a self-reference.
 //!
-//! The declared references are resolved BEFORE the `dataType` rule, because a
-//! non-empty `extendsFrom` is what licenses a `PropertyDefinitionRequest`
-//! carrying no `dataType`: a parent that does not resolve would otherwise
-//! license a definition whose `dataType` can never be resolved from anywhere.
+//! The declared references are resolved BEFORE the `dataType` rule, because the
+//! `extendsFrom` chain is what a `PropertyDefinitionRequest` carrying no
+//! `dataType` inherits one through: a parent that does not resolve would
+//! otherwise be asked for a definition it could never contribute.
 //!
 //! Authorization is not emulated, so the modelled `AccessDeniedException` is
 //! never returned.
@@ -339,10 +341,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reference — the integrity `DeleteComponentType` already relies on in
         // the other direction.
         //
-        // Resolved BEFORE the `dataType` rule below, because a non-empty
-        // `extendsFrom` is what licenses a definition carrying no `dataType`:
-        // a parent that does not resolve would otherwise license a definition
-        // whose `dataType` can never be resolved from anywhere.
+        // Resolved BEFORE the `dataType` rule below, because the `extendsFrom`
+        // chain is what a definition carrying no `dataType` inherits one
+        // through: a parent that does not resolve would otherwise be asked for
+        // a definition it could never contribute.
         if let Some(message) =
             crate::state::extends_from_violation(workspace, &input.component_type_id, &extends_from)
         {
@@ -357,19 +359,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // `dataType` is optional on `PropertyDefinitionRequest` but REQUIRED on
         // the `PropertyDefinitionResponse` a read reports, so a definition may
-        // omit it only where it refines one it inherits — the rule
-        // `crate::state::property_definition_needs_data_type` holds for every
-        // writer of a definition. Walked in property-NAME order, so a request
-        // carrying more than one definition without a `dataType` is always
-        // refused for the first of them in key order, exactly as the sibling
-        // `UpdateComponentType` refuses it.
-        for (property_name, definition) in &property_definitions {
-            if crate::state::property_definition_needs_data_type(&extends_from, definition) {
-                return Err(validation_exception(format!(
-                    "propertyDefinitions.{property_name}.dataType is required for a \
-                     component type that extends nothing"
-                )));
-            }
+        // omit it only where it REFINES one the declared inheritance brings for
+        // the same property — the rule
+        // `crate::state::Workspace::stranded_property_definition` holds for
+        // every writer of a definition, asked of the whole requested map in ONE
+        // walk of the declared chain. Walked in property-NAME order, so a
+        // request carrying more than one definition without a `dataType` is
+        // always refused for the first of them in key order, exactly as the
+        // sibling `UpdateComponentType` refuses it.
+        if let Some(property_name) = workspace.stranded_property_definition(
+            &extends_from,
+            property_definitions
+                .iter()
+                .map(|(property_name, definition)| (property_name.as_str(), definition)),
+        ) {
+            return Err(validation_exception(
+                crate::state::property_definition_needs_data_type_message(property_name),
+            ));
         }
 
         let arn = crate::state::component_type_arn(

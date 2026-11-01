@@ -29,11 +29,14 @@
 //!   `GetComponentType` gives the same two labels, since both address a
 //!   resource that must already exist;
 //! * the patched component type would hold a property definition with no
-//!   `dataType` while extending nothing — a `ValidationException`, the rule
-//!   [`crate::state::property_definition_needs_data_type`] holds for every
+//!   `dataType` that inherits none — it extends nothing, or no component type
+//!   on its `extendsFrom` chain declares that property with a `dataType` — a
+//!   `ValidationException`, the rule
+//!   [`crate::state::Workspace::stranded_property_definition`] holds for every
 //!   writer of a definition. Checked over the WHOLE patched record, because an
-//!   update that clears `extendsFrom` takes away the inheritance an older
-//!   definition was relying on;
+//!   update that clears or re-points `extendsFrom` takes away the inheritance
+//!   an older definition was relying on, and asked whenever the request touches
+//!   either input of the rule;
 //! * a reference the update DECLARES does not resolve — an `extendsFrom` or
 //!   `compositeComponentTypes[*].componentTypeId` id naming a component type
 //!   the service does not hold, inheritance that reaches back to the component
@@ -395,16 +398,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Every definition the patched record would hold has to be reportable,
-        // not just the ones this request carried: an update that clears
-        // `extendsFrom` takes the inheritance an older definition was relying
-        // on away with it.
-        for (property_name, definition) in &updated.property_definitions {
-            if crate::state::property_definition_needs_data_type(&updated.extends_from, definition)
-            {
-                return Err(validation_exception(format!(
-                    "propertyDefinitions.{property_name}.dataType is required for a component \
-                     type that extends nothing"
-                )));
+        // not just the ones this request carried: an update that clears or
+        // re-points `extendsFrom` takes the inheritance an older definition was
+        // relying on away with it. Asked whenever the request touches either
+        // input of the rule — the definitions themselves or the inheritance
+        // they resolve a `dataType` through — and skipped otherwise, exactly as
+        // the property-group rule above is, because a patch that leaves both
+        // alone leaves the answer the stored record was already held to.
+        if declares_property_definitions || declares_extends_from {
+            if let Some(property_name) = workspace.stranded_property_definition(
+                &updated.extends_from,
+                updated
+                    .property_definitions
+                    .iter()
+                    .map(|(property_name, definition)| (property_name.as_str(), definition)),
+            ) {
+                return Err(validation_exception(
+                    crate::state::property_definition_needs_data_type_message(property_name),
+                ));
             }
         }
 

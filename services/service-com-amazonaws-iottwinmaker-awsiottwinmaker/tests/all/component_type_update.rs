@@ -84,15 +84,21 @@ async fn baseline_emulator() -> Emulator {
         200,
         "the workspace the cases are created in must exist"
     );
-    for referenced in [
-        "com.example.parent",
-        "com.example.other",
-        "com.example.outlet",
-        "com.example.inlet",
+    for (referenced, body) in [
+        ("com.example.parent", json!({})),
+        ("com.example.other", json!({})),
+        ("com.example.outlet", json!({})),
+        ("com.example.inlet", json!({})),
+        // The one parent that DECLARES a property, so a child may refine it
+        // without restating its `dataType`.
+        (
+            "com.example.declarer",
+            json!({"propertyDefinitions": {"inheritedOnly": {"dataType": {"type": "STRING"}}}}),
+        ),
     ] {
         assert_eq!(
             emulator
-                .create_component_type(WORKSPACE, referenced, json!({}))
+                .create_component_type(WORKSPACE, referenced, body)
                 .await
                 .status,
             200,
@@ -608,10 +614,20 @@ async fn a_patch_that_would_leave_an_unreportable_definition_is_refused() {
         (
             "extendsFrom cleared under an untyped definition",
             json!({
-                "extendsFrom": ["com.example.parent"],
+                "extendsFrom": ["com.example.declarer"],
                 "propertyDefinitions": {"inheritedOnly": {"displayName": "Inherited"}},
             }),
             json!({"extendsFrom": []}),
+        ),
+        (
+            // The inheritance is not cleared but RE-POINTED at a parent that
+            // declares nothing, which takes the same `dataType` away.
+            "extendsFrom re-pointed away from the parent that declared it",
+            json!({
+                "extendsFrom": ["com.example.declarer"],
+                "propertyDefinitions": {"inheritedOnly": {"displayName": "Inherited"}},
+            }),
+            json!({"extendsFrom": ["com.example.other"]}),
         ),
     ];
 

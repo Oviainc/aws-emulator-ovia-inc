@@ -1448,6 +1448,73 @@ impl Workspace {
         (names, holds_unstored)
     }
 
+    /// The first property, in property-NAME order, whose definition a component
+    /// type that `extends_from` these parents would hold with no `dataType` at
+    /// all — `None` when every definition it would hold is one a read can
+    /// report.
+    ///
+    /// `dataType` is optional on `PropertyDefinitionRequest` but REQUIRED on the
+    /// `PropertyDefinitionResponse` a read reports (see
+    /// [`property_definition_response`]), so a declaration may omit it only
+    /// where it REFINES one it inherits: some component type the `extendsFrom`
+    /// chain reaches declares the SAME property name with a `dataType`, which is
+    /// the value [`refined_property_definition`] would fold out for it (that
+    /// fold takes `dataType` from the nearest declaration that sets one, so some
+    /// declaration setting one is exactly the question). A component type that
+    /// extends nothing inherits nothing, and one that extends something
+    /// inherits nothing for a name no component type on its chain declares with
+    /// a `dataType`: in either case a writer refuses the request rather than
+    /// storing a definition a reader would have to drop. Where the chain
+    /// reaches a built-in type this emulator does not model, it does not hold
+    /// that type's declarations, so a `dataType` it cannot find there cannot be
+    /// called uninherited and every definition stands — the same stand-down the
+    /// sibling rule [`property_groups_violation`] makes on the same unknowable
+    /// chain.
+    ///
+    /// Asked of the WHOLE set of definitions the component type would hold
+    /// rather than of one of them, because `extends_from` is the other input and
+    /// it is the same for every definition in the set: the inheritance chain is
+    /// therefore resolved ONCE per request, by the single walk every reader of
+    /// inherited structure shares, and each definition is then answered by a
+    /// lookup in what that walk reached. Walked in name order, the way
+    /// every writer of a requested map walks one ([`requested_in_key_order`]),
+    /// so a record holding more than one such definition is always refused for
+    /// the same one. Shared by every writer of a COMPONENT TYPE's definitions so
+    /// a create and an update hold one definition to one rule; the same question
+    /// about a COMPONENT's definition, whose inheritance runs through the
+    /// component type it instantiates rather than through `extendsFrom`, is
+    /// [`stranded_component_property_definition`](Self::stranded_component_property_definition).
+    pub fn stranded_property_definition<'definitions>(
+        &self,
+        extends_from: &[String],
+        definitions: impl IntoIterator<
+            Item = (
+                &'definitions str,
+                &'definitions crate::ops::types::PropertyDefinitionRequest,
+            ),
+        >,
+    ) -> Option<&'definitions str> {
+        let (chain, _, inherits_unknown_definitions) =
+            self.component_type_closure(extends_from.iter().cloned());
+        if inherits_unknown_definitions {
+            return None;
+        }
+        definitions
+            .into_iter()
+            .find_map(|(property_name, definition)| {
+                if definition.data_type.is_some() {
+                    return None;
+                }
+                let inherits_data_type = chain.iter().any(|ancestor| {
+                    ancestor
+                        .property_definitions
+                        .get(property_name)
+                        .is_some_and(|declared| declared.data_type.is_some())
+                });
+                (!inherits_data_type).then_some(property_name)
+            })
+    }
+
     /// Every id that some stored entity names as its parent, in ONE pass.
     ///
     /// A listing needs `hasChildEntities` for each entity it reports; asking
@@ -1627,10 +1694,10 @@ impl Workspace {
     /// would have to drop.
     ///
     /// The component-level counterpart of
-    /// [`property_definition_needs_data_type`], which asks the same question of
-    /// a component TYPE's own definitions; shared by every writer of a
-    /// component's definition so a create and an update hold one definition to
-    /// one rule.
+    /// [`stranded_property_definition`](Self::stranded_property_definition),
+    /// which asks the same question of a component TYPE's own definitions;
+    /// shared by every writer of a component's definition so a create and an
+    /// update hold one definition to one rule.
     pub fn component_property_definition_needs_data_type(
         &self,
         component_type_id: Option<&str>,
@@ -2671,25 +2738,12 @@ pub fn component_property_groups_response(
         .collect()
 }
 
-/// Whether storing this property definition would leave a component type that
-/// `extends_from` these parents holding a definition no read can report.
-///
-/// `dataType` is optional on `PropertyDefinitionRequest` but REQUIRED on the
-/// `PropertyDefinitionResponse` a read reports (see
-/// [`property_definition_response`]), so a definition may omit it only where it
-/// refines one it inherits. A component type that extends nothing inherits
-/// nothing, so each of its own definitions must carry one, and a writer refuses
-/// the request rather than storing a definition a reader would have to drop.
-/// Shared by every writer of a COMPONENT TYPE's definitions so a create and an
-/// update hold one definition to one rule; the same question about a
-/// COMPONENT's definition, whose inheritance runs through the component type it
-/// instantiates rather than through `extendsFrom`, is
-/// [`Workspace::component_property_definition_needs_data_type`].
-pub fn property_definition_needs_data_type(
-    extends_from: &[String],
-    definition: &crate::ops::types::PropertyDefinitionRequest,
-) -> bool {
-    extends_from.is_empty() && definition.data_type.is_none()
+/// How a writer refuses a property definition
+/// [`Workspace::stranded_property_definition`] names, so a create and an update
+/// word one rule one way — and the same way the component-level writers word
+/// theirs.
+pub fn property_definition_needs_data_type_message(property_name: &str) -> String {
+    format!("propertyDefinitions.{property_name}.dataType is required")
 }
 
 /// The names under which a component type's `functions` map carries a DATA
@@ -3264,10 +3318,10 @@ pub fn property_groups_violation(workspace: &Workspace, record: &ComponentType) 
 /// may REFINE an inherited definition — restate only the members it changes,
 /// `dataType` included — rather than replace it, which is exactly why a writer
 /// accepts a definition without a `dataType` wherever one is inherited
-/// ([`property_definition_needs_data_type`]). A reader therefore folds the whole
-/// set of declarations that reach a property instead of taking the nearest one
-/// whole, so the definition it reports carries the refined members and the
-/// inherited values of everything the refinement left alone.
+/// ([`Workspace::stranded_property_definition`]). A reader therefore folds the
+/// whole set of declarations that reach a property instead of taking the
+/// nearest one whole, so the definition it reports carries the refined members
+/// and the inherited values of everything the refinement left alone.
 ///
 /// Shared by every resolver of a definition — a component's
 /// ([`Workspace::effective_property_definition`]) and a component type's own —

@@ -722,8 +722,8 @@ async fn a_component_type_request_the_service_cannot_serve_is_refused() {
     }
 
     // `dataType` is required on the definition a read reports, so a definition
-    // that omits it is refused unless the component type has a parent to
-    // inherit one from.
+    // that omits it is refused unless the same property reaches the component
+    // type with one through its `extendsFrom` chain.
     let definitions = json!({"propertyDefinitions": {"untyped": {"isTimeSeries": true}}});
     let refused = emulator
         .create_component_type("refusalWorkspace", "com.example.untyped", definitions.clone())
@@ -748,15 +748,42 @@ async fn a_component_type_request_the_service_cannot_serve_is_refused() {
         "case \"no dataType, no parent\": a refused create persists nothing, got {gone:?}"
     );
 
+    // A parent that does not declare the property brings no `dataType` for it,
+    // so naming one changes nothing: the definition is still unreportable.
+    let mut stranded = definitions.clone();
+    stranded["extendsFrom"] = json!(["com.example.present"]);
+    let refused = emulator
+        .create_component_type("refusalWorkspace", "com.example.stranded", stranded)
+        .await;
+    assert_eq!(
+        (refused.status, refused.error_type.as_deref()),
+        (400, Some("ValidationException")),
+        "case \"no dataType, a parent that does not declare it\": expected the modelled refusal, \
+         got {refused:?}"
+    );
+
+    // The parent that DOES declare it is what the definition refines.
+    assert_eq!(
+        emulator
+            .create_component_type(
+                "refusalWorkspace",
+                "com.example.declaresUntyped",
+                json!({"propertyDefinitions": {"untyped": {"dataType": {"type": "BOOLEAN"}}}}),
+            )
+            .await
+            .status,
+        200,
+        "the parent the refining definition inherits from must exist"
+    );
     let mut inheriting = definitions;
-    inheriting["extendsFrom"] = json!(["com.example.present"]);
+    inheriting["extendsFrom"] = json!(["com.example.declaresUntyped"]);
     let accepted = emulator
         .create_component_type("refusalWorkspace", "com.example.inheriting", inheriting)
         .await;
     assert_eq!(
         accepted.status, 200,
-        "case \"no dataType, with a parent\": the definition may refine an inherited one, \
-         got {accepted:?}"
+        "case \"no dataType, with a parent that declares it\": the definition may refine an \
+         inherited one, got {accepted:?}"
     );
 }
 

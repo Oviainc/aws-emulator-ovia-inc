@@ -65,6 +65,9 @@ mod component_type_listing;
 #[path = "all/component_type_repoint.rs"]
 mod component_type_repoint;
 
+#[path = "all/component_type_untyped_property_definition.rs"]
+mod component_type_untyped_property_definition;
+
 #[path = "all/component_type_update.rs"]
 mod component_type_update;
 
