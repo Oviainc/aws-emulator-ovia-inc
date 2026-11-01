@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomDataIdentifier
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCustomDataIdentifier`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCustomDataIdentifier::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a custom data identifier in `crate::state`, with every
+//! member of the request stored, and reports the id it assigned.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +188,518 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCustomDataIdentifier` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCustomDataIdentifierErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCustomDataIdentifier"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateCustomDataIdentifierErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the custom data identifier store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // A custom data identifier belongs to one region: the region the create
+        // addressed, which is also the region in its ARN.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // Every documented bound is checked BEFORE the store is touched, so a
+        // refused request leaves nothing behind. The `regex` itself is stored
+        // as sent and never compiled: a pattern an untrusted caller chose is
+        // not something to hand a matching engine on the request path.
+        if let Some(message) = documented_violation(&input) {
+            return Err(CreateCustomDataIdentifierErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut state = store.lock();
+
+        if state.session(&region).is_none() {
+            return Err(CreateCustomDataIdentifierErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A retry carrying the same `clientToken` replays the identifier that
+        // token minted instead of minting a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            let replay_key = crate::state::idempotency_key(&region, Self::NAME, token);
+            if let Some(minted) = state.idempotency.get(&replay_key).cloned() {
+                if state.identifier(&region, &minted).is_some() {
+                    return Ok(CreateCustomDataIdentifierOutput {
+                        custom_data_identifier_id: Some(minted),
+                    });
+                }
+                // The identifier that token minted is gone, so the token
+                // replays nothing.
+                state.idempotency.remove(&replay_key);
+            }
+        }
+
+        // The EMULATOR's own bound on the registry, reported through the quota
+        // error this operation models: without it a caller could grow one
+        // process's heap without limit.
+        if state.custom_data_identifiers.len() >= crate::state::MAX_CUSTOM_DATA_IDENTIFIERS {
+            return Err(
+                CreateCustomDataIdentifierErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "This emulator holds the maximum of {} custom data identifiers. \
+                             Delete a custom data identifier before creating another.",
+                            crate::state::MAX_CUSTOM_DATA_IDENTIFIERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = crate::state::new_resource_id(state.next_id_seed(), now);
+        let identifier = crate::state::CustomDataIdentifier {
+            arn: crate::state::custom_data_identifier_arn(&region, &id),
+            id: id.clone(),
+            region: region.clone(),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            regex: input.regex.clone(),
+            keywords: input.keywords.clone().unwrap_or_default(),
+            ignore_words: input.ignore_words.clone().unwrap_or_default(),
+            // The member carries a documented default, so the service applies
+            // it and later reads report the distance that is in effect.
+            maximum_match_distance: input
+                .maximum_match_distance
+                .unwrap_or(crate::state::DEFAULT_MAXIMUM_MATCH_DISTANCE),
+            severity_levels: input.severity_levels.clone().unwrap_or_default(),
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<_, _>>(),
+            created_at: now,
+            deleted: false,
+        };
+
+        if let Some(token) = input.client_token.as_deref() {
+            let replay_key = crate::state::idempotency_key(&region, Self::NAME, token);
+            state.idempotency.insert(replay_key, id.clone());
+        }
+        state.custom_data_identifiers.insert(id.clone(), identifier);
+
+        Ok(CreateCustomDataIdentifierOutput {
+            custom_data_identifier_id: Some(id),
+        })
+    }
+}
+
+/// The first documented bound `input` breaks, worded for the caller, or `None`
+/// when it breaks none.
+///
+/// Each bound comes from the member's own documentation in this service's
+/// Smithy model; none of them is expressible as a modelled constraint, so the
+/// boundary validator passes them all and this is where they are refused. The
+/// constants are in `crate::state`, each citing the sentence it comes from.
+fn documented_violation(input: &CreateCustomDataIdentifierInput) -> Option<String> {
+    let name_chars = input.name.chars().count();
+    if name_chars == 0 {
+        return Some("The name must contain at least one character.".to_string());
+    }
+    if name_chars > crate::state::MAX_NAME_CHARS {
+        return Some(format!(
+            "The name can contain as many as {} characters.",
+            crate::state::MAX_NAME_CHARS
+        ));
+    }
+
+    let regex_chars = input.regex.chars().count();
+    if regex_chars == 0 {
+        return Some("The regex must contain at least one character.".to_string());
+    }
+    if regex_chars > crate::state::MAX_REGEX_CHARS {
+        return Some(format!(
+            "The regex can contain as many as {} characters.",
+            crate::state::MAX_REGEX_CHARS
+        ));
+    }
+
+    if let Some(description) = input.description.as_deref() {
+        if description.chars().count() > crate::state::MAX_DESCRIPTION_CHARS {
+            return Some(format!(
+                "The description can contain as many as {} characters.",
+                crate::state::MAX_DESCRIPTION_CHARS
+            ));
+        }
+    }
+
+    if let Some(keywords) = input.keywords.as_deref() {
+        if keywords.len() > crate::state::MAX_KEYWORDS {
+            return Some(format!(
+                "The keywords array can contain as many as {} keywords.",
+                crate::state::MAX_KEYWORDS
+            ));
+        }
+        if keywords.iter().any(|keyword| {
+            !(crate::state::MIN_KEYWORD_CHARS..=crate::state::MAX_KEYWORD_CHARS)
+                .contains(&keyword.chars().count())
+        }) {
+            return Some(format!(
+                "Each keyword can contain {}-{} UTF-8 characters.",
+                crate::state::MIN_KEYWORD_CHARS,
+                crate::state::MAX_KEYWORD_CHARS
+            ));
+        }
+    }
+
+    if let Some(ignore_words) = input.ignore_words.as_deref() {
+        if ignore_words.len() > crate::state::MAX_IGNORE_WORDS {
+            return Some(format!(
+                "The ignoreWords array can contain as many as {} ignore words.",
+                crate::state::MAX_IGNORE_WORDS
+            ));
+        }
+        if ignore_words.iter().any(|word| {
+            !(crate::state::MIN_IGNORE_WORD_CHARS..=crate::state::MAX_IGNORE_WORD_CHARS)
+                .contains(&word.chars().count())
+        }) {
+            return Some(format!(
+                "Each ignore word can contain {}-{} UTF-8 characters.",
+                crate::state::MIN_IGNORE_WORD_CHARS,
+                crate::state::MAX_IGNORE_WORD_CHARS
+            ));
+        }
+    }
+
+    if let Some(distance) = input.maximum_match_distance {
+        if !(crate::state::MIN_MAXIMUM_MATCH_DISTANCE
+            ..=crate::state::MAX_MAXIMUM_MATCH_DISTANCE)
+            .contains(&distance)
+        {
+            return Some(format!(
+                "The maximumMatchDistance can be {}-{} characters.",
+                crate::state::MIN_MAXIMUM_MATCH_DISTANCE,
+                crate::state::MAX_MAXIMUM_MATCH_DISTANCE
+            ));
+        }
+    }
+
+    if let Some(levels) = input.severity_levels.as_deref() {
+        return severity_levels_violation(levels);
+    }
+
+    None
+}
+
+/// The documented rule for `severityLevels`: as many as three entries, one for
+/// each severity, with the occurrences thresholds "in ascending order by
+/// severity, moving from LOW to HIGH".
+fn severity_levels_violation(levels: &[SeverityLevel]) -> Option<String> {
+    if levels.len() > crate::state::MAX_SEVERITY_LEVELS {
+        return Some(format!(
+            "The severityLevels array can contain as many as {} SeverityLevel objects, \
+             one for each severity.",
+            crate::state::MAX_SEVERITY_LEVELS
+        ));
+    }
+
+    // Each entry's severity is validated against `DataIdentifierSeverity`
+    // before this handler runs, so a rank is always resolvable; `None` would
+    // mean a severity this emulator does not order, which it refuses rather
+    // than silently accepting out of order.
+    let mut ranked: Vec<(usize, i64)> = Vec::with_capacity(levels.len());
+    for level in levels {
+        let Some(rank) = crate::state::severity_rank(&level.severity) else {
+            return Some(format!(
+                "The severity {} is not one of {}.",
+                level.severity,
+                crate::state::SEVERITIES_ASCENDING.join(", ")
+            ));
+        };
+        if ranked.iter().any(|(seen, _)| *seen == rank) {
+            return Some(format!(
+                "The severityLevels array can specify the {} severity only once.",
+                level.severity
+            ));
+        }
+        ranked.push((rank, level.occurrences_threshold));
+    }
+
+    ranked.sort_unstable();
+    if ranked
+        .windows(2)
+        .any(|pair| pair.first().map(|(_, low)| *low) >= pair.last().map(|(_, high)| *high))
+    {
+        return Some(
+            "The occurrences thresholds in the severityLevels array must be in ascending \
+             order by severity, moving from LOW to HIGH."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{documented_violation, CreateCustomDataIdentifierInput, SeverityLevel};
+
+    /// A request inside every documented bound, which each case below then
+    /// breaks in exactly one way.
+    fn valid() -> CreateCustomDataIdentifierInput {
+        CreateCustomDataIdentifierInput {
+            name: "demo".to_string(),
+            regex: "[0-9]+".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The bound checks are a pure function of the request, so the whole class
+    /// is spanned here rather than through the engine: a request inside every
+    /// bound is accepted, and one outside any single bound is refused.
+    #[test]
+    fn every_documented_bound_is_enforced() {
+        assert_eq!(
+            documented_violation(&valid()),
+            None,
+            "case \"inside every bound\": expected no violation, got {:?}",
+            documented_violation(&valid())
+        );
+
+        let accepted: Vec<(&str, CreateCustomDataIdentifierInput)> = vec![
+            (
+                "name at its maximum",
+                CreateCustomDataIdentifierInput {
+                    name: "n".repeat(crate::state::MAX_NAME_CHARS),
+                    ..valid()
+                },
+            ),
+            (
+                "regex at its maximum",
+                CreateCustomDataIdentifierInput {
+                    regex: "x".repeat(crate::state::MAX_REGEX_CHARS),
+                    ..valid()
+                },
+            ),
+            (
+                "keywords at both character bounds",
+                CreateCustomDataIdentifierInput {
+                    keywords: Some(vec![
+                        "k".repeat(crate::state::MIN_KEYWORD_CHARS),
+                        "k".repeat(crate::state::MAX_KEYWORD_CHARS),
+                    ]),
+                    ..valid()
+                },
+            ),
+            (
+                "ignore words at both character bounds",
+                CreateCustomDataIdentifierInput {
+                    ignore_words: Some(vec![
+                        "w".repeat(crate::state::MIN_IGNORE_WORD_CHARS),
+                        "w".repeat(crate::state::MAX_IGNORE_WORD_CHARS),
+                    ]),
+                    ..valid()
+                },
+            ),
+            (
+                "maximumMatchDistance at its minimum",
+                CreateCustomDataIdentifierInput {
+                    maximum_match_distance: Some(crate::state::MIN_MAXIMUM_MATCH_DISTANCE),
+                    ..valid()
+                },
+            ),
+            (
+                "maximumMatchDistance at its maximum",
+                CreateCustomDataIdentifierInput {
+                    maximum_match_distance: Some(crate::state::MAX_MAXIMUM_MATCH_DISTANCE),
+                    ..valid()
+                },
+            ),
+            (
+                "one severity level per severity, ascending",
+                CreateCustomDataIdentifierInput {
+                    severity_levels: Some(vec![
+                        level("HIGH", 100),
+                        level("LOW", 1),
+                        level("MEDIUM", 50),
+                    ]),
+                    ..valid()
+                },
+            ),
+            (
+                "a multi-byte name counted in characters, not bytes",
+                CreateCustomDataIdentifierInput {
+                    name: "é".repeat(crate::state::MAX_NAME_CHARS),
+                    ..valid()
+                },
+            ),
+        ];
+        for (case, input) in accepted {
+            assert_eq!(
+                documented_violation(&input),
+                None,
+                "case {case:?}: expected no violation, got {:?}",
+                documented_violation(&input)
+            );
+        }
+
+        let refused: Vec<(&str, CreateCustomDataIdentifierInput)> = vec![
+            (
+                "empty name",
+                CreateCustomDataIdentifierInput {
+                    name: String::new(),
+                    ..valid()
+                },
+            ),
+            (
+                "name one past its maximum",
+                CreateCustomDataIdentifierInput {
+                    name: "n".repeat(crate::state::MAX_NAME_CHARS + 1),
+                    ..valid()
+                },
+            ),
+            (
+                "empty regex",
+                CreateCustomDataIdentifierInput {
+                    regex: String::new(),
+                    ..valid()
+                },
+            ),
+            (
+                "regex one past its maximum",
+                CreateCustomDataIdentifierInput {
+                    regex: "x".repeat(crate::state::MAX_REGEX_CHARS + 1),
+                    ..valid()
+                },
+            ),
+            (
+                "description one past its maximum",
+                CreateCustomDataIdentifierInput {
+                    description: Some("d".repeat(crate::state::MAX_DESCRIPTION_CHARS + 1)),
+                    ..valid()
+                },
+            ),
+            (
+                "one keyword too many",
+                CreateCustomDataIdentifierInput {
+                    keywords: Some(vec![
+                        "key".to_string();
+                        crate::state::MAX_KEYWORDS + 1
+                    ]),
+                    ..valid()
+                },
+            ),
+            (
+                "a keyword one character short",
+                CreateCustomDataIdentifierInput {
+                    keywords: Some(vec![
+                        "k".repeat(crate::state::MIN_KEYWORD_CHARS - 1),
+                    ]),
+                    ..valid()
+                },
+            ),
+            (
+                "a keyword one character too long",
+                CreateCustomDataIdentifierInput {
+                    keywords: Some(vec![
+                        "k".repeat(crate::state::MAX_KEYWORD_CHARS + 1),
+                    ]),
+                    ..valid()
+                },
+            ),
+            (
+                "one ignore word too many",
+                CreateCustomDataIdentifierInput {
+                    ignore_words: Some(vec![
+                        "word".to_string();
+                        crate::state::MAX_IGNORE_WORDS + 1
+                    ]),
+                    ..valid()
+                },
+            ),
+            (
+                "an ignore word one character short",
+                CreateCustomDataIdentifierInput {
+                    ignore_words: Some(vec![
+                        "w".repeat(crate::state::MIN_IGNORE_WORD_CHARS - 1),
+                    ]),
+                    ..valid()
+                },
+            ),
+            (
+                "an ignore word one character too long",
+                CreateCustomDataIdentifierInput {
+                    ignore_words: Some(vec![
+                        "w".repeat(crate::state::MAX_IGNORE_WORD_CHARS + 1),
+                    ]),
+                    ..valid()
+                },
+            ),
+            (
+                "maximumMatchDistance one below its minimum",
+                CreateCustomDataIdentifierInput {
+                    maximum_match_distance: Some(crate::state::MIN_MAXIMUM_MATCH_DISTANCE - 1),
+                    ..valid()
+                },
+            ),
+            (
+                "maximumMatchDistance one past its maximum",
+                CreateCustomDataIdentifierInput {
+                    maximum_match_distance: Some(crate::state::MAX_MAXIMUM_MATCH_DISTANCE + 1),
+                    ..valid()
+                },
+            ),
+            (
+                "one severity level too many",
+                CreateCustomDataIdentifierInput {
+                    severity_levels: Some(vec![
+                        level("LOW", 1),
+                        level("MEDIUM", 2),
+                        level("HIGH", 3),
+                        level("LOW", 4),
+                    ]),
+                    ..valid()
+                },
+            ),
+            (
+                "the same severity twice",
+                CreateCustomDataIdentifierInput {
+                    severity_levels: Some(vec![level("LOW", 1), level("LOW", 2)]),
+                    ..valid()
+                },
+            ),
+            (
+                "thresholds not ascending by severity",
+                CreateCustomDataIdentifierInput {
+                    severity_levels: Some(vec![level("LOW", 100), level("HIGH", 1)]),
+                    ..valid()
+                },
+            ),
+            (
+                "two severities sharing a threshold",
+                CreateCustomDataIdentifierInput {
+                    severity_levels: Some(vec![level("LOW", 7), level("MEDIUM", 7)]),
+                    ..valid()
+                },
+            ),
+        ];
+        for (case, input) in refused {
+            assert!(
+                documented_violation(&input).is_some(),
+                "case {case:?}: expected a ValidationException message, got None"
+            );
+        }
+    }
+
+    fn level(severity: &str, occurrences_threshold: i64) -> SeverityLevel {
+        SeverityLevel {
+            severity: severity.to_string(),
+            occurrences_threshold,
+        }
     }
 }

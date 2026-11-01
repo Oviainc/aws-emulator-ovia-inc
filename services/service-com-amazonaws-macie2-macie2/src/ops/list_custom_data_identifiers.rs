@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCustomDataIdentifiers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCustomDataIdentifiers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCustomDataIdentifiers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: pages through this region's stored custom data identifiers.
+//! Reporting only — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +152,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCustomDataIdentifiers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCustomDataIdentifiersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCustomDataIdentifiers"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCustomDataIdentifiersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the custom data identifier store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        let state = store.lock();
+        if state.session(&region).is_none() {
+            return Err(ListCustomDataIdentifiersErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A `nextToken` is this operation's own opaque encoding of the cursor,
+        // so one it did not issue names no page and is refused rather than
+        // silently read as "start again".
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match decode_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListCustomDataIdentifiersErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "The nextToken is not a token that this service issued."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        // `maxResults` is a bare `__integer` with neither a modelled range nor
+        // a documented default, so an absent or non-positive value takes the
+        // emulator's default page size and anything larger than its maximum is
+        // capped there: that cap is what bounds the response one small request
+        // can produce.
+        let page_size = match input.max_results {
+            Some(requested) if requested > 0 => usize::try_from(requested)
+                .unwrap_or(crate::state::MAX_PAGE_SIZE)
+                .min(crate::state::MAX_PAGE_SIZE),
+            _ => crate::state::DEFAULT_PAGE_SIZE,
+        };
+
+        // Enumerated in id order, which is the order the registry holds them
+        // in, so the total order a page boundary rests on is stable.
+        let ids: Vec<&str> = state
+            .live_identifiers(&region)
+            .map(|identifier| identifier.id.as_str())
+            .collect();
+        let start = match resume_after.as_deref() {
+            Some(cursor) => ids.partition_point(|id| *id <= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(ids.len());
+        let page = ids.get(start..end).unwrap_or_default();
+
+        let items: Vec<CustomDataIdentifierSummary> = page
+            .iter()
+            .filter_map(|id| state.identifier(&region, id))
+            .map(|identifier| CustomDataIdentifierSummary {
+                arn: Some(identifier.arn.clone()),
+                created_at: Some(crate::state::to_date_time(identifier.created_at)),
+                description: identifier.description.clone(),
+                id: Some(identifier.id.clone()),
+                name: Some(identifier.name.clone()),
+            })
+            .collect();
+
+        // A token only when identifiers remain after this page, so a caller
+        // stops paging exactly when the enumeration is exhausted.
+        let next_token = (end < ids.len())
+            .then(|| page.last().map(|id| encode_next_token(id)))
+            .flatten();
+
+        Ok(ListCustomDataIdentifiersOutput {
+            items: Some(items),
+            next_token,
+        })
+    }
+}
+
+/// Render the page cursor — the id the previous page ended on — as the opaque
+/// `nextToken` the next request replays. `nextToken` is modelled as a bare
+/// string, so the cursor is rendered in hex: an alphabet that survives any
+/// transport and that no client can mistake for a value it may construct
+/// itself.
+fn encode_next_token(id: &str) -> String {
+    hex::encode(id)
+}
+
+/// Read a cursor back out of a `nextToken`. `None` when the token is not one
+/// this operation issued.
+fn decode_next_token(token: &str) -> Option<String> {
+    String::from_utf8(hex::decode(token).ok()?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_next_token, encode_next_token};
+
+    /// A cursor survives the token it is rendered as, and nothing else is read
+    /// as a cursor: the token is this operation's own encoding, so its
+    /// round-trip is pinned here beside it.
+    #[test]
+    fn a_cursor_round_trips_through_its_token() {
+        for (case, id) in [
+            ("a minted id", "abcdefghij0123456789ab"),
+            ("all digits", "0000000000000000000000"),
+            ("all letters", "zzzzzzzzzzzzzzzzzzzzzz"),
+        ] {
+            let token = encode_next_token(id);
+            assert_eq!(
+                decode_next_token(&token).as_deref(),
+                Some(id),
+                "case {case:?}: the cursor must survive its token {token:?}"
+            );
+        }
+
+        for (case, token) in [
+            ("not hex at all", "not-a-token"),
+            ("an odd number of digits", "abc"),
+            ("hex that is not UTF-8", "ff"),
+        ] {
+            assert!(
+                decode_next_token(token).is_none(),
+                "case {case:?}: {token:?} is not a token this operation issued"
+            );
+        }
     }
 }

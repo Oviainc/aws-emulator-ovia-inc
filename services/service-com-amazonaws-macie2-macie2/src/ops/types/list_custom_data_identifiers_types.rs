@@ -25,7 +25,13 @@ pub struct ListCustomDataIdentifiersOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.macie2#CustomDataIdentifierSummary")]
+// `CustomDataIdentifierSummary`'s schema and codec are written out by hand
+// rather than derived with `#[smithy_macros::smithy(shape = ...)]`, because
+// `createdAt` targets `__timestampIso8601` and the derive drops that shape's
+// `@timestampFormat("date-time")`. See `super::date_time_wire` for the whole
+// reason and for when to delete this block; everything else below mirrors the
+// derive exactly, including the `SCHEMA` associated constant that the derived
+// `ListCustomDataIdentifiersOutput` writes each element of `items` against.
 #[derive(Debug, Clone, Default)]
 pub struct CustomDataIdentifierSummary {
     pub arn: Option<String>,
@@ -34,4 +40,102 @@ pub struct CustomDataIdentifierSummary {
     pub id: Option<String>,
     pub name: Option<String>,
 }
+
+impl CustomDataIdentifierSummary {
+    pub const M_ARN: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#CustomDataIdentifierSummary$arn",
+        "arn",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    /// `@timestampFormat("date-time")`, from the `__timestampIso8601` shape it
+    /// targets. THE reason this schema is hand-written.
+    pub const M_CREATED_AT: ::aws_smithy_schema::Schema = super::date_time_wire::date_time_member(
+        "com.amazonaws.macie2#CustomDataIdentifierSummary$createdAt",
+        "createdAt",
+        1,
+    );
+    pub const M_DESCRIPTION: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#CustomDataIdentifierSummary$description",
+        "description",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    pub const M_ID: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#CustomDataIdentifierSummary$id",
+        "id",
+        ::aws_smithy_schema::ShapeType::String,
+        3,
+    );
+    pub const M_NAME: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#CustomDataIdentifierSummary$name",
+        "name",
+        ::aws_smithy_schema::ShapeType::String,
+        4,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.macie2#CustomDataIdentifierSummary",
+            "com.amazonaws.macie2",
+            "CustomDataIdentifierSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ARN,
+            &Self::M_CREATED_AT,
+            &Self::M_DESCRIPTION,
+            &Self::M_ID,
+            &Self::M_NAME,
+        ],
+    );
+}
+
+pub static CUSTOM_DATA_IDENTIFIER_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema =
+    &CustomDataIdentifierSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for CustomDataIdentifierSummary {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.description.as_ref() {
+            s.write_string(&Self::M_DESCRIPTION, value.as_str())?;
+        }
+        if let Some(value) = self.id.as_ref() {
+            s.write_string(&Self::M_ID, value.as_str())?;
+        }
+        if let Some(value) = self.name.as_ref() {
+            s.write_string(&Self::M_NAME, value.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for CustomDataIdentifierSummary {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.arn = Some(d.read_string(&Self::M_ARN)?),
+                Some(1) => out.created_at = Some(d.read_timestamp(&Self::M_CREATED_AT)?),
+                Some(2) => out.description = Some(d.read_string(&Self::M_DESCRIPTION)?),
+                Some(3) => out.id = Some(d.read_string(&Self::M_ID)?),
+                Some(4) => out.name = Some(d.read_string(&Self::M_NAME)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
 

@@ -16,7 +16,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-macie2-macie2.json");
 pub struct GetMacieSessionInput {
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.macie2#GetMacieSessionResponse")]
+// `GetMacieSessionOutput`'s schema and codec are written out by hand rather than
+// derived with `#[smithy_macros::smithy(shape = ...)]`, because `createdAt` and
+// `updatedAt` target `__timestampIso8601` and the derive drops that shape's
+// `@timestampFormat("date-time")`. See `super::date_time_wire` for the whole
+// reason and for when to delete this block; everything else below mirrors the
+// derive exactly.
 #[derive(Debug, Clone, Default)]
 pub struct GetMacieSessionOutput {
     pub created_at: Option<::aws_smithy_types::DateTime>,
@@ -25,4 +30,111 @@ pub struct GetMacieSessionOutput {
     pub status: Option<String>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+impl GetMacieSessionOutput {
+    /// `@timestampFormat("date-time")`, from the `__timestampIso8601` shape it
+    /// targets. THE reason this schema is hand-written.
+    pub const M_CREATED_AT: ::aws_smithy_schema::Schema = super::date_time_wire::date_time_member(
+        "com.amazonaws.macie2#GetMacieSessionResponse$createdAt",
+        "createdAt",
+        0,
+    );
+    /// Targets the `FindingPublishingFrequency` enum, which is string-encoded on
+    /// the wire — the derive classifies an enum member as a string too.
+    pub const M_FINDING_PUBLISHING_FREQUENCY: ::aws_smithy_schema::Schema =
+        super::date_time_wire::member(
+            "com.amazonaws.macie2#GetMacieSessionResponse$findingPublishingFrequency",
+            "findingPublishingFrequency",
+            ::aws_smithy_schema::ShapeType::String,
+            1,
+        );
+    pub const M_SERVICE_ROLE: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetMacieSessionResponse$serviceRole",
+        "serviceRole",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    /// Targets the `MacieStatus` enum; string-encoded, as above.
+    pub const M_STATUS: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetMacieSessionResponse$status",
+        "status",
+        ::aws_smithy_schema::ShapeType::String,
+        3,
+    );
+    /// `@timestampFormat("date-time")`, as `createdAt` above.
+    pub const M_UPDATED_AT: ::aws_smithy_schema::Schema = super::date_time_wire::date_time_member(
+        "com.amazonaws.macie2#GetMacieSessionResponse$updatedAt",
+        "updatedAt",
+        4,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.macie2#GetMacieSessionResponse",
+            "com.amazonaws.macie2",
+            "GetMacieSessionResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_CREATED_AT,
+            &Self::M_FINDING_PUBLISHING_FREQUENCY,
+            &Self::M_SERVICE_ROLE,
+            &Self::M_STATUS,
+            &Self::M_UPDATED_AT,
+        ],
+    );
+}
+
+pub static GET_MACIE_SESSION_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetMacieSessionOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetMacieSessionOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // Every member is optional, so each is written only when present — the
+        // derive's `is_option` split.
+        if let Some(value) = self.created_at.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.finding_publishing_frequency.as_ref() {
+            s.write_string(&Self::M_FINDING_PUBLISHING_FREQUENCY, value.as_str())?;
+        }
+        if let Some(value) = self.service_role.as_ref() {
+            s.write_string(&Self::M_SERVICE_ROLE, value.as_str())?;
+        }
+        if let Some(value) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, value.as_str())?;
+        }
+        if let Some(value) = self.updated_at.as_ref() {
+            s.write_timestamp(&Self::M_UPDATED_AT, value)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for GetMacieSessionOutput {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.created_at = Some(d.read_timestamp(&Self::M_CREATED_AT)?),
+                Some(1) => {
+                    out.finding_publishing_frequency =
+                        Some(d.read_string(&Self::M_FINDING_PUBLISHING_FREQUENCY)?);
+                }
+                Some(2) => out.service_role = Some(d.read_string(&Self::M_SERVICE_ROLE)?),
+                Some(3) => out.status = Some(d.read_string(&Self::M_STATUS)?),
+                Some(4) => out.updated_at = Some(d.read_timestamp(&Self::M_UPDATED_AT)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
 

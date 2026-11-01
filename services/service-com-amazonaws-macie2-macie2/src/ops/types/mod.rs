@@ -24,6 +24,11 @@ pub mod create_findings_filter_types;
 pub mod create_invitations_types;
 pub mod create_member_types;
 pub mod create_sample_findings_types;
+/// The `@timestampFormat("date-time")` compensation the scaffold's codegen
+/// omits; read its module note before touching a response shape that carries an
+/// instant. Not re-exported below: it holds no modelled shape, only the member
+/// schema constructors those shapes use.
+pub mod date_time_wire;
 pub mod decline_invitations_types;
 pub mod delete_allow_list_types;
 pub mod delete_custom_data_identifier_types;

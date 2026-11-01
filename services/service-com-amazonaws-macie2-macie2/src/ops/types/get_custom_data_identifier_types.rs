@@ -17,7 +17,12 @@ pub struct GetCustomDataIdentifierInput {
     pub id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.macie2#GetCustomDataIdentifierResponse")]
+// `GetCustomDataIdentifierOutput`'s schema and codec are written out by hand
+// rather than derived with `#[smithy_macros::smithy(shape = ...)]`, because
+// `createdAt` targets `__timestampIso8601` and the derive drops that shape's
+// `@timestampFormat("date-time")`. See `super::date_time_wire` for the whole
+// reason and for when to delete this block; everything else below mirrors the
+// derive exactly.
 #[derive(Debug, Clone, Default)]
 pub struct GetCustomDataIdentifierOutput {
     pub arn: Option<String>,
@@ -33,4 +38,238 @@ pub struct GetCustomDataIdentifierOutput {
     pub severity_levels: Option<Vec<SeverityLevel>>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+impl GetCustomDataIdentifierOutput {
+    pub const M_ARN: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetCustomDataIdentifierResponse$arn",
+        "arn",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    /// `@timestampFormat("date-time")`, from the `__timestampIso8601` shape it
+    /// targets. THE reason this schema is hand-written.
+    pub const M_CREATED_AT: ::aws_smithy_schema::Schema = super::date_time_wire::date_time_member(
+        "com.amazonaws.macie2#GetCustomDataIdentifierResponse$createdAt",
+        "createdAt",
+        1,
+    );
+    pub const M_DELETED: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetCustomDataIdentifierResponse$deleted",
+        "deleted",
+        ::aws_smithy_schema::ShapeType::Boolean,
+        2,
+    );
+    pub const M_DESCRIPTION: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetCustomDataIdentifierResponse$description",
+        "description",
+        ::aws_smithy_schema::ShapeType::String,
+        3,
+    );
+    pub const M_ID: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetCustomDataIdentifierResponse$id",
+        "id",
+        ::aws_smithy_schema::ShapeType::String,
+        4,
+    );
+    pub const M_IGNORE_WORDS: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetCustomDataIdentifierResponse$ignoreWords",
+        "ignoreWords",
+        ::aws_smithy_schema::ShapeType::List,
+        5,
+    );
+    pub const M_KEYWORDS: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetCustomDataIdentifierResponse$keywords",
+        "keywords",
+        ::aws_smithy_schema::ShapeType::List,
+        6,
+    );
+    pub const M_MAXIMUM_MATCH_DISTANCE: ::aws_smithy_schema::Schema =
+        super::date_time_wire::member(
+            "com.amazonaws.macie2#GetCustomDataIdentifierResponse$maximumMatchDistance",
+            "maximumMatchDistance",
+            ::aws_smithy_schema::ShapeType::Integer,
+            7,
+        );
+    pub const M_NAME: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetCustomDataIdentifierResponse$name",
+        "name",
+        ::aws_smithy_schema::ShapeType::String,
+        8,
+    );
+    pub const M_REGEX: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetCustomDataIdentifierResponse$regex",
+        "regex",
+        ::aws_smithy_schema::ShapeType::String,
+        9,
+    );
+    pub const M_SEVERITY_LEVELS: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetCustomDataIdentifierResponse$severityLevels",
+        "severityLevels",
+        ::aws_smithy_schema::ShapeType::List,
+        10,
+    );
+    pub const M_TAGS: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetCustomDataIdentifierResponse$tags",
+        "tags",
+        ::aws_smithy_schema::ShapeType::Map,
+        11,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.macie2#GetCustomDataIdentifierResponse",
+            "com.amazonaws.macie2",
+            "GetCustomDataIdentifierResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ARN,
+            &Self::M_CREATED_AT,
+            &Self::M_DELETED,
+            &Self::M_DESCRIPTION,
+            &Self::M_ID,
+            &Self::M_IGNORE_WORDS,
+            &Self::M_KEYWORDS,
+            &Self::M_MAXIMUM_MATCH_DISTANCE,
+            &Self::M_NAME,
+            &Self::M_REGEX,
+            &Self::M_SEVERITY_LEVELS,
+            &Self::M_TAGS,
+        ],
+    );
+}
+
+pub static GET_CUSTOM_DATA_IDENTIFIER_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetCustomDataIdentifierOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetCustomDataIdentifierOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.deleted.as_ref() {
+            s.write_boolean(&Self::M_DELETED, *value)?;
+        }
+        if let Some(value) = self.description.as_ref() {
+            s.write_string(&Self::M_DESCRIPTION, value.as_str())?;
+        }
+        if let Some(value) = self.id.as_ref() {
+            s.write_string(&Self::M_ID, value.as_str())?;
+        }
+        if let Some(value) = self.ignore_words.as_ref() {
+            s.write_list(&Self::M_IGNORE_WORDS, &|sl| {
+                for word in value.iter() {
+                    sl.write_string(&Self::M_IGNORE_WORDS, word.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(value) = self.keywords.as_ref() {
+            s.write_list(&Self::M_KEYWORDS, &|sl| {
+                for keyword in value.iter() {
+                    sl.write_string(&Self::M_KEYWORDS, keyword.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(value) = self.maximum_match_distance.as_ref() {
+            s.write_integer(&Self::M_MAXIMUM_MATCH_DISTANCE, *value)?;
+        }
+        if let Some(value) = self.name.as_ref() {
+            s.write_string(&Self::M_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.regex.as_ref() {
+            s.write_string(&Self::M_REGEX, value.as_str())?;
+        }
+        if let Some(value) = self.severity_levels.as_ref() {
+            s.write_list(&Self::M_SEVERITY_LEVELS, &|sl| {
+                for level in value.iter() {
+                    // A list of STRUCTURES is written against the element
+                    // shape's own schema, as the derive does.
+                    sl.write_struct(&SeverityLevel::SCHEMA, level)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(value) = self.tags.as_ref() {
+            s.write_map(&Self::M_TAGS, &|sm| {
+                for (key, tag) in value.iter() {
+                    sm.write_string(&Self::M_TAGS, key.as_str())?;
+                    sm.write_string(&Self::M_TAGS, tag.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for GetCustomDataIdentifierOutput {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.arn = Some(d.read_string(&Self::M_ARN)?),
+                Some(1) => out.created_at = Some(d.read_timestamp(&Self::M_CREATED_AT)?),
+                Some(2) => out.deleted = Some(d.read_boolean(&Self::M_DELETED)?),
+                Some(3) => out.description = Some(d.read_string(&Self::M_DESCRIPTION)?),
+                Some(4) => out.id = Some(d.read_string(&Self::M_ID)?),
+                Some(5) => {
+                    let mut words: Vec<String> = Vec::new();
+                    d.read_list(&Self::M_IGNORE_WORDS, &mut |dl| {
+                        words.push(dl.read_string(&Self::M_IGNORE_WORDS)?);
+                        Ok(())
+                    })?;
+                    out.ignore_words = Some(words);
+                }
+                Some(6) => {
+                    let mut keywords: Vec<String> = Vec::new();
+                    d.read_list(&Self::M_KEYWORDS, &mut |dl| {
+                        keywords.push(dl.read_string(&Self::M_KEYWORDS)?);
+                        Ok(())
+                    })?;
+                    out.keywords = Some(keywords);
+                }
+                Some(7) => {
+                    out.maximum_match_distance =
+                        Some(d.read_integer(&Self::M_MAXIMUM_MATCH_DISTANCE)?);
+                }
+                Some(8) => out.name = Some(d.read_string(&Self::M_NAME)?),
+                Some(9) => out.regex = Some(d.read_string(&Self::M_REGEX)?),
+                Some(10) => {
+                    let mut levels: Vec<SeverityLevel> = Vec::new();
+                    d.read_list(&Self::M_SEVERITY_LEVELS, &mut |dl| {
+                        levels.push(
+                            <SeverityLevel as ::aws_smithy_schema_server::DeserializableStruct>
+                                ::deserialize(dl)?,
+                        );
+                        Ok(())
+                    })?;
+                    out.severity_levels = Some(levels);
+                }
+                Some(11) => {
+                    let mut tags: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    d.read_map(&Self::M_TAGS, &mut |key, dm| {
+                        tags.insert(key, dm.read_string(&Self::M_TAGS)?);
+                        Ok(())
+                    })?;
+                    out.tags = Some(tags);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
 

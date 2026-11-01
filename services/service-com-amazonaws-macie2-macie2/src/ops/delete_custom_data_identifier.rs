@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCustomDataIdentifier
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCustomDataIdentifier`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCustomDataIdentifier::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: soft deletes the stored custom data identifier.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +142,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCustomDataIdentifier` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCustomDataIdentifierErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCustomDataIdentifier"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteCustomDataIdentifierErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the custom data identifier store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        let mut state = store.lock();
+        if state.session(&region).is_none() {
+            return Err(DeleteCustomDataIdentifierErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let Some(identifier) = state.identifier_mut(&region, &input.id) else {
+            return Err(
+                DeleteCustomDataIdentifierErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "The request failed because the custom data identifier {} doesn't exist.",
+                            input.id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // This operation "Soft deletes a custom data identifier": the record
+        // stays so a later `GetCustomDataIdentifier` can report that it was
+        // deleted, and only `ListCustomDataIdentifiers` stops enumerating it.
+        identifier.deleted = true;
+
+        Ok(DeleteCustomDataIdentifierOutput {})
     }
 }

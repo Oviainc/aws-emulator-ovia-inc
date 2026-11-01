@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableMacie
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableMacie`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableMacie::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints this region's Macie session in `crate::state`.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +149,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableMacie` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableMacieErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableMacie"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(EnableMacieErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Macie session store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // Macie is enabled per account and Region, and a request names the
+        // region it addresses, so the session this call mints belongs to THAT
+        // region.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+
+        // A retry carrying the same `clientToken` replays the enable that token
+        // performed rather than answering the conflict a second enable would.
+        if let Some(token) = input.client_token.as_deref() {
+            let replay_key = crate::state::idempotency_key(&region, Self::NAME, token);
+            if state.idempotency.contains_key(&replay_key) {
+                if state.session(&region).is_some() {
+                    return Ok(EnableMacieOutput {});
+                }
+                // The session that token enabled has since been disabled, so
+                // the token replays nothing and Macie can be enabled again.
+                state.idempotency.remove(&replay_key);
+            }
+        }
+
+        if state.session(&region).is_some() {
+            return Err(EnableMacieErrorModeled::ConflictException(ConflictException {
+                message: Some("Macie has already been enabled.".to_string()),
+            })
+            .into());
+        }
+
+        // The EMULATOR's own bound on how many per-region records one process
+        // keeps: the region comes off the wire, so without this a caller could
+        // grow the store without limit. Reported through the quota error this
+        // operation models.
+        if state.sessions.len() >= crate::state::MAX_EMULATED_REGIONS {
+            return Err(EnableMacieErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "This emulator holds Macie state for the maximum of {} regions. \
+                         Disable Macie in a region before enabling it in another.",
+                        crate::state::MAX_EMULATED_REGIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let session = crate::state::MacieSession {
+            // Both enums are validated against the model before this handler
+            // runs, so a present value is one the wire allows; an absent one
+            // takes the documented default.
+            status: input
+                .status
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_MACIE_STATUS.to_string()),
+            finding_publishing_frequency: input
+                .finding_publishing_frequency
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_FINDING_PUBLISHING_FREQUENCY.to_string()),
+            service_role: crate::state::service_role_arn(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        if let Some(token) = input.client_token.as_deref() {
+            let replay_key = crate::state::idempotency_key(&region, Self::NAME, token);
+            state.idempotency.insert(replay_key, region.clone());
+        }
+        state.sessions.insert(region, session);
+
+        // `EnableMacieResponse` models no members: what the call produced is
+        // read back through `GetMacieSession`.
+        Ok(EnableMacieOutput {})
     }
 }

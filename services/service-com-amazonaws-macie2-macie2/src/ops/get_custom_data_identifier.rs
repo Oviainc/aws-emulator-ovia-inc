@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCustomDataIdentifier
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCustomDataIdentifier`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCustomDataIdentifier::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: projects the stored custom data identifier. Reporting only — it
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +175,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCustomDataIdentifier` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCustomDataIdentifierErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCustomDataIdentifier"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(GetCustomDataIdentifierErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the custom data identifier store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        let state = store.lock();
+        if state.session(&region).is_none() {
+            return Err(GetCustomDataIdentifierErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A soft-deleted identifier is still reported: `DeleteCustomDataIdentifier`
+        // "Soft deletes" it, and `deleted` is what says so.
+        let Some(identifier) = state.identifier(&region, &input.id) else {
+            return Err(GetCustomDataIdentifierErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "The request failed because the custom data identifier {} doesn't exist.",
+                        input.id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetCustomDataIdentifierOutput {
+            arn: Some(identifier.arn.clone()),
+            created_at: Some(crate::state::to_date_time(identifier.created_at)),
+            deleted: Some(identifier.deleted),
+            description: identifier.description.clone(),
+            id: Some(identifier.id.clone()),
+            ignore_words: identifier.ignore_words_output(),
+            keywords: identifier.keywords_output(),
+            maximum_match_distance: Some(identifier.maximum_match_distance),
+            name: Some(identifier.name.clone()),
+            regex: Some(identifier.regex.clone()),
+            severity_levels: identifier.severity_levels_output(),
+            tags: identifier.tags_output(),
+        })
     }
 }
