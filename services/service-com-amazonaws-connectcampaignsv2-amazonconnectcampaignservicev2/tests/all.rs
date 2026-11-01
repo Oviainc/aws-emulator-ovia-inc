@@ -83,6 +83,8 @@ mod connect_instance_integrations;
 mod connect_instance_registry_gate;
 #[path = "all/cursor_paging_is_one_rule.rs"]
 mod cursor_paging_is_one_rule;
+#[path = "all/cursor_token_is_only_the_spelling_it_minted.rs"]
+mod cursor_token_is_only_the_spelling_it_minted;
 #[path = "all/cursor_tokens_are_scoped_to_their_listing.rs"]
 mod cursor_tokens_are_scoped_to_their_listing;
 #[path = "all/enum_catalog_is_one_rule.rs"]

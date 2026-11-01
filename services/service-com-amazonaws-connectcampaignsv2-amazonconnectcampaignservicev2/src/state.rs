@@ -976,14 +976,26 @@ pub fn encode_next_token(scope: &CursorScope, last_sequence: u64) -> String {
 
 /// Decode a cursor [`encode_next_token`] minted for `scope`, or `None` when the
 /// token was not produced by it for THIS listing — a token this codec never minted,
-/// and a token it minted for another listing alike.
+/// a token it minted for another listing, and a re-spelling of one of its own tokens
+/// alike.
+///
+/// A position is resolved only from the token [`encode_next_token`] would itself
+/// write for it, which is the only spelling of that position this service ever hands
+/// out: reading the position back out of the token is not enough, because the readers
+/// this walks through each take spellings the minting side cannot write — `u64`'s
+/// `FromStr` takes a leading `+` and any number of leading zeros, while
+/// `::hex::decode` takes the upper-case digits `::hex::encode` never emits — and a
+/// position resolved from one of those would resume a caller mid-list from a cursor
+/// this service never issued, silently dropping every record before it instead of
+/// refusing the token.
 pub fn decode_next_token(scope: &CursorScope, token: &str) -> Option<u64> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
     let (tag, position) = decoded.split_once(':')?;
     if tag != scope.tag() {
         return None;
     }
-    position.parse().ok()
+    let sequence: u64 = position.parse().ok()?;
+    (encode_next_token(scope, sequence) == token).then_some(sequence)
 }
 
 /// The page size a cursor-paged list uses when the caller names no `maxResults`:
