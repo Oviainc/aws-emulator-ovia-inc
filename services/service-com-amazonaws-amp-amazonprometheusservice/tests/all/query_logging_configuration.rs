@@ -10,16 +10,25 @@
 //! group, whatever its `qspThreshold`, and in whatever region the request was signed
 //! for. Each suite spans that class with a table; the recorded case is one row.
 //!
+//! A create is only accepted for a workspace that will still be there to hold the record
+//! it writes, so the last two suites pin the other half of that rule: the workspace's own
+//! status decides whether it can take a configuration at all, and a create that arrives
+//! while the workspace's removal is owed is refused rather than accepted and then dropped.
+//!
 //! The HTTP harness ([`crate::workspace_lifecycle::Amp`]) is shared with the workspace
 //! suite, so every test in this crate reaches the service the same way: through
 //! `MultiServiceRouter::dispatch`, exercising routing, the `restJson1` wire shapes, the
 //! modelled response statuses and the modelled error envelopes.
 
 use crate::workspace_lifecycle::{text, wait_for_due_transition, Amp, Reply};
-use service_com_amazonaws_amp_amazonprometheusservice::ops::types::QUERY_LOGGING_CONFIGURATION_STATUS_CODE_VALUES;
+use service_com_amazonaws_amp_amazonprometheusservice::ops::types::{
+    QUERY_LOGGING_CONFIGURATION_STATUS_CODE_VALUES, WORKSPACE_STATUS_CODE_VALUES,
+};
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    QUERY_LOGGING_NOT_FOUND_MESSAGE, QUERY_LOGGING_STATUS_ACTIVE, QUERY_LOGGING_STATUS_CREATING,
-    QUERY_LOGGING_STATUS_DELETING, QUERY_LOGGING_STATUS_UPDATING,
+    QUERY_LOGGING_CONFIGURATION_DELETING_MESSAGE, QUERY_LOGGING_NOT_FOUND_MESSAGE,
+    QUERY_LOGGING_STATUS_ACTIVE, QUERY_LOGGING_STATUS_CREATING, QUERY_LOGGING_STATUS_DELETING,
+    QUERY_LOGGING_STATUS_UPDATING, STATUS_ACTIVE, STATUS_CREATING, STATUS_DELETING,
+    STATUS_UPDATING, WORKSPACE_DELETING_MESSAGE, WORKSPACE_NOT_FOUND_MESSAGE,
 };
 
 /// `CreateQueryLoggingConfiguration`: `POST /workspaces/{workspaceId}/logging/query`.
@@ -955,6 +964,412 @@ async fn requests_outside_a_published_constraint_are_refused() {
         assert_eq!(
             after.status, 404,
             "case {case:?}: a refused create must store nothing, got {after:?}"
+        );
+    }
+}
+
+/// The state the WORKSPACE is in when the create arrives. The catalog is the modelled
+/// `WorkspaceStatusCode` — `CREATING`, `ACTIVE`, `UPDATING`, `DELETING`,
+/// `CREATION_FAILED` — of which every status this emulator can put a workspace in is a
+/// row here, plus the workspace being gone once its owed removal came due.
+/// `CREATION_FAILED` has no row because nothing in this emulator fails a create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Parent {
+    /// A create whose owed move to `ACTIVE` has not come due yet.
+    Creating,
+    /// A settled workspace.
+    Active,
+    /// A rename whose owed settling has not come due yet.
+    Updating,
+    /// A delete whose owed removal has not come due yet.
+    Deleting,
+    /// The same delete, once that removal came due: the workspace is gone.
+    Removed,
+}
+
+impl Parent {
+    /// The status a workspace in this state REPORTS, or `None` once it holds no record
+    /// to report at all.
+    fn reported(self) -> Option<&'static str> {
+        match self {
+            Parent::Creating => Some(STATUS_CREATING),
+            Parent::Active => Some(STATUS_ACTIVE),
+            Parent::Updating => Some(STATUS_UPDATING),
+            Parent::Deleting => Some(STATUS_DELETING),
+            Parent::Removed => None,
+        }
+    }
+
+    /// Put a workspace of `region` into this state and answer its id.
+    async fn workspace(self, amp: &Amp, region: &str, case: &str) -> String {
+        if self == Parent::Creating {
+            // The owed move to ACTIVE is not waited for, so the workspace is still
+            // CREATING when the create under test arrives.
+            let created = amp
+                .call(
+                    "POST",
+                    "/workspaces",
+                    region,
+                    &serde_json::json!({ "alias": "query-logging" }).to_string(),
+                )
+                .await;
+            assert_eq!(
+                created.status, 202,
+                "case {case:?}: the workspace create must be accepted, got {created:?}"
+            );
+            return text(&created.body["workspaceId"]);
+        }
+
+        let workspace_id = amp.active_workspace(region, "query-logging").await;
+        match self {
+            Parent::Active => {}
+            Parent::Updating => {
+                let renamed = amp
+                    .rename(
+                        region,
+                        &workspace_id,
+                        &serde_json::json!({ "alias": "query-logging-renamed" }),
+                    )
+                    .await;
+                assert_eq!(
+                    renamed.status, 204,
+                    "case {case:?}: the rename must be accepted, got {renamed:?}"
+                );
+            }
+            Parent::Deleting | Parent::Removed => {
+                let deleted = amp.delete(region, &workspace_id, None).await;
+                assert_eq!(
+                    deleted.status, 202,
+                    "case {case:?}: deleting an {STATUS_ACTIVE} workspace must be accepted, \
+                     got {deleted:?}"
+                );
+                if self == Parent::Removed {
+                    wait_for_due_transition();
+                }
+            }
+            Parent::Creating => unreachable!("handled above"),
+        }
+        workspace_id
+    }
+}
+
+/// One row of the parent-status table: the state the workspace is in, the region the
+/// calls are signed for, and the destination the create carries — the rule turns on the
+/// workspace's state alone, whatever the request asks for.
+struct ParentCase {
+    name: &'static str,
+    region: &'static str,
+    parent: Parent,
+    log_group: &'static str,
+    qsp_threshold: i64,
+    client_token: Option<&'static str>,
+}
+
+fn parent_cases() -> Vec<ParentCase> {
+    vec![
+        ParentCase {
+            name: "a workspace still being created",
+            region: "us-west-2",
+            parent: Parent::Creating,
+            log_group: "query-logs",
+            // `LoggingFilter$qspThreshold` is modelled `@range(min: 0)`: the published
+            // lower bound.
+            qsp_threshold: 0,
+            client_token: None,
+        },
+        ParentCase {
+            name: "a settled workspace",
+            region: "eu-west-1",
+            parent: Parent::Active,
+            log_group: "obs/query-logs",
+            qsp_threshold: 5,
+            client_token: Some("token-on-an-active-workspace"),
+        },
+        ParentCase {
+            name: "a workspace whose rename has not settled",
+            region: "ap-southeast-2",
+            parent: Parent::Updating,
+            log_group: "aws/aps/query_logs.v1#1",
+            qsp_threshold: 1_234_567,
+            client_token: None,
+        },
+        ParentCase {
+            name: "a workspace whose deletion has not settled",
+            region: "us-east-1",
+            parent: Parent::Deleting,
+            log_group: "query-logs",
+            qsp_threshold: 7,
+            client_token: None,
+        },
+        ParentCase {
+            name: "a workspace whose deletion has not settled, under a token",
+            region: "us-gov-west-1",
+            parent: Parent::Deleting,
+            log_group: "aws/aps/deleting-workspace",
+            qsp_threshold: i64::MAX,
+            client_token: Some("token-on-a-deleting-workspace"),
+        },
+        ParentCase {
+            name: "a workspace whose deletion came due",
+            region: "eu-central-1",
+            parent: Parent::Removed,
+            log_group: "query-logs",
+            qsp_threshold: 3,
+            client_token: None,
+        },
+    ]
+}
+
+/// A create is accepted only for a workspace that will still be there to hold the record
+/// it writes: while the workspace's own removal is owed (`DELETING`, "Workspace is being
+/// deleted") the create is refused with the modelled `ValidationException` (400) and
+/// writes nothing, because the owed removal drops the configuration along with the
+/// workspace — a create accepted in that window could only leave the store holding
+/// nothing for it. Every other status the workspace can report is not on its way out, so
+/// the same create is accepted and persists; once the removal has come due there is no
+/// workspace at all and the refusal is `ResourceNotFoundException` (404).
+#[tokio::test]
+async fn a_create_is_refused_exactly_while_the_workspace_removal_is_owed() {
+    for case in parent_cases() {
+        let ParentCase {
+            name,
+            region,
+            parent,
+            log_group,
+            qsp_threshold,
+            client_token,
+        } = case;
+        let amp = Amp::new();
+        let workspace_id = parent.workspace(&amp, region, name).await;
+
+        let reported = amp.describe(region, &workspace_id).await;
+        match parent.reported() {
+            Some(status) => {
+                assert!(
+                    WORKSPACE_STATUS_CODE_VALUES.contains(&status),
+                    "case {name:?}: {status:?} is not a modelled WorkspaceStatusCode \
+                     ({WORKSPACE_STATUS_CODE_VALUES:?})"
+                );
+                assert_eq!(
+                    text(&reported.body["workspace"]["status"]["statusCode"]),
+                    status,
+                    "case {name:?}: the workspace must be in the status under test, got \
+                     {reported:?}"
+                );
+            }
+            None => assert_eq!(
+                reported.status, 404,
+                "case {name:?}: the owed removal must leave the workspace gone, got \
+                 {reported:?}"
+            ),
+        }
+
+        let arn = log_group_arn(region, log_group);
+        let mut body = serde_json::json!({ "destinations": destinations_json(&arn, qsp_threshold) });
+        if let Some(token) = client_token {
+            body["clientToken"] = serde_json::Value::String(token.to_string());
+        }
+        let reply = create_configuration(&amp, region, &workspace_id, &body).await;
+
+        match parent {
+            Parent::Deleting => {
+                assert_eq!(
+                    reply.status, 400,
+                    "case {name:?}: a create on a workspace being deleted must be refused \
+                     with 400, got {reply:?}"
+                );
+                assert_eq!(
+                    reply.error_code(),
+                    "ValidationException",
+                    "case {name:?}: expected the modelled ValidationException, got {reply:?}"
+                );
+                assert_eq!(
+                    text(&reply.body["message"]),
+                    WORKSPACE_DELETING_MESSAGE,
+                    "case {name:?}: the refusal must say the workspace's deletion stands in \
+                     the way, got {reply:?}"
+                );
+            }
+            Parent::Removed => {
+                assert_eq!(
+                    reply.status, 404,
+                    "case {name:?}: a create for a workspace that is gone must be refused \
+                     with 404, got {reply:?}"
+                );
+                assert_eq!(
+                    reply.error_code(),
+                    "ResourceNotFoundException",
+                    "case {name:?}: expected the modelled ResourceNotFoundException, got \
+                     {reply:?}"
+                );
+                assert_eq!(
+                    text(&reply.body["message"]),
+                    WORKSPACE_NOT_FOUND_MESSAGE,
+                    "case {name:?}: unexpected refusal message, got {reply:?}"
+                );
+                assert_eq!(
+                    text(&reply.body["resourceId"]),
+                    workspace_id,
+                    "case {name:?}: the refusal must name the resource asked for, got {reply:?}"
+                );
+            }
+            Parent::Creating | Parent::Active | Parent::Updating => {
+                assert_eq!(
+                    reply.status, 202,
+                    "case {name:?}: a workspace that is not on its way out must take a \
+                     configuration, got {reply:?}"
+                );
+                assert_eq!(
+                    text(&reply.body["status"]["statusCode"]),
+                    QUERY_LOGGING_STATUS_CREATING,
+                    "case {name:?}: a fresh configuration must report \
+                     {QUERY_LOGGING_STATUS_CREATING}, got {reply:?}"
+                );
+            }
+        }
+
+        // What the STORE holds is what decides it: an accepted create is readable back
+        // through the describe, and a refused one left nothing for a reader to find.
+        let described = describe_configuration(&amp, region, &workspace_id).await;
+        if matches!(parent, Parent::Deleting | Parent::Removed) {
+            assert_eq!(
+                described.status, 404,
+                "case {name:?}: the refused create must leave the store holding nothing \
+                 for it, got {described:?}"
+            );
+        } else {
+            assert_eq!(
+                described.status, 200,
+                "case {name:?}: the accepted create must be readable back, got {described:?}"
+            );
+            assert_eq!(
+                destinations_of(&described.body["queryLoggingConfiguration"]["destinations"]),
+                vec![(arn.clone(), qsp_threshold)],
+                "case {name:?}: describe must report the stored destinations, got \
+                 {described:?}"
+            );
+        }
+    }
+}
+
+/// The token the create of the next suite carries, so its refused calls can replay
+/// exactly it.
+const BOTH_OWED_TOKEN: &str = "create-before-both-removals";
+
+/// When BOTH removals are owed — the configuration's own and its workspace's — the
+/// refusal names the WORKSPACE's, because the workspace's removal takes the record with
+/// it whatever status that record is in. Neither refusal writes anything: the record on
+/// its way out stays the one the create left, and once the removals come due nothing is
+/// left behind. Rows: the token the refused call carries (none, the create's own,
+/// another).
+#[tokio::test]
+async fn the_workspace_removal_is_what_a_refusal_names_when_both_are_owed() {
+    for token in [None, Some(BOTH_OWED_TOKEN), Some("another-token")] {
+        let name = format!("token {token:?}");
+        let region = "us-west-2";
+        let amp = Amp::new();
+        let workspace_id = amp.active_workspace(region, "query-logging").await;
+        let first = log_group_arn(region, "first-logs");
+        let created = create_configuration(
+            &amp,
+            region,
+            &workspace_id,
+            &serde_json::json!({
+                "destinations": destinations_json(&first, 13),
+                "clientToken": BOTH_OWED_TOKEN,
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {name:?}: the first create must be accepted, got {created:?}"
+        );
+        wait_for_due_transition();
+        let settled = describe_configuration(&amp, region, &workspace_id).await;
+        assert_eq!(
+            text(&settled.body["queryLoggingConfiguration"]["status"]["statusCode"]),
+            QUERY_LOGGING_STATUS_ACTIVE,
+            "case {name:?}: the first configuration must settle first, got {settled:?}"
+        );
+
+        let other = log_group_arn(region, "other-logs");
+        let mut body = serde_json::json!({ "destinations": destinations_json(&other, 17) });
+        if let Some(token) = token {
+            body["clientToken"] = serde_json::Value::String(token.to_string());
+        }
+
+        // Only the CONFIGURATION's removal is owed yet, so that is what the refusal
+        // names.
+        let deleted = delete_configuration(&amp, region, &workspace_id, None).await;
+        assert_eq!(
+            deleted.status, 202,
+            "case {name:?}: deleting the configuration must be accepted, got {deleted:?}"
+        );
+        let refused = create_configuration(&amp, region, &workspace_id, &body).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {name:?}: a create while the configuration's removal is owed must be \
+             refused with 400, got {refused:?}"
+        );
+        assert_eq!(
+            text(&refused.body["message"]),
+            QUERY_LOGGING_CONFIGURATION_DELETING_MESSAGE,
+            "case {name:?}: the refusal must name the configuration's own deletion, got \
+             {refused:?}"
+        );
+
+        // Now the WORKSPACE's removal is owed too, and it is the one that stands in the
+        // way: it drops the record whatever status that record is in.
+        let deleted_workspace = amp.delete(region, &workspace_id, None).await;
+        assert_eq!(
+            deleted_workspace.status, 202,
+            "case {name:?}: deleting the workspace must be accepted, got \
+             {deleted_workspace:?}"
+        );
+        let refused_again = create_configuration(&amp, region, &workspace_id, &body).await;
+        assert_eq!(
+            refused_again.status, 400,
+            "case {name:?}: a create on a workspace being deleted must be refused with \
+             400, got {refused_again:?}"
+        );
+        assert_eq!(
+            refused_again.error_code(),
+            "ValidationException",
+            "case {name:?}: expected the modelled ValidationException, got {refused_again:?}"
+        );
+        assert_eq!(
+            text(&refused_again.body["message"]),
+            WORKSPACE_DELETING_MESSAGE,
+            "case {name:?}: the refusal must name the workspace's deletion, got \
+             {refused_again:?}"
+        );
+
+        // Neither refusal wrote anything: the record on its way out is still the one the
+        // first create left.
+        let unchanged = describe_configuration(&amp, region, &workspace_id).await;
+        assert_eq!(
+            destinations_of(&unchanged.body["queryLoggingConfiguration"]["destinations"]),
+            vec![(first.clone(), 13)],
+            "case {name:?}: the refusals must store nothing, got {unchanged:?}"
+        );
+        assert_eq!(
+            text(&unchanged.body["queryLoggingConfiguration"]["status"]["statusCode"]),
+            QUERY_LOGGING_STATUS_DELETING,
+            "case {name:?}: the record must still be the one on its way out, got \
+             {unchanged:?}"
+        );
+
+        wait_for_due_transition();
+        let gone = describe_configuration(&amp, region, &workspace_id).await;
+        assert_eq!(
+            gone.status, 404,
+            "case {name:?}: once the removals come due nothing is held for the workspace, \
+             got {gone:?}"
+        );
+        let workspace_gone = amp.describe(region, &workspace_id).await;
+        assert_eq!(
+            workspace_gone.status, 404,
+            "case {name:?}: the workspace itself must be gone, got {workspace_gone:?}"
         );
     }
 }
