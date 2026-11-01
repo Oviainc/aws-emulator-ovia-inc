@@ -797,10 +797,31 @@ enum RuleOutcome {
         action: EdgeAction,
         /// Its `CustomResponse`, if it configured one.
         custom_response: Option<CustomResponse>,
-        /// The rule within a rule group that decided, when a group rule did, named as
-        /// [`group_rule_name`] qualifies it.
-        inner_rule: Option<String>,
+        /// Where the rule that decided came from, when a rule of a rule GROUP
+        /// decided; [`GroupRuleProvenance::default`] for a rule of the web ACL
+        /// itself, which came from no group.
+        group: GroupRuleProvenance,
     },
+}
+
+/// What a sample of the rule that DECIDED a request reports about the rule group that
+/// rule came from.
+///
+/// Both members are properties of where the rule lives and of what the web ACL said
+/// about it, not of the action that ended up being applied, so they travel together
+/// with every outcome a group's rule can produce — the ones that terminate the
+/// evaluation as much as the ones that only count the request.
+#[derive(Debug, Clone, Default)]
+struct GroupRuleProvenance {
+    /// `SampledHTTPRequest$RuleNameWithinRuleGroup`: the rule within a rule group that
+    /// decided, named as [`group_rule_name`] qualifies it.
+    inner_rule: Option<String>,
+    /// `SampledHTTPRequest$OverriddenAction` — "used only for rule group rules that
+    /// have a rule action override in place in the web ACL. This is the action that
+    /// the rule group rule is configured for, and not the action that was applied to
+    /// the request" — so it is the CONFIGURED action, and only where the web ACL put
+    /// something else in its place.
+    overridden_action: Option<String>,
 }
 
 impl Evaluation<'_> {
@@ -847,7 +868,7 @@ impl Evaluation<'_> {
             if let RuleOutcome::Terminate {
                 action,
                 custom_response,
-                inner_rule,
+                group,
             } = outcome
             {
                 let custom = self.rendered_response(web_acl, custom_response.as_ref(), action);
@@ -855,8 +876,8 @@ impl Evaluation<'_> {
                     &mut samples,
                     &rule.visibility_config,
                     action.action_value(),
-                    None,
-                    inner_rule.clone(),
+                    group.overridden_action.clone(),
+                    group.inner_rule.clone(),
                     &inserted,
                     &cx.labels,
                 );
@@ -874,7 +895,7 @@ impl Evaluation<'_> {
                         },
                         custom_response: custom,
                         rule_name: Some(rule.name.clone()),
-                        rule_name_within_rule_group: inner_rule,
+                        rule_name_within_rule_group: group.inner_rule,
                         labels: cx.labels,
                     },
                     samples,
@@ -992,7 +1013,7 @@ impl Evaluation<'_> {
             return RuleOutcome::Continue;
         }
         add_labels(&mut cx.labels, namespace, rule.rule_labels.as_deref());
-        let outcome = self.apply_action(rule.action.as_ref(), inserted, None);
+        let outcome = self.apply_action(rule.action.as_ref(), inserted);
         if let RuleOutcome::Continue = outcome {
             // The rule MATCHED and its action does not terminate the evaluation, so
             // this request is one the rule COUNTED: it belongs to the rule's own
@@ -1053,9 +1074,14 @@ impl Evaluation<'_> {
                 counted_group,
             );
             let named = group_rule_name(group, &group_rule.name);
-            if let Some(outcome) =
-                terminating(decided.action.as_ref(), inserted, Some(named.clone()))
-            {
+            if let Some(outcome) = terminating(
+                decided.action.as_ref(),
+                inserted,
+                GroupRuleProvenance {
+                    inner_rule: Some(named.clone()),
+                    overridden_action: decided.overridden_action.clone(),
+                },
+            ) {
                 return outcome;
             }
             // The group's rule matched and did not terminate, so it COUNTED this
@@ -1126,9 +1152,14 @@ impl Evaluation<'_> {
             );
             // A customer-owned group is named by its own name alone.
             let named = group_rule_name(&[group_name], &group_rule.name);
-            if let Some(outcome) =
-                terminating(decided.action.as_ref(), inserted, Some(named.clone()))
-            {
+            if let Some(outcome) = terminating(
+                decided.action.as_ref(),
+                inserted,
+                GroupRuleProvenance {
+                    inner_rule: Some(named.clone()),
+                    overridden_action: decided.overridden_action.clone(),
+                },
+            ) {
                 return outcome;
             }
             // As in [`Self::run_group`]: a group rule that matched without
@@ -1150,13 +1181,16 @@ impl Evaluation<'_> {
     }
 
     /// Apply a web ACL rule's own `Action`.
+    ///
+    /// Such a rule belongs to no rule group, so a sample of it reports neither the
+    /// name within a group nor an overridden action.
     fn apply_action(
         &self,
         action: Option<&RuleAction>,
         inserted: &mut Vec<(String, String)>,
-        inner_rule: Option<String>,
     ) -> RuleOutcome {
-        terminating(action, inserted, inner_rule).unwrap_or(RuleOutcome::Continue)
+        terminating(action, inserted, GroupRuleProvenance::default())
+            .unwrap_or(RuleOutcome::Continue)
     }
 
     /// Whether a rate-based statement rate-limits this request, and the aggregation
@@ -1567,14 +1601,14 @@ fn effective_group_action(
 fn terminating(
     action: Option<&RuleAction>,
     inserted: &mut Vec<(String, String)>,
-    inner_rule: Option<String>,
+    group: GroupRuleProvenance,
 ) -> Option<RuleOutcome> {
     let action = action?;
     if let Some(block) = action.block.as_ref() {
         return Some(RuleOutcome::Terminate {
             action: EdgeAction::Block,
             custom_response: block.custom_response.clone(),
-            inner_rule,
+            group,
         });
     }
     if let Some(allow) = action.allow.as_ref() {
@@ -1584,7 +1618,7 @@ fn terminating(
         return Some(RuleOutcome::Terminate {
             action: EdgeAction::Allow,
             custom_response: None,
-            inner_rule,
+            group,
         });
     }
     if let Some(captcha) = action.captcha.as_ref() {
@@ -1594,7 +1628,7 @@ fn terminating(
         return Some(RuleOutcome::Terminate {
             action: EdgeAction::Captcha,
             custom_response: None,
-            inner_rule,
+            group,
         });
     }
     if let Some(challenge) = action.challenge.as_ref() {
@@ -1604,7 +1638,7 @@ fn terminating(
         return Some(RuleOutcome::Terminate {
             action: EdgeAction::Challenge,
             custom_response: None,
-            inner_rule,
+            group,
         });
     }
     // `Count` "enables WAF to count requests that match the rule, without otherwise

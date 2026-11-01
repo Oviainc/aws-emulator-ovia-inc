@@ -35,14 +35,14 @@ use crate::web_acl_lifecycle::{base64_of, visibility, Waf, TEST_REGION};
 
 /// The `Scope` every web ACL here lives in: an API Gateway stage is a REGIONAL
 /// protected resource.
-const SCOPE: &str = "REGIONAL";
+pub(crate) const SCOPE: &str = "REGIONAL";
 
 /// The separator the member's documented format joins its segments with.
 const SEPARATOR: char = '#';
 
 /// The vendor of the managed rule groups this suite references
 /// (`ManagedRuleGroupStatement$VendorName`).
-const VENDOR: &str = "AWS";
+pub(crate) const VENDOR: &str = "AWS";
 
 /// A stub protected resource: an API Gateway REST API stage, the one ARN form
 /// `AssociateWebACLRequest$ResourceArn` documents for one. The stage itself belongs to
@@ -53,7 +53,7 @@ fn stage_arn(row: usize) -> String {
 }
 
 /// One request as the edge inspects it.
-fn request_at(path: &str, query_string: &str) -> InspectedRequest {
+pub(crate) fn request_at(path: &str, query_string: &str) -> InspectedRequest {
     InspectedRequest {
         method: "GET".to_string(),
         uri_path: path.to_string(),
@@ -80,7 +80,7 @@ fn managed_group_rule(rule_name: &str, group: &str) -> Value {
 
 /// The rule names `DescribeManagedRuleGroup` declares for `(VENDOR, group)` — the set
 /// the last segment of a managed group's qualified rule name has to come from.
-async fn declared_rule_names(waf: &Waf, group: &str) -> Vec<String> {
+pub(crate) async fn declared_rule_names(waf: &Waf, group: &str) -> Vec<String> {
     let described = waf
         .ok(
             "DescribeManagedRuleGroup",
@@ -97,7 +97,7 @@ async fn declared_rule_names(waf: &Waf, group: &str) -> Vec<String> {
 }
 
 /// The samples `GetSampledRequests` holds for the `metric` dimension of `web_acl_arn`.
-async fn samples_of(waf: &Waf, web_acl_arn: &str, metric: &str) -> Vec<Value> {
+pub(crate) async fn samples_of(waf: &Waf, web_acl_arn: &str, metric: &str) -> Vec<Value> {
     let answered = waf
         .ok(
             "GetSampledRequests",
