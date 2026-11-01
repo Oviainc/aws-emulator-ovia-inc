@@ -29,10 +29,12 @@
 //!
 //! RULE 4 (the binding is what authorizes a registration): a registration presenting no
 //! external account binding is refused `400`
-//! `urn:ietf:params:acme:error:externalAccountRequired`, and one whose MAC does not check
-//! out under the key id it names — a forged MAC, another binding's key, a binding whose
-//! authority has been withdrawn — is refused `400`
-//! `urn:ietf:params:acme:error:unauthorized`.
+//! `urn:ietf:params:acme:error:externalAccountRequired`; one whose credential this
+//! endpoint does not account for — a forged MAC, another binding's key, a key id it never
+//! issued, a binding whose authority has been withdrawn — is a credential the server
+//! REJECTED and is refused `403` `urn:ietf:params:acme:error:unauthorized`, while one
+//! whose FORM is wrong (bound to another key, signed for another url) is a defect in the
+//! request and is refused `400` `urn:ietf:params:acme:error:malformed`.
 //!
 //! Every assertion goes through [`MultiServiceRouter::dispatch`], the same path the
 //! emulator serves production traffic on, and every URL and credential the client half
@@ -1243,40 +1245,48 @@ async fn a_registration_is_authorized_by_the_endpoint_external_account_binding()
     );
 
     // The table: every way a presented binding fails to be one these credentials account
-    // for. `None` is the registration that presents none at all.
-    let rows: Vec<(&str, Option<Value>, &str)> = vec![
+    // for, with the status each class of failure is refused at — a credential the server
+    // rejected is `403`, a request whose binding is malformed is `400`. `None` is the
+    // registration that presents none at all.
+    let rows: Vec<(&str, Option<Value>, u16, &str)> = vec![
         (
             "no externalAccountBinding at all",
             None,
+            400,
             "urn:ietf:params:acme:error:externalAccountRequired",
         ),
         (
             "a forged MAC under a key id this endpoint did issue",
             Some(forged),
+            403,
             "urn:ietf:params:acme:error:unauthorized",
         ),
         (
             "another binding's MAC key under this binding's key id",
             Some(wrong_binding),
+            403,
             "urn:ietf:params:acme:error:unauthorized",
         ),
         (
             "a key id this endpoint never issued",
             Some(unknown_key_id),
+            403,
             "urn:ietf:params:acme:error:unauthorized",
         ),
         (
             "a binding bound to another account key",
             Some(bound_to_another_key),
+            400,
             "urn:ietf:params:acme:error:malformed",
         ),
         (
             "a binding signed for another url",
             Some(wrong_url),
+            400,
             "urn:ietf:params:acme:error:malformed",
         ),
     ];
-    for (case, binding, expected) in rows {
+    for (case, binding, expected_status, expected) in rows {
         let nonce = fresh_nonce(&router, case, &enrollment).await;
         let mut payload = registration(&enrollment, &key, &["mailto:bound@example.com"], None);
         match binding {
@@ -1293,8 +1303,8 @@ async fn a_registration_is_authorized_by_the_endpoint_external_account_binding()
         let status = response.status().as_u16();
         let document = body_json(case, &response);
         assert_eq!(
-            status, 400,
-            "case {case:?}: the registration must be refused, got {status} {document}"
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} {document}"
         );
         assert_eq!(
             problem_type(&document),
@@ -1373,7 +1383,7 @@ async fn a_registration_is_authorized_by_the_endpoint_external_account_binding()
     let status = response.status().as_u16();
     let document = body_json("a revoked binding", &response);
     assert_eq!(
-        status, 400,
+        status, 403,
         "case \"a revoked binding\": a withdrawn binding must authorize nothing, got {status} {document}"
     );
     assert_eq!(

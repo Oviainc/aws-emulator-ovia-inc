@@ -1365,6 +1365,21 @@ impl AcmeEndpointRecord {
     }
 }
 
+/// Which call started the work an ACME domain validation is still in the middle of.
+///
+/// The two are refused differently when a caller asks to update the record mid-flight:
+/// work the service started on its own is a precondition on the status the record
+/// carries, while work ANOTHER caller's update started is that caller's modification
+/// still in progress, which is the optimistic-concurrency conflict a client retries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcmeDomainValidationWork {
+    /// The prevalidation the create started: the service proving the domain on its own.
+    Prevalidation,
+    /// The reconfiguration an `UpdateAcmeDomainValidation` call started, which is in
+    /// flight until the prevalidation it re-opened falls due.
+    Reconfiguration,
+}
+
 /// The status transition the clock already owes an ACME domain validation.
 ///
 /// Stored, never slept on, for the same reason [`PendingAcmeEndpointStatus`] is: the
@@ -1376,18 +1391,30 @@ pub struct PendingAcmeDomainValidationStatus {
     pub due_at: SystemTime,
     /// The `AcmeDomainValidationStatus` the validation carries from then on.
     pub status: String,
+    /// What started the work this transition completes.
+    pub work: AcmeDomainValidationWork,
 }
 
 impl PendingAcmeDomainValidationStatus {
-    /// The transition owed to a validation whose prevalidation started at `started_at`
-    /// — when it was created, or when its prevalidation configuration was replaced and
-    /// the domain had to be proved again: the prevalidation completes
+    /// The transition owed to a validation whose prevalidation the create started at
+    /// `started_at`: the prevalidation completes
     /// [`ACME_DOMAIN_VALIDATION_SETTLE_DELAY`] later and it becomes
     /// [`ACME_DOMAIN_VALIDATION_STATUS_VALID`].
     pub fn validating_at(started_at: SystemTime) -> Self {
         Self {
             due_at: started_at + ACME_DOMAIN_VALIDATION_SETTLE_DELAY,
             status: ACME_DOMAIN_VALIDATION_STATUS_VALID.to_string(),
+            work: AcmeDomainValidationWork::Prevalidation,
+        }
+    }
+
+    /// The same transition, owed to a validation whose prevalidation configuration an
+    /// update replaced at `started_at` so the domain has to be proved again. It is the
+    /// REQUESTING call's work, so it is what a second update racing it conflicts with.
+    pub fn reconfigured_at(started_at: SystemTime) -> Self {
+        Self {
+            work: AcmeDomainValidationWork::Reconfiguration,
+            ..Self::validating_at(started_at)
         }
     }
 }
@@ -1439,6 +1466,18 @@ pub struct AcmeDomainValidationRecord {
 }
 
 impl AcmeDomainValidationRecord {
+    /// Whether another caller's update of this validation is still in flight: it
+    /// re-opened the prevalidation and the transition that completes it has not fallen
+    /// due yet.
+    ///
+    /// Read AFTER [`Self::materialize_due`], so a transition the clock has already made
+    /// is no longer somebody's modification in progress.
+    pub fn update_in_flight(&self) -> bool {
+        self.pending_status
+            .as_ref()
+            .is_some_and(|pending| pending.work == AcmeDomainValidationWork::Reconfiguration)
+    }
+
     /// Apply the status transition the clock already owes this validation at `now`.
     ///
     /// A validation ACM reports as `VALIDATING` is waiting on prevalidation work ACM
@@ -2188,6 +2227,50 @@ pub fn acme_domain_validation_arn_prefix(acme_endpoint_arn: &str) -> String {
 pub fn acme_domain_validation_not_found_message(acme_domain_validation_arn: &str) -> String {
     format!("Could not find ACME domain validation {acme_domain_validation_arn}.")
 }
+
+/// The `ConflictException` message for a second domain validation of a domain one ACME
+/// endpoint already validates, built from the domain name the request asked for.
+///
+/// Recorded behaviour fixes the whole sentence around that one variable part: the name
+/// the caller submitted, and nothing of the validation that already holds it — a refused
+/// create is told what it asked for, not the identifier of a resource it did not create.
+pub fn acme_domain_validation_exists_message(domain_name: &str) -> String {
+    format!("An ACME domain validation for {domain_name} already exists.")
+}
+
+/// The `ValidationException` message for an update of a domain validation the service is
+/// itself still working through, built from the status the record carries.
+///
+/// Recorded behaviour fixes the sentence around that one variable part: the status is
+/// read from the resource's own state, and the request's ARN is not reflected into the
+/// refusal.
+pub fn acme_domain_validation_status_blocks_update_message(status: &str) -> String {
+    format!("Cannot update ACME domain validation in {status} status.")
+}
+
+/// The `ConflictException` message for an update that raced another caller's update of
+/// the same domain validation, built from the ARN the request named.
+///
+/// `ConflictException` is the retryable signal ("wait for the previous operation to
+/// finish and try again"), so the sentence asks for the retry.
+pub fn acme_domain_validation_concurrent_modification_message(
+    acme_domain_validation_arn: &str,
+) -> String {
+    format!(
+        "Concurrent modification of ACME domain validation {acme_domain_validation_arn}. \
+         Please try again."
+    )
+}
+
+/// The `ConflictException` message for an `@idempotencyToken` re-sent with parameters
+/// that are not the ones it already created a resource from.
+///
+/// FIXED text, shared by every ACME create that indexes its token: the sentence states
+/// the rule the refusal is made by and interpolates nothing — not the token, not a
+/// parameter name, and not the resource the first call created, whose identifier the
+/// mismatched request never asked for.
+pub const IDEMPOTENCY_TOKEN_REUSED_MESSAGE: &str =
+    "Idempotency token was already used with different request parameters";
 
 /// The `acme-external-account-binding` segment every ACME external-account-binding ARN
 /// carries between its endpoint's ARN and its own id, as

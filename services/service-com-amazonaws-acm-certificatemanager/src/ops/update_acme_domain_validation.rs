@@ -5,8 +5,10 @@
 //! stored ACME domain validation its `AcmeDomainValidationArn` identifies, leaves every
 //! other member of the record (and everything this operation models no input member
 //! for) exactly as it stands, and answers an empty body. An ARN with no record behind it
-//! is `ResourceNotFoundException`; a validation ACM is itself still acting on is refused
-//! `ValidationException`, with nothing written.
+//! is `ResourceNotFoundException`; a validation another caller's update is still
+//! changing is `ConflictException`, the retryable concurrency signal; a validation ACM
+//! is itself still working through is `ValidationException`, naming the status that
+//! blocks the call — in both cases with nothing written.
 //!
 //! A changed prevalidation configuration is evidence ACM has not checked yet, so the
 //! call puts the validation back into `VALIDATING` and records the `VALID` transition
@@ -241,6 +243,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // A caller's own update of this validation that is still in flight is a
+        // CONCURRENT MODIFICATION, not a precondition on the status: the record is
+        // mid-change because somebody else is changing it, which is exactly what
+        // `ConflictException` ("you are trying to update a resource or configuration
+        // that is already being created or updated. Wait for the previous operation to
+        // finish and try again") reports — the retryable signal, so a client that
+        // retries on conflict gets the update AWS would have let it make. It is decided
+        // BEFORE the status guard below, so a record that is unsettled only because
+        // another update re-opened its prevalidation is never reported as a request
+        // defect. Nothing is written.
+        if validation.update_in_flight() {
+            return Err(UpdateAcmeDomainValidationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(
+                        crate::state::acme_domain_validation_concurrent_modification_message(
+                            &input.acme_domain_validation_arn,
+                        ),
+                    ),
+                },
+            )
+            .into());
+        }
+
         // Only a validation ACM is not itself acting on can be reconfigured. Of the
         // statuses `AcmeDomainValidationStatus` declares (`smithy_query(query="shape",
         // shape="com.amazonaws.acm#AcmeDomainValidationStatus")`: VALIDATING | VALID |
@@ -258,10 +283,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ValidationException {
                     // The status that blocks the update, and nothing of the request: the
                     // ARN a caller sent is not reflected back into a 400 body.
-                    message: Some(format!(
-                        "An ACME domain validation that is {} cannot be updated. Wait for the previous operation to finish and try again.",
-                        validation.status
-                    )),
+                    message: Some(
+                        crate::state::acme_domain_validation_status_blocks_update_message(
+                            &validation.status,
+                        ),
+                    ),
                 },
             )
             .into());
@@ -312,7 +338,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // failed" (`AcmeDomainValidation$FailureDetails` doc), and this one has not.
         validation.failure_details = None;
         validation.pending_status = Some(
-            crate::state::PendingAcmeDomainValidationStatus::validating_at(now),
+            crate::state::PendingAcmeDomainValidationStatus::reconfigured_at(now),
         );
         validation.updated_at = now;
 

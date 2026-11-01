@@ -426,9 +426,15 @@ async fn an_idempotency_token_names_one_create() {
         let arn = first["AcmeExternalAccountBindingArn"]
             .as_str()
             .unwrap_or_default();
+        assert_eq!(
+            error_message(&response),
+            state::IDEMPOTENCY_TOKEN_REUSED_MESSAGE,
+            "case {what:?}: expected the fixed idempotency-conflict sentence, got {:?}",
+            error_message(&response)
+        );
         assert!(
-            error_message(&response).contains(arn),
-            "case {what:?}: the conflict must name the binding the token already created ({arn}), got {:?}",
+            !error_message(&response).contains(arn),
+            "case {what:?}: the conflict must not name the binding the token created ({arn}), got {:?}",
             error_message(&response)
         );
 

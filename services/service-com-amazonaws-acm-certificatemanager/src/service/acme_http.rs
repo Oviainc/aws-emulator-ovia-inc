@@ -222,6 +222,17 @@ const BINDING_URL_MISMATCH: &str =
 const BINDING_KEY_MISMATCH: &str =
     "The externalAccountBinding payload must be the account key being registered";
 
+/// The status an ACME server refuses a registration whose external account binding does
+/// not AUTHENTICATE with.
+///
+/// The credential the registration presents is read and judged, and found not to carry
+/// the authority to register: RFC 9110 §15.5.4 words that verdict as `403 (Forbidden)`,
+/// and the recorded behaviour of ACM's ACME endpoints grades the RFC 8555 §7.3.4
+/// verification failure at that status. A binding whose FORM is wrong (another MAC
+/// algorithm, another url, another account key) is a defect in the request rather than a
+/// credential that was rejected, so it stays `malformed` at 400.
+const BINDING_UNAUTHORIZED_STATUS: u16 = 403;
+
 /// The detail of a refusal of an external account binding this endpoint issued no
 /// credentials for.
 const BINDING_UNKNOWN: &str =
@@ -709,7 +720,8 @@ fn account_interaction(
 /// `Err` carries the refusal, boxed because an HTTP response is far larger than the ARN
 /// the happy path reports: the registration presented none, presented one that is not a
 /// MAC-signed JWS over the account key, or presented one whose MAC this endpoint's
-/// credentials do not account for (RFC 8555 §7.3.4).
+/// credentials do not account for (RFC 8555 §7.3.4) — the last of which is a credential
+/// this server rejected, answered at [`BINDING_UNAUTHORIZED_STATUS`].
 fn external_account_binding(
     store: &mut state::ComAmazonawsAcmCertificatemanagerState,
     endpoint_arn: &str,
@@ -763,17 +775,25 @@ fn external_account_binding(
             )
         });
     let Some((arn, mac_key, revoked, expires_at)) = named else {
-        return Err(Box::new(problem(400, UNAUTHORIZED, BINDING_UNKNOWN)));
+        return Err(Box::new(problem(
+            BINDING_UNAUTHORIZED_STATUS,
+            UNAUTHORIZED,
+            BINDING_UNKNOWN,
+        )));
     };
     // A revocation withdraws the authority the credentials carried, and an expiry does
     // the same at the instant the binding was created to run out
     // (`AcmeExternalAccountBinding$RevokedAt` / `$ExpiresAt` docs).
     if revoked || expires_at.is_some_and(|expires_at| now >= expires_at) {
-        return Err(Box::new(problem(400, UNAUTHORIZED, BINDING_WITHDRAWN)));
+        return Err(Box::new(problem(
+            BINDING_UNAUTHORIZED_STATUS,
+            UNAUTHORIZED,
+            BINDING_WITHDRAWN,
+        )));
     }
     if !binding_mac_checks_out(&mac_key, &binding_jws) {
         return Err(Box::new(problem(
-            400,
+            BINDING_UNAUTHORIZED_STATUS,
             UNAUTHORIZED,
             BINDING_MAC_UNVERIFIED,
         )));
@@ -1070,11 +1090,10 @@ fn mint_nonce() -> String {
 
 /// The refusal of an ACME interaction this emulator does not implement.
 ///
-/// `501` with a problem document, never an empty `200`: registering an account,
-/// ordering a certificate, revoking one or rolling an account key over all require
-/// verifying the client's JWS signature over the request, which this emulator does
-/// not do — so there is no account, order or certificate behind such a call, and a
-/// success would report an interaction nothing performed.
+/// `501` with a problem document, never an empty `200`: ordering a certificate, revoking
+/// one and rolling an account key over each mint or withdraw something this emulator
+/// issues nothing for, so there is no order, certificate or key change behind such a
+/// call and a success would report an interaction nothing performed.
 fn not_implemented(resource: &str, directory_url: &str) -> RtResponse {
     let detail = format!(
         "This ACME server does not implement the {} interaction yet",

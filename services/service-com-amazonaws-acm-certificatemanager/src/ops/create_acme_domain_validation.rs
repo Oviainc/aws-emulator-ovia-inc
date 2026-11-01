@@ -252,14 +252,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // identifier that is already taken, so it is refused rather than silently
             // discarding the change — which is what `ConflictException` ("you are trying
             // to update a resource or configuration that is already being created or
-            // updated") names.
+            // updated") names. The refusal is the one sentence this service states that
+            // rule in ([`crate::state::IDEMPOTENCY_TOKEN_REUSED_MESSAGE`]).
             if seen.fingerprint != fingerprint {
                 return Err(CreateAcmeDomainValidationErrorModeled::ConflictException(
                     ConflictException {
-                        message: Some(format!(
-                            "the idempotency token of this request already created ACME domain validation {}, with different parameters",
-                            seen.acme_domain_validation_arn
-                        )),
+                        message: Some(
+                            crate::state::IDEMPOTENCY_TOKEN_REUSED_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());
@@ -297,14 +297,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a domain it already validates would leave two records authorizing the same
         // name, so it is refused rather than silently shadowing the first. DNS labels are
         // case-insensitive, so the two names are compared as domains.
-        if let Some(existing) =
-            store.acme_domain_validation_for(&acme_endpoint_arn, &input.domain_name)
+        if store
+            .acme_domain_validation_for(&acme_endpoint_arn, &input.domain_name)
+            .is_some()
         {
             return Err(CreateAcmeDomainValidationErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "ACME endpoint {acme_endpoint_arn} already has domain validation {} for domain {}",
-                        existing.arn, existing.domain_name
+                    // The domain the CALLER submitted is the one variable part of the
+                    // refusal: the validation that already holds it is not named, so a
+                    // request that created nothing learns no other resource's identity.
+                    message: Some(crate::state::acme_domain_validation_exists_message(
+                        &input.domain_name,
                     )),
                 },
             )

@@ -476,9 +476,14 @@ async fn a_domain_is_validated_once_per_endpoint() {
             "ConflictException",
             "case {case:?}: expected ConflictException for a duplicate domain, got {refusal}"
         );
+        assert_eq!(
+            error_message(&refusal),
+            state::acme_domain_validation_exists_message(&domain),
+            "case {case:?}: expected the duplicate-domain sentence naming {domain}, got {refusal}"
+        );
         assert!(
-            error_message(&refusal).contains(&arn),
-            "case {case:?}: expected the refusal to name the existing validation {arn}, got {refusal}"
+            !error_message(&refusal).contains(&arn),
+            "case {case:?}: the refusal must not name the existing validation {arn}, got {refusal}"
         );
 
         // The same name is still one domain when its labels are upper-cased, so the

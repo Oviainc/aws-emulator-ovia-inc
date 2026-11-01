@@ -264,15 +264,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // identifier that is already taken, so it is refused rather than silently
             // discarding the change — which is what `ConflictException` ("you are trying
             // to update a resource or configuration that is already being created or
-            // updated") names.
+            // updated") names. The refusal is the one sentence this service states that
+            // rule in ([`crate::state::IDEMPOTENCY_TOKEN_REUSED_MESSAGE`]).
             if seen.fingerprint != fingerprint {
                 return Err(
                     CreateAcmeExternalAccountBindingErrorModeled::ConflictException(
                         ConflictException {
-                            message: Some(format!(
-                                "the idempotency token of this request already created ACME external account binding {}, with different parameters",
-                                seen.acme_external_account_binding_arn
-                            )),
+                            message: Some(
+                                crate::state::IDEMPOTENCY_TOKEN_REUSED_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into(),
