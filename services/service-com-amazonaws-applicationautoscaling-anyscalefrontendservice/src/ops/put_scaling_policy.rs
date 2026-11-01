@@ -438,29 +438,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_executed: stored.as_ref().and_then(|existing| existing.last_executed),
         };
         state.policies.insert(key.clone(), record);
-
-        // A target-tracking policy IS its alarms: putting one materialises the alarm set
-        // in CloudWatch and records it on the policy. Planned under this service's lock,
-        // applied with it RELEASED, then recorded under it again — so the CloudWatch write
-        // never happens inside this service's critical section.
-        let plan = crate::state::plan_target_alarms(&state, &key.target, resolved_capacity);
         drop(state);
-        let minted = crate::state::apply_target_alarms(&*self.engine, &plan);
-        let (alarms, orphaned) = {
-            let mut state = self_state.lock();
-            let orphaned = crate::state::record_minted_alarms(&mut state, minted);
-            let alarms = state
-                .policies
-                .get(&key)
-                .map(|record| record.alarms.clone())
-                .unwrap_or_default();
-            (alarms, orphaned)
-        };
-        // A policy deleted while the lock was released owns nothing any more, so the
-        // alarms just written for it are retired rather than left behind.
-        for key in &orphaned {
-            crate::state::retire_policy_alarms(&*self.engine, key, "TargetTrackingScaling");
-        }
+
+        // A target-tracking policy IS its alarms: putting one materialises the alarm set in
+        // CloudWatch and records it on the policy. Done with this service's lock RELEASED —
+        // the CloudWatch write never happens inside this service's critical section — and in
+        // this store's turn at alarm writes, so two puts of ONE policy cannot leave
+        // CloudWatch holding the alarm set of the configuration that lost.
+        crate::state::sync_target_alarms(
+            &*self.engine,
+            &self_state,
+            &key.target,
+            resolved_capacity,
+        );
+        // Read off the policy record, so the response reports the alarms the store holds for
+        // it rather than a list this call invented. A policy deleted while the sync ran holds
+        // none.
+        let alarms = self_state
+            .lock()
+            .policies
+            .get(&key)
+            .map(|record| record.alarms.clone())
+            .unwrap_or_default();
 
         // A policy that is put against an alarm ALREADY in ALARM is owed its execution from
         // the instant that alarm transitioned, so what the clock has made due is performed

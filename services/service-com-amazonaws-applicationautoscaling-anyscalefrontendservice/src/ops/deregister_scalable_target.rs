@@ -238,9 +238,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .retain(|action_key, _| action_key.target != key);
             (removed, retired)
         };
-        for (policy_key, policy_type) in &retired {
-            crate::state::retire_policy_alarms(&*self.engine, policy_key, policy_type);
-        }
+        // The alarms go in this store's turn at alarm writes, so a concurrent put of one of
+        // the retired policies cannot write its alarms back after the target is gone.
+        crate::state::retire_policies_alarms(&*self.engine, &state, &retired);
 
         // The audit record for a destructive call: what was removed, and what went with it.
         ::tracing::info!(

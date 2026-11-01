@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/capacity_window_enforcement.rs"]
 mod capacity_window_enforcement;
+#[path = "all/concurrent_policy_alarm_consistency.rs"]
+mod concurrent_policy_alarm_consistency;
 #[path = "all/control_plane_rules.rs"]
 mod control_plane_rules;
 #[path = "all/customized_metric_alarms.rs"]

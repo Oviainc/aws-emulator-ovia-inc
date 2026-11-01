@@ -451,22 +451,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // within these bounds, even if you don't include the MinCapacity or MaxCapacity
         // request parameters."
         let effective_capacity = enforce_capacity_window(state, &key, resolved_capacity, now);
+        drop(guard);
 
         // Suspending or resuming a scaling activity changes which alarms the target's
         // policies want to exist, and a capacity move changes what their thresholds are
-        // computed from, so the alarm set is re-materialised here: planned under this
-        // service's lock, applied with it RELEASED, recorded under it again. The capacity
-        // the thresholds are computed from is the one the resource is left at, not the one
-        // it was read at.
-        let plan = crate::state::plan_target_alarms(state, &key, effective_capacity);
-        drop(guard);
-        let minted = crate::state::apply_target_alarms(&*self.engine, &plan);
-        let orphaned = crate::state::record_minted_alarms(&mut self_state.lock(), minted);
-        // A policy deleted while the lock was released owns nothing any more, so the
-        // alarms just written for it are retired rather than left behind.
-        for key in &orphaned {
-            crate::state::retire_policy_alarms(&*self.engine, key, "TargetTrackingScaling");
-        }
+        // computed from, so the alarm set is re-materialised here: with this service's lock
+        // RELEASED, and in this store's turn at alarm writes, so a registration and a
+        // concurrent policy write cannot leave CloudWatch holding an alarm set that belongs
+        // to neither. The capacity the thresholds are computed from is the one the resource
+        // is left at, not the one it was read at.
+        crate::state::sync_target_alarms(&*self.engine, &self_state, &key, effective_capacity);
 
         // The capacity window this registration wrote is what every scaling policy of the
         // target is clamped into, and the movement this call may have made is one the scaled

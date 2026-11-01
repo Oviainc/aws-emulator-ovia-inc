@@ -20,6 +20,7 @@
 //! cannot drift from each other.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -184,6 +185,38 @@ pub struct ScalingActivityRecord {
     pub not_scaled_reasons: Vec<NotScaledReason>,
 }
 
+/// The order in which this store's CloudWatch alarm writes happen.
+///
+/// The alarms a target's policies own live in ANOTHER service's store, which cannot be
+/// written under this service's lock, so every alarm write is a three-step sequence: plan
+/// under this lock, write with it released, record under it again. Two of those sequences
+/// for one target may therefore interleave, and the one that writes LAST decides what
+/// CloudWatch ends up holding — which, without this token, can be a plan computed from a
+/// configuration that has since been overwritten, leaving an alarm set that belongs to no
+/// stored policy.
+///
+/// So the whole sequence is taken in turn: a holder plans from the store it reads INSIDE its
+/// turn, which makes the last write the one derived from the last configuration the store
+/// holds. It is a lock of its own rather than this service's store lock, because the
+/// CloudWatch write must still happen with every store lock released.
+///
+/// Clone-cheap (an `Arc` inside): a handler clones it out of the store
+/// ([`ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState::alarm_sync`]) and then
+/// takes its turn with the store lock dropped.
+#[derive(Debug, Clone, Default)]
+pub struct AlarmSyncToken(Arc<Mutex<()>>);
+
+impl AlarmSyncToken {
+    /// Wait for this token's turn, which lasts until the guard is dropped.
+    ///
+    /// Recovers from a poisoned lock exactly as the engine's own state lock does: the token
+    /// guards an ORDER, not a value, so a handler that panicked mid-sequence leaves nothing
+    /// behind for the next one to misread, and a long-lived emulator must keep serving.
+    fn take_turn(&self) -> MutexGuard<'_, ()> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Per-service state for com-amazonaws-applicationautoscaling-anyscalefrontendservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
@@ -255,6 +288,10 @@ pub struct ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
     /// The running clock's task, kept so the claim can tell a clock that is still running
     /// from one whose task has ended without releasing it.
     pub scaling_clock: Option<::tokio::task::JoinHandle<()>>,
+    /// The turn-taking token every CloudWatch alarm write of this store goes through, so
+    /// the alarms CloudWatch holds for a target are the ones this store's policies want.
+    /// Read through [`Self::alarm_sync`]; see [`AlarmSyncToken`].
+    alarm_sync: AlarmSyncToken,
 }
 
 impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
@@ -366,6 +403,11 @@ impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
     /// Release the in-flight marker [`Self::begin_target_update`] took.
     pub fn end_target_update(&mut self, target: &TargetKey) {
         self.updating.remove(target);
+    }
+
+    /// This store's alarm-sync token. See [`AlarmSyncToken`].
+    pub fn alarm_sync(&self) -> AlarmSyncToken {
+        self.alarm_sync.clone()
     }
 
     /// Remember that `arn` was minted for `target` and that the target it names is no longer
@@ -2932,7 +2974,65 @@ pub fn retire_policy_alarms<Eng: Send + Sync + 'static>(
     }
 }
 
-/// The CloudWatch alarms that INVOKE each scaling policy, by the policy ARN they name.
+/// The handle a handler holds on this service's store, as [`service_state`] answers it.
+///
+/// Named so the alarm-sync helpers below can take the HANDLE rather than a guard: they lock
+/// and unlock the store several times in one sequence, which is what keeps the CloudWatch
+/// write out of this service's critical section.
+pub type StateHandle =
+    ::engine::ServiceState<ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState>;
+
+/// Make CloudWatch hold exactly the alarms `target`'s policies want, taking this store's
+/// turn at alarm writes ([`AlarmSyncToken`]) for the WHOLE plan → apply → record sequence.
+///
+/// The one way this service writes a target's alarms, so every call that changes what those
+/// alarms should be — putting a policy, registering the target, writing a managed target —
+/// leaves CloudWatch holding the alarm set computed from the policies this store holds, and
+/// never one computed from a configuration that has since been overwritten. The plan is read
+/// INSIDE the turn for exactly that reason: the holder that writes last is the one that read
+/// last.
+///
+/// Call it with NO store lock held. `resolved_capacity` is the capacity the thresholds are
+/// computed from, read from the service that owns the resource before any lock was taken;
+/// `None` falls back to the target's own floor (see [`plan_target_alarms`]). A policy deleted
+/// while this sequence ran owns nothing any more, so the alarms just written for it are
+/// retired rather than left behind.
+pub fn sync_target_alarms<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    state: &StateHandle,
+    target: &TargetKey,
+    resolved_capacity: Option<i64>,
+) {
+    let token = state.lock().alarm_sync();
+    let _turn = token.take_turn();
+    let plan = plan_target_alarms(&state.lock(), target, resolved_capacity);
+    let minted = apply_target_alarms(engine, &plan);
+    let orphaned = record_minted_alarms(&mut state.lock(), minted);
+    for policy_key in &orphaned {
+        retire_policy_alarms(engine, policy_key, TARGET_TRACKING_POLICY_TYPE);
+    }
+}
+
+/// Retire what each `(policy, type)` pair that is going away owns in CloudWatch, taking this
+/// store's turn at alarm writes ([`AlarmSyncToken`]) first.
+///
+/// The removal half of [`sync_target_alarms`], in the same turn order: a delete that ran
+/// between another call's plan and its write would otherwise be undone by that write, and the
+/// retired policy's alarms would outlive it. Call it with NO store lock held.
+pub fn retire_policies_alarms<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    state: &StateHandle,
+    policies: &[(PolicyKey, String)],
+) {
+    if policies.is_empty() {
+        return;
+    }
+    let token = state.lock().alarm_sync();
+    let _turn = token.take_turn();
+    for (policy_key, policy_type) in policies {
+        retire_policy_alarms(engine, policy_key, policy_type);
+    }
+}
 ///
 /// A policy's `Alarms` are "the CloudWatch alarms associated with the scaling policy"
 /// (`ScalingPolicy$Alarms`), and what associates an alarm with a policy is the alarm's own
@@ -3165,9 +3265,10 @@ pub fn apply_managed_target<Eng: Send + Sync + 'static>(
         return;
     };
     let now = SystemTime::now();
-    // What the CloudWatch side owes once this service's lock is released: the alarm plan
-    // of the target that was written, and the policies whose alarms are to be retired.
-    let mut plan: Option<AlarmPlan> = None;
+    // What the CloudWatch side owes once this service's lock is released: whether the
+    // target's alarm set is to be re-materialised, and the policies whose alarms are to be
+    // retired.
+    let mut resync = false;
     let mut retired: Vec<(PolicyKey, String)> = Vec::new();
     {
         let mut guard = state.lock();
@@ -3296,23 +3397,20 @@ pub fn apply_managed_target<Eng: Send + Sync + 'static>(
                             },
                         );
                     }
-                    plan = Some(plan_target_alarms(store, key, None));
+                    // The alarm set is re-materialised with this service's lock released,
+                    // in this store's turn at alarm writes, so what CloudWatch ends up
+                    // holding is computed from the policy this write left behind.
+                    resync = true;
                 }
             }
         }
     }
     // With this service's lock released: the CloudWatch writes, exactly as
     // `PutScalingPolicy` and `DeregisterScalableTarget` sequence them.
-    if let Some(plan) = plan {
-        let minted = apply_target_alarms(engine, &plan);
-        let orphaned = record_minted_alarms(&mut state.lock(), minted);
-        for policy_key in &orphaned {
-            retire_policy_alarms(engine, policy_key, TARGET_TRACKING_POLICY_TYPE);
-        }
+    if resync {
+        sync_target_alarms(engine, &state, key, None);
     }
-    for (policy_key, policy_type) in &retired {
-        retire_policy_alarms(engine, policy_key, policy_type);
-    }
+    retire_policies_alarms(engine, &state, &retired);
 }
 
 /// The capacity window and the target-tracking configuration this service holds for

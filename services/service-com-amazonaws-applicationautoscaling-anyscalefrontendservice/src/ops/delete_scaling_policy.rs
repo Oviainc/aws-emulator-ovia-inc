@@ -235,8 +235,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The alarms a target-tracking policy minted exist because the policy does:
         // "Deleting a target tracking scaling policy deletes the CloudWatch alarms that it
         // created." A step policy's alarms are the CALLER's and survive it. Every other
-        // policy of the same target keeps its own either way.
-        crate::state::retire_policy_alarms(&*self.engine, &key, &removed.policy_type);
+        // policy of the same target keeps its own either way. Retired in this store's turn
+        // at alarm writes, so a concurrent put of another policy of the same target cannot
+        // write this policy's alarms back after the delete.
+        crate::state::retire_policies_alarms(
+            &*self.engine,
+            &state,
+            &[(key.clone(), removed.policy_type.clone())],
+        );
 
         // The audit record for a destructive call.
         ::tracing::info!(
