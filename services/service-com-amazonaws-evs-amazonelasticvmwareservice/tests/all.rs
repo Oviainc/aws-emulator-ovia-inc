@@ -62,6 +62,8 @@ mod eip_release_on_environment_deletion;
 mod eip_vlan_gate;
 #[path = "all/entitlement_connector.rs"]
 mod entitlement_connector;
+#[path = "all/entitlement_stop_stamp.rs"]
+mod entitlement_stop_stamp;
 #[path = "all/entitlement_vm_id_identity.rs"]
 mod entitlement_vm_id_identity;
 #[path = "all/entitlements.rs"]

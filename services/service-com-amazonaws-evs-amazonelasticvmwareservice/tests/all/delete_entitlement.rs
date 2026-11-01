@@ -79,7 +79,7 @@ fn create_request(environment_id: &str, connector_id: &str, vm_ids: &[String]) -
 }
 
 /// A `DeleteEntitlement` request for `vm_ids`, through `connector_id`.
-fn delete_request(environment_id: &str, connector_id: &str, vm_ids: &[String]) -> Value {
+pub(crate) fn delete_request(environment_id: &str, connector_id: &str, vm_ids: &[String]) -> Value {
     json!({
         "environmentId": environment_id,
         "connectorId": connector_id,
@@ -98,7 +98,7 @@ fn list_request(environment_id: &str, connector_id: &str) -> Value {
 }
 
 /// The `entitlements` of a response body.
-fn entitlements(case: &str, body: &Value) -> Vec<Value> {
+pub(crate) fn entitlements(case: &str, body: &Value) -> Vec<Value> {
     body["entitlements"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: no entitlements list in {body}"))
@@ -119,12 +119,12 @@ fn reported_vm_ids(case: &str, entries: &[Value]) -> BTreeSet<String> {
 }
 
 /// `vm_ids` as the owned strings the request builders take.
-fn vms(vm_ids: &[&str]) -> Vec<String> {
+pub(crate) fn vms(vm_ids: &[&str]) -> Vec<String> {
     vm_ids.iter().map(|vm| (*vm).to_string()).collect()
 }
 
 /// Create the entitlements for `vm_ids`, failing the test if the create is refused.
-async fn entitle(
+pub(crate) async fn entitle(
     router: &Emulator,
     case: &str,
     environment: &str,
@@ -145,7 +145,7 @@ async fn entitle(
 
 /// Every entitlement one environment and connector still holds, following `nextToken` to
 /// the end.
-async fn list_all(router: &Emulator, case: &str, environment: &str, connector: &str) -> Vec<Value> {
+pub(crate) async fn list_all(router: &Emulator, case: &str, environment: &str, connector: &str) -> Vec<Value> {
     let mut collected = Vec::new();
     let mut next_token: Option<String> = None;
     // One round per possible page plus one, so a token that never clears fails here
@@ -170,7 +170,7 @@ async fn list_all(router: &Emulator, case: &str, environment: &str, connector: &
 }
 
 /// Assert one reported entitlement is the stopped form of a record that was removed.
-fn assert_stopped(case: &str, entry: &Value, environment: &str, connector: &str) {
+pub(crate) fn assert_stopped(case: &str, entry: &Value, environment: &str, connector: &str) {
     for (member, expected) in [
         ("environmentId", json!(environment)),
         ("connectorId", json!(connector)),
