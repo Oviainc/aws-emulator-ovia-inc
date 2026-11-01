@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLocalGatewayVirtualInterfaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLocalGatewayVirtualInterfaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLocalGatewayVirtualInterfaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the local gateway virtual interfaces the account holds
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::local_gateway_virtual_interfaces`]),
+//! narrowed by the `LocalGatewayVirtualInterfaceIds` and `Filters` the request names and
+//! cut into `MaxResults`-sized pages. It is a READ: nothing it does changes what a later
+//! caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +145,297 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLocalGatewayVirtualInterfaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLocalGatewayVirtualInterfacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`DescribeLocalGatewayVirtualInterfacesRequest$DryRun`). Every caller of this
+        // emulator is permitted, so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+
+        // "The token for the next page of results" (`...Request$NextToken`) — anything
+        // else is refused rather than read as an id, and it is refused before any other
+        // member is looked at, so whether a bogus token is caught never depends on the
+        // rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // "The IDs of the virtual interfaces" (`...Request$LocalGatewayVirtualInterfaceIds`):
+        // the request-controlled factors of the scan below are capped BEFORE any work
+        // proportional to them is done, the model bounding none of them. The id set is
+        // bounded the way every other EC2 request's id list is.
+        let requested: &[String] = input
+            .local_gateway_virtual_interface_ids
+            .as_deref()
+            .unwrap_or_default();
+        if requested.len() > crate::state::MAX_RESOURCE_IDS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request names {} virtual interface ids, above the maximum of {}",
+                requested.len(),
+                crate::state::MAX_RESOURCE_IDS
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored virtual interfaces, so
+        // each request-controlled factor is capped here and their PRODUCT is charged to one
+        // [`crate::state::MatchBudget`] below — the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > crate::state::MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum of {}",
+                crate::state::MAX_FILTERS
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // virtual interface would have matched it, so an unsupported filter can never read
+        // as "no results". Each value is compiled into its pattern ONCE here rather than
+        // re-compiled per comparison.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<crate::state::CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !VIRTUAL_INTERFACE_FILTERS.contains(&name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > crate::state::MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of {}",
+                    values.len(),
+                    crate::state::MAX_FILTER_VALUES
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > crate::state::MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of {}",
+                    oversize.len(),
+                    crate::state::MAX_FILTER_VALUE_BYTES
+                )));
+            }
+            selectors.push(crate::state::CompiledFilter::new(
+                name.to_string(),
+                values.to_vec(),
+            ));
+        }
+
+        // The ids are looked up as a SET, so narrowing the store by them costs one hash per
+        // stored virtual interface rather than one comparison per (interface, id) pair —
+        // the id list being capped above does not by itself make that product small.
+        let named_ids: ::std::collections::HashSet<&str> =
+            requested.iter().map(String::as_str).collect();
+
+        let store = state.lock();
+
+        // The default is to describe every virtual interface the account holds; the ids
+        // narrow the store to those named, and every filter must then hold ("If you specify
+        // multiple filters, the filters are joined with an AND" — `Filter`). An id that
+        // names no virtual interface of the account contributes no row: this operation
+        // models no error and AWS publishes no not-found code for this id set, so there is
+        // no code to refuse it with that this service would not have had to invent.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLocalGatewayVirtualInterfaces"))
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored interfaces,
+        // ids, filters, values and value length is bounded however the caller combines them
+        // — which is also what bounds how long this holds the state lock.
+        let mut budget = crate::state::MatchBudget::new(crate::state::MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&LocalGatewayVirtualInterface> = Vec::new();
+        for virtual_interface in store.local_gateway_virtual_interfaces.values() {
+            if budget.exhausted() {
+                break;
+            }
+            let named = requested.is_empty()
+                || virtual_interface
+                    .local_gateway_virtual_interface_id
+                    .as_deref()
+                    .is_some_and(|id| named_ids.contains(id));
+            if named && matches_every_filter(virtual_interface, &selectors, &mut budget) {
+                selected.push(virtual_interface);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {} comparisons to \
+                     evaluate; narrow them or page with MaxResults",
+                    crate::state::MAX_FILTER_MATCH_STEPS
+                ),
+            ));
+        }
+
+        // Page in virtual-interface-id order, which the cursor below names a position in.
+        // The store is an ordered map, so its iteration order already satisfies this sort;
+        // doing it here establishes the invariant the cursor depends on at the point of use
+        // rather than inheriting it from the container `crate::state` happens to hold. It
+        // compares the id exactly as the cursor below does — the id text, an absent id
+        // reading as the empty string — so the sort and the cursor cannot disagree about
+        // where a page starts.
+        selected.sort_by(|left, right| {
+            left.local_gateway_virtual_interface_id
+                .as_deref()
+                .unwrap_or_default()
+                .cmp(
+                    right
+                        .local_gateway_virtual_interface_id
+                        .as_deref()
+                        .unwrap_or_default(),
+                )
+        });
+
+        // That order is both the stable paging order and the cursor, so a token naming the
+        // id the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|virtual_interface| {
+                virtual_interface
+                    .local_gateway_virtual_interface_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of results to return with a single call"
+        // (`...Request$MaxResults`). A request that names none gets the largest page the
+        // model publishes, so the `NextToken` path below behaves the same whether or not a
+        // page size was asked for. The model's `range 5..1000` has already refused anything
+        // outside it, so the only value that cannot convert is one the boundary validator
+        // would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // "This value is null when there are no more results to return"
+        // (`...Result$NextToken`): a token only when a virtual interface follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|virtual_interface| {
+                virtual_interface
+                    .local_gateway_virtual_interface_id
+                    .as_deref()
+            })
+            .map(crate::state::encode_page_token);
+
+        Ok(DescribeLocalGatewayVirtualInterfacesOutput {
+            local_gateway_virtual_interfaces: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|virtual_interface| (*virtual_interface).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`LocalGatewayMaxResults`, `range 5..1000`), which is also the most EC2 returns in one
+/// page.
+const DEFAULT_MAX_RESULTS: usize = 1000;
+
+/// The filter names this operation documents, from
+/// `DescribeLocalGatewayVirtualInterfacesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeLocalGatewayVirtualInterfacesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// That doc names no `tag:<key>` or `tag-key` filter for this operation, and no filter on
+/// the virtual interface GROUP id, so none of those is accepted here even though the
+/// virtual interface shape carries both. Every entry must be answered by [`filter_values`].
+const VIRTUAL_INTERFACE_FILTERS: [&str; 8] = [
+    "local-address",
+    "local-bgp-asn",
+    "local-gateway-id",
+    "local-gateway-virtual-interface-id",
+    "owner-id",
+    "peer-address",
+    "peer-bgp-asn",
+    "vlan",
+];
+
+/// The values the EC2 filter `name` compares against this virtual interface.
+///
+/// A filter naming an attribute this virtual interface does not carry compares against NO
+/// values, so it selects nothing — the same answer AWS gives for any attribute a resource
+/// holds no value for. A numeric attribute (`local-bgp-asn`, `peer-bgp-asn`, `vlan`)
+/// compares as the decimal text EC2 reports it as, every EC2 filter value being a string.
+fn filter_values<'a>(
+    virtual_interface: &'a LocalGatewayVirtualInterface,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    let number = |value: Option<i32>| -> Vec<Cow<'a, str>> {
+        value
+            .map(|value| Cow::Owned(value.to_string()))
+            .into_iter()
+            .collect()
+    };
+    match name {
+        "local-address" => text(virtual_interface.local_address.as_deref()),
+        "local-bgp-asn" => number(virtual_interface.local_bgp_asn),
+        "local-gateway-id" => text(virtual_interface.local_gateway_id.as_deref()),
+        "local-gateway-virtual-interface-id" => {
+            text(virtual_interface.local_gateway_virtual_interface_id.as_deref())
+        }
+        "owner-id" => text(virtual_interface.owner_id.as_deref()),
+        "peer-address" => text(virtual_interface.peer_address.as_deref()),
+        "peer-bgp-asn" => number(virtual_interface.peer_bgp_asn),
+        "vlan" => number(virtual_interface.vlan),
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check
+        // were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `virtual_interface` satisfy every filter?
+///
+/// The AND/OR evaluation EC2 defines for every `Filters` member, through the crate's one
+/// implementation of it ([`crate::state::matches_every_filter`]): "If you specify multiple
+/// filters, the filters are joined with an AND" (`Filter`), and within one filter "if you
+/// specify multiple values for a filter, the values are joined with an OR"
+/// (`Filter$Values`) — each value matched case-sensitively, with EC2's own `*`/`?`
+/// wildcards, by the pattern the value was compiled into. So a filter carrying no value at
+/// all matches nothing, there being no value for the attribute to match.
+///
+/// Every comparison, and the candidate itself, is charged to `budget`, so one request's
+/// filtering cannot cost more than the ceiling however it combines filters, values and
+/// value length.
+fn matches_every_filter(
+    virtual_interface: &LocalGatewayVirtualInterface,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    crate::state::matches_every_filter(selectors, budget, &|name| {
+        filter_values(virtual_interface, name)
+    })
 }

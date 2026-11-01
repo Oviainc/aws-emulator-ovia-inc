@@ -98,6 +98,13 @@
 //! one way a group is stored, and it derives every member the service owns (the group id,
 //! its ARN and the owning account) rather than taking it from a caller.
 //!
+//! [`ComAmazonawsEc2Amazonec2State::local_gateway_virtual_interfaces`] holds the virtual
+//! interfaces themselves the same way, keyed by `LocalGatewayVirtualInterfaceId`, so
+//! `DescribeLocalGatewayVirtualInterfaces` reports one exactly as its writer stored it and
+//! pages over the same id order. It starts EMPTY for the reason the group store does, and
+//! [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_virtual_interface`] is the one way
+//! one is stored.
+//!
 //! [`ComAmazonawsEc2Amazonec2State::local_gateway_route_table_vpc_associations`] holds the
 //! associations between a local gateway route table of
 //! [`ComAmazonawsEc2Amazonec2State::local_gateway_route_tables`] and a VPC, keyed by
@@ -3124,6 +3131,19 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// stored.
     pub local_gateway_virtual_interface_groups:
         BTreeMap<String, crate::ops::types::LocalGatewayVirtualInterfaceGroup>,
+    /// Every local gateway virtual interface the account holds, by
+    /// `LocalGatewayVirtualInterfaceId`, as the modelled
+    /// [`crate::ops::types::LocalGatewayVirtualInterface`] shape itself — so a member a
+    /// writer sets round-trips through `DescribeLocalGatewayVirtualInterfaces` without a
+    /// field-by-field copy that can silently drop one. Ordered by id, which is the order
+    /// that describe reports and pages over.
+    ///
+    /// Starts EMPTY, for the reason the group store above it does: a virtual interface
+    /// lives on an Outpost's local gateway, which no EC2 call creates, so an account
+    /// without an Outpost has no virtual interface to report.
+    /// [`Self::insert_local_gateway_virtual_interface`] is the one way one is stored.
+    pub local_gateway_virtual_interfaces:
+        BTreeMap<String, crate::ops::types::LocalGatewayVirtualInterface>,
     /// Every local gateway the account holds, by `LocalGatewayId`, as the modelled
     /// [`crate::ops::types::LocalGateway`] shape itself — so a member a writer sets
     /// round-trips through a report of the gateways without a field-by-field copy that can
@@ -4629,6 +4649,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // A local gateway route table lives on an Outpost, which no EC2 call creates.
             local_gateway_route_tables: BTreeMap::new(),
             local_gateway_virtual_interface_groups: BTreeMap::new(),
+            // A local gateway virtual interface comes with an Outpost, which no EC2 call
+            // creates either.
+            local_gateway_virtual_interfaces: BTreeMap::new(),
             // A local gateway is part of an Outpost rack, which no EC2 call creates.
             local_gateways: BTreeMap::new(),
             // A fresh account has created no Client VPN endpoint, so it holds none and no
@@ -14541,6 +14564,180 @@ impl ComAmazonawsEc2Amazonec2State {
         self.local_gateway_virtual_interface_groups
             .insert(group_id.clone(), group);
         Some(group_id)
+    }
+}
+
+// =============================================================================
+// Local gateway virtual interfaces
+// =============================================================================
+
+/// The id prefix EC2 mints a local gateway virtual interface with: `lgw-vif-`, as the AWS
+/// Outposts and EC2 documentation's own ids read (for example `lgw-vif-06f8c3f5c3EXAMPLE`).
+/// The model puts no pattern on `LocalGatewayVirtualInterfaceId`, so the prefix is the one
+/// thing that says which resource an id names — and it is a strict prefix of the GROUP's
+/// ([`LOCAL_GATEWAY_VIF_GROUP_ID_PREFIX`]), so a group id reads as malformed here rather
+/// than as a virtual interface, its suffix (`grp-…`) not being hexadecimal.
+pub const LOCAL_GATEWAY_VIF_ID_PREFIX: &str = "lgw-vif";
+
+/// How many local gateway virtual interfaces this emulator stores before a write must
+/// refuse.
+///
+/// CHOSEN, like [`MAX_LOCAL_GATEWAY_VIF_GROUPS`] and for the same reason: nothing in this
+/// emulator reclaims a stored virtual interface, so the store needs a ceiling that is not
+/// the process's memory. A count ceiling is no bound on the caller-chosen bytes each record
+/// holds, so those are charged against [`MAX_STORED_BYTES`] too
+/// ([`local_gateway_vif_payload_bytes`]).
+pub const MAX_LOCAL_GATEWAY_VIFS: usize = 4096;
+
+/// The ARN of a local gateway virtual interface:
+/// `arn:aws:ec2:<region>:<account>:local-gateway-virtual-interface/<id>`, the form
+/// `LocalGatewayVirtualInterface$LocalGatewayVirtualInterfaceArn` carries ("The Amazon
+/// Resource Number (ARN) of the local gateway virtual interface") under the resource path
+/// `ResourceType`'s own `local-gateway-virtual-interface` member names
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+pub fn local_gateway_virtual_interface_arn(region: &str, virtual_interface_id: &str) -> String {
+    ::engine::emulator_arn(
+        "ec2",
+        region,
+        &format!("local-gateway-virtual-interface/{virtual_interface_id}"),
+    )
+}
+
+/// Whether `id` is a well-formed local gateway virtual interface id — one EC2 could have
+/// issued.
+///
+/// `<prefix>-<8 or 17 lowercase hex digits>`, read by the one generic id reader
+/// ([`prefixed_id_is_well_formed`]) under this resource's own prefix
+/// ([`LOCAL_GATEWAY_VIF_ID_PREFIX`], whose doc carries the evidence for it).
+pub fn local_gateway_virtual_interface_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(LOCAL_GATEWAY_VIF_ID_PREFIX, id)
+}
+
+/// What one local gateway virtual interface is written with: the local gateway and the
+/// virtual interface group it belongs to, the Outpost LAG that carries it, its VLAN, the
+/// local and peer addresses and BGP configuration, the Region whose ARN namespace its ARN
+/// names, its configuration state, and its tags.
+///
+/// Every member the service itself owns — the virtual interface id, the ARN built from the
+/// Region and that id, and the owning account — is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_virtual_interface`] rather than
+/// taken from the caller, so two writers cannot report one virtual interface differently.
+#[derive(Debug, Clone)]
+pub struct LocalGatewayVirtualInterfaceSpec {
+    /// "The ID of the local gateway" the virtual interface belongs to.
+    pub local_gateway_id: String,
+    /// "The ID of the local gateway virtual interface group" it is a member of.
+    pub local_gateway_virtual_interface_group_id: Option<String>,
+    /// "The Outpost LAG ID" that connects the Outpost to the on-premises network devices.
+    pub outpost_lag_id: Option<String>,
+    /// "The ID of the VLAN" the virtual interface runs on.
+    pub vlan: Option<i32>,
+    /// "The local address" — the address on the Outpost side. Only IPv4 is supported.
+    pub local_address: Option<String>,
+    /// "The peer address" — the on-premises side of the link.
+    pub peer_address: Option<String>,
+    /// "The Border Gateway Protocol (BGP) Autonomous System Number (ASN) of the local
+    /// gateway".
+    pub local_bgp_asn: Option<i32>,
+    /// "The peer BGP ASN".
+    pub peer_bgp_asn: Option<i32>,
+    /// "The extended 32-bit ASN of the BGP peer for use with larger ASN values".
+    pub peer_bgp_asn_extended: Option<i64>,
+    /// The Region the virtual interface's ARN names.
+    pub region: String,
+    /// "The current state of the local gateway virtual interface"
+    /// (`LocalGatewayVirtualInterface$ConfigurationState`), one of
+    /// [`crate::ops::types::LOCAL_GATEWAY_VIRTUAL_INTERFACE_CONFIGURATION_STATE_VALUES`].
+    pub configuration_state: String,
+    /// "The tags assigned to the virtual interface".
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored virtual interface holds: its tags, the configuration
+/// state a writer pinned on it, the local gateway and group ids, the Outpost LAG id, the
+/// local and peer addresses, and the Region, which the stored ARN carries. Everything else
+/// on the record — the virtual interface id, the rest of the ARN, the owning account, the
+/// VLAN and the ASNs — is derived by this module or fixed-size.
+///
+/// The ONE definition of that charge, the way [`local_gateway_vif_group_payload_bytes`] is
+/// for the group store beside it:
+/// [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_virtual_interface`] charges exactly
+/// it, and a removal path must give back the same number.
+pub fn local_gateway_vif_payload_bytes(spec: &LocalGatewayVirtualInterfaceSpec) -> usize {
+    [
+        spec.local_gateway_virtual_interface_group_id.as_deref(),
+        spec.outpost_lag_id.as_deref(),
+        spec.local_address.as_deref(),
+        spec.peer_address.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(tag_list_bytes(&spec.tags), |total, value| {
+        total.saturating_add(value.len())
+    })
+    .saturating_add(spec.configuration_state.len())
+    .saturating_add(spec.local_gateway_id.len())
+    .saturating_add(spec.region.len())
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another `count` local gateway virtual interfaces fit inside the store's
+    /// ceiling ([`MAX_LOCAL_GATEWAY_VIFS`]).
+    ///
+    /// A writer may ask this before inserting, the way
+    /// [`Self::has_local_gateway_vif_group_capacity`] gates the group store, so it can
+    /// refuse in the `<Resource>LimitExceeded` family this service's other quotas are
+    /// refused with rather than discover the refusal from an absent id. The insert itself
+    /// asks it too, so no path can get past it.
+    pub fn has_local_gateway_vif_capacity(&self, count: usize) -> bool {
+        self.local_gateway_virtual_interfaces
+            .len()
+            .saturating_add(count)
+            <= MAX_LOCAL_GATEWAY_VIFS
+    }
+
+    /// Store one local gateway virtual interface, and answer the id it was given — or
+    /// `None` when the store cannot take it.
+    ///
+    /// Both of the store's bounds are enforced HERE, before an id is minted or a byte
+    /// charged: the count ceiling ([`Self::has_local_gateway_vif_capacity`]) and the byte
+    /// budget ([`Self::would_exceed_stored_bytes`] over
+    /// [`local_gateway_vif_payload_bytes`]) — the same contract as
+    /// [`Self::insert_local_gateway_virtual_interface_group`]. A caller that gets `None`
+    /// must refuse the request with the `<Resource>LimitExceeded` code for this quota,
+    /// which belongs with that writer rather than here.
+    pub fn insert_local_gateway_virtual_interface(
+        &mut self,
+        spec: LocalGatewayVirtualInterfaceSpec,
+    ) -> Option<String> {
+        let payload_bytes = local_gateway_vif_payload_bytes(&spec);
+        if !self.has_local_gateway_vif_capacity(1) || self.would_exceed_stored_bytes(payload_bytes) {
+            return None;
+        }
+        let virtual_interface_id = self.next_id(LOCAL_GATEWAY_VIF_ID_PREFIX);
+        let virtual_interface = crate::ops::types::LocalGatewayVirtualInterface {
+            local_gateway_virtual_interface_id: Some(virtual_interface_id.clone()),
+            local_gateway_id: Some(spec.local_gateway_id),
+            local_gateway_virtual_interface_group_id: spec.local_gateway_virtual_interface_group_id,
+            local_gateway_virtual_interface_arn: Some(local_gateway_virtual_interface_arn(
+                &spec.region,
+                &virtual_interface_id,
+            )),
+            outpost_lag_id: spec.outpost_lag_id,
+            vlan: spec.vlan,
+            local_address: spec.local_address,
+            peer_address: spec.peer_address,
+            local_bgp_asn: spec.local_bgp_asn,
+            peer_bgp_asn: spec.peer_bgp_asn,
+            peer_bgp_asn_extended: spec.peer_bgp_asn_extended,
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            tags: Some(spec.tags),
+            configuration_state: Some(spec.configuration_state),
+        };
+        self.add_stored_bytes(payload_bytes);
+        self.local_gateway_virtual_interfaces
+            .insert(virtual_interface_id.clone(), virtual_interface);
+        Some(virtual_interface_id)
     }
 }
 
