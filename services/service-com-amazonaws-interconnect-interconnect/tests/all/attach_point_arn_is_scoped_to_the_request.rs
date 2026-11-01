@@ -92,6 +92,21 @@ async fn live_connection(
     body["connection"].clone()
 }
 
+/// [`live_connection`] carried on to the fully provisioned state — the state a
+/// connection is the connectivity an attach point names in, so a row offering an ARN it
+/// expects to RESOLVE takes its record from here and what the refusals below show is the
+/// scope rather than the readiness.
+async fn provisioned_connection(
+    emulator: &Emulator,
+    region: &str,
+    placement: &(String, String),
+) -> Value {
+    let created = live_connection(emulator, region, placement).await;
+    emulator
+        .provisioned_connection(region, &text(&created, "id"))
+        .await
+}
+
 /// The `ConnectionId`s `region`'s endpoint holds, walked page by page so the answer is
 /// the whole store however it is windowed. Ids rather than whole records, because the
 /// clock moves a record's `state` on its own between two listings.
@@ -166,7 +181,7 @@ async fn an_attach_point_arn_resolves_only_through_the_region_its_connection_liv
         // addresses.
         let places = placements_in(&emulator, region).await;
         let placement = &places[seed % places.len()];
-        let live = live_connection(&emulator, region, placement).await;
+        let live = provisioned_connection(&emulator, region, placement).await;
         let arn = text(&live, "arn");
         let id = text(&live, "id");
         assert_eq!(
@@ -276,9 +291,12 @@ async fn an_acceptance_resolves_an_attach_point_arn_in_the_region_it_addresses()
         let caller_places = placements_in(&emulator, caller).await;
         let home_placement = &home_places[seed % home_places.len()];
         let caller_placement = &caller_places[(seed + 1) % caller_places.len()];
-        let foreign_arn = text(&live_connection(&emulator, home, home_placement).await, "arn");
+        let foreign_arn = text(
+            &provisioned_connection(&emulator, home, home_placement).await,
+            "arn",
+        );
         let local_arn = text(
-            &live_connection(&emulator, caller, caller_placement).await,
+            &provisioned_connection(&emulator, caller, caller_placement).await,
             "arn",
         );
 

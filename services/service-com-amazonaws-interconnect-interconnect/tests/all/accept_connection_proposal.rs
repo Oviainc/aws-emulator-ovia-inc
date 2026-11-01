@@ -423,6 +423,11 @@ async fn an_acceptance_may_select_an_attach_point_by_arn() {
         // The connection whose ARN the acceptance selects, in the same Region: an ARN
         // identifies its resource in full, so only this Region's own resolves here.
         let base = create_proposal(&emulator, case).await;
+        // A connection is the connectivity an attach point names only once it is fully
+        // provisioned, so its ARN is offered after the clock has carried it there.
+        let base = emulator
+            .provisioned_connection(case.region, &text(&base, "id"))
+            .await;
         let attach_point = json!({ "arn": text(&base, "arn") });
 
         let proposal = create_proposal(&emulator, case).await;

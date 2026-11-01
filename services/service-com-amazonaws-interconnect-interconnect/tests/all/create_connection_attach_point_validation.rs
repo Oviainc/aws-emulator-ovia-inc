@@ -300,8 +300,8 @@ async fn every_listed_attach_point_is_accepted_and_read_back() {
 }
 
 /// RULE: the `arn` member names an attach point by full ARN, so a Connection the
-/// account HOLDS is one — while the same ARN, once that connection is gone, no longer
-/// resolves to anything.
+/// account HOLDS and has fully provisioned is one — while the same ARN, once that
+/// connection is gone, no longer resolves to anything.
 #[tokio::test]
 async fn a_connection_of_the_account_is_an_attach_point_by_arn() {
     let emulator = Emulator::new();
@@ -338,6 +338,11 @@ async fn a_connection_of_the_account_is_an_attach_point_by_arn() {
         );
         let base_arn = text(&base["connection"], "arn");
         let attach_point = json!({ "arn": base_arn });
+        // A connection is the connectivity an attach point names only once it is fully
+        // provisioned, so the ARN is offered after the clock has carried it there.
+        emulator
+            .provisioned_connection(region, &text(&base["connection"], "id"))
+            .await;
 
         let (status, attached) =
             create_on(&emulator, region, environment, &bandwidth, &attach_point).await;

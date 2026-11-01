@@ -90,6 +90,20 @@ async fn live_connection(emulator: &Emulator, region: &str, placement: &(String,
     body["connection"].clone()
 }
 
+/// [`live_connection`] carried on to the fully provisioned state, which is the state a
+/// connection is the connectivity an attach point names in — so every row below differs
+/// from the ARN that resolves in one FIELD and in nothing else.
+async fn provisioned_connection(
+    emulator: &Emulator,
+    region: &str,
+    placement: &(String, String),
+) -> Value {
+    let created = live_connection(emulator, region, placement).await;
+    emulator
+        .provisioned_connection(region, &text(&created, "id"))
+        .await
+}
+
 /// Accept the proposal `activation_key` names with the `arn` attach point, signed for
 /// `region`.
 async fn accept_with_arn(
@@ -168,7 +182,7 @@ async fn an_acceptance_resolves_an_attach_point_arn_field_for_field_in_the_regio
         // One live connection of the Region the acceptance addresses, whose ARN is the
         // attach point that DOES resolve, and one live connection of another Region,
         // whose ARN names a resource this endpoint holds nothing for.
-        let local = live_connection(&emulator, caller, caller_placement).await;
+        let local = provisioned_connection(&emulator, caller, caller_placement).await;
         let local_id = text(&local, "id");
         let local_arn = text(&local, "arn");
         assert_eq!(
@@ -177,7 +191,7 @@ async fn an_acceptance_resolves_an_attach_point_arn_field_for_field_in_the_regio
             "case {caller:?}: expected the stored ARN to carry this request's partition, Region and account, got {local_arn:?}"
         );
         let foreign_id = text(
-            &live_connection(&emulator, elsewhere, foreign_placement).await,
+            &provisioned_connection(&emulator, elsewhere, foreign_placement).await,
             "id",
         );
 

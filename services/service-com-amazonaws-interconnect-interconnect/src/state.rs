@@ -521,22 +521,24 @@ impl ComAmazonawsInterconnectInterconnectState {
     /// Two filters, both of them rules this crate already applies elsewhere. The ARN
     /// resolves the resource the way a HANDLE on a connection resolves here
     /// ([`Self::connection_in_by_arn`]): in full, and inside the scope the request
-    /// addressed. And the connectivity behind it has to still be there: an attach
-    /// point is a handle whose whole subject is the connectivity the new Connection is
-    /// provisioned onto, so from the moment a `DeleteConnection` is made on the
-    /// connection behind it the handle names nothing ([`is_deleted_or_deleting`]) —
-    /// the same filter [`Self::proposal_in`] applies to the other handle of that kind,
-    /// and the same readiness rule the union's gateway member is held to, where a
-    /// gateway being torn down is no longer a valid attach point
-    /// ([`direct_connect`]). The record itself stays readable by its identifier and by
-    /// its ARN, which is how a caller polling the delete sees the teardown.
+    /// addressed. And the connectivity behind it has to BE there: an attach point is a
+    /// handle whose whole subject is the connectivity the new Connection is provisioned
+    /// onto, so the handle names something only while the connection behind it is
+    /// providing that connectivity ([`provides_connectivity`]) — the readiness rule the
+    /// union's gateway member is held to as well, where only a gateway that is ready for
+    /// use is a valid attach point ([`direct_connect`]). That covers both ends of the
+    /// connection's life: one still being brought up has no connectivity yet, and one a
+    /// `DeleteConnection` has been made on has none any more — the filter
+    /// [`Self::proposal_in`] applies to the other handle of that kind. The record itself
+    /// stays readable by its identifier and by its ARN, which is how a caller polling the
+    /// delete sees the teardown.
     pub fn attach_point_connection_in(
         &self,
         region: &str,
         arn: &str,
     ) -> Option<&StoredConnection> {
         self.connection_in_by_arn(region, arn)
-            .filter(|stored| !is_deleted_or_deleting(&stored.connection.state))
+            .filter(|stored| provides_connectivity(&stored.connection.state))
     }
 
     /// The stored connection an `AmazonResourceName` ADDRESSES in `region`, for the
@@ -1466,6 +1468,32 @@ pub const AWAITING_ACCEPTANCE_CONNECTION_STATE: &str = "requested";
 /// Partner"), which is the first leg of the progression the clock then owes it.
 pub const ACCEPTED_CONNECTION_STATE: &str = "pending";
 
+/// The one `ConnectionState` in which a connection IS the connectivity something can be
+/// attached to.
+///
+/// The model documents the value as "available: The connection has been fully
+/// provisioned between AWS and the Partner". Every other modelled state is a circuit
+/// that is not there to attach anything to: one still waiting at the partner portal
+/// ("requested: … the state will remain here until the Connection is accepted on the
+/// Partner portal"), one still being provisioned (`pending`), one being re-provisioned
+/// (`updating`), one that is not passing traffic (`down`), one that never came up
+/// ("failed: the connection has failed to be created") and one being torn down or
+/// already torn down (`deleting`, `deleted`).
+pub const CONNECTION_READY_STATE: &str = "available";
+
+/// Whether a connection in `state` provides connectivity a new Connection can be
+/// provisioned onto.
+///
+/// The ONE readiness rule the whole `AttachPoint` union is held to, stated for this
+/// member's resource: an attach point is a handle whose subject is connectivity, so it
+/// names something only while the resource behind it is in the state its own service
+/// documents as ready for use — [`CONNECTION_READY_STATE`] for a connection of this
+/// service, and the equivalent gateway state for the union's other member
+/// ([`direct_connect`]).
+pub fn provides_connectivity(state: &str) -> bool {
+    state == CONNECTION_READY_STATE
+}
+
 /// The `ConnectionState` a connection whose bandwidth is being re-provisioned
 /// reports ("updating: the connection is being updated"), which is the transient
 /// state `UpdateConnection`'s own change hands the connection to the clock in.
@@ -1477,7 +1505,7 @@ pub const UPDATING_CONNECTION_STATE: &str = "updating";
 /// that is not passing traffic reports, and the one an in-flight change reports.
 pub const ACCEPTED_CONNECTION_STATES: [&str; 4] = [
     ACCEPTED_CONNECTION_STATE,
-    "available",
+    CONNECTION_READY_STATE,
     "down",
     UPDATING_CONNECTION_STATE,
 ];

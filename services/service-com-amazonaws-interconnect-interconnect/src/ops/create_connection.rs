@@ -317,9 +317,10 @@ fn judge_against_store(
     // — the connection it names, resolved in full, so one whose Region or account is
     // not the stored one names no resource this account holds, inside the scope the
     // request addressed, so a connection created through another Region's endpoint is
-    // one this endpoint holds nothing for, and with the connectivity behind it still
-    // there, so a connection whose teardown has already been called is no longer an
-    // attach point. An ARN that resolves to nothing has no attach point behind it, so
+    // one this endpoint holds nothing for, and with the connectivity behind it actually
+    // there, so a connection that is not fully provisioned — one still being brought up
+    // as much as one whose teardown has been called — is not an attach
+    // point. An ARN that resolves to nothing has no attach point behind it, so
     // there is nothing to provision the connection onto — the same answer, and the
     // same wording, an identifier the account does not hold at all gets, so what
     // refuses the request never reports whether another scope holds the resource.

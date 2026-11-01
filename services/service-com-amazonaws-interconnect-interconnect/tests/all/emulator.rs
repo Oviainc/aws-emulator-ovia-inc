@@ -53,6 +53,20 @@ pub(crate) const HARNESS_GATEWAY_NAME: &str = "ic-harness-attach-point";
 /// is the only state a gateway is an attach point in.
 pub(crate) const GATEWAY_READY_STATE: &str = "available";
 
+/// The `ConnectionState` the model documents as "available: The connection has been
+/// fully provisioned between AWS and the Partner" — the state a connection is the
+/// connectivity something can be attached to in, as `available` is for a gateway.
+pub(crate) const CONNECTION_READY_STATE: &str = "available";
+
+/// How long a wait for a connection to be fully provisioned runs before the case fails.
+///
+/// The clock owes a created connection the two legs of the documented progression, so
+/// this is well past both: a suite waits for the state, never for a fixed span.
+pub(crate) const CONNECTION_READY_BUDGET: Duration = Duration::from_secs(5);
+
+/// How often that wait re-reads.
+pub(crate) const CONNECTION_READY_INTERVAL: Duration = Duration::from_millis(5);
+
 /// An email address of the shape an Environment declaring the `email`
 /// `RemoteAccountIdentifierType` asks a create for.
 pub(crate) const PARTNER_EMAIL: &str = "interconnect-partner@example.test";
@@ -446,6 +460,38 @@ impl Emulator {
     pub(crate) async fn get_connection(&self, identifier: &str) -> (u16, Value) {
         self.ic("GetConnection", json!({ "identifier": identifier }))
             .await
+    }
+
+    /// The record `region`'s endpoint reports for `identifier` once the clock has
+    /// carried it to [`CONNECTION_READY_STATE`], polled rather than slept for.
+    ///
+    /// What a suite needs before it can offer that connection's ARN as an attach point:
+    /// a connection is the connectivity a new Connection is provisioned onto only once
+    /// it is fully provisioned itself, exactly as a gateway is an attach point only once
+    /// it is ready for use ([`Self::ready_gateways`]).
+    pub(crate) async fn provisioned_connection(&self, region: &str, identifier: &str) -> Value {
+        let started = Instant::now();
+        loop {
+            let (status, body) = self
+                .ic_in(region, "GetConnection", json!({ "identifier": identifier }))
+                .await;
+            assert_eq!(
+                status, 200,
+                "setup {identifier:?}: expected the connection to stay readable while it \
+                 provisions, got {status} with {body:?}"
+            );
+            let connection = body["connection"].clone();
+            let state = text(&connection, "state");
+            if state == CONNECTION_READY_STATE {
+                return connection;
+            }
+            assert!(
+                started.elapsed() < CONNECTION_READY_BUDGET,
+                "setup {identifier:?}: expected the connection to be fully provisioned within \
+                 {CONNECTION_READY_BUDGET:?}, it is still {state:?}"
+            );
+            tokio::time::sleep(CONNECTION_READY_INTERVAL).await;
+        }
     }
 }
 

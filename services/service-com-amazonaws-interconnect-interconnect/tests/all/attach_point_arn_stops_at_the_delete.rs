@@ -11,7 +11,9 @@
 //! stays readable by its own identifier so a caller polling the delete sees the
 //! teardown. The readiness rule is the union's, not one member's: the gateway member is
 //! refused once its gateway is no longer ready for use, and the ARN member is refused
-//! once its connection's teardown has been called.
+//! once its connection no longer provides the connectivity the handle is for — the
+//! teardown this suite drives being one end of that rule, and the not-yet-provisioned
+//! connection of `attach_point_arn_needs_provisioned_connectivity` the other.
 //!
 //! The rows differ along what the rule generalises over: the operation that carries the
 //! attach point (`smithy_query(query="operation",operation="CreateConnection,AcceptConnectionProposal")`
@@ -82,6 +84,20 @@ async fn live_connection(emulator: &Emulator, region: &str, placement: &(String,
         "setup {region:?}: expected the connection the ARN will name to be created, got {status} with {body:?}"
     );
     body["connection"].clone()
+}
+
+/// [`live_connection`] carried on to the fully provisioned state — the record whose ARN
+/// a row offers as the attach point that DOES resolve, since a connection is the
+/// connectivity a Connection is provisioned onto only once it has that connectivity.
+async fn provisioned_connection(
+    emulator: &Emulator,
+    region: &str,
+    placement: &(String, String),
+) -> Value {
+    let created = live_connection(emulator, region, placement).await;
+    emulator
+        .provisioned_connection(region, &text(&created, "id"))
+        .await
 }
 
 /// The `ConnectionId`s `region`'s endpoint holds, walked page by page so the answer is
@@ -205,7 +221,7 @@ async fn a_create_refuses_an_attach_point_arn_whose_delete_was_called() {
             // called, one left alone, so the only difference between the refusal and the
             // acceptance below is the state of the connection the ARN names.
             let doomed = live_connection(&emulator, region, placement).await;
-            let untouched = live_connection(&emulator, region, placement).await;
+            let untouched = provisioned_connection(&emulator, region, placement).await;
             let doomed_arn = text(&doomed, "arn");
             let untouched_arn = text(&untouched, "arn");
             let doomed_id = text(&doomed, "id");
@@ -334,7 +350,7 @@ async fn an_acceptance_refuses_an_attach_point_arn_whose_delete_was_called() {
             let case = format!("{offering:?} / {region} / {} / {}", placement.0, placement.1);
 
             let doomed = live_connection(&emulator, region, placement).await;
-            let untouched = live_connection(&emulator, region, placement).await;
+            let untouched = provisioned_connection(&emulator, region, placement).await;
             let doomed_arn = text(&doomed, "arn");
             let untouched_arn = text(&untouched, "arn");
             delete_and_reach(&emulator, region, &text(&doomed, "id"), offering).await;
