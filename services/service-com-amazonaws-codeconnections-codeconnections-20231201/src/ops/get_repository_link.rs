@@ -164,10 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ResourceNotFoundException {
                     // The repository-link surface's fixed not-found template, stated
                     // once in `state`: the account the lookup was made in, the id that
-                    // resolved to nothing, and the service-framework tail every refusal
-                    // of this family carries.
+                    // resolved to nothing under the label of the absence it is (a link
+                    // this account held and deleted, or an id it has no record of), and
+                    // the service-framework tail every refusal of this family carries.
                     message: Some(crate::state::repository_link_not_found_message(
                         &input.repository_link_id,
+                        store.repository_link_was_deleted(&input.repository_link_id),
                     )),
                 },
             )

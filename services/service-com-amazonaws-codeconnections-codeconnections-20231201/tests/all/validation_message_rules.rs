@@ -9,8 +9,10 @@
 //!
 //! * a value outside a `@length`, `@pattern`, `@range` or `@uniqueItems` constraint is
 //!   reported WITHOUT the value — `Value at '<member>' failed to satisfy constraint: …`;
-//! * a value outside an ENUM's value set IS quoted — `Value '<value>' at '<member>' …` —
-//!   and its requirement reads `Member must be one of: [ … ]`;
+//! * a value outside an ENUM's value set IS quoted — `Value '<value>' at '<member>' …`;
+//! * an enum requirement reads `Member must be one of: [ … ]` over the type's values, in
+//!   the order this service advertises that value set in (which for `ProviderType` is not
+//!   the model's declaration order);
 //! * an absent `@required` member is reported as the `null` it was;
 //! * a `@pattern` requirement quotes the expression WITHOUT the `^` / `$` anchors the
 //!   model spells it with, so a caller can re-apply exactly what it was advertised;
@@ -54,14 +56,16 @@ const REPOSITORY_LINK_ID_EXPRESSION: &str =
 /// implementation's own constant, so rewording that constant fails this suite.
 const CONNECTION_ARN_EXPRESSION: &str = r"arn:aws(-[\w]+)*:(codestar-connections|codeconnections):[a-z0-9\-]+:[0-9]{12}:connection\/[\w\-]+";
 
-/// The `ProviderType` value set as the model declares it
-/// (`smithy_query(query="shape", shape="ProviderType")`).
+/// The `ProviderType` value set as this service ADVERTISES it, written out as the literal
+/// the recorded service returns.
 ///
-/// The recorded refusal listed the same six values in another order; no rule of the model
-/// produces that order, so what this suite pins is the CLAUSE — `Member must be one of:`
-/// over the type's values — and not the order the set is printed in.
+/// The bracketed sequence is fixed text of the refusal: the service states these six
+/// members in this order, which is not the order the model declares them in
+/// (`smithy_query(query="shape", shape="ProviderType")` gives `Bitbucket, GitHub,
+/// GitHubEnterpriseServer, GitLab, GitLabSelfManaged, AzureDevOps`), so the order is
+/// pinned here rather than derived from the enum.
 const PROVIDER_TYPES: &str =
-    "[Bitbucket, GitHub, GitHubEnterpriseServer, GitLab, GitLabSelfManaged, AzureDevOps]";
+    "[GitLab, GitHub, GitHubEnterpriseServer, AzureDevOps, GitLabSelfManaged, Bitbucket]";
 
 /// The `SyncConfigurationType` value set as the model declares it: one value.
 const SYNC_TYPES: &str = "[CFN_STACK_SYNC]";

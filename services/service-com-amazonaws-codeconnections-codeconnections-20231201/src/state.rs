@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-codeconnections-codeconnections-20231201 service.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -395,6 +395,20 @@ pub struct ComAmazonawsCodeconnectionsCodeconnections20231201State {
     /// the next link's id (see [`resource_id`]). It counts mints, so it never rewinds
     /// and a deleted link's id and ARN never come back.
     pub repository_links_minted: u64,
+    /// The `RepositoryLinkId` of every repository link this account HELD and has since
+    /// deleted: the TOMBSTONE a delete leaves behind.
+    ///
+    /// A deleted link resolves to nothing — every reader answers the same absence as for
+    /// an id that was never minted — but the two absences are not WORDED alike: the
+    /// repository-link surface reports an id it still has a deleted record of under a
+    /// different label from one it has no record of at all (see
+    /// [`repository_link_not_found_message`]). Keeping the id is what lets it tell them
+    /// apart; the record itself is gone, so nothing here can be read back as a link, and
+    /// the id is never minted again ([`Self::repository_links_minted`]). Held in the order
+    /// the deletes happened and bounded like the live store, through
+    /// [`Self::remember_deleted_repository_link`], so the most recent deletes are the ones
+    /// remembered.
+    pub repository_links_deleted: VecDeque<String>,
     /// Every sync configuration this account holds, keyed by
     /// [`sync_configuration_key`] — the `(SyncType, ResourceName)` pair the API
     /// addresses one by.
@@ -551,6 +565,36 @@ impl ComAmazonawsCodeconnectionsCodeconnections20231201State {
                 && link.owner_id == owner_id
                 && link.repository_name == repository_name
         })
+    }
+
+    /// Whether this account HELD a repository link of this id and deleted it — the
+    /// tombstone [`Self::repository_links_deleted`] keeps.
+    ///
+    /// Read by the repository-link readers to word the absence of an id they still have a
+    /// deleted record of, which this service words differently from the absence of an id
+    /// it has no record of; a live link is not absent at all, so this answers for an id
+    /// the live store no longer holds.
+    pub fn repository_link_was_deleted(&self, repository_link_id: &str) -> bool {
+        self.repository_links_deleted
+            .iter()
+            .any(|remembered| remembered == repository_link_id)
+    }
+
+    /// Remember that the link `repository_link_id` named was deleted.
+    ///
+    /// BOUNDED like the live store itself ([`MAX_REPOSITORY_LINKS`]): the records live in
+    /// this process, so a caller cycling create-and-delete cannot grow this record without
+    /// end. At the bound the LONGEST-REMEMBERED id makes room for the new one, so the link
+    /// deleted most recently is always the one whose absence is worded as a deleted
+    /// link's; an id no longer remembered is worded exactly as one this account never
+    /// held, which is still an absence either way.
+    pub fn remember_deleted_repository_link(&mut self, repository_link_id: String) {
+        while self.repository_links_deleted.len() >= MAX_REPOSITORY_LINKS {
+            if self.repository_links_deleted.pop_front().is_none() {
+                break;
+            }
+        }
+        self.repository_links_deleted.push_back(repository_link_id);
     }
 }
 
@@ -965,11 +1009,15 @@ pub fn tags_after_merge(stored: &[Tag], requested: &[Tag]) -> Vec<Tag> {
 }
 
 /// What the tagging surface answers for a request that would leave a resource carrying
-/// more tags than [`MAX_TAGS_PER_RESOURCE`]: the shape's documented sentence for the
-/// limit that was exceeded, naming the limit the caller is held to — the way this
-/// service's other capacity refusals are worded (see `CreateRepositoryLink`).
+/// more tags than [`MAX_TAGS_PER_RESOURCE`]: the fixed sentence the tagging surface states
+/// for the tag-set cap.
+///
+/// The sentence is about the RESULTANT tag set — which is the bound this surface enforces,
+/// since `TagResource` judges what the call would LEAVE on the resource rather than what
+/// the call carried — and the cap is substituted from the one limit constant, so the
+/// number the refusal reports is the number that was enforced.
 pub fn tag_limit_exceeded_message(limit: usize) -> String {
-    format!("Exceeded the maximum limit for tags ({limit}).")
+    format!("The resultant tag set must not have more than {limit} user tags.")
 }
 
 /// The kind of resource an ARN of this service names — the kinds whose absences this
@@ -1017,14 +1065,53 @@ pub fn tagging_resource_not_found_message(resource_arn: &str) -> String {
 /// What the repository-link surface answers for a `RepositoryLinkId` that resolves to no
 /// link: the account the lookup was made in and the id that resolved to nothing, plus the
 /// framework tail for a 404 `ResourceNotFoundException`.
-pub fn repository_link_not_found_message(repository_link_id: &str) -> String {
+///
+/// The LABEL the id is reported under says which absence it is: this service keeps a
+/// deleted link's record (see
+/// [`ComAmazonawsCodeconnectionsCodeconnections20231201State::repository_links_deleted`]),
+/// so a lookup that finds that record reports the id as the `uuid` of a link that is gone,
+/// while a lookup that finds no record of the id at all reports it as a bare `UUID` — the
+/// two labels recorded behaviour pairs with those two cases. `deleted` is that
+/// distinction, read off the store by the caller
+/// ([`ComAmazonawsCodeconnectionsCodeconnections20231201State::repository_link_was_deleted`]),
+/// so every operation that resolves a link id words one absence one way.
+pub fn repository_link_not_found_message(repository_link_id: &str, deleted: bool) -> String {
+    let label = if deleted { "uuid" } else { "UUID" };
     with_framework_tail(
         &format!(
-            "Repository not found for accountId: {} and UUID: {repository_link_id}",
+            "Repository not found for accountId: {} and {label}: {repository_link_id}",
             ::engine::emulator_account_id()
         ),
         TAIL_RESOURCE_NOT_FOUND,
     )
+}
+
+/// The ARN service namespace the Git-sync component behind the repository-link surface
+/// names a repository-link resource in: the LEGACY namespace this service was renamed
+/// from, which is the namespace that component spells into the refusals it raises —
+/// whatever namespace the ARN the API hands back carries.
+///
+/// The model admits both namespaces for every ARN member of this service
+/// (`smithy_query(query="shape", shape="HostArn")`'s
+/// `(codestar-connections|codeconnections)` alternation, which the repository-link ARN
+/// pattern spells the same way), so an ARN stated in either is addressable.
+const LEGACY_ARN_NAMESPACE: &str = "codestar-connections";
+
+/// `arn` with its vendor field restated as [`LEGACY_ARN_NAMESPACE`] and every other field
+/// left exactly as it was.
+///
+/// Read through the emulator's ONE ARN parse (`service_common::arn`) rather than by
+/// splitting the value here, so the partition, region, account and resource a refusal
+/// states are the ones the stored ARN carries. A value that is not a well-formed ARN is
+/// stated as it is: there is no namespace field to restate.
+fn in_legacy_arn_namespace(arn: &str) -> String {
+    match ::service_common::arn::parse(arn) {
+        Some(parsed) => format!(
+            "arn:{}:{LEGACY_ARN_NAMESPACE}:{}:{}:{}",
+            parsed.partition, parsed.region, parsed.account, parsed.resource
+        ),
+        None => arn.to_string(),
+    }
 }
 
 /// What `CreateRepositoryLink` answers when the (connection, owner, repository) triple it
@@ -1032,9 +1119,14 @@ pub fn repository_link_not_found_message(repository_link_id: &str) -> String {
 /// caller can adopt it — plus the framework tail for a 409
 /// `ResourceAlreadyExistsException`. The ARN is the STORED one, read off the existing
 /// record rather than rebuilt from the request.
+/// The ARN is stated in the surface's own namespace ([`in_legacy_arn_namespace`]), which
+/// is what addresses the existing link for a caller that lifts it out of this sentence.
 pub fn repository_link_already_exists_message(existing_repository_link_arn: &str) -> String {
     with_framework_tail(
-        &format!("RepoConfiguration already exists. Arn: {existing_repository_link_arn}"),
+        &format!(
+            "RepoConfiguration already exists. Arn: {}",
+            in_legacy_arn_namespace(existing_repository_link_arn)
+        ),
         TAIL_RESOURCE_ALREADY_EXISTS,
     )
 }
@@ -1056,6 +1148,19 @@ pub fn sync_configurations_still_exist_message(owner_id: &str, repository_name: 
         ),
         TAIL_RESOURCE_STILL_EXISTS,
     )
+}
+
+/// What the sync-blocker surface answers for a blocker `Id` that resolves to no blocker of
+/// the resource the request addresses: the fixed sentence naming the id that resolved to
+/// nothing.
+///
+/// The sentence's fixed text ends with a SPACE after `does not exist`, which is how this
+/// service words this refusal, and it is the whole message: the refusal carries no
+/// framework tail. One template, so a blocker id that names no blocker at all and one that
+/// names a blocker of another resource — the same absence, judged against the addressed
+/// resource — are worded alike and cannot be told apart by their wording.
+pub fn sync_blocker_does_not_exist_message(blocker_id: &str) -> String {
+    format!("Sync blocker with id {blocker_id} does not exist ")
 }
 
 /// The only value the modeled `SyncConfigurationType` enum declares

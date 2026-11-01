@@ -21,6 +21,8 @@ mod git_sync;
 mod host_association;
 #[path = "all/host_deletion.rs"]
 mod host_deletion;
+#[path = "all/host_update.rs"]
+mod host_update;
 #[path = "all/list_hosts.rs"]
 mod list_hosts;
 #[path = "all/list_repository_links.rs"]

@@ -27,14 +27,9 @@ use service_com_amazonaws_codeconnections_codeconnections_20231201::ComAmazonaws
 
 use super::connection_lifecycle::{REGION, call, create, router, router_with_engine};
 use super::git_sync::error_code;
-use super::host_association::{create_host, create_plain_host, host_cases, plain_host};
-
-/// The sentence this service answers for an ARN that resolves to no host, written out as
-/// the LITERAL its host readers return rather than read off the implementation's own
-/// constant — the same literal `refusal_messages.rs` pins.
-fn host_not_found_message(host_arn: &str) -> String {
-    format!("No host exists with the ARN: {host_arn}")
-}
+use super::host_association::{
+    create_host, create_plain_host, host_cases, host_not_found_message, plain_host,
+};
 
 /// Every value the `Host` shape's `Status` member documents, from
 /// `smithy_query(query="doc", shape="Host", member="Status")`: "The status of the host,
@@ -414,10 +409,11 @@ async fn a_host_with_associated_connections_is_refused_until_they_are_gone() {
 /// other documented status deletes. Rows are every value the `Host` shape's `Status`
 /// member documents, including the two the operation names and the three it does not.
 ///
-/// No implemented operation of this service moves a host out of `PENDING` yet
-/// (`UpdateHost` is still a scaffold), so each row's status is seeded into the shared
-/// engine's store — the same engine every handler of this router reads — the way
-/// `absent_resource_answers.rs` seeds the sync state only the service records.
+/// No operation of this service moves a host out of `PENDING` (`UpdateHost` writes the
+/// configuration members and not the status, and the VPC provisioning a status reports on
+/// is console-driven), so each row's status is seeded into the shared engine's store — the
+/// same engine every handler of this router reads — the way `absent_resource_answers.rs`
+/// seeds the sync state only the service records.
 #[tokio::test]
 async fn a_host_in_a_status_that_forbids_deletion_is_refused() {
     let (router, engine) = router_with_engine();
@@ -487,7 +483,7 @@ async fn a_deleted_hosts_arn_is_never_reused() {
 }
 
 /// Put one stored host into `status`, in the engine every handler of the router reads:
-/// the state only `UpdateHost` and the VPC provisioning the console drives would write.
+/// the state the VPC provisioning the console drives would write.
 fn seed_host_status(engine: &Arc<engine::InMemoryEngine>, host_arn: &str, status: &str) {
     let store = engine.state::<CodeConnectionsState>();
     let mut guard = store.lock();

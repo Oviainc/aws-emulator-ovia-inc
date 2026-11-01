@@ -22,21 +22,34 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_codeconnections_codeconnections_20231201::state::MAX_TAGS_PER_RESOURCE;
+
 use super::connection_lifecycle::{REGION, call, call_signed_for, create, router};
 use super::git_sync::{SYNC_TYPE, error_code, role_arn};
-use super::host_association::create_plain_host;
+use super::host_association::{create_plain_host, host_not_found_message};
+
+/// The per-resource cap the tagging surface holds a resource to: the published AWS
+/// restriction of 50 user tags per resource, which the refusal below names.
+const USER_TAG_CAP: usize = 50;
+
+/// The sentence the tagging surface answers for a request that would leave a resource
+/// past the tag cap, written out as the LITERAL the recorded service returns rather than
+/// read off the implementation's own constant, so rewording that constant fails this
+/// suite.
+const TAG_CAP_MESSAGE: &str = "The resultant tag set must not have more than 50 user tags.";
+
+/// The sentence the sync-blocker surface answers for a blocker id that resolves to no
+/// blocker of the addressed resource. A literal, for the reason above — including the
+/// SPACE the fixed text ends with, which is why this is written as a concatenation the
+/// formatter cannot trim.
+fn sync_blocker_does_not_exist_message(blocker_id: &str) -> String {
+    format!("Sync blocker with id {blocker_id} does not exist") + " "
+}
 
 /// The sentence CodeConnections answers for an ARN that resolves to no CONNECTION,
 /// written out as the LITERAL the recorded service returns rather than read off the
 /// implementation's own constant, so rewording that constant fails this suite.
 const CONNECTION_NOT_FOUND_MESSAGE: &str = "No connection exists with the ARN";
-
-/// The sentence this service answers for an ARN that resolves to no HOST, as its host
-/// readers word it: the only kind-specific absence this service is known to name the ARN
-/// in. Also a literal, for the reason above.
-fn host_not_found_message(host_arn: &str) -> String {
-    format!("No host exists with the ARN: {host_arn}")
-}
 
 /// The sentence the ARN-addressed tagging surface answers for an ARN of neither kind — a
 /// repository-link ARN naming no link, say.
@@ -455,48 +468,67 @@ async fn an_unresolvable_connection_arn_is_refused_with_the_services_fixed_sente
 }
 
 /// CAUSE 2 — the repository-link surface words a `RepositoryLinkId` that resolves to no
-/// link with the service's template AND the framework tail.
+/// link with the service's template AND the framework tail, under the label of the
+/// absence it is: a link this account HELD and deleted is reported as that link's `uuid`,
+/// an id the account has no record of as a bare `UUID`.
 ///
 /// Rows span the id forms the modeled `RepositoryLinkId` pattern admits (lowercase and
-/// uppercase hex, the all-zero id) plus the id of a link that was deleted. Both operations
-/// that resolve an id — `GetRepositoryLink` and `UpdateRepositoryLink` — answer it the
-/// same way, and every answer names a different request.
+/// uppercase hex, the all-zero id), which the account never held, plus the ids of two
+/// links that were deleted — so each label is asserted over more than one id. Both
+/// operations that resolve an id — `GetRepositoryLink` and `UpdateRepositoryLink` —
+/// answer it the same way, and every answer names a different request.
 #[tokio::test]
 async fn a_repository_link_id_that_resolves_to_nothing_is_refused_with_the_framework_tail() {
     let router = router();
     let (live_id, _live_arn) = create_link(&router, 0, "acme", "service").await;
     let (deleted_id, _) = create_link(&router, 1, "acme", "retired").await;
-    let (status, body) = call(
-        &router,
-        "DeleteRepositoryLink",
-        serde_json::json!({ "RepositoryLinkId": deleted_id }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "deleting an unreferenced link must succeed, got {status} {body}"
-    );
+    let (also_deleted_id, _) = create_link(&router, 2, "contoso", "infra/platform").await;
+    for id in [&deleted_id, &also_deleted_id] {
+        let (status, body) = call(
+            &router,
+            "DeleteRepositoryLink",
+            serde_json::json!({ "RepositoryLinkId": id }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "deleting an unreferenced link must succeed, got {status} {body}"
+        );
+    }
 
-    let rows: Vec<(&str, String)> = vec![
+    // (case, the id, whether this account held a link of that id and deleted it)
+    let rows: Vec<(&str, String, bool)> = vec![
         (
             "a lowercase id this store never minted",
             "00000000-1111-2222-3333-444444444444".to_string(),
+            false,
         ),
         (
             "an uppercase-hex id the pattern also admits",
             "AABBCCDD-EEFF-0011-2233-445566778899".to_string(),
+            false,
         ),
         (
             "the all-zero id",
             "00000000-0000-0000-0000-000000000000".to_string(),
+            false,
         ),
-        ("the id of a link that was deleted", deleted_id.clone()),
+        ("the id of a link that was deleted", deleted_id.clone(), true),
+        (
+            "the id of a second link that was deleted",
+            also_deleted_id.clone(),
+            true,
+        ),
     ];
 
     let mut request_ids: Vec<String> = Vec::new();
-    for (label, id) in &rows {
+    for (label, id, held_before) in &rows {
+        // The label is the one the service reports that absence under — written out as
+        // the two literals the recorded service returns, not read off the
+        // implementation's own constant.
+        let absence_label = if *held_before { "uuid" } else { "UUID" };
         let expected = format!(
-            "Repository not found for accountId: {} and UUID: {id}",
+            "Repository not found for accountId: {} and {absence_label}: {id}",
             account()
         );
         for operation in ["GetRepositoryLink", "UpdateRepositoryLink"] {
@@ -546,7 +578,8 @@ async fn a_repository_link_id_that_resolves_to_nothing_is_refused_with_the_frame
 }
 
 /// CAUSE 3 — a `CreateRepositoryLink` for a triple that is already linked is refused
-/// with the ARN of the link that holds it, plus the 409 tail.
+/// with the ARN of the link that holds it — in this surface's own ARN service namespace,
+/// the legacy `codestar-connections` one — plus the 409 tail.
 ///
 /// Rows differ in the owner and repository the link names — each published bound of
 /// `OwnerId` (1..255) and `RepositoryName` (1..128), a nested name, and a provider the
@@ -601,14 +634,27 @@ async fn a_duplicate_repository_link_is_refused_with_the_existing_links_arn() {
             .to_string();
 
         let (status, body) = call(&router, "CreateRepositoryLink", create_body).await;
+        // The ARN the refusal states is the existing link's, in the LEGACY service
+        // namespace this surface words a repository-link resource in — written out as the
+        // literal the recorded service returns, not as the stored ARN (which the API
+        // hands back in the current namespace).
+        let expected_arn = format!(
+            "arn:aws:codestar-connections:{REGION}:{}:repository-link/{existing_id}",
+            account()
+        );
         assert_tailed_refusal(
             label,
             status,
             &body,
             409,
             "ResourceAlreadyExistsException",
-            &format!("RepoConfiguration already exists. Arn: {existing_arn}"),
+            &format!("RepoConfiguration already exists. Arn: {expected_arn}"),
             "ResourceAlreadyExistsException",
+        );
+        assert_ne!(
+            expected_arn, existing_arn,
+            "case {label:?}: the refusal's namespace is the surface's own, not the stored \
+             ARN's, got {existing_arn:?}"
         );
         assert!(
             body["RepositoryLinkInfo"].is_null(),
@@ -867,6 +913,250 @@ async fn deleting_a_sync_configuration_restores_the_same_missing_configuration_r
                 after, before,
                 "case {resource_name:?} delete #{attempt}: each refusal names its own request, \
                  got {after:?} twice"
+            );
+        }
+    }
+}
+
+/// The kinds of resource this service's tagging surface addresses by ARN.
+#[derive(Debug, Clone, Copy)]
+enum TaggableKind {
+    Connection,
+    Host,
+    RepositoryLink,
+}
+
+/// Render `(key, value)` pairs as the wire `TagList`.
+fn tag_list(tags: &[(String, String)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        tags.iter()
+            .map(|(key, value)| serde_json::json!({ "Key": key, "Value": value }))
+            .collect(),
+    )
+}
+
+/// `count` distinct tags whose keys carry `prefix`.
+fn tags(prefix: &str, count: usize) -> Vec<(String, String)> {
+    (0..count)
+        .map(|index| (format!("{prefix}-{index}"), format!("v{index}")))
+        .collect()
+}
+
+/// Create one taggable resource of `kind` and return its ARN.
+async fn create_taggable(
+    router: &MultiServiceRouter,
+    kind: TaggableKind,
+    index: usize,
+) -> String {
+    match kind {
+        TaggableKind::Connection => create(router, &format!("tag-cap-conn-{index}"), "GitHub").await,
+        TaggableKind::Host => {
+            create_plain_host(router, &format!("tag-cap-host-{index}"), "GitHubEnterpriseServer")
+                .await
+        }
+        TaggableKind::RepositoryLink => {
+            create_link(router, 900 + index, "acme", &format!("tag-cap-{index}"))
+                .await
+                .1
+        }
+    }
+}
+
+/// The tags a resource already carries, as `ListTagsForResource` reports them.
+async fn reported_tags(
+    router: &MultiServiceRouter,
+    case: &str,
+    resource_arn: &str,
+) -> Vec<(String, String)> {
+    let (status, body) = call(
+        router,
+        "ListTagsForResource",
+        serde_json::json!({ "ResourceArn": resource_arn }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from ListTagsForResource, got {status} {body}"
+    );
+    body["Tags"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|tag| {
+            (
+                tag["Key"].as_str().unwrap_or_default().to_string(),
+                tag["Value"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// One way a `TagResource` request can cross the per-resource tag cap.
+struct TagCapCase {
+    /// What a failing assertion names this row by.
+    label: &'static str,
+    /// The tags the resource carries before the refused call.
+    seeded: Vec<(String, String)>,
+    /// The tags the refused call carries.
+    requested: Vec<(String, String)>,
+}
+
+/// A `TagResource` that would leave a resource carrying more than the per-resource tag cap
+/// is refused with the surface's FIXED sentence — the whole message, with no framework
+/// tail — and writes nothing.
+///
+/// Rows span the kinds of resource this service tags crossed with the ways a request can
+/// cross the cap: one batch past it on an untagged resource, one tag past a resource
+/// already at the cap, and a batch whose new keys overflow a partially tagged one. The
+/// sentence is entirely fixed text, so every row must state exactly the same message.
+#[tokio::test]
+async fn a_tag_request_past_the_cap_is_refused_with_the_surfaces_fixed_sentence() {
+    let router = router();
+    assert_eq!(
+        MAX_TAGS_PER_RESOURCE, USER_TAG_CAP,
+        "the cap this service enforces is the cap the sentence names, got {MAX_TAGS_PER_RESOURCE}"
+    );
+
+    // The ways a request can cross the cap.
+    let rows: Vec<TagCapCase> = vec![
+        TagCapCase {
+            label: "one batch past the cap on an untagged resource",
+            seeded: Vec::new(),
+            requested: tags("fresh", USER_TAG_CAP + 1),
+        },
+        TagCapCase {
+            label: "one tag past a resource already at the cap",
+            seeded: tags("seeded", USER_TAG_CAP),
+            requested: tags("extra", 1),
+        },
+        TagCapCase {
+            label: "a batch whose new keys overflow a partially tagged resource",
+            seeded: tags("seeded", USER_TAG_CAP - 2),
+            requested: tags("extra", 3),
+        },
+    ];
+
+    for (kind_index, kind) in [
+        TaggableKind::Connection,
+        TaggableKind::Host,
+        TaggableKind::RepositoryLink,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (row_index, row) in rows.iter().enumerate() {
+            let case = format!("{} ({kind:?})", row.label);
+            let arn = create_taggable(&router, kind, kind_index * 10 + row_index).await;
+
+            if !row.seeded.is_empty() {
+                let (status, body) = call(
+                    &router,
+                    "TagResource",
+                    serde_json::json!({ "ResourceArn": arn, "Tags": tag_list(&row.seeded) }),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected 200 seeding the resource, got {status} {body}"
+                );
+            }
+
+            let (status, body) = call(
+                &router,
+                "TagResource",
+                serde_json::json!({ "ResourceArn": arn, "Tags": tag_list(&row.requested) }),
+            )
+            .await;
+            assert_eq!(
+                status, 429,
+                "case {case:?}: expected 429 past the tag cap, got {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "LimitExceededException",
+                "case {case:?}: expected LimitExceededException, got {body}"
+            );
+            let message = refusal_message(&case, &body);
+            assert_eq!(
+                message, TAG_CAP_MESSAGE,
+                "case {case:?}: expected the surface's fixed sentence, got {message:?}"
+            );
+            assert!(
+                !message.contains("(Service:"),
+                "case {case:?}: this refusal carries no framework tail, got {message:?}"
+            );
+
+            // The refusal guarded the resource rather than writing part of the batch.
+            let after = reported_tags(&router, &case, &arn).await;
+            assert_eq!(
+                after, row.seeded,
+                "case {case:?}: a refused TagResource writes nothing, got {after:?}"
+            );
+        }
+    }
+}
+
+/// An `UpdateSyncBlocker` naming a blocker id that resolves to no blocker of the addressed
+/// resource is refused with the surface's FIXED sentence — which ends with a space after
+/// `does not exist` and carries no framework tail — naming the id from the request.
+///
+/// Rows span the id forms the modelled `Id` admits (`length 1..50`, each published bound
+/// among them) crossed with the resource states that reach this refusal: the id is
+/// resolved BEFORE the `(SyncType, ResourceName)` pair, so a resource with a sync
+/// configuration and one with none answer alike.
+#[tokio::test]
+async fn an_unknown_sync_blocker_id_is_refused_with_the_surfaces_fixed_sentence() {
+    let router = router();
+    let (link_id, _) = create_link(&router, 70, "acme", "blocked").await;
+    create_sync_configuration(&router, &link_id, "ConfiguredStack").await;
+
+    // The published bounds of `Id` (1..50) plus id forms the recorded unit did not cite.
+    let blocker_ids: Vec<String> = vec![
+        "blocker-1".to_string(),
+        "b".to_string(),
+        "x".repeat(50),
+        "BLOCKER_42".to_string(),
+        "0".to_string(),
+    ];
+
+    for resource_name in ["ConfiguredStack", "UnconfiguredStack"] {
+        for blocker_id in &blocker_ids {
+            let case = format!("{blocker_id:?} on {resource_name}");
+            let (status, body) = call(
+                &router,
+                "UpdateSyncBlocker",
+                serde_json::json!({
+                    "Id": blocker_id,
+                    "SyncType": SYNC_TYPE,
+                    "ResourceName": resource_name,
+                    "ResolvedReason": "resolved by the test",
+                }),
+            )
+            .await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected 404 for a blocker id that resolves to nothing, \
+                 got {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "SyncBlockerDoesNotExistException",
+                "case {case:?}: expected SyncBlockerDoesNotExistException, got {body}"
+            );
+            let message = refusal_message(&case, &body);
+            assert_eq!(
+                message,
+                sync_blocker_does_not_exist_message(blocker_id),
+                "case {case:?}: expected the surface's fixed sentence, got {message:?}"
+            );
+            assert!(
+                message.ends_with(' '),
+                "case {case:?}: the fixed text ends with a space, got {message:?}"
+            );
+            assert!(
+                !message.contains("(Service:"),
+                "case {case:?}: this refusal carries no framework tail, got {message:?}"
             );
         }
     }

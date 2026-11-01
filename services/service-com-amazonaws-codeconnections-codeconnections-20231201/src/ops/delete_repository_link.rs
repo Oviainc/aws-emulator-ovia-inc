@@ -210,6 +210,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceNotFoundException` here stays for a resource reference that is not
         // the link id itself.
         let removed = store.repository_links.remove(&input.repository_link_id);
+        // A delete that removed a link leaves its id behind as a TOMBSTONE: the record is
+        // gone and no reader resolves it, but the surface still has a deleted record of
+        // that id, which is the absence it words as a link that is gone rather than as an
+        // id this account never held. The set of remembered ids is bounded like the live
+        // store — see `state::remember_deleted_repository_link`.
+        if removed.is_some() {
+            store.remember_deleted_repository_link(input.repository_link_id.clone());
+        }
         drop(store);
 
         // Audit record for a destructive operation: who presented which access key id,

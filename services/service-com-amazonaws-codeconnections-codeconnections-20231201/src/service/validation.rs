@@ -30,8 +30,9 @@
 //!   one statement of that rendering): a caller that lifts the advertised expression out
 //!   of the message and re-applies it locally must get the expression the service
 //!   advertises;
-//! * an enum requirement reads `Member must be one of: [ … ]`, over the values as the
-//!   type declares them.
+//! * an enum requirement reads `Member must be one of: [ … ]`, over the values of the type
+//!   in the order this service advertises that value set in ([`advertised_enum_values`]),
+//!   which for one of its types is not the order the model declares them in.
 //!
 //! Nothing here is keyed to an operation or to a recorded value: the rule is applied to
 //! whatever [`Violation`] the walk produces, so it holds for every constrained member of
@@ -196,6 +197,52 @@ fn advertised_pattern(path: &str, model_pattern: &str) -> String {
     ::service_common::validation::unanchored(model_pattern)
 }
 
+/// The order this service advertises the members of its `ProviderType` value set in.
+///
+/// The sequence inside the brackets of an enum clause is FIXED TEXT of the refusal, not a
+/// rendering of the model: this service states these six members in this order, which is
+/// NOT the order the model declares them in (`smithy_query(query="shape",
+/// shape="ProviderType")` gives `Bitbucket, GitHub, GitHubEnterpriseServer, GitLab,
+/// GitLabSelfManaged, AzureDevOps`). A caller that reads the bracketed list back to offer
+/// a user the values it may send has to be given the list the service states, so the
+/// sequence is stated here beside the message wording rather than taken from the shape's
+/// declaration.
+const PROVIDER_TYPE_ADVERTISED_ORDER: &[&str] = &[
+    "GitLab",
+    "GitHub",
+    "GitHubEnterpriseServer",
+    "AzureDevOps",
+    "GitLabSelfManaged",
+    "Bitbucket",
+];
+
+/// Every value set this service advertises in an order of its own.
+///
+/// A set that is not listed here is advertised in the order the walk reports it, which is
+/// the model's declaration order: this service's other enum, `SyncConfigurationType`,
+/// declares one value, so no order of its own can be observed.
+const ADVERTISED_ENUM_ORDERS: &[&[&str]] = &[PROVIDER_TYPE_ADVERTISED_ORDER];
+
+/// `allowed` — the value set the walk reports, in the model's declaration order — in the
+/// order this service advertises that set in.
+///
+/// Matched on the SET and not on the member the violation sits at, so every member of a
+/// type (a `ProviderType`, a `ProviderTypeFilter`, a provider named on any operation of
+/// this service) advertises one sequence, and a type whose declaration gains or loses a
+/// value falls back to the declared order rather than advertising a stale list.
+fn advertised_enum_values(allowed: &[String]) -> Vec<String> {
+    for order in ADVERTISED_ENUM_ORDERS {
+        let same_set = order.len() == allowed.len()
+            && order
+                .iter()
+                .all(|value| allowed.iter().any(|declared| declared == value));
+        if same_set {
+            return order.iter().map(|value| (*value).to_string()).collect();
+        }
+    }
+    allowed.to_vec()
+}
+
 /// The requirement a violation states, worded as this service words it. `None` for a
 /// class this service has no wording for.
 ///
@@ -225,7 +272,10 @@ fn requirement(kind: &ViolationKind, path: &str) -> Option<String> {
             advertised_pattern(path, pattern)
         ),
         ViolationKind::EnumValue(allowed) => {
-            format!("Member must be one of: [{}]", allowed.join(", "))
+            format!(
+                "Member must be one of: [{}]",
+                advertised_enum_values(allowed).join(", ")
+            )
         }
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
@@ -316,6 +366,78 @@ mod tests {
             spelled, CONNECTION_ARN_MEMBER,
             "expected the framework's spelling {spelled:?}, got {CONNECTION_ARN_MEMBER:?}"
         );
+    }
+
+    /// The advertised sequence of a value set is a PERMUTATION of the set the model
+    /// declares: the order is this service's, the membership is the model's. Rows are the
+    /// sets this service's enums carry, plus a set no entry claims.
+    #[test]
+    fn an_advertised_value_set_holds_exactly_the_values_the_model_declares() {
+        let rows: [(&str, &[&str], &[&str]); 3] = [
+            (
+                "ProviderType, which this service advertises in an order of its own",
+                crate::ops::types::PROVIDER_TYPE_VALUES,
+                PROVIDER_TYPE_ADVERTISED_ORDER,
+            ),
+            (
+                "SyncConfigurationType, which declares one value",
+                crate::ops::types::SYNC_CONFIGURATION_TYPE_VALUES,
+                crate::ops::types::SYNC_CONFIGURATION_TYPE_VALUES,
+            ),
+            (
+                "a value set no advertised order claims",
+                crate::ops::types::BLOCKER_STATUS_VALUES,
+                crate::ops::types::BLOCKER_STATUS_VALUES,
+            ),
+        ];
+
+        for (case, declared, expected) in rows {
+            let declared: Vec<String> = declared.iter().map(|value| value.to_string()).collect();
+            let actual = advertised_enum_values(&declared);
+            let expected: Vec<String> = expected.iter().map(|value| value.to_string()).collect();
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the advertised sequence {expected:?}, got {actual:?}"
+            );
+
+            let mut sorted_actual = actual.clone();
+            sorted_actual.sort();
+            let mut sorted_declared = declared.clone();
+            sorted_declared.sort();
+            assert_eq!(
+                sorted_actual, sorted_declared,
+                "case {case:?}: expected exactly the declared values {sorted_declared:?}, \
+                 got {sorted_actual:?}"
+            );
+        }
+    }
+
+    /// An advertised sequence states the SAME members the model declares for that type: a
+    /// value added to or removed from the shape leaves the sequence stale, and the clause
+    /// would silently fall back to declaration order, so the membership is asserted
+    /// against the model here rather than only through [`advertised_enum_values`].
+    #[test]
+    fn every_advertised_sequence_matches_a_value_set_the_model_declares() {
+        let declared_sets: [&[&str]; 3] = [
+            crate::ops::types::PROVIDER_TYPE_VALUES,
+            crate::ops::types::SYNC_CONFIGURATION_TYPE_VALUES,
+            crate::ops::types::BLOCKER_STATUS_VALUES,
+        ];
+
+        for order in ADVERTISED_ENUM_ORDERS {
+            let mut advertised: Vec<&str> = order.to_vec();
+            advertised.sort_unstable();
+            let matched = declared_sets.iter().any(|declared| {
+                let mut declared: Vec<&str> = declared.to_vec();
+                declared.sort_unstable();
+                declared == advertised
+            });
+            assert!(
+                matched,
+                "the advertised sequence {order:?} states values no enum of this model \
+                 declares: the sequence is stale"
+            );
+        }
     }
 
     /// The advertised expression, as the check transcribes it, decides the cases the loose

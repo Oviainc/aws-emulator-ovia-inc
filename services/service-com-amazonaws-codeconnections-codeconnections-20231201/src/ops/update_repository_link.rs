@@ -197,14 +197,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.repository_link_id)
             .cloned()
         else {
+            let deleted = store.repository_link_was_deleted(&input.repository_link_id);
             return Err(UpdateRepositoryLinkErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     // The same template `GetRepositoryLink` answers
-                    // (`state::repository_link_not_found_message`), tail included: one
-                    // id resolving to nothing is worded one way whichever operation
-                    // resolved it.
+                    // (`state::repository_link_not_found_message`), tail and absence
+                    // label included: one id resolving to nothing is worded one way
+                    // whichever operation resolved it.
                     message: Some(crate::state::repository_link_not_found_message(
                         &input.repository_link_id,
+                        deleted,
                     )),
                 },
             )

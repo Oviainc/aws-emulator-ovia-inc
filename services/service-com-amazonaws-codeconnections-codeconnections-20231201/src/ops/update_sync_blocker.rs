@@ -183,7 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateSyncBlockerErrorModeled::SyncBlockerDoesNotExistException(
                     SyncBlockerDoesNotExistException {
-                        message: Some(format!("Sync blocker with id {} does not exist", input.id)),
+                        // The surface's fixed template, stated once in
+                        // `state::sync_blocker_does_not_exist_message`.
+                        message: Some(crate::state::sync_blocker_does_not_exist_message(
+                            &input.id,
+                        )),
                     },
                 )
                 .into(),
@@ -197,9 +201,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateSyncBlockerErrorModeled::SyncBlockerDoesNotExistException(
                     SyncBlockerDoesNotExistException {
-                        message: Some(format!(
-                            "Sync blocker with id {} does not exist for resource {}",
-                            input.id, input.resource_name
+                        // The SAME template the branch above answers: this is the same
+                        // absence — no blocker of the addressed resource carries that id —
+                        // so it is worded the same way rather than in a sentence of its
+                        // own.
+                        message: Some(crate::state::sync_blocker_does_not_exist_message(
+                            &input.id,
                         )),
                     },
                 )

@@ -20,7 +20,7 @@ use super::connection_lifecycle::{PROVIDER_TYPES, REGION, call, create, router};
 /// A `VpcConfiguration` list is `length 1..10` on both `SubnetIds` and
 /// `SecurityGroupIds` (`smithy_query(query="shape", shape="SubnetIds,SecurityGroupIds")`),
 /// so the table below covers each published bound.
-const VPC_LIST_MAX: usize = 10;
+pub(crate) const VPC_LIST_MAX: usize = 10;
 
 /// One `CreateHost` request whose round trip this suite asserts.
 ///
@@ -53,7 +53,15 @@ fn security_group_id(index: usize) -> String {
 
 /// A `VpcConfiguration` with `subnets` subnet ids and `groups` security group ids,
 /// optionally carrying a TLS certificate.
-fn vpc_configuration(subnets: usize, groups: usize, tls: Option<&str>) -> serde_json::Value {
+///
+/// `pub(crate)` because the VPC shapes a host carries are the same set every host suite
+/// needs: `host_update.rs` sends these as the REPLACEMENT configuration rather than
+/// building a second builder of its own.
+pub(crate) fn vpc_configuration(
+    subnets: usize,
+    groups: usize,
+    tls: Option<&str>,
+) -> serde_json::Value {
     let mut config = serde_json::json!({
         // `VpcId` is `length 12..21`, pattern `^vpc-\w{8}(\w{9})?$`.
         "VpcId": "vpc-0123abcd",
@@ -186,6 +194,18 @@ pub(crate) async fn create_plain_host(
     provider_type: &'static str,
 ) -> String {
     create_host(router, &plain_host(name, provider_type)).await
+}
+
+/// The sentence this service answers for an ARN that resolves to no host, written out as
+/// the LITERAL its host readers return rather than read off the implementation's own
+/// constant.
+///
+/// `pub(crate)` and stated HERE, beside the host helpers, because every suite that
+/// addresses a host by ARN asserts the same sentence (`host_deletion.rs`,
+/// `host_update.rs`, `refusal_messages.rs`): one literal for the whole test target, so a
+/// reworded constant fails all of them rather than one.
+pub(crate) fn host_not_found_message(host_arn: &str) -> String {
+    format!("No host exists with the ARN: {host_arn}")
 }
 
 /// Assert an ARN satisfies the modeled `HostArn` pattern
