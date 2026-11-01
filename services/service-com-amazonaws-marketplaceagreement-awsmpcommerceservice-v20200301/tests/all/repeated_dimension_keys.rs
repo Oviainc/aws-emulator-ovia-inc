@@ -428,6 +428,11 @@ async fn accepting_an_amendment_over_a_repeated_key_bills_the_units_it_adds() {
         accepted.status, accepted.body
     );
     let agreement = accepted.str_at("/agreementId");
+    assert_eq!(
+        agreement, source,
+        "case {case:?}: an amendment modifies the agreement it names, so the accept answers \
+         that agreement, got {agreement:?}"
+    );
 
     let listed = call(
         &router,
@@ -446,14 +451,15 @@ async fn accepting_an_amendment_over_a_repeated_key_bills_the_units_it_adds() {
         .unwrap_or_default();
     assert_eq!(
         groups.len(),
-        1,
-        "case {case:?}: the amendment's charge is billed by one invoice, got {:?}",
+        2,
+        "case {case:?}: the agreement is billed by the invoice of its own purchase and by the \
+         one the amendment's charge adds, got {:?}",
         listed.body
     );
     let billed = minor(
         case,
-        "agreementInvoiceLineItemGroupSummaries[0].pricingCurrencyAmount.amount",
-        &groups[0]["pricingCurrencyAmount"]["amount"],
+        "agreementInvoiceLineItemGroupSummaries[1].pricingCurrencyAmount.amount",
+        &groups[1]["pricingCurrencyAmount"]["amount"],
     );
     assert_eq!(
         billed,

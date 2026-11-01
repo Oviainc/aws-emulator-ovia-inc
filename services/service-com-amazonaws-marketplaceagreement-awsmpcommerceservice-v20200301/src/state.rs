@@ -8,7 +8,10 @@
 //!   (`CreateAgreementRequest`), which captures the requested terms and the
 //!   charges they imply;
 //! * an **agreement** — what `AcceptAgreementRequest` finalises from one of
-//!   those requests, and what the clock creates again at the end date of one
+//!   those requests, or, where the request amends an existing agreement
+//!   ("`AMEND` – Modifies an existing agreement with terms that are accepted in
+//!   the request"), the agreement that accept re-states ([`Agreement::amend`]),
+//!   and what the clock creates again at the end date of one
 //!   whose accepted terms renew it there
 //!   ([`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::settle_agreement`]),
 //!   and what `DescribeAgreement`, `GetAgreementTerms`,
@@ -2155,6 +2158,15 @@ pub struct AgreementRequest {
     /// The agreement `AcceptAgreementRequest` finalised from this request; a
     /// second accept of the same request is a conflict.
     pub accepted_agreement_id: Option<String>,
+    /// When that acceptance happened, and `None` while this quote has not been
+    /// accepted at all.
+    ///
+    /// What dates the charges this quote minted: a prepaid charge is "charged
+    /// immediately when the agreement request is accepted", so the instant THIS
+    /// request was accepted is the date its own charges are incurred — which an
+    /// amendment's charges are reported under rather than the acceptance of the
+    /// agreement it amended ([`…State::charges_of`](ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::charges_of)).
+    pub accepted_at: Option<SystemTime>,
     pub created_at: SystemTime,
 }
 
@@ -2257,6 +2269,16 @@ pub struct Agreement {
     /// agreement's own initial id, so a chain traces back to its first link.
     pub initial_agreement_id: String,
     pub agreement_request_id: String,
+    /// The quotes of the amendments applied to this agreement, in the order
+    /// they were accepted.
+    ///
+    /// `Intent` `AMEND` "modifies an existing agreement with terms that are
+    /// accepted in the request", so an accepted amendment's own quote is a
+    /// quote OF this agreement beside the one it was accepted from: its
+    /// charges are charges of this agreement, and the last one priced the
+    /// agreement as it now stands
+    /// ([`…State::quotes_of`](ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::quotes_of)).
+    pub amendment_request_ids: Vec<String>,
     pub agreement_type: String,
     pub catalog: String,
     pub acceptor: Acceptor,
@@ -2331,6 +2353,40 @@ impl Agreement {
             Some(held) => *held = association,
             None => self.purchase_orders.push(association),
         }
+        self.updated_at = now;
+    }
+
+    /// Apply to this agreement the amendment the quote `request_id` priced,
+    /// whose accepted terms are `accepted_terms` and which commits the
+    /// agreement until `end_time`, at `now`.
+    ///
+    /// `Intent` `AMEND` "modifies an existing agreement with terms that are
+    /// accepted in the request", so the terms accepted in that request become
+    /// this agreement's accepted terms and the window they commit it for
+    /// becomes its end date ([`agreement_end_time`]); the amendment's own quote
+    /// joins the quotes of this agreement, so what it priced is this
+    /// agreement's value and the charges it minted are this agreement's
+    /// charges. The record changed, which is what
+    /// `AgreementViewSummary$lastUpdateTime` reports: "an agreement is updated
+    /// when any of its attributes or accepted terms change. Amendments,
+    /// renewals, and a party changing whether the agreement renews are all
+    /// examples."
+    ///
+    /// Nothing else about the agreement moves. An amendment is none of the
+    /// status transitions this service performs — [`Agreement::leave_active`]
+    /// names them — and the entitlements the agreement granted entitle its
+    /// acceptor to the same resources under the same licences, so neither is
+    /// re-stated here.
+    pub fn amend(
+        &mut self,
+        request_id: String,
+        accepted_terms: Vec<AcceptedTerm>,
+        end_time: Option<SystemTime>,
+        now: SystemTime,
+    ) {
+        self.accepted_terms = accepted_terms;
+        self.end_time = end_time;
+        self.amendment_request_ids.push(request_id);
         self.updated_at = now;
     }
 
@@ -4823,11 +4879,15 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// Issue the invoices accepting `agreement_id` bills, answering their ids in
     /// the order they were issued.
     ///
-    /// One invoice per charge of the agreement's own quote that is charged on
-    /// acceptance and carries an amount — see [`Invoice`] for why those are the
-    /// charges this service can invoice. The amount and currency are READ from
-    /// that quote, which priced the charge once, so an invoice never states a
-    /// second amount for a charge the agreement already reports.
+    /// One invoice per charge of the quote the acceptance applied that is
+    /// charged on acceptance and carries an amount — see [`Invoice`] for why
+    /// those are the charges this service can invoice. That quote is the LAST
+    /// one of the agreement ([`Self::quotes_of`]): the one it was accepted from
+    /// for an agreement an acceptance created, and the amendment's own for an
+    /// acceptance that amended one, whose charges nothing has billed before.
+    /// The amount and currency are READ from that quote, which priced the charge
+    /// once, so an invoice never states a second amount for a charge the
+    /// agreement already reports.
     pub fn issue_acceptance_invoices(
         &mut self,
         agreement_id: &str,
@@ -4836,7 +4896,7 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
         let Some(summary) = self
             .agreements
             .get(agreement_id)
-            .and_then(|agreement| self.agreement_requests.get(&agreement.agreement_request_id))
+            .and_then(|agreement| self.quotes_of(agreement).last())
             .map(|request| request.charge_summary.clone())
         else {
             return Vec::new();
@@ -5290,7 +5350,11 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
         // The instant the renewal is due at, which is the source's end date.
         let end = source.end_time?;
         let source = source.clone();
-        let quote = self.agreement_requests.get(&source.agreement_request_id)?.clone();
+        // The quote the source STANDS AT ([`Self::quotes_of`]): "a new agreement
+        // is created from the accepted terms of this agreement", so an
+        // agreement an amendment modified is renewed over the terms that
+        // amendment accepted rather than the ones it held before.
+        let quote = self.quotes_of(&source).last()?.clone();
         let requested_terms = quote.requested_terms;
 
         // The renewal's own quote, which prices the same requested terms afresh
@@ -5326,6 +5390,7 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
                 // the renewal below is the agreement it was accepted as.
                 client_token: None,
                 accepted_agreement_id: Some(id.clone()),
+                accepted_at: Some(end),
                 created_at: end,
             },
         );
@@ -5335,6 +5400,10 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
                 id: id.clone(),
                 initial_agreement_id: source.initial_agreement_id.clone(),
                 agreement_request_id: request_id,
+                // A renewal is a new agreement over its own quote: the
+                // amendments applied to the agreement it continues were applied
+                // to THAT record, and its terms are already in the quote above.
+                amendment_request_ids: Vec::new(),
                 agreement_type: source.agreement_type.clone(),
                 catalog: source.catalog.clone(),
                 acceptor: source.acceptor.clone(),
@@ -5432,7 +5501,25 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
             .filter(|request| request.created_charge_id().is_some())
     }
 
-    /// The charges of `agreement`, in the order its quote minted them followed
+    /// The quotes of `agreement`, in the order they were accepted: the one it
+    /// was accepted from, followed by the quote of each amendment applied to it
+    /// ([`Agreement::amend`]).
+    ///
+    /// An amendment "modifies an existing agreement with terms that are
+    /// accepted in the request", so its quote prices THIS agreement: the
+    /// charges of the agreement are the charges of all of its quotes, and the
+    /// LAST one is the quote the agreement stands at. A quote this store no
+    /// longer holds is simply not among them.
+    pub fn quotes_of<'a>(
+        &'a self,
+        agreement: &'a Agreement,
+    ) -> impl Iterator<Item = &'a AgreementRequest> + 'a {
+        ::std::iter::once(&agreement.agreement_request_id)
+            .chain(agreement.amendment_request_ids.iter())
+            .filter_map(|id| self.agreement_requests.get(id))
+    }
+
+    /// The charges of `agreement`, in the order its quotes minted them followed
     /// by the order its payment requests were approved in, as
     /// `ListAgreementCharges` reports them.
     ///
@@ -5443,12 +5530,21 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// absent while the charge carries none, which is what "The purchase order
     /// reference associated with the charge, if any" states.
     ///
+    /// Every quote of the agreement is reported, which for an amended agreement
+    /// is the one it was accepted from and each amendment's own
+    /// ([`Self::quotes_of`]): an amendment modifies the agreement rather than
+    /// creating one, so the charges it added are charges of the same agreement
+    /// and the charges it was already reporting stay reported.
+    ///
     /// The approval of a payment request creates a charge of the same agreement
     /// ([`Self::approved_payment_requests_of`]), so it is reported here too,
     /// read from the one payment request record that holds it.
     pub fn charges_of(&self, agreement: &Agreement) -> Vec<Charge> {
         let mut charges: Vec<Charge> = Vec::new();
-        if let Some(request) = self.agreement_requests.get(&agreement.agreement_request_id) {
+        for request in self.quotes_of(agreement) {
+            // When the quote that minted these charges was accepted, which for
+            // the quote the agreement was accepted from is its own acceptance.
+            let accepted_at = request.accepted_at.unwrap_or(agreement.acceptance_time);
             charges.extend(
                 request
                     .charge_summary
@@ -5474,19 +5570,14 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
                             // incurred. This is available only when the charge
                             // date is known." A charge timed `ON_ACCEPTANCE` is
                             // "charged immediately when the agreement request is
-                            // accepted", so this agreement's acceptance is its
-                            // date. One timed on a billing period or on the
-                            // proposal's payment schedule is dated by a billing
-                            // cycle or a schedule this service does not model, so
-                            // its date stays unknown.
+                            // accepted", so the acceptance of the request that
+                            // minted it is its date. One timed on a billing
+                            // period or on the proposal's payment schedule is
+                            // dated by a billing cycle or a schedule this service
+                            // does not model, so its date stays unknown.
                             time: expected.time.or_else(|| {
-                                (expected.timing.as_deref() == Some(TIMING_ON_ACCEPTANCE)).then(
-                                    || {
-                                        ::aws_smithy_types::DateTime::from(
-                                            agreement.acceptance_time,
-                                        )
-                                    },
-                                )
+                                (expected.timing.as_deref() == Some(TIMING_ON_ACCEPTANCE))
+                                    .then(|| ::aws_smithy_types::DateTime::from(accepted_at))
                             }),
                         })
                     }),
@@ -5523,19 +5614,22 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
 
     /// The agreement's estimated cost, as `DescribeAgreement` reports it.
     ///
-    /// Read from the quote the agreement was accepted from, which priced the
-    /// terms being accepted once ([`Self::charge_summary`]):
+    /// Read from the quote the agreement STANDS AT ([`Self::quotes_of`]), which
+    /// priced the terms it holds once ([`Self::charge_summary`]): the one it was
+    /// accepted from, or the last amendment applied to it.
     /// `ChargeSummary$newAgreementValue` is "the total value of the agreement,
     /// which includes any amendments", the same total
     /// `EstimatedCharges$agreementValue` reports ("the total known amount
-    /// customer has to pay across the lifecycle of the agreement"). Reading it
-    /// rather than pricing the accepted terms a second time is what keeps the
-    /// quote, the agreement and the agreement's charges reporting one set of
-    /// amounts.
+    /// customer has to pay across the lifecycle of the agreement", which "in
+    /// case a customer has amended an agreement, by purchasing more units of any
+    /// dimension … will include both the original cost as well as the added cost
+    /// incurred due to addition of new units"). Reading it rather than pricing
+    /// the accepted terms a second time is what keeps the quote, the agreement
+    /// and the agreement's charges reporting one set of amounts.
     pub fn estimated_charges(&self, agreement: &Agreement) -> EstimatedCharges {
         let summary = self
-            .agreement_requests
-            .get(&agreement.agreement_request_id)
+            .quotes_of(agreement)
+            .last()
             .map(|request| &request.charge_summary);
         EstimatedCharges {
             currency_code: summary.and_then(|summary| summary.currency_code.clone()),

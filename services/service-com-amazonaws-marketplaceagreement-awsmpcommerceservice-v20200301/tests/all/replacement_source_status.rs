@@ -20,8 +20,8 @@
 //! carries, the path that put it there (a direct cancel, an approved
 //! cancellation request, an earlier replacement), the `Intent` of the request
 //! accepted over it (`REPLACE`, which moves an active source, and `AMEND`, which
-//! documents no move at all) and the number of replacements that name the same
-//! source.
+//! modifies the agreement it names instead of moving its status) and the number
+//! of replacements that name the same source.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -261,12 +261,24 @@ async fn accepting_a_replacement_never_moves_a_source_that_already_left_active()
                 "case {case}: accepting must succeed, got {} with {:?}",
                 accepted.status, accepted.body
             );
-            let minted = accepted.str_at("/agreementId");
-            assert!(
-                !minted.is_empty() && minted != source,
-                "case {case}: the accept mints its own agreement, got {minted:?} against the \
-                 source {source:?}"
-            );
+            // What the accept answers: `agreementId` is "the unique identifier
+            // of the agreement created or modified by accepting the agreement
+            // request", so a replacement answers the agreement it created and
+            // an amendment the one it modified.
+            let answered = accepted.str_at("/agreementId");
+            if intent == AMEND {
+                assert_eq!(
+                    answered, source,
+                    "case {case}: an amendment modifies the agreement it names, so the accept \
+                     answers that agreement, got {answered:?}"
+                );
+            } else {
+                assert!(
+                    !answered.is_empty() && answered != source,
+                    "case {case}: a replacement mints its own agreement, got {answered:?} \
+                     against the source {source:?}"
+                );
+            }
 
             // The source: the status the rule leaves it in, agreed on by both
             // reports, and the instant of the last call that actually moved it.
@@ -285,16 +297,24 @@ async fn accepting_a_replacement_never_moves_a_source_that_already_left_active()
                 "case {case}: the search summary must agree on {expected}, got {summary:?}"
             );
             let after = last_update_time(&router, &source).await;
-            if expected == state.status() {
+            // Whether the accept changed the source at all: a replacement moves
+            // an active source's status, and an amendment re-states the accepted
+            // terms of the agreement it names — "an agreement is updated when
+            // any of its attributes or accepted terms change. Amendments,
+            // renewals, and a party changing whether the agreement renews are
+            // all examples" (`AgreementViewSummary$lastUpdateTime`).
+            let changed = intent == AMEND || expected != state.status();
+            if changed {
+                assert!(
+                    after > before,
+                    "case {case}: a call that changes the agreement stamps lastUpdateTime past \
+                     {before}, got {after}"
+                );
+            } else {
                 assert_eq!(
                     after, before,
                     "case {case}: a call that moves nothing leaves lastUpdateTime at {before}, \
                      got {after}"
-                );
-            } else {
-                assert!(
-                    after > before,
-                    "case {case}: the transition stamps lastUpdateTime past {before}, got {after}"
                 );
             }
 
@@ -314,21 +334,25 @@ async fn accepting_a_replacement_never_moves_a_source_that_already_left_active()
                 );
             }
 
-            // The agreement the accept minted is its own, active record, and a
-            // replacement or amendment stays in the chain its source started.
-            let new_described = describe(&router, &minted).await;
-            assert_eq!(
-                new_described.str_at("/status"),
-                ACTIVE,
-                "case {case}: the minted agreement is active, got {:?}",
-                new_described.body
-            );
-            assert_eq!(
-                new_described.str_at("/initialAgreementId"),
-                describe(&router, &source).await.str_at("/initialAgreementId"),
-                "case {case}: the minted agreement keeps the chain of its source, got {:?}",
-                new_described.body
-            );
+            // The agreement a replacement minted is its own, active record, and
+            // it stays in the chain its source started. An amendment minted
+            // none: the agreement it answered is the source, already asserted
+            // above.
+            if intent != AMEND {
+                let new_described = describe(&router, &answered).await;
+                assert_eq!(
+                    new_described.str_at("/status"),
+                    ACTIVE,
+                    "case {case}: the minted agreement is active, got {:?}",
+                    new_described.body
+                );
+                assert_eq!(
+                    new_described.str_at("/initialAgreementId"),
+                    describe(&router, &source).await.str_at("/initialAgreementId"),
+                    "case {case}: the minted agreement keeps the chain of its source, got {:?}",
+                    new_described.body
+                );
+            }
         }
     }
 }

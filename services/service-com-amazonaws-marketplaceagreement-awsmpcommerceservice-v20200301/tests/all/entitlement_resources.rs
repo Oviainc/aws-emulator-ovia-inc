@@ -174,9 +174,11 @@ async fn derived_agreement(
 /// entitles.
 ///
 /// The rows differ along what the rule generalises over: how the agreement came
-/// to be (a new one, an amendment, a replacement), how many terms it was
-/// accepted over and of which kinds. None of those changes the resources it is
-/// involved with, which is what the entitlement count follows.
+/// to be (a new one, a replacement), how many terms it was accepted over and of
+/// which kinds. None of those changes the resources it is involved with, which
+/// is what the entitlement count follows. An amendment grants nothing of its
+/// own, which the tail of this test asserts: it modifies an existing agreement,
+/// whose entitlements already entitle its acceptor to those resources.
 #[tokio::test]
 async fn an_agreement_grants_one_entitlement_per_resource_it_is_involved_with() {
     let router = emulator();
@@ -205,7 +207,6 @@ async fn an_agreement_grants_one_entitlement_per_resource_it_is_involved_with() 
     let cases: Vec<(&str, &String)> = vec![
         ("a new agreement over one term", &plain),
         ("a new agreement over three terms", &many_terms),
-        ("an amendment of an agreement", &amended),
         ("a replacement of an agreement", &replacement),
     ];
 
@@ -263,6 +264,40 @@ async fn an_agreement_grants_one_entitlement_per_resource_it_is_involved_with() 
             "case {case:?}: the agreement must report the resources its entitlements were \
              provisioned to, got {:?}",
             described.body
+        );
+    }
+
+    // An amendment "modifies an existing agreement with terms that are accepted
+    // in the request", so it answers that agreement and grants no second
+    // licence for resources it already entitles its acceptor to: the licences
+    // the amended agreement reports are the ones it was already reporting, and
+    // none of them is a licence this test has not already seen.
+    let case = "an amendment of an agreement";
+    assert_eq!(
+        &amended, &plain,
+        "case {case:?}: the accept must answer the agreement it modified, got {amended:?} \
+         against {plain:?}"
+    );
+    let after = entitlements_of(&router, &amended).await;
+    let granted_licenses: Vec<String> = after
+        .iter()
+        .map(|entitlement| {
+            entitlement["licenseArn"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        granted_licenses.len(),
+        PUBLISHED_PRODUCTS.len(),
+        "case {case:?}: the amended agreement still grants one entitlement per resource, \
+         got {after:?}"
+    );
+    for license in &granted_licenses {
+        assert!(
+            licenses.contains(license),
+            "case {case:?}: an amendment grants no new licence, got {license} in {after:?}"
         );
     }
 }

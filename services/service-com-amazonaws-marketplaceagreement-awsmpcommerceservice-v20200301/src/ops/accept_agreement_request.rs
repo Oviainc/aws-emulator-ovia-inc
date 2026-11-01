@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptAgreementRequest
-//! Finalises the agreement: the stored agreement request's terms become the new
-//! agreement's accepted terms, and the record every other operation reports on is
-//! persisted in [`crate::state`]. This is the ONLY file to touch for this operation.
+//! Finalises the agreement: the stored agreement request's terms become the
+//! accepted terms of the agreement this call creates or, where the request
+//! amends one, of the agreement it modifies — and the record every other
+//! operation reports on is persisted in [`crate::state`]. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -213,13 +215,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reference with ONE charge of the agreement being accepted, and the
         // charges of that agreement are the ones this request's quote minted
         // into `ChargeSummary$expectedCharges` — each at its first revision and
-        // held by no agreement yet, since this call is what mints them and the
-        // agreement that will hold them. A list that names a charge the request
-        // does not hold, names one twice, carries no reference to associate,
-        // states no `chargeRevision`, or one other than the revision its charge
-        // is at, or states an `agreementId` — which cannot be the agreement
-        // holding its charge, as that agreement does not exist when the request
-        // is made — is refused before anything is stored; see
+        // held by no agreement yet, since this call is what mints them. A list
+        // that names a charge the request does not hold, names one twice,
+        // carries no reference to associate, states no `chargeRevision`, or one
+        // other than the revision its charge is at, or states an `agreementId` —
+        // which an accept does not take, the agreement holding its charge being
+        // the one this call answers — is refused before anything is stored; see
         // `crate::state::validate_purchase_orders` for the rule.
         let purchase_orders = input.purchase_orders.unwrap_or_default();
         if let Err(refusal) = crate::state::validate_purchase_orders(
@@ -232,134 +233,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let id = store.mint_agreement_id();
-        // "The list of resources involved in the agreement": the resources of
-        // the agreement an amendment or a replacement acts upon, and otherwise
-        // the products the published offer is for — see
-        // `crate::state::agreement_resources` for that one resolution, which
-        // both this summary and the entitlements below read.
-        let resources = crate::state::agreement_resources(
-            source
-                .as_ref()
-                .and_then(|source| source.proposal_summary.resources.as_deref()),
-        );
-        let proposal_summary = ProposalSummary {
-            // The only identity of the proposal this emulator holds is the
-            // identifier the request named; its offer set lives in the
-            // agreement proposal, which is not this service's resource.
-            offer_id: request
-                .agreement_proposal_identifier
-                .clone()
-                .or_else(|| {
-                    source
-                        .as_ref()
-                        .and_then(|source| source.proposal_summary.offer_id.clone())
-                }),
-            resources: Some(resources.clone()),
-            offer_set_id: source
-                .as_ref()
-                .and_then(|source| source.proposal_summary.offer_set_id.clone()),
+        // Where the terms accepted here land, which `Intent` decides: `NEW`
+        // "creates a new agreement for terms in the request" and `REPLACE`
+        // "creates a new agreement with accepted terms and replaces the existing
+        // agreement", while `AMEND` "modifies an existing agreement with terms
+        // that are accepted in the request" — so an amendment writes them onto
+        // the agreement it acts upon and mints nothing. That is the "modified"
+        // half of this operation's answer: `agreementId` is "the unique
+        // identifier of the agreement created or MODIFIED by accepting the
+        // agreement request".
+        let amended = (request.intent == crate::state::INTENT_AMEND)
+            .then_some(source.as_ref())
+            .flatten();
+        let id = match amended {
+            Some(amended) => amended.id.clone(),
+            None => store.mint_agreement_id(),
         };
-        // Accepting the quote is what provisions the agreement's entitlements:
-        // one licence per resource the agreement is involved with, each
-        // `PENDING` until the clock owes it its `PROVISIONED` status. The
-        // licence is minted in the region this caller signed for — when the
-        // credential scope's region field is a Region label at all, which
-        // `crate::state::request_region` is what decides — and reported from
-        // then on by `GetAgreementEntitlements`, `SearchAgreements` and its
-        // `LicenseArn` filter.
-        let region = crate::state::request_region(ctx.parts());
-        let entitlements = store.provision_entitlements(&resources, &region, now);
-        // Both sides of the agreement name an account: the caller accepted these
-        // terms (the buyer's call) and it is also the account this service lets
-        // a seller act under, so it is the proposer too — see
-        // `crate::state::agreement_parties` for the one place that decides it.
-        let (acceptor, proposer) = crate::state::agreement_parties();
+        let purchase_orders: Vec<PurchaseOrder> = purchase_orders
+            .into_iter()
+            .map(|order| PurchaseOrder {
+                // "The unique identifier of the agreement associated with this
+                // charge": the agreement being accepted, which is the one this
+                // call minted or amended — an element that stated any agreement
+                // of its own was refused above, so nothing a caller sent is
+                // being overwritten.
+                agreement_id: Some(id.clone()),
+                ..order
+            })
+            .collect();
         // The terms this agreement holds: the proposal's own term, as the
         // published offer document carries it, for each term the request asked
         // for — plus this agreement's own window where a term reports one. The
         // context is built once for the whole agreement, so every term of it
         // reports the same contract length and the same dates, and the
-        // agreement's end date is the end of the window its terms commit it for.
+        // agreement's end date is the end of the window its terms commit it
+        // for. An amendment modifies an existing agreement rather than starting
+        // one, so that window is measured from the start date the agreement
+        // already has.
+        let start = amended.map_or(now, |amended| amended.start_time);
         let context = crate::state::AcceptedTermContext::new(
             &request.requested_terms,
-            now,
+            start,
             source.as_ref(),
         );
         let accepted_terms = crate::state::accepted_terms(&request.requested_terms, &context);
         let end_time = crate::state::agreement_end_time(&accepted_terms, &context);
-        let agreement = crate::state::Agreement {
-            // "When an agreement isn't derived from another agreement, its
-            // InitialAgreementId is its own AgreementId."
-            initial_agreement_id: source
-                .as_ref()
-                .map_or_else(|| id.clone(), |source| source.initial_agreement_id.clone()),
-            id: id.clone(),
-            agreement_request_id: request.id.clone(),
-            agreement_type: crate::state::AGREEMENT_TYPE.to_string(),
-            catalog: crate::state::CATALOG.to_string(),
-            acceptor,
-            proposer,
-            // The region this caller signed for, which the licences above were
-            // minted in: a renewal the clock performs later mints its own in the
-            // same region.
-            region,
-            // "The maximum number of times the agreement can be renewed" counts
-            // from the agreement an acceptance created, which has been renewed
-            // no times.
-            renewal_count: 0,
-            status: crate::state::STATUS_ACTIVE.to_string(),
-            // "AcceptanceTime and StartTime can differ for future dated
-            // agreements"; the accepted terms carry no start date, so this
-            // agreement starts when it was accepted.
-            start_time: now,
-            acceptance_time: now,
-            // "The field is null for pay-as-you-go agreements, which don't have
-            // end dates" — this agreement ends when the duration its accepted
-            // terms commit it for runs out, and has no end date when they
-            // commit none.
-            end_time,
-            proposal_summary,
-            accepted_terms,
-            purchase_orders: purchase_orders
-                .into_iter()
-                .map(|order| PurchaseOrder {
-                    // "The unique identifier of the agreement associated with
-                    // this charge": the agreement being accepted, which is the
-                    // one minted here — an element that stated any agreement of
-                    // its own was refused above, so nothing a caller sent is
-                    // being overwritten.
-                    agreement_id: Some(id.clone()),
-                    ..order
-                })
-                .collect(),
-            entitlements,
-            updated_at: now,
-        };
 
-        store.agreements.insert(id.clone(), agreement);
+        if amended.is_some() {
+            // The amendment is applied to the agreement it acts upon
+            // (`crate::state::Agreement::amend`): the terms accepted here become
+            // its accepted terms, the window they commit it for becomes its end
+            // date, this amendment's quote becomes the quote it stands at — so
+            // its value is "the total value of the agreement, which includes any
+            // amendments" — and its `lastUpdateTime` is this acceptance. Its
+            // status is untouched, an amendment being none of this service's
+            // status transitions, and so are the entitlements it granted, which
+            // entitle its acceptor to the same resources under the same
+            // licences.
+            if let Some(agreement) = store.agreements.get_mut(&id) {
+                agreement.amend(request.id.clone(), accepted_terms, end_time, now);
+                for order in purchase_orders {
+                    agreement.associate_purchase_order(order, now);
+                }
+            }
+        } else {
+            // "The list of resources involved in the agreement": the resources of
+            // the agreement a replacement acts upon, and otherwise the products
+            // the published offer is for — see
+            // `crate::state::agreement_resources` for that one resolution, which
+            // both this summary and the entitlements below read.
+            let resources = crate::state::agreement_resources(
+                source
+                    .as_ref()
+                    .and_then(|source| source.proposal_summary.resources.as_deref()),
+            );
+            let proposal_summary = ProposalSummary {
+                // The only identity of the proposal this emulator holds is the
+                // identifier the request named; its offer set lives in the
+                // agreement proposal, which is not this service's resource.
+                offer_id: request.agreement_proposal_identifier.clone().or_else(|| {
+                    source
+                        .as_ref()
+                        .and_then(|source| source.proposal_summary.offer_id.clone())
+                }),
+                resources: Some(resources.clone()),
+                offer_set_id: source
+                    .as_ref()
+                    .and_then(|source| source.proposal_summary.offer_set_id.clone()),
+            };
+            // Accepting the quote is what provisions the agreement's entitlements:
+            // one licence per resource the agreement is involved with, each
+            // `PENDING` until the clock owes it its `PROVISIONED` status. The
+            // licence is minted in the region this caller signed for — when the
+            // credential scope's region field is a Region label at all, which
+            // `crate::state::request_region` is what decides — and reported from
+            // then on by `GetAgreementEntitlements`, `SearchAgreements` and its
+            // `LicenseArn` filter.
+            let region = crate::state::request_region(ctx.parts());
+            let entitlements = store.provision_entitlements(&resources, &region, now);
+            // Both sides of the agreement name an account: the caller accepted these
+            // terms (the buyer's call) and it is also the account this service lets
+            // a seller act under, so it is the proposer too — see
+            // `crate::state::agreement_parties` for the one place that decides it.
+            let (acceptor, proposer) = crate::state::agreement_parties();
+            let agreement = crate::state::Agreement {
+                // "When an agreement isn't derived from another agreement, its
+                // InitialAgreementId is its own AgreementId."
+                initial_agreement_id: source
+                    .as_ref()
+                    .map_or_else(|| id.clone(), |source| source.initial_agreement_id.clone()),
+                id: id.clone(),
+                agreement_request_id: request.id.clone(),
+                // Nothing has amended this agreement yet.
+                amendment_request_ids: Vec::new(),
+                agreement_type: crate::state::AGREEMENT_TYPE.to_string(),
+                catalog: crate::state::CATALOG.to_string(),
+                acceptor,
+                proposer,
+                // The region this caller signed for, which the licences above were
+                // minted in: a renewal the clock performs later mints its own in the
+                // same region.
+                region,
+                // "The maximum number of times the agreement can be renewed" counts
+                // from the agreement an acceptance created, which has been renewed
+                // no times.
+                renewal_count: 0,
+                status: crate::state::STATUS_ACTIVE.to_string(),
+                // "AcceptanceTime and StartTime can differ for future dated
+                // agreements"; the accepted terms carry no start date, so this
+                // agreement starts when it was accepted.
+                start_time: now,
+                acceptance_time: now,
+                // "The field is null for pay-as-you-go agreements, which don't have
+                // end dates" — this agreement ends when the duration its accepted
+                // terms commit it for runs out, and has no end date when they
+                // commit none.
+                end_time,
+                proposal_summary,
+                accepted_terms,
+                purchase_orders,
+                entitlements,
+                updated_at: now,
+            };
+            store.agreements.insert(id.clone(), agreement);
+        }
+
         if let Some(request) = store.agreement_requests.get_mut(&input.agreement_request_id) {
             request.accepted_agreement_id = Some(id.clone());
+            // When the charges this quote minted are incurred: they are charged
+            // when the request carrying them is accepted, which is now.
+            request.accepted_at = Some(now);
         }
         // Accepting the quote also INVOICES the charges it incurs right now:
         // a charge timed `ON_ACCEPTANCE` is "charged immediately when the
         // agreement request is accepted", so the invoice that bills it is
-        // issued by this call. `ListAgreementInvoiceLineItems` reports them,
-        // and `BatchCreateBillingAdjustmentRequest` adjusts one of them — see
-        // `crate::state::Invoice` for which charges are invoiced at all.
+        // issued by this call — for an amendment, the charges ITS quote added to
+        // the agreement it modified. `ListAgreementInvoiceLineItems` reports
+        // them, and `BatchCreateBillingAdjustmentRequest` adjusts one of them —
+        // see `crate::state::Invoice` for which charges are invoiced at all.
         for invoice in store.issue_acceptance_invoices(&id, now) {
             crate::state::audit("AcceptAgreementRequest", "invoiced", &invoice, ctx.parts());
         }
-        crate::state::audit("AcceptAgreementRequest", "accepted", &id, ctx.parts());
+        crate::state::audit(
+            "AcceptAgreementRequest",
+            if amended.is_some() {
+                "amended"
+            } else {
+                "accepted"
+            },
+            &id,
+            ctx.parts(),
+        );
 
         // `AgreementStatus` documents the status the agreement a replacement
         // acts upon carries from then on: "REPLACED – The agreement was replaced
-        // using an agreement replacement offer." What an AMEND leaves its source
-        // in is not documented, so the emulator does not move it. The move goes
-        // through the guarded writer every status transition of this service
-        // goes through (`Agreement::replace`), so a source that has already
-        // reached a terminal status keeps it and only the transition this call
-        // actually made is audited.
+        // using an agreement replacement offer." An amendment moves no status at
+        // all — it modified the agreement above instead — so only a replacement
+        // reaches this. The move goes through the guarded writer every status
+        // transition of this service goes through (`Agreement::replace`), so a
+        // source that has already reached a terminal status keeps it and only
+        // the transition this call actually made is audited.
         if request.intent == crate::state::INTENT_REPLACE {
             if let Some(source) = request
                 .source_agreement_identifier

@@ -348,6 +348,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_token: input.client_token,
             // Nothing is accepted until `AcceptAgreementRequest` runs.
             accepted_agreement_id: None,
+            accepted_at: None,
             created_at: now,
         };
         store.agreement_requests.insert(id.clone(), request);
