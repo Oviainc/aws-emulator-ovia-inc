@@ -3,12 +3,16 @@
 //! @op StartNextPendingJobExecution
 //!
 //! Takes the thing's next pending (`IN_PROGRESS` or `QUEUED`) execution. A QUEUED
-//! one is STARTED: moved to `IN_PROGRESS`, the request's `statusDetails` and step
-//! timeout applied, `versionNumber` incremented. An execution the thing already has
-//! in progress is merely re-handed, unchanged. Either way the stored execution is
-//! returned with its job document. A thing with no pending execution gets a 200 whose
-//! `execution` is JSON `null` — the response document always carries the modelled
-//! member (see [`super::types::ResponseDocument`]).
+//! one is STARTED: moved to `IN_PROGRESS`, `versionNumber` incremented. Either way the
+//! request's `statusDetails` and step timeout are applied whenever the request
+//! SPECIFIES them — the model leaves a stored value alone only for a member the
+//! request does not carry — so a device re-acquiring an execution it already has in
+//! progress records its details and arms its step timer too; a poll carrying neither
+//! member that resolves to an execution already in progress merely re-hands it and
+//! writes nothing. Either way the stored execution is returned with its job document.
+//! A thing with no pending execution gets a 200 whose `execution` is JSON `null` — the
+//! response document always carries the modelled member (see
+//! [`super::types::ResponseDocument`]).
 //!
 //! "Pending" is read at the CURRENT instant: the `TIMED_OUT` transition the clock has
 //! already made due on the thing's executions is materialised first
@@ -249,13 +253,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             };
-            // An execution the thing already has IN_PROGRESS is merely re-handed:
-            // this call starts nothing, so it writes nothing — the device gets the
-            // same version, the same `startedAt` and the same details it was handed
-            // before, and the version it holds stays usable as an
-            // `expectedVersion`. Only a QUEUED -> IN_PROGRESS start is a device
-            // update, and only it applies this request's details and step timeout.
-            if record.status != STATUS_IN_PROGRESS {
+            // Both request members are request-DRIVEN, and the only condition the
+            // model puts on leaving the stored value alone is the member not being
+            // specified ("If not specified, the statusDetails are unchanged"; the
+            // step timeout "Specifies the amount of time this device has to finish
+            // execution of this job"). So a poll that CARRIES either member applies
+            // it to whichever pending execution it resolved to — including one the
+            // thing already has in progress, which this operation's own doc lists as
+            // pending and which is what a device re-acquiring work after a restart
+            // polls for. Applying a member is a device update, so the stamps and the
+            // version move with it.
+            //
+            // A poll carrying NEITHER member that resolves to an execution already
+            // IN_PROGRESS is the one case that writes nothing: it merely re-hands the
+            // execution, so the device gets the same version, the same `startedAt`
+            // and the same details it was handed before, and the version it holds
+            // stays usable as an `expectedVersion` however often it polls.
+            let starts_the_execution = record.status != STATUS_IN_PROGRESS;
+            let carries_a_member =
+                input.status_details.is_some() || input.step_timeout_in_minutes.is_some();
+            if starts_the_execution || carries_a_member {
                 // Checked above, so it cannot fail here; a refusal would still
                 // leave the execution untouched.
                 if let Err(reason) = record.try_replace_status_details(input.status_details.as_ref())
@@ -270,11 +287,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     );
                 }
                 // `start` moves the status to `IN_PROGRESS` and stamps `startedAt`
-                // on the first start, arming the job's in-progress timer with it.
+                // on the first start, arming the job's in-progress timer with it; an
+                // execution already in progress keeps both, so a resumption is the
+                // same call.
                 record.start(now);
                 record.arm_step_timer(input.step_timeout_in_minutes, now);
                 record.last_updated_at = now;
-                // Starting the execution IS a device update, so the version moves.
+                // Starting the execution, and applying a member the device sent, are
+                // both device updates, so the version moves.
                 record.version_number += 1;
             }
             // The device needs the job document to run the job, so it is always

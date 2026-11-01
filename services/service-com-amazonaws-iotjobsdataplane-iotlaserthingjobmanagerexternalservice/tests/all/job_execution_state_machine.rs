@@ -13,10 +13,11 @@
 //!    nothing, whether the version named is in the past or in the future;
 //! 3. a `statusDetails` map the request CARRIES replaces the stored map wholesale,
 //!    and an OMITTED one leaves the stored map exactly as it was;
-//! 4. `StartNextPendingJobExecution` starts a QUEUED execution and merely re-hands
-//!    one already in progress: the re-hand writes nothing (same version, same
-//!    `startedAt`, same details) and the next queued execution waits for the one in
-//!    progress to finish.
+//! 4. `StartNextPendingJobExecution` starts a QUEUED execution and resolves again to
+//!    one already in progress: a poll carrying NEITHER request member re-hands it
+//!    unchanged (same version, same `startedAt`, same details), a poll carrying one
+//!    applies it as a device update, and either way the next queued execution waits
+//!    for the one in progress to finish.
 //!
 //! Every request goes over the wire (restJson1 through the multi-service router), so
 //! what is asserted is the HTTP behaviour a device agent sees.
@@ -518,15 +519,18 @@ async fn a_supplied_status_details_map_replaces_the_stored_one_and_an_omitted_on
 }
 
 /// RULE: `StartNextPendingJobExecution` STARTS a queued execution (version +1,
-/// `startedAt` stamped) and merely RE-HANDS one the thing already has in progress:
-/// the re-hand writes nothing, so the version the device holds stays usable as an
-/// `expectedVersion` however often it polls, and the next queued execution is handed
-/// out only once the one in progress reaches a terminal status.
+/// `startedAt` stamped) and resolves again to one the thing already has in progress: a
+/// poll carrying NEITHER request member re-hands that execution unchanged, so the
+/// version the device holds stays usable as an `expectedVersion` however often it polls
+/// for nothing, while a poll that carries `statusDetails` or `stepTimeoutInMinutes`
+/// applies it as a device update and hands back the version that update produced.
+/// Either way the next queued execution is handed out only once the one in progress
+/// reaches a terminal status, and `startedAt` is the first start's.
 ///
 /// The rows differ in what the re-poll carries (nothing, details, a step timeout,
-/// both), none of which may change an execution this call does not start.
+/// both), which is what decides whether it writes.
 #[tokio::test]
-async fn re_handing_an_in_progress_execution_writes_nothing_and_the_queue_waits() {
+async fn re_polling_an_in_progress_execution_applies_only_what_it_carries_and_the_queue_waits() {
     let emulator = Emulator::new();
     let thing = "laser-rehand";
 
@@ -555,26 +559,41 @@ async fn re_handing_an_in_progress_execution_writes_nothing_and_the_queue_waits(
         "the start stamps startedAt, got {started}"
     );
 
-    for (case, body) in [
-        ("an empty re-poll", json!({})),
+    // The version the device currently holds, and the details the execution currently
+    // carries: both move only with a poll that carries something to apply.
+    let mut version = handed["versionNumber"].as_i64().unwrap_or_default();
+    let mut details = handed["statusDetails"].clone();
+
+    // (case, the body of the re-poll, the details it leaves stored or `None` when it
+    //  carries no map)
+    for (case, body, written) in [
+        ("an empty re-poll", json!({}), None),
         (
             "a re-poll carrying details",
-            json!({"statusDetails": {"stage": "ignored"}}),
+            json!({"statusDetails": {"stage": "verify"}}),
+            Some(json!({"stage": "verify"})),
         ),
         (
             "a re-poll carrying a step timeout",
             json!({"stepTimeoutInMinutes": 7}),
+            None,
         ),
         (
             "a re-poll carrying both",
-            json!({"statusDetails": {"stage": "also-ignored"}, "stepTimeoutInMinutes": 10}),
+            json!({"statusDetails": {"stage": "install"}, "stepTimeoutInMinutes": 10}),
+            Some(json!({"stage": "install"})),
         ),
     ] {
+        let applies = body.as_object().is_some_and(|body| !body.is_empty());
         let (status, again) = emulator.start_next(thing, body).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected 200, got {status} {again}"
         );
+        version += i64::from(applies);
+        if let Some(written) = written {
+            details = written;
+        }
         assert_eq!(
             (
                 again["execution"]["jobId"].as_str(),
@@ -586,11 +605,11 @@ async fn re_handing_an_in_progress_execution_writes_nothing_and_the_queue_waits(
             (
                 handed["jobId"].as_str(),
                 handed["status"].as_str(),
-                handed["versionNumber"].as_i64(),
+                Some(version),
                 handed["startedAt"].as_i64(),
-                handed["statusDetails"].clone(),
+                details.clone(),
             ),
-            "case {case:?}: re-handing an already-started execution must change nothing, got {again}"
+            "case {case:?}: expected the same execution at version {version} carrying {details}, got {again}"
         );
 
         // The other execution is still waiting, and only that one.
@@ -607,26 +626,26 @@ async fn re_handing_an_in_progress_execution_writes_nothing_and_the_queue_waits(
         );
     }
 
-    // The version the first call handed out is still the current one, so the device's
-    // own update is accepted after any number of re-polls.
+    // The version the last poll handed out is the current one, so the device's own
+    // update is accepted naming it.
     let (status, finished) = emulator
         .update(
             thing,
             &first,
             json!({
                 "status": "SUCCEEDED",
-                "expectedVersion": handed["versionNumber"],
+                "expectedVersion": version,
                 "includeJobExecutionState": true,
             }),
         )
         .await;
     assert_eq!(
         status, 200,
-        "the version handed out before the re-polls is still current, got {status} {finished}"
+        "the version the last poll handed out is current, got {status} {finished}"
     );
     assert_eq!(
         finished["executionState"]["versionNumber"].as_i64(),
-        handed["versionNumber"].as_i64().map(|version| version + 1),
+        Some(version + 1),
         "finishing it advances the version once, got {finished}"
     );
 

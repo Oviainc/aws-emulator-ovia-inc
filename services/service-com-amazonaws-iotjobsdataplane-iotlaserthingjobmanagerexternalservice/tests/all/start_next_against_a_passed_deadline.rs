@@ -301,12 +301,63 @@ fn assert_started(
     );
 }
 
+/// RULE for the execution a poll resolves to that is ALREADY in progress: the poll
+/// starts nothing, so `startedAt` and the job's own in-progress timer stay the first
+/// start's, and it writes exactly what it CARRIES — a `stepTimeoutInMinutes` re-arms
+/// the step timer from the instant of the call and advances the version (applying a
+/// member a device sent is a device update), while a poll carrying no member at all
+/// leaves the record exactly as it was.
+fn assert_resumed(
+    label: &str,
+    before: &StoredExecution,
+    after: &StoredExecution,
+    poll_step_minutes: Option<i64>,
+    called_between: (i64, i64),
+) {
+    let (earliest, latest) = called_between;
+    let Some(minutes) = poll_step_minutes else {
+        assert_eq!(
+            after, before,
+            "case {label:?}: a poll carrying nothing to apply must re-hand the execution unchanged, got {after:?}"
+        );
+        return;
+    };
+    assert_eq!(
+        (
+            after.status.as_str(),
+            after.version_number,
+            after.started_at,
+            after.execution_timeout_expires_at
+        ),
+        (
+            STATUS_IN_PROGRESS,
+            before.version_number + 1,
+            before.started_at,
+            before.execution_timeout_expires_at
+        ),
+        "case {label:?}: a resumed execution keeps its start and advances its version once, got {after:?}"
+    );
+    assert!(
+        (earliest..=latest).contains(&after.last_updated_at),
+        "case {label:?}: a resumed execution is stamped as updated within {earliest}..={latest}, got {after:?}"
+    );
+    let armed = after.step_timeout_expires_at.unwrap_or_else(|| {
+        panic!("case {label:?}: the poll's step timeout must arm a timer, got {after:?}")
+    });
+    let from = earliest + minutes * SECONDS_PER_MINUTE;
+    let to = latest + minutes * SECONDS_PER_MINUTE;
+    assert!(
+        (from..=to).contains(&armed),
+        "case {label:?}: a resumed execution's step timer must be re-armed within {from}..={to}, got {armed}"
+    );
+}
+
 /// RULE: the queue a poll reads is the one the CLOCK has already decided, so an
 /// execution whose armed deadline has passed is `TIMED_OUT` — recorded at that
 /// deadline, with its version untouched and its timers spent — and the execution
 /// waiting behind it is the one started; an execution whose deadline has NOT passed is
-/// the one handed out, started if it was queued and re-handed unchanged if the device
-/// already had it in progress.
+/// the one handed out, started if it was queued and resumed — applying what the poll
+/// carries — if the device already had it in progress.
 #[tokio::test]
 async fn a_poll_starts_the_execution_behind_every_deadline_that_has_passed() {
     let emulator = Emulator::new();
@@ -376,11 +427,12 @@ async fn a_poll_starts_the_execution_behind_every_deadline_that_has_passed() {
             );
         } else {
             if seeded.head_before.status == STATUS_IN_PROGRESS {
-                // An execution the device already has in progress is merely
-                // re-handed: this poll starts nothing, so it writes nothing.
-                assert_eq!(
-                    head_after, seeded.head_before,
-                    "case {label:?}: an execution in progress must be re-handed unchanged, got {head_after:?}"
+                assert_resumed(
+                    label,
+                    &seeded.head_before,
+                    &head_after,
+                    case.poll_step_minutes,
+                    (earliest, latest),
                 );
             } else {
                 assert_started(
@@ -420,8 +472,8 @@ async fn a_poll_starts_the_execution_behind_every_deadline_that_has_passed() {
 /// RULE, from the symptom's side: a device that keeps polling cannot keep an execution
 /// the clock finished alive. Every poll after the deadline answers the same way — the
 /// finished execution stays `TIMED_OUT` at its own deadline with its version untouched
-/// — and the execution started behind it is re-handed unchanged rather than started
-/// again.
+/// — and the execution started behind it is resumed, applying whatever that poll
+/// carries, rather than started again.
 #[tokio::test]
 async fn polling_on_cannot_revive_the_execution_the_clock_finished() {
     let emulator = Emulator::new();
@@ -441,16 +493,21 @@ async fn polling_on_cannot_revive_the_execution_the_clock_finished() {
                 status, 200,
                 "case {label:?}: poll {poll} must answer 200, got {status} {answered}"
             );
+            // The first poll starts the execution behind (one device update); a later
+            // poll advances it again only when it carries a member to apply.
+            let expected_version = seeded.follower_before.version_number
+                + if case.poll_step_minutes.is_some() {
+                    poll
+                } else {
+                    1
+                };
             assert_eq!(
                 (
                     answered["execution"]["jobId"].as_str(),
                     answered["execution"]["versionNumber"].as_i64()
                 ),
-                (
-                    Some(seeded.follower.as_str()),
-                    Some(seeded.follower_before.version_number + 1)
-                ),
-                "case {label:?}: poll {poll} must hand out the execution behind, got {answered}"
+                (Some(seeded.follower.as_str()), Some(expected_version)),
+                "case {label:?}: poll {poll} must hand out the execution behind at version {expected_version}, got {answered}"
             );
 
             let head_after = emulator.stored_execution(case.thing, &seeded.head);
@@ -471,10 +528,29 @@ async fn polling_on_cannot_revive_the_execution_the_clock_finished() {
             let follower_after = emulator.stored_execution(case.thing, &seeded.follower);
             match &first_handed {
                 None => first_handed = Some(follower_after),
-                Some(first) => assert_eq!(
-                    &follower_after, first,
-                    "case {label:?}: poll {poll} must re-hand the started execution unchanged, got {follower_after:?}"
-                ),
+                Some(first) => {
+                    // `startedAt` and the job's own in-progress timer belong to the
+                    // first start, so no later poll may move them.
+                    assert_eq!(
+                        (
+                            follower_after.status.as_str(),
+                            follower_after.started_at,
+                            follower_after.execution_timeout_expires_at
+                        ),
+                        (
+                            first.status.as_str(),
+                            first.started_at,
+                            first.execution_timeout_expires_at
+                        ),
+                        "case {label:?}: poll {poll} must not start the execution again, got {follower_after:?}"
+                    );
+                    if case.poll_step_minutes.is_none() {
+                        assert_eq!(
+                            &follower_after, first,
+                            "case {label:?}: poll {poll} carries nothing to apply, so it must change nothing, got {follower_after:?}"
+                        );
+                    }
+                }
             }
         }
     }

@@ -41,6 +41,8 @@ mod refusals_report_the_execution_state;
 mod response_document_completeness;
 #[path = "all/start_next_against_a_passed_deadline.rs"]
 mod start_next_against_a_passed_deadline;
+#[path = "all/start_next_applies_the_members_it_carries.rs"]
+mod start_next_applies_the_members_it_carries;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/status_details_modeled_constraints.rs"]
