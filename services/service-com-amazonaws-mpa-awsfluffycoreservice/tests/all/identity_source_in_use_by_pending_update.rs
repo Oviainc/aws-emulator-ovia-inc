@@ -38,10 +38,10 @@ const CLOCK_SLACK: Duration = Duration::from_millis(250);
 
 /// A policy ARN the seeded catalog holds, in the form `PolicyReference$PolicyArn`'s
 /// modelled pattern requires.
-const POLICY_ARN: &str = "arn:aws:mpa:::aws:policy/IdentityCenter/MPAApprovalTeamPolicy/$DEFAULT";
+pub(crate) const POLICY_ARN: &str = "arn:aws:mpa:::aws:policy/IdentityCenter/MPAApprovalTeamPolicy/$DEFAULT";
 
 /// One approver of the team: identity `index`, authenticated by `source_arn`.
-fn approver_member(index: usize, source_arn: &str) -> Value {
+pub(crate) fn approver_member(index: usize, source_arn: &str) -> Value {
     json!({
         "PrimaryIdentityId": format!("identity-{index:04}"),
         "PrimaryIdentitySourceArn": source_arn,
@@ -51,7 +51,7 @@ fn approver_member(index: usize, source_arn: &str) -> Value {
 /// The `PrimaryIdentitySourceArn` of every approver a team read reports, either off the
 /// team itself (`member` is `None`) or off the change it has been asked to approve
 /// (`Some("PendingUpdate")`).
-fn reported_sources(body: &Value, member: Option<&str>) -> Vec<String> {
+pub(crate) fn reported_sources(body: &Value, member: Option<&str>) -> Vec<String> {
     let approvers = match member {
         None => &body["Approvers"],
         Some(member) => &body[member]["Approvers"],

@@ -143,7 +143,7 @@ async fn create_source(harness: &Harness, case: &SourceCase) -> String {
 
 /// `GET /identity-sources/{IdentitySourceArn}` — the label is non-greedy, so the ARN is
 /// percent-encoded into one path segment.
-async fn get_source(harness: &Harness, arn: &str) -> (u16, Value) {
+pub(crate) async fn get_source(harness: &Harness, arn: &str) -> (u16, Value) {
     harness
         .call("GET", &format!("/identity-sources/{}", encode_label(arn)), None)
         .await

@@ -51,6 +51,8 @@ mod identity_source_detail;
 mod identity_source_in_use_by_pending_update;
 #[path = "all/identity_source_region.rs"]
 mod identity_source_region;
+#[path = "all/identity_source_removal_in_use.rs"]
+mod identity_source_removal_in_use;
 #[path = "all/identity_sources.rs"]
 mod identity_sources;
 #[path = "all/inactive_team_version_deletion.rs"]

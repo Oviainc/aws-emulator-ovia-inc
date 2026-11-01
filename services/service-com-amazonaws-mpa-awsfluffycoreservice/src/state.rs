@@ -52,7 +52,10 @@
 //! * The removal of an identity source whose deletion `DeleteIdentitySource` started
 //!   ([`IDENTITY_SOURCE_DELETION_DELAY`]). The source is reported `DELETING` — the
 //!   model's other non-terminal `IdentitySourceStatus` token — until the removal comes
-//!   due, and is gone afterwards, so `ListIdentitySources` omits it.
+//!   due, and is gone afterwards, so `ListIdentitySources` omits it. A removal is
+//!   carried out only while the rule that permits it still holds at the instant it comes
+//!   due: a source a stored team's approvers authenticate through is IN USE, so it stays
+//!   `DELETING` with the removal still owed until no stored team names it any more.
 //! * The activation of a new session ([`SESSION_ACTIVATION_DELAY`]) and, after it, that
 //!   session's expiration ([`SESSION_EXPIRATION`]): a session is `CREATING` until its
 //!   activation comes due, `PENDING` while it waits on its approvers, and `FAILED` with
@@ -129,7 +132,12 @@
 //! ([`ComAmazonawsMpaAwsfluffycoreserviceState::remove_identity_source`]), so the
 //! record a later read reports — or omits — is this one store's. A source an approver
 //! record of a stored team authenticates through is IN USE and is not removed at all
-//! ([`ComAmazonawsMpaAwsfluffycoreserviceState::team_arn_using_identity_source`]).
+//! ([`ComAmazonawsMpaAwsfluffycoreserviceState::team_arn_using_identity_source`]): the
+//! rule is the STORE's, so both paths that act on it read that one resolver — the
+//! request that asks for the removal, which is refused while it holds, and the clock
+//! pass that carries the removal out ([`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`]),
+//! which re-reads it at the instant the removal comes due and keeps the record while it
+//! still holds.
 //!
 //! # The policy catalog
 //!
@@ -1852,7 +1860,10 @@ impl IdentitySource {
     /// Put this source into `DELETING` and record the instant its removal comes due
     /// ([`IDENTITY_SOURCE_DELETION_DELAY`]), which
     /// [`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] materialises for
-    /// every later reader.
+    /// every later reader — which is also where the IN-USE rule is read again, so a
+    /// source a stored team's approvers authenticate through when the removal comes due
+    /// stays `DELETING` rather than being removed
+    /// ([`ComAmazonawsMpaAwsfluffycoreserviceState::team_arn_using_identity_source`]).
     ///
     /// A source whose deletion has started is no longer waiting to become `ACTIVE`, so
     /// its activation is dropped: the clock owes exactly one transition from here, the
@@ -2962,6 +2973,12 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// request that materialises it happens to arrive: where two changes bear on the same
     /// record — the approvers' answer to a session and that session's expiration — the one
     /// that fell due first is applied first, and the later one acts on its result.
+    ///
+    /// A removal the clock owes is carried out only while the rule that permits it still
+    /// holds at the instant it comes due, read out of the store here and not out of the
+    /// request that scheduled it: an identity source a stored team's approvers
+    /// authenticate through is in use, so it keeps its record and its owed removal
+    /// ([`ComAmazonawsMpaAwsfluffycoreserviceState::team_arn_using_identity_source`]).
     pub fn materialize_due(&mut self, now: SystemTime) {
         for team in self.approval_teams.values_mut() {
             // The approvers of the team AND of the change it has been asked to approve
@@ -3017,22 +3034,6 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
                 continue;
             }
             source.activate();
-        }
-
-        // An identity source whose deletion `DeleteIdentitySource` started is gone once
-        // that removal comes due: until then it is reported `DELETING`, afterwards
-        // `ListIdentitySources` omits it.
-        let deleted: Vec<String> = self
-            .identity_sources
-            .values()
-            .filter(|source| {
-                source.status == IdentitySourceStatus::Deleting
-                    && source.deletion_due.is_some_and(|due| due <= now)
-            })
-            .map(|source| source.arn.clone())
-            .collect();
-        for arn in deleted {
-            self.remove_identity_source(&arn);
         }
 
         // The instant the approvers' answer is owed at, per session the clock owes one in:
@@ -3272,6 +3273,39 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         for arn in elapsed {
             self.remove_team(&arn);
         }
+
+        // An identity source whose deletion `DeleteIdentitySource` started is gone once
+        // that removal comes due: until then it is reported `DELETING`, afterwards
+        // `ListIdentitySources` omits it. The removal is carried out only while the
+        // condition that permits it still holds — a source an approver record of a stored
+        // team authenticates through is IN USE and is not removed at all — so the path
+        // that really drops the record consults the one resolver that decides it
+        // ([`ComAmazonawsMpaAwsfluffycoreserviceState::team_arn_using_identity_source`])
+        // rather than trusting the request that scheduled the removal: a reference
+        // recorded after that request was accepted keeps the source, so no read ever
+        // reports an approver authenticated by a source this store no longer holds. The
+        // removal stays owed and is carried out at the first instant no stored team names
+        // the source any more.
+        //
+        // It is the LAST thing this pass decides, after every other change the clock owes
+        // at `now`, because what is owed is owed in the order it fell due and not in the
+        // order this function walks the store: a change that drops the last reference to
+        // the source — the activation of an approver set that no longer names it, or the
+        // removal of the team holding it — is materialised above, so this decision reads
+        // the store as it stands at `now`.
+        let removable: Vec<String> = self
+            .identity_sources
+            .values()
+            .filter(|source| {
+                source.status == IdentitySourceStatus::Deleting
+                    && source.deletion_due.is_some_and(|due| due <= now)
+                    && self.team_arn_using_identity_source(&source.arn).is_none()
+            })
+            .map(|source| source.arn.clone())
+            .collect();
+        for arn in removable {
+            self.remove_identity_source(&arn);
+        }
     }
 
     /// Drop a team and everything that indexes it.
@@ -3396,7 +3430,9 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// change the team has been asked to approve, which the team read reports and
     /// activation installs as the live set — because a reference in either is a reference
     /// this store holds. It is the one place that reference is resolved, so every
-    /// operation deciding whether a source is in use reads the same records.
+    /// operation deciding whether a source is in use reads the same records, and so does
+    /// the clock pass that carries a scheduled removal out
+    /// ([`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`]).
     #[must_use]
     pub fn team_arn_using_identity_source(&self, arn: &str) -> Option<&str> {
         self.approval_teams

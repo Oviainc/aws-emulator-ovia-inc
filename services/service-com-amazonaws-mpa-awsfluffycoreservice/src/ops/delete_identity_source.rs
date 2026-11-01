@@ -48,7 +48,12 @@
 //!   one is a reference this store holds: the live approvers, and the approvers of the
 //!   change the team has been asked to approve, which `GetApprovalTeam` reports in
 //!   `PendingUpdate$Approvers` and which activation installs as the live set
-//!   ([`crate::state::ApprovalTeam::approver_records`] reads both).
+//!   ([`crate::state::ApprovalTeam::approver_records`] reads both). The rule is the
+//!   STORE's rather than this request's, so the clock pass that carries the scheduled
+//!   removal out reads the same resolver again when the removal comes due: a reference
+//!   recorded after this call was accepted keeps the source `DELETING` with its removal
+//!   still owed, so a later delete of it earns the same 409 and no read ever reports an
+//!   approver authenticated by a source this store no longer holds.
 //!
 //! The management-account gate [`crate::service`] puts in front of the creates does not
 //! apply: this request identifies its resource BY ARN, so its authorization decision
