@@ -183,6 +183,8 @@ mod network_resource_relationships;
 mod network_resources;
 #[path = "all/network_telemetry.rs"]
 mod network_telemetry;
+#[path = "all/optional_reference_one_home.rs"]
+mod optional_reference_one_home;
 #[path = "all/organization_service_access.rs"]
 mod organization_service_access;
 #[path = "all/page_token_canonical_spelling.rs"]

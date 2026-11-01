@@ -484,7 +484,10 @@ fn kind_label(kind: &str) -> String {
 ///
 /// Every id shape of this service is modelled `len 0..50` over `^[\s\S]*$`
 /// (`smithy_query query="shape" shape="SiteId"`), so the empty string satisfies the
-/// constraint walk and reaches the handler. On a member that is OPTIONAL the empty string
+/// constraint walk and reaches the handler; an ARN-shaped reference member reaches it the
+/// same way when its own pattern spells the empty string as an alternative of its own
+/// (`^arn:…$|^$`, `smithy_query query="shape" shape="SubnetArn"`). On a member that is
+/// OPTIONAL the empty string
 /// is the ABSENCE of the reference — the spelling the service documents for giving no
 /// value ("To remove information for any of the parameters, specify an empty string",
 /// `smithy_query query="doc" shape="UpdateDevice"`) — and not a reference to a resource

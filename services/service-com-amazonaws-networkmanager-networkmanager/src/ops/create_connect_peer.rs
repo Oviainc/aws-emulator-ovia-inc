@@ -288,11 +288,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateConnectPeerErrorModeled::ValidationException(rejection).into());
         }
 
-        // The modelled `SubnetArn` pattern admits the empty string, which names no subnet; a
+        // The modelled `SubnetArn` pattern admits the empty string, which names no subnet, so
+        // what this optional reference member names is read the way every other reader and
+        // writer of an optional reference reads it ([`crate::state::optional_reference`]). A
         // subnet that IS named has to sit in the Region the attachment's edge is in, since
         // that is where this peer reaches its appliance — the same rule a VPC attachment's
         // subnets follow.
-        let subnet_arn = input.subnet_arn.clone().filter(|arn| !arn.is_empty());
+        let subnet_arn = crate::state::optional_reference(input.subnet_arn.clone());
         if let Some(arn) = subnet_arn.as_deref() {
             if crate::state::arn_region(arn) != Some(edge_location.as_str()) {
                 return Err(CreateConnectPeerErrorModeled::ValidationException(
