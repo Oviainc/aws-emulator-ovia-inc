@@ -264,11 +264,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call answers describes the access that was actually withdrawn rather than the
         // request's own members.
         let removed = store.account_assignments.remove(position);
-        // A provisioning that had put the permission set into this account recorded the
-        // copy it delivered; the assignment just withdrawn delivered one too, and an
-        // account holds the LAST copy delivered to it, so the copy the account keeps goes
-        // on reporting the definition that row recorded. An account no provisioning
-        // targeted keeps no copy, so withdrawing its last assignment deprovisions it.
+        // The assignment just withdrawn had delivered a copy of the permission set to its
+        // account, and withdrawing it delivers none, so every record that still holds a
+        // copy there — another assignment granted on the account, or a provisioning that
+        // targeted it — goes on reporting the definition that row recorded: an account
+        // holds the LAST copy delivered to it. An account that holds no other record of the
+        // permission set keeps no copy, so withdrawing its last assignment deprovisions it.
         store.keep_withdrawn_copy(
             &input.instance_arn,
             &removed.permission_set_arn,

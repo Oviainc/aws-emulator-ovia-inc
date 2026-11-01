@@ -3081,20 +3081,14 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         let revision = record.revision.clone();
         let captured_at = record.created_date;
         let accounts = record.accounts.clone();
-        for row in &mut self.account_assignments {
-            if row.instance_arn != instance_arn || row.permission_set_arn != permission_set_arn {
-                continue;
-            }
-            if !accounts.contains(&row.account_id) {
-                continue;
-            }
-            if !is_not_older_than_recorded_copy(&captured_at, &row.provisioned_at) {
-                continue;
-            }
-            row.provisioned_revision = revision.clone();
-            row.provisioned_at = captured_at;
-        }
         for account_id in &accounts {
+            self.record_copy_on_assignment_rows(
+                &instance_arn,
+                &permission_set_arn,
+                account_id,
+                &revision,
+                captured_at,
+            );
             self.record_provisioned_copy(
                 &instance_arn,
                 &permission_set_arn,
@@ -3102,6 +3096,41 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
                 &revision,
                 captured_at,
             );
+        }
+    }
+
+    /// Record the copy a provisioning that captured its definition at `captured_at`
+    /// delivered at `revision` on every ASSIGNMENT ROW of `account_id` for
+    /// `permission_set_arn` — the rows that record a copy of that permission set in that
+    /// account ([`AccountAssignmentRecord::provisioned_revision`]).
+    ///
+    /// The ONE place a delivered copy is written onto those rows, so every caller applies
+    /// the same rule [`is_not_older_than_recorded_copy`] states: a row recording a copy
+    /// captured LATER is left alone, because this provisioning copies what it captured when
+    /// it was accepted and must not rewind the provisioning that followed it.
+    ///
+    /// Writes no new row: a row exists because an assignment is granted, which this does not
+    /// do.
+    fn record_copy_on_assignment_rows(
+        &mut self,
+        instance_arn: &str,
+        permission_set_arn: &str,
+        account_id: &str,
+        revision: &str,
+        captured_at: DateTime,
+    ) {
+        for row in &mut self.account_assignments {
+            if row.instance_arn != instance_arn
+                || row.permission_set_arn != permission_set_arn
+                || row.account_id != account_id
+            {
+                continue;
+            }
+            if !is_not_older_than_recorded_copy(&captured_at, &row.provisioned_at) {
+                continue;
+            }
+            row.provisioned_revision = revision.to_string();
+            row.provisioned_at = captured_at;
         }
     }
 
@@ -3163,19 +3192,24 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         })
     }
 
-    /// Carry the copy a WITHDRAWN assignment recorded into the copy its account keeps,
-    /// when a provisioning had delivered one there.
+    /// Carry the copy a WITHDRAWN assignment recorded onto every record that still holds a
+    /// copy of that permission set in the account: its remaining assignment rows and the
+    /// copy a provisioning delivered there.
     ///
-    /// An account holds the LAST copy delivered to it, and a grant delivers one too, so an
-    /// account that was provisioned before the assignment was granted holds what the grant
-    /// put there rather than the older definition the provisioning carried: withdrawing
-    /// that assignment removes the row recording it, and the copy the account keeps has to
-    /// go on reporting the same definition. Nothing is recorded for an account no
-    /// provisioning ever targeted, so withdrawing its last assignment deprovisions it as
-    /// before.
+    /// Withdrawing an assignment delivers no copy, so it cannot change which definition the
+    /// account holds: an account holds the LAST copy delivered to it, and a grant delivers
+    /// one too, so an account whose newest copy came from the assignment being withdrawn
+    /// goes on reporting that definition for as long as it holds the permission set at all
+    /// — whether what holds it is another assignment or a provisioning that targeted it.
+    /// Leaving the withdrawn row's copy behind would rewind the account to an older
+    /// definition no later provisioning had undone.
     ///
-    /// `captured_at` is the instant the withdrawn row's copy was captured, so a copy a
-    /// LATER provisioning delivered is kept instead, under the one rule
+    /// Only records that already exist are written, so an account that holds no other record
+    /// of the permission set — no remaining assignment and no provisioning that targeted it
+    /// — is deprovisioned when its last assignment goes, as before.
+    ///
+    /// `captured_at` is the instant the withdrawn row's copy was captured, so a record
+    /// holding a copy a LATER provisioning delivered is kept instead, under the one rule
     /// [`is_not_older_than_recorded_copy`] states.
     pub fn keep_withdrawn_copy(
         &mut self,
@@ -3185,6 +3219,13 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         revision: &str,
         captured_at: DateTime,
     ) {
+        self.record_copy_on_assignment_rows(
+            instance_arn,
+            permission_set_arn,
+            account_id,
+            revision,
+            captured_at,
+        );
         if let Some(copy) =
             self.provisioned_copy_mut(instance_arn, permission_set_arn, account_id)
         {

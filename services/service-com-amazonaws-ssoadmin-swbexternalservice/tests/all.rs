@@ -207,3 +207,5 @@ mod unknown_instance_channel;
 mod unknown_instance_message;
 #[path = "all/validation_message_wording.rs"]
 mod validation_message_wording;
+#[path = "all/withdrawn_assignment_copy_in_place.rs"]
+mod withdrawn_assignment_copy_in_place;
