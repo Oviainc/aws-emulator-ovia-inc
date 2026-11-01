@@ -372,6 +372,7 @@ async fn a_load_balancer_certificate_takes_and_loses_tags_by_key() {
             row.certificate,
             CERTIFICATE_RESOURCE_TYPE,
             row.region,
+            "TagResource",
         );
 
         let want = merged(row.created, ADDED_TAGS);
@@ -394,6 +395,7 @@ async fn a_load_balancer_certificate_takes_and_loses_tags_by_key() {
             row.certificate,
             CERTIFICATE_RESOURCE_TYPE,
             row.region,
+            "UntagResource",
         );
 
         let left = reported(&emulator, row.region, row.balancer, row.certificate).await;
@@ -453,6 +455,7 @@ async fn only_the_named_certificate_changes() {
         "twin-cert",
         CERTIFICATE_RESOURCE_TYPE,
         DEFAULT_REGION,
+        "TagResource",
     );
 
     let tagged = reported(&emulator, DEFAULT_REGION, "shared-lb", "twin-cert").await;
@@ -539,6 +542,7 @@ async fn a_name_two_load_balancers_of_one_region_share_addresses_the_first() {
         "shared-name",
         CERTIFICATE_RESOURCE_TYPE,
         DEFAULT_REGION,
+        "TagResource",
     );
 
     let first = reported(&emulator, DEFAULT_REGION, "lb-a", "shared-name").await;

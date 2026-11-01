@@ -430,13 +430,14 @@ fn assert_logged(case: &str, operations: &[Value], kind: Kind, name: &str, regio
         Some(kind.resource_type()),
         "case {case}: expected the resource's own type, got {operation:?}"
     );
-    // NO `operationType`: the modelled `OperationType` enum declares a member for
-    // each call that writes this log and none for a change to a resource's tags,
-    // and `Operation$operationType` is optional — the same entry `UntagResource`
-    // writes (pinned in `resource_tags.rs`).
-    assert!(
-        operation["operationType"].is_null(),
-        "case {case}: expected no operationType, got {operation:?}"
+    // The entry NAMES the call that wrote it, as every entry of this log does,
+    // although the modelled `OperationType` enum declares no member for a change
+    // to a resource's tags — the same entry `UntagResource` writes (pinned in
+    // `resource_tags.rs`), under the whole log's rule (`operation_log_naming.rs`).
+    assert_eq!(
+        operation["operationType"].as_str(),
+        Some("TagResource"),
+        "case {case}: expected the entry to name the call that wrote it, got {operation:?}"
     );
     assert_eq!(
         operation["status"].as_str(),

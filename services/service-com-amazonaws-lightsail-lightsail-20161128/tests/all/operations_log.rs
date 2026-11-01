@@ -311,7 +311,10 @@ fn expected_page_sizes(count: usize) -> Vec<usize> {
 /// Checks the paging invariants every page must satisfy on the way: no page is
 /// larger than one page, and a `nextPageToken` names exactly the first entry of
 /// the page after it.
-async fn walk(emulator: &Emulator, case: &str) -> (Vec<Value>, Vec<usize>) {
+///
+/// `pub(crate)` so a sibling suite in this test target reads the account-wide log
+/// through this ONE walk rather than carrying a second copy of it.
+pub(crate) async fn walk(emulator: &Emulator, case: &str) -> (Vec<Value>, Vec<usize>) {
     let mut entries: Vec<Value> = Vec::new();
     let mut page_sizes = Vec::new();
     let mut token: Option<String> = None;
@@ -354,7 +357,9 @@ async fn walk(emulator: &Emulator, case: &str) -> (Vec<Value>, Vec<usize>) {
 }
 
 /// Every entry the per-resource read reports for `name`, walking its pages.
-async fn walk_one_resource(emulator: &Emulator, case: &str, name: &str) -> Vec<Value> {
+///
+/// `pub(crate)` for the same reason [`walk`] is.
+pub(crate) async fn walk_one_resource(emulator: &Emulator, case: &str, name: &str) -> Vec<Value> {
     let mut entries: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
     loop {

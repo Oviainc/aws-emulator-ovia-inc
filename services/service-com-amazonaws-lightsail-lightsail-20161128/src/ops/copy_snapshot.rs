@@ -311,15 +311,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // several resources at once; one `CopySnapshot` creates exactly one
             // snapshot, so it answers exactly one entry — against the copy, the
             // resource the call created — left non-terminal until the copy the
-            // clock owes it is due. It reports no `operationType`: the modelled
-            // `OperationType` enum declares no value for this call, and an
-            // absent optional member is the model's answer to that.
-            let operation = store.start_untyped_operation(
+            // clock owes it is due. The entry names the call that wrote it, as
+            // every entry of this log does
+            // (`crate::state::OPERATION_TYPE_COPY_SNAPSHOT`).
+            let operation = store.start_operation(
                 now,
+                crate::state::OPERATION_TYPE_COPY_SNAPSHOT,
                 resource_type,
                 &target_name,
                 &location,
-                settles_at_ms,
+                Some(settles_at_ms),
             );
             Ok(CopySnapshotOutput {
                 operations: Some(vec![operation.view()]),

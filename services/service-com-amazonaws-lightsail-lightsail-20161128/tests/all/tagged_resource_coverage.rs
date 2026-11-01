@@ -340,6 +340,7 @@ async fn every_tag_carrying_kind_loses_exactly_the_listed_keys() {
             kind.name(),
             kind.resource_type(),
             DEFAULT_REGION,
+            "UntagResource",
         );
 
         let left = kind.tags(&emulator).await;
@@ -379,6 +380,7 @@ async fn every_key_can_be_removed_from_every_kind() {
             kind.name(),
             kind.resource_type(),
             DEFAULT_REGION,
+            "UntagResource",
         );
         let twice = kind.tags(&emulator).await;
         assert_eq!(
@@ -407,6 +409,7 @@ async fn only_the_named_resource_loses_tags() {
             target.name(),
             target.resource_type(),
             DEFAULT_REGION,
+            "UntagResource",
         );
 
         for (index, kind) in KINDS.iter().enumerate() {

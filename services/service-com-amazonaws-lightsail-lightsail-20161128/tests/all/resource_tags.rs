@@ -258,19 +258,21 @@ pub(crate) async fn untag(
     operations[0].clone()
 }
 
-/// Assert the operation-log entry `UntagResource` answered is the terminal entry
-/// for `name` of `resource_type` in `region`.
+/// Assert the operation-log entry a tag change answered is the terminal entry
+/// for `name` of `resource_type` in `region`, reporting `operation_type`.
 ///
-/// The entry reports NO `operationType`: the modelled `OperationType` enum
-/// declares a member for each call that writes this log and none for a change to
-/// a resource's tags, so there is no modelled value to report, and
-/// `Operation$operationType` is an optional member.
+/// The entry names the call that wrote it — `TagResource` or `UntagResource` — as
+/// every entry of this log does: the modelled `OperationType` enum declares no
+/// member for either, and the member is a wire string a client has to tolerate an
+/// unknown value in (the whole log's rule is pinned in
+/// `operation_log_naming.rs`).
 pub(crate) fn assert_entry(
     case: &str,
     entry: &Value,
     name: &str,
     resource_type: &str,
     region: &str,
+    operation_type: &str,
 ) {
     assert_eq!(
         entry["resourceName"].as_str(),
@@ -297,9 +299,10 @@ pub(crate) fn assert_entry(
         Some(region),
         "case {case}: expected the entry in region {region}, got {entry:?}"
     );
-    assert!(
-        entry["operationType"].is_null(),
-        "case {case}: expected no operationType, got {entry:?}"
+    assert_eq!(
+        entry["operationType"].as_str(),
+        Some(operation_type),
+        "case {case}: expected the entry to name the call that wrote it, got {entry:?}"
     );
     let id = entry["id"].as_str().unwrap_or_default();
     assert!(
@@ -333,6 +336,7 @@ async fn every_kind_of_resource_loses_exactly_the_listed_keys() {
             kind.name(),
             kind.resource_type(),
             DEFAULT_REGION,
+            "UntagResource",
         );
 
         let left = kind.tags(&emulator, None).await;
@@ -387,7 +391,14 @@ async fn a_contact_method_is_untagged_by_the_name_it_reports() {
     );
 
     let entry = untag(&emulator, None, &name, &["owner", "cost-centre"]).await;
-    assert_entry("Email", &entry, &name, "ContactMethod", DEFAULT_REGION);
+    assert_entry(
+        "Email",
+        &entry,
+        &name,
+        "ContactMethod",
+        DEFAULT_REGION,
+        "UntagResource",
+    );
 
     let left = reported_tags(&reported_contact_method(&emulator, "Email").await);
     assert_eq!(
@@ -491,7 +502,14 @@ async fn the_listed_key_set_decides_what_is_left() {
         kind.create(&emulator, None, TAGS).await;
 
         let entry = untag(&emulator, None, kind.name(), row.keys).await;
-        assert_entry(case, &entry, kind.name(), kind.resource_type(), DEFAULT_REGION);
+        assert_entry(
+            case,
+            &entry,
+            kind.name(),
+            kind.resource_type(),
+            DEFAULT_REGION,
+            "UntagResource",
+        );
 
         let left = kind.tags(&emulator, None).await;
         assert_eq!(
@@ -515,7 +533,14 @@ async fn repeating_a_removal_changes_nothing() {
         untag(&emulator, None, kind.name(), row.keys).await;
         let once = kind.tags(&emulator, None).await;
         let entry = untag(&emulator, None, kind.name(), row.keys).await;
-        assert_entry(case, &entry, kind.name(), kind.resource_type(), DEFAULT_REGION);
+        assert_entry(
+            case,
+            &entry,
+            kind.name(),
+            kind.resource_type(),
+            DEFAULT_REGION,
+            "UntagResource",
+        );
         let twice = kind.tags(&emulator, None).await;
 
         assert_eq!(
@@ -603,6 +628,7 @@ async fn only_the_named_resource_loses_tags() {
             target.name(),
             target.resource_type(),
             DEFAULT_REGION,
+            "UntagResource",
         );
 
         for (index, kind) in KINDS.iter().enumerate() {
@@ -778,6 +804,7 @@ async fn an_arn_that_is_not_the_named_resources_own_is_refused() {
         Kind::Instance.name(),
         Kind::Instance.resource_type(),
         DEFAULT_REGION,
+        "UntagResource",
     );
     let tags = Kind::Instance.tags(&emulator, None).await;
     assert_eq!(

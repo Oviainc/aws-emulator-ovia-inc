@@ -269,8 +269,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let (resource_type, location) = resolved?;
             // `operations` is a list because other Lightsail calls act on several
             // resources at once; this one changes the tags of exactly the one
-            // resource it names, so it answers exactly one entry.
-            let operation = store.record_untyped_operation(now, resource_type, &name, &location);
+            // resource it names, so it answers exactly one entry. The entry is
+            // terminal — the next read already reports the new tags, so the clock
+            // owes it nothing — and it names the call that wrote it, as every
+            // entry of this log does
+            // (`crate::state::OPERATION_TYPE_COPY_SNAPSHOT`).
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_TAG_RESOURCE,
+                resource_type,
+                &name,
+                &location,
+                None,
+            );
             Ok(TagResourceOutput {
                 operations: Some(vec![operation.view()]),
             })

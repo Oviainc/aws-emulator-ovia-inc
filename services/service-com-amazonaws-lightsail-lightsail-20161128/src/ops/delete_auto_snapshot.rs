@@ -196,10 +196,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The copy is gone as this call returns, so the work the operation
             // describes is already done and the entry is terminal. It is logged
             // against the resource the copy was taken of, because that is the
-            // resource an automatic snapshot is addressed through, and it reports
-            // no `operationType`, because the modelled `OperationType` enum
-            // defines no value for this call.
-            let operation = store.record_untyped_operation(now, resource_type, &name, &location);
+            // resource an automatic snapshot is addressed through, and it names
+            // the call that wrote it, as every entry of this log does
+            // (`crate::state::OPERATION_TYPE_COPY_SNAPSHOT`).
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_AUTO_SNAPSHOT,
+                resource_type,
+                &name,
+                &location,
+                None,
+            );
             // `operations` is a list because other Lightsail calls act on several
             // resources at once; this one deletes one copy of the one resource it
             // names, so it answers exactly one entry.

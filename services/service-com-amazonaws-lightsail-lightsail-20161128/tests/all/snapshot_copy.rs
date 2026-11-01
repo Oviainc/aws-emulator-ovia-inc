@@ -592,9 +592,9 @@ async fn a_copied_snapshot_holds_what_the_snapshot_it_was_copied_from_holds() {
         // The copy answers ONE operation-log entry — it creates one snapshot —
         // against the copy it created, in the Region it was created in, and it
         // is not terminal yet because the copy is still being taken when the
-        // call returns. It reports no `operationType`: the modelled
-        // `OperationType` enum declares no value for this call, and an absent
-        // optional member is the model's answer to that.
+        // call returns. It names the call that wrote it, as every entry of this
+        // log does (the whole log's rule is pinned in
+        // `operation_log_naming.rs`).
         let operations = answered["operations"]
             .as_array()
             .unwrap_or_else(|| panic!("case {case}: expected an operations array, got {answered:?}"))
@@ -605,9 +605,10 @@ async fn a_copied_snapshot_holds_what_the_snapshot_it_was_copied_from_holds() {
             "case {case}: expected exactly one operation, got {operations:?}"
         );
         let operation = operations[0].clone();
-        assert!(
-            operation["operationType"].is_null(),
-            "case {case}: the model declares no operationType for this call, got {operation:?}"
+        assert_eq!(
+            operation["operationType"].as_str(),
+            Some("CopySnapshot"),
+            "case {case}: expected the entry to name the call that wrote it, got {operation:?}"
         );
         assert_eq!(
             operation["resourceType"].as_str(),

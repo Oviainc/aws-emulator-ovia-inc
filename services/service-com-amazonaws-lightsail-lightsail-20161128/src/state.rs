@@ -772,37 +772,38 @@ pub const OPERATION_TYPE_DELETE_DOMAIN_ENTRY: &str = "DeleteDomainEntry";
 /// The `operationType` the log entry of a whole zone's removal carries, the
 /// modelled `OperationType` enum's own `DeleteDomain` member.
 pub const OPERATION_TYPE_DELETE_DOMAIN: &str = "DeleteDomain";
-/// The `operationType` the log entry of an `ExportSnapshot` call carries.
+/// The `operationType` the log entry of a `CopySnapshot` call carries — and the
+/// ONE statement of the rule every call the modelled `OperationType` enum
+/// declares no member for follows.
 ///
-/// `Operation$operationType` targets the modelled `OperationType` enum, whose
-/// members this module otherwise keeps to (see
-/// [`OPERATION_TYPE_UPDATE_DOMAIN_ENTRY`], where a modelled value states exactly
-/// the same fact). That enum predates the Amazon EC2 export family — it carries
-/// no member for `ExportSnapshot`, and none for `CreateCloudFormationStack`
-/// either — and no member it does carry states what an export did: logging one
-/// as a snapshot CREATE would misreport the call. A Smithy enum is open on the
-/// wire (a client has to tolerate a value it does not know), so the honest entry
-/// names the operation that ran, exactly as every other value here does.
+/// `Operation$operationType` targets that enum, whose own members this module
+/// reports wherever one of them states what the call did (see
+/// [`OPERATION_TYPE_UPDATE_DOMAIN_ENTRY`]). The enum LAGS this API: it declares
+/// no member for copying a snapshot, for a change to a resource's tags, for the
+/// deletion of one automatic snapshot, for a key pair's deletion, for either VPC
+/// peering call, for the Amazon EC2 export family or for the stack an export is
+/// turned into — and no member it does carry states what one of those calls did,
+/// so reporting a copy or an export as a snapshot CREATE would misreport it. The
+/// member is a string on the wire and a Smithy enum is open there (a client has
+/// to tolerate a value it does not know), so EVERY entry this log holds names the
+/// call that wrote it, whether or not the enum declares that name: one rule for
+/// the whole log `GetOperations` and `GetOperationsForResource` report, rather
+/// than entries that say nothing about what ran.
+pub const OPERATION_TYPE_COPY_SNAPSHOT: &str = "CopySnapshot";
+/// See [`OPERATION_TYPE_COPY_SNAPSHOT`], the one rule for the `operationType` of
+/// a call the modelled `OperationType` enum declares no member for.
+pub const OPERATION_TYPE_TAG_RESOURCE: &str = "TagResource";
+/// See [`OPERATION_TYPE_COPY_SNAPSHOT`].
+pub const OPERATION_TYPE_UNTAG_RESOURCE: &str = "UntagResource";
+/// See [`OPERATION_TYPE_COPY_SNAPSHOT`].
+pub const OPERATION_TYPE_DELETE_AUTO_SNAPSHOT: &str = "DeleteAutoSnapshot";
+/// See [`OPERATION_TYPE_COPY_SNAPSHOT`].
 pub const OPERATION_TYPE_EXPORT_SNAPSHOT: &str = "ExportSnapshot";
-/// The `operationType` the log entry of a `DeleteKeyPair` call carries.
-///
-/// The modelled `OperationType` enum carries no member for any of the key pair
-/// calls — it has `DeleteKnownHostKeys` but neither `DeleteKeyPair` nor
-/// `CreateKeyPair` — exactly as it carries none for the Amazon EC2 export family
-/// (see [`OPERATION_TYPE_EXPORT_SNAPSHOT`], where the same reasoning is spelled
-/// out), and no member it does carry states what deleting a key pair did. A
-/// Smithy enum is open on the wire, so the honest entry names the operation that
-/// ran.
+/// See [`OPERATION_TYPE_COPY_SNAPSHOT`].
 pub const OPERATION_TYPE_DELETE_KEY_PAIR: &str = "DeleteKeyPair";
-/// The `operationType` the log entry of a `PeerVpc` call carries.
-///
-/// The modelled `OperationType` enum carries no member for either VPC peering
-/// call — it predates them, exactly as it predates the Amazon EC2 export family
-/// (see [`OPERATION_TYPE_EXPORT_SNAPSHOT`], where the same reasoning is spelled
-/// out) — and no member it does carry states what peering a VPC did. A Smithy
-/// enum is open on the wire, so the honest entry names the operation that ran.
+/// See [`OPERATION_TYPE_COPY_SNAPSHOT`].
 pub const OPERATION_TYPE_PEER_VPC: &str = "PeerVpc";
-/// See [`OPERATION_TYPE_PEER_VPC`].
+/// See [`OPERATION_TYPE_COPY_SNAPSHOT`].
 pub const OPERATION_TYPE_UNPEER_VPC: &str = "UnpeerVpc";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DISABLE_ADD_ON: &str = "DisableAddOn";
@@ -6806,10 +6807,9 @@ pub const CLOUD_FORMATION_STACK_RECORD_ARN_RESOURCE_PREFIX: &str = "CloudFormati
 pub const RESOURCE_TYPE_CLOUD_FORMATION_STACK_RECORD: &str = "CloudFormationStackRecord";
 
 /// The `operationType` the log entry of a `CreateCloudFormationStack` call
-/// carries, for the same reason [`OPERATION_TYPE_EXPORT_SNAPSHOT`] names its own
-/// call: the modelled `OperationType` enum predates the Amazon EC2 export family
-/// and carries no member for this operation, a Smithy enum is open on the wire,
-/// and no member it does carry states what this call did.
+/// carries: the name of the call, under the one rule
+/// [`OPERATION_TYPE_COPY_SNAPSHOT`] states for every call the modelled
+/// `OperationType` enum declares no member for.
 pub const OPERATION_TYPE_CREATE_CLOUD_FORMATION_STACK: &str = "CreateCloudFormationStack";
 
 /// The most CloudFormation stack records this emulator will hold.
@@ -8894,11 +8894,11 @@ pub struct StoredOperation {
     pub location: StoredLocation,
     pub is_terminal: bool,
     pub operation_details: Option<String>,
-    /// The kind of call this entry records, a value of the modelled
-    /// `OperationType` enum — and `None` for a call that enum declares no member
-    /// for, which is what [`ComAmazonawsLightsailLightsail20161128State::record_untyped_operation`]
-    /// writes.
-    pub operation_type: Option<String>,
+    /// The kind of call this entry records: a value of the modelled
+    /// `OperationType` enum where it declares one, and otherwise the name of the
+    /// call itself (see [`OPERATION_TYPE_COPY_SNAPSHOT`]) — never nothing, so an
+    /// entry always says what ran.
+    pub operation_type: String,
     pub status: String,
     pub status_changed_at_ms: i64,
     pub error_code: Option<String>,
@@ -8919,7 +8919,7 @@ impl StoredOperation {
             location: Some(self.location.view()),
             is_terminal: Some(self.is_terminal),
             operation_details: self.operation_details.clone(),
-            operation_type: self.operation_type.clone(),
+            operation_type: Some(self.operation_type.clone()),
             status: Some(self.status.clone()),
             status_changed_at: Some(timestamp(self.status_changed_at_ms)),
             error_code: self.error_code.clone(),
@@ -16055,7 +16055,11 @@ impl ComAmazonawsLightsailLightsail20161128State {
         session
     }
 
-    /// Build and record an operation of `operation_type` against `resource_name`.
+    /// Build and record an operation of `operation_type` against
+    /// `resource_name` — the ONE place an operation-log entry is built, so every
+    /// entry this service writes carries the same members and names the call
+    /// that wrote it whether or not the modelled `OperationType` enum declares a
+    /// member for that call (see [`OPERATION_TYPE_COPY_SNAPSHOT`]).
     ///
     /// `resource_type` is the kind of resource the operation acted on, from the
     /// modelled `ResourceType` enum, so the log says what each entry is about.
@@ -16072,76 +16076,6 @@ impl ComAmazonawsLightsailLightsail20161128State {
         location: &StoredLocation,
         settles_at_ms: Option<i64>,
     ) -> StoredOperation {
-        self.log_operation(
-            now_ms,
-            Some(operation_type.to_string()),
-            resource_type,
-            resource_name,
-            location,
-            settles_at_ms,
-        )
-    }
-
-    /// Build and record a TERMINAL operation against `resource_name` that
-    /// reports no `operationType`.
-    ///
-    /// The modelled `OperationType` enum declares a member for most calls that
-    /// write this log and none for a change to a resource's tags or for the
-    /// deletion of one automatic snapshot, so an entry for either leaves
-    /// `Operation$operationType` — an optional member — absent rather than
-    /// reporting a value the model does not define. The entry is terminal
-    /// because such a change is complete when the call returns: what the next
-    /// read reports is already the new tags, or a resource whose copy is gone,
-    /// so the clock owes the entry nothing.
-    pub fn record_untyped_operation(
-        &mut self,
-        now_ms: i64,
-        resource_type: &str,
-        resource_name: &str,
-        location: &StoredLocation,
-    ) -> StoredOperation {
-        self.log_operation(now_ms, None, resource_type, resource_name, location, None)
-    }
-
-    /// Build and record a NON-TERMINAL operation against `resource_name` that
-    /// reports no `operationType`, which the clock owes its terminal status at
-    /// `settles_at_ms`.
-    ///
-    /// The counterpart of [`Self::record_untyped_operation`] for a call the
-    /// modelled `OperationType` enum declares no value for whose work is NOT
-    /// finished when the call returns — copying a snapshot, where the copy is
-    /// still being taken as the call answers, so the entry stays `Started` until
-    /// the clock settles it.
-    pub fn start_untyped_operation(
-        &mut self,
-        now_ms: i64,
-        resource_type: &str,
-        resource_name: &str,
-        location: &StoredLocation,
-        settles_at_ms: i64,
-    ) -> StoredOperation {
-        self.log_operation(
-            now_ms,
-            None,
-            resource_type,
-            resource_name,
-            location,
-            Some(settles_at_ms),
-        )
-    }
-
-    /// The one place an operation-log entry is built, so every entry this
-    /// service writes has the same members whether or not the modelled
-    /// `OperationType` enum has a value for the call that wrote it.
-    fn log_operation(
-        &mut self,
-        now_ms: i64,
-        operation_type: Option<String>,
-        resource_type: &str,
-        resource_name: &str,
-        location: &StoredLocation,
-        settles_at_ms: Option<i64>,
-    ) -> StoredOperation {
         let id = self.mint_uuid();
         let terminal = settles_at_ms.is_none();
         let operation = StoredOperation {
@@ -16152,7 +16086,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
             location: location.clone(),
             is_terminal: terminal,
             operation_details: Some(resource_name.to_string()),
-            operation_type,
+            operation_type: operation_type.to_string(),
             status: if terminal {
                 OPERATION_STATUS_SUCCEEDED.to_string()
             } else {

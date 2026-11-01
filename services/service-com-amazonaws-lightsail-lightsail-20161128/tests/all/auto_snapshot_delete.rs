@@ -121,9 +121,8 @@ async fn delete(emulator: &Emulator, name: &str, date: &str) -> Value {
 ///
 /// A deletion is complete when the call returns — the next read answers a
 /// resource whose copy is gone — so the entry is terminal and `Succeeded`. It
-/// reports no `operationType`: the modelled `OperationType` enum declares no
-/// value for this call, and an absent optional member is the model's answer to
-/// that, never an invented value.
+/// names the call that wrote it, as every entry of this log does (the whole
+/// log's rule is pinned in `operation_log_naming.rs`).
 fn assert_one_terminal_operation(case: &str, answered: &Value, kind: Kind, name: &str) -> String {
     let logged = answered["operations"]
         .as_array()
@@ -155,9 +154,10 @@ fn assert_one_terminal_operation(case: &str, answered: &Value, kind: Kind, name:
         Some(SUCCEEDED),
         "case {case:?}: expected the terminal status, got {entry:?}"
     );
-    assert!(
-        entry["operationType"].is_null(),
-        "case {case:?}: the model declares no operationType for this call, got {entry:?}"
+    assert_eq!(
+        entry["operationType"].as_str(),
+        Some("DeleteAutoSnapshot"),
+        "case {case:?}: expected the entry to name the call that wrote it, got {entry:?}"
     );
     assert!(
         entry["createdAt"].as_f64().is_some(),
