@@ -23,6 +23,8 @@ mod error_message_templates;
 mod fleet_attributes;
 #[path = "all/game_session_placements.rs"]
 mod game_session_placements;
+#[path = "all/game_session_queue_updates.rs"]
+mod game_session_queue_updates;
 #[path = "all/game_session_queues.rs"]
 mod game_session_queues;
 #[path = "all/hosting_loop.rs"]

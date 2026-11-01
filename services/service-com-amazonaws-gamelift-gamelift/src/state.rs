@@ -975,6 +975,100 @@ impl GameSessionQueueRecord {
     }
 }
 
+/// What the service answers when no queue is stored under the
+/// `GameSessionQueueNameOrArn` an operation was asked to act on — the message of the
+/// modelled `NotFoundException`, shared by every operation that names ONE queue, so the
+/// same missing queue reads the same way whichever of them was called.
+///
+/// The identifier the CALLER supplied is the sentence's one variable part: either of the
+/// two forms the member accepts selects the same queue, so the refusal states what was
+/// asked for rather than anything the service resolved it to.
+pub fn game_session_queue_not_found_message(name_or_arn: &str) -> String {
+    format!("Game session queue {name_or_arn} does not exist.")
+}
+
+/// The refusal a request that configures a game session queue earns, or `None` when every
+/// setting it supplies is one the service accepts.
+///
+/// `CreateGameSessionQueue` and `UpdateGameSessionQueue` configure the SAME resource from
+/// the same members, so the rules over those members — and the sentence each refusal
+/// answers with — live here rather than once per operation. Each argument is the value the
+/// REQUEST supplied, so a member the request left out is `None` and is not checked: it
+/// keeps whatever the service already decided for it.
+pub fn game_session_queue_setting_refusal(
+    destinations: Option<&[GameSessionQueueDestination]>,
+    player_latency_policies: Option<&[PlayerLatencyPolicy]>,
+    timeout_in_seconds: Option<i32>,
+    priority_configuration: Option<&PriorityConfiguration>,
+) -> Option<String> {
+    // The two list members the model leaves unbounded are what one request could
+    // otherwise make a stored queue occupy — the record holds them for as long as the
+    // queue exists — so they are refused before anything is stored. (`Name`,
+    // `CustomEventData` and `NotificationTarget` carry modelled lengths, and the
+    // `PriorityConfiguration` and `FilterConfiguration` lists are bounded by the model at
+    // 4 and 100 entries, so the boundary walk has already refused an oversized one of
+    // those.)
+    let destination_count = destinations.map_or(0, <[GameSessionQueueDestination]>::len);
+    if destination_count > MAX_QUEUE_DESTINATIONS {
+        return Some(format!(
+            "Destinations lists {destination_count} destinations; a queue may list at most \
+             {MAX_QUEUE_DESTINATIONS}."
+        ));
+    }
+    let policy_count = player_latency_policies.map_or(0, <[PlayerLatencyPolicy]>::len);
+    if policy_count > MAX_QUEUE_PLAYER_LATENCY_POLICIES {
+        return Some(format!(
+            "PlayerLatencyPolicies lists {policy_count} policies; a queue may list at most \
+             {MAX_QUEUE_PLAYER_LATENCY_POLICIES}."
+        ));
+    }
+
+    // "The maximum time, in seconds, that a new game session placement request remains in
+    // the queue [...] The minimum value is 10 and the maximum value is 600." The modelled
+    // `WholeNumber` range bounds the member only below, so the documented bounds are what
+    // this refusal enforces — and the message is the service's fixed sentence, naming the
+    // member and those two documented bounds and reading the same whatever value was
+    // rejected.
+    let (min_timeout, max_timeout) = QUEUE_TIMEOUT_RANGE_SECONDS;
+    if let Some(requested) = timeout_in_seconds {
+        if !(min_timeout..=max_timeout).contains(&requested) {
+            return Some(format!(
+                "TimeoutInSeconds must be between {min_timeout} and {max_timeout} seconds"
+            ));
+        }
+    }
+
+    // `PriorityConfiguration$PriorityOrder`: "Each priority type is listed once."
+    // `$LocationOrder`: "Each location must be listed only once." The modelled list
+    // lengths and the `PriorityType` enum are refused by the boundary walk before a
+    // handler runs; the uniqueness of each sequence is the service's own rule.
+    if let Some(priority) = priority_configuration {
+        if let Some(duplicate) = first_duplicate(priority.priority_order.as_deref()) {
+            return Some(format!(
+                "PriorityConfiguration.PriorityOrder lists each priority type once; {duplicate} \
+                 is listed more than once."
+            ));
+        }
+        if let Some(duplicate) = first_duplicate(priority.location_order.as_deref()) {
+            return Some(format!(
+                "PriorityConfiguration.LocationOrder lists each location once; {duplicate} is \
+                 listed more than once."
+            ));
+        }
+    }
+    None
+}
+
+/// The first entry a sequence lists twice, if any: what a "listed only once" refusal
+/// names. An absent sequence lists nothing twice.
+fn first_duplicate(entries: Option<&[String]>) -> Option<String> {
+    let mut seen = HashSet::new();
+    entries?
+        .iter()
+        .find(|entry| !seen.insert((*entry).clone()))
+        .cloned()
+}
+
 /// What the service answers when no alias is stored under the `AliasIdOrArn` an operation
 /// was asked to act on — the message of the modelled `NotFoundException`, shared by every
 /// operation that names ONE alias, so the same missing alias reads the same way whichever

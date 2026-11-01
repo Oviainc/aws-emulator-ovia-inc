@@ -210,10 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{
-            DEFAULT_QUEUE_TIMEOUT_SECONDS, MAX_GAME_SESSION_QUEUES_PER_ACCOUNT,
-            MAX_QUEUE_DESTINATIONS, MAX_QUEUE_PLAYER_LATENCY_POLICIES, QUEUE_TIMEOUT_RANGE_SECONDS,
-        };
+        use crate::state::{DEFAULT_QUEUE_TIMEOUT_SECONDS, MAX_GAME_SESSION_QUEUES_PER_ACCOUNT};
 
         let invalid = |message: String| -> Self::Error {
             CreateGameSessionQueueErrorModeled::InvalidRequestException(InvalidRequestException {
@@ -222,64 +219,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
-        // The two list members the model leaves unbounded are what one request could
-        // otherwise make a stored queue occupy — the record holds them for as long as the
-        // queue exists — so they are refused HERE, before any state is locked and before
-        // anything is stored. (`Tags`, `Name`, `CustomEventData` and `NotificationTarget`
-        // carry modelled lengths, and the `PriorityConfiguration` and
-        // `FilterConfiguration` lists are bounded by the model at 4 and 100 entries, so
-        // the boundary walk has already refused an oversized one of those.)
-        let destination_count = input.destinations.as_ref().map_or(0, Vec::len);
-        if destination_count > MAX_QUEUE_DESTINATIONS {
-            return Err(invalid(format!(
-                "Destinations lists {destination_count} destinations; a queue may list at most \
-                 {MAX_QUEUE_DESTINATIONS}."
-            )));
-        }
-        let policy_count = input.player_latency_policies.as_ref().map_or(0, Vec::len);
-        if policy_count > MAX_QUEUE_PLAYER_LATENCY_POLICIES {
-            return Err(invalid(format!(
-                "PlayerLatencyPolicies lists {policy_count} policies; a queue may list at most \
-                 {MAX_QUEUE_PLAYER_LATENCY_POLICIES}."
-            )));
+        // Every rule over the members that configure a queue is the one
+        // `UpdateGameSessionQueue` holds its requests to as well, so both operations are
+        // refused by the same shared check — HERE, before any state is locked and before
+        // anything is stored. (`Tags` carries a modelled length, so the boundary walk has
+        // already refused an oversized one of those.)
+        if let Some(message) = crate::state::game_session_queue_setting_refusal(
+            input.destinations.as_deref(),
+            input.player_latency_policies.as_deref(),
+            input.timeout_in_seconds,
+            input.priority_configuration.as_ref(),
+        ) {
+            return Err(invalid(message));
         }
 
-        // "The maximum time, in seconds, that a new game session placement request
-        // remains in the queue [...] The minimum value is 10 and the maximum value is
-        // 600." The modelled `WholeNumber` range bounds the member only below, so the
-        // documented bounds are what this refusal enforces — and the message is the
-        // service's fixed sentence, naming the member and those two documented bounds and
-        // reading the same whatever value was rejected.
-        let (min_timeout, max_timeout) = QUEUE_TIMEOUT_RANGE_SECONDS;
-        let timeout_in_seconds = match input.timeout_in_seconds {
-            Some(requested) if !(min_timeout..=max_timeout).contains(&requested) => {
-                return Err(invalid(format!(
-                    "TimeoutInSeconds must be between {min_timeout} and {max_timeout} seconds"
-                )))
-            }
-            Some(requested) => requested,
-            // "If you don't specify a request timeout, the queue uses a default value."
-            None => DEFAULT_QUEUE_TIMEOUT_SECONDS,
-        };
-
-        // `PriorityConfiguration$PriorityOrder`: "Each priority type is listed once."
-        // `$LocationOrder`: "Each location must be listed only once." The modelled list
-        // lengths and the `PriorityType` enum are refused by the boundary walk before
-        // this handler runs; the uniqueness of each sequence is the service's own rule.
-        if let Some(priority) = &input.priority_configuration {
-            if let Some(duplicate) = first_duplicate(priority.priority_order.as_deref()) {
-                return Err(invalid(format!(
-                    "PriorityConfiguration.PriorityOrder lists each priority type once; \
-                     {duplicate} is listed more than once."
-                )));
-            }
-            if let Some(duplicate) = first_duplicate(priority.location_order.as_deref()) {
-                return Err(invalid(format!(
-                    "PriorityConfiguration.LocationOrder lists each location once; {duplicate} \
-                     is listed more than once."
-                )));
-            }
-        }
+        // "If you don't specify a request timeout, the queue uses a default value."
+        let timeout_in_seconds = input
+            .timeout_in_seconds
+            .unwrap_or(DEFAULT_QUEUE_TIMEOUT_SECONDS);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateGameSessionQueueErrorModeled::InternalServiceException(
@@ -349,14 +306,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             game_session_queue: Some(stored.to_modelled()),
         })
     }
-}
-
-/// The first entry a sequence lists twice, if any: what a "listed only once" refusal
-/// names. An absent sequence lists nothing twice.
-fn first_duplicate(entries: Option<&[String]>) -> Option<String> {
-    let mut seen = ::std::collections::HashSet::new();
-    entries?
-        .iter()
-        .find(|entry| !seen.insert((*entry).clone()))
-        .cloned()
 }

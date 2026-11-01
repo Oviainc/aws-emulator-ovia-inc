@@ -312,9 +312,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(queue_name) = state.resolve_queue_name(&input.game_session_queue_name) else {
             return Err(StartGameSessionPlacementErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Game session queue {} does not exist.",
-                        input.game_session_queue_name
+                    message: Some(crate::state::game_session_queue_not_found_message(
+                        &input.game_session_queue_name,
                     )),
                 },
             )
@@ -323,9 +322,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(queue) = state.game_session_queues.get(&queue_name) else {
             return Err(StartGameSessionPlacementErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Game session queue {} does not exist.",
-                        input.game_session_queue_name
+                    message: Some(crate::state::game_session_queue_not_found_message(
+                        &input.game_session_queue_name,
                     )),
                 },
             )

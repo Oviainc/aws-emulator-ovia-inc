@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGameSessionQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGameSessionQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGameSessionQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the settings the request supplies to the stored placement queue it names and
+//! leaves the ones it omits as they were, so this response and every later read of the
+//! queue (`DescribeGameSessionQueues`) are served from the one stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -179,20 +174,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGameSessionQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGameSessionQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGameSessionQueue"))
+        let invalid = |message: String| -> Self::Error {
+            UpdateGameSessionQueueErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // Every rule over the members that configure a queue is the one
+        // `CreateGameSessionQueue` holds its requests to as well, so both operations are
+        // refused by the same shared check — before any state is locked and before
+        // anything is written, so a refused update leaves the stored queue exactly as it
+        // was.
+        if let Some(message) = crate::state::game_session_queue_setting_refusal(
+            input.destinations.as_deref(),
+            input.player_latency_policies.as_deref(),
+            input.timeout_in_seconds,
+            input.priority_configuration.as_ref(),
+        ) {
+            return Err(invalid(message));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateGameSessionQueueErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        // "To update settings, specify the queue name to be updated and provide the new
+        // settings", by name or by ARN. A name that identifies no stored queue is the
+        // modelled `NotFoundException` ("The resource was either not created yet or
+        // deleted"), and nothing is written.
+        let Some(name) = state.resolve_queue_name(&input.name) else {
+            return Err(UpdateGameSessionQueueErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::game_session_queue_not_found_message(
+                        &input.name,
+                    )),
+                },
+            )
+            .into());
+        };
+        let Some(queue) = state.game_session_queues.get_mut(&name) else {
+            return Err(UpdateGameSessionQueueErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "the game session queue to update could not be read back".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The settings the request supplies are what the queue carries afterwards, and
+        // the ones it omits keep the values the stored queue already has.
+        if let Some(timeout_in_seconds) = input.timeout_in_seconds {
+            queue.timeout_in_seconds = timeout_in_seconds;
+        }
+        // "When updating destinations, provide a complete list of destinations", and
+        // "when updating policies, provide a complete collection of policies": a supplied
+        // list REPLACES the stored one rather than adding to it, so a request that
+        // supplies an empty list leaves the queue with none.
+        if let Some(destinations) = input.destinations {
+            queue.destinations = destinations;
+        }
+        if let Some(player_latency_policies) = input.player_latency_policies {
+            queue.player_latency_policies = player_latency_policies;
+        }
+        // "To remove an existing filter configuration, pass in an empty set" — and the
+        // same for the priority configuration. The modelled lists inside each structure
+        // are bounded below at one entry, so the empty set that reaches a handler is the
+        // structure with no list in it at all.
+        if let Some(filter_configuration) = input.filter_configuration {
+            let empty = clears_configuration(&[filter_configuration.allowed_locations.as_deref()]);
+            queue.filter_configuration = (!empty).then_some(filter_configuration);
+        }
+        if let Some(priority_configuration) = input.priority_configuration {
+            let empty = clears_configuration(&[
+                priority_configuration.priority_order.as_deref(),
+                priority_configuration.location_order.as_deref(),
+            ]);
+            queue.priority_configuration = (!empty).then_some(priority_configuration);
+        }
+        if let Some(custom_event_data) = input.custom_event_data {
+            queue.custom_event_data = Some(custom_event_data);
+        }
+        if let Some(notification_target) = input.notification_target {
+            queue.notification_target = Some(notification_target);
+        }
+
+        // Report the STORED record, so this response and every later describe of the same
+        // queue can only agree.
+        Ok(UpdateGameSessionQueueOutput {
+            game_session_queue: Some(queue.to_modelled()),
+        })
     }
+}
+
+/// Whether a configuration structure the request supplied is the "empty set" that REMOVES
+/// the one the queue carries: every list it is built from is absent or empty, so the
+/// structure asks for nothing.
+fn clears_configuration(lists: &[Option<&[String]>]) -> bool {
+    lists
+        .iter()
+        .all(|list| list.is_none_or(<[String]>::is_empty))
 }

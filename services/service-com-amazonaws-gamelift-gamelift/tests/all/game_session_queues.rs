@@ -16,29 +16,29 @@ use super::hosting_loop::{create_fleet, ec2_fleet, gamelift_arn, GameLift};
 /// (`smithy_query doc shape=CreateGameSessionQueueInput member=TimeoutInSeconds`: "The
 /// minimum value is 10 and the maximum value is 600."), and the value a queue created
 /// without the parameter carries.
-const MIN_TIMEOUT: i64 = 10;
+pub(crate) const MIN_TIMEOUT: i64 = 10;
 /// See [`MIN_TIMEOUT`].
-const MAX_TIMEOUT: i64 = 600;
+pub(crate) const MAX_TIMEOUT: i64 = 600;
 
 /// Every `PriorityType` the model declares (`smithy_query shape=PriorityType`), so the
 /// prioritization rows below are drawn from the modelled catalog rather than from one
 /// example.
-const PRIORITY_TYPES: [&str; 4] = ["LATENCY", "COST", "DESTINATION", "LOCATION"];
+pub(crate) const PRIORITY_TYPES: [&str; 4] = ["LATENCY", "COST", "DESTINATION", "LOCATION"];
 
 /// The ARN a queue named `name` is assigned:
 /// `arn:aws:gamelift:<region>:<account>:gamesessionqueue/<queue name>`.
-fn queue_arn(name: &str) -> String {
+pub(crate) fn queue_arn(name: &str) -> String {
     gamelift_arn(&format!("gamesessionqueue/{name}"))
 }
 
 /// The queues `DescribeGameSessionQueues` reports for `request`.
-async fn describe_queues(gamelift: &GameLift, request: Value) -> Value {
+pub(crate) async fn describe_queues(gamelift: &GameLift, request: Value) -> Value {
     let described = gamelift.ok("DescribeGameSessionQueues", request).await;
     described["GameSessionQueues"].clone()
 }
 
 /// A destination list naming `count` fleet ARNs, in placement-preference order.
-fn destinations(count: usize) -> Value {
+pub(crate) fn destinations(count: usize) -> Value {
     json!((0..count)
         .map(|index| json!({"DestinationArn": gamelift_arn(&format!("fleet/fleet-dest-{index}"))}))
         .collect::<Vec<_>>())
@@ -58,7 +58,7 @@ const MAX_NAMES_PER_DESCRIBE: usize =
 /// A latency policy list of `count` policies, each capping latency more loosely than the
 /// one before it: "policies are evaluated in order starting with the lowest maximum
 /// latency value".
-fn latency_policies(count: usize) -> Value {
+pub(crate) fn latency_policies(count: usize) -> Value {
     json!((0..count)
         .map(|index| json!({
             "MaximumIndividualPlayerLatencyMilliseconds": 50 + 10 * index,
