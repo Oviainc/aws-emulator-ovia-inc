@@ -1,40 +1,55 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterMarketplaceModelEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterMarketplaceModelEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterMarketplaceModelEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers the Amazon SageMaker endpoint an `endpointIdentifier` names with Amazon
+//! Bedrock Marketplace, recording in [`crate::state`] which Marketplace model the request
+//! says is deployed on it, and reports the stored record — so what this call answers is
+//! what `GetMarketplaceModelEndpoint` answers for afterwards.
 //!
-//! ## Shape of an operation
+//! * `modelSourceIdentifier` names a HUB CONTENT of the AWS-managed Amazon SageMaker
+//!   public hub, and the model it names is resolved FIRST: a name that hub publishes
+//!   nothing under ([`crate::state::is_published_marketplace_model`]) is refused 404
+//!   `ResourceNotFoundException` naming the content the identifier named
+//!   ([`crate::state::marketplace_hub_content_not_found`]) — the recorded refusal, and
+//!   recorded ahead of anything about the endpoint, so a request whose endpoint is absent
+//!   too is told about the model source it cannot register. The published catalog is a
+//!   SUBSET of the hub's contents, so what this account has already DEPLOYED is evidence
+//!   of existence too: a registration of the very model source the endpoint the identifier
+//!   names already carries is a registration of a model the hub held when
+//!   `CreateMarketplaceModelEndpoint` deployed it, and is not refused on the catalog. That
+//!   is what keeps the two operations from contradicting each other — nothing this service
+//!   let a caller deploy is then unregisterable.
+//! * An `endpointIdentifier` this account holds no endpoint under then names nothing to
+//!   register, so it is refused 404 `ResourceNotFoundException`
+//!   ([`crate::state::MARKETPLACE_ENDPOINT_NOT_FOUND_MESSAGE`]) — the code and the
+//!   sentence the sibling writes `UpdateMarketplaceModelEndpoint` and
+//!   `DeregisterMarketplaceModelEndpoint` answer for such an ARN. The endpoints Amazon
+//!   Bedrock knows are the entries of
+//!   [`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::marketplace_model_endpoints`],
+//!   whose membership IS the registration, and `Arn` declares no pattern
+//!   (`@length(max: 2048)` only), so an identifier that is no ARN at all names no endpoint
+//!   either and is refused the same way rather than as a malformed value.
+//! * The model source is "the ARN of the model from Amazon Bedrock Marketplace that is
+//!   deployed on the endpoint", so the registration stores it against the endpoint and
+//!   every later read reports it. A call naming the model source the endpoint already
+//!   carries changes nothing, leaving `updatedAt` where it stood.
+//! * `status` is [`crate::state::MARKETPLACE_ENDPOINT_REGISTERED`] from this call onwards:
+//!   the endpoint is one Bedrock Marketplace knows. The endpoint's own `endpointStatus` is
+//!   SageMaker's, which registering with Bedrock does not move, so it keeps the status the
+//!   clock has made due for it.
 //!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `RegisterMarketplaceModelEndpoint::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! SCOPE. Amazon Bedrock registers an endpoint Amazon SageMaker hosts, and this emulator
+//! holds no SageMaker endpoint state of its own — the only endpoints it knows are the ones
+//! `CreateMarketplaceModelEndpoint` deployed, which is what
+//! [`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::marketplace_model_endpoints`]
+//! documents. So an endpoint created elsewhere, and an endpoint whose record
+//! `DeregisterMarketplaceModelEndpoint` dropped, are both identifiers this service holds
+//! nothing under, and this operation refuses them rather than inventing an endpoint it was
+//! never told the configuration of. Registering a SageMaker endpoint this service has no
+//! record of needs that record to exist first — a SageMaker-side endpoint store this crate
+//! can resolve — which is not this operation's to add.
 //!
-//! ## Reaching this service's state
-//!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
-//! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
-//!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
-//!
-//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
-//! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
-//! The engine is NOT reached through `ctx`.
-//!
-//! @generated by the emulator core scaffold op-stub generator.
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -154,20 +169,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterMarketplaceModelEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterMarketplaceModelEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterMarketplaceModelEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                RegisterMarketplaceModelEndpointErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "marketplace model endpoint state is not available on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // What this account already has deployed on the endpoint the identifier names, when
+        // it holds one: the published catalog is a subset of the public hub's contents, so a
+        // model source an endpoint of this account was deployed from is one the hub held,
+        // and re-registering exactly that is not refused on the catalog.
+        let already_deployed = store
+            .marketplace_model_endpoints
+            .get(&input.endpoint_identifier)
+            .is_some_and(|endpoint| {
+                endpoint.model_source_identifier == input.model_source_identifier
+            });
+
+        // The Marketplace model comes first: the identifier names a hub content of the
+        // AWS-managed SageMaker public hub, and a name neither that hub nor this account's
+        // own endpoints know is what the request is refused on, whatever the endpoint half
+        // of it names.
+        let hub_content =
+            crate::state::marketplace_model_source_name_of(&input.model_source_identifier);
+        if !already_deployed && !crate::state::is_published_marketplace_model(hub_content) {
+            return Err(
+                RegisterMarketplaceModelEndpointErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::marketplace_hub_content_not_found(
+                            hub_content,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The endpoint is addressed by its ARN, which carries its region, so the request's
+        // own signing region decides nothing here. An identifier this account holds no
+        // endpoint under names nothing to register, and is refused the way the sibling
+        // writes `UpdateMarketplaceModelEndpoint` and `DeregisterMarketplaceModelEndpoint`
+        // refuse such an ARN.
+        let Some(endpoint) = store.marketplace_model_endpoint(&input.endpoint_identifier, now)
+        else {
+            return Err(
+                RegisterMarketplaceModelEndpointErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::MARKETPLACE_ENDPOINT_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The registration records which Marketplace model is deployed on the endpoint, so
+        // a call naming another model source replaces the stored one and moves the
+        // endpoint's `updatedAt`, while one naming the model source it already carries
+        // changes nothing.
+        if endpoint.model_source_identifier != input.model_source_identifier
+            || endpoint.status != crate::state::MARKETPLACE_ENDPOINT_REGISTERED
+        {
+            endpoint.model_source_identifier = input.model_source_identifier;
+            endpoint.status = crate::state::MARKETPLACE_ENDPOINT_REGISTERED;
+            endpoint.updated_at = now;
+        }
+
+        // Report the STORED record, so the caller is told exactly what a later
+        // GetMarketplaceModelEndpoint will find.
+        Ok(RegisterMarketplaceModelEndpointOutput {
+            marketplace_model_endpoint: crate::state::marketplace_model_endpoint_view(endpoint),
+        })
     }
 }

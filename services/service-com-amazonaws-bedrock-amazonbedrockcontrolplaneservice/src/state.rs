@@ -61,6 +61,7 @@
 //! And it holds the Bedrock Marketplace model endpoints
 //! `ops/create_marketplace_model_endpoint.rs` mints,
 //! `ops/update_marketplace_model_endpoint.rs` reconfigures,
+//! `ops/register_marketplace_model_endpoint.rs` registers with Amazon Bedrock,
 //! `ops/get_marketplace_model_endpoint.rs` reads back and
 //! `ops/deregister_marketplace_model_endpoint.rs` drops, together with the instant each
 //! endpoint's non-terminal `endpointStatus` is owed its move to `InService`.
@@ -507,7 +508,9 @@ fn spelled_resource_type(resource_type: &str) -> String {
 /// because `CreateMarketplaceModelEndpoint` was called was created by Bedrock from a
 /// Marketplace model, so it is registered with Bedrock from that call onwards;
 /// `INCOMPATIBLE_ENDPOINT` names an endpoint Bedrock cannot use, which no call here
-/// produces.
+/// produces. `RegisterMarketplaceModelEndpoint` is the other call that leaves an endpoint
+/// in it: registering an endpoint with Bedrock Marketplace is what makes it one Bedrock
+/// knows.
 pub const MARKETPLACE_ENDPOINT_REGISTERED: &str = "REGISTERED";
 
 /// `MarketplaceModelEndpoint$endpointStatus` while the underlying endpoint is still being
@@ -1434,7 +1437,9 @@ pub struct MarketplaceModelEndpointRecord {
     /// `endpointName`, as the create request spelled it. The ARN's resource id, so it is
     /// also what makes the name unique within the account and region.
     pub name: String,
-    /// `modelSourceIdentifier` — the Marketplace model this endpoint serves.
+    /// `modelSourceIdentifier` — the Marketplace model this endpoint serves, as the create
+    /// request named it and as each `RegisterMarketplaceModelEndpoint` re-states it: the
+    /// registration is where the model deployed on the endpoint is recorded.
     pub model_source_identifier: String,
     /// `endpointConfig` — the create request's configuration, REPLACED whole by each
     /// `UpdateMarketplaceModelEndpoint`.
@@ -3853,8 +3858,8 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// Every Bedrock Marketplace model endpoint this account has REGISTERED with Amazon
     /// Bedrock, keyed by its `endpointArn` — the one identifier
     /// `GetMarketplaceModelEndpoint`, `UpdateMarketplaceModelEndpoint`,
-    /// `DeregisterMarketplaceModelEndpoint` and `DeleteMarketplaceModelEndpoint` address an
-    /// endpoint by.
+    /// `RegisterMarketplaceModelEndpoint`, `DeregisterMarketplaceModelEndpoint` and
+    /// `DeleteMarketplaceModelEndpoint` address an endpoint by.
     ///
     /// Membership here IS the registration: an endpoint
     /// `DeregisterMarketplaceModelEndpoint` removed is no longer one Amazon Bedrock knows,
@@ -5715,9 +5720,9 @@ fn minted_uuid(ordinal: u64, now: SystemTime) -> String {
     )
 }
 
-/// What `UpdateMarketplaceModelEndpoint` and `DeregisterMarketplaceModelEndpoint` answer
-/// as the `ResourceNotFoundException` message for a Bedrock Marketplace model endpoint ARN
-/// this account holds no endpoint for.
+/// What `UpdateMarketplaceModelEndpoint`, `RegisterMarketplaceModelEndpoint` and
+/// `DeregisterMarketplaceModelEndpoint` answer as the `ResourceNotFoundException` message
+/// for a Bedrock Marketplace model endpoint ARN this account holds no endpoint for.
 ///
 /// RECORDED behaviour, not a modelled sentence (the model's own doc for the error reads
 /// "The specified resource Amazon Resource Name (ARN) was not found. …"): the corpus
@@ -5727,7 +5732,8 @@ fn minted_uuid(ordinal: u64, now: SystemTime) -> String {
 /// resource is not there and nothing about which ARN was asked for, so the message cannot
 /// be used to probe the store.
 ///
-/// Scoped to the operations the corpus records it for. The same corpus records
+/// Scoped to the operations recorded answering `ResourceNotFoundException` for such an ARN
+/// — the WRITES that address an endpoint by it. The same corpus records
 /// `GetMarketplaceModelEndpoint` refusing the SAME ARN with 400 `ValidationException`
 /// instead, so the code and the sentence are per-operation; and this service's guardrail
 /// and prompt router handlers keep the sentences they already word, because no recording
@@ -5744,6 +5750,71 @@ pub fn marketplace_endpoint_name_of(endpoint_arn: &str) -> &str {
         Some((_, name)) => name,
         None => endpoint_arn,
     }
+}
+
+/// Every Bedrock Marketplace model this emulator's Amazon Bedrock publishes, by the HUB
+/// CONTENT NAME the Amazon SageMaker public hub holds it under — the name a
+/// `ModelSourceIdentifier` addresses a model by.
+///
+/// A PUBLISHED catalog, the way [`FOUNDATION_MODELS`] is: Amazon Bedrock Marketplace offers
+/// the models of the AWS-managed `SageMakerPublicHub`, and no request creates one, so this
+/// is the set a `modelSourceIdentifier` can name — nothing a caller adds to or removes
+/// from. The names are the hub content names AWS publishes there, and the catalog is a
+/// SUBSET of them, spanning several providers and name forms, because the rule — a name the
+/// public hub does not publish names no model — not the catalog's size is what this
+/// emulator has to get right.
+///
+/// In `name` order, so a reader sees the set rather than a history of additions.
+pub const PUBLISHED_MARKETPLACE_MODELS: &[&str] = &[
+    "deepseek-llm-r1-distill-qwen-7b",
+    "huggingface-llm-falcon-7b-instruct-bf16",
+    "huggingface-llm-gemma-7b-instruct",
+    "huggingface-llm-mistral-7b-instruct",
+    "meta-textgeneration-llama-2-7b-f",
+    "meta-textgeneration-llama-3-70b-instruct",
+    "meta-textgeneration-llama-3-8b-instruct",
+];
+
+/// The hub content NAME inside a `ModelSourceIdentifier`: the segment after the ARN's
+/// `.../Model/`, up to the content VERSION the identifier may carry after it — or the whole
+/// value when it carries no such segment.
+///
+/// `ModelSourceIdentifier`'s pattern is
+/// `arn:aws:sagemaker:.*:hub-content/SageMakerPublicHub/Model/.*`
+/// (`smithy_query(query="shape",shape="ModelSourceIdentifier")`), and a SageMaker hub
+/// content is addressed by `<hub>/<type>/<name>/<version>`, so what follows `Model/` is the
+/// content's name and then its version. Built like [`marketplace_endpoint_name_of`]: a
+/// member carrying a resource's ARN is read back to the name the resource is held under.
+pub fn marketplace_model_source_name_of(model_source_identifier: &str) -> &str {
+    let after_type = match model_source_identifier.rsplit_once("/Model/") {
+        Some((_, rest)) => rest,
+        None => model_source_identifier,
+    };
+    match after_type.split_once('/') {
+        Some((name, _version)) => name,
+        None => after_type,
+    }
+}
+
+/// Whether the Amazon SageMaker public hub publishes a Bedrock Marketplace model under this
+/// hub content name ([`PUBLISHED_MARKETPLACE_MODELS`]).
+#[must_use]
+pub fn is_published_marketplace_model(hub_content_name: &str) -> bool {
+    PUBLISHED_MARKETPLACE_MODELS.contains(&hub_content_name)
+}
+
+/// What a request naming a Bedrock Marketplace model the public hub does not publish is
+/// refused with: `Hub content with name <name> does not exist.`
+///
+/// RECORDED behaviour, not a modelled sentence: the corpus records Amazon Bedrock answering
+/// `RegisterMarketplaceModelEndpoint` 404 `ResourceNotFoundException` with exactly this
+/// sentence for a well-formed `modelSourceIdentifier` whose hub content name the public hub
+/// holds nothing under — and it is the model source, not the endpoint, that such a request
+/// is refused on. BUILT FROM THE REQUEST: it names the hub content the identifier named
+/// ([`marketplace_model_source_name_of`]), so the rule is "name the content the identifier
+/// names", not one recorded name.
+pub fn marketplace_hub_content_not_found(hub_content_name: &str) -> String {
+    format!("Hub content with name {hub_content_name} does not exist.")
 }
 
 /// What `GetMarketplaceModelEndpoint` answers as its `ValidationException` message for an

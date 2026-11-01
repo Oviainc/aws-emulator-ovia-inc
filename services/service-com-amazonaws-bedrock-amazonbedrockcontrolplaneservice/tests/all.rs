@@ -93,6 +93,8 @@ mod inference_profile_listing;
 mod inference_profiles;
 #[path = "all/marketplace_endpoint_deregistration.rs"]
 mod marketplace_endpoint_deregistration;
+#[path = "all/marketplace_endpoint_registration.rs"]
+mod marketplace_endpoint_registration;
 #[path = "all/marketplace_model_endpoints.rs"]
 mod marketplace_model_endpoints;
 #[path = "all/model_copy_jobs.rs"]
