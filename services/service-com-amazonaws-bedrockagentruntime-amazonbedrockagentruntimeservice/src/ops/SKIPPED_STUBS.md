@@ -24,3 +24,15 @@ handler returns an error, so it never has to construct a value.
 // SKIPPED: InvokeInlineAgent — unsupported shape construct: operation 'InvokeInlineAgent' has a @streaming event-stream output member, which needs wire framing the generator does not emit
 // SKIPPED: OptimizePrompt — unsupported shape construct: operation 'OptimizePrompt' has a @streaming event-stream output member, which needs wire framing the generator does not emit
 // SKIPPED: RetrieveAndGenerateStream — unsupported shape construct: operation 'RetrieveAndGenerateStream' has a @streaming event-stream output member, which needs wire framing the generator does not emit
+
+## Hand-authored since
+
+`InvokeInlineAgent` is now written by hand in `ops/invoke_inline_agent.rs`, with the
+request half of its shapes in `ops/types/invoke_inline_agent_types.rs` and the
+`completion` event stream in that file's `unsupported = [..]` list. `src/service.rs`
+routes a request to it through `Service::override_operation` behind
+`service_common::event_stream::EventStreamRoute`, because the GENERATED
+`ErasedOperation` shim of a `@streaming`-output operation declines the request. So its
+own input is validated against the model, and the response stream — the part nobody has
+written — answers the scaffold's 501. The other five are still unwired.
+

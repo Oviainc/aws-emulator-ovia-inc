@@ -19,6 +19,8 @@ mod date_time_wire_form;
 mod invocations;
 #[path = "all/list_sessions.rs"]
 mod list_sessions;
+#[path = "all/pattern_constraint_messages.rs"]
+mod pattern_constraint_messages;
 #[path = "all/reranking.rs"]
 mod reranking;
 #[path = "all/session_error_messages.rs"]

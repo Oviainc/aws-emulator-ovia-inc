@@ -40,16 +40,81 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use service_common::event_stream::EventStreamRoute;
 use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
+
+use crate::ops::invoke_inline_agent::{self, InvokeInlineAgent};
+
+/// The `@pattern` this service PUBLISHES for a member whose on-disk model records a STALE
+/// spelling of the same constraint, keyed by the stale text the generated schema carries.
+///
+/// A refusal states the requirement the SERVICE publishes, and for these members the model
+/// shipped in `smithy-model/` and the service disagree: each pair below is one member shape
+/// whose recorded refusal quotes an expression the on-disk `@pattern` does not spell, so the
+/// published one is what a caller lifting the expression out of the message has to satisfy.
+/// Keyed by the MODEL's text rather than by a member path, so a model that is refreshed to
+/// the published spelling stops matching here and the override falls away by itself, and so
+/// that every member reaching the same shape states one requirement.
+///
+/// What each pair records, from the recorded refusals of this service:
+///
+/// * `KnowledgeBaseArn` — the partition alternation names the three ISOLATED partitions
+///   beside the commercial, China and GovCloud ones, so a knowledge-base ARN in any
+///   partition this service serves satisfies the stated expression;
+/// * `KmsKeyArn` — the same partition alternation, on the customer-managed-key ARN both
+///   `CreateSession` and the inline-agent invocation accept;
+/// * `TaggableResourcesArn` — the published expression admits the two RUNTIME resource
+///   kinds this plane's tagging operations address (the session and the prompt-optimisation
+///   job) with an identifier of the general ARN resource grammar, where the on-disk
+///   spelling names the session alone with a uuid body.
+///
+/// The CHECK stays the model's: only the expression a refusal QUOTES is decided here.
+const PUBLISHED_PATTERNS: &[(&str, &str)] = &[
+    (
+        "^arn:aws(|-cn|-us-gov):bedrock:[a-zA-Z0-9-]*:[0-9]{12}:knowledge-base/[0-9a-zA-Z]+$",
+        "^arn:aws(|-cn|-us-gov|-iso|-iso-b|-iso-f):bedrock:[a-zA-Z0-9-]*:[0-9]{12}\
+         :knowledge-base/[0-9a-zA-Z]+$",
+    ),
+    (
+        "^arn:aws(|-cn|-us-gov):kms:[a-zA-Z0-9-]*:[0-9]{12}:key/[a-zA-Z0-9-]{36}$",
+        "^arn:aws(|-cn|-us-gov|-iso|-iso-b|-iso-f):kms:[a-zA-Z0-9-]*:[0-9]{12}\
+         :key/[a-zA-Z0-9-]{36}$",
+    ),
+    (
+        "(^arn:aws(-[^:]+)?:bedrock:[a-zA-Z0-9-]+:[0-9]{12}:(session)/[a-f0-9]{8}-[a-f0-9]{4}\
+         -[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$)",
+        "^arn:aws(-[^:]+)?:bedrock:[a-zA-Z0-9-]+:[0-9]{12}\
+         :(session|advanced-optimize-prompt-job)/[a-zA-Z0-9-]+$",
+    ),
+];
+
+/// The expression a `@pattern` refusal of this service QUOTES: the published constraint
+/// ([`PUBLISHED_PATTERNS`]) stated as the expression the whole value must match
+/// (`service_common::validation::whole_value_expression`).
+fn quoted_pattern(modelled: &str) -> String {
+    let published = PUBLISHED_PATTERNS
+        .iter()
+        .find(|(stale, _)| *stale == modelled)
+        .map_or(modelled, |(_, published)| *published);
+    service_common::validation::whole_value_expression(published)
+}
 
 /// The `com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
+///
+/// Besides the generated entry it holds `InvokeInlineAgent`. That operation is NOT in the
+/// entry's routing table in a servable form: the generated `ErasedOperation` shim of an
+/// operation whose output is a `@streaming` union declines the request (it cannot drive
+/// `serialize_as_event_stream<P>` through an object-safe `run`), so it is held here behind
+/// an [`EventStreamRoute`] and routed by [`EmulatedService::override_operation`] — which
+/// the router consults FIRST, before the generated table.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    invoke_inline_agent: EventStreamRoute<InvokeInlineAgent<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -58,7 +123,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(engine.clone()),
+            invoke_inline_agent: EventStreamRoute(InvokeInlineAgent::new(engine)),
         }
     }
 }
@@ -87,10 +153,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // first three the two models bind DIFFERENT routes, so this service claims only
         // the routes its own model binds (`POST /knowledgebases/{id}/retrieve`, the flow
         // execution paths, the agent memory and invocation paths); under `tags` both bind
-        // the identical three routes, so the ARN in the path decides — the two models'
-        // `TaggableResourcesArn` patterns name disjoint resource types, and a `session`
-        // ARN is this service's. `None` for the RPC argument: every operation here is
-        // bound to a URI.
+        // the identical three routes and the ARN in the path names no endpoint — each
+        // Bedrock endpoint judges a tagging ARN by its OWN model's taggable-resource
+        // pattern and refuses one it does not admit — so that segment has a declared
+        // owner, this service. `None` for the RPC argument: every operation here is bound
+        // to a URI.
         service_common::bedrock::claims_request(
             parts,
             self.definition(),
@@ -103,11 +170,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        // `InvokeInlineAgent`, which the generated routing table cannot serve: its output
+        // is a `@streaming` union, so the generated shim declines the request. Routed by
+        // the one route the operation itself recognises (`invoke_inline_agent::addresses`),
+        // so nothing else is touched — every other request resolves through the generated
+        // table.
+        if invoke_inline_agent::addresses(req) {
+            return Some(&self.invoke_inline_agent);
+        }
         None
     }
 
@@ -122,26 +192,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // on the code, so a message without its matching code is worse than
         // leaving both alone.
         //
-        // This service restates a `@pattern` failure with the expression UNANCHORED — the
-        // `^`/`$` a model writes to demand a whole-string match are not part of the
-        // expression a value has to satisfy, and a caller that compiles or compares the
-        // quoted pattern must see the one the member's constraint publishes. Of the two
-        // renderings the shared home offers this service states the GROUPING one
-        // (`service_common::validation::unanchored_grouping_alternation`), which keeps a
-        // top-level alternation grouped so the quoted expression still matches what the
-        // anchored one matched.
+        // This service restates a `@pattern` failure as the expression the WHOLE VALUE has
+        // to match: the `^`/`$` a model writes to demand a whole-string match are not part
+        // of the expression a value satisfies, and an end the model leaves OPEN is spelled
+        // with the unconstrained run it admits, so a caller that compiles or compares the
+        // quoted expression gets one its own whole value has to satisfy. Of the renderings
+        // the shared home offers this service states
+        // `service_common::validation::whole_value_expression`, which decides the two ends
+        // independently and keeps a leftover top-level alternation grouped.
         //
-        // That choice is the ONLY thing decided here: which refusals are restated, the
-        // modelled `ValidationException` code, the envelope, the member paths and every
-        // other requirement are the shared
+        // The expression it is applied to is the constraint this service PUBLISHES
+        // (`PUBLISHED_PATTERNS`), which for three member shapes is not the stale spelling the
+        // on-disk model carries. Both choices are the ONLY things decided here: which
+        // refusals are restated, the modelled `ValidationException` code, the envelope, the
+        // member paths and every other requirement are the shared
         // `service_common::validation_message::aws_validation_refusal_with`'s and the
         // framework's, so this service cannot drift from them. Every other violation class
         // keeps the framework's wording, and an authentication refusal keeps it too: it is
         // not an input-constraint failure.
-        service_common::validation_message::aws_validation_refusal_with(
-            refusal,
-            service_common::validation::unanchored_grouping_alternation,
-        )
+        service_common::validation_message::aws_validation_refusal_with(refusal, |pattern| {
+            quoted_pattern(pattern)
+        })
     }
 
     fn override_routing_error(

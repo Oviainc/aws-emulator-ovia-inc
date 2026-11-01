@@ -35,6 +35,7 @@ pub mod get_flow_execution_types;
 pub mod get_ingested_document_acl_types;
 pub mod get_invocation_step_types;
 pub mod get_session_types;
+pub mod invoke_inline_agent_types;
 pub mod list_flow_execution_events_types;
 pub mod list_flow_executions_types;
 pub mod list_invocation_steps_types;
@@ -80,6 +81,8 @@ pub use get_ingested_document_acl_types::*;
 pub use get_invocation_step_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_session_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use invoke_inline_agent_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_flow_execution_events_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

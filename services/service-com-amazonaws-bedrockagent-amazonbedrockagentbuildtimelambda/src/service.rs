@@ -101,7 +101,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // splits them there: under `agents`, `knowledgebases` and `flows` the two models
         // bind DIFFERENT routes, so each service claims only a request its own model binds
         // a route for; under `tags` they bind the identical three routes, so that segment
-        // has a declared owner — this service, which owns the resources being tagged.
+        // has a declared owner — the `bedrock-agent-runtime` data plane, because the ARN in
+        // the path names no endpoint (each Bedrock endpoint judges a tagging ARN by its own
+        // taggable-resource pattern), so this service's tagging operations are not reached.
         // `None` for the RPC argument: every operation here is bound to a URI.
         service_common::bedrock::claims_request(
             parts,

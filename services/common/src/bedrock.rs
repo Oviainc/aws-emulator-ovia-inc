@@ -24,8 +24,6 @@
 
 use smithy_server_runtime::ErasedServiceDefinition;
 
-use crate::shared_path::{shared_path_arn, SharedPathArn};
-
 /// The `aws.api#service$arnNamespace` every Bedrock-family model shares
 /// (`smithy_query(query="service_info")` on each of the six reports `bedrock`), and so
 /// the only service field an ARN any of them addresses can carry.
@@ -71,31 +69,7 @@ enum Shared {
     /// there are unreachable, which keeps the owner's working instead of refusing both
     /// with `500 AmbiguousService`.
     OwnedBy(&'static str),
-    /// The sharers bind the SAME routes under this segment, and the `@httpLabel` in the
-    /// path is a resource ARN — so the request DOES tell them apart: a resource belongs
-    /// to exactly one service, the one whose own model's taggable-resource ARN pattern
-    /// admits that resource type and whose own operations mint it. The resource TYPE
-    /// therefore decides the claim ([`crate::shared_path::shared_path_arn`]).
-    ///
-    /// `prefix` is the literal segments leading to the label, `owners` the resource
-    /// types one sharer's model claims, and `default_owner` the sharer every other type
-    /// — and a label that names no resource in the family's ARN namespace — belongs to,
-    /// so a request on this space always reaches exactly one claimant.
-    ByArnResourceType {
-        prefix: &'static [&'static str],
-        owners: &'static [(&'static str, &'static str)],
-        default_owner: &'static str,
-    },
 }
-
-/// The resource types the `bedrock-agent-runtime` model's own `TaggableResourcesArn`
-/// admits under `/tags/{resourceArn}`: the SESSION, and nothing else
-/// (`smithy_query(query="operation",operation="TagResource")` on that model ->
-/// `resourceArn`'s pattern is `…:(session)/<uuid>$`). Every other `bedrock` resource type
-/// — the build-time plane's `agent`, `agent-alias`, `knowledge-base`, `flow`, `prompt`, …
-/// — is named only by the `bedrock-agent` model's own pattern, so it stays with that
-/// plane.
-const TAGS_BY_RESOURCE_TYPE: &[(&str, &str)] = &[("session", AGENT_RUNTIME)];
 
 /// Every first URI path segment more than one Bedrock-family model publishes, and how it
 /// is split. Each sharer reads this one table, so the claims cannot drift into a path
@@ -106,12 +80,15 @@ const TAGS_BY_RESOURCE_TYPE: &[(&str, &str)] = &[("session", AGENT_RUNTIME)];
 ///   (`PUT /knowledgebases/` and `POST /knowledgebases/{knowledgeBaseId}/datasources/`
 ///   against `POST /knowledgebases/{knowledgeBaseId}/retrieve`), so the route decides.
 /// * `tags` — the same two both bind `GET`, `POST` and `DELETE /tags/{resourceArn}`, the
-///   identical three routes, so neither the method nor the URI template decides; the ARN
-///   in the path does, because the two models' taggable-resource patterns name DISJOINT
-///   resource types (`session` against `agent`/`agent-alias`/`knowledge-base`/`flow`/
-///   `prompt`/…). A session ARN is the data plane's, every other `bedrock` resource — and
-///   a label that is no `bedrock` resource ARN at all — the build-time plane's, which owns
-///   the resources being tagged.
+///   identical three routes, so neither the method nor the URI template decides, and
+///   neither does the ARN in the path: each Bedrock endpoint validates a tagging ARN
+///   against its OWN model's taggable-resource pattern and refuses one it does not admit
+///   (the recorded `bedrock-agent-runtime` refusal of a build-time plane's ARN quotes the
+///   RUNTIME's pattern rather than deferring to the plane that mints that resource), so an
+///   ARN names only which pattern will judge it, not which endpoint was addressed. The
+///   segment therefore has a declared owner, as the three identically-bound tagging
+///   segments below do: the data plane, whose tagging operations are the ones the corpus
+///   addresses and the only ones implemented.
 /// * `listTagsForResource`, `tagResource`, `untagResource` — the `bedrock` control plane
 ///   and `bedrock-data-automation` both bind `POST` on each of these three, again
 ///   identically, and the control plane is the member every Bedrock tagging flow uses.
@@ -121,14 +98,7 @@ const SHARED_SEGMENTS: &[(&str, Shared)] = &[
     ("knowledgebases", Shared::ByRoute),
     ("listTagsForResource", Shared::OwnedBy(CONTROL_PLANE)),
     ("tagResource", Shared::OwnedBy(CONTROL_PLANE)),
-    (
-        "tags",
-        Shared::ByArnResourceType {
-            prefix: &["tags"],
-            owners: TAGS_BY_RESOURCE_TYPE,
-            default_owner: AGENT,
-        },
-    ),
+    ("tags", Shared::OwnedBy(AGENT_RUNTIME)),
     ("untagResource", Shared::OwnedBy(CONTROL_PLANE)),
 ];
 
@@ -161,34 +131,48 @@ pub fn claims_request(
     }
     match shared_split(parts.uri.path()) {
         None => true,
-        Some(Shared::ByRoute) => crate::addresses_modeled_route(parts, definition),
+        Some(Shared::ByRoute) => {
+            crate::addresses_modeled_route(parts, definition)
+                && trailing_slash_owner(parts)
+                    .is_none_or(|owner| identity.shape_id() == owner)
+        }
         Some(Shared::OwnedBy(owner)) => identity.shape_id() == owner,
-        Some(Shared::ByArnResourceType {
-            prefix,
-            owners,
-            default_owner,
-        }) => identity.shape_id() == arn_resource_owner(parts, prefix, owners, default_owner),
     }
 }
 
-/// The one service that owns the resource the ARN in `parts`' path names: the sharer
-/// whose model claims that resource TYPE, else `default_owner`.
-fn arn_resource_owner(
-    parts: &http::request::Parts,
-    prefix: &'static [&'static str],
-    owners: &'static [(&'static str, &'static str)],
-    default_owner: &'static str,
-) -> &'static str {
-    match shared_path_arn(parts.uri.path(), prefix, ARN_NAMESPACE) {
-        SharedPathArn::Resource(kind) => owners
-            .iter()
-            .find(|(resource_type, _)| *resource_type == kind)
-            .map_or(default_owner, |(_, owner)| *owner),
-        // Not an ARN this family's models name a resource with: the declared owner
-        // answers it, so the request reaches one claimant and gets that service's own
-        // modelled refusal rather than a `404 UnknownService`.
-        SharedPathArn::NotShared | SharedPathArn::Unrecognised => default_owner,
+/// The ONE route shape both `agents` sharers bind, which [`Shared::ByRoute`] cannot split:
+/// the build-time plane's `POST /agents/{agentId}/` (`PrepareAgent`) and the data plane's
+/// `POST /agents/{sessionId}` (`InvokeInlineAgent`). Source:
+/// `smithy_query(query="digest")` on each of the two models.
+const AGENTS_SEGMENT: &str = "agents";
+
+/// The sharer a request on that one route shape belongs to, or `None` when the request is
+/// not on it — in which case the route alone already names one claimant.
+///
+/// The framework's route matcher trims a trailing `/` from both the request path and the
+/// URI template, so the two templates above match the SAME requests and both models bind
+/// one: the route rule leaves two claimants, which the router answers `500 AmbiguousService`
+/// rather than serving either. AWS separates the two by endpoint host, which is not on the
+/// wire here; what IS on the wire is the spelling a client renders from the model's own URI,
+/// and those two URIs differ in the trailing slash. So the request's own trailing slash
+/// decides: `/agents/<id>/` is the build-time plane's `PrepareAgent`, `/agents/<id>` the
+/// data plane's `InvokeInlineAgent`.
+fn trailing_slash_owner(parts: &http::request::Parts) -> Option<&'static str> {
+    if parts.method != http::Method::POST {
+        return None;
     }
+    let path = parts.uri.path();
+    let ends_with_slash = path.ends_with('/');
+    let mut segments = path.trim_matches('/').split('/');
+    let (Some(AGENTS_SEGMENT), Some(_label), None) =
+        (segments.next(), segments.next(), segments.next())
+    else {
+        // Anything else is not this route shape: `/agents/` and `/agents` carry no
+        // identifier (both models bind `PUT`/`POST /agents/`, which the method and the
+        // route already separate), and a deeper path is a route only one of them binds.
+        return None;
+    };
+    Some(if ends_with_slash { AGENT } else { AGENT_RUNTIME })
 }
 
 /// How the first segment of `path` is split, or `None` when only one Bedrock-family model
@@ -215,7 +199,7 @@ mod tests {
     #[test]
     fn the_shared_segments_are_declared_once_each() {
         // (case, path, expected split)
-        let rows: [(&str, &str, Option<Shared>); 12] = [
+        let rows: [(&str, &str, Option<Shared>); 14] = [
             ("the agent pair's agents", "/agents/", Some(Shared::ByRoute)),
             (
                 "a deep path under it",
@@ -231,11 +215,17 @@ mod tests {
             (
                 "the agent pair's identical tagging routes",
                 "/tags/arn%3Aaws%3Abedrock%3A%3A%3Aagent%2Fa1",
-                Some(Shared::ByArnResourceType {
-                    prefix: &["tags"],
-                    owners: TAGS_BY_RESOURCE_TYPE,
-                    default_owner: AGENT,
-                }),
+                Some(Shared::OwnedBy(AGENT_RUNTIME)),
+            ),
+            (
+                "the same tagging space addressed with a session ARN",
+                "/tags/arn%3Aaws%3Abedrock%3A%3A%3Asession%2Fs1",
+                Some(Shared::OwnedBy(AGENT_RUNTIME)),
+            ),
+            (
+                "the same tagging space addressed with no ARN at all",
+                "/tags/not-an-arn",
+                Some(Shared::OwnedBy(AGENT_RUNTIME)),
             ),
             (
                 "the control plane's tagging routes",
@@ -294,36 +284,21 @@ mod tests {
                     "segment {segment:?} is owned by {owner:?}, which is not a member of \
                      the bedrock family"
                 ),
-                Shared::ByArnResourceType {
-                    owners,
-                    default_owner,
-                    ..
-                } => {
-                    assert!(
-                        members.contains(default_owner),
-                        "segment {segment:?} falls back to {default_owner:?}, which is not a \
-                         member of the bedrock family"
-                    );
-                    for (resource_type, owner) in *owners {
-                        assert!(
-                            members.contains(owner),
-                            "segment {segment:?} gives {resource_type:?} to {owner:?}, which \
-                             is not a member of the bedrock family"
-                        );
-                    }
-                }
                 Shared::ByRoute => {}
             }
         }
     }
 
-    /// RULE: on a path space the sharers bind identically, whose `@httpLabel` is a
-    /// resource ARN, the resource TYPE the ARN names decides the claim — the service
-    /// whose own model's taggable-resource pattern admits that type — and every label
-    /// that names no resource of this family falls to the declared owner, so exactly one
-    /// service claims any such request.
+    /// RULE: on a path space the sharers bind IDENTICALLY, the ARN in the `@httpLabel`
+    /// does not name the service — each Bedrock endpoint judges a tagging ARN by its own
+    /// model's taggable-resource pattern — so the whole space belongs to its declared
+    /// owner and exactly one service claims any such request.
+    ///
+    /// The rows differ along the resource type the ARN names, the partition, the spelling
+    /// of the label's separators, the identifier form, and the labels that name no resource
+    /// at all: every one of them is the data plane's.
     #[test]
-    fn the_tagging_path_is_claimed_by_the_service_that_owns_the_arns_resource() {
+    fn the_whole_tagging_path_belongs_to_one_declared_owner() {
         /// The label as a client that percent-encodes a non-greedy `@httpLabel` sends it.
         fn encoded(arn: &str) -> String {
             arn.replace(':', "%3A").replace('/', "%2F")
@@ -332,19 +307,12 @@ mod tests {
         const SESSION: &str =
             "arn:aws:bedrock:us-west-2:000000000000:session/0cabde93-58b4-4d68-b230-90df328e1acb";
 
-        // The rows differ along the resource type the ARN names, the partition, the
-        // spelling of the label's separators, and the forms that name no resource at all.
-        let rows: Vec<(&str, String, &str)> = vec![
+        let rows: Vec<(&str, String)> = vec![
             (
                 "a session ARN, percent-encoded as an SDK sends it",
                 format!("/tags/{}", encoded(SESSION)),
-                AGENT_RUNTIME,
             ),
-            (
-                "the same session ARN sent raw",
-                format!("/tags/{SESSION}"),
-                AGENT_RUNTIME,
-            ),
+            ("the same session ARN sent raw", format!("/tags/{SESSION}")),
             (
                 "a session ARN in another partition",
                 format!(
@@ -354,7 +322,6 @@ mod tests {
                          11111111-2222-3333-4444-555555555555"
                     )
                 ),
-                AGENT_RUNTIME,
             ),
             (
                 "a non-canonically cased session ARN",
@@ -365,15 +332,30 @@ mod tests {
                          0cabde93-58b4-4d68-b230-90df328e1acb"
                     )
                 ),
-                AGENT_RUNTIME,
             ),
             (
-                "an agent ARN",
+                "an ARN of the other resource kind this plane's tagging admits",
+                format!(
+                    "/tags/{}",
+                    encoded(
+                        "arn:aws:bedrock:us-east-1:000000000000\
+                         :advanced-optimize-prompt-job/job-1"
+                    )
+                ),
+            ),
+            (
+                "an agent ARN, naming a build-time plane resource",
                 format!(
                     "/tags/{}",
                     encoded("arn:aws:bedrock:us-east-1:000000000000:agent/AGENT12345")
                 ),
-                AGENT,
+            ),
+            (
+                "an agent ARN whose identifier no model's pattern admits",
+                format!(
+                    "/tags/{}",
+                    encoded("arn:aws:bedrock:us-east-1:000000000000:agent/NOTASESSION")
+                ),
             ),
             (
                 "a knowledge-base ARN",
@@ -381,15 +363,6 @@ mod tests {
                     "/tags/{}",
                     encoded("arn:aws:bedrock:us-east-1:000000000000:knowledge-base/KB12345678")
                 ),
-                AGENT,
-            ),
-            (
-                "a prompt ARN",
-                format!(
-                    "/tags/{}",
-                    encoded("arn:aws:bedrock:us-east-1:000000000000:prompt/PROMPT1234")
-                ),
-                AGENT,
             ),
             (
                 "another service's ARN",
@@ -397,19 +370,14 @@ mod tests {
                     "/tags/{}",
                     encoded("arn:aws:sqs:us-east-1:000000000000:session/q")
                 ),
-                AGENT,
             ),
-            (
-                "a label that is not an ARN",
-                "/tags/not-an-arn".to_string(),
-                AGENT,
-            ),
-            ("no label at all", "/tags".to_string(), AGENT),
+            ("a label that is not an ARN", "/tags/not-an-arn".to_string()),
+            ("no label at all", "/tags".to_string()),
         ];
 
-        for (case, path, expected) in rows {
-            let parts = parts_for(&path);
-            let actual = arn_resource_owner(&parts, &["tags"], TAGS_BY_RESOURCE_TYPE, AGENT);
+        let expected = Some(Shared::OwnedBy(AGENT_RUNTIME));
+        for (case, path) in rows {
+            let actual = shared_split(&path);
             assert_eq!(
                 actual, expected,
                 "case {case:?} ({path}): expected {expected:?}, got {actual:?}"
@@ -417,10 +385,69 @@ mod tests {
         }
     }
 
-    /// The request parts for one path, which is all the claim rule reads here.
-    fn parts_for(path: &str) -> http::request::Parts {
+    /// RULE: where the two sharers' URI templates differ in NOTHING but a trailing slash —
+    /// the one route shape the framework's matcher cannot tell apart — the request's own
+    /// trailing slash names the sharer, and every other request on the segment is left to
+    /// the route rule (`None` here).
+    ///
+    /// The rows span the two spellings of that shape, the methods that are not it, the
+    /// paths with no identifier, a deeper path under the same segment, and another shared
+    /// segment entirely.
+    #[test]
+    fn the_one_route_shape_both_agent_models_bind_is_split_by_the_trailing_slash() {
+        // (case, method, path, the sharer the request belongs to)
+        let rows: [(&str, &str, &str, Option<&str>); 9] = [
+            (
+                "the data plane's inline-agent invocation",
+                "POST",
+                "/agents/probe-session-0a1f2a1d",
+                Some(AGENT_RUNTIME),
+            ),
+            (
+                "a session id that looks like an agent id",
+                "POST",
+                "/agents/ABCDEFGHIJ",
+                Some(AGENT_RUNTIME),
+            ),
+            (
+                "the build-time plane's PrepareAgent, with the slash its URI carries",
+                "POST",
+                "/agents/ABCDEFGHIJ/",
+                Some(AGENT),
+            ),
+            // Not this route shape: the route rule already names one claimant.
+            ("the agent listing, no identifier", "POST", "/agents/", None),
+            ("the same segment with no slash", "POST", "/agents", None),
+            ("the agent read, another method", "GET", "/agents/a-1/", None),
+            (
+                "the agent creation, another method",
+                "PUT",
+                "/agents/a-1/",
+                None,
+            ),
+            (
+                "a deeper path under the same segment",
+                "POST",
+                "/agents/a-1/agentaliases/",
+                None,
+            ),
+            ("another shared segment", "POST", "/flows/f-1", None),
+        ];
+
+        for (case, method, path, expected) in rows {
+            let parts = parts_for(method, path);
+            let actual = trailing_slash_owner(&parts);
+            assert_eq!(
+                actual, expected,
+                "case {case:?} ({method} {path}): expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// The request parts for one method and path, which is all this rule reads.
+    fn parts_for(method: &str, path: &str) -> http::request::Parts {
         http::Request::builder()
-            .method("POST")
+            .method(method)
             .uri(path)
             .body(())
             .expect("the test request builds")

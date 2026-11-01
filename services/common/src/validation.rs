@@ -120,7 +120,9 @@
 //!   dropped from a top-level alternation, where the alternation is kept grouped so the
 //!   expression still matches what it matched anchored, and
 //!   [`unanchored_keeping_inner_anchors`] for the services whose refusals quote an
-//!   expression that anchors its own BRANCHES as the model declares it) — LANDED here,
+//!   expression that anchors its own BRANCHES as the model declares it, and
+//!   [`whole_value_expression`] for the services whose refusals quote the expression the
+//!   WHOLE value must match, deciding the two ends independently) — LANDED here,
 //!   while ~26 service crates still carry their own inlined copy
 //!   (`grep -rln 'fn unanchored' services/*/src`), each pinned by that service's own
 //!   recordings and tests; deleting those copies in favour of this one is the migration's
@@ -1187,6 +1189,89 @@ pub fn unanchored_keeping_inner_anchors(regex: &str) -> String {
         return stated;
     }
     regex.to_string()
+}
+
+/// The unconstrained run an expression spells for an end a `@pattern` leaves OPEN.
+const ANY_RUN: &str = ".*";
+
+/// The expression the WHOLE value must match, for the services whose refusals quote a
+/// `@pattern` that way — a FOURTH dialect beside the three renderings above, sharing their
+/// reading of an anchor and differing in what it does with an end the model leaves open.
+///
+/// A Smithy `@pattern` is a FIND rather than a total match, so the expression a member
+/// declares and the expression its whole value must satisfy are two different things, and a
+/// refusal in this dialect states the second. The two ends are decided INDEPENDENTLY,
+/// because a model may anchor one and leave the other open:
+///
+/// * an end the model ANCHORS carries its `^` / `$` away with it — the anchor is how the
+///   model makes the match total at that end, not part of the character grammar a caller
+///   has to satisfy;
+/// * an end the model leaves OPEN admits any run of characters before (or after) the match,
+///   which this spells as [`ANY_RUN`] unless the expression already leaves that end open
+///   with one;
+/// * an expression that anchors NEITHER end while carrying an anchor inside itself — an
+///   alternation whose branches are each anchored (`(^a$)|(^b$)`) — already describes the
+///   whole value, so it is quoted exactly as the model declares it, which is the same
+///   reading [`unanchored_keeping_inner_anchors`] states;
+/// * a top-level ALTERNATION left over once BOTH anchors were dropped is kept GROUPED, and
+///   only when its own branches carry no anchor: the quoted expression then still matches
+///   what the model's anchored text matched, which is [`unanchored_grouping_alternation`]'s
+///   rule. Branches that anchor themselves pin each alternative already, so nothing is
+///   added around them.
+///
+/// Recorded for the Bedrock family, whose refusals quote all four forms: `^[0-9a-zA-Z._:-]+$`
+/// as `[0-9a-zA-Z._:-]+`, `^(arn:…flow/[0-9a-zA-Z]{10})|([0-9a-zA-Z]{10})$` as
+/// `((arn:…flow/[0-9a-zA-Z]{10})|([0-9a-zA-Z]{10}))`, `^[a-zA-Z0-9-]{1,36}$|^(arn:…)$` as
+/// `[a-zA-Z0-9-]{1,36}$|^(arn:…)` and the model-identifier alternation `(^…)$|(^…)$` as
+/// `.*(^…)$|(^…)`. The CHECK always runs the model's pattern as written; only this
+/// rendering decides the ends.
+#[must_use]
+pub fn whole_value_expression(regex: &str) -> String {
+    let (body, anchored_at_start, anchored_at_end) = split_outer_anchors(regex);
+    match (anchored_at_start, anchored_at_end) {
+        (true, true) => grouping_an_unanchored_alternation(body),
+        // Anchored inside its own branches rather than at either end.
+        (false, false) if regex_syntax(regex).anchor => regex.to_string(),
+        (start, end) => opened(body, !start, !end),
+    }
+}
+
+/// `regex` without the anchors at its two ends, and whether each end carried one. The two
+/// are read independently, and an escaped `$` is a literal dollar rather than an anchor —
+/// the same reading [`unanchored`] applies to the pair as a whole.
+fn split_outer_anchors(regex: &str) -> (&str, bool, bool) {
+    let (body, anchored_at_start) = match regex.strip_prefix('^') {
+        Some(rest) => (rest, true),
+        None => (regex, false),
+    };
+    match body.strip_suffix('$') {
+        Some(inner) if !ends_with_escape(inner) => (inner, anchored_at_start, true),
+        _ => (body, anchored_at_start, false),
+    }
+}
+
+/// `body` wrapped in ONE group when it alternates at its top level and carries no anchor of
+/// its own, else `body` itself.
+fn grouping_an_unanchored_alternation(body: &str) -> String {
+    let syntax = regex_syntax(body);
+    if syntax.top_level_alternation && !syntax.anchor {
+        return format!("({body})");
+    }
+    body.to_string()
+}
+
+/// `body` with [`ANY_RUN`] spelled at each open end, unless the expression already leaves
+/// that end open with one.
+fn opened(body: &str, at_start: bool, at_end: bool) -> String {
+    let mut expression = String::with_capacity(body.len() + 2 * ANY_RUN.len());
+    if at_start && !body.starts_with(ANY_RUN) {
+        expression.push_str(ANY_RUN);
+    }
+    expression.push_str(body);
+    if at_end && !body.ends_with(ANY_RUN) {
+        expression.push_str(ANY_RUN);
+    }
+    expression
 }
 
 /// Whether `text` alternates at its TOP level — a `|` that is not inside a group and not
@@ -2262,6 +2347,7 @@ mod tests {
         MAX_RECORDED_LEAVES, MAX_RECORDED_RENDERED_BYTES, MAX_RECORDED_RENDERINGS,
         MAX_RENDERED_CHILDREN, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
     };
+    use super::whole_value_expression;
     use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
     use std::collections::HashMap;
 
@@ -3233,6 +3319,99 @@ mod tests {
                 actual, stated,
                 "case {case:?}: expected unanchored_keeping_inner_anchors {stated:?}, got \
                  {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: [`super::whole_value_expression`] states the expression the WHOLE value must
+    /// match, deciding the two ends independently — an anchored end loses its anchor, an
+    /// open end is spelled with the unconstrained run it admits — while an expression that
+    /// anchors only its own branches is quoted as declared, and a top-level alternation
+    /// left bare by dropping BOTH anchors is kept grouped.
+    ///
+    /// The rows span every combination of the two ends (both anchored, neither, start only,
+    /// end only), the alternation forms the Bedrock family's published patterns take
+    /// (branches sharing one pair, branches anchored individually, branches anchored inside
+    /// their own groups), an expression that already opens an end with the run, and the
+    /// regex constructs that can hide an anchor or an alternation — an escape, a negated
+    /// class, a class whose first member is a literal bracket.
+    #[test]
+    fn the_whole_value_rendering_decides_the_two_ends_independently() {
+        // (case, the model's pattern, what `whole_value_expression` states)
+        let rows: [(&str, &str, &str); 16] = [
+            ("a plain whole-value pattern", "^[0-9]{12}$", "[0-9]{12}"),
+            // The recorded `SessionId` form: one branch, both ends anchored.
+            (
+                "a recorded single-branch label pattern",
+                "^[0-9a-zA-Z._:-]+$",
+                "[0-9a-zA-Z._:-]+",
+            ),
+            // The recorded `FlowIdentifier` form: two groups sharing one pair, neither
+            // branch anchored, so the leftover alternation is grouped.
+            (
+                "a top-level alternation of two unanchored groups",
+                "^(arn:[^:]+:flow/[0-9a-zA-Z]{10})|([0-9a-zA-Z]{10})$",
+                "((arn:[^:]+:flow/[0-9a-zA-Z]{10})|([0-9a-zA-Z]{10}))",
+            ),
+            ("a bare top-level alternation", "^a|b$", "(a|b)"),
+            // The recorded `FlowExecutionIdentifier` form: the two ends are the first and
+            // last branch's own anchors, and the interior ones stay where they are.
+            (
+                "branches anchored individually, sharing the outer pair",
+                "^[a-zA-Z0-9-]{1,36}$|^(arn:[^:]+:execution/x)$",
+                "[a-zA-Z0-9-]{1,36}$|^(arn:[^:]+:execution/x)",
+            ),
+            // The recorded `ModelIdentifier` form: the start is open, the end anchored.
+            (
+                "branches in their own groups with the anchors outside them",
+                "(^a)$|(^b)$",
+                ".*(^a)$|(^b)",
+            ),
+            (
+                "branches anchored inside their own groups",
+                "(^a$)|(^b$)",
+                "(^a$)|(^b$)",
+            ),
+            (
+                "one branch anchored inside its own group",
+                "(^arn:[^:]+:session/x$)",
+                "(^arn:[^:]+:session/x$)",
+            ),
+            ("anchored at the start only", "^abc", "abc.*"),
+            ("anchored at the end only", "abc$", ".*abc"),
+            ("no anchors at all", "[0-9]+", ".*[0-9]+.*"),
+            (
+                "an expression that already opens its tail with the run",
+                "^abc.*",
+                "abc.*",
+            ),
+            (
+                "a trailing escaped dollar, which is a literal and no anchor",
+                r"^cost\$",
+                r"cost\$.*",
+            ),
+            (
+                "a caret inside a negated class, which is not an anchor",
+                "^[^:]+$",
+                "[^:]+",
+            ),
+            (
+                "a pipe inside a character class, which is a literal",
+                "^[a|b]{2}$",
+                "[a|b]{2}",
+            ),
+            (
+                "a literal bracket opening a class, with a pipe inside it",
+                "^[]|]a$",
+                "[]|]a",
+            ),
+        ];
+
+        for (case, pattern, stated) in rows {
+            let actual = whole_value_expression(pattern);
+            assert_eq!(
+                actual, stated,
+                "case {case:?}: expected whole_value_expression {stated:?}, got {actual:?}"
             );
         }
     }
