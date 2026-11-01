@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status_message: None,
             auto_scaling_status: Some(fleet.auto_scaling_status().to_string()),
             target_worker_count: Some(fleet.target_worker_count()),
-            worker_count: fleet.worker_count,
+            worker_count: fleet.worker_count(),
             min_worker_count: fleet.min_worker_count,
             max_worker_count: fleet.max_worker_count,
             configuration: fleet.configuration.clone(),

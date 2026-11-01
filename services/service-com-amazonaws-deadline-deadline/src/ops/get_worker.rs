@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWorker
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWorker`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWorker::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one worker back: this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +150,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWorker` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWorkerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWorker"))
+        // A read: nothing below writes, so a later caller sees exactly what it would have
+        // seen had this call never happened.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetWorkerErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // A worker is reached only through its own fleet and that fleet only through its
+        // own farm, so the 404 names the level that is missing.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(GetWorkerErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        if store.fleet(&input.farm_id, &input.fleet_id).is_none() {
+            return Err(GetWorkerErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FLEET, &input.fleet_id),
+            )
+            .into());
+        }
+        let Some(worker) = store.worker(&input.farm_id, &input.fleet_id, &input.worker_id) else {
+            return Err(GetWorkerErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_WORKER, &input.worker_id),
+            )
+            .into());
+        };
+
+        Ok(GetWorkerOutput {
+            farm_id: worker.farm_id.clone(),
+            fleet_id: worker.fleet_id.clone(),
+            worker_id: worker.worker_id.clone(),
+            host_properties: worker.host_properties(),
+            status: worker.status.clone(),
+            // `log` is the configuration of the worker's own log destination, which the
+            // worker's session logs are written to. Nothing in this emulator writes those
+            // logs, so there is no destination to report rather than one it made up.
+            log: None,
+            created_at: crate::state::timestamp(worker.created_at),
+            created_by: worker.created_by.clone(),
+            updated_at: worker.updated_at.map(crate::state::timestamp),
+            updated_by: worker.updated_by.clone(),
+        })
     }
 }

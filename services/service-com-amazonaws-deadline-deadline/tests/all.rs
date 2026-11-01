@@ -27,3 +27,5 @@ mod limit;
 mod state_roundtrip;
 #[path = "all/storage_profile.rs"]
 mod storage_profile;
+#[path = "all/worker.rs"]
+mod worker;

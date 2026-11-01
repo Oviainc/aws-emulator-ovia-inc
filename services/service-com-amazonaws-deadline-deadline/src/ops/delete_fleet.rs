@@ -198,11 +198,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The client token the fleet's own create spent is released with the fleet, so
-        // the idempotency record does not outlive the resources it describes. The record
-        // this delete leaves in its place is what makes its own retry recognizable, and
-        // is evicted at the store's token cap like every other entry.
-        store.forget_resources(::std::slice::from_ref(&removed_fleet.fleet_id));
+        // The client token the fleet's own create spent is released with the fleet, and so
+        // are the tokens spent by the creates of the workers it held: a worker is reachable
+        // only through its fleet, so this removal took them with it and no idempotency
+        // record outlives the resources it describes. The record this delete leaves in its
+        // place is what makes its own retry recognizable, and is evicted at the store's
+        // token cap like every other entry.
+        let mut removed: Vec<String> = vec![removed_fleet.fleet_id.clone()];
+        removed.extend(removed_fleet.workers.keys().cloned());
+        store.forget_resources(&removed);
         if let Some(key) = token {
             store.remember_resource(key, &removed_fleet.fleet_id);
         }

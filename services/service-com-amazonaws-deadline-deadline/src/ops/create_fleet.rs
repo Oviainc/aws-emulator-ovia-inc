@@ -366,7 +366,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // non-terminal status and the move to ACTIVE is owed by the clock.
                 status: crate::state::FLEET_STATUS_CREATE_IN_PROGRESS.to_string(),
                 // Nothing has registered a worker with a fleet this call has just made.
-                worker_count: 0,
+                workers: ::std::collections::HashMap::new(),
                 tags: input.tags.unwrap_or_default(),
                 created_at: ::std::time::SystemTime::now(),
                 created_by,

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorker
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorker`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorker::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a worker with a fleet: this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +156,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorker` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorker"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateWorkerErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // `clientToken` is `@idempotencyToken`: a retry of the same create must answer with
+        // the worker the first call registered, not register a second one. The token is
+        // scoped to this operation and to the fleet the worker joins, so the same token
+        // replayed on another fleet is a different record.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, &input.fleet_id, token));
+        if let Some(key) = token.as_deref() {
+            if let Some(worker_id) = store.remembered_resource(key).map(str::to_string) {
+                if store
+                    .worker(&input.farm_id, &input.fleet_id, &worker_id)
+                    .is_some()
+                {
+                    return Ok(CreateWorkerOutput { worker_id });
+                }
+            }
+        }
+
+        // The id and the principal are taken before the fleet is borrowed, so the fleet
+        // this worker is stored under is reached exactly once.
+        let worker_id = store.mint_id("worker");
+        let created_by = crate::state::caller_principal(ctx);
+
+        // A worker joins a fleet of a farm, so an unheld farm or an unheld fleet is a 404
+        // naming the level that is missing, and nothing is registered.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(CreateWorkerErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        let Some(fleet) = store.fleet_mut(&input.farm_id, &input.fleet_id) else {
+            return Err(CreateWorkerErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FLEET, &input.fleet_id),
+            )
+            .into());
+        };
+
+        // The service keeps a fleet's worker count at or below the fleet's own
+        // `maxWorkerCount`, and this emulator holds no more workers for one fleet than
+        // `MAX_WORKERS_PER_FLEET`, so the fleet's capacity is the smaller of the two. The
+        // fleet is the resource in conflict: its current worker count, not anything in this
+        // request, is what leaves no room, and a worker leaving makes room again.
+        let capacity = i64::from(fleet.max_worker_count)
+            .min(crate::state::MAX_WORKERS_PER_FLEET as i64);
+        if i64::from(fleet.worker_count()) >= capacity {
+            return Err(CreateWorkerErrorModeled::ConflictException(
+                crate::state::fleet_at_worker_capacity(&input.fleet_id, capacity),
+            )
+            .into());
+        }
+
+        fleet.workers.insert(
+            worker_id.clone(),
+            crate::state::Worker {
+                worker_id: worker_id.clone(),
+                fleet_id: input.fleet_id.clone(),
+                farm_id: input.farm_id.clone(),
+                host_properties: input.host_properties,
+                // The worker is registered, and nothing has reported it onward yet.
+                status: crate::state::WORKER_STATUS_CREATED.to_string(),
+                tags: input.tags.unwrap_or_default(),
+                created_at: ::std::time::SystemTime::now(),
+                created_by,
+                updated_at: None,
+                updated_by: None,
+            },
+        );
+        if let Some(key) = token {
+            store.remember_resource(key, &worker_id);
+        }
+
+        Ok(CreateWorkerOutput { worker_id })
     }
 }

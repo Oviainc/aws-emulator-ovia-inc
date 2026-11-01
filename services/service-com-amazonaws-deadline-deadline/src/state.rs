@@ -51,6 +51,15 @@ pub const AUTO_SCALING_STATUS_STEADY: &str = "STEADY";
 /// `AutoScalingStatus` a fleet carries while it holds more workers than its target.
 pub const AUTO_SCALING_STATUS_SHRINKING: &str = "SHRINKING";
 
+/// `WorkerStatus` a worker carries from the moment it is registered.
+///
+/// From `smithy_query(query="shape", shape="WorkerStatus")`: `CREATED`, `STARTED`,
+/// `STOPPING`, `STOPPED`, `NOT_RESPONDING`, `NOT_COMPATIBLE`, `RUNNING`, `IDLE`. A worker
+/// is the agent's own registration, and only the agent reports it onward
+/// (`UpdatedWorkerStatus` is `STARTED` | `STOPPING` | `STOPPED`), so a registered worker
+/// stays here until a call moves it: nothing about this status is owed by the clock.
+pub const WORKER_STATUS_CREATED: &str = "CREATED";
+
 /// `JobLifecycleStatus` a job carries while the service is still assembling it.
 ///
 /// From `smithy_query(query="shape", shape="JobLifecycleStatus")`.
@@ -89,6 +98,9 @@ pub const RESOURCE_TYPE_FARM: &str = "farm";
 pub const RESOURCE_TYPE_QUEUE: &str = "queue";
 /// `resourceType` this service reports for a fleet in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_FLEET: &str = "fleet";
+/// `resourceType` this service reports for a worker in `ResourceNotFoundException` and
+/// `ConflictException`.
+pub const RESOURCE_TYPE_WORKER: &str = "worker";
 /// `resourceType` this service reports for a job in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_JOB: &str = "job";
 /// `resourceType` this service reports for a budget in `ResourceNotFoundException`.
@@ -131,6 +143,14 @@ pub const MAX_JOBS_PER_QUEUE: usize = 1000;
 
 /// How many fleets one farm holds at once. See [`MAX_FARMS`].
 pub const MAX_FLEETS_PER_FARM: usize = 500;
+
+/// How many workers this emulator stores for one fleet.
+///
+/// A fleet's own `maxWorkerCount` is the service's limit on its worker count, but it is a
+/// caller-chosen `MinZeroMaxInteger`, so it bounds nothing this process has to hold: this
+/// is the store's own ceiling on an insert only a delete releases, alongside the other
+/// per-parent bounds here.
+pub const MAX_WORKERS_PER_FLEET: usize = 500;
 
 /// How many budgets one farm holds at once. See [`MAX_FARMS`].
 pub const MAX_BUDGETS_PER_FARM: usize = 500;
@@ -254,12 +274,10 @@ pub struct Fleet {
     pub configuration: crate::ops::types::FleetConfiguration,
     pub host_configuration: Option<crate::ops::types::HostConfiguration>,
     pub status: String,
-    /// How many workers this emulator holds for the fleet.
-    ///
-    /// A fleet is created holding none, and it stays at none until the worker operations
-    /// (`CreateWorker` / `DeleteWorker`, still scaffolds) are implemented and keep it in
-    /// step as they register and remove workers.
-    pub worker_count: i32,
+    /// The workers registered with this fleet, keyed by `workerId`, exactly as the model's
+    /// paths nest them (`/2023-10-12/farms/{farmId}/fleets/{fleetId}/workers/{workerId}`),
+    /// so a worker is reachable only through its own fleet and its count has one source.
+    pub workers: HashMap<String, Worker>,
     pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
     pub created_by: String,
@@ -284,6 +302,15 @@ impl Fleet {
         }
     }
 
+    /// How many workers are registered with the fleet.
+    ///
+    /// Derived from the workers the fleet holds rather than counted alongside them, so a
+    /// create or a delete cannot leave the reported count and the stored workers
+    /// disagreeing.
+    pub fn worker_count(&self) -> i32 {
+        i32::try_from(self.workers.len()).unwrap_or(i32::MAX)
+    }
+
     /// How many workers the fleet is scaling towards.
     ///
     /// Nothing schedules work onto a fleet in this emulator, so the only pull on its
@@ -297,7 +324,7 @@ impl Fleet {
     ///
     /// [`target_worker_count`]: Self::target_worker_count
     pub fn auto_scaling_status(&self) -> &'static str {
-        match self.worker_count.cmp(&self.target_worker_count()) {
+        match self.worker_count().cmp(&self.target_worker_count()) {
             ::std::cmp::Ordering::Less => AUTO_SCALING_STATUS_GROWING,
             ::std::cmp::Ordering::Equal => AUTO_SCALING_STATUS_STEADY,
             ::std::cmp::Ordering::Greater => AUTO_SCALING_STATUS_SHRINKING,
@@ -332,6 +359,40 @@ impl Fleet {
         Some(crate::ops::types::FleetCapabilities {
             amounts,
             attributes,
+        })
+    }
+}
+
+/// A persisted worker, as `CreateWorker` registered it under its fleet.
+#[derive(Debug, Clone)]
+pub struct Worker {
+    pub worker_id: String,
+    pub fleet_id: String,
+    pub farm_id: String,
+    pub host_properties: Option<crate::ops::types::HostPropertiesRequest>,
+    pub status: String,
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    pub created_by: String,
+    pub updated_at: Option<SystemTime>,
+    pub updated_by: Option<String>,
+}
+
+impl Worker {
+    /// The worker's host properties as a response reports them.
+    ///
+    /// A request carries only the host's own addresses and name
+    /// (`HostPropertiesRequest`), while the response shape adds the host EC2 instance's
+    /// ARN and type. This emulator launches no instance for a worker, so those two are
+    /// reported by nothing; a worker registered without host properties at all has none
+    /// to report and the member is left out rather than sent empty.
+    pub fn host_properties(&self) -> Option<crate::ops::types::HostPropertiesResponse> {
+        let properties = self.host_properties.as_ref()?;
+        Some(crate::ops::types::HostPropertiesResponse {
+            ip_addresses: properties.ip_addresses.clone(),
+            host_name: properties.host_name.clone(),
+            ec2_instance_arn: None,
+            ec2_instance_type: None,
         })
     }
 }
@@ -569,6 +630,18 @@ impl ComAmazonawsDeadlineDeadlineState {
         self.farms.get(farm_id)?.fleets.get(fleet_id)
     }
 
+    /// Mutable form of [`fleet`](Self::fleet).
+    pub fn fleet_mut(&mut self, farm_id: &str, fleet_id: &str) -> Option<&mut Fleet> {
+        self.farms.get_mut(farm_id)?.fleets.get_mut(fleet_id)
+    }
+
+    /// The worker `worker_id` names UNDER `farm_id`/`fleet_id`: a worker of another fleet
+    /// is not found here, because the model reaches a worker only through its own fleet's
+    /// path.
+    pub fn worker(&self, farm_id: &str, fleet_id: &str, worker_id: &str) -> Option<&Worker> {
+        self.fleet(farm_id, fleet_id)?.workers.get(worker_id)
+    }
+
     /// Mutable form of [`queue`](Self::queue).
     pub fn queue_mut(&mut self, farm_id: &str, queue_id: &str) -> Option<&mut Queue> {
         self.farms.get_mut(farm_id)?.queues.get_mut(queue_id)
@@ -698,6 +771,30 @@ pub fn quota_exceeded(
         service_code: "deadline".to_string(),
         quota_code: QUOTA_CODE_RESOURCE_COUNT.to_string(),
         resource_id: None,
+        context: None,
+    }
+}
+
+/// The 409 this service answers when a fleet already holds every worker it can hold.
+///
+/// The service documents a fleet's worker count as limited to its `maxWorkerCount`, so the
+/// fleet is the resource in conflict and the message names the capacity the registration
+/// ran into; `capacity` is read from the fleet, never from the request.
+pub fn fleet_at_worker_capacity(
+    fleet_id: &str,
+    capacity: i64,
+) -> crate::ops::types::ConflictException {
+    crate::ops::types::ConflictException {
+        message: format!(
+            "The fleet {fleet_id} already has its maximum worker count of {capacity} workers."
+        ),
+        // From `smithy_query(query="shape", shape="ConflictExceptionReason")`:
+        // CONFLICT_EXCEPTION, CONCURRENT_MODIFICATION, RESOURCE_ALREADY_EXISTS,
+        // RESOURCE_IN_USE, STATUS_CONFLICT. Every worker the fleet holds is in use by it,
+        // which is what leaves no room for another.
+        reason: "RESOURCE_IN_USE".to_string(),
+        resource_id: fleet_id.to_string(),
+        resource_type: RESOURCE_TYPE_FLEET.to_string(),
         context: None,
     }
 }
