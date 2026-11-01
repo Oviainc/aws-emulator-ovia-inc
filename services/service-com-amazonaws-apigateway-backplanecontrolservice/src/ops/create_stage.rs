@@ -155,7 +155,12 @@ pub fn validate_stage_name(stage_name: &str) -> Result<(), String> {
 /// `methodSettings` is reported even when empty: every stage has the map, and it is what
 /// `UpdateStage` fills. `cacheClusterStatus` is computed from the stored record (see
 /// [`StageEntry::cache_cluster_status`]).
-pub fn stage_body(entry: &StageEntry) -> CreateStageOutput {
+///
+/// `web_acl_arn` is NOT a field of the record: it is the web ACL WAF currently has in
+/// front of this stage ([`crate::state::associated_web_acl_arn`]), which the caller
+/// resolves with this service's store unlocked and hands in, so every reader of a stage
+/// reports the one live association and none of them can report a stale one.
+pub fn stage_body(entry: &StageEntry, web_acl_arn: Option<String>) -> CreateStageOutput {
     CreateStageOutput {
         deployment_id: Some(entry.deployment_id.clone()),
         client_certificate_id: entry.client_certificate_id.clone(),
@@ -182,8 +187,10 @@ pub fn stage_body(entry: &StageEntry) -> CreateStageOutput {
         access_log_settings: entry.access_log_settings.clone(),
         canary_settings: entry.canary_settings.clone(),
         tracing_enabled: entry.tracing_enabled,
-        // Set by associating a WebACL through AWS WAF, which this service does not model.
-        web_acl_arn: None,
+        // "The ARN of the WebAcl associated with the Stage" (`Stage$webAclArn`): set by
+        // associating a web ACL with this stage's ARN through AWS WAF, so it is read from
+        // that association on every report rather than stored here.
+        web_acl_arn,
         tags: (!entry.tags.is_empty()).then(|| {
             entry
                 .tags
@@ -429,11 +436,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_date: Some(now),
             last_updated_date: Some(now),
         };
+        let region = api.arn_region().to_string();
         api.stages.insert(input.stage_name.clone(), entry);
         let stored = api
             .stages
             .get(&input.stage_name)
             .ok_or_else(crate::state::state_unavailable)?;
-        Ok(stage_body(stored))
+        let body = stage_body(stored, None);
+        // The web ACL in front of the stage is WAFv2's record, read with this service's
+        // store released: a stage can already be protected when it is created, because a
+        // web ACL is bound to the stage's ARN rather than to the record this call wrote.
+        drop(store);
+        Ok(CreateStageOutput {
+            web_acl_arn: crate::state::associated_web_acl_arn(
+                &*self.engine,
+                &region,
+                &input.rest_api_id,
+                &input.stage_name,
+            ),
+            ..body
+        })
     }
 }

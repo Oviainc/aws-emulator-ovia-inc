@@ -862,7 +862,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Rendered through the one `Stage` body this crate builds, from the record about
         // to be stored, so the update reports the stage exactly as `GetStage` will read
         // it back.
-        let body = super::create_stage::stage_body(&updated);
+        let body = super::create_stage::stage_body(&updated, None);
+        let region = api.arn_region().to_string();
         api.stages.insert(input.stage_name.clone(), updated);
         let output = UpdateStageOutput {
             deployment_id: body.deployment_id,
@@ -878,7 +879,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             access_log_settings: body.access_log_settings,
             canary_settings: body.canary_settings,
             tracing_enabled: body.tracing_enabled,
-            web_acl_arn: body.web_acl_arn,
+            web_acl_arn: None,
             tags: body.tags,
             created_date: body.created_date,
             last_updated_date: body.last_updated_date,
@@ -886,6 +887,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Everything below is owned, so the lock is released before the audit record is
         // emitted: the critical section covers the state change only.
         drop(store);
+        // "The ARN of the WebAcl associated with the Stage": WAFv2's own record, read
+        // with this service's store released, so the update reports the web ACL in front
+        // of the stage exactly as `GetStage` reads it back.
+        let output = UpdateStageOutput {
+            web_acl_arn: crate::state::associated_web_acl_arn(
+                &*self.engine,
+                &region,
+                &input.rest_api_id,
+                &input.stage_name,
+            ),
+            ..output
+        };
         // The access record for a state-changing operation: who, what, and the outcome.
         ::tracing::info!(
             target: crate::state::AUDIT_TARGET,

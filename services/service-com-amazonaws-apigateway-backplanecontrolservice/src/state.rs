@@ -4299,6 +4299,44 @@ pub fn service_arn(region: &str, resource_path: &str) -> String {
     format!("arn:aws:{ARN_SERVICE}:{region}::{resource_path}")
 }
 
+/// The ARN of the stage `stage_name` of the api `rest_api_id`, created in `region`: the
+/// ARN a web ACL is put in front of a stage BY, and the one every reader of that stage
+/// resolves its web ACL through.
+pub fn stage_arn(region: &str, rest_api_id: &str, stage_name: &str) -> String {
+    tagged_resource_arn(
+        region,
+        &TaggedResource::Stage {
+            rest_api_id: rest_api_id.to_string(),
+            stage_name: stage_name.to_string(),
+        },
+    )
+}
+
+/// The ARN of the web ACL WAF currently has in front of one stage of this service, or
+/// `None` when no web ACL is associated with it.
+///
+/// `Stage$webAclArn` is "The ARN of the WebAcl associated with the Stage", and that
+/// association is WAFv2's own record — `AssociateWebACL` binds a web ACL to the stage's
+/// ARN and `DisassociateWebACL` takes it away — so it is READ from there on every report
+/// rather than copied onto the stage: a stage cannot then report a binding WAF no longer
+/// holds, and a binding made before or after the stage was read needs nothing written
+/// here. It is the same record the data plane asks for its decision
+/// (`crate::service::invoke`), so the report and the edge cannot disagree.
+///
+/// Call it with NO lock of this service's store held: it locks the wafv2 store, and that
+/// service holds no record of this one, so the two are never held at the same time.
+pub fn associated_web_acl_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    rest_api_id: &str,
+    stage_name: &str,
+) -> Option<String> {
+    let arn = stage_arn(region, rest_api_id, stage_name);
+    let waf = ::service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(engine)?;
+    let store = waf.lock();
+    store.web_acl_associations.get(&arn).cloned()
+}
+
 /// The ARN of the stored custom domain name addressed by `key` (a [`domain_name_key`]).
 pub fn domain_name_arn(region: &str, key: &str) -> String {
     tagged_resource_arn(

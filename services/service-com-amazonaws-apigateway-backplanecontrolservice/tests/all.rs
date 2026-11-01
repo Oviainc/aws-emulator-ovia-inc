@@ -26,6 +26,9 @@ mod passed_through_integration;
 // Declared here, at the head, for the reason the entry above records.
 #[path = "all/stage_web_acl_edge.rs"]
 mod stage_web_acl_edge;
+// Declared here, at the head, for the reason the entry above records.
+#[path = "all/stage_web_acl_association_report.rs"]
+mod stage_web_acl_association_report;
 
 #[path = "all/account_settings.rs"]
 mod account_settings;

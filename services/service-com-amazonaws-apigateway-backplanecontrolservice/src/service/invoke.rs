@@ -1509,17 +1509,15 @@ fn web_acl_decision<Eng: Send + Sync + 'static>(
             return EdgeOutcome::Unchanged;
         }
         (
-            // The Region comes from the api's own record, because the ARN the web ACL
-            // was bound by is the stage's one ARN: `AssociateWebACL` is given the ARN
-            // of a stage created in a Region, while a client invoking that stage
-            // reaches this emulator at a host that need not spell any Region, so a
-            // Region read off the request would look up a key nothing ever stored.
-            crate::state::tagged_resource_arn(
+            crate::state::stage_arn(
+                // The Region comes from the api's own record, because the ARN the web ACL
+                // was bound by is the stage's one ARN: `AssociateWebACL` is given the ARN
+                // of a stage created in a Region, while a client invoking that stage
+                // reaches this emulator at a host that need not spell any Region, so a
+                // Region read off the request would look up a key nothing ever stored.
                 resolved.api.arn_region(),
-                &crate::state::TaggedResource::Stage {
-                    rest_api_id: resolved.api.id.clone(),
-                    stage_name: stage_name.to_string(),
-                },
+                &resolved.api.id,
+                stage_name,
             ),
             resolved.invoke_path.to_string(),
         )

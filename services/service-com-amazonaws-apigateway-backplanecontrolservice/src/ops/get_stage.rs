@@ -190,7 +190,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(crate::state::NO_SUCH_STAGE.to_string()),
             })
         })?;
-        let body = super::create_stage::stage_body(stage);
+        let region = api.arn_region().to_string();
+        let body = super::create_stage::stage_body(stage, None);
+        // The web ACL in front of the stage is WAFv2's own record, so it is read with
+        // this service's store released.
+        drop(store);
+        let web_acl_arn = crate::state::associated_web_acl_arn(
+            &*self.engine,
+            &region,
+            &input.rest_api_id,
+            &input.stage_name,
+        );
         Ok(GetStageOutput {
             deployment_id: body.deployment_id,
             client_certificate_id: body.client_certificate_id,
@@ -205,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             access_log_settings: body.access_log_settings,
             canary_settings: body.canary_settings,
             tracing_enabled: body.tracing_enabled,
-            web_acl_arn: body.web_acl_arn,
+            web_acl_arn,
             tags: body.tags,
             created_date: body.created_date,
             last_updated_date: body.last_updated_date,

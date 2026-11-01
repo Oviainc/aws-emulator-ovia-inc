@@ -155,7 +155,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
             })
         })?;
-        let items = api
+        let region = api.arn_region().to_string();
+        let items: Vec<(String, CreateStageOutput)> = api
             .stages
             .values()
             // `deploymentId` NARROWS the collection ("The stages' deployment
@@ -170,7 +171,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             // One rendering of the `Stage` shape for the whole crate, so a listed stage
             // and a `GetStage` of the same record cannot differ member for member.
-            .map(super::create_stage::stage_body)
+            .map(|stage| {
+                (
+                    stage.stage_name.clone(),
+                    super::create_stage::stage_body(stage, None),
+                )
+            })
+            .collect();
+        // The web ACL in front of each stage is WAFv2's own record, so the listing is
+        // completed with this service's store released — one association lookup per
+        // listed stage, each the one `GetStage` of that stage reports.
+        drop(store);
+        let items: Vec<CreateStageOutput> = items
+            .into_iter()
+            .map(|(stage_name, body)| CreateStageOutput {
+                web_acl_arn: crate::state::associated_web_acl_arn(
+                    &*self.engine,
+                    &region,
+                    &input.rest_api_id,
+                    &stage_name,
+                ),
+                ..body
+            })
             .collect();
         // Reported even when empty: the API has the collection, and an absent `item`
         // would say something different from "no stage matches". The order is the stored
