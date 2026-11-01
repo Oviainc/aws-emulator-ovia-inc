@@ -819,12 +819,18 @@ async fn ids_narrow_the_account_to_the_checks_named() {
         );
     }
 
-    // An id of the right form that names no check, and one of no form at all: neither names
-    // a check of the account, which is what the refusal says.
-    for unknown in [
-        "asc-0123456789abcdef0",
-        "asc-12345678",
-        "not-an-application-status-check-id",
+    // An id this service cannot resolve is refused, and WHICH refusal says why: an id of the
+    // right form that names no check is `NotFound`, while a value that is no application
+    // status check id at all is `Malformed`, answered before any check is looked up.
+    for (unknown, code) in [
+        ("asc-0123456789abcdef0", "InvalidApplicationStatusCheckId.NotFound"),
+        ("asc-12345678", "InvalidApplicationStatusCheckId.NotFound"),
+        (
+            "not-an-application-status-check-id",
+            "InvalidApplicationStatusCheckId.Malformed",
+        ),
+        ("asc-0123456789abcdefg", "InvalidApplicationStatusCheckId.Malformed"),
+        ("appstatuscheck-0123456789abcdef0", "InvalidApplicationStatusCheckId.Malformed"),
     ] {
         let (status, body) = describe(
             &fixture.router,
@@ -837,8 +843,13 @@ async fn ids_narrow_the_account_to_the_checks_named() {
         );
         assert_eq!(
             ec2_query::error_code(&body),
-            "InvalidApplicationStatusCheckId.NotFound",
-            "case {unknown:?}: got body {body}"
+            code,
+            "case {unknown:?}: expected the code {code:?}, got body {body}"
+        );
+        let message = ec2_query::error_message(&body);
+        assert!(
+            message.contains(unknown),
+            "case {unknown:?}: expected the refusal to name the id, got {message:?}"
         );
     }
 }

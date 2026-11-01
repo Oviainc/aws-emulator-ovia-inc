@@ -28,8 +28,20 @@
 //! an unspecified member with, the published bounds it enforces, the quota it asks about, the
 //! bytes a stored check is charged and the comparison a replayed `ClientToken` is judged on
 //! all live here, beside the store they are about.
+//!
+//! What a check is ASSOCIATED with is the end of this module: the TAG associations are the
+//! check's own `TargetTagAssociations` member, so there is one copy of them and the describe
+//! reports exactly what an associate stored, while an INSTANCE association is the per-check
+//! result that instance holds in [`ComAmazonawsEc2Amazonec2State::application_status`] —
+//! "health monitoring automatically begins" the moment one is made, which is a result of
+//! `initializing` until something reports one.
 
-use crate::ops::types::{ApplicationStatusCheckResponseObject, HealthCheckPathResponseObject};
+use ::std::time::SystemTime;
+
+use crate::ops::types::{
+    ApplicationStatusCheckResponseObject, ApplicationStatusDetail, CustomTagKeyValueResponsePair,
+    HealthCheckPathResponseObject,
+};
 use crate::scaffolded::Scaffolded;
 
 use super::{same_tags, tag_list_bytes, ComAmazonawsEc2Amazonec2State};
@@ -133,28 +145,90 @@ pub const INVALID_APPLICATION_STATUS_CHECK_ID_NOT_FOUND: &str =
     "InvalidApplicationStatusCheckId.NotFound";
 
 /// Refuse a request that named an application status check id no check of the account has:
-/// HTTP 400 [`INVALID_APPLICATION_STATUS_CHECK_ID_NOT_FOUND`].
+/// HTTP 400 [`INVALID_APPLICATION_STATUS_CHECK_ID_NOT_FOUND`], `The application-status-check ID
+/// '<id>' does not exist`.
+///
+/// The resource is named the way this family's refusals name it — the hyphenated
+/// `application-status-check` of [`APPLICATION_STATUS_CHECK_TAGGABLE_RESOURCE`], which is also
+/// what [`invalid_application_status_check_id_malformed`] carries, so the two halves of the
+/// pair name one resource one way.
 pub fn invalid_application_status_check_id_not_found<E>(
     application_status_check_id: &str,
 ) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_APPLICATION_STATUS_CHECK_ID_NOT_FOUND,
         400,
-        format!("The application status check ID '{application_status_check_id}' does not exist"),
+        format!(
+            "The {APPLICATION_STATUS_CHECK_TAGGABLE_RESOURCE} ID '{}' does not exist",
+            super::echoed_resource_id(application_status_check_id)
+        ),
     )
 }
 
-/// Refuse an application status check id the request named that this service cannot resolve.
+/// `InvalidApplicationStatusCheckId.Malformed` (HTTP 400): the request named something that
+/// is not an application status check id AT ALL, so there is nothing to look up — the
+/// `.Malformed` half EC2 answers BEFORE it resolves an id, as
+/// [`INVALID_APPLICATION_STATUS_CHECK_ID_NOT_FOUND`] is the half it answers after.
+pub const INVALID_APPLICATION_STATUS_CHECK_ID_MALFORMED: &str =
+    "InvalidApplicationStatusCheckId.Malformed";
+
+/// Whether `id` is a well-formed application status check id — one this service could have
+/// issued.
 ///
-/// Unlike the route server and launch template ids, there is no `Malformed` half: the model
-/// publishes no pattern for `ApplicationStatusCheckId`, so nothing distinguishes "not an id
-/// of this kind" from "no such check" without inventing a pattern AWS does not publish.
-/// Every unresolvable id is therefore reported as the one thing that is known about it — the
-/// account holds no check for it.
+/// `<prefix>-<8 or 17 lowercase hex digits>`, read by the one generic id reader
+/// ([`super::prefixed_id_is_well_formed`]) under this resource's own prefix
+/// ([`APPLICATION_STATUS_CHECK_ID_PREFIX`]), which is also what
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] mints. A value under any other prefix is not an
+/// id of this kind, whatever its suffix looks like.
+pub fn application_status_check_id_is_well_formed(id: &str) -> bool {
+    super::prefixed_id_is_well_formed(APPLICATION_STATUS_CHECK_ID_PREFIX, id)
+}
+
+/// Refuse something that is not an application status check id at all: HTTP 400
+/// [`INVALID_APPLICATION_STATUS_CHECK_ID_MALFORMED`], `The application-status-check ID '<id>'
+/// is malformed`, built from the value the REQUEST sent (bounded by
+/// [`super::echoed_resource_id`]).
+///
+/// The sentence template this crate words every malformed resource id with — `The <resource
+/// type> ID '<id>' is malformed` — with this resource's own type name, the
+/// `application-status-check` member of the modelled `ResourceType` catalog that
+/// [`APPLICATION_STATUS_CHECK_TAGGABLE_RESOURCE`] already names once.
+pub fn invalid_application_status_check_id_malformed<E>(
+    application_status_check_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_APPLICATION_STATUS_CHECK_ID_MALFORMED,
+        400,
+        format!(
+            "The {APPLICATION_STATUS_CHECK_TAGGABLE_RESOURCE} ID '{}' is malformed",
+            super::echoed_resource_id(application_status_check_id)
+        ),
+    )
+}
+
+/// Refuse an `ApplicationStatusCheckId` that is not an id of this kind, BEFORE anything is
+/// looked up or any other member is read — the ordering EC2 keeps, so a caller can tell "not
+/// an id of this kind" from every other reason a request is refused.
+pub fn require_well_formed_application_status_check_id<E>(
+    application_status_check_id: &str,
+) -> Result<(), Scaffolded<E>> {
+    if !application_status_check_id_is_well_formed(application_status_check_id) {
+        return Err(invalid_application_status_check_id_malformed(
+            application_status_check_id,
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an application status check id the request named that this service cannot resolve: a
+/// MALFORMED one before an unknown one, the way this service orders the two for every resource
+/// kind whose id has both halves ([`require_well_formed_application_status_check_id`] and
+/// [`invalid_application_status_check_id_not_found`]).
 pub fn require_known_application_status_check<E>(
     store: &ComAmazonawsEc2Amazonec2State,
     application_status_check_id: &str,
 ) -> Result<(), Scaffolded<E>> {
+    require_well_formed_application_status_check_id(application_status_check_id)?;
     if !store
         .application_status_checks
         .contains_key(application_status_check_id)
@@ -255,7 +329,25 @@ pub fn application_status_check_payload_bytes(
         .saturating_add(check.path.as_deref().map_or(0, str::len))
         .saturating_add(check.status_code_matcher.as_deref().map_or(0, str::len))
         .saturating_add(paths)
+        .saturating_add(tag_association_bytes(
+            check.target_tag_associations.as_deref().unwrap_or_default(),
+        ))
         .saturating_add(client_token.map_or(0, str::len))
+}
+
+/// The caller-chosen bytes a check's TAG ASSOCIATIONS hold: the key and the value of each
+/// pair the caller asked the check to monitor.
+///
+/// Part of [`application_status_check_payload_bytes`] rather than a second charge of its own,
+/// so an association path charges exactly what a removal path gives back — and reachable on
+/// its own because `AssociateApplicationStatusCheck` has to ask what the pairs it is about to
+/// store would cost BEFORE it stores them.
+pub fn tag_association_bytes(pairs: &[CustomTagKeyValueResponsePair]) -> usize {
+    pairs.iter().fold(0, |bytes, pair| {
+        bytes
+            .saturating_add(pair.key.as_deref().map_or(0, str::len))
+            .saturating_add(pair.value.as_deref().map_or(0, str::len))
+    })
 }
 
 /// The caller-chosen bytes one health check path holds: the ids its source and each of its
@@ -352,3 +444,145 @@ fn same_health_check_paths(
                     })
         })
 }
+
+// =============================================================================
+// What a check is ASSOCIATED with
+// =============================================================================
+
+/// How many TAG associations one application status check may hold: "You can create a maximum
+/// of 50 tag associations for each application status check"
+/// (`AssociateApplicationStatusCheck`).
+///
+/// A DOCUMENTED ceiling rather than one this emulator chose, so it is the bound an association
+/// asks about, counted over the pairs the check would hold afterwards.
+pub const MAX_APPLICATION_STATUS_CHECK_TAG_ASSOCIATIONS: usize = 50;
+
+/// The `AssociationType` of a TAG association, as the association response objects spell it:
+/// "The type of association. Valid values: EC2TAG and INSTANCE_ID"
+/// (`SuccessfulAssociationResponseObject$AssociationType`).
+///
+/// A different spelling from the `AssociationTypeEnum` the association DESCRIBE reports
+/// (`tag`, `instance-id`): one association kind, two spellings, each a fact of the shape that
+/// carries it.
+pub const ASSOCIATION_TYPE_EC2_TAG: &str = "EC2TAG";
+
+/// The `AssociationType` of an INSTANCE association — see [`ASSOCIATION_TYPE_EC2_TAG`].
+pub const ASSOCIATION_TYPE_INSTANCE_ID: &str = "INSTANCE_ID";
+
+/// What separates the two halves of a tag association's reported value: "the value is
+/// formatted as `key=value`" (`SuccessfulAssociationResponseObject$AssociationValue`).
+pub const TAG_ASSOCIATION_VALUE_SEPARATOR: char = '=';
+
+/// The `AssociationValue` of one tag association: "For EC2TAG, the value is formatted as
+/// `key=value`" (`SuccessfulAssociationResponseObject$AssociationValue`) — the ONE place that
+/// value is built, so every reader of it reads one form.
+pub fn tag_association_value(key: &str, value: &str) -> String {
+    format!("{key}{TAG_ASSOCIATION_VALUE_SEPARATOR}{value}")
+}
+
+/// Whether `check` already monitors the instances carrying the tag `(key, value)`.
+///
+/// The PAIR is the association's identity, not the key alone: "Each tag is a key-value pair"
+/// (`AssociateApplicationStatusCheckRequest$TargetTagAssociations`), so one check can monitor
+/// two values of one key and neither displaces the other.
+pub fn holds_tag_association(
+    check: &ApplicationStatusCheckResponseObject,
+    key: &str,
+    value: &str,
+) -> bool {
+    check
+        .target_tag_associations
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|pair| {
+            pair.key.as_deref().unwrap_or_default() == key
+                && pair.value.as_deref().unwrap_or_default() == value
+        })
+}
+
+/// Whether the check `application_status_check_id` names already monitors `instance_id`.
+///
+/// An instance association IS the per-check result the instance holds for that check
+/// ([`ComAmazonawsEc2Amazonec2State::application_status`] keeps "the result of every
+/// application status check associated with this instance"), so the association is read off
+/// that one store rather than from a second map of associated instances that could disagree
+/// with it.
+pub fn holds_instance_association(
+    store: &ComAmazonawsEc2Amazonec2State,
+    application_status_check_id: &str,
+    instance_id: &str,
+) -> bool {
+    store
+        .application_status
+        .get(instance_id)
+        .is_some_and(|record| record.details.contains_key(application_status_check_id))
+}
+
+/// The per-check result an instance gets the moment a check is associated with it: the check
+/// applies and has reported nothing yet.
+///
+/// "Once you create an association, health monitoring automatically begins for the specified
+/// instances" (`AssociateApplicationStatusCheck`), and a check that is monitoring but has
+/// reported no result is `initializing` — "The check is initializing or has not reached a
+/// success or failure threshold" (`ApplicationStatusDetail$Status`). The detail carries the
+/// check's own aggregation setting, which is what decides whether it contributes to the
+/// instance-level status ([`super::aggregated_application_status`]).
+pub fn initializing_application_status_detail(
+    check: &ApplicationStatusCheckResponseObject,
+    at: SystemTime,
+) -> ApplicationStatusDetail {
+    let at = super::system_time_to_date_time(at);
+    ApplicationStatusDetail {
+        application_status_check_id: check.application_status_check_id.clone(),
+        check_update_time: Some(at),
+        aggregation: check.aggregation.clone(),
+        status: Some(super::APPLICATION_STATUS_CHECK_INITIALIZING.to_string()),
+        status_time_stamp: Some(at),
+        status_since: Some(at),
+        // "The reason for the current status" belongs to a check that reported one; nothing
+        // has reported yet.
+        reason: None,
+    }
+}
+
+/// Why `instance_id` cannot be monitored by an application status check, or `None` when the
+/// account holds that instance.
+///
+/// The SENTENCE this service refuses that instance id with
+/// ([`super::require_instance_record`], a malformed id before an unknown one), carried as one
+/// item's `Reason` instead of as a refusal of the whole request: the association operations
+/// report per-item outcomes ("The associations that were successfully created" beside "The
+/// associations that failed to be created"), so one instance the account does not hold fails
+/// on its own row and the rest of the request is still carried out.
+pub fn instance_association_failure_reason(
+    store: &ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+) -> Option<String> {
+    let refusal: Scaffolded<()> = match super::require_instance_record(store, instance_id) {
+        Ok(_) => return None,
+        Err(refusal) => refusal,
+    };
+    // `None` is the caller's "this instance can be monitored", so every refusal has to come
+    // back as a reason: the id reader answers one of this service's own error codes, and the
+    // modelled channel carries no message at all (EC2's model declares no error shape), so
+    // that one variant is worded from the id itself rather than reported as no failure.
+    Some(match refusal {
+        Scaffolded::ServiceError(refusal) => refusal.message,
+        Scaffolded::ValidationException(refusal) => refusal.message,
+        Scaffolded::NotImplemented(refusal) => refusal.message,
+        Scaffolded::Modeled(()) => super::invalid_id_message(instance_id),
+    })
+}
+
+/// Refuse an association that would take one check past the documented ceiling of tag
+/// associations: HTTP 400 [`super::RESOURCE_LIMIT_EXCEEDED`], the code this service answers
+/// for a published limit with no code of its own.
+pub fn tag_association_limit_exceeded<E>(held: usize, asked: usize) -> Scaffolded<E> {
+    super::resource_limit_exceeded(format!(
+        "An application status check holds at most \
+         {MAX_APPLICATION_STATUS_CHECK_TAG_ASSOCIATIONS} tag associations, and this one \
+         already holds {held}, so it cannot take {asked} more"
+    ))
+}
+

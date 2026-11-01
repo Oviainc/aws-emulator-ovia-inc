@@ -443,6 +443,11 @@ mod application_status_checks;
 // published bounds it refuses past, and the check it answers read back through the describe.
 #[path = "all/create_application_status_check.rs"]
 mod create_application_status_check;
+// What `AssociateApplicationStatusCheck` associates one check with — tag pairs on the check
+// itself and the monitoring that begins for each named instance — read back through
+// `DescribeApplicationStatusChecks` and `DescribeApplicationStatus`.
+#[path = "all/associate_application_status_check.rs"]
+mod associate_application_status_check;
 // What `AssignIpv6Addresses` takes out of the IPv6 block of the subnet a network interface
 // sits in, and records on that interface — named addresses and prefixes against a count of
 // each, read back through `DescribeNetworkInterfaces`.
