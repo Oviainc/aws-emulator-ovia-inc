@@ -130,6 +130,87 @@ pub fn foundation_model_arn(region: &str, model_id: &str) -> String {
     format!("arn:aws:bedrock:{region}::foundation-model/{model_id}")
 }
 
+/// The WHOLE projection of the published catalog row `model` that a listing
+/// (`ListFoundationModels`) and a read (`GetFoundationModel`) must both report for it in
+/// `region`: the ten members `FoundationModelSummary`/`FoundationModelDetails` declare
+/// (`smithy_query(query="shape",shape="FoundationModelSummary")`) and the nine capability
+/// members a catalog listing reports beside them.
+///
+/// Computed HERE from the row's own published attributes rather than by asking the service
+/// for them, so it is an independent statement of the rule a summary must satisfy:
+///
+/// * `modelFamily` is the row's family.
+/// * `inferenceAPIsSupported` carries `invokeModel` for every offered model, `converse` for
+///   one that produces TEXT, and the two OpenAI-compatible endpoints for a model that
+///   provider publishes.
+/// * `guardrailsSupported` holds of a model that produces TEXT — a guardrail decides about
+///   text and about nothing else, and is applied beside the invocation rather than built
+///   into the model's integration, so nothing else is needed of the model.
+/// * `featuresSupported` is the set of Amazon Bedrock features the row publishes support
+///   for, and `explicitPromptCaching`, `intelligentPromptRouting`,
+///   `latencyOptimizationSupported` and `batchSupported` each report whether that one
+///   feature is in it — each is a published per-model fact, so a model no feature's
+///   supported-models table lists supports none of them.
+/// * `converse` reports Converse support and whether it can be streamed.
+///
+/// Here rather than in one suite because the listing suite, the read suite and the
+/// capability suite all compare a response against it, and the projection they compare
+/// against must be ONE projection.
+pub fn expected_foundation_model_projection(
+    model: &bedrock::state::FoundationModel,
+    region: &str,
+) -> Value {
+    let conversational = model.output_modalities.contains(&"TEXT");
+    let published = |feature: &str| model.features_supported.contains(&feature);
+
+    let mut apis: Vec<&str> = Vec::new();
+    if conversational {
+        apis.push("converse");
+    }
+    apis.push("invokeModel");
+    if model.provider_name == "OpenAI" {
+        apis.push("openAiChatCompletions");
+        apis.push("openAiResponses");
+    }
+
+    let mut lifecycle = json!({
+        "status": model.lifecycle_status,
+        // Every offered model has launched, so its projection carries its launch instant.
+        "startOfLifeTime": model.start_of_life_time,
+    });
+    // Both ends of the legacy window AWS publishes, for a deprecated model and for no
+    // other; `publicExtendedAccessTime` is published for none.
+    if let Some(window) = model.legacy_window {
+        lifecycle["legacyTime"] = json!(window.entered_at);
+        lifecycle["endOfLifeTime"] = json!(window.end_of_life_at);
+    }
+
+    json!({
+        "modelArn": foundation_model_arn(region, model.model_id),
+        "modelId": model.model_id,
+        "modelName": model.model_name,
+        "providerName": model.provider_name,
+        "inputModalities": model.input_modalities,
+        "outputModalities": model.output_modalities,
+        "responseStreamingSupported": model.response_streaming_supported,
+        "customizationsSupported": model.customizations_supported,
+        "inferenceTypesSupported": model.inference_types_supported,
+        "modelLifecycle": lifecycle,
+        "modelFamily": model.model_family,
+        "inferenceAPIsSupported": apis,
+        "featuresSupported": model.features_supported,
+        "guardrailsSupported": conversational,
+        "explicitPromptCaching": published("PROMPT_CACHING"),
+        "intelligentPromptRouting": published("INTELLIGENT_PROMPT_ROUTING"),
+        "latencyOptimizationSupported": published("LATENCY_OPTIMIZATION"),
+        "batchSupported": published("BATCH_INFERENCE"),
+        "converse": {
+            "supported": conversational,
+            "streamingSupported": conversational && model.response_streaming_supported,
+        },
+    })
+}
+
 /// The bare error code out of an `__type` / `x-amzn-errortype` value, which may carry a
 /// namespace or a URL beside it.
 pub fn error_code(raw: &str) -> &str {

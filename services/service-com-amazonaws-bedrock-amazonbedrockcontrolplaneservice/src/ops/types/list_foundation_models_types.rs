@@ -20,13 +20,57 @@ pub struct ListFoundationModelsInput {
     pub by_inference_type: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#ListFoundationModelsResponse")]
+/// `ListFoundationModelsResponse`, plus `enableAccessToAllModelsByDefault`.
+///
+/// RECORDED behaviour, not modelled: the on-disk shape declares `modelSummaries` alone
+/// (`smithy_query(query="shape", shape="com.amazonaws.bedrock#ListFoundationModelsResponse")`),
+/// while a listing also reports whether this account reaches every model the catalog offers
+/// by default. The model evidently predates the member, so it is appended LAST — the
+/// model's own member keeps the index the model gives it, and a later model refresh that
+/// declares the flag only has to move it into place. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] for that reason; see `types/date_time_wire.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct ListFoundationModelsOutput {
     pub model_summaries: Option<Vec<FoundationModelSummary>>,
+    pub enable_access_to_all_models_by_default: Option<bool>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#FoundationModelSummary")]
+bedrock_schema_and_codec!(
+    ListFoundationModelsOutput,
+    LIST_FOUNDATION_MODELS_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#ListFoundationModelsResponse",
+    "com.amazonaws.bedrock",
+    "ListFoundationModelsResponse",
+    (
+        M_MODEL_SUMMARIES,
+        model_summaries,
+        "modelSummaries",
+        0,
+        opt,
+        list_of_struct(FoundationModelSummary)
+    ),
+    (
+        M_ENABLE_ACCESS_TO_ALL_MODELS_BY_DEFAULT,
+        enable_access_to_all_models_by_default,
+        "enableAccessToAllModelsByDefault",
+        1,
+        opt,
+        boolean
+    ),
+);
+
+/// `FoundationModelSummary`, plus the capability members a listing reports per model.
+///
+/// The first ten members are the model's, member for member, in its order:
+/// `smithy_query(query="shape", shape="com.amazonaws.bedrock#FoundationModelSummary")`.
+/// The nine after them are RECORDED behaviour, not modelled — the shape declares none of
+/// them, while a listing reports the model's family and what may be done with it
+/// (`crate::state::foundation_model_summary` computes each one from the catalog row) — so
+/// they are appended LAST, keeping the model's own indices intact for a later refresh.
+///
+/// Its schema and codec therefore come from [`bedrock_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]`, which can only emit the members the model
+/// declares; see `types/date_time_wire.rs` for that whole story.
 #[derive(Debug, Clone, Default)]
 pub struct FoundationModelSummary {
     pub model_arn: String,
@@ -39,5 +83,146 @@ pub struct FoundationModelSummary {
     pub customizations_supported: Option<Vec<String>>,
     pub inference_types_supported: Option<Vec<String>>,
     pub model_lifecycle: Option<FoundationModelLifecycle>,
+    pub model_family: Option<String>,
+    pub inference_apis_supported: Option<Vec<String>>,
+    pub features_supported: Option<Vec<String>>,
+    pub guardrails_supported: Option<bool>,
+    pub explicit_prompt_caching: Option<bool>,
+    pub intelligent_prompt_routing: Option<bool>,
+    pub latency_optimization_supported: Option<bool>,
+    pub batch_supported: Option<bool>,
+    pub converse: Option<ConverseSupport>,
 }
+
+bedrock_schema_and_codec!(
+    FoundationModelSummary,
+    FOUNDATION_MODEL_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrock#FoundationModelSummary",
+    "com.amazonaws.bedrock",
+    "FoundationModelSummary",
+    (M_MODEL_ARN, model_arn, "modelArn", 0, req, string),
+    (M_MODEL_ID, model_id, "modelId", 1, req, string),
+    (M_MODEL_NAME, model_name, "modelName", 2, opt, string),
+    (
+        M_PROVIDER_NAME,
+        provider_name,
+        "providerName",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_INPUT_MODALITIES,
+        input_modalities,
+        "inputModalities",
+        4,
+        opt,
+        list_of_string
+    ),
+    (
+        M_OUTPUT_MODALITIES,
+        output_modalities,
+        "outputModalities",
+        5,
+        opt,
+        list_of_string
+    ),
+    (
+        M_RESPONSE_STREAMING_SUPPORTED,
+        response_streaming_supported,
+        "responseStreamingSupported",
+        6,
+        opt,
+        boolean
+    ),
+    (
+        M_CUSTOMIZATIONS_SUPPORTED,
+        customizations_supported,
+        "customizationsSupported",
+        7,
+        opt,
+        list_of_string
+    ),
+    (
+        M_INFERENCE_TYPES_SUPPORTED,
+        inference_types_supported,
+        "inferenceTypesSupported",
+        8,
+        opt,
+        list_of_string
+    ),
+    (
+        M_MODEL_LIFECYCLE,
+        model_lifecycle,
+        "modelLifecycle",
+        9,
+        opt,
+        struct_of(FoundationModelLifecycle)
+    ),
+    (M_MODEL_FAMILY, model_family, "modelFamily", 10, opt, string),
+    (
+        M_INFERENCE_APIS_SUPPORTED,
+        inference_apis_supported,
+        "inferenceAPIsSupported",
+        11,
+        opt,
+        list_of_string
+    ),
+    (
+        M_FEATURES_SUPPORTED,
+        features_supported,
+        "featuresSupported",
+        12,
+        opt,
+        list_of_string
+    ),
+    (
+        M_GUARDRAILS_SUPPORTED,
+        guardrails_supported,
+        "guardrailsSupported",
+        13,
+        opt,
+        boolean
+    ),
+    (
+        M_EXPLICIT_PROMPT_CACHING,
+        explicit_prompt_caching,
+        "explicitPromptCaching",
+        14,
+        opt,
+        boolean
+    ),
+    (
+        M_INTELLIGENT_PROMPT_ROUTING,
+        intelligent_prompt_routing,
+        "intelligentPromptRouting",
+        15,
+        opt,
+        boolean
+    ),
+    (
+        M_LATENCY_OPTIMIZATION_SUPPORTED,
+        latency_optimization_supported,
+        "latencyOptimizationSupported",
+        16,
+        opt,
+        boolean
+    ),
+    (
+        M_BATCH_SUPPORTED,
+        batch_supported,
+        "batchSupported",
+        17,
+        opt,
+        boolean
+    ),
+    (
+        M_CONVERSE,
+        converse,
+        "converse",
+        18,
+        opt,
+        struct_of(ConverseSupport)
+    ),
+);
 

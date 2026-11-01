@@ -1473,6 +1473,41 @@ bedrock_schema_and_codec!(
     ),
 );
 
+/// What the Converse API supports for one published foundation model, as the `converse`
+/// member of a `FoundationModelSummary` / `FoundationModelDetails` carries it.
+///
+/// RECORDED behaviour, not modelled: the on-disk model declares no shape of this name and
+/// no `converse` member on either of those two structures
+/// (`smithy_query(query="shape", shape="com.amazonaws.bedrock#FoundationModelSummary")`),
+/// while a listing of the catalog reports Converse metadata per model. Its schema and
+/// codec therefore come from [`bedrock_schema_and_codec!`], like every other structure in
+/// this service whose wire form the derive cannot emit — see `types/date_time_wire.rs`.
+///
+/// Both members are optional, because neither is `@required` anywhere: nothing in the
+/// model constrains a shape the model does not declare.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConverseSupport {
+    pub supported: Option<bool>,
+    pub streaming_supported: Option<bool>,
+}
+
+bedrock_schema_and_codec!(
+    ConverseSupport,
+    FOUNDATION_MODEL_CONVERSE_SUPPORT_SCHEMA,
+    "com.amazonaws.bedrock#FoundationModelConverseSupport",
+    "com.amazonaws.bedrock",
+    "FoundationModelConverseSupport",
+    (M_SUPPORTED, supported, "supported", 0, opt, boolean),
+    (
+        M_STREAMING_SUPPORTED,
+        streaming_supported,
+        "streamingSupported",
+        1,
+        opt,
+        boolean
+    ),
+);
+
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrock#PromptRouterTargetModel")]
 #[derive(Debug, Clone, Default)]
 pub struct PromptRouterTargetModel {

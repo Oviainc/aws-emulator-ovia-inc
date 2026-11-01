@@ -10,6 +10,13 @@
 //! `ops/get_foundation_model.rs` also reports a model through, so a listing and a read
 //! cannot disagree about a model.
 //!
+//! Beside the summaries, the response reports whether this account reaches every model the
+//! catalog offers by default
+//! ([`crate::state::FoundationModelAccessDefault`]) — an account-level fact, so it is
+//! reported once rather than per summary. The on-disk model declares neither it nor the
+//! capability members a summary carries; `types/list_foundation_models_types.rs` says where
+//! their wire form comes from.
+//!
 //! A pure read: the catalog is published rather than created, so no call of this operation
 //! writes anything, and two listings of the same filters answer alike.
 //!
@@ -184,6 +191,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListFoundationModelsOutput {
             model_summaries: Some(model_summaries),
+            // Whether a model this listing reports needs an access request before it can be
+            // invoked is an ACCOUNT-level fact, so it is reported once beside the models
+            // rather than per summary, read off the store like the catalog itself.
+            enable_access_to_all_models_by_default: Some(
+                store.foundation_model_access_default.enabled(),
+            ),
         })
     }
 }

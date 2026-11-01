@@ -38,13 +38,16 @@
 //! `GetFoundationModelIdentifier`), and the requests go through `crate::support` — the ONE
 //! harness every suite in this crate drives the emulator with.
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::{
     FoundationModel, FOUNDATION_MODELS,
 };
 
-use crate::support::{emulator, error_code, foundation_model_arn as model_arn, label, Emulator, Reply, REGION};
+use crate::support::{
+    emulator, error_code, expected_foundation_model_projection,
+    foundation_model_arn as model_arn, label, Emulator, Reply, REGION,
+};
 
 /// The path `GetFoundationModel` is bound to
 /// (`smithy_query(query="operation",operation="GetFoundationModel")`: `GET
@@ -93,31 +96,11 @@ fn details(case: &str, reply: &Reply) -> Value {
 }
 
 /// The `FoundationModelDetails` a read of `model` in `region` must report, read off the
-/// catalog row itself.
+/// catalog row itself — the ONE projection the listing suite compares against too
+/// ([`crate::support::expected_foundation_model_projection`]), because a read of a model and
+/// a listing that carries it must agree member for member.
 fn expected_details(model: &FoundationModel, region: &str) -> Value {
-    let mut lifecycle = json!({
-        "status": model.lifecycle_status,
-        // Every offered model has launched, so a read reports its launch instant.
-        "startOfLifeTime": model.start_of_life_time,
-    });
-    // Both ends of the legacy window AWS publishes, for a deprecated model and for no
-    // other; `publicExtendedAccessTime` is published for none.
-    if let Some(window) = model.legacy_window {
-        lifecycle["legacyTime"] = json!(window.entered_at);
-        lifecycle["endOfLifeTime"] = json!(window.end_of_life_at);
-    }
-    json!({
-        "modelArn": format!("arn:aws:bedrock:{region}::foundation-model/{}", model.model_id),
-        "modelId": model.model_id,
-        "modelName": model.model_name,
-        "providerName": model.provider_name,
-        "inputModalities": model.input_modalities,
-        "outputModalities": model.output_modalities,
-        "responseStreamingSupported": model.response_streaming_supported,
-        "customizationsSupported": model.customizations_supported,
-        "inferenceTypesSupported": model.inference_types_supported,
-        "modelLifecycle": lifecycle,
-    })
+    expected_foundation_model_projection(model, region)
 }
 
 // ---------------------------------------------------------------------------------------

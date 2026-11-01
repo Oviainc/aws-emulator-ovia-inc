@@ -179,6 +179,7 @@ use crate::ops::types::{
     AutomatedReasoningPolicyTestResult, CustomModelDataSource,
     CustomModelDeploymentSummary,
     CustomModelSummary, CustomizationConfig, EndpointConfig, EvaluationConfig,
+    ConverseSupport,
     ModelInvocationJobInputDataConfig, ModelInvocationJobOutputDataConfig,
     ModelInvocationJobSummary,
     EvaluationInferenceConfig, EvaluationOutputDataConfig, FoundationModelDetails,
@@ -4098,6 +4099,12 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// A FIXED set, not a resource a caller creates: no operation of this service adds a
     /// row to it or takes one away, so it cannot grow the store either.
     pub foundation_models: FoundationModelCatalog,
+    /// Whether this account reaches every model the catalog offers by default
+    /// ([`FoundationModelAccessDefault`]), which is what a listing of the catalog reports
+    /// beside the models themselves.
+    ///
+    /// Seeded, like the catalog beside it, and written by no operation of this service.
+    pub foundation_model_access_default: FoundationModelAccessDefault,
     /// Every resource policy in force, keyed by the RESOURCE it is attached to rather than
     /// by one spelling of that resource's ARN — the document `PutResourcePolicy` last
     /// stored for it and `GetResourcePolicy` reports back.
@@ -7060,6 +7067,15 @@ pub struct FoundationModel {
     pub model_name: &'static str,
     /// `BrandedName` (len 1..20) — the provider that publishes the model.
     pub provider_name: &'static str,
+    /// The model LINE this model belongs to: the branded family name its provider publishes
+    /// the model under ("Amazon Bedrock foundation models" groups each provider's models by
+    /// family, and the model catalogue reports that family beside the model), with the
+    /// per-model variant left off — the family of a model is what it shares with its
+    /// siblings, so two sizes or two dated revisions of one line carry the same family.
+    ///
+    /// Stored rather than derived: a family is branded data, so it is published for the
+    /// model rather than computable from its id.
+    pub model_family: &'static str,
     /// `ModelModalityList` — what the model takes, each value out of `ModelModality`
     /// (`crate::ops::types::MODEL_MODALITY_VALUES`).
     pub input_modalities: &'static [&'static str],
@@ -7074,6 +7090,18 @@ pub struct FoundationModel {
     /// `InferenceTypeList` — the inference types the model is offered under, each value out
     /// of `InferenceType` (`crate::ops::types::INFERENCE_TYPE_VALUES`).
     pub inference_types_supported: &'static [&'static str],
+    /// The Amazon Bedrock FEATURES published for this model, each out of
+    /// [`PUBLISHED_FEATURE_VALUES`].
+    ///
+    /// Every one of them is a feature Amazon Bedrock layers ON a model — caching a prompt
+    /// prefix, routing a prompt between models, optimizing inference latency, running the
+    /// model over a dataset — and each publishes the models it supports in its own
+    /// "Supported models" table in the Amazon Bedrock User Guide. So it is a published
+    /// per-model fact and NOT derivable from what the model does: two models with the same
+    /// modalities, streaming and inference types differ here when the feature's table lists
+    /// one and not the other, and a model no table lists supports none of them — a freshly
+    /// offered model is exactly that case.
+    pub features_supported: &'static [&'static str],
     /// `FoundationModelLifecycleStatus` — `ACTIVE` for a model that is available, `LEGACY`
     /// for one that is deprecated
     /// (`crate::ops::types::FOUNDATION_MODEL_LIFECYCLE_STATUS_VALUES`).
@@ -7132,6 +7160,29 @@ const FINE_TUNING: &[&str] = &["FINE_TUNING"];
 const FINE_TUNING_AND_PRE_TRAINING: &[&str] = &["FINE_TUNING", "CONTINUED_PRE_TRAINING"];
 /// `ModelCustomization` — a model that accepts both fine-tuning and distillation.
 const FINE_TUNING_AND_DISTILLATION: &[&str] = &["FINE_TUNING", "DISTILLATION"];
+
+/// Every Amazon Bedrock feature a catalog row can publish support for
+/// ([`FoundationModel::features_supported`]), in the order a summary reports them.
+///
+/// Each one has its own "Supported models" table in the Amazon Bedrock User Guide, which is
+/// what makes support for it a published per-model fact; the order here is that of the
+/// feature names, so two rows list the features they share in the same order.
+pub const PUBLISHED_FEATURE_VALUES: &[&str] = &[
+    FEATURE_BATCH_INFERENCE,
+    FEATURE_INTELLIGENT_PROMPT_ROUTING,
+    FEATURE_LATENCY_OPTIMIZATION,
+    FEATURE_PROMPT_CACHING,
+];
+
+/// `featuresSupported` — no feature's table lists the model, which is where a freshly
+/// offered model starts.
+const NO_FEATURES: &[&str] = &[];
+/// `featuresSupported` — a model batch inference runs and no other feature lists.
+const BATCH_ONLY: &[&str] = &[FEATURE_BATCH_INFERENCE];
+/// `featuresSupported` — a model batch inference runs and a prompt router routes to.
+const BATCH_AND_ROUTING: &[&str] = &[FEATURE_BATCH_INFERENCE, FEATURE_INTELLIGENT_PROMPT_ROUTING];
+/// `featuresSupported` — a model every one of these four features lists.
+const EVERY_PUBLISHED_FEATURE: &[&str] = PUBLISHED_FEATURE_VALUES;
 /// `FoundationModelLifecycleStatus` — the model is available.
 const LIFECYCLE_ACTIVE: &str = "ACTIVE";
 /// `FoundationModelLifecycleStatus` — the model is deprecated: it is still offered and
@@ -7160,11 +7211,12 @@ const LIFECYCLE_LEGACY: &str = "LEGACY";
 /// (on-demand throughput)" and "Supported foundation models in Amazon Bedrock", and the
 /// rows AWS marks deprecated carry the status "Model lifecycle" lists them under; this
 /// emulator's bedrock-runtime plane serves the same ids, so the two planes agree about
-/// which models exist. Each row's provider, modalities, streaming support, customizations and
-/// inference types are as those pages publish them for that model; a per-model attribute
-/// no page publishes is left out of the row rather than invented (the lifecycle's
-/// `startOfLifeTime`, `endOfLifeTime`, `legacyTime` and `publicExtendedAccessTime` are
-/// such instants, so a listed model reports its `status` and no dates).
+/// which models exist. Each row's provider, family, modalities, streaming support,
+/// customizations, inference types and published features are as those pages publish them
+/// for that model — the features from each feature's own "Supported models" table, so a
+/// model a table does not list does not support that feature — and a per-model attribute no
+/// page publishes is left out of the row rather than invented (`publicExtendedAccessTime`
+/// is such an instant, so no row carries one).
 ///
 /// It is a SUBSET of what AWS offers, spanning every value of each member a caller can
 /// filter on, because the filter rule — not the catalog's size — is what this emulator
@@ -7174,11 +7226,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "ai21.jamba-1-5-mini-v1:0",
         model_name: "Jamba 1.5 Mini",
         provider_name: "AI21 Labs",
+        model_family: "Jamba 1.5",
         input_modalities: IN_TEXT,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND,
+        features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-08-22T00:00:00Z",
         legacy_window: None,
@@ -7187,11 +7241,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "amazon.nova-canvas-v1:0",
         model_name: "Nova Canvas",
         provider_name: "Amazon",
+        model_family: "Nova",
         input_modalities: IN_TEXT_AND_IMAGE,
         output_modalities: OUT_IMAGE,
         response_streaming_supported: false,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND,
+        features_supported: NO_FEATURES,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-12-03T00:00:00Z",
         legacy_window: None,
@@ -7200,11 +7256,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "amazon.nova-lite-v1:0",
         model_name: "Nova Lite",
         provider_name: "Amazon",
+        model_family: "Nova",
         input_modalities: IN_TEXT_AND_IMAGE,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING_AND_DISTILLATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: EVERY_PUBLISHED_FEATURE,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-12-03T00:00:00Z",
         legacy_window: None,
@@ -7213,11 +7271,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "amazon.nova-micro-v1:0",
         model_name: "Nova Micro",
         provider_name: "Amazon",
+        model_family: "Nova",
         input_modalities: IN_TEXT,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING_AND_DISTILLATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: EVERY_PUBLISHED_FEATURE,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-12-03T00:00:00Z",
         legacy_window: None,
@@ -7226,11 +7286,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "amazon.nova-pro-v1:0",
         model_name: "Nova Pro",
         provider_name: "Amazon",
+        model_family: "Nova",
         input_modalities: IN_TEXT_AND_IMAGE,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING_AND_DISTILLATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: EVERY_PUBLISHED_FEATURE,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-12-03T00:00:00Z",
         legacy_window: None,
@@ -7239,11 +7301,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "amazon.titan-embed-image-v1",
         model_name: "Titan Embed Image",
         provider_name: "Amazon",
+        model_family: "Titan",
         input_modalities: IN_TEXT_AND_IMAGE,
         output_modalities: OUT_EMBEDDING,
         response_streaming_supported: false,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2023-11-29T00:00:00Z",
         legacy_window: None,
@@ -7252,11 +7316,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "amazon.titan-embed-text-v2:0",
         model_name: "Titan Embed Text V2",
         provider_name: "Amazon",
+        model_family: "Titan",
         input_modalities: IN_TEXT,
         output_modalities: OUT_EMBEDDING,
         response_streaming_supported: false,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-04-30T00:00:00Z",
         legacy_window: None,
@@ -7265,11 +7331,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "amazon.titan-image-generator-v1",
         model_name: "Titan Image Gen G1",
         provider_name: "Amazon",
+        model_family: "Titan",
         input_modalities: IN_TEXT_AND_IMAGE,
         output_modalities: OUT_IMAGE,
         response_streaming_supported: false,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: NO_FEATURES,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2023-11-29T00:00:00Z",
         legacy_window: None,
@@ -7278,11 +7346,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "amazon.titan-text-lite-v1",
         model_name: "Titan Text Lite",
         provider_name: "Amazon",
+        model_family: "Titan",
         input_modalities: IN_TEXT,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING_AND_PRE_TRAINING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_LEGACY,
         start_of_life_time: "2023-09-28T00:00:00Z",
         legacy_window: Some(LegacyWindow {
@@ -7294,11 +7364,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "amazon.titan-text-premier-v1:0",
         model_name: "Titan Text Premier",
         provider_name: "Amazon",
+        model_family: "Titan",
         input_modalities: IN_TEXT,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND,
+        features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-04-30T00:00:00Z",
         legacy_window: None,
@@ -7307,11 +7379,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0",
         model_name: "Claude 3.5 Sonnet",
         provider_name: "Anthropic",
+        model_family: "Claude 3.5",
         input_modalities: IN_TEXT_AND_IMAGE,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_AND_ROUTING,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-10-22T00:00:00Z",
         legacy_window: None,
@@ -7320,11 +7394,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "anthropic.claude-3-haiku-20240307-v1:0",
         model_name: "Claude 3 Haiku",
         provider_name: "Anthropic",
+        model_family: "Claude 3",
         input_modalities: IN_TEXT_AND_IMAGE,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_AND_ROUTING,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-03-13T00:00:00Z",
         legacy_window: None,
@@ -7333,11 +7409,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "anthropic.claude-3-sonnet-20240229-v1:0",
         model_name: "Claude 3 Sonnet",
         provider_name: "Anthropic",
+        model_family: "Claude 3",
         input_modalities: IN_TEXT_AND_IMAGE,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-03-04T00:00:00Z",
         legacy_window: None,
@@ -7346,11 +7424,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "cohere.command-light-text-v14",
         model_name: "Command Light",
         provider_name: "Cohere",
+        model_family: "Command",
         input_modalities: IN_TEXT,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_LEGACY,
         start_of_life_time: "2023-09-28T00:00:00Z",
         legacy_window: Some(LegacyWindow {
@@ -7362,11 +7442,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "cohere.command-text-v14",
         model_name: "Command",
         provider_name: "Cohere",
+        model_family: "Command",
         input_modalities: IN_TEXT,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_LEGACY,
         start_of_life_time: "2023-09-28T00:00:00Z",
         legacy_window: Some(LegacyWindow {
@@ -7378,11 +7460,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "cohere.embed-english-v3",
         model_name: "Embed English",
         provider_name: "Cohere",
+        model_family: "Embed",
         input_modalities: IN_TEXT,
         output_modalities: OUT_EMBEDDING,
         response_streaming_supported: false,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2023-11-29T00:00:00Z",
         legacy_window: None,
@@ -7391,11 +7475,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "meta.llama3-1-8b-instruct-v1:0",
         model_name: "Llama 3.1 8B",
         provider_name: "Meta",
+        model_family: "Llama 3.1",
         input_modalities: IN_TEXT,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND,
+        features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-07-23T00:00:00Z",
         legacy_window: None,
@@ -7404,11 +7490,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "meta.llama3-70b-instruct-v1:0",
         model_name: "Llama 3 70B Instruct",
         provider_name: "Meta",
+        model_family: "Llama 3",
         input_modalities: IN_TEXT,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-04-18T00:00:00Z",
         legacy_window: None,
@@ -7417,11 +7505,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "mistral.mistral-large-2402-v1:0",
         model_name: "Mistral Large",
         provider_name: "Mistral AI",
+        model_family: "Mistral Large",
         input_modalities: IN_TEXT,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-04-02T00:00:00Z",
         legacy_window: None,
@@ -7430,11 +7520,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "mistral.mixtral-8x7b-instruct-v0:1",
         model_name: "Mixtral 8x7B",
         provider_name: "Mistral AI",
+        model_family: "Mixtral",
         input_modalities: IN_TEXT,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-03-01T00:00:00Z",
         legacy_window: None,
@@ -7443,11 +7535,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "moonshotai.kimi-k2.5",
         model_name: "Kimi K2.5",
         provider_name: "Moonshot AI",
+        model_family: "Kimi K2.5",
         input_modalities: IN_TEXT_AND_IMAGE,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND,
+        features_supported: NO_FEATURES,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2025-12-09T00:00:00Z",
         legacy_window: None,
@@ -7456,11 +7550,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         model_id: "stability.stable-diffusion-xl-v1",
         model_name: "SDXL 1.0",
         provider_name: "Stability AI",
+        model_family: "SDXL",
         input_modalities: IN_TEXT_AND_IMAGE,
         output_modalities: OUT_IMAGE,
         response_streaming_supported: false,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: NO_FEATURES,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2023-11-29T00:00:00Z",
         legacy_window: None,
@@ -7547,6 +7643,38 @@ impl FoundationModelCatalog {
     }
 }
 
+/// Whether this account reaches every model the catalog offers without asking for access to
+/// one model at a time.
+///
+/// Reported beside the listing itself, because it is what tells a client whether a model it
+/// found in the catalog needs an access request before it can be invoked, or is simply
+/// there to be used. Account-level like [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::use_case_for_model_access`],
+/// and PUBLISHED rather than created: no operation of this service turns it off, so it
+/// seeds itself the way the catalog does ([`FoundationModelCatalog::default`]) and a read
+/// of it changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoundationModelAccessDefault(bool);
+
+impl Default for FoundationModelAccessDefault {
+    fn default() -> Self {
+        Self(ACCESS_TO_ALL_MODELS_BY_DEFAULT)
+    }
+}
+
+impl FoundationModelAccessDefault {
+    /// Whether access to all models is on for this account.
+    #[must_use]
+    pub fn enabled(self) -> bool {
+        self.0
+    }
+}
+
+/// An account reaches the models this control plane offers without requesting access to
+/// each one: the models that need a provider agreement accepted first say so through their
+/// own offer ([`model_agreement_outstanding`]) rather than through this flag, so the flag
+/// is the account-level default and not a per-model one.
+pub const ACCESS_TO_ALL_MODELS_BY_DEFAULT: bool = true;
+
 /// What a `modelId` naming a base model resolves to
 /// ([`FoundationModelCatalog::resolve_base_model`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7618,6 +7746,164 @@ pub fn provider_matches(model: &FoundationModel, by_provider: &str) -> bool {
         || by_provider.eq_ignore_ascii_case(id_provider)
 }
 
+// =============================================================================
+// The capability projection of a published model
+// =============================================================================
+//
+// Amazon Bedrock reports, beside the ten members `FoundationModelSummary` declares, the
+// CAPABILITIES of the model: the family it belongs to, the invocation APIs it is reachable
+// through, and whether guardrails, prompt caching, intelligent prompt routing, latency
+// optimization and batch inference may be used with it. None of them is declared on the
+// on-disk shape (`smithy_query(query="shape", shape="FoundationModelSummary")` lists
+// modelArn/modelId/modelName/providerName/inputModalities/outputModalities/
+// responseStreamingSupported/customizationsSupported/inferenceTypesSupported/
+// modelLifecycle), so they are appended after it — a client decides from them whether it
+// may stream, converse, guard, cache, route, batch or customise a model it picked out of
+// the listing, which is what makes a listing that omits them undecidable.
+//
+// Each one is read off the catalog row: the family and the four features of
+// [`PUBLISHED_FEATURE_VALUES`] are PUBLISHED per model — each feature has its own
+// "Supported models" table, so support for it is a fact about the model and not a
+// consequence of what the model does — while the rest follow from attributes the row
+// already carries, so they are computed rather than stored a second time. Nothing here is
+// invented for a model: a feature no table lists the model in is simply not supported for
+// it, which is where a freshly offered model starts.
+
+/// `ModelModality` — the modality a model that takes part in a conversation produces
+/// (`crate::ops::types::MODEL_MODALITY_VALUES`).
+const MODALITY_TEXT: &str = "TEXT";
+
+/// The `providerName` whose own OpenAI-compatible endpoints Amazon Bedrock serves its
+/// models on beside its own invocation APIs, which is what puts those two APIs in their
+/// `inferenceAPIsSupported`.
+const OPENAI_MODEL_PROVIDER: &str = "OpenAI";
+
+/// The Converse API: Amazon Bedrock's own conversation API.
+const INFERENCE_API_CONVERSE: &str = "converse";
+/// The InvokeModel API: every offered model is reachable through it, whatever it produces.
+const INFERENCE_API_INVOKE_MODEL: &str = "invokeModel";
+/// The OpenAI-compatible chat completions endpoint.
+const INFERENCE_API_OPENAI_CHAT_COMPLETIONS: &str = "openAiChatCompletions";
+/// The OpenAI-compatible responses endpoint.
+const INFERENCE_API_OPENAI_RESPONSES: &str = "openAiResponses";
+
+/// `featuresSupported` — a model invocation job may run the model over a dataset ("Supported
+/// models and Regions for batch inference").
+const FEATURE_BATCH_INFERENCE: &str = "BATCH_INFERENCE";
+/// `featuresSupported` — a prompt router may route a prompt to the model ("Supported models
+/// and Regions for intelligent prompt routing").
+const FEATURE_INTELLIGENT_PROMPT_ROUTING: &str = "INTELLIGENT_PROMPT_ROUTING";
+/// `featuresSupported` — the model is offered with latency-optimized inference ("Supported
+/// models and Regions for latency-optimized inference").
+const FEATURE_LATENCY_OPTIMIZATION: &str = "LATENCY_OPTIMIZATION";
+/// `featuresSupported` — a prompt prefix may be cached explicitly for the model ("Supported
+/// models and Regions for prompt caching").
+const FEATURE_PROMPT_CACHING: &str = "PROMPT_CACHING";
+
+/// Whether `model` takes part in a conversation: it produces TEXT, which is the one
+/// modality a turn of a conversation is made of.
+///
+/// The precondition of every capability that acts on what a model SAYS — Converse and
+/// guardrails — so an embedding or image model, which says nothing a further turn can be
+/// built from, has neither.
+#[must_use]
+pub fn model_is_conversational(model: &FoundationModel) -> bool {
+    model.output_modalities.contains(&MODALITY_TEXT)
+}
+
+/// Whether a guardrail may be applied to `model`.
+///
+/// A guardrail evaluates the text a model is given and the text it produces, so it applies
+/// to a model that produces text and to no other: there is nothing in a vector or an image
+/// for a topic, word or contextual-grounding policy to decide about. Unlike the four
+/// features of [`PUBLISHED_FEATURE_VALUES`], this needs nothing of the model beyond that —
+/// a guardrail is applied BESIDE the invocation rather than built into the model's
+/// integration — so it is decided here rather than published per model.
+#[must_use]
+pub fn model_guardrails_supported(model: &FoundationModel) -> bool {
+    model_is_conversational(model)
+}
+
+/// Whether `feature` — one of [`PUBLISHED_FEATURE_VALUES`] — is published for `model`.
+fn model_publishes_feature(model: &FoundationModel, feature: &str) -> bool {
+    model.features_supported.contains(&feature)
+}
+
+/// Whether a prompt prefix may be cached explicitly for `model`.
+#[must_use]
+pub fn model_explicit_prompt_caching(model: &FoundationModel) -> bool {
+    model_publishes_feature(model, FEATURE_PROMPT_CACHING)
+}
+
+/// Whether a prompt router may route a prompt to `model`.
+#[must_use]
+pub fn model_intelligent_prompt_routing(model: &FoundationModel) -> bool {
+    model_publishes_feature(model, FEATURE_INTELLIGENT_PROMPT_ROUTING)
+}
+
+/// Whether `model` is offered with latency-optimized inference.
+#[must_use]
+pub fn model_latency_optimization_supported(model: &FoundationModel) -> bool {
+    model_publishes_feature(model, FEATURE_LATENCY_OPTIMIZATION)
+}
+
+/// Whether a model invocation job may run `model` over a dataset.
+#[must_use]
+pub fn model_batch_supported(model: &FoundationModel) -> bool {
+    model_publishes_feature(model, FEATURE_BATCH_INFERENCE)
+}
+
+/// The invocation APIs `model` is reachable through, in the order this control plane
+/// reports them.
+///
+/// `invokeModel` reaches every offered model, whatever it produces; `converse` carries a
+/// CONVERSATION, so it reaches a conversational model ([`model_is_conversational`]) and no
+/// other; and the two OpenAI-compatible endpoints reach a model published by that provider
+/// ([`OPENAI_MODEL_PROVIDER`]), whose own API they are the shape of.
+#[must_use]
+pub fn model_inference_apis_supported(model: &FoundationModel) -> Vec<String> {
+    let mut apis: Vec<String> = Vec::new();
+    if model_is_conversational(model) {
+        apis.push(INFERENCE_API_CONVERSE.to_string());
+    }
+    apis.push(INFERENCE_API_INVOKE_MODEL.to_string());
+    if model.provider_name == OPENAI_MODEL_PROVIDER {
+        apis.push(INFERENCE_API_OPENAI_CHAT_COMPLETIONS.to_string());
+        apis.push(INFERENCE_API_OPENAI_RESPONSES.to_string());
+    }
+    apis
+}
+
+/// The features published for `model` ([`FoundationModel::features_supported`]), as the one
+/// list a client can test membership in.
+///
+/// The same set the four feature members beside it report one by one, so the list and those
+/// members cannot disagree: a feature is listed exactly while the row publishes it.
+#[must_use]
+pub fn model_features_supported(model: &FoundationModel) -> Vec<String> {
+    model
+        .features_supported
+        .iter()
+        .map(|feature| (*feature).to_string())
+        .collect()
+}
+
+/// What the Converse API supports for `model`.
+///
+/// Reported beside `inferenceAPIsSupported` because Converse is the API a conversational
+/// client drives the model through, and the two things it has to know before it does are
+/// whether the model is reachable that way at all and whether the answer can be streamed —
+/// the model's own `responseStreamingSupported`, which it only means anything to stream
+/// through Converse when the model is conversational.
+#[must_use]
+pub fn model_converse_support(model: &FoundationModel) -> ConverseSupport {
+    let supported = model_is_conversational(model);
+    ConverseSupport {
+        supported: Some(supported),
+        streaming_supported: Some(supported && model.response_streaming_supported),
+    }
+}
+
 /// One catalog row as the `FoundationModelSummary` a `ListFoundationModels` response for
 /// `region` carries.
 ///
@@ -7632,6 +7918,9 @@ pub fn provider_matches(model: &FoundationModel, by_provider: &str) -> bool {
 /// ([`FoundationModel::legacy_window`]): when it entered that state and when it stops being
 /// available. `publicExtendedAccessTime` is left out, because nothing publishes it per
 /// model: it is part of a legacy window AWS states no instant for.
+///
+/// The members after `modelLifecycle` are the model's CAPABILITIES, each computed from this
+/// row — see the capability section above for what each one takes of a model.
 #[must_use]
 pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> FoundationModelSummary {
     let list = |values: &[&str]| values.iter().map(|value| (*value).to_string()).collect();
@@ -7656,6 +7945,15 @@ pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> Founda
                 .and_then(|window| published_instant(window.entered_at)),
             public_extended_access_time: None,
         }),
+        model_family: Some(model.model_family.to_string()),
+        inference_apis_supported: Some(model_inference_apis_supported(model)),
+        features_supported: Some(model_features_supported(model)),
+        guardrails_supported: Some(model_guardrails_supported(model)),
+        explicit_prompt_caching: Some(model_explicit_prompt_caching(model)),
+        intelligent_prompt_routing: Some(model_intelligent_prompt_routing(model)),
+        latency_optimization_supported: Some(model_latency_optimization_supported(model)),
+        batch_supported: Some(model_batch_supported(model)),
+        converse: Some(model_converse_support(model)),
     }
 }
 
@@ -7673,7 +7971,7 @@ fn published_instant(published: &str) -> Option<::aws_smithy_types::DateTime> {
 /// The same catalog row as the `FoundationModelDetails` a `GetFoundationModel` response
 /// for `region` carries.
 ///
-/// `FoundationModelDetails` and `FoundationModelSummary` declare the same ten members, and
+/// `FoundationModelDetails` and `FoundationModelSummary` carry the same members, and
 /// a read of a model must report what a listing reports for it, so this moves the ONE
 /// mapping [`foundation_model_summary`] computes into the shape this response declares
 /// rather than computing the members a second time.
@@ -7691,6 +7989,15 @@ pub fn foundation_model_details(model: &FoundationModel, region: &str) -> Founda
         customizations_supported: summary.customizations_supported,
         inference_types_supported: summary.inference_types_supported,
         model_lifecycle: summary.model_lifecycle,
+        model_family: summary.model_family,
+        inference_apis_supported: summary.inference_apis_supported,
+        features_supported: summary.features_supported,
+        guardrails_supported: summary.guardrails_supported,
+        explicit_prompt_caching: summary.explicit_prompt_caching,
+        intelligent_prompt_routing: summary.intelligent_prompt_routing,
+        latency_optimization_supported: summary.latency_optimization_supported,
+        batch_supported: summary.batch_supported,
+        converse: summary.converse,
     }
 }
 

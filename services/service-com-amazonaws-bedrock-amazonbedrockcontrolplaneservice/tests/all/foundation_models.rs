@@ -44,7 +44,9 @@ use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::{
     FoundationModel, FOUNDATION_MODELS,
 };
 
-use crate::support::{emulator, error_code, Emulator, Reply, REGION};
+use crate::support::{
+    emulator, error_code, expected_foundation_model_projection, Emulator, Reply, REGION,
+};
 
 /// The one path `ListFoundationModels` is bound to
 /// (`smithy_query(query="operation",operation="ListFoundationModels")`: `GET
@@ -168,18 +170,15 @@ async fn an_unfiltered_listing_reports_every_catalog_row_in_model_id_order() {
             lifecycle["legacyTime"] = json!(window.entered_at);
             lifecycle["endOfLifeTime"] = json!(window.end_of_life_at);
         }
-        let expected = json!({
-            "modelArn": format!("arn:aws:bedrock:{REGION}::foundation-model/{}", model.model_id),
-            "modelId": model.model_id,
-            "modelName": model.model_name,
-            "providerName": model.provider_name,
-            "inputModalities": model.input_modalities,
-            "outputModalities": model.output_modalities,
-            "responseStreamingSupported": model.response_streaming_supported,
-            "customizationsSupported": model.customizations_supported,
-            "inferenceTypesSupported": model.inference_types_supported,
-            "modelLifecycle": lifecycle,
-        });
+        // The projection a read of this one model reports too
+        // (`crate::support::expected_foundation_model_projection`): a listing and a read
+        // cannot disagree about a model.
+        let expected = expected_foundation_model_projection(model, REGION);
+        assert_eq!(
+            row.get("modelLifecycle"),
+            Some(&lifecycle),
+            "case {case:?}: expected the lifecycle {lifecycle:?}, got {row:?}"
+        );
         assert_eq!(
             row, &expected,
             "case {case:?}: expected the summary {expected:?}, got {row:?}"

@@ -23,7 +23,13 @@ pub struct GetFoundationModelOutput {
     pub model_details: Option<FoundationModelDetails>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#FoundationModelDetails")]
+/// `FoundationModelDetails`, plus the capability members a read of a model reports.
+///
+/// The same member set as [`FoundationModelSummary`], for the reason
+/// `crate::state::foundation_model_details` gives: a read of one model must report what a
+/// listing reports for it. The first ten are the model's, in its order
+/// (`smithy_query(query="shape", shape="com.amazonaws.bedrock#FoundationModelDetails")`);
+/// the nine after them are RECORDED behaviour the shape does not declare, appended last.
 #[derive(Debug, Clone, Default)]
 pub struct FoundationModelDetails {
     pub model_arn: String,
@@ -36,5 +42,146 @@ pub struct FoundationModelDetails {
     pub customizations_supported: Option<Vec<String>>,
     pub inference_types_supported: Option<Vec<String>>,
     pub model_lifecycle: Option<FoundationModelLifecycle>,
+    pub model_family: Option<String>,
+    pub inference_apis_supported: Option<Vec<String>>,
+    pub features_supported: Option<Vec<String>>,
+    pub guardrails_supported: Option<bool>,
+    pub explicit_prompt_caching: Option<bool>,
+    pub intelligent_prompt_routing: Option<bool>,
+    pub latency_optimization_supported: Option<bool>,
+    pub batch_supported: Option<bool>,
+    pub converse: Option<ConverseSupport>,
 }
+
+bedrock_schema_and_codec!(
+    FoundationModelDetails,
+    FOUNDATION_MODEL_DETAILS_SCHEMA,
+    "com.amazonaws.bedrock#FoundationModelDetails",
+    "com.amazonaws.bedrock",
+    "FoundationModelDetails",
+    (M_MODEL_ARN, model_arn, "modelArn", 0, req, string),
+    (M_MODEL_ID, model_id, "modelId", 1, req, string),
+    (M_MODEL_NAME, model_name, "modelName", 2, opt, string),
+    (
+        M_PROVIDER_NAME,
+        provider_name,
+        "providerName",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_INPUT_MODALITIES,
+        input_modalities,
+        "inputModalities",
+        4,
+        opt,
+        list_of_string
+    ),
+    (
+        M_OUTPUT_MODALITIES,
+        output_modalities,
+        "outputModalities",
+        5,
+        opt,
+        list_of_string
+    ),
+    (
+        M_RESPONSE_STREAMING_SUPPORTED,
+        response_streaming_supported,
+        "responseStreamingSupported",
+        6,
+        opt,
+        boolean
+    ),
+    (
+        M_CUSTOMIZATIONS_SUPPORTED,
+        customizations_supported,
+        "customizationsSupported",
+        7,
+        opt,
+        list_of_string
+    ),
+    (
+        M_INFERENCE_TYPES_SUPPORTED,
+        inference_types_supported,
+        "inferenceTypesSupported",
+        8,
+        opt,
+        list_of_string
+    ),
+    (
+        M_MODEL_LIFECYCLE,
+        model_lifecycle,
+        "modelLifecycle",
+        9,
+        opt,
+        struct_of(FoundationModelLifecycle)
+    ),
+    (M_MODEL_FAMILY, model_family, "modelFamily", 10, opt, string),
+    (
+        M_INFERENCE_APIS_SUPPORTED,
+        inference_apis_supported,
+        "inferenceAPIsSupported",
+        11,
+        opt,
+        list_of_string
+    ),
+    (
+        M_FEATURES_SUPPORTED,
+        features_supported,
+        "featuresSupported",
+        12,
+        opt,
+        list_of_string
+    ),
+    (
+        M_GUARDRAILS_SUPPORTED,
+        guardrails_supported,
+        "guardrailsSupported",
+        13,
+        opt,
+        boolean
+    ),
+    (
+        M_EXPLICIT_PROMPT_CACHING,
+        explicit_prompt_caching,
+        "explicitPromptCaching",
+        14,
+        opt,
+        boolean
+    ),
+    (
+        M_INTELLIGENT_PROMPT_ROUTING,
+        intelligent_prompt_routing,
+        "intelligentPromptRouting",
+        15,
+        opt,
+        boolean
+    ),
+    (
+        M_LATENCY_OPTIMIZATION_SUPPORTED,
+        latency_optimization_supported,
+        "latencyOptimizationSupported",
+        16,
+        opt,
+        boolean
+    ),
+    (
+        M_BATCH_SUPPORTED,
+        batch_supported,
+        "batchSupported",
+        17,
+        opt,
+        boolean
+    ),
+    (
+        M_CONVERSE,
+        converse,
+        "converse",
+        18,
+        opt,
+        struct_of(ConverseSupport)
+    ),
+);
 
