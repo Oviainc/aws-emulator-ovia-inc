@@ -25,6 +25,8 @@ mod listeners;
 mod referential_integrity_conflict_messages;
 #[path = "all/resource_not_found_messages.rs"]
 mod resource_not_found_messages;
+#[path = "all/resource_policy.rs"]
+mod resource_policy;
 #[path = "all/rules.rs"]
 mod rules;
 #[path = "all/service_network_update_and_timestamps.rs"]

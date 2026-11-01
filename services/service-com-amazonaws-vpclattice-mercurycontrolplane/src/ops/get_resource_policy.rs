@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the policy document stored against the resource its `resourceArn`
+//! names, and reports no `policy` member for a resource that has none. A read only — it
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +109,17 @@ impl From<GetResourcePolicyErrorModeled> for GetResourcePolicyError {
     }
 }
 
+/// HTTP 404 for a `resourceArn` that names no persisted resource, built by the service's
+/// shared error construction ([`crate::state::resource_not_found`]): AWS's not-found
+/// message over the submitted ARN, and the named kind's resource-type token.
+fn not_found(kind: crate::state::ResourceKind, resource_arn: &str) -> GetResourcePolicyError {
+    GetResourcePolicyErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        kind,
+        resource_arn,
+    ))
+    .into()
+}
+
 /// The `GetResourcePolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -150,18 +156,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // The same resolution the put and the delete of a resource policy use: the kind
+        // and the id the ARN names, reported as a not-found when nothing holds it.
+        let Some((kind, id)) = crate::state::policy_target(&input.resource_arn) else {
+            return Err(not_found(
+                crate::state::UNRESOLVED_POLICY_TARGET_KIND,
+                &input.resource_arn,
+            ));
+        };
+        let store = state.lock();
+        if !store.holds(kind, &id) {
+            return Err(not_found(kind, &input.resource_arn));
+        }
+        // A resource that has no policy is still a resource: the read succeeds and
+        // reports no `policy`, which the model declares optional. Nothing is written —
+        // this operation is `@readonly`, so a resource without a policy does not get one
+        // from being read.
+        Ok(GetResourcePolicyOutput {
+            policy: store.resource_policies.get(&id).cloned(),
+        })
     }
 }

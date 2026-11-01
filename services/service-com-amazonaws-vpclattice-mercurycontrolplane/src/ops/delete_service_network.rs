@@ -199,6 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let name_key =
                 crate::state::name_key(crate::state::KIND_SERVICE_NETWORK, &removed.name);
             store.name_index.remove(&name_key);
+            // A resource policy belongs to the resource it is attached to, so it goes
+            // with it rather than outliving it.
+            store.resource_policies.remove(&removed.id);
             // A clientToken record must not outlive the resource it created.
             store.idempotency_tokens.forget_resource(&removed.id);
         }

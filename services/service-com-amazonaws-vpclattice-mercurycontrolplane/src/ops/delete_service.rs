@@ -215,8 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If you delete a service, all resources related to the service, such as the
         // resource policy, auth policy, listeners, listener rules, and access log
         // subscriptions, are also deleted" (this operation's own documentation), so no
-        // listener of this service outlives it.
+        // listener of this service, and no resource policy attached to it, outlives it.
         store.remove_listeners_of(&removed.id);
+        store.resource_policies.remove(&removed.id);
         // A clientToken record must not outlive the resource it created.
         store.idempotency_tokens.forget_resource(&removed.id);
         Ok(DeleteServiceOutput {

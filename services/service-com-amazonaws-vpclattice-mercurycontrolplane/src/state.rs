@@ -3,7 +3,7 @@
 //! Engine state for the com-amazonaws-vpclattice-mercurycontrolplane service.
 //!
 //! One store holds the service-network / service / service-association / listener /
-//! listener-rule slice, and the
+//! listener-rule / resource-policy slice, and the
 //! helpers every handler in `src/ops/` shares live here too: identifier resolution
 //! (bare id or ARN), id and ARN minting, the request's region, and the clock-owed
 //! `CREATE_IN_PROGRESS -> ACTIVE` span. Handlers reach the store through
@@ -39,6 +39,9 @@ pub const KIND_RULE: &str = "rule";
 /// The ARN resource kind of a target group: `.../targetgroup/tg-…`
 /// (`TargetGroupArn`'s modelled pattern).
 pub const KIND_TARGET_GROUP: &str = "targetgroup";
+/// The ARN resource kind of a resource configuration:
+/// `.../resourceconfiguration/rcfg-…` (`ResourceConfigurationArn`'s modelled pattern).
+pub const KIND_RESOURCE_CONFIGURATION: &str = "resourceconfiguration";
 
 /// The id prefix of a service network (`^sn-[0-9a-z]{17}$`).
 pub const PREFIX_SERVICE_NETWORK: &str = "sn-";
@@ -52,6 +55,8 @@ pub const PREFIX_LISTENER: &str = "listener-";
 pub const PREFIX_RULE: &str = "rule-";
 /// The id prefix of a target group (`^tg-[0-9a-z]{17}$`).
 pub const PREFIX_TARGET_GROUP: &str = "tg-";
+/// The id prefix of a resource configuration (`^rcfg-[0-9a-z]{17}$`).
+pub const PREFIX_RESOURCE_CONFIGURATION: &str = "rcfg-";
 
 /// Every modelled id of this service is its prefix plus 17 `[0-9a-z]` characters.
 const ID_SUFFIX_LEN: usize = 17;
@@ -78,11 +83,13 @@ pub enum ResourceKind {
     Rule,
     /// A target group (`tg-…`).
     TargetGroup,
+    /// A resource configuration (`rcfg-…`).
+    ResourceConfiguration,
 }
 
 impl ResourceKind {
     /// How many kinds there are, so a per-kind cache can hold one slot each.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
 
     /// This kind's slot in a per-kind array ([`Self::COUNT`] wide).
     pub const fn slot(self) -> usize {
@@ -93,6 +100,7 @@ impl ResourceKind {
             Self::Listener => 3,
             Self::Rule => 4,
             Self::TargetGroup => 5,
+            Self::ResourceConfiguration => 6,
         }
     }
 
@@ -106,6 +114,7 @@ impl ResourceKind {
             Self::Listener => KIND_LISTENER,
             Self::Rule => KIND_RULE,
             Self::TargetGroup => KIND_TARGET_GROUP,
+            Self::ResourceConfiguration => KIND_RESOURCE_CONFIGURATION,
         }
     }
 
@@ -118,6 +127,7 @@ impl ResourceKind {
             Self::Listener => PREFIX_LISTENER,
             Self::Rule => PREFIX_RULE,
             Self::TargetGroup => PREFIX_TARGET_GROUP,
+            Self::ResourceConfiguration => PREFIX_RESOURCE_CONFIGURATION,
         }
     }
 
@@ -139,6 +149,7 @@ impl ResourceKind {
             Self::Listener => "LISTENER",
             Self::Rule => "RULE",
             Self::TargetGroup => "TARGET_GROUP",
+            Self::ResourceConfiguration => "RESOURCE_CONFIGURATION",
         }
     }
 
@@ -161,6 +172,7 @@ impl ResourceKind {
             Self::Listener => "Listener",
             Self::Rule => "Rule",
             Self::TargetGroup => "TargetGroup",
+            Self::ResourceConfiguration => "ResourceConfiguration",
         }
     }
 
@@ -176,6 +188,7 @@ impl ResourceKind {
             Self::Listener => "listener",
             Self::Rule => "rule",
             Self::TargetGroup => "target group",
+            Self::ResourceConfiguration => "resource configuration",
         }
     }
 
@@ -203,6 +216,7 @@ impl ResourceKind {
             Self::Listener => Some(LISTENER_NAME_PATTERN),
             Self::Rule => Some(RULE_NAME_PATTERN),
             Self::TargetGroup => Some(TARGET_GROUP_NAME_PATTERN),
+            Self::ResourceConfiguration => Some(RESOURCE_CONFIGURATION_NAME_PATTERN),
             Self::ServiceAssociation => None,
         }
     }
@@ -1030,6 +1044,13 @@ pub struct ComAmazonawsVpclatticeMercurycontrolplaneState {
     pub rules: HashMap<String, Rule>,
     /// Keyed by `tg-…` id. At most [`MAX_TARGET_GROUPS`] entries.
     pub target_groups: HashMap<String, TargetGroup>,
+    /// `<resource id>` -> the resource-based permission policy document
+    /// `PutResourcePolicy` attached to that resource, for the kinds whose ARN the
+    /// operation accepts ([`policy_target`]). One entry per resource that has a policy,
+    /// written only for a resource this store holds and removed by that resource's
+    /// delete, so the resource ceilings above bound this map too; each document is at
+    /// most the `@length` ceiling the model puts on `PolicyString`.
+    pub resource_policies: HashMap<String, String>,
     /// `<ARN resource kind>/<name>` -> id. A name must be unique to the account, so a
     /// second create under a taken name is a `ConflictException`. One key per stored
     /// resource, so the resource ceilings bound this map too.
@@ -1191,6 +1212,26 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
         arns.sort();
         arns.dedup();
         arns
+    }
+
+    /// Whether this store holds a resource of `kind` under `id`.
+    ///
+    /// The one place a kind maps to the registry that holds it, so an operation that
+    /// takes an identifier of several kinds (a resource policy's `resourceArn`) resolves
+    /// existence without a second copy of that mapping. A kind no implemented create
+    /// mints yet holds nothing, so an identifier naming one is a not-found.
+    pub fn holds(&self, kind: ResourceKind, id: &str) -> bool {
+        match kind {
+            ResourceKind::ServiceNetwork => self.service_networks.contains_key(id),
+            ResourceKind::Service => self.services.contains_key(id),
+            ResourceKind::ServiceAssociation => self.service_associations.contains_key(id),
+            ResourceKind::Listener => self.listeners.contains_key(id),
+            ResourceKind::Rule => self.rules.contains_key(id),
+            ResourceKind::TargetGroup => self.target_groups.contains_key(id),
+            // `CreateResourceConfiguration` is still a 501, so no resource
+            // configuration can be stored for one to be found.
+            ResourceKind::ResourceConfiguration => false,
+        }
     }
 
     /// The association of this exact (service network, service) pair, if there is one.
@@ -1404,6 +1445,44 @@ pub fn id_from_identifier(identifier: &str, prefix: &str) -> Option<String> {
     .then(|| tail.to_string())
 }
 
+/// The kinds a resource-based permission policy can be attached to, as the `ResourceArn`
+/// the policy operations take enumerates them: a service network, a service, or a
+/// resource configuration (`smithy_query(query="shape",shape="ResourceArn")`).
+pub const POLICY_TARGET_KINDS: [ResourceKind; 3] = [
+    ResourceKind::ServiceNetwork,
+    ResourceKind::Service,
+    ResourceKind::ResourceConfiguration,
+];
+
+/// The kind a resource-policy refusal names when the submitted `resourceArn` names no kind
+/// a policy can be attached to at all: the first kind `ResourceArn` enumerates.
+///
+/// Unreachable for a request that satisfied that member's modelled pattern, which pairs
+/// every ARN it accepts with one of [`POLICY_TARGET_KINDS`]; it is here so a handler can
+/// still answer a modelled not-found instead of inventing a refusal the model does not
+/// declare for it.
+pub const UNRESOLVED_POLICY_TARGET_KIND: ResourceKind = POLICY_TARGET_KINDS[0];
+
+/// The kind and id a resource-policy `resourceArn` names, or `None` when it names no
+/// kind a policy can be attached to — which the policy operations answer with
+/// `ResourceNotFoundException`.
+///
+/// `ResourceArn` admits only the ARN form, and its pattern pairs each kind's ARN path
+/// segment with that kind's id prefix (`servicenetwork/sn-`, `service/svc-`,
+/// `resourceconfiguration/rcfg-`), so both halves have to agree here; everything before
+/// the kind segment is read the way [`id_from_identifier`] reads it, so an ARN of any
+/// partition, region or account resolves to the id it names.
+pub fn policy_target(resource_arn: &str) -> Option<(ResourceKind, String)> {
+    let (head, tail) = resource_arn.rsplit_once('/')?;
+    let arn_kind = head.rsplit_once(':').map_or(head, |(_, kind)| kind);
+    POLICY_TARGET_KINDS.into_iter().find_map(|kind| {
+        (arn_kind == kind.arn_kind())
+            .then(|| id_from_identifier(tail, kind.id_prefix()))
+            .flatten()
+            .map(|id| (kind, id))
+    })
+}
+
 /// The `@pattern` the model declares on `ServiceName`, which `CreateService.name`
 /// targets. SOURCE: `smithy_query(query="shape",shape="ServiceName")`.
 pub const SERVICE_NAME_PATTERN: &str = r"^(?!svc-)(?![-])(?!.*[-]$)(?!.*[-]{2})[a-z0-9-]+$";
@@ -1426,6 +1505,12 @@ pub const RULE_NAME_PATTERN: &str = r"^(?!rule-)(?![-])(?!.*[-]$)(?!.*[-]{2})[a-
 /// `CreateTargetGroup.name` targets.
 /// SOURCE: `smithy_query(query="shape",shape="TargetGroupName")`.
 pub const TARGET_GROUP_NAME_PATTERN: &str = r"^(?!tg-)(?![-])(?!.*[-]$)(?!.*[-]{2})[a-z0-9-]+$";
+
+/// The `@pattern` the model declares on `ResourceConfigurationName`, which
+/// `CreateResourceConfiguration.name` targets.
+/// SOURCE: `smithy_query(query="shape",shape="ResourceConfigurationName")`.
+pub const RESOURCE_CONFIGURATION_NAME_PATTERN: &str =
+    r"^(?!rcfg-)(?![-])(?!.*[-]$)(?!.*[-]{2})[a-z0-9-]+$";
 
 /// The `@pattern`, with the anchors stripped, as a validation error reports it.
 ///
@@ -1563,6 +1648,7 @@ pub fn check_resource_name(
 /// one slot per kind.
 fn compiled_pattern(kind: ResourceKind) -> Option<&'static ::fancy_regex::Regex> {
     static COMPILED: [::std::sync::OnceLock<::fancy_regex::Regex>; ResourceKind::COUNT] = [
+        ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),

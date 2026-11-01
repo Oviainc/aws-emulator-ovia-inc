@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: attaches the submitted policy document to the resource its `resourceArn`
+//! names, replacing whatever that resource's policy was, so a later `GetResourcePolicy`
+//! reports exactly what was stored and an unrelated update of the resource leaves it be.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +109,17 @@ impl From<PutResourcePolicyErrorModeled> for PutResourcePolicyError {
     }
 }
 
+/// HTTP 404 for a `resourceArn` that names no persisted resource, built by the service's
+/// shared error construction ([`crate::state::resource_not_found`]): AWS's not-found
+/// message over the submitted ARN, and the named kind's resource-type token.
+fn not_found(kind: crate::state::ResourceKind, resource_arn: &str) -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        kind,
+        resource_arn,
+    ))
+    .into()
+}
+
 /// The `PutResourcePolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -150,18 +156,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let _ = ctx;
+        // `policy` is `@required` and carries `PolicyString`'s `@length` and `@pattern`
+        // constraints, so an absent, empty or all-whitespace document — and one broken
+        // across lines, which that pattern forbids — is already refused before this
+        // handler runs.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // A policy is attached to a resource that EXISTS: the ARN is resolved to the kind
+        // and the id it names, and a resource no registry holds is a not-found over the
+        // kind the caller named. An ARN naming no kind a policy can be attached to is
+        // reported against the first kind `ResourceArn` enumerates, so the caller still
+        // gets the modelled not-found rather than a refusal the model does not declare.
+        let Some((kind, id)) = crate::state::policy_target(&input.resource_arn) else {
+            return Err(not_found(
+                crate::state::UNRESOLVED_POLICY_TARGET_KIND,
+                &input.resource_arn,
+            ));
+        };
+        let mut store = state.lock();
+        if !store.holds(kind, &id) {
+            return Err(not_found(kind, &input.resource_arn));
+        }
+        // The document is stored VERBATIM against the resource it belongs to: this
+        // operation "attaches a resource-based permission policy" to that resource, so the
+        // policy a later read reports is the one the caller submitted, and a second put
+        // replaces the first (the operation is `@idempotent`).
+        store.resource_policies.insert(id, input.policy);
+        // The model gives this response no members; the 200 is the whole answer.
+        Ok(PutResourcePolicyOutput {})
     }
 }
