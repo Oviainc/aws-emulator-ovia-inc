@@ -7223,6 +7223,19 @@ pub fn scheduled_query_not_found_message(identifier: &str) -> String {
     format!("Scheduled query with identifier {identifier} not found")
 }
 
+/// The refusal CloudWatch Logs answers a scheduled-query create with when the account already
+/// holds a query under the `name` it asks for ("The name must be unique within your account and
+/// region", refused as the conflict the operation models: "This operation attempted to create a
+/// resource that already exists").
+///
+/// It is the same identifier phrasing the service refuses a scheduled query it cannot find with
+/// ([`scheduled_query_not_found_message`]): the resource kind, then the identifier the request
+/// carried, then the condition — so the only variable part is that identifier, taken from the
+/// request verbatim and carrying nothing the account generated (no ARN, account id or instant).
+pub fn scheduled_query_already_exists_message(identifier: &str) -> String {
+    format!("Scheduled query with identifier {identifier} already exists")
+}
+
 /// The refusal CloudWatch Logs answers when the missing resource is one the request
 /// IDENTIFIES NOTHING OF: a log-group level policy document addressed by the identifier of
 /// the log group it is attached to and by nothing else, which that group does not hold. The

@@ -214,9 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.scheduled_queries.contains_key(&input.name) {
             return Err(
                 CreateScheduledQueryErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "A scheduled query named {} already exists",
-                        input.name
+                    // The service states the refusal in its identifier phrasing for this
+                    // resource, naming the identifier the request carried, exactly as the
+                    // not-found refusal of the same resource does.
+                    message: Some(crate::state::scheduled_query_already_exists_message(
+                        &input.name,
                     )),
                 })
                 .into(),

@@ -189,6 +189,8 @@ mod scheduled_queries;
 mod scheduled_query_enumeration;
 #[path = "all/scheduled_query_insights_start.rs"]
 mod scheduled_query_insights_start;
+#[path = "all/scheduled_query_name_conflict.rs"]
+mod scheduled_query_name_conflict;
 #[path = "all/scheduled_query_removal.rs"]
 mod scheduled_query_removal;
 #[path = "all/scheduled_query_updates.rs"]
