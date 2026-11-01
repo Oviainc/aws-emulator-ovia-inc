@@ -1792,6 +1792,10 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     /// token is looked up in is the whole store's ([`Self::client_tokens`]), so the
     /// `Catalog` a create named is a member its fingerprint can differ on, exactly as the
     /// application an application-write names is.
+    ///
+    /// A token this index holds always names an application this store holds — the write
+    /// path records the two together or records neither ([`Self::insert_application`]) — so
+    /// `Ok(None)` cannot mean "a spent token whose application is gone".
     pub fn replayed_create(
         &self,
         client_token: &str,
@@ -1898,31 +1902,34 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     /// than one catalog's, because the `Catalog` the request named is one of the members
     /// the fingerprint covers (see [`Self::replayed_create`]).
     ///
-    /// Nothing is stored when the catalog does not exist, which a handler has already
-    /// refused.
+    /// The record and both index entries are ONE step, taken only once the catalog the
+    /// application lives in is known to be there: when it is not — which a handler has
+    /// already refused — NOTHING is stored, neither the application nor the ARN entry nor
+    /// the spent token. So an index of this store never names an application the store does
+    /// not hold: `arns` and `client_tokens` keep at most one entry per stored application,
+    /// the bound this store is finite by, and [`Self::replayed_create`] cannot read a
+    /// stranded token as either a spent one or a new request.
     pub fn insert_application(
         &mut self,
         client_token: String,
         request_fingerprint: String,
         application: BenefitApplication,
     ) {
-        self.arns.insert(
-            application.arn.clone(),
-            (application.catalog.clone(), application.id.clone()),
-        );
+        let Some(catalog) = self.catalogs.get_mut(&application.catalog) else {
+            return;
+        };
+        let catalog_name = application.catalog.clone();
+        let (arn, id) = (application.arn.clone(), application.id.clone());
+        catalog.applications.insert(id.clone(), application);
+        self.arns.insert(arn, (catalog_name.clone(), id.clone()));
         self.client_tokens.insert(
             client_token,
             ClientTokenRecord {
-                catalog: application.catalog.clone(),
-                application_id: application.id.clone(),
+                catalog: catalog_name,
+                application_id: id,
                 request_fingerprint,
             },
         );
-        if let Some(catalog) = self.catalogs.get_mut(&application.catalog) {
-            catalog
-                .applications
-                .insert(application.id.clone(), application);
-        }
     }
 
     /// Record an allocation AWS granted for a benefit, and report the id it minted.

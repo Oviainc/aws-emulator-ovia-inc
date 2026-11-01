@@ -67,6 +67,8 @@ mod get_benefit_allocation;
 mod handler_enforced_length_wording;
 #[path = "all/idempotent_parameter_mismatch.rs"]
 mod idempotent_parameter_mismatch;
+#[path = "all/insert_application_write_is_atomic.rs"]
+mod insert_application_write_is_atomic;
 #[path = "all/list_applications_filter_members.rs"]
 mod list_applications_filter_members;
 #[path = "all/member_refusal_one_construction.rs"]
