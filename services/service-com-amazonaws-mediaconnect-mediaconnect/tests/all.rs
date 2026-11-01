@@ -239,3 +239,5 @@ mod flow_start_stop_preconditions;
 mod maintenance_window_follows_the_preference;
 #[path = "all/router_maintenance_reschedule.rs"]
 mod router_maintenance_reschedule;
+#[path = "all/flow_source_ingest_endpoint.rs"]
+mod flow_source_ingest_endpoint;

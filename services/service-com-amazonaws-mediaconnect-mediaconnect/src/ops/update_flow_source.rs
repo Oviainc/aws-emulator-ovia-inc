@@ -26,6 +26,12 @@
 //! becomes the state a source reports, so a source whose requests never mentioned router
 //! integration still reports the disabled state.
 //!
+//! The members the SERVICE derives rather than copies are re-resolved after the merge
+//! through the one place the add paths resolve them, so an update cannot leave a record no
+//! create or add could produce: the ingest endpoint (its address and its port together)
+//! through [`crate::state::assigned_source_ingest_endpoint`], and the smoothing bitrate
+//! through [`crate::state::assigned_source_max_bitrate`].
+//!
 //! A setting the request MOVES is admitted before anything is written, so a refused update
 //! leaves the source exactly as it was: every reference it carries has to resolve — the
 //! flow's own media streams and VPC interfaces by name, and the bridge a
@@ -576,18 +582,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             updated.transport = Some(transport);
         }
-        // The port the source listens on, resolved against the protocol it now carries
-        // through the one place this crate resolves a source's port: a source whose protocol
-        // this request moved onto Zixi listens on the port the model fixes for it, exactly
-        // as it would have been created, and a source that listens on no ingest endpoint of
-        // its own keeps none.
-        updated.ingest_port = crate::state::assigned_source_ingest_port(
+        // The ingest endpoint the source now listens on — its address and its port
+        // together, resolved against the entitlement and the protocol it carries once this
+        // request is applied, through the one place this crate pairs the two: a source this
+        // request reaches through another account's entitlement is fed by that account's
+        // flow and keeps no endpoint of its own, and an owned source whose protocol this
+        // request moved onto Zixi listens on the port the model fixes for it, exactly as it
+        // would have been created.
+        let (ingest_ip, ingest_port) = crate::state::assigned_source_ingest_endpoint(
+            updated.entitlement_arn.as_deref(),
             updated
                 .transport
                 .as_ref()
                 .map(|transport| transport.protocol.as_str()),
+            updated.ingest_ip.clone(),
             updated.ingest_port,
         );
+        updated.ingest_ip = ingest_ip;
+        updated.ingest_port = ingest_port;
         // "The media stream that is associated with the source, and the parameters for
         // that association": the member carries the WHOLE association list, so the list in
         // the request becomes the source's, materialised the one way this crate

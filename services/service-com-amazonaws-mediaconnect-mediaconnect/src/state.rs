@@ -1430,6 +1430,30 @@ pub fn assigned_source_ingest_port(protocol: Option<&str>, port: Option<i32>) ->
     }
 }
 
+/// The ingest endpoint — the address and the port TOGETHER — a source reports, given the
+/// `entitlement_arn` it carries, the `protocol` it is on, and the endpoint it would
+/// otherwise hold.
+///
+/// A source reached through another account's entitlement is fed by that account's flow, so
+/// this service assigns it no ingest endpoint of its own — neither half of the pair — while
+/// an owned source listens on the address and the port the service assigned it, the port
+/// resolved against the protocol through [`assigned_source_ingest_port`]. The two halves are
+/// one service-derived relation keyed on the same marker a flow's `SourceType` is read off
+/// ([`StoredFlow::source_type`]), so every operation that materialises or UPDATES a source
+/// resolves them HERE: the pair cannot drift apart into a source that is entitled and still
+/// advertises an endpoint of this account, or that holds a port with no address beside it.
+pub fn assigned_source_ingest_endpoint(
+    entitlement_arn: Option<&str>,
+    protocol: Option<&str>,
+    ingest_ip: Option<String>,
+    ingest_port: Option<i32>,
+) -> (Option<String>, Option<i32>) {
+    if entitlement_arn.is_some() {
+        return (None, None);
+    }
+    (ingest_ip, assigned_source_ingest_port(protocol, ingest_port))
+}
+
 /// Why `ingest_port` cannot be the port a source on `protocol` listens on, or `None` when
 /// it can — including when the request named no port at all, because the service then
 /// assigns the source its port ([`assigned_source_ingest_port`]). `member` is the request
@@ -1755,10 +1779,21 @@ impl StoredSource {
         region: &str,
         suffix: u64,
     ) -> Self {
-        // A source reached through another account's entitlement is fed by that account's
-        // flow, so this service assigns it no ingest endpoint of its own; an owned source
-        // listens on the address and port the service assigns it.
-        let entitled = request.entitlement_arn.is_some();
+        // The ingest endpoint the source listens on: the address and the port TOGETHER,
+        // resolved through the one place this crate pairs a source's entitlement with its
+        // endpoint, so an owned source gets the address and the port the service assigns it
+        // (the port the request named where it named one) and a source reached through
+        // another account's entitlement gets neither.
+        let (ingest_ip, ingest_port) = assigned_source_ingest_endpoint(
+            request.entitlement_arn.as_deref(),
+            request.protocol.as_deref(),
+            Some(assigned_ingest_ip(suffix)),
+            Some(
+                request
+                    .ingest_port
+                    .unwrap_or_else(|| assigned_ingest_port(suffix)),
+            ),
+        );
         StoredSource {
             source_arn: ::engine::emulator_arn(
                 SERVICE_NAMESPACE,
@@ -1767,19 +1802,8 @@ impl StoredSource {
             ),
             name,
             description: request.description.clone(),
-            ingest_ip: (!entitled).then(|| assigned_ingest_ip(suffix)),
-            // The port the source listens on: the one the request named, or the one the
-            // service assigns a request that named none — resolved against the protocol
-            // through the one place this crate resolves a source's port, so a Zixi source
-            // listens on the port the model fixes for it.
-            ingest_port: assigned_source_ingest_port(
-                request.protocol.as_deref(),
-                (!entitled).then(|| {
-                    request
-                        .ingest_port
-                        .unwrap_or_else(|| assigned_ingest_port(suffix))
-                }),
-            ),
+            ingest_ip,
+            ingest_port,
             whitelist_cidr: request.whitelist_cidr.clone(),
             entitlement_arn: request.entitlement_arn.clone(),
             vpc_interface_name: request.vpc_interface_name.clone(),

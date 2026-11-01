@@ -220,16 +220,25 @@ fn update_cases(bridge_arn: &str) -> Vec<UpdateCase> {
         },
         UpdateCase {
             // `EntitlementArn` carries the modelled pattern
-            // `^arn:.+:mediaconnect.+:entitlement:.+$`.
+            // `^arn:.+:mediaconnect.+:entitlement:.+$`. A source reached through another
+            // account's entitlement is fed by that account's flow, so it holds no ingest
+            // endpoint of this account: the pair the earlier rows wrote goes with the
+            // entitlement, which `crate::flow_source_ingest_endpoint` asserts over a table.
             case: "an entitlement ARN",
             body: json!({
                 "entitlementArn":
                     "arn:aws:mediaconnect:us-east-1:111122223333:entitlement:1-0000beef:shared"
             }),
-            expect: vec![(
-                "entitlementArn",
-                json!("arn:aws:mediaconnect:us-east-1:111122223333:entitlement:1-0000beef:shared"),
-            )],
+            expect: vec![
+                (
+                    "entitlementArn",
+                    json!(
+                        "arn:aws:mediaconnect:us-east-1:111122223333:entitlement:1-0000beef:shared"
+                    ),
+                ),
+                ("ingestIp", Value::Null),
+                ("ingestPort", Value::Null),
+            ],
         },
         UpdateCase {
             // `EncodingName` is one of jxsv | raw | smpte291 | pcm
