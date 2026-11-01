@@ -30,7 +30,9 @@
 //! "has no effect" for any of them), the statuses a stop can arrive in, each engine family
 //! the command does not apply to, and the identifier shapes the snapshot member refuses.
 
-use service_com_amazonaws_rds_amazonrdsv19::state::STATUS_TRANSITION_DELAY;
+use service_com_amazonaws_rds_amazonrdsv19::state::{
+    stop_db_instance_state_message, STATUS_TRANSITION_DELAY,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{
@@ -311,9 +313,11 @@ async fn a_stop_takes_an_available_instance_to_stopped_and_retains_its_metadata(
             "InvalidDBInstanceState",
         );
         let message = text(&again, "Message");
-        assert!(
-            message.contains(row.identifier) && message.contains("stopped"),
-            "case {:?}: stopping a stopped instance must say so, got {message:?}",
+        assert_eq!(
+            message,
+            stop_db_instance_state_message(row.identifier),
+            "case {:?}: stopping a stopped instance must answer the service's own sentence, \
+             got {message:?}",
             row.case
         );
 
@@ -566,9 +570,11 @@ async fn only_an_available_instance_in_the_signed_region_can_be_stopped() {
         "InvalidDBInstanceState",
     );
     let message = text(&body, "Message");
-    assert!(
-        message.contains("emu-stop-creating") && message.contains("creating"),
-        "the refusal must name the instance and the status it is in, got {message:?}"
+    assert_eq!(
+        message,
+        stop_db_instance_state_message("emu-stop-creating"),
+        "the refusal must answer the service's own sentence naming the instance, got \
+         {message:?}"
     );
 
     // Nor can one whose stop is already running.
@@ -594,9 +600,11 @@ async fn only_an_available_instance_in_the_signed_region_can_be_stopped() {
         "InvalidDBInstanceState",
     );
     let message = text(&body, "Message");
-    assert!(
-        message.contains("emu-stop-creating") && message.contains("stopping"),
-        "the refusal must say the stop is already running, got {message:?}"
+    assert_eq!(
+        message,
+        stop_db_instance_state_message("emu-stop-creating"),
+        "a stop that is already running must be refused in the same sentence, got \
+         {message:?}"
     );
 
     // RDS is regional: an instance is addressable only in the region it was created in,

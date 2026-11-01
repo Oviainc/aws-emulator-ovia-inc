@@ -134,7 +134,7 @@ pub use db_proxies::{
     DEFAULT_DB_PROXY_TARGET_GROUP, DEFAULT_IDLE_CLIENT_TIMEOUT, DEFAULT_MAX_CONNECTIONS_PERCENT,
     DEFAULT_MAX_CONNECTIONS_PERCENT_SQLSERVER, DB_PROXY_QUOTA_PER_REGION,
     DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING, DB_PROXY_TARGET_QUOTA_PER_PROXY,
-    ENGINE_FAMILY_SQLSERVER, NETWORK_TYPE_IPV4,
+    ENGINE_FAMILY_SQLSERVER, MISSING_DB_PROXY_TARGET_IDENTIFIER_MESSAGE, NETWORK_TYPE_IPV4,
 };
 pub use engine_log::InstanceLog;
 pub use events::{
@@ -239,6 +239,67 @@ pub fn reboot_db_instance_state_message(identifier: &str, status: &str) -> Strin
         "Can only reboot db instances with state in: {}.  Instance {identifier} has state: \
          {status}.",
         REBOOTABLE_DB_INSTANCE_STATUSES.join(", ")
+    )
+}
+
+/// The sentence `ModifyDBInstance` answers an `InvalidDBInstanceStateFault` with when the
+/// instance is not in a state a modification can be taken in.
+///
+/// It has NO variable part: Amazon RDS interpolates neither the identifier the request
+/// carried nor the status the instance is in — it states only the state a modification
+/// needs — so this is a constant rather than a `format!` over the request and the store,
+/// and a caller matching the sentence sees exactly what the real service sends.
+pub const MODIFY_DB_INSTANCE_INVALID_STATE_MESSAGE: &str =
+    "Database instance is not in available state.";
+
+/// The message `StopDBInstance` answers an `InvalidDBInstanceStateFault` with when the
+/// instance is not in the one state a stop is accepted from
+/// ([`DB_INSTANCE_STATUS_AVAILABLE`]).
+///
+/// Amazon RDS names the instance the request addressed and states the state a stop needs;
+/// it does NOT report the status the instance is actually in, so nothing of the store but
+/// the instance's identifier is in it.
+pub fn stop_db_instance_state_message(identifier: &str) -> String {
+    format!("Instance {identifier} is not in available state.")
+}
+
+/// The DB instance statuses a start is accepted from, as Amazon RDS lists them INSIDE the
+/// quotes of [`start_db_instance_state_message`] — the stopped instance a start brings back
+/// up, plus the two states a start is how a caller recovers from, the second with the
+/// engine qualification RDS attaches to it.
+///
+/// The list is the refusal's fixed text, so it is one string rather than an array of
+/// statuses: its last entry carries a parenthetical that qualifies the entry and is not
+/// part of any status value. The only one of them this service ever puts an instance in is
+/// [`DB_INSTANCE_STATUS_STOPPED`], which is what `StartDBInstance` accepts.
+const STARTABLE_DB_INSTANCE_STATUSES: &str =
+    "stopped, inaccessible-encryption-credentials-recoverable, incompatible-network (only \
+     valid for non-SqlServer instances)";
+
+/// The message `StartDBInstance` answers an `InvalidDBInstanceStateFault` with when the
+/// instance is in none of the statuses a start is accepted from.
+///
+/// Amazon RDS names the instance the request addressed and then the permitted set — what a
+/// caller reads to decide whether to wait or to fail — single-quoted as a whole; it does
+/// NOT report the status the instance is actually in.
+pub fn start_db_instance_state_message(identifier: &str) -> String {
+    format!(
+        "Instance {identifier} cannot be started as it is not in one of the following \
+         statuses: '{STARTABLE_DB_INSTANCE_STATUSES}'."
+    )
+}
+
+/// The message `CreateDBSnapshot` answers an `InvalidDBInstanceStateFault` with when the
+/// source instance is not in the one state a snapshot can be taken from
+/// ([`DB_INSTANCE_STATUS_AVAILABLE`]).
+///
+/// Amazon RDS words this one as a statement about the snapshot it will not create, naming
+/// the source instance and the state the instance has to be in; the status it is actually
+/// in is not part of it.
+pub fn create_db_snapshot_instance_state_message(identifier: &str) -> String {
+    format!(
+        "Cannot create a snapshot because the database instance {identifier} is not \
+         currently in the available state."
     )
 }
 
@@ -4106,6 +4167,38 @@ pub fn db_cluster_not_found_colon_message(named: &str) -> String {
 pub const MODIFY_DB_CLUSTER_INVALID_STATE_MESSAGE: &str =
     "This cluster could not be modified. Please try again";
 
+/// How many DB instances a DB cluster has to hold for a failover to be accepted.
+///
+/// A failover moves the writer role from one member of the cluster to another, so there has
+/// to be a member to move it TO as well as one to move it from: a cluster holding fewer is
+/// refused with [`failover_needs_two_instances_message`].
+pub const MIN_FAILOVER_DB_CLUSTER_INSTANCES: usize = 2;
+
+/// The message `FailoverDBCluster` answers an `InvalidDBClusterStateFault` with when the
+/// cluster holds fewer than [`MIN_FAILOVER_DB_CLUSTER_INSTANCES`] DB instances.
+///
+/// Amazon RDS states the precondition as the COUNT the cluster has to reach, and names the
+/// cluster straight after the colon with no space before it.
+pub fn failover_needs_two_instances_message(identifier: &str) -> String {
+    format!(
+        "Database cluster:{identifier} should have at least two database instances for \
+         failover."
+    )
+}
+
+/// The message an `InvalidDBParameterGroupStateFault` carries for a reset refused because a
+/// parameter of the group still carries a change that has not been applied.
+///
+/// Amazon RDS names ONE parameter, single-quoted, and says only that it has pending
+/// changes: it names neither the group the request addressed nor what has to happen before
+/// the reset is accepted.
+pub fn parameter_has_pending_changes_message(parameter_name: &str) -> String {
+    format!(
+        "Cannot reset the parameter group because the parameter '{parameter_name}' has \
+         pending changes."
+    )
+}
+
 /// The name AWS gives the DB subnet group it creates alongside an account's default
 /// VPC. `CreateDBSubnetGroup$DBSubnetGroupName` refuses it ("Must not be default")
 /// because the service owns that name, and `CreateDBInstance$PubliclyAccessible`
@@ -5740,12 +5833,17 @@ pub fn decode_marker(marker: &str) -> Option<String> {
     String::from_utf8(::aws_smithy_types::base64::decode(marker).ok()?).ok()
 }
 
-/// The refusal Amazon RDS answers a `Marker` no prior page issued with. Fixed text: the
-/// service names neither the token nor the member, so there is nothing of the request in
-/// it.
-pub const INVALID_MARKER: &str =
-    "Invalid marker. Please use the marker returned from a prior request or omit the \
-     marker parameter.";
+/// The refusal Amazon RDS answers a `Marker` no prior page issued with.
+///
+/// The one variable part is the token the REQUEST carried, echoed verbatim so a caller
+/// looping over pages can see which of the markers it holds was rejected; the rest is fixed
+/// text naming the two ways to ask again.
+pub fn invalid_marker_message(marker: &str) -> String {
+    format!(
+        "Invalid marker: {marker}. Please use the marker returned from the prior request or \
+         omit the marker parameter."
+    )
+}
 
 /// Take the page of `records` that starts at `marker` and holds at most
 /// `page_size` items. `records` must be in the order the report serves them.
@@ -5766,10 +5864,9 @@ pub fn paginate<T>(
         None => 0,
         Some(marker) => decode_marker(marker)
             .and_then(|key| records.iter().position(|(held, _)| *held == key))
-            // The wording Amazon RDS answers a marker it never issued with: it carries no
-            // variable part at all — not even the token — and tells the caller the two
-            // ways to ask again.
-            .ok_or_else(|| INVALID_MARKER.to_string())?,
+            // The wording Amazon RDS answers a marker it never issued with: it echoes the
+            // token the request carried and tells the caller the two ways to ask again.
+            .ok_or_else(|| invalid_marker_message(marker))?,
     };
     let end = start.saturating_add(page_size).min(records.len());
     let next_marker = records.get(end).map(|(key, _)| encode_marker(key));

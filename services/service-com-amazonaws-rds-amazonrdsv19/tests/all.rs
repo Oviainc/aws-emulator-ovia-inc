@@ -153,6 +153,8 @@ mod refusal_wording_and_input_guards;
 mod resource_tags;
 #[path = "all/sibling_control_plane_clusters.rs"]
 mod sibling_control_plane_clusters;
+#[path = "all/state_precondition_refusal_sentences.rs"]
+mod state_precondition_refusal_sentences;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/static_reference_catalogs.rs"]

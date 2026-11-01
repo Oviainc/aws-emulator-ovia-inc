@@ -183,8 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if instances.is_empty() && clusters.is_empty() {
             return Err(RegisterDBProxyTargetsError::invalid_parameter_combination(
-                "name at least one of DBInstanceIdentifiers or DBClusterIdentifiers: a \
-                 registration with neither registers nothing",
+                crate::state::MISSING_DB_PROXY_TARGET_IDENTIFIER_MESSAGE,
             ));
         }
 

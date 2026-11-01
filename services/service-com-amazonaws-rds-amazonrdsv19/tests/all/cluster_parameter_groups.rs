@@ -105,7 +105,10 @@ fn form_encode(value: &str) -> String {
 const DOCDB_FAMILY: &str = "docdb5.0";
 
 /// Create a group and return its (lowercased) name.
-async fn create_group(
+///
+/// `pub(crate)` so a sibling suite of this one test target creates a cluster parameter group
+/// the same way rather than growing a second copy of this call.
+pub(crate) async fn create_group(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -128,7 +131,9 @@ async fn create_group(
 }
 
 /// Set one parameter on `group`, with an optional apply method.
-async fn modify(
+///
+/// `pub(crate)` for the same reason [`create_group`] is.
+pub(crate) async fn modify(
     router: &MultiServiceRouter,
     group: &str,
     name: &str,

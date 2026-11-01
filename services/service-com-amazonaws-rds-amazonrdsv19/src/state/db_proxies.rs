@@ -131,6 +131,16 @@ pub fn db_proxy_not_found_message(named: &str) -> String {
     format!("DBProxy '{named}' not found.")
 }
 
+/// The sentence `RegisterDBProxyTargets` and `DeregisterDBProxyTargets` refuse a request
+/// that names no database to act on with.
+///
+/// Both members that name one are optional, so a request can carry neither — and a
+/// registration of nothing is not a registration. Amazon RDS words the refusal as a
+/// statement about what is missing, naming the two KINDS of database rather than the
+/// modelled member names, and interpolates nothing from the request.
+pub const MISSING_DB_PROXY_TARGET_IDENTIFIER_MESSAGE: &str =
+    "Missing DB instance or DB cluster identifier.";
+
 /// Refuse a `TargetGroupName` that is not the one target group a proxy has.
 ///
 /// "Currently, this name must be `default`" — each proxy has exactly one target group and

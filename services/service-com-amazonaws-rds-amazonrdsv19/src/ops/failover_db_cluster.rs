@@ -223,18 +223,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|instance| (instance.identifier.clone(), instance.status.clone()))
             .collect();
         // A failover promotes a replica "to be the primary DB instance (the cluster
-        // writer)", so there has to be an instance in the cluster to promote. A cluster
-        // holding none — one created with no DB instance in it — has no writer to move, and
-        // the state fault says so rather than reporting a failover nothing performed.
-        let Some((current_writer, _)) = members.first().cloned() else {
-            return Err(FailoverDBClusterErrorModeled::InvalidDBClusterStateFault(
-                InvalidDBClusterStateFault {
-                    message: Some(format!(
-                        "DB cluster {identifier} has no DB instance to promote to primary"
-                    )),
-                },
-            )
-            .into());
+        // writer)", so the writer role has to have somewhere to move TO as well as
+        // somewhere to move from: a cluster holding fewer than
+        // `crate::state::MIN_FAILOVER_DB_CLUSTER_INSTANCES` members cannot take one, and
+        // the state fault states that count rather than reporting a failover nothing
+        // performed. The writer itself is the first member of the cluster's own order.
+        let current_writer = match members.first() {
+            Some((writer, _))
+                if members.len() >= crate::state::MIN_FAILOVER_DB_CLUSTER_INSTANCES =>
+            {
+                writer.clone()
+            }
+            _ => {
+                return Err(FailoverDBClusterErrorModeled::InvalidDBClusterStateFault(
+                    InvalidDBClusterStateFault {
+                        message: Some(crate::state::failover_needs_two_instances_message(
+                            &identifier,
+                        )),
+                    },
+                )
+                .into())
+            }
         };
 
         // `TargetDBInstanceIdentifier`: "the name of the DB instance to promote to the
@@ -273,10 +282,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 member.clone()
             }
             // No target: the failover promotes one of the cluster's replicas, which is the
-            // first reader — the member after the writer in the cluster's own order. A
-            // single-instance cluster has no replica to promote to, so its one instance
-            // stays the writer, which is what a forced failover of such a cluster leaves
-            // behind.
+            // first reader — the member after the writer in the cluster's own order. The
+            // cluster holds at least two members by the check above, so there is one;
+            // `unwrap_or` keeps the writer where it is rather than panicking if every
+            // member folded to the same identifier.
             None => members
                 .iter()
                 .map(|(member, _)| member)

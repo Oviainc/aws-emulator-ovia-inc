@@ -210,9 +210,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if source.status != "available" {
             return Err(CreateDBSnapshotErrorModeled::InvalidDBInstanceStateFault(
                 InvalidDBInstanceStateFault {
-                    message: Some(format!(
-                        "DB instance {source_identifier} is not available for a snapshot (status {})",
-                        source.status
+                    message: Some(crate::state::create_db_snapshot_instance_state_message(
+                        &source_identifier,
                     )),
                 },
             )

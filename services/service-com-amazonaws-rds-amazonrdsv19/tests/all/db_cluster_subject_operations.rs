@@ -48,7 +48,7 @@ const PRESENT: &str = "emu-present-cluster";
 
 /// The ARN a stored DB cluster carries, which is also the other form every member that
 /// names a cluster accepts.
-fn cluster_arn(identifier: &str) -> String {
+pub(crate) fn cluster_arn(identifier: &str) -> String {
     format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:{identifier}")
 }
 
@@ -72,7 +72,10 @@ async fn create_cluster(
 }
 
 /// Create a cluster and wait until the clock has made it `available`.
-async fn create_available_cluster(
+///
+/// `pub(crate)` so a sibling suite of this one test target stands a cluster and its members
+/// up the same way rather than growing a second copy of these calls.
+pub(crate) async fn create_available_cluster(
     router: &MultiServiceRouter,
     identifier: &str,
     engine: &str,
@@ -86,7 +89,9 @@ async fn create_available_cluster(
 }
 
 /// `CreateDBInstance` for an instance that joins `cluster`.
-async fn create_member(
+///
+/// `pub(crate)` for the same reason [`create_available_cluster`] is.
+pub(crate) async fn create_member(
     router: &MultiServiceRouter,
     identifier: &str,
     engine: &str,
@@ -601,7 +606,9 @@ async fn a_stop_moves_the_cluster_and_its_members_through_the_transient_status()
 
 /// The `(identifier, is the cluster writer)` pairs a cluster reports, in the order it
 /// reports them.
-async fn reported_members(
+///
+/// `pub(crate)` for the same reason [`create_available_cluster`] is.
+pub(crate) async fn reported_members(
     router: &MultiServiceRouter,
     case: &str,
     cluster: &str,

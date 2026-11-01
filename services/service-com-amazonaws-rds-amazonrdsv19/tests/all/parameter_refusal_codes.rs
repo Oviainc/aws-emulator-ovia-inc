@@ -35,7 +35,7 @@
 //! The harness (router, call, XML element readers) is the one `db_instances` owns; only
 //! the tables here are local.
 
-use service_com_amazonaws_rds_amazonrdsv19::state::{INVALID_MARKER, MAX_RECORDS_RANGE};
+use service_com_amazonaws_rds_amazonrdsv19::state::{invalid_marker_message, MAX_RECORDS_RANGE};
 
 use crate::db_instances::{
     call, emulator, expect_error, expect_ok, text, wait_for_settle, REGION,
@@ -342,8 +342,8 @@ async fn an_identifier_refusal_is_worded_by_the_subject_its_member_carries() {
     }
 }
 
-/// A `Marker` no prior page issued is refused in one fixed text, identically on every
-/// paginated report: the token is not echoed, because the service does not echo it.
+/// A `Marker` no prior page issued is refused in one wording, identically on every
+/// paginated report: the fixed text echoing the token the request carried.
 #[tokio::test]
 async fn an_unissued_marker_is_refused_in_one_fixed_text_on_every_report() {
     let router = emulator();
@@ -363,7 +363,7 @@ async fn an_unissued_marker_is_refused_in_one_fixed_text_on_every_report() {
             );
             assert_eq!(
                 text(&body, "Message"),
-                INVALID_MARKER,
+                invalid_marker_message(marker),
                 "case {case:?}: expected the service's own marker refusal, got {:?}",
                 text(&body, "Message")
             );
@@ -588,7 +588,7 @@ async fn a_value_outside_a_modelled_constraint_carries_the_same_invalid_paramete
     );
     assert_eq!(
         text(&body, "Message"),
-        INVALID_MARKER,
+        invalid_marker_message(&"m".repeat(MAX_MARKER_LEN)),
         "case \"the longest Marker the member admits\": expected the paginator's own refusal, \
          got {body}"
     );

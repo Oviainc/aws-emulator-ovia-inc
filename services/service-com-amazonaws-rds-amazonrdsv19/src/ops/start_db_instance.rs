@@ -272,13 +272,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // way out or still shutting down cannot take a start. The status the clock has yet
         // to settle is real.
         if instance.status != DB_INSTANCE_STATUS_STOPPED {
-            let status = instance.status.clone();
             return Err(StartDBInstanceErrorModeled::InvalidDBInstanceStateFault(
                 InvalidDBInstanceStateFault {
-                    message: Some(format!(
-                        "DB instance {identifier} is not stopped, so it can't be started \
-                         (status {status})"
-                    )),
+                    message: Some(crate::state::start_db_instance_state_message(&identifier)),
                 },
             )
             .into());

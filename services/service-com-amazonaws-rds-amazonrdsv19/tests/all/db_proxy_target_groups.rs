@@ -76,7 +76,10 @@ const ENGINE_FAMILY_CASES: &[EngineFamilyCase] = &[
 ];
 
 /// `CreateDBProxy` with its required members, for a proxy of `engine_family`.
-async fn create_proxy(router: &MultiServiceRouter, name: &str, engine_family: &str) {
+///
+/// `pub(crate)` so a sibling suite of this one test target stands a proxy up the same way
+/// rather than growing a second copy of this call.
+pub(crate) async fn create_proxy(router: &MultiServiceRouter, name: &str, engine_family: &str) {
     expect_ok(
         &format!("create proxy {name}"),
         call(

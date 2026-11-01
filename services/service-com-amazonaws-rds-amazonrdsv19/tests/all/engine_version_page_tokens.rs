@@ -36,7 +36,7 @@ use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    CertificateKey, CA_CERTIFICATES, INVALID_MARKER, MAX_RECORDS_RANGE,
+    invalid_marker_message, CertificateKey, CA_CERTIFICATES, MAX_RECORDS_RANGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -303,7 +303,7 @@ async fn a_marker_is_an_opaque_token_the_service_issued_and_accepts_back() {
             );
             assert_eq!(
                 text(&body, "Message"),
-                INVALID_MARKER,
+                invalid_marker_message(unissued),
                 "case {refused:?}: a token no page issued is refused in the service's own \
                  wording"
             );

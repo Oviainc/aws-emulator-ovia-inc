@@ -463,9 +463,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if current_status != "available" && current_status != "modifying" {
             return Err(ModifyDBInstanceErrorModeled::InvalidDBInstanceStateFault(
                 InvalidDBInstanceStateFault {
-                    message: Some(format!(
-                        "DB instance {identifier} is not available for modification (status {current_status})"
-                    )),
+                    message: Some(
+                        crate::state::MODIFY_DB_INSTANCE_INVALID_STATE_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

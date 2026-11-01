@@ -62,7 +62,10 @@ type ReportedSetting = (String, Option<String>, Option<String>, Option<String>);
 type FilterCase = (String, Vec<(String, String)>, Vec<String>);
 
 /// Create a DB parameter group and return the name the store keys it under.
-async fn create_group(
+///
+/// `pub(crate)` so a sibling suite of this one test target creates a DB parameter group the
+/// same way rather than growing a second copy of this call.
+pub(crate) async fn create_group(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -124,7 +127,9 @@ async fn modify(
 }
 
 /// `DescribeDBParameters` on `group`, carrying `extra` request members.
-async fn describe(
+///
+/// `pub(crate)` for the same reason [`create_group`] is.
+pub(crate) async fn describe(
     router: &MultiServiceRouter,
     group: &str,
     extra: &[(&str, String)],

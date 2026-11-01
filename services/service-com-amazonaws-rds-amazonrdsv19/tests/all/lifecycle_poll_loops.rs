@@ -30,6 +30,7 @@
 
 use std::time::{Duration, Instant};
 
+use service_com_amazonaws_rds_amazonrdsv19::state::start_db_instance_state_message;
 use smithy_server_runtime::MultiServiceRouter;
 use tokio::time::sleep;
 
@@ -694,9 +695,11 @@ async fn a_start_is_accepted_only_for_a_stopped_instance_this_command_applies_to
         "InvalidDBInstanceState",
     );
     let message = text(&body, "Message");
-    assert!(
-        message.contains("emu-life-start") && message.contains("creating"),
-        "the refusal must name the instance and the status it is in, got {message:?}"
+    assert_eq!(
+        message,
+        start_db_instance_state_message("emu-life-start"),
+        "the refusal must answer the service's own sentence listing the startable statuses, \
+         got {message:?}"
     );
 
     // Nor can one that is already running.
@@ -713,9 +716,11 @@ async fn a_start_is_accepted_only_for_a_stopped_instance_this_command_applies_to
         "InvalidDBInstanceState",
     );
     let message = text(&body, "Message");
-    assert!(
-        message.contains("emu-life-start") && message.contains("available"),
-        "the refusal must name the instance and the status it is in, got {message:?}"
+    assert_eq!(
+        message,
+        start_db_instance_state_message("emu-life-start"),
+        "an instance that is already running must be refused in the same sentence, got \
+         {message:?}"
     );
 
     // A stopped instance IS started, which is what makes the rows above refusals of the
@@ -752,9 +757,11 @@ async fn a_start_is_accepted_only_for_a_stopped_instance_this_command_applies_to
         "InvalidDBInstanceState",
     );
     let message = text(&body, "Message");
-    assert!(
-        message.contains("emu-life-start") && message.contains("starting"),
-        "the refusal must say the start is already running, got {message:?}"
+    assert_eq!(
+        message,
+        start_db_instance_state_message("emu-life-start"),
+        "a start that is already running must be refused in the same sentence, got \
+         {message:?}"
     );
 
     // "The identifier or the name of the DB capacity reservation for the DB instance to

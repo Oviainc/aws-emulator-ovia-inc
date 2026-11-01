@@ -29,7 +29,7 @@ use service_com_amazonaws_rds_amazonrdsv19::state::{
     db_cluster_identifier_max_len, DB_CLUSTER_STATUS_AVAILABLE, DB_CLUSTER_STATUS_CREATING,
     DB_CLUSTER_STATUS_DELETING, DB_CLUSTER_STATUS_FAILING_OVER, DB_CLUSTER_STATUS_MODIFYING,
     DB_CLUSTER_STATUS_STOPPED, DB_CLUSTER_STATUS_STOPPING,
-    MODIFY_DB_CLUSTER_INVALID_STATE_MESSAGE,
+    MIN_FAILOVER_DB_CLUSTER_INSTANCES, MODIFY_DB_CLUSTER_INVALID_STATE_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -98,9 +98,12 @@ struct RefusalCase {
 }
 
 impl RefusalCase {
-    /// The member DB instance a failover needs to have something to promote.
-    fn member_identifier(&self) -> String {
-        format!("{}-m", self.identifier)
+    /// The member DB instances a failover needs: the writer the role moves FROM and the
+    /// replica it moves TO, which is the smallest membership a failover is accepted for.
+    fn member_identifiers(&self) -> Vec<String> {
+        (0..MIN_FAILOVER_DB_CLUSTER_INSTANCES)
+            .map(|index| format!("{}-m{index}", self.identifier))
+            .collect()
     }
 }
 
@@ -248,28 +251,32 @@ async fn a_modification_of_a_cluster_in_a_blocking_state_is_refused_with_one_fix
     let cases = refusal_cases();
 
     // Every cluster whose blocking call needs it `available` first, plus the member
-    // instance a failover has to have something to promote. One wait settles them all.
+    // instances a failover has to have to move the writer role between. One wait settles
+    // them all.
     for row in &cases {
         if row.blocked == Blocked::StillCreating {
             continue;
         }
         expect_ok(row.case, create_cluster(&router, row).await);
         if row.blocked == Blocked::FailingOver {
-            expect_ok(
-                row.case,
-                call(
-                    &router,
-                    "CreateDBInstance",
-                    &[
-                        ("DBInstanceIdentifier", row.member_identifier().as_str()),
-                        ("Engine", row.engine),
-                        ("DBInstanceClass", "db.serverless"),
-                        ("DBClusterIdentifier", row.identifier.as_str()),
-                        ("AvailabilityZone", format!("{REGION}a").as_str()),
-                    ],
-                )
-                .await,
-            );
+            for (index, member) in row.member_identifiers().iter().enumerate() {
+                let zone = char::from(b'a' + u8::try_from(index).unwrap_or(0));
+                expect_ok(
+                    row.case,
+                    call(
+                        &router,
+                        "CreateDBInstance",
+                        &[
+                            ("DBInstanceIdentifier", member.as_str()),
+                            ("Engine", row.engine),
+                            ("DBInstanceClass", "db.serverless"),
+                            ("DBClusterIdentifier", row.identifier.as_str()),
+                            ("AvailabilityZone", format!("{REGION}{zone}").as_str()),
+                        ],
+                    )
+                    .await,
+                );
+            }
         }
     }
     wait_for_settle();

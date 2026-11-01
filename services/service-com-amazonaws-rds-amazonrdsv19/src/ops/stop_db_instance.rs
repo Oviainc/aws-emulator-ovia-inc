@@ -274,13 +274,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an instance still coming up, on its way out, or already stopped cannot take a
         // stop. The status the clock has yet to settle is real.
         if instance.status != DB_INSTANCE_STATUS_AVAILABLE {
-            let status = instance.status.clone();
             return Err(StopDBInstanceErrorModeled::InvalidDBInstanceStateFault(
                 InvalidDBInstanceStateFault {
-                    message: Some(format!(
-                        "DB instance {identifier} is not available for a stop (status \
-                         {status})"
-                    )),
+                    message: Some(crate::state::stop_db_instance_state_message(&identifier)),
                 },
             )
             .into());
