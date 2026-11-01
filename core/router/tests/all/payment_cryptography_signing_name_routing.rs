@@ -20,7 +20,10 @@
 //! path its protocol posts to, and the data plane claims the URI path space its
 //! `restJson1` operations bind. This suite pins the split in the production router
 //! across both services' own traffic, either endpoint host, a loopback endpoint, and
-//! both a read and a write.
+//! both a read and a write. Each case's marker is a string only the claiming service
+//! can produce: a member of its own output, its own 501 for an operation it has not
+//! implemented, or — for an operation it serves — its own modelled refusal naming what
+//! the request asked for.
 //!
 //! Assembling the router costs stack, so it runs on an explicitly sized thread for the
 //! same reason `boot_serve.rs` does.
@@ -85,6 +88,12 @@ const VERIFY_MAC_BODY: &str = r#"{"KeyIdentifier":"alias/routing-check",
 const JSON_1_0: &str = "application/x-amz-json-1.0";
 /// The content type a `restJson1` request carries.
 const REST_JSON: &str = "application/json";
+
+/// The data plane's answer to the alias above, which no key is bound to: the
+/// `ResourceId` of its modelled `ResourceNotFoundException` is the identifier the
+/// request named, so a body carrying this came from the data-plane crate serving the
+/// operation — the service whose key resolution produced it.
+const ROUTING_CHECK_RESOURCE_ID: &str = r#""ResourceId":"alias/routing-check""#;
 
 /// The rows differ along which service owns the request, the endpoint host it was
 /// addressed at, the operation's protocol and path, and whether the operation reads or
@@ -188,9 +197,12 @@ const CASES: &[Case] = &[
     },
     Case {
         // The data plane's own traffic, under the same signing name and with no
-        // `X-Amz-Target` at all: it must be claimed by the data-plane crate, whose
-        // operations are still scaffolded, so its own 501 names the operation its
-        // model bound for this path.
+        // `X-Amz-Target` at all: it must be claimed by the data-plane crate, which
+        // SERVES this operation — so what identifies the claimant is the data plane's
+        // own modelled answer for a `KeyIdentifier` that names no key: its
+        // `ResourceNotFoundException`, whose `ResourceId` echoes the identifier this
+        // body asked for. The control plane binds no such path and could not produce
+        // it.
         name: "GenerateMac on the data-plane endpoint host",
         host: "dataplane.payment-cryptography.us-east-1.amazonaws.com",
         target: "",
@@ -199,8 +211,8 @@ const CASES: &[Case] = &[
         content_type: REST_JSON,
         body: GENERATE_MAC_BODY,
         who: "the data plane",
-        status: 501,
-        marker: "operation GenerateMac is scaffolded",
+        status: 404,
+        marker: ROUTING_CHECK_RESOURCE_ID,
     },
     Case {
         // The same path space on the CONTROL plane's endpoint host: the path decides,
@@ -213,8 +225,8 @@ const CASES: &[Case] = &[
         content_type: REST_JSON,
         body: VERIFY_MAC_BODY,
         who: "the data plane",
-        status: 501,
-        marker: "operation VerifyMac is scaffolded",
+        status: 404,
+        marker: ROUTING_CHECK_RESOURCE_ID,
     },
     Case {
         // A second data-plane path space, on a loopback endpoint.

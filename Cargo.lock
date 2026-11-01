@@ -12984,6 +12984,7 @@ dependencies = [
 name = "service-com-amazonaws-paymentcryptographydata-paymentcryptographydataplane"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -12995,9 +12996,13 @@ dependencies = [
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
+ "cmac",
+ "des",
  "hex",
+ "hmac 0.12.1",
  "http",
  "serde_json",
+ "service-com-amazonaws-paymentcryptography-paymentcryptographycontrolplane",
  "service-common",
  "sha2 0.10.9",
  "tokio",

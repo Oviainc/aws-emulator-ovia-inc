@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EncryptData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EncryptData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EncryptData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Encrypts `PlainText` under the key `KeyIdentifier` names: the block cipher that
+//! key's algorithm names, keyed by that key's working material, run in the mode
+//! `EncryptionAttributes` names over the plaintext. The answer is the cipher's output
+//! and nothing else, so `DecryptData` under the same key, mode and initialization
+//! vector returns the plaintext bit for bit.
+//!
+//! The key itself lives in the Payment Cryptography control plane's store, where
+//! `CreateKey` minted it; [`crate::state::resolve_key`] is what reads it, so the
+//! `KeyArn` answered is the canonical one and `KeyCheckValue` is the value that store
+//! computed from the key's own secret.
+//!
+//! This slice serves the `Symmetric` encryption attributes. The asymmetric (RSA),
+//! DUKPT and EMV attribute sets, and the dynamic `WrappedKey` form, each need key
+//! derivation or a key form nothing here establishes yet, so they answer 501 rather
+//! than a ciphertext no documented algorithm produced.
 //!
 //! ## Shape of an operation
 //!
@@ -197,20 +204,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EncryptData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EncryptDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EncryptData"))
+        // "This operation also supports dynamic keys, allowing you to pass a dynamic
+        // encryption key as a TR-31 WrappedKeyBlock" (this operation's own
+        // documentation): a key form nothing here establishes yet.
+        if input.wrapped_key.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "EncryptData with a WrappedKey",
+            ));
+        }
+        let EncryptionDecryptionAttributes::Symmetric(attributes) = &input.encryption_attributes
+        else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "EncryptData with Asymmetric, Dukpt or Emv encryption attributes",
+            ));
+        };
+
+        let key =
+            crate::state::resolve_key(&*self.engine, &input.key_identifier).map_err(refused)?;
+        // "For this operation, the key must have KeyModesOfUse set to Encrypt" (this
+        // operation's own documentation).
+        if !key.modes.encrypt() {
+            return Err(invalid(format!(
+                "The KeyModesOfUse of key {} do not include Encrypt.",
+                key.key_arn
+            )));
+        }
+
+        let Ok(plain_text) = hex::decode(&input.plain_text) else {
+            return Err(invalid("PlainText must be hexadecimal.".to_string()));
+        };
+        let initialization_vector = match attributes.initialization_vector.as_deref() {
+            None => None,
+            Some(iv) => match hex::decode(iv) {
+                Ok(iv) => Some(iv),
+                Err(_) => {
+                    return Err(invalid(
+                        "InitializationVector must be hexadecimal.".to_string(),
+                    ))
+                }
+            },
+        };
+        let cipher_text = crate::state::crypto::symmetric_encrypt(
+            &crate::state::crypto::SymmetricRequest {
+                key_algorithm: &key.key_algorithm,
+                material: key.material(),
+                mode: &attributes.mode,
+                initialization_vector: initialization_vector.as_deref(),
+                data: &plain_text,
+            },
+        )
+        .map_err(invalid)?;
+
+        Ok(EncryptDataOutput {
+            key_arn: key.key_arn,
+            key_check_value: Some(key.key_check_value),
+            cipher_text: hex::encode_upper(cipher_text),
+        })
+    }
+}
+
+/// A request this operation cannot serve as asked: the modelled `ValidationException`.
+fn invalid(message: String) -> EncryptDataError {
+    EncryptDataErrorModeled::ValidationException(ValidationException {
+        message,
+        field_list: None,
+    })
+    .into()
+}
+
+/// The refusal [`crate::state::resolve_key`] answered, in this operation's own error
+/// channel.
+fn refused(refusal: crate::state::KeyRefusal) -> EncryptDataError {
+    match refusal {
+        crate::state::KeyRefusal::NotFound(identifier) => {
+            EncryptDataErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                resource_id: Some(identifier),
+            })
+            .into()
+        }
+        crate::state::KeyRefusal::NotUsable(message) => invalid(message),
+        crate::state::KeyRefusal::Unavailable(message) => {
+            EncryptDataErrorModeled::InternalServerException(InternalServerException {
+                message: Some(message),
+            })
+            .into()
+        }
     }
 }

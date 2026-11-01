@@ -24,13 +24,34 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# A key lives in the Payment Cryptography CONTROL plane's store, which is where
+# `CreateKey` mints it: this service resolves a `KeyIdentifier` against that store
+# rather than keeping a second copy of the key registry.
+service-com-amazonaws-paymentcryptography-paymentcryptographycontrolplane = { workspace = true }
+# The real block ciphers every computation here runs on, rather than a hand-rolled
+# imitation: AES and Triple DES for symmetric encryption and decryption, for the
+# ISO 9797 CBC-MACs, and for the single-DES steps of the card verification value.
+aes = "0.8"
+des = "0.8"
+# CMAC MAC generation over AES and Triple DES.
+cmac = "0.7"
+# HMAC MAC generation, and the derivation of a key's working material.
+# 0.12 — not the 0.13 the SigV4 stack resolves — because it is the release built on
+# `digest` 0.10, the generation `sha2` 0.10, `cmac` 0.7 and `aes` 0.8 above share: one
+# `digest` version has to serve all of them.
+hmac = "0.12"
+sha2 = { workspace = true }
+# Renders a ciphertext, a plaintext and a MAC as the hex the model's patterns admit.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# The suites drive the control plane's own `CreateKey`/`CreateAlias`/`GetKey` to mint
+# the keys they then use on this service, so the key material behind a data-plane
+# response is the one that service stored.
+service-com-amazonaws-paymentcryptography-paymentcryptographycontrolplane = { workspace = true }
 
 [lints]
 workspace = true

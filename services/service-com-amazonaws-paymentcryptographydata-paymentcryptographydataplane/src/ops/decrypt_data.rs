@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DecryptData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DecryptData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DecryptData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Decrypts `CipherText` under the key `KeyIdentifier` names: the block cipher that
+//! key's algorithm names, keyed by that key's working material, run backwards in the
+//! mode `DecryptionAttributes` names. The answer is that combination's own plaintext,
+//! so a ciphertext `EncryptData` produced under the same key, mode and initialization
+//! vector comes back bit for bit — and one produced under a different key or mode
+//! does not, because the cipher is keyed by the key the request named and by nothing
+//! else. These modes carry no integrity check, so the service cannot tell a caller
+//! which key a ciphertext was encrypted under; what it can guarantee, and does, is
+//! that no key returns another key's plaintext.
+//!
+//! This slice serves the `Symmetric` decryption attributes; the asymmetric, DUKPT and
+//! EMV attribute sets and the dynamic `WrappedKey` form answer 501, as on
+//! `EncryptData`.
 //!
 //! ## Shape of an operation
 //!
@@ -191,20 +196,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DecryptData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DecryptDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DecryptData"))
+        if input.wrapped_key.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DecryptData with a WrappedKey",
+            ));
+        }
+        let EncryptionDecryptionAttributes::Symmetric(attributes) = &input.decryption_attributes
+        else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DecryptData with Asymmetric, Dukpt or Emv decryption attributes",
+            ));
+        };
+
+        let key =
+            crate::state::resolve_key(&*self.engine, &input.key_identifier).map_err(refused)?;
+        // "For this operation, the key must have KeyModesOfUse set to Decrypt" (this
+        // operation's own documentation).
+        if !key.modes.decrypt() {
+            return Err(invalid(format!(
+                "The KeyModesOfUse of key {} do not include Decrypt.",
+                key.key_arn
+            )));
+        }
+
+        let Ok(cipher_text) = hex::decode(&input.cipher_text) else {
+            return Err(invalid("CipherText must be hexadecimal.".to_string()));
+        };
+        let initialization_vector = match attributes.initialization_vector.as_deref() {
+            None => None,
+            Some(iv) => match hex::decode(iv) {
+                Ok(iv) => Some(iv),
+                Err(_) => {
+                    return Err(invalid(
+                        "InitializationVector must be hexadecimal.".to_string(),
+                    ))
+                }
+            },
+        };
+        let plain_text = crate::state::crypto::symmetric_decrypt(
+            &crate::state::crypto::SymmetricRequest {
+                key_algorithm: &key.key_algorithm,
+                material: key.material(),
+                mode: &attributes.mode,
+                initialization_vector: initialization_vector.as_deref(),
+                data: &cipher_text,
+            },
+        )
+        .map_err(invalid)?;
+
+        Ok(DecryptDataOutput {
+            key_arn: key.key_arn,
+            key_check_value: key.key_check_value,
+            plain_text: hex::encode_upper(plain_text),
+        })
+    }
+}
+
+/// A request this operation cannot serve as asked: the modelled `ValidationException`.
+fn invalid(message: String) -> DecryptDataError {
+    DecryptDataErrorModeled::ValidationException(ValidationException {
+        message,
+        field_list: None,
+    })
+    .into()
+}
+
+/// The refusal [`crate::state::resolve_key`] answered, in this operation's own error
+/// channel.
+fn refused(refusal: crate::state::KeyRefusal) -> DecryptDataError {
+    match refusal {
+        crate::state::KeyRefusal::NotFound(identifier) => {
+            DecryptDataErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                resource_id: Some(identifier),
+            })
+            .into()
+        }
+        crate::state::KeyRefusal::NotUsable(message) => invalid(message),
+        crate::state::KeyRefusal::Unavailable(message) => {
+            DecryptDataErrorModeled::InternalServerException(InternalServerException {
+                message: Some(message),
+            })
+            .into()
+        }
     }
 }

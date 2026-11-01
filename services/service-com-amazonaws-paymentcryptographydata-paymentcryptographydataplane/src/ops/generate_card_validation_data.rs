@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GenerateCardValidationData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GenerateCardValidationData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GenerateCardValidationData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Computes the card verification value of `PrimaryAccountNumber` under the card
+//! verification key `KeyIdentifier` names, by the published CVV/CVC computation over
+//! that key's own working material (see
+//! [`crate::state::crypto::card_validation_data`]), and answers the leading
+//! `ValidationDataLength` digits of it — three when the request names no length, as
+//! that member documents.
+//!
+//! This slice serves the `CardVerificationValue1` and `CardVerificationValue2`
+//! attributes, the two the published computation is defined for from an account
+//! number, an expiry date and a service code alone. The American Express security
+//! codes and the DYNAMIC values (dCVV, dCVC, the cardholder verification value) take
+//! an application transaction counter or an unpredictable number through their own
+//! derivations, which are separate slices, so they answer 501 rather than a value no
+//! documented computation produced.
 //!
 //! ## Shape of an operation
 //!
@@ -178,20 +184,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GenerateCardValidationData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GenerateCardValidationDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GenerateCardValidationData"))
+        let (expiry_date, service_code) = match &input.generation_attributes {
+            CardGenerationAttributes::CardVerificationValue1(attributes) => (
+                attributes.card_expiry_date.clone(),
+                attributes.service_code.clone(),
+            ),
+            CardGenerationAttributes::CardVerificationValue2(attributes) => (
+                attributes.card_expiry_date.clone(),
+                crate::state::crypto::CVV2_SERVICE_CODE.to_string(),
+            ),
+            _ => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "GenerateCardValidationData with American Express or dynamic card \
+                     generation attributes",
+                ))
+            }
+        };
+
+        let key =
+            crate::state::resolve_key(&*self.engine, &input.key_identifier).map_err(refused)?;
+        // "To begin this operation, a CVK (Card Verification Key) encryption key is
+        // required" — the TR-31 card verification key — "The KeyModesOfUse should be
+        // set to Generate and Verify for a CVK encryption key" (this operation's own
+        // documentation). That advice is about how a CVK is provisioned for the pair of
+        // operations; what THIS half of the pair uses the key for is generating, so
+        // Generate is the mode it requires, and `VerifyCardValidationData` requires
+        // Verify.
+        if key.key_usage != crate::state::KEY_USAGE_CARD_VERIFICATION {
+            return Err(invalid(format!(
+                "KeyUsage {} is not valid for this operation.",
+                key.key_usage
+            )));
+        }
+        if !key.modes.generate() {
+            return Err(invalid(format!(
+                "The KeyModesOfUse of key {} do not include Generate.",
+                key.key_arn
+            )));
+        }
+
+        // "The length of the CVV or CSC to be generated. The default value is 3"
+        // (`ValidationDataLength`), whose modelled range is 3..5.
+        let length = input
+            .validation_data_length
+            .unwrap_or(crate::state::DEFAULT_VALIDATION_DATA_LENGTH);
+        let Ok(length) = usize::try_from(length) else {
+            return Err(invalid(format!(
+                "ValidationDataLength {length} is not a valid length."
+            )));
+        };
+        let validation_data = crate::state::crypto::card_validation_data(
+            &key.key_algorithm,
+            key.material(),
+            &input.primary_account_number,
+            &expiry_date,
+            &service_code,
+            length,
+        )
+        .map_err(invalid)?;
+
+        Ok(GenerateCardValidationDataOutput {
+            key_arn: key.key_arn,
+            key_check_value: key.key_check_value,
+            validation_data,
+        })
+    }
+}
+
+/// A request this operation cannot serve as asked: the modelled `ValidationException`.
+fn invalid(message: String) -> GenerateCardValidationDataError {
+    GenerateCardValidationDataErrorModeled::ValidationException(ValidationException {
+        message,
+        field_list: None,
+    })
+    .into()
+}
+
+/// The refusal [`crate::state::resolve_key`] answered, in this operation's own error
+/// channel.
+fn refused(refusal: crate::state::KeyRefusal) -> GenerateCardValidationDataError {
+    match refusal {
+        crate::state::KeyRefusal::NotFound(identifier) => {
+            GenerateCardValidationDataErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    resource_id: Some(identifier),
+                },
+            )
+            .into()
+        }
+        crate::state::KeyRefusal::NotUsable(message) => invalid(message),
+        crate::state::KeyRefusal::Unavailable(message) => {
+            GenerateCardValidationDataErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }

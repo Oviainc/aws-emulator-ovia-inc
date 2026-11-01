@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op VerifyCardValidationData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `VerifyCardValidationData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`VerifyCardValidationData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Recomputes the card verification value of `PrimaryAccountNumber` under the card
+//! verification key `KeyIdentifier` names, to the length of the `ValidationData` the
+//! request presents, and compares the two. Equal is a 200 carrying the key's ARN and
+//! check value; anything else — another value, another account number, another expiry
+//! date or service code, another key — is the modelled `VerificationFailedException`
+//! with `Reason` `INVALID_VALIDATION_DATA`.
+//!
+//! It serves the same two attribute sets as `GenerateCardValidationData`, for the
+//! same reason.
 //!
 //! ## Shape of an operation
 //!
@@ -179,20 +180,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `VerifyCardValidationData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(VerifyCardValidationDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("VerifyCardValidationData"))
+        let (expiry_date, service_code) = match &input.verification_attributes {
+            CardVerificationAttributes::CardVerificationValue1(attributes) => (
+                attributes.card_expiry_date.clone(),
+                attributes.service_code.clone(),
+            ),
+            CardVerificationAttributes::CardVerificationValue2(attributes) => (
+                attributes.card_expiry_date.clone(),
+                crate::state::crypto::CVV2_SERVICE_CODE.to_string(),
+            ),
+            _ => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "VerifyCardValidationData with American Express, Discover or dynamic \
+                     card verification attributes",
+                ))
+            }
+        };
+
+        let key =
+            crate::state::resolve_key(&*self.engine, &input.key_identifier).map_err(refused)?;
+        if key.key_usage != crate::state::KEY_USAGE_CARD_VERIFICATION {
+            return Err(invalid(format!(
+                "KeyUsage {} is not valid for this operation.",
+                key.key_usage
+            )));
+        }
+        // "The KeyModesOfUse should be set to Generate and Verify for a CVK encryption
+        // key" (`GenerateCardValidationData`'s documentation); this half of the pair
+        // needs Verify.
+        if !key.modes.verify() {
+            return Err(invalid(format!(
+                "The KeyModesOfUse of key {} do not include Verify.",
+                key.key_arn
+            )));
+        }
+
+        // The value under verification carries its own length, which is the length of
+        // the value this key computes for comparison.
+        let expected = crate::state::crypto::card_validation_data(
+            &key.key_algorithm,
+            key.material(),
+            &input.primary_account_number,
+            &expiry_date,
+            &service_code,
+            input.validation_data.chars().count(),
+        )
+        .map_err(invalid)?;
+
+        if input.validation_data != expected {
+            return Err(VerifyCardValidationDataErrorModeled::VerificationFailedException(
+                VerificationFailedException {
+                    reason: crate::state::VERIFICATION_FAILED_INVALID_VALIDATION_DATA.to_string(),
+                    message: crate::state::VERIFICATION_FAILED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        Ok(VerifyCardValidationDataOutput {
+            key_arn: key.key_arn,
+            key_check_value: key.key_check_value,
+        })
+    }
+}
+
+/// A request this operation cannot serve as asked: the modelled `ValidationException`.
+fn invalid(message: String) -> VerifyCardValidationDataError {
+    VerifyCardValidationDataErrorModeled::ValidationException(ValidationException {
+        message,
+        field_list: None,
+    })
+    .into()
+}
+
+/// The refusal [`crate::state::resolve_key`] answered, in this operation's own error
+/// channel.
+fn refused(refusal: crate::state::KeyRefusal) -> VerifyCardValidationDataError {
+    match refusal {
+        crate::state::KeyRefusal::NotFound(identifier) => {
+            VerifyCardValidationDataErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    resource_id: Some(identifier),
+                },
+            )
+            .into()
+        }
+        crate::state::KeyRefusal::NotUsable(message) => invalid(message),
+        crate::state::KeyRefusal::Unavailable(message) => {
+            VerifyCardValidationDataErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }
