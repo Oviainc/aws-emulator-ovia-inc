@@ -41,6 +41,8 @@ mod delete_keyspace_lifecycle;
 mod delete_table_in_flight;
 #[path = "all/delete_type.rs"]
 mod delete_type;
+#[path = "all/delete_type_users_on_their_way_out.rs"]
+mod delete_type_users_on_their_way_out;
 #[path = "all/duplicate_column_precedes_type_resolution.rs"]
 mod duplicate_column_precedes_type_resolution;
 #[path = "all/encryption_key_identifier_mode.rs"]

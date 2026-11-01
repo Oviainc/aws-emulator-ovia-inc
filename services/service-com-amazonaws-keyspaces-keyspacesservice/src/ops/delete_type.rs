@@ -234,10 +234,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // users of a type are derived from the keyspace as it stands now — the same
         // derivation `GetType` reports as `directReferringTables` and
         // `directParentTypes` — so a table or type created after this one counts, and a
-        // reference dropped by deleting its table stops counting. The type stays exactly
-        // as it was: the request is answered with the conflict and nothing is written.
-        let referring_tables = keyspace.direct_referring_tables(&type_name);
-        let parent_types = keyspace.direct_parent_types(&type_name);
+        // reference dropped by deleting its table stops counting: a resource whose own
+        // deletion this service has already ACCEPTED
+        // ([`crate::state::is_departing_status`]) is on its way out, takes no further
+        // change and can gain no new reference, so it is no longer a user of anything —
+        // the same judgement the keyspace-wide in-flight check makes. The type stays
+        // exactly as it was: the request is answered with the conflict and nothing is
+        // written.
+        let referring_tables = keyspace.referring_tables_still_using(&type_name);
+        let parent_types = keyspace.parent_types_still_using(&type_name);
         if !referring_tables.is_empty() || !parent_types.is_empty() {
             let mut users: Vec<String> = referring_tables
                 .iter()

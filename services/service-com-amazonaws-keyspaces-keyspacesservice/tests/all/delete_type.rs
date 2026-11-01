@@ -13,7 +13,9 @@
 //!    something still uses is refused with the modelled `ConflictException` and is left
 //!    exactly as it was, and the same request succeeds once nothing uses it. The users
 //!    are derived from the keyspace's current contents, however a column or field type
-//!    reaches the type.
+//!    reaches the type, and a resource whose own deletion the service has already
+//!    accepted is not one of them — which
+//!    [`crate::delete_type_users_on_their_way_out`] pins on its own.
 //! 3. A type with an action of its own already in progress — the creation `CreateType`
 //!    started, or a deletion this operation started — is refused with the modelled
 //!    `ConflictException`, and the action in flight is not disturbed.
@@ -39,7 +41,7 @@ fn type_arn(keyspace: &str, type_name: &str) -> String {
 }
 
 /// Create a keyspace and hand its name back.
-async fn keyspace(emulator: &Emulator, name: &'static str) -> &'static str {
+pub(crate) async fn keyspace(emulator: &Emulator, name: &'static str) -> &'static str {
     assert_ok(
         "create the keyspace",
         emulator
@@ -50,7 +52,7 @@ async fn keyspace(emulator: &Emulator, name: &'static str) -> &'static str {
 }
 
 /// Create one type with a single scalar field.
-async fn create_type(emulator: &Emulator, case: &str, ks: &str, type_name: &str) {
+pub(crate) async fn create_type(emulator: &Emulator, case: &str, ks: &str, type_name: &str) {
     assert_ok(
         case,
         emulator
@@ -67,7 +69,7 @@ async fn create_type(emulator: &Emulator, case: &str, ks: &str, type_name: &str)
 }
 
 /// `GetType`'s report of one type, or the failure it answered with.
-async fn get_type(emulator: &Emulator, ks: &str, type_name: &str) -> (u16, Value) {
+pub(crate) async fn get_type(emulator: &Emulator, ks: &str, type_name: &str) -> (u16, Value) {
     emulator
         .call("GetType", json!({"keyspaceName": ks, "typeName": type_name}))
         .await
@@ -335,8 +337,10 @@ async fn delete_type_refuses_a_type_a_table_or_another_type_uses() {
         );
     }
 
-    // Deleting the user only STARTS its removal, so while that removal is in flight the
-    // user still exists and still uses the type.
+    // Drop every user and let the removals the clock owes complete, so nothing uses the
+    // types any more. That a user whose removal is merely ACCEPTED has already stopped
+    // counting is the rule
+    // `crate::delete_type_users_on_their_way_out` pins.
     for case in &cases {
         let requested = match case.user {
             User::Table(table_name) => emulator
@@ -353,17 +357,6 @@ async fn delete_type_refuses_a_type_a_table_or_another_type_uses() {
                 .await,
         };
         assert_ok(case.case, requested);
-        assert_failure(
-            case.case,
-            emulator
-                .call(
-                    "DeleteType",
-                    json!({"keyspaceName": ks, "typeName": case.used}),
-                )
-                .await,
-            400,
-            "ConflictException",
-        );
     }
     tokio::time::sleep(settle_wait()).await;
 

@@ -438,6 +438,20 @@ pub fn is_in_flight_status(status: &str) -> bool {
         || status == TABLE_STATUS_RESTORING
 }
 
+/// Whether `status` is the one a resource holds once the service has ACCEPTED its
+/// deletion: the resource is on its way out, so it takes no further change, can gain no
+/// new reference, and the clock owes it nothing but its removal.
+///
+/// The companion of [`is_in_flight_status`], which deliberately leaves this status out
+/// for the same reason: a resource already on its way out does not block a change to
+/// another resource. `DELETING` has the same spelling in the model's `KeyspaceStatus`,
+/// `TableStatus` and `TypeStatus` value sets, so one predicate answers for all three.
+pub fn is_departing_status(status: &str) -> bool {
+    // Spelled with the table constant; the comparison is against the status STRING,
+    // which the keyspace and type value sets spell identically.
+    status == TABLE_STATUS_DELETING
+}
+
 /// The largest page a `@paginated` listing of this service returns, and the page size a
 /// caller that names no `maxResults` gets: the maximum of the modelled `maxResults` range
 /// (`1..1000`), which every `@paginated` operation of this service shares.
@@ -983,7 +997,7 @@ impl Keyspace {
     /// [`KEYSPACE_STATUS_DELETING`] — so it is on its way out and takes no further
     /// change.
     pub fn is_deleting(&self) -> bool {
-        self.status == KEYSPACE_STATUS_DELETING
+        is_departing_status(&self.status)
     }
 
     /// The first resource of this keyspace that still has a change of its OWN in flight:
@@ -1590,16 +1604,47 @@ impl Keyspace {
     /// this one, which is exactly what [`referenced_type_names`] extracts. One pass over
     /// the keyspace's types, so at most [`MAX_TYPES_PER_KEYSPACE`] x
     /// [`MAX_FIELDS_PER_TYPE`] field types are scanned.
+    ///
+    /// EVERY such type, whatever its status: this is what the keyspace HOLDS, which is
+    /// what a report of the type describes. The narrower question "what still uses this
+    /// type" is [`Self::parent_types_still_using`].
     pub fn direct_parent_types(&self, type_name: &str) -> Vec<String> {
+        self.parent_types(type_name, |_| true)
+    }
+
+    /// The types of this keyspace that still USE `type_name`: the parents
+    /// [`Self::direct_parent_types`] derives, minus every one whose own deletion the
+    /// service has already accepted ([`is_departing_status`]).
+    ///
+    /// A type on its way out takes no further change and is excluded from
+    /// [`Self::usable_type_names`], so its fields can neither change nor be referred to
+    /// again: the reference it holds is already dropped, and it is not a user of
+    /// anything the caller can still do something about.
+    pub fn parent_types_still_using(&self, type_name: &str) -> Vec<String> {
+        self.parent_types(type_name, |candidate| {
+            !is_departing_status(&candidate.status)
+        })
+    }
+
+    /// The parents of `type_name` that `counts` keeps — the ONE derivation both readers
+    /// above share, so they can never disagree about what a parent is.
+    fn parent_types(
+        &self,
+        type_name: &str,
+        counts: impl Fn(&UserDefinedType) -> bool,
+    ) -> Vec<String> {
         self.types
             .values()
             .filter(|candidate| {
                 candidate.type_name != type_name
-                    && candidate.field_definitions.iter().any(|field| {
-                        referenced_type_names(&field.r#type)
+                    && counts(candidate)
+                    && refers_to_type(
+                        candidate
+                            .field_definitions
                             .iter()
-                            .any(|referenced| referenced == type_name)
-                    })
+                            .map(|field| field.r#type.as_str()),
+                        type_name,
+                    )
             })
             .map(|candidate| candidate.type_name.clone())
             .collect()
@@ -1608,24 +1653,61 @@ impl Keyspace {
     /// The tables of this keyspace that use `type_name` in one of their columns —
     /// `GetType`'s `directReferringTables` ("The tables that use this type").
     ///
-    /// Derived the same way, in one pass over the keyspace's tables.
+    /// Derived the same way, in one pass over the keyspace's tables, and over every
+    /// table the keyspace holds whatever its status.
     pub fn direct_referring_tables(&self, type_name: &str) -> Vec<String> {
+        self.referring_tables(type_name, |_| true)
+    }
+
+    /// The tables of this keyspace that still USE `type_name`: the referring tables
+    /// [`Self::direct_referring_tables`] derives, minus every one whose own deletion the
+    /// service has already accepted ([`is_departing_status`]).
+    ///
+    /// The same rule as [`Self::parent_types_still_using`] one resource kind over: a
+    /// table on its way out takes no further change ([`table_deleting_rejection`]), so
+    /// the columns it was deleted with are the last it will ever have and the reference
+    /// deleting it dropped has stopped counting.
+    pub fn referring_tables_still_using(&self, type_name: &str) -> Vec<String> {
+        self.referring_tables(type_name, |table| !is_departing_status(&table.status))
+    }
+
+    /// The tables referring to `type_name` that `counts` keeps — the ONE derivation both
+    /// readers above share.
+    fn referring_tables(&self, type_name: &str, counts: impl Fn(&Table) -> bool) -> Vec<String> {
         self.tables
             .values()
             .filter(|table| {
-                table
-                    .schema_definition
-                    .iter()
-                    .flat_map(|schema| &schema.all_columns)
-                    .any(|column| {
-                        referenced_type_names(&column.r#type)
+                counts(table)
+                    && refers_to_type(
+                        table
+                            .schema_definition
                             .iter()
-                            .any(|referenced| referenced == type_name)
-                    })
+                            .flat_map(|schema| &schema.all_columns)
+                            .map(|column| column.r#type.as_str()),
+                        type_name,
+                    )
             })
             .map(|table| table.table_name.clone())
             .collect()
     }
+}
+
+/// Whether any of `type_expressions` — the `type` of a table's columns, or of a type's
+/// fields — refers to the user-defined type `type_name`.
+///
+/// A reference reaches a type through any type expression that names it, directly or
+/// inside a collection or `frozen<...>` constructor, which is exactly what
+/// [`referenced_type_names`] extracts: the derivations above differ only in WHICH
+/// expressions they feed in, never in what counts as a reference.
+fn refers_to_type<'a>(
+    type_expressions: impl Iterator<Item = &'a str>,
+    type_name: &str,
+) -> bool {
+    type_expressions.into_iter().any(|expression| {
+        referenced_type_names(expression)
+            .iter()
+            .any(|referenced| referenced == type_name)
+    })
 }
 
 /// `GetType`'s `maxNestingDepth` ("The level of nesting implemented for this type"):
@@ -2247,7 +2329,7 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
         // question for it.
         let table_name = table_name?;
         let table = keyspace.tables.get(&table_name)?;
-        (table.status == TABLE_STATUS_DELETING)
+        is_departing_status(&table.status)
             .then(|| table_deleting_rejection(&keyspace_name, &table_name))
     }
 
