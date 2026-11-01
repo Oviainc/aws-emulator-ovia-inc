@@ -10,7 +10,9 @@
 //! authorization and ingesting with it (authorize → connect → ingest), so it is
 //! what makes an authorization usable by `CreateIngestion`. The transition is
 //! owed to THIS call, not to the clock: an authorization stays `PendingConnect`
-//! until a caller connects it.
+//! until a caller connects it. The call carries no idempotency token, so a repeat
+//! of it is served; one whose authorization is already `Connected` has no change
+//! left to apply, so it reports the record as it stands, `updatedAt` included.
 //!
 //! No credential material is read or stored: the `authRequest` the OAuth2 flow
 //! carries is `@sensitive`, and the only thing this handler takes from it is
@@ -211,20 +213,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The handshake this emulator can complete: the authorization becomes
         // usable, which is the state the rest of the chain depends on. Connecting
-        // one that is already `Connected` is the same write, so a retry is
-        // answered the same way rather than refused.
-        authorization.status = crate::state::APP_AUTHORIZATION_STATUS_CONNECTED.to_string();
-        authorization.updated_at = ::std::time::SystemTime::now();
+        // one that is already `Connected` has no change left to apply, so it is
+        // answered with the record exactly as it stands rather than refused —
+        // `updatedAt` dates the last CHANGE to the record (and the audit trail
+        // records changes), so a call that moves nothing moves neither. The
+        // sibling `UpdateAppAuthorization` decides the same way for the same
+        // record.
+        let moved = !authorization.is_connected();
+        if moved {
+            authorization.status = crate::state::APP_AUTHORIZATION_STATUS_CONNECTED.to_string();
+            authorization.updated_at = ::std::time::SystemTime::now();
+        }
         let id = authorization.id.clone();
-        // Read the response back out of the record this call just wrote.
+        // Read the response back out of the record this call left behind.
         let app_authorization_summary = authorization.to_summary();
-        crate::state::audit_resource_change(
-            ctx.parts(),
-            Self::NAME,
-            "AppAuthorization",
-            &id,
-            "connected",
-        );
+        if moved {
+            crate::state::audit_resource_change(
+                ctx.parts(),
+                Self::NAME,
+                "AppAuthorization",
+                &id,
+                "connected",
+            );
+        }
         Ok(ConnectAppAuthorizationOutput {
             app_authorization_summary,
         })

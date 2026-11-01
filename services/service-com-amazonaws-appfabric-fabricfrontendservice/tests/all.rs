@@ -67,6 +67,8 @@ mod oauth2_auth_type_predicate;
 mod page_token_authenticity;
 #[path = "all/pagination_token_lifetime.rs"]
 mod pagination_token_lifetime;
+#[path = "all/repeat_connect_dates_nothing.rs"]
+mod repeat_connect_dates_nothing;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/spent_client_token_decision.rs"]
