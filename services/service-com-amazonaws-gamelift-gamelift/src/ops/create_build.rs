@@ -323,13 +323,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // minted with it could upload nowhere: the bucket behind a service-owned location is
         // stood up as part of creating the build, in the one object store this emulator
         // holds. Like the credential, it is claimed BEFORE the build store is locked, so no
-        // other component's lock is taken while that guard is held. Its name is fixed, so
-        // this records at most that ONE bucket however many builds are created, and a name
-        // held by a bucket that is not this service's refuses the create rather than vending
-        // an upload into it. A caller that named its own bucket needs none of this: those
-        // files are already where they belong.
+        // other component's lock is taken while that guard is held. Its name is the service's
+        // build bucket for the Region this create was served in, so this records at most one
+        // bucket per Region however many builds are created, and a name held by a bucket that
+        // is not this service's refuses the create rather than vending an upload into it. A
+        // caller that named its own bucket needs none of this: those files are already where
+        // they belong.
         if requested_location.is_none()
-            && crate::state::provision_build_upload_bucket(&*self.engine) != Some(true)
+            && crate::state::provision_build_upload_bucket(&*self.engine, &region) != Some(true)
         {
             withdraw("the upload location's object store could not be stood up");
             return Err(internal(
@@ -393,7 +394,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 files_present.then(|| now + WORKFLOW_DELAY),
             ),
             None => (
-                crate::state::service_owned_build_location(&build_id),
+                crate::state::service_owned_build_location(&region, &build_id),
                 None,
             ),
         };

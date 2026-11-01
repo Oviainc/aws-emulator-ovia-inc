@@ -295,6 +295,18 @@ pub const MAX_SCRIPTS_PER_ACCOUNT: usize = 100;
 /// removes it, and `CreateBuild` models no `LimitExceededException`.
 pub const MAX_BUILDS_PER_ACCOUNT: usize = 100;
 
+/// How many Regions this service stands a build-upload bucket up in before `CreateBuild`
+/// refuses to hand out an upload location in a further one.
+///
+/// The service runs one upload bucket per Region ([`service_owned_build_bucket`]) and the
+/// Region is the one the request was served in, so this is the bound that keeps the Regions
+/// a sequence of requests names from growing the object store without limit: a bucket is
+/// stood up for the Region's uploads rather than for one build, so nothing releases it when
+/// a build goes, and [`MAX_BUILDS_PER_ACCOUNT`] does not bound it. CHOSEN for the same
+/// reason as [`MAX_CUSTOM_LOCATIONS_PER_ACCOUNT`]: far above the Regions Amazon GameLift
+/// Servers hosts in, so no realistic script reaches it.
+pub const MAX_BUILD_UPLOAD_BUCKETS: usize = 100;
+
 /// How many matchmaking rule sets this emulator holds before `CreateMatchmakingRuleSet`
 /// answers the modelled `LimitExceededException`. CHOSEN for the same reason as
 /// [`MAX_CUSTOM_LOCATIONS_PER_ACCOUNT`]: the model carries no quota, and a stored rule set
@@ -1322,15 +1334,51 @@ pub const DEFAULT_NODE_JS_VERSION: &str = NODE_JS_VERSIONS[0];
 /// Servers to access the S3 bucket" of ANOTHER account, and none is involved here — and no
 /// `ObjectVersion`, which is the caller's own bucket versioning.
 ///
-/// The service names one script bucket per Region (`prod-gamescale-scripts-<region>`) and
-/// holds each account's scripts under their own prefix, so the key is the account that
-/// owns the script and the script that holds the files: two scripts never share a
-/// location, and nothing the caller supplies names either part.
+/// The service names one script bucket per Region ([`SCRIPT_UPLOAD_FAMILY`]) and holds each
+/// account's scripts under their own prefix, so the key is the account that owns the script
+/// and the script that holds the files: two scripts never share a location, and nothing the
+/// caller supplies names either part.
 pub fn service_owned_script_location(region: &str, script_id: &str) -> S3Location {
+    service_owned_location(SCRIPT_UPLOAD_FAMILY, region, script_id)
+}
+
+/// The resource family whose uploads a service-owned bucket holds: the custom game builds
+/// `CreateBuild` hands an upload location to.
+pub const BUILD_UPLOAD_FAMILY: &str = "builds";
+
+/// The resource family whose uploads a service-owned bucket holds: the Realtime scripts
+/// `CreateScript` and `UpdateScript` store a local zip file for.
+pub const SCRIPT_UPLOAD_FAMILY: &str = "scripts";
+
+/// The Amazon GameLift Servers-owned bucket that holds one resource family's uploads for one
+/// Region: the service runs its own S3 bucket per Region per family, named
+/// `prod-gamescale-<family>-<region>`.
+///
+/// Nothing a caller supplies is part of the name: the family is fixed by the operation and
+/// the Region is the one the request was served in ([`request_region`]), so the names this
+/// can produce are the Regions requests name, not values a request carries.
+pub fn service_owned_bucket(family: &str, region: &str) -> String {
+    format!("prod-gamescale-{family}-{region}")
+}
+
+/// The Amazon GameLift Servers-owned S3 location one resource's uploaded files are held at:
+/// the family's bucket for the Region ([`service_owned_bucket`]), holding each account's
+/// resources under their own prefix — so the key is the account that owns the resource and
+/// the resource that holds the files, and two resources never share a location.
+///
+/// The ONE derivation every service-owned location comes from, so a build's and a script's
+/// locations can only follow the same rule, and whatever reports one reports what was
+/// stored.
+///
+/// The bucket belongs to the service rather than to the caller, so the location carries no
+/// `RoleArn` — that member "allows Amazon GameLift Servers to access the S3 bucket" of
+/// ANOTHER account, and none is involved here — and no `ObjectVersion`, which is the
+/// caller's own bucket versioning.
+pub fn service_owned_location(family: &str, region: &str, resource_id: &str) -> S3Location {
     S3Location {
-        bucket: Some(format!("prod-gamescale-scripts-{region}")),
+        bucket: Some(service_owned_bucket(family, region)),
         key: Some(format!(
-            "{}/{script_id}",
+            "{}/{resource_id}",
             ::engine::emulator_account_id()
         )),
         role_arn: None,
@@ -1421,32 +1469,18 @@ pub const DEFAULT_SERVER_SDK_VERSION: &str = "4.0.2";
 /// CreateBuild's doc: "Upload your build files to a Amazon GameLift Servers Amazon S3
 /// location. To use this option, specify a build name and operating system. This operation
 /// creates a new build resource and also returns an Amazon S3 location with temporary
-/// access credentials." The bucket belongs to the service rather than to the caller, so
-/// the location carries no `RoleArn` — that member "allows Amazon GameLift Servers to
-/// access the S3 bucket" of ANOTHER account — and no `ObjectVersion`, which is the
-/// caller's own bucket versioning. The bucket and key formats are CHOSEN (the service
-/// documents neither): the key names the build that holds the files, so two builds never
-/// share a location.
-pub fn service_owned_build_location(build_id: &str) -> S3Location {
-    S3Location {
-        bucket: Some(service_owned_build_bucket()),
-        key: Some(format!("{build_id}/build.zip")),
-        role_arn: None,
-        object_version: None,
-    }
+/// access credentials." The one derivation every service-owned location comes from
+/// ([`service_owned_location`]), for the builds family: the service's own build bucket for
+/// the Region the create was served in, under the account that owns the build and the build
+/// that holds the files.
+pub fn service_owned_build_location(region: &str, build_id: &str) -> S3Location {
+    service_owned_location(BUILD_UPLOAD_FAMILY, region, build_id)
 }
 
-/// The ONE Amazon GameLift Servers-owned bucket every build uploaded through
-/// [`service_owned_build_location`] is held in, with a key per build.
-///
-/// Nothing a caller supplies is part of the name: it is this emulator's account and a fixed
-/// label, so however many builds are created, and whatever their requests say, the object
-/// store gains at most this single bucket.
-pub fn service_owned_build_bucket() -> String {
-    format!(
-        "gamelift-build-uploads-{}",
-        ::engine::emulator_account_id()
-    )
+/// The Amazon GameLift Servers-owned bucket every build uploaded through
+/// [`service_owned_build_location`] in one Region is held in, with a key per build.
+pub fn service_owned_build_bucket(region: &str) -> String {
+    service_owned_bucket(BUILD_UPLOAD_FAMILY, region)
 }
 
 /// What the Amazon GameLift Servers-owned upload bucket is recorded as provisioned by in
@@ -1465,31 +1499,42 @@ pub const BUILD_UPLOAD_BUCKET_PROVISIONER: &str = "gamelift";
 /// the caller's `PutObject` and everything this service later reads about the upload are
 /// then the one store.
 ///
-/// IDEMPOTENT and BOUNDED: the name and the Region are fixed ([`service_owned_build_bucket`],
-/// [`DEFAULT_REGION`]), so a call either records that one bucket or finds it already
-/// recorded — no caller-supplied value keys an entry, and no number of requests grows the
-/// object store by more than this bucket. A bucket of that name the store holds for anybody
-/// else is NOT adopted: the upload would then be vended into a bucket that is not this
-/// service's, so the call answers `false` and the create is refused instead.
+/// IDEMPOTENT and BOUNDED: the name is the family's bucket for ONE Region
+/// ([`service_owned_build_bucket`]), so a call either records that Region's bucket or finds
+/// it already recorded — no value a request CARRIES keys an entry, and the count of buckets
+/// this service stands up is capped at [`MAX_BUILD_UPLOAD_BUCKETS`], past which a create
+/// served in a further Region is refused rather than recording another. A bucket of that
+/// name the store holds for anybody else is NOT adopted: the upload would then be vended
+/// into a bucket that is not this service's, so the call answers `false` and the create is
+/// refused instead.
 ///
 /// `false` when the store holds no such bucket of this service's and could not record one
-/// (a name in use, or its own bucket quota), `None` when that store cannot be reached at
-/// all — a router that mounts this service without Amazon S3.
+/// (a name in use, its own bucket quota, or this service's cap), `None` when that store
+/// cannot be reached at all — a router that mounts this service without Amazon S3.
 ///
 /// LOCK ORDER: this takes the S3 store's lock and holds no other while it does, and hands
 /// back an owned value rather than a guard — so it must be called with NO guard of this
 /// service's store held. Keeping the cross-service access one-directional and guard-free is
 /// what makes a lock cycle between the two stores unreachable.
-pub fn provision_build_upload_bucket<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<bool> {
+pub fn provision_build_upload_bucket<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+) -> Option<bool> {
     use ::service_com_amazonaws_s3_amazons3::state::BucketCreation;
 
-    let bucket = service_owned_build_bucket();
+    let bucket = service_owned_build_bucket(region);
     let state = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
     let mut store = state.lock();
-    let recorded = match store.provision_bucket(&bucket, DEFAULT_REGION, BUILD_UPLOAD_BUCKET_PROVISIONER)
+    // The Region is read from the request, so the cap is what keeps the Regions a sequence
+    // of requests names from growing the object store without limit. A bucket this service
+    // already stands up is not a further one, so it is served however many there are.
+    if store.bucket(&bucket).is_none() && service_owned_buckets(&store) >= MAX_BUILD_UPLOAD_BUCKETS
     {
+        return Some(false);
+    }
+    let recorded = match store.provision_bucket(&bucket, region, BUILD_UPLOAD_BUCKET_PROVISIONER) {
         BucketCreation::Created => true,
-        // The name is in use, which for this one fixed name is ordinarily the bucket an
+        // The name is in use, which for this derived name is ordinarily the bucket an
         // earlier create recorded — but `provision_bucket` reports a name taken by ANY
         // bucket, so the one that holds it is what decides.
         BucketCreation::NameTaken => store
@@ -1498,6 +1543,17 @@ pub fn provision_build_upload_bucket<Eng: Send + Sync + 'static>(engine: &Eng) -
         BucketCreation::QuotaReached => false,
     };
     Some(recorded)
+}
+
+/// How many buckets this service has stood up in the one object store, the count
+/// [`MAX_BUILD_UPLOAD_BUCKETS`] bounds.
+fn service_owned_buckets(
+    store: &::service_com_amazonaws_s3_amazons3::state::ComAmazonawsS3Amazons3State,
+) -> usize {
+    store
+        .buckets()
+        .filter(|(_, bucket)| bucket.provisioned_by() == Some(BUILD_UPLOAD_BUCKET_PROVISIONER))
+        .count()
 }
 
 /// Whether the build files a storage location names are in the one object store: the

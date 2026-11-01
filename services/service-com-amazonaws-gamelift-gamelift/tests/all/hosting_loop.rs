@@ -60,11 +60,23 @@ impl GameLift {
 
     /// Send `GameLift.<operation>` with `body` and return the status and parsed body.
     pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+        self.call_in(REGION, operation, body).await
+    }
+
+    /// [`Self::call`], signed for `region` rather than for [`REGION`]: the emulator serves a
+    /// request in the Region of its SigV4 credential scope, so this is how a suite reaches
+    /// the same operation in another Region.
+    pub(crate) async fn call_in(
+        &self,
+        region: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let credential =
-            format!("AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/gamelift/aws4_request, SignedHeaders=host, Signature=00");
+            format!("AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/gamelift/aws4_request, SignedHeaders=host, Signature=00");
         let request = http::Request::builder()
             .method("POST")
-            .uri(format!("https://gamelift.{REGION}.amazonaws.com/"))
+            .uri(format!("https://gamelift.{region}.amazonaws.com/"))
             .header("content-type", "application/x-amz-json-1.1")
             .header("x-amz-target", format!("GameLift.{operation}"))
             .header("authorization", credential)
@@ -84,10 +96,15 @@ impl GameLift {
 
     /// The body of a call that must succeed.
     pub(crate) async fn ok(&self, operation: &str, body: Value) -> Value {
-        let (status, parsed) = self.call(operation, &body).await;
+        self.ok_in(REGION, operation, body).await
+    }
+
+    /// [`Self::ok`] for a call served in `region`.
+    pub(crate) async fn ok_in(&self, region: &str, operation: &str, body: Value) -> Value {
+        let (status, parsed) = self.call_in(region, operation, &body).await;
         assert_eq!(
             status, 200,
-            "{operation} {body}: expected HTTP 200, got {status} with body {parsed}"
+            "{operation} in {region} {body}: expected HTTP 200, got {status} with body {parsed}"
         );
         parsed
     }

@@ -49,6 +49,8 @@ mod script_deletion;
 mod scripts;
 #[path = "all/server_process_capacity.rs"]
 mod server_process_capacity;
+#[path = "all/service_owned_upload_locations.rs"]
+mod service_owned_upload_locations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unknown_resource_lookups.rs"]

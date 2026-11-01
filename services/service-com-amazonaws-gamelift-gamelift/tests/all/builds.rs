@@ -803,10 +803,13 @@ async fn the_build_upload_location_serves_the_files_uploaded_to_it() {
 #[tokio::test]
 async fn an_upload_bucket_that_is_not_the_services_is_not_adopted() {
     let gamelift = GameLift::new();
-    // The name the service-owned upload location carries
-    // (`state::service_owned_build_bucket`), created here through S3's own API so it
-    // belongs to the caller rather than to this service.
-    let taken = format!("gamelift-build-uploads-{}", engine::emulator_account_id());
+    // The name the service-owned upload location carries for the Region every request in
+    // this suite is served in (`state::service_owned_build_bucket`), created here through
+    // S3's own API so it belongs to the caller rather than to this service.
+    let taken = format!(
+        "prod-gamescale-builds-{}",
+        super::hosting_loop::REGION
+    );
     create_bucket(&gamelift, &taken).await;
 
     let (status, code) = gamelift
