@@ -207,40 +207,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => return Err(validation(crate::state::INVALID_NEXT_TOKEN)),
         };
 
-        // Catalog position kept beside each row: the token is an offset into the
+        // The rows the request selects, each with its catalog position, through
+        // the one shared selection step: the token is an offset into the
         // catalog, not into the filtered view, so changing the filter between
         // pages cannot make a page resume in the middle of a row it already
         // reported.
-        let selected: Vec<(usize, ActivitySummary)> = catalog
-            .iter()
-            .enumerate()
-            .skip(offset)
-            .filter(|(_, activity)| {
-                wanted.is_empty() || wanted.contains(&activity.status)
-            })
-            .map(|(position, activity)| {
-                (
-                    position,
-                    ActivitySummary {
-                        activity_id: activity.activity_id.clone(),
-                        // The stored row's title in the requested language; a
-                        // request that named none is answered in the catalog's
-                        // base language.
-                        title: activity.title.in_language(language_code).to_string(),
-                        reward: activity.reward_union(),
-                        status: activity.status.clone(),
-                    },
-                )
-            })
-            .collect();
+        let selected = crate::state::select_rows(catalog, offset, |activity| {
+            wanted.is_empty() || wanted.contains(&activity.status)
+        });
 
         // The page cut and the token it issues are this service's one
-        // pagination rule, stated beside the token codec and the page-size
-        // resolution it belongs with, so both paginated operations page alike.
+        // pagination rule, stated beside the token codec, the page-size
+        // resolution and the selection step it belongs with, so both paginated
+        // operations page alike.
         let (page, next_token) = crate::state::cut_page(PAGE_KIND, &selected, page_size);
 
         Ok(ListAccountActivitiesOutput {
-            activities: page.iter().map(|(_, summary)| summary.clone()).collect(),
+            activities: page
+                .iter()
+                .map(|(_, activity)| ActivitySummary {
+                    activity_id: activity.activity_id.clone(),
+                    // The stored row's title in the requested language; a
+                    // request that named none is answered in the catalog's
+                    // base language.
+                    title: activity.title.in_language(language_code).to_string(),
+                    reward: activity.reward_union(),
+                    status: activity.status.clone(),
+                })
+                .collect(),
             next_token,
         })
     }

@@ -187,20 +187,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => return Err(validation(crate::state::INVALID_NEXT_TOKEN)),
         };
 
-        // Position in the stored order kept beside each selected row, so the
-        // token is an offset into the records and not into the filtered view.
-        let mut selected: Vec<(usize, &crate::state::UsageRecord)> = Vec::new();
-        for (position, record) in records.iter().enumerate().skip(offset) {
-            let keep = filter
+        // The rows the request selects, each with its position in the stored
+        // order, through the one shared selection step: the token is an offset
+        // into the records and not into the filtered view.
+        let selected = crate::state::select_rows(records, offset, |record| {
+            filter
                 .as_ref()
-                .is_none_or(|filter| matches_expression(record, filter));
-            if keep {
-                selected.push((position, record));
-            }
-        }
+                .is_none_or(|filter| matches_expression(record, filter))
+        });
 
         // The same pagination rule `ListAccountActivities` pages by, stated
-        // once beside the token codec and the page-size resolution.
+        // once beside the token codec, the page-size resolution and the
+        // selection step.
         let (page, next_token) = crate::state::cut_page(PAGE_KIND, &selected, page_size);
 
         Ok(GetFreeTierUsageOutput {

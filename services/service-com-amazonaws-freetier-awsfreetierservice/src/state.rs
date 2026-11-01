@@ -521,19 +521,46 @@ pub fn page_size(max_results: i32) -> usize {
     usize::try_from(requested).unwrap_or(DEFAULT_MAX_RESULTS as usize)
 }
 
+/// The rows one request selects out of a stored collection, each paired with
+/// its position in the STORED order: starting at the offset the request's token
+/// resumed at, every row `selects` keeps.
+///
+/// The step [`cut_page`] cuts, stated here ONCE beside it rather than
+/// hand-written in each paginated operation, because it is what makes the token
+/// `cut_page` issues an offset into the stored collection: the offset is skipped
+/// over the STORED rows and the position paired with a kept row is its stored
+/// one, so a page never resumes in the middle of the filtered view and changing
+/// the filter between pages cannot make a page skip or repeat a row. `selects`
+/// is the only part that differs between the listings — the statuses a request
+/// lists, the filter expression it carries — and a request expressing no
+/// narrowing selects every row.
+pub fn select_rows<T>(
+    stored: &[T],
+    offset: usize,
+    mut selects: impl FnMut(&T) -> bool,
+) -> Vec<(usize, &T)> {
+    stored
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .filter(|&(_, row)| selects(row))
+        .collect()
+}
+
 /// Cut the rows a request selected down to one page and issue the `nextToken`
 /// that resumes the listing after it.
 ///
-/// The third part of the pagination rule whose other two parts are
-/// [`encode_page_token`]/[`page_offset`] and [`page_size`], stated here
-/// ONCE so both paginated operations page by the same rule: a page reports at
-/// most `page_size` of the selected rows, in the order they were selected, and
-/// a token is issued only while a selected row is still unreported — the
-/// `@paginated` contract is that an absent token ends the iteration, so an
-/// exactly-filled last page carries none.
+/// The part of the pagination rule whose other parts are
+/// [`encode_page_token`]/[`page_offset`], [`page_size`] and [`select_rows`],
+/// stated here ONCE so both paginated operations page by the same rule: a page
+/// reports at most `page_size` of the selected rows, in the order they were
+/// selected, and a token is issued only while a selected row is still
+/// unreported — the `@paginated` contract is that an absent token ends the
+/// iteration, so an exactly-filled last page carries none.
 ///
-/// `rows` pairs each selected item with its position in the STORED order, so
-/// the token the page issues is an offset into the stored collection and not
+/// `rows` pairs each selected item with its position in the STORED order —
+/// which is what [`select_rows`], the step before this one, is for — so the
+/// token the page issues is an offset into the stored collection and not
 /// into the filtered view: changing the filter between pages cannot make a page
 /// resume in the middle of a row it already reported. `kind` names the listing
 /// the token belongs to, so a token one paginated operation issued is not
@@ -557,12 +584,12 @@ pub fn cut_page<'rows, T>(
 /// other listing, of an older encoding, one carrying an offset no page could
 /// have stopped at, or one that was never a token at all.
 ///
-/// The fourth part of the pagination rule, beside
-/// [`encode_page_token`]/[`page_offset`], [`page_size`] and [`cut_page`],
-/// so both paginated operations refuse a token they did not issue in ONE
-/// wording: the condition is "this is not a token of mine", which is the same
-/// condition whichever listing was asked and whatever the token held, so the
-/// sentence names neither the operation nor the token.
+/// The last part of the pagination rule, beside
+/// [`encode_page_token`]/[`page_offset`], [`page_size`], [`select_rows`] and
+/// [`cut_page`], so both paginated operations refuse a token they did not issue
+/// in ONE wording: the condition is "this is not a token of mine", which is the
+/// same condition whichever listing was asked and whatever the token held, so
+/// the sentence names neither the operation nor the token.
 pub const INVALID_NEXT_TOKEN: &str = "The next token is invalid.";
 
 /// The `message` a `ValidationException` this service's OWN validation layer
