@@ -61,6 +61,8 @@ mod create_connection_client_token_replay;
 mod create_connection_remote_account;
 #[path = "all/emulator.rs"]
 mod emulator;
+#[path = "all/list_connections_environment_filter.rs"]
+mod list_connections_environment_filter;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
 #[path = "all/proposal_parameters_are_captured.rs"]

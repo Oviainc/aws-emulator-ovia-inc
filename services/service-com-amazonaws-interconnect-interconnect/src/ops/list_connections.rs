@@ -186,6 +186,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The `environmentId` filter is NOT resolved in the Environment catalog, unlike
+        // the `environmentId` of every operation whose SUBJECT is an Environment
+        // (`GetEnvironment`, `ListAttachPoints`, `CreateConnection`), each of which
+        // refuses an id the called Region's catalog does not hold. This member filters
+        // "the results" — the connections the caller has access to — "to only include
+        // Connection objects on the given Environment", so it SELECTS on a stored member
+        // of each connection rather than naming a resource this listing is for: the
+        // service is recorded answering a filtered listing that selects no stored
+        // connection with HTTP 200 and an empty page, so a value nothing carries means
+        // "nothing of yours is on that Environment" and is never a refusal. The two
+        // unions above are a different case for a different reason — what they carry is
+        // outside the MEMBER's own modelled constraints, which is a fault in the request
+        // however the store looks — and so is the cursor below, which this endpoint
+        // either issued or did not.
+        //
         // "Only Connection objects matching all filters will be returned": every
         // supplied filter is an exact-match conjunct, and an absent one constrains
         // nothing. Each summary is PROJECTED from the stored connection, so the list
