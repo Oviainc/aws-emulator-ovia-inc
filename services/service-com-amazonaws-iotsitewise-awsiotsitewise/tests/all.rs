@@ -543,6 +543,12 @@ mod list_bulk_import_jobs;
 // declaration of its own, and four appends there collided in a row with this one.
 #[path = "all/client_token_idempotency.rs"]
 mod client_token_idempotency;
+// In its alphabetical place inside the sorted list, rather than at the head of this
+// file or appended after the list: both of those are where every concurrent
+// iotsitewise change puts a declaration of its own, and two squashes in a row
+// collided with this one at the head.
+#[path = "all/composite_property_published_id_ingest.rs"]
+mod composite_property_published_id_ingest;
 // In its alphabetical place inside the sorted list, rather than appended after
 // it: the end of this file is where every concurrent iotsitewise change appends a
 // declaration of its own, and each append there collided with this one.
