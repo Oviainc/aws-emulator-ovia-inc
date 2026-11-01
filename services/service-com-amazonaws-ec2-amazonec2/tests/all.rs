@@ -1185,3 +1185,9 @@ mod transit_gateway_route_table_associations;
 // refuses.
 #[path = "all/create_transit_gateway_vpc_attachment.rs"]
 mod create_transit_gateway_vpc_attachment;
+// Appended at the END of this file, for the reason the header gives. The entries (rules) of a
+// transit gateway metering policy: what `CreateTransitGatewayMeteringPolicyEntry` stores on a
+// stored policy, how one rule number names one entry of one policy, and what
+// `GetTransitGatewayMeteringPolicyEntries` reports, filters and pages out of that store.
+#[path = "all/transit_gateway_metering_policy_entries.rs"]
+mod transit_gateway_metering_policy_entries;

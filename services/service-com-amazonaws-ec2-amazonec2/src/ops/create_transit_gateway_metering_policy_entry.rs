@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGatewayMeteringPolicyEntry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGatewayMeteringPolicyEntry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: adds an entry to the transit gateway metering policy the request names, at the
+//! rule number it names, over the traffic-matching criteria it carries, in the one state its
+//! catalog admits for an entry in force.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGatewayMeteringPolicyEntry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +156,315 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayMeteringPolicyEntry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayMeteringPolicyEntryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayMeteringPolicyEntry"))
+        // `ctx` carries request metadata only; this operation reads none of it — an entry is a
+        // resource OF the policy the request names and carries no Region of its own. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the transit gateway metering policy to add the entry to"
+        // (`$TransitGatewayMeteringPolicyId`): the id's FORM first, before any other member is
+        // looked at and before the store is touched — a value that is not a metering policy id
+        // at all names nothing that could exist in any account, so it is refused as malformed
+        // rather than reported as a policy nobody holds, through the ONE place this resource's
+        // malformed refusal is worded.
+        let metering_policy_id = input.transit_gateway_metering_policy_id.as_str();
+        state::require_well_formed_transit_gateway_metering_policy_id(metering_policy_id)?;
+
+        // "The rule number for the metering policy entry. Rules are processed in order from
+        // lowest to highest number" (`$PolicyRuleNumber`): the number is an ordinal position
+        // in that order, counted from
+        // [`crate::state::MIN_TRANSIT_GATEWAY_METERING_POLICY_RULE_NUMBER`]. The model puts no
+        // `@range` on the member, so the handler is the only place that floor can be enforced.
+        let rule_number = input.policy_rule_number;
+        if rule_number < state::MIN_TRANSIT_GATEWAY_METERING_POLICY_RULE_NUMBER {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({rule_number}) for parameter policyRuleNumber is invalid. A rule \
+                 number is a positive integer, from {first}",
+                first = state::MIN_TRANSIT_GATEWAY_METERING_POLICY_RULE_NUMBER,
+            )));
+        }
+
+        // The traffic-matching criteria the entry is to meter, every one of them optional:
+        // "the ID of the source transit gateway attachment for traffic matching"
+        // (`$SourceTransitGatewayAttachmentId`) and its destination twin, the two CIDR blocks,
+        // the two port ranges and the protocol. Each is read into the form it will be STORED
+        // in, so nothing the request sent is stored unchecked and an entry is never half
+        // written. The two attachment TYPES and `MeteredAccount` target modelled enums, so the
+        // boundary validator has already refused any word outside their catalogs.
+        let source_attachment_id = named_attachment(input.source_transit_gateway_attachment_id.as_deref())?;
+        let destination_attachment_id =
+            named_attachment(input.destination_transit_gateway_attachment_id.as_deref())?;
+        let source_cidr_block = matched_cidr_block(
+            input.source_cidr_block.as_deref(),
+            "sourceCidrBlock",
+        )?;
+        let destination_cidr_block = matched_cidr_block(
+            input.destination_cidr_block.as_deref(),
+            "destinationCidrBlock",
+        )?;
+        let source_port_range =
+            matched_port_range(input.source_port_range.as_deref(), "sourcePortRange")?;
+        let destination_port_range = matched_port_range(
+            input.destination_port_range.as_deref(),
+            "destinationPortRange",
+        )?;
+        let protocol = matched_protocol(input.protocol.as_deref())?;
+
+        // The rule as the request describes it. A member nothing was given for is stored
+        // absent rather than as an empty string, so a reader reports it absent instead of
+        // inventing a value for it — and an entry whose request named no criterion at all
+        // carries no rule, rather than an empty one.
+        let metering_policy_rule = TransitGatewayMeteringPolicyRule {
+            source_transit_gateway_attachment_id: source_attachment_id.clone(),
+            source_transit_gateway_attachment_type: input
+                .source_transit_gateway_attachment_type
+                .clone(),
+            source_cidr_block,
+            source_port_range,
+            destination_transit_gateway_attachment_id: destination_attachment_id.clone(),
+            destination_transit_gateway_attachment_type: input
+                .destination_transit_gateway_attachment_type
+                .clone(),
+            destination_cidr_block,
+            destination_port_range,
+            protocol,
+        };
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`$DryRun`): the flag asks about PERMISSION, not about the
+        // resources the request names, so it is answered once the request's own form has been
+        // checked and before anything is resolved or written; every caller of this emulator is
+        // permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether this entry can be created is asked of the state its policy
+        // and the attachments it names are ACTUALLY in rather than the one they were left in.
+        store.materialize_due_transitions();
+
+        // An entry has nowhere to live without the policy that holds it, so an id this account
+        // holds no policy for is refused with the one refusal every reader of a
+        // `TransitGatewayMeteringPolicyId` answers for an id it cannot resolve.
+        if !store
+            .transit_gateway_metering_policies
+            .contains_key(metering_policy_id)
+        {
+            return Err(state::invalid_transit_gateway_metering_policy_id_not_found(
+                metering_policy_id,
+            ));
+        }
+        // Every attachment the rule matches on has to exist too: an id that names no
+        // attachment of the account is a dangling reference, and storing it would leave an
+        // entry metering traffic that can never arrive — the refusal this crate answers
+        // wherever an attachment id is a PARAMETER of some other action.
+        for attachment_id in [&source_attachment_id, &destination_attachment_id]
+            .into_iter()
+            .flatten()
+        {
+            if !store
+                .transit_gateway_attachments
+                .contains_key(attachment_id.as_str())
+            {
+                return Err(state::invalid_transit_gateway_attachment_id_not_found(
+                    attachment_id,
+                ));
+            }
+        }
+        // "Rules are processed in order from lowest to highest number" (`$PolicyRuleNumber`)
+        // and no operation modifies an entry in place — `DeleteTransitGatewayMeteringPolicyEntry`
+        // resolves one by its policy and that number alone — so one rule number names one
+        // entry of one policy and a create never overwrites it.
+        if store.transit_gateway_metering_policy_holds_entry(metering_policy_id, rule_number) {
+            return Err(state::transit_gateway_metering_policy_entry_already_exists(
+                metering_policy_id,
+                rule_number,
+            ));
+        }
+
+        // The entry as the request asks for it, with everything the request does NOT decide
+        // left to the store's own writer: the rule number as it is reported, the state, and the
+        // two instants the entry carries.
+        let requested = TransitGatewayMeteringPolicyEntry {
+            policy_rule_number: None,
+            metered_account: Some(input.metered_account.clone()),
+            state: None,
+            updated_at: None,
+            update_effective_at: None,
+            metering_policy_rule: metering_policy_rule_or_none(metering_policy_rule),
+        };
+
+        // A record count ceiling first, then the byte budget: a record count on its own admits
+        // criteria of any length, and a byte budget on its own admits records without end. The
+        // insert below asks the same predicates and answers `None` for them, so this is the
+        // refusal the caller sees rather than a second rule.
+        if !store.has_transit_gateway_metering_policy_entry_capacity(metering_policy_id) {
+            return Err(policy_is_full(
+                metering_policy_id,
+                store.transit_gateway_metering_policy_entry_count(metering_policy_id),
+            ));
+        }
+        // The bytes this entry would add to the store, charged against the crate's one byte
+        // budget BEFORE the write and counted by the ONE definition of a stored entry's
+        // caller-supplied bytes, so the pre-check and the charge cannot drift apart.
+        let payload_bytes = state::transit_gateway_metering_policy_entry_payload_bytes(&requested);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store another transit gateway metering policy entry",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        let Some(entry) = store.insert_transit_gateway_metering_policy_entry(
+            metering_policy_id,
+            rule_number,
+            requested,
+        ) else {
+            // Unreachable: the policy was resolved, the rule number was found free and the
+            // ceiling was asked, all under the lock this still holds. Kept as the backstop
+            // that keeps a full policy from reading as a 501 or a 200, worded by the ONE
+            // definition of that refusal so the two cannot drift apart.
+            return Err(policy_is_full(
+                metering_policy_id,
+                store.transit_gateway_metering_policy_entry_count(metering_policy_id),
+            ));
+        };
+
+        // The answer is the entry as it was STORED, so this create and every later reader of
+        // it cannot drift apart.
+        Ok(CreateTransitGatewayMeteringPolicyEntryOutput {
+            transit_gateway_metering_policy_entry: Some(entry),
+        })
     }
+}
+
+/// A `TransitGatewayAttachmentId` the request named, held to the attachment id form before
+/// anything is looked up, or `None` when the request named none.
+///
+/// An empty value is no value: ec2Query carries an unset string member as an absent one, and a
+/// caller that sent the key with nothing after it has named no attachment either.
+fn named_attachment(
+    attachment_id: Option<&str>,
+) -> Result<Option<String>, CreateTransitGatewayMeteringPolicyEntryError> {
+    let Some(attachment_id) = attachment_id.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    crate::state::require_well_formed_transit_gateway_attachment_id(attachment_id)?;
+    Ok(Some(attachment_id.to_string()))
+}
+
+/// A CIDR block the request named for traffic matching, in the canonical form it is stored
+/// and reported in, or `None` when the request named none.
+///
+/// "The source CIDR block for traffic matching" (`$SourceCidrBlock`) and its destination twin
+/// are plain strings of either address family, so a value that is not a CIDR block at all is
+/// refused — and the one a request DID name is stored through the crate's one canonicalisation
+/// of a block ([`crate::state::canonical_cidr_block`]), the form every EC2 `CidrBlock` member
+/// documents ("we modify the specified CIDR block to its canonical form"), so two spellings of
+/// one range are one range.
+fn matched_cidr_block(
+    cidr_block: Option<&str>,
+    member: &str,
+) -> Result<Option<String>, CreateTransitGatewayMeteringPolicyEntryError> {
+    let Some(cidr_block) = cidr_block.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let canonical = crate::state::canonical_cidr_block(cidr_block).ok_or_else(|| {
+        crate::state::invalid_parameter_value(format!(
+            "Value ({echoed}) for parameter {member} is invalid. This is not a valid CIDR \
+             block.",
+            echoed = crate::state::echoed_resource_id(cidr_block),
+        ))
+    })?;
+    Ok(Some(canonical))
+}
+
+/// A port range the request named for traffic matching, as it is stored, or `None` when the
+/// request named none.
+///
+/// A range that IS given has to name ports: the one reading of a port-range string this crate
+/// has ([`crate::state::metering_policy_port_range_is_well_formed`]). The value is stored as
+/// the request spelled it — nothing in the model says a range is reported in one of its
+/// spellings rather than another.
+fn matched_port_range(
+    port_range: Option<&str>,
+    member: &str,
+) -> Result<Option<String>, CreateTransitGatewayMeteringPolicyEntryError> {
+    let Some(port_range) = port_range.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if !crate::state::metering_policy_port_range_is_well_formed(port_range) {
+        return Err(crate::state::invalid_parameter_value(format!(
+            "Value ({echoed}) for parameter {member} is invalid. A port range is a port, or a \
+             first and a last port between 0 and {max}",
+            echoed = crate::state::echoed_resource_id(port_range),
+            max = crate::state::MAX_PORT,
+        )));
+    }
+    Ok(Some(port_range.to_string()))
+}
+
+/// The protocol the request named for traffic matching, as it is stored, or `None` when the
+/// request named none.
+///
+/// "The protocol for traffic matching (1, 6, 17, etc.)" (`$Protocol`) — read by the crate's
+/// ONE definition of a protocol a rule may name ([`crate::state::ip_protocol_is_known`]), so
+/// this operation cannot accept a protocol a security group rule would refuse, or the other
+/// way round.
+fn matched_protocol(
+    protocol: Option<&str>,
+) -> Result<Option<String>, CreateTransitGatewayMeteringPolicyEntryError> {
+    let Some(protocol) = protocol.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if !crate::state::ip_protocol_is_known(protocol) {
+        return Err(crate::state::invalid_parameter_value(format!(
+            "Value ({echoed}) for parameter protocol is invalid. A protocol is a protocol \
+             number between 0 and {max}, or {all} for all protocols",
+            echoed = crate::state::echoed_resource_id(protocol),
+            max = crate::state::MAX_PROTOCOL_NUMBER,
+            all = crate::state::ALL_IP_PROTOCOLS,
+        )));
+    }
+    Ok(Some(protocol.to_string()))
+}
+
+/// The rule as it is STORED: the one the request described, or nothing at all when the request
+/// named no matching criterion — a member nothing was recorded for is stored absent rather
+/// than as an empty structure, the way every other writer of this crate stores one.
+fn metering_policy_rule_or_none(
+    rule: TransitGatewayMeteringPolicyRule,
+) -> Option<TransitGatewayMeteringPolicyRule> {
+    let named_nothing = rule.source_transit_gateway_attachment_id.is_none()
+        && rule.source_transit_gateway_attachment_type.is_none()
+        && rule.source_cidr_block.is_none()
+        && rule.source_port_range.is_none()
+        && rule.destination_transit_gateway_attachment_id.is_none()
+        && rule.destination_transit_gateway_attachment_type.is_none()
+        && rule.destination_cidr_block.is_none()
+        && rule.destination_port_range.is_none()
+        && rule.protocol.is_none();
+    (!named_nothing).then_some(rule)
+}
+
+/// The refusal a metering policy that holds as many entries as it can answers: HTTP 400
+/// `ResourceLimitExceeded`, naming the policy and how many entries it holds.
+///
+/// The ONE definition of that wording, so the pre-check and the writer's backstop below it
+/// cannot drift apart.
+fn policy_is_full(
+    metering_policy_id: &str,
+    held: usize,
+) -> CreateTransitGatewayMeteringPolicyEntryError {
+    crate::state::resource_limit_exceeded(format!(
+        "The transit gateway metering policy {metering_policy_id} holds {held} entries, which \
+         is as many as it stores"
+    ))
 }

@@ -230,13 +230,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A value that is not a metering policy id at all is refused as malformed, so "not an
         // id of this kind" never reads as "no such resource" and is never answered by the
-        // DryRun arm below either.
+        // DryRun arm below either. Through the ONE place this resource's malformed refusal is
+        // worded, which `CreateTransitGatewayMeteringPolicyEntry` and
+        // `GetTransitGatewayMeteringPolicyEntries` answer as well.
         for metering_policy_id in requested {
-            state::require_well_formed_id(
-                state::TRANSIT_GATEWAY_METERING_POLICY_ID_PREFIX,
-                metering_policy_id,
-                state::INVALID_TRANSIT_GATEWAY_METERING_POLICY_ID_MALFORMED,
-            )?;
+            state::require_well_formed_transit_gateway_metering_policy_id(metering_policy_id)?;
         }
 
         // "Checks whether you have the required permissions for the action, WITHOUT

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTransitGatewayMeteringPolicyEntries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTransitGatewayMeteringPolicyEntries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the entries the store holds for the transit gateway metering policy
+//! the request names, narrowed by every filter, in rule-number order, paged with a token
+//! naming the rule number the next page starts at.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTransitGatewayMeteringPolicyEntries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +71,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::borrow::Cow;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +141,304 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTransitGatewayMeteringPolicyEntries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTransitGatewayMeteringPolicyEntriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — the entries
+        // are those of the policy the request names. The store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the transit gateway metering policy to retrieve entries for"
+        // (`$TransitGatewayMeteringPolicyId`): the id's FORM first, before anything else is
+        // read and before the store is touched — the same order
+        // `CreateTransitGatewayMeteringPolicyEntry` reads it in, so the two cannot disagree
+        // about which refusal a request with two faults gets.
+        let metering_policy_id = input.transit_gateway_metering_policy_id.as_str();
+        state::require_well_formed_transit_gateway_metering_policy_id(metering_policy_id)?;
+
+        // Matching cost is filters x values x the policy's entries x value length, and the
+        // model bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so
+        // every request-controlled factor is capped HERE, before any work proportional to it is
+        // done and before the store is locked — the same ceilings the other EC2 reads of this
+        // crate enforce, from `crate::state`. Their PRODUCT is charged to one
+        // [`crate::state::MatchBudget`] below, which is the bound the per-factor caps cannot
+        // give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > state::MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {supplied} filters, above the maximum of {maximum}",
+                supplied = filters.len(),
+                maximum = state::MAX_FILTERS,
+            )));
+        }
+        // A filter name that is not one of an entry's own attributes is refused whether or not
+        // any entry would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here, rather than recompiled
+        // for every candidate entry.
+        let mut compiled: Vec<state::CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                state::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > state::MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {supplied} values, above the maximum of \
+                     {maximum}",
+                    supplied = values.len(),
+                    maximum = state::MAX_FILTER_VALUES,
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is bounded
+            // too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > state::MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {supplied} bytes, above the maximum \
+                     of {maximum}",
+                    supplied = oversize.len(),
+                    maximum = state::MAX_FILTER_VALUE_BYTES,
+                )));
+            }
+            compiled.push(state::CompiledFilter::new(
+                canonical.to_string(),
+                values.to_vec(),
+            ));
+        }
+
+        // "The token for the next page of results" (`$NextToken`) — a token this service did
+        // not mint, or one minted while paging ANOTHER policy's entries, is refused rather than
+        // read as a position, and it is refused before the store is read, so whether a bogus
+        // token is caught never depends on what the store holds. The position it carries is the
+        // rule number the next page starts at.
+        let start_at: Option<i32> = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_scoped_page_token(token, metering_policy_id)
+                    .and_then(|position| position.parse::<i32>().ok())
+                    .ok_or_else(state::invalid_pagination_token)?,
+            ),
+        };
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`$DryRun`): the flag asks about PERMISSION, not about the
+        // policy the request names, so it is answered once the request's own form has been
+        // checked and before anything is resolved; every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock-owed moves this read is allowed to apply — the same call the other reads of
+        // this crate make: a resource its own request left in a transient state has reached the
+        // next one once its due instant has passed, whether or not anybody called, so applying
+        // it here changes nothing a later caller would not have seen anyway. The entries
+        // themselves are only read below.
+        store.materialize_due_transitions();
+
+        // A policy this account holds none of has no entries to report, which is a refusal and
+        // not an empty page — what lets a client tell a dangling reference from a policy that
+        // simply carries no entry yet.
+        if !store
+            .transit_gateway_metering_policies
+            .contains_key(metering_policy_id)
+        {
+            return Err(state::invalid_transit_gateway_metering_policy_id_not_found(
+                metering_policy_id,
+            ));
+        }
+
+        // Every entry of that policy, in "lowest to highest number" order
+        // (`TransitGatewayMeteringPolicyEntry$PolicyRuleNumber`, "rules are processed in order
+        // from lowest to highest number") — the store is keyed by that number, so its iteration
+        // order already satisfies the order this reads in and the cursor below names a position
+        // in. Every filter must then hold ("If you specify multiple filters, the filters are
+        // joined with an AND" — `Filter`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTransitGatewayMeteringPolicyEntries"))
+        // Every comparison is charged to ONE budget — one step per candidate even when no
+        // filter was given, so an unfiltered scan is counted too — which bounds the product of
+        // the policy's entries, filters, values and value length however the caller combines
+        // them, and with it how long this holds the store's lock.
+        let mut budget = state::MatchBudget::new(state::MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<(i32, &TransitGatewayMeteringPolicyEntry)> = Vec::new();
+        for (rule_number, entry) in store
+            .transit_gateway_metering_policy_entries
+            .get(metering_policy_id)
+            .into_iter()
+            .flatten()
+        {
+            if budget.exhausted() {
+                break;
+            }
+            // The stored entry IS the modelled shape its writer stored, so every member a
+            // writer set round-trips and a member nothing recorded is reported absent rather
+            // than invented here.
+            if state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(entry, name)
+            }) {
+                selected.push((*rule_number, entry));
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as a
+        // result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {steps} comparisons to \
+                     evaluate; narrow them or page with MaxResults",
+                    steps = state::MAX_FILTER_MATCH_STEPS,
+                ),
+            ));
+        }
+
+        // The page the cursor names: the entries from the rule number it carries onwards.
+        let from = match start_at {
+            None => 0,
+            Some(cursor) => selected.partition_point(|(rule_number, _)| *rule_number < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of results to return with a single call" (`$MaxResults`). A
+        // request that names none gets the largest page the model publishes, so the `NextToken`
+        // path below behaves the same whether or not a page size was asked for. The model's
+        // `range 5..1000` has already refused anything outside it; the floor of
+        // [`MIN_MAX_RESULTS`] is applied anyway, because a page size of zero would mint a token
+        // for a page that carried nothing and leave a paging client in a loop that never
+        // advances.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .clamp(MIN_MAX_RESULTS, DEFAULT_MAX_RESULTS);
+
+        // "The token to use to retrieve the next page of results. This value is null when there
+        // are no more results to return" (`...Result$NextToken`): a token only when an entry
+        // follows this page, naming the rule number the next page starts at — opaquely and
+        // bound to THIS policy, so a caller can neither assemble one nor resume another
+        // policy's walk with it.
+        let next_token = page.get(limit).map(|(rule_number, _)| {
+            state::encode_scoped_page_token(metering_policy_id, &rule_number.to_string())
+        });
+
+        Ok(GetTransitGatewayMeteringPolicyEntriesOutput {
+            transit_gateway_metering_policy_entries: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|(_, entry)| (*entry).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`TransitGatewayMaxResults`, `range 5..1000`), which is also the most EC2 returns in one
+/// page.
+const DEFAULT_MAX_RESULTS: usize = 1000;
+
+/// The smallest page this operation will serve: the minimum of the same published range
+/// (`TransitGatewayMaxResults`, `range 5..1000`). The boundary validator refuses anything below
+/// it, so this is the floor that keeps a page of zero — which would mint a token for a page
+/// carrying nothing — unreachable however the request is read.
+const MIN_MAX_RESULTS: usize = 5;
+
+/// The filter names this operation answers.
+///
+/// The model documents no catalog for this one — `...Request$Filters` says only "One or more
+/// filters to apply when retrieving metering policy entries"
+/// (`smithy_query(query="doc",shape="GetTransitGatewayMeteringPolicyEntriesRequest",member="Filters")`)
+/// — so the names are the reported resource's OWN members in EC2's hyphenated filter spelling,
+/// one per member of `TransitGatewayMeteringPolicyEntry`
+/// (`smithy_query(query="shape",shape="TransitGatewayMeteringPolicyEntry")`, whose members are
+/// `PolicyRuleNumber`, `MeteredAccount`, `State`, `UpdatedAt`, `UpdateEffectiveAt` and
+/// `MeteringPolicyRule`) and, for the rule it carries, one per member of
+/// `TransitGatewayMeteringPolicyRule`
+/// (`smithy_query(query="shape",shape="TransitGatewayMeteringPolicyRule")`, whose members are
+/// the two attachment ids, the two attachment types, the two CIDR blocks, the two port ranges
+/// and `Protocol`) — the rule's criteria being what a caller selects an entry by. Every entry
+/// must be answered by [`filter_values`].
+const METERING_POLICY_ENTRY_FILTERS: [&str; 14] = [
+    "destination-cidr-block",
+    "destination-port-range",
+    "destination-transit-gateway-attachment-id",
+    "destination-transit-gateway-attachment-type",
+    "metered-account",
+    "policy-rule-number",
+    "protocol",
+    "source-cidr-block",
+    "source-port-range",
+    "source-transit-gateway-attachment-id",
+    "source-transit-gateway-attachment-type",
+    "state",
+    "update-effective-at",
+    "updated-at",
+];
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None` when
+/// this operation answers no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact. An entry is
+/// not a taggable resource — `TransitGatewayMeteringPolicyEntry` carries no `Tags` member — so
+/// there is no `tag:` family here, unlike the describes of the policies themselves.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    METERING_POLICY_ENTRY_FILTERS
+        .contains(&name)
+        .then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against this entry.
+///
+/// A filter naming a member this entry carries no value for compares against NO values, so it
+/// selects nothing — the same answer AWS gives for any attribute a resource holds no value for,
+/// and what an entry whose request named no matching criterion answers for every filter on the
+/// rule. `name` is a name [`canonical_filter_name`] resolved.
+fn filter_values<'a>(
+    entry: &'a TransitGatewayMeteringPolicyEntry,
+    name: &str,
+) -> Vec<Cow<'a, str>> {
+    let text =
+        |value: Option<&'a str>| -> Vec<Cow<'a, str>> { value.map(Cow::Borrowed).into_iter().collect() };
+    let rule = entry.metering_policy_rule.as_ref();
+    match name {
+        "destination-cidr-block" => {
+            text(rule.and_then(|rule| rule.destination_cidr_block.as_deref()))
+        }
+        "destination-port-range" => {
+            text(rule.and_then(|rule| rule.destination_port_range.as_deref()))
+        }
+        "destination-transit-gateway-attachment-id" => text(
+            rule.and_then(|rule| rule.destination_transit_gateway_attachment_id.as_deref()),
+        ),
+        "destination-transit-gateway-attachment-type" => text(
+            rule.and_then(|rule| rule.destination_transit_gateway_attachment_type.as_deref()),
+        ),
+        "metered-account" => text(entry.metered_account.as_deref()),
+        "policy-rule-number" => text(entry.policy_rule_number.as_deref()),
+        "protocol" => text(rule.and_then(|rule| rule.protocol.as_deref())),
+        "source-cidr-block" => text(rule.and_then(|rule| rule.source_cidr_block.as_deref())),
+        "source-port-range" => text(rule.and_then(|rule| rule.source_port_range.as_deref())),
+        "source-transit-gateway-attachment-id" => {
+            text(rule.and_then(|rule| rule.source_transit_gateway_attachment_id.as_deref()))
+        }
+        "source-transit-gateway-attachment-type" => {
+            text(rule.and_then(|rule| rule.source_transit_gateway_attachment_type.as_deref()))
+        }
+        "state" => text(entry.state.as_deref()),
+        // The one rendering of a modelled timestamp a filter compares against, shared with
+        // every other read of this crate that filters on one.
+        "update-effective-at" => crate::state::filter_timestamp_values(entry.update_effective_at),
+        "updated-at" => crate::state::filter_timestamp_values(entry.updated_at),
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
     }
 }

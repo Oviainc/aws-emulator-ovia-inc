@@ -1692,7 +1692,7 @@ use crate::ops::types::{
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment, TransitGatewayConnect,
     TransitGatewayConnectPeer,
-    TransitGatewayMeteringPolicy,
+    TransitGatewayMeteringPolicy, TransitGatewayMeteringPolicyEntry,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
     TransitGatewayPeeringAttachment, TransitGatewayPolicyTable,
     TransitGatewayAssociation,
@@ -1752,6 +1752,14 @@ pub use traffic_mirror_sessions::*;
 /// primitive here.
 pub mod vpc_peering_connections;
 pub use vpc_peering_connections::*;
+
+/// The entries of a transit gateway metering policy — what one is stored as, the state a
+/// created entry is in, the refusals a create answers, the store's bounds and its one
+/// writer — in a module of its own, re-exported so a handler reaches them as
+/// `crate::state::<item>` like every other primitive here. The policies the entries belong
+/// to live in the "Transit gateway metering policies" section of this module.
+pub mod transit_gateway_metering_policy_entries;
+pub use transit_gateway_metering_policy_entries::*;
 
 /// The `Reservation` shape, under the name the scaffold generated for it.
 ///
@@ -4109,6 +4117,24 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::asn_association_moves`]. Only a policy a write left in a transient state has
     /// an entry here, so a policy stored in a terminal one is never moved out of it.
     pub transit_gateway_metering_policy_moves: BTreeMap<String, PendingStateMove>,
+    /// The entries of each transit gateway metering policy, by
+    /// `TransitGatewayMeteringPolicyId` and then by the entry's own rule number, each as the
+    /// modelled [`TransitGatewayMeteringPolicyEntry`] shape itself.
+    ///
+    /// Keyed by the rule number because that is what identifies an entry WITHIN its policy —
+    /// `DeleteTransitGatewayMeteringPolicyEntry` names an entry by its policy and that number
+    /// alone (`smithy_query(query="operation",operation="DeleteTransitGatewayMeteringPolicyEntry")`)
+    /// — so a policy cannot hold two entries at one number, and the key order is "rules are
+    /// processed in order from lowest to highest number"
+    /// (`CreateTransitGatewayMeteringPolicyEntryRequest$PolicyRuleNumber`), which is the
+    /// stable order `GetTransitGatewayMeteringPolicyEntries` reports and pages over.
+    ///
+    /// Beside [`Self::transit_gateway_metering_policies`] rather than inside the policy
+    /// record, because that store holds the MODELLED `TransitGatewayMeteringPolicy` shape and
+    /// it carries no member for the policy's entries; the same arrangement as
+    /// [`Self::transit_gateway_metering_policy_moves`].
+    pub transit_gateway_metering_policy_entries:
+        BTreeMap<String, BTreeMap<i32, TransitGatewayMeteringPolicyEntry>>,
     /// Every IPAM pool the account holds, by `IpamPoolId`, as the modelled [`IpamPool`]
     /// shape itself.
     pub ipam_pools: BTreeMap<String, IpamPool>,
@@ -4735,6 +4761,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_policy_tables: BTreeMap::new(),
             transit_gateway_metering_policies: BTreeMap::new(),
             transit_gateway_metering_policy_moves: BTreeMap::new(),
+            // A fresh account holds no metering policy, so no policy holds an entry either.
+            transit_gateway_metering_policy_entries: BTreeMap::new(),
             ipam_pools: BTreeMap::new(),
             // A fresh account has brought no ASN of its own to IPAM, so nothing is
             // associated with any of its address ranges either.
@@ -33159,10 +33187,16 @@ pub const RESOURCE_TYPE_TRANSIT_GATEWAY_METERING_POLICY: &str = "transit-gateway
 pub const INVALID_TRANSIT_GATEWAY_METERING_POLICY_ID_NOT_FOUND: &str =
     "InvalidTransitGatewayMeteringPolicyId.NotFound";
 
-/// `InvalidTransitGatewayMeteringPolicyId.Malformed` (HTTP 400): the request named something
-/// that is not a transit gateway metering policy id at all.
+/// `InvalidTransitGatewayMeteringPolicyIdMalformedException` (HTTP 400): the request named
+/// something that is not a transit gateway metering policy id at all.
+///
+/// The code AWS answers for this resource, in the exception-suffixed spelling the newer EC2
+/// actions use (the same spelling `InvalidLaunchTemplateName.NotFoundException` carries), as
+/// the recorded refusal of a `CreateTransitGatewayMeteringPolicyEntry` naming an id outside
+/// the id form shows. Every operation that resolves a `TransitGatewayMeteringPolicyId` takes
+/// it from HERE, so one resource answers one code.
 pub const INVALID_TRANSIT_GATEWAY_METERING_POLICY_ID_MALFORMED: &str =
-    "InvalidTransitGatewayMeteringPolicyId.Malformed";
+    "InvalidTransitGatewayMeteringPolicyIdMalformedException";
 
 /// Refuse a request that named a transit gateway metering policy id no policy of the account
 /// has: HTTP 400 `InvalidTransitGatewayMeteringPolicyId.NotFound`, worded the way
@@ -33178,6 +33212,51 @@ pub fn invalid_transit_gateway_metering_policy_id_not_found<E>(
              does not exist."
         ),
     )
+}
+
+/// Whether `id` is a well-formed transit gateway metering policy id:
+/// `<prefix>-<8 or 17 lowercase hex digits>` under this resource's own prefix
+/// ([`TRANSIT_GATEWAY_METERING_POLICY_ID_PREFIX`]), read by the one generic id reader
+/// ([`prefixed_id_is_well_formed`]).
+pub fn transit_gateway_metering_policy_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(TRANSIT_GATEWAY_METERING_POLICY_ID_PREFIX, id)
+}
+
+/// Refuse something that is not a transit gateway metering policy id at all: HTTP 400
+/// [`INVALID_TRANSIT_GATEWAY_METERING_POLICY_ID_MALFORMED`], answered BEFORE the id is looked
+/// up, so "not an id of this kind" is never reported as "no such policy".
+///
+/// The ONE place this resource's malformed refusal is worded, for every operation that
+/// resolves a `TransitGatewayMeteringPolicyId`. The sentence is AWS's own for this
+/// resource — `The <resource type> ID '<id>' is malformed`, the template
+/// [`invalid_image_usage_report_id_malformed`] carries for its own kind, with the resource
+/// spelled as the modelled `ResourceType` spells it
+/// ([`RESOURCE_TYPE_TRANSIT_GATEWAY_METERING_POLICY`]) — built from the id the REQUEST sent,
+/// bounded by the one echo every refusal of this crate quotes a caller's value through.
+pub fn invalid_transit_gateway_metering_policy_id_malformed<E>(
+    transit_gateway_metering_policy_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_TRANSIT_GATEWAY_METERING_POLICY_ID_MALFORMED,
+        400,
+        format!(
+            "The {RESOURCE_TYPE_TRANSIT_GATEWAY_METERING_POLICY} ID '{echoed}' is malformed",
+            echoed = echoed_resource_id(transit_gateway_metering_policy_id),
+        ),
+    )
+}
+
+/// Hold a `TransitGatewayMeteringPolicyId` to the id form before anything is looked up:
+/// [`invalid_transit_gateway_metering_policy_id_malformed`] for a value outside it.
+pub fn require_well_formed_transit_gateway_metering_policy_id<E>(
+    transit_gateway_metering_policy_id: &str,
+) -> Result<(), Scaffolded<E>> {
+    if transit_gateway_metering_policy_id_is_well_formed(transit_gateway_metering_policy_id) {
+        return Ok(());
+    }
+    Err(invalid_transit_gateway_metering_policy_id_malformed(
+        transit_gateway_metering_policy_id,
+    ))
 }
 
 /// The caller-chosen bytes one stored metering policy holds: its tags and the middlebox
