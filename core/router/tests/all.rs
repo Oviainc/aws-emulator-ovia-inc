@@ -848,3 +848,5 @@ mod cloudformation_provisions_kms_keys;
 mod cloudformation_provisions_mq_brokers;
 #[path = "all/cloudformation_refuses_mq_brokers.rs"]
 mod cloudformation_refuses_mq_brokers;
+#[path = "all/cloudformation_provisions_agentcore_workload_identities.rs"]
+mod cloudformation_provisions_agentcore_workload_identities;

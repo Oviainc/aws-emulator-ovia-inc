@@ -538,6 +538,13 @@ const RDS_DB_PARAMETER_GROUP: &str = "AWS::RDS::DBParameterGroup";
 /// `DBClusterParameterGroupName` names.
 const RDS_DB_CLUSTER_PARAMETER_GROUP: &str = "AWS::RDS::DBClusterParameterGroup";
 
+/// `AWS::BedrockAgentCore::WorkloadIdentity`: "Ref returns the name" of the workload
+/// identity — the handle every call of the Amazon Bedrock AgentCore control plane on one
+/// takes (`GetWorkloadIdentity`, `UpdateWorkloadIdentity` and `DeleteWorkloadIdentity` each
+/// address an identity by its `name`) — so a resource of this type is addressed by its
+/// physical resource id.
+const BEDROCK_AGENTCORE_WORKLOAD_IDENTITY: &str = "AWS::BedrockAgentCore::WorkloadIdentity";
+
 /// `AWS::Glue::Job`: "Ref returns the job name" — the `Name` the declaration states, which
 /// is what `CreateJob` creates the job under and what every AWS Glue operation on a job
 /// definition (`GetJob`, `UpdateJob`, `StartJobRun`, `DeleteJob`) addresses it by. That is
@@ -719,6 +726,12 @@ pub(super) enum Provisioner {
     BackupVault,
     BackupPlan,
     BackupSelection,
+    /// `AWS::BedrockAgentCore::WorkloadIdentity`: a workload identity of the Amazon Bedrock
+    /// AgentCore control plane, which `CreateWorkloadIdentity` creates under the name the
+    /// template states, `UpdateWorkloadIdentity` changes and `DeleteWorkloadIdentity`
+    /// removes. The name IS the identity's handle — every call on one takes it — so it is
+    /// the physical id the naming rules already compute for the type.
+    BedrockAgentCoreWorkloadIdentity,
     /// `AWS::XRay::SamplingRule`: a sampling rule of AWS X-Ray, which
     /// `CreateSamplingRule` creates under the rule name its declaration states and
     /// `DeleteSamplingRule` deletes. X-Ray mints the `RuleARN` that type's `Ref`
@@ -837,6 +850,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         BACKUP_VAULT => Some(Provisioner::BackupVault),
         BACKUP_PLAN => Some(Provisioner::BackupPlan),
         BACKUP_SELECTION => Some(Provisioner::BackupSelection),
+        BEDROCK_AGENTCORE_WORKLOAD_IDENTITY => {
+            Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
+        }
         XRAY_SAMPLING_RULE => Some(Provisioner::XraySamplingRule),
         _ => None,
     }
@@ -1215,6 +1231,13 @@ impl Provisioner {
             // `BackupSelection` and no tags: AWS Backup tags a plan and a vault, not a
             // selection, so no tags are propagated to one.
             Self::BackupSelection => create_backup_selection(ctx, region, resource).await,
+            // `AWS::BedrockAgentCore::WorkloadIdentity` publishes `Tags`, and
+            // `CreateWorkloadIdentity` takes a tag MAP of its own, so an identity a stack
+            // creates carries the tags CloudFormation gives it beside the ones the
+            // declaration asks for.
+            Self::BedrockAgentCoreWorkloadIdentity => {
+                create_workload_identity(ctx, region, resource, propagated).await
+            }
             Self::XraySamplingRule => {
                 create_sampling_rule(ctx, region, resource, propagated).await
             }
@@ -1564,6 +1587,16 @@ impl Provisioner {
             // so a declaration whose change is its tags has nothing else to ask of that
             // service ([`update_schedule_group`]).
             Self::SchedulerScheduleGroup => Ok(update_schedule_group(resource, declared)),
+            // `UpdateWorkloadIdentity` takes an identity's name together with the whole
+            // list of allowed OAuth2 return URLs, which "replaces the existing list" — so
+            // a changed declaration of that list is applied to the identity the stack
+            // created rather than replacing it, and a declaration that states none leaves
+            // it with none ([`update_workload_identity`]).
+            Self::BedrockAgentCoreWorkloadIdentity => {
+                update_workload_identity(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -1985,6 +2018,9 @@ impl Provisioner {
             // The delete addresses the selection by the PAIR AWS Backup keys one by, and
             // the plan half of that pair is on the resource's own declaration.
             Self::BackupSelection => delete_backup_selection(ctx, region, resource).await,
+            Self::BedrockAgentCoreWorkloadIdentity => {
+                delete_workload_identity(ctx, region, physical_resource_id).await
+            }
             // A rule is addressed by its name or by the ARN X-Ray minted — "either name
             // or ARN, but not both" — and the ARN is this resource's physical id.
             Self::XraySamplingRule => delete_sampling_rule(ctx, region, resource).await,
@@ -2312,6 +2348,11 @@ impl Provisioner {
             // identifier it was created under.
             Self::RedshiftCluster => {
                 describe_redshift_cluster(ctx, region, physical_resource_id).await
+            }
+            // The AgentCore control plane's own read of the identity, by the name it was
+            // created under.
+            Self::BedrockAgentCoreWorkloadIdentity => {
+                describe_workload_identity(ctx, region, physical_resource_id).await
             }
             // X-Ray publishes no read of ONE sampling rule, so the rule is read out of the
             // account's own listing, by the identity that service minted for it.
@@ -25152,6 +25193,218 @@ fn sampling_rule_handle(resource: &StoredResource) -> (&'static str, &str) {
         return (XRAY_RULE_ARN, identity);
     }
     (XRAY_RULE_NAME, identity)
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Bedrock AgentCore: AWS::BedrockAgentCore::WorkloadIdentity
+// ---------------------------------------------------------------------------
+
+/// The AgentCore CONTROL plane's signing name, from its model (`sigv4Name:
+/// bedrock-agentcore`, `endpointPrefix: bedrock-agentcore-control`), which speaks
+/// `restJson1` — so its calls ride on [`call_rest_json`], each on the URI its own
+/// operation's `@http` binding declares.
+const AGENTCORE_SIGNING_NAME: &str = "bedrock-agentcore";
+
+/// The URIs the workload-identity operations a stack makes are bound to, as that model's
+/// `@http` traits declare them (`POST /identities/CreateWorkloadIdentity` and so on: each
+/// operation of this resource family is a POST to a URI named after it).
+const AGENTCORE_CREATE_WORKLOAD_IDENTITY_URI: &str = "/identities/CreateWorkloadIdentity";
+const AGENTCORE_GET_WORKLOAD_IDENTITY_URI: &str = "/identities/GetWorkloadIdentity";
+const AGENTCORE_UPDATE_WORKLOAD_IDENTITY_URI: &str = "/identities/UpdateWorkloadIdentity";
+const AGENTCORE_DELETE_WORKLOAD_IDENTITY_URI: &str = "/identities/DeleteWorkloadIdentity";
+
+/// The error code the AgentCore control plane answers for a workload identity it does not
+/// hold (`ResourceNotFoundException`, the modelled 404 of its reads, updates and deletes).
+const AGENTCORE_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The one `AWS::BedrockAgentCore::WorkloadIdentity` property beside the name and the tags
+/// that is a member of the create and of the update, as (property, member).
+///
+/// Source: `CreateWorkloadIdentity`'s and `UpdateWorkloadIdentity`'s input members in that
+/// service's model (`name`, `allowedResourceOauth2ReturnUrls`, and the create's `tags`)
+/// against the upper-camel property names a CloudFormation template spells. The name is
+/// not here because it is the one member CloudFormation decides
+/// ([`workload_identity_request`]), and the tags because they are a map the declaration
+/// and the stack both contribute to ([`create_workload_identity`]).
+const WORKLOAD_IDENTITY_MEMBERS: &[(&str, &str)] = &[(
+    "AllowedResourceOauth2ReturnUrls",
+    "allowedResourceOauth2ReturnUrls",
+)];
+
+/// Create the workload identity an `AWS::BedrockAgentCore::WorkloadIdentity` declares, so a
+/// client that deployed the stack and then calls `GetWorkloadIdentity` with the name the
+/// stack publishes reads the identity back rather than a `ResourceNotFoundException`.
+///
+/// "Ref returns the name", which is this resource's physical id and the handle every
+/// AgentCore call on an identity takes, so the identity is created under exactly that name
+/// and the ARN that service minted is reported back as the resource's
+/// `WorkloadIdentityArn` attribute.
+///
+/// The identity carries the tags the declaration asks for beside the ones CloudFormation
+/// gives the resource ([`tags_of`]), as the tag MAP `CreateWorkloadIdentity`'s own `tags`
+/// member takes. That set reaches the control plane on the CREATE alone: this type has no
+/// [`Provisioner::retag`] arm, so a later deployment that changes only the tags leaves the
+/// identity carrying the set it was created with.
+async fn create_workload_identity(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    // A property no arm below maps onto `CreateWorkloadIdentity`'s request would otherwise
+    // be dropped silently, leaving an identity configured differently from the
+    // declaration; refusing names which property it was. The type publishes exactly these
+    // three (AWS's resource reference for it against `CreateWorkloadIdentityRequest`).
+    refuse_unmapped_properties(
+        resource,
+        &["Name", "Tags", "AllowedResourceOauth2ReturnUrls"],
+    )?;
+    let mut request =
+        workload_identity_request(&resource.physical_resource_id, &resource.properties);
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let answered = call_agentcore(
+        ctx,
+        region,
+        AGENTCORE_CREATE_WORKLOAD_IDENTITY_URI,
+        &Value::Object(request),
+    )
+    .await?;
+    Ok(Created::attributes(workload_identity_attributes(
+        &answered,
+    )?))
+}
+
+/// Apply a changed declaration to the workload identity the stack created, through
+/// `UpdateWorkloadIdentity` — the one call that changes an identity that exists.
+///
+/// The request carries the whole declared list, because that member "replaces the existing
+/// list": a declaration that states none leaves the identity with none, rather than with
+/// the list an earlier deployment gave it. The identity's NAME is create-only (the service
+/// publishes no call that renames one), so a declaration that states another name replaces
+/// the resource and never reaches here.
+async fn update_workload_identity(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let request = workload_identity_request(&resource.physical_resource_id, declared);
+    let answered = call_agentcore(
+        ctx,
+        region,
+        AGENTCORE_UPDATE_WORKLOAD_IDENTITY_URI,
+        &Value::Object(request),
+    )
+    .await?;
+    Ok(Created::attributes(workload_identity_attributes(
+        &answered,
+    )?))
+}
+
+/// Delete the workload identity a stack created, by the name it was created under — this
+/// resource's physical id. One the service no longer holds
+/// (`ResourceNotFoundException`, judged on the CODE and never on a message that carries
+/// the request's own name) is already in the state the delete asks for.
+async fn delete_workload_identity(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "name": physical_resource_id });
+    match call_agentcore(
+        ctx,
+        region,
+        AGENTCORE_DELETE_WORKLOAD_IDENTITY_URI,
+        &request,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == AGENTCORE_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The workload identity's configuration as the AgentCore control plane reports it, for
+/// drift detection: `GetWorkloadIdentity`'s own answer, read by the name that is this
+/// resource's physical id. One it no longer holds (`ResourceNotFoundException`) was
+/// deleted.
+///
+/// The members its read reports under the names this type declares are the identity's name
+/// and its allowed return URLs; the instants it reports are no property of the type, and a
+/// property the read does not report is not evidence of anything ([`super::drift`]).
+async fn describe_workload_identity(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "name": physical_resource_id });
+    match call_agentcore(ctx, region, AGENTCORE_GET_WORKLOAD_IDENTITY_URI, &request).await {
+        Ok(answer) => {
+            let mut members = vec![("Name", "name")];
+            members.extend_from_slice(WORKLOAD_IDENTITY_MEMBERS);
+            Ok(Some(reported_as_properties(&answer, &members)))
+        }
+        Err(refusal) if refusal.code == AGENTCORE_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// One workload-identity create or update request: the `name` CloudFormation decided, plus
+/// the members `properties` declares ([`WORKLOAD_IDENTITY_MEMBERS`]). The two calls take
+/// the same members, so one builder serves both; the create adds the tags on top of it.
+fn workload_identity_request(name: &str, properties: &Value) -> Map<String, Value> {
+    let mut request = Map::new();
+    request.insert("name".to_string(), Value::String(name.to_string()));
+    if let Some(declared) = properties.as_object() {
+        copy_members(declared, WORKLOAD_IDENTITY_MEMBERS, &mut request);
+    }
+    request
+}
+
+/// The attributes an answered workload identity reports: the two values the type publishes
+/// as return values, read off the answer rather than recomputed here.
+///
+/// An answer carrying neither is reported as a refusal rather than recorded as a created
+/// resource: there would be no handle a client could call the service with.
+fn workload_identity_attributes(answered: &Value) -> Result<BTreeMap<String, String>, Refusal> {
+    let (Some(name), Some(arn)) = (
+        reported_text(answered, "name"),
+        reported_text(answered, "workloadIdentityArn"),
+    ) else {
+        return Err(Refusal {
+            code: "InternalFailure".to_string(),
+            message: "the Amazon Bedrock AgentCore control plane answered a workload identity \
+                      without a name and an ARN"
+                .to_string(),
+        });
+    };
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Name".to_string(), name);
+    attributes.insert("WorkloadIdentityArn".to_string(), arn);
+    Ok(attributes)
+}
+
+/// Call one operation of the Amazon Bedrock AgentCore control plane on the `restJson1` wire
+/// its model declares: a POST to the operation's own URI, carrying the request document.
+async fn call_agentcore(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    uri: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_rest_json(
+        ctx,
+        AGENTCORE_SIGNING_NAME,
+        region,
+        "POST",
+        uri,
+        Some(request),
+    )
+    .await
 }
 
 #[cfg(test)]

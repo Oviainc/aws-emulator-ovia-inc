@@ -597,9 +597,18 @@ fn output_cases() -> Vec<OutputCase> {
             ],
         },
         OutputCase {
-            // The AgentCore deployment case: a memory and a workload identity, whose
-            // identifiers the OWNING SERVICE assigns, so the rule is the documented form.
-            case: "an agentcore memory and workload identity: the ids their service assigns",
+            // The AgentCore deployment case: a memory whose identifier the OWNING SERVICE
+            // assigns, so the rule is the documented form.
+            //
+            // The `AWS::BedrockAgentCore::WorkloadIdentity` resource this row used to
+            // declare beside it moved to
+            // `core/router/tests/all/cloudformation_provisions_agentcore_workload_identities.rs`
+            // when that type gained a provisioner, for the same reason the
+            // `AWS::Transfer::Server` case above did: a stack that declares it now CALLS
+            // the AgentCore control plane, which only a router with both services mounted
+            // can serve — and that suite asserts the published name and ARN against the
+            // identity the service really created, which is stronger than a form check.
+            case: "an agentcore memory: the id its service assigns",
             stack_name: "agentcore-memory",
             template: concat!(
                 "Resources:\n",
@@ -607,10 +616,6 @@ fn output_cases() -> Vec<OutputCase> {
                 "    Type: AWS::BedrockAgentCore::Memory\n",
                 "    Properties:\n",
                 "      EventExpiryDuration: 30\n",
-                "  Identity:\n",
-                "    Type: AWS::BedrockAgentCore::WorkloadIdentity\n",
-                "    Properties:\n",
-                "      Name: probe-workload\n",
                 "Outputs:\n",
                 "  MemoryId:\n",
                 "    Value: !GetAtt Memory.MemoryId\n",
@@ -619,10 +624,6 @@ fn output_cases() -> Vec<OutputCase> {
                 "      Fn::GetAtt: [Memory, MemoryArn]\n",
                 "  MemoryRef:\n",
                 "    Value: !Ref Memory\n",
-                "  IdentityName:\n",
-                "    Value: !GetAtt Identity.Name\n",
-                "  IdentityArn:\n",
-                "    Value: !GetAtt Identity.WorkloadIdentityArn\n",
             )
             .to_string(),
             parameters: vec![],
@@ -649,19 +650,6 @@ fn output_cases() -> Vec<OutputCase> {
                         described: "a MemoryId",
                         check: is_agentcore_memory_id,
                     },
-                ),
-                (
-                    // A workload identity is NAMED, not id'd: the template's own name is
-                    // the identifier, so this row is a literal rather than a form.
-                    "IdentityName",
-                    Expected::Value("probe-workload".to_string()),
-                ),
-                (
-                    "IdentityArn",
-                    Expected::Value(format!(
-                        "arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:\
-                         workload-identity-directory/default/workload-identity/probe-workload"
-                    )),
                 ),
             ],
         },
