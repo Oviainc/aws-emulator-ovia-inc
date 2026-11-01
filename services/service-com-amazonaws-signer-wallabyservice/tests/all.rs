@@ -32,6 +32,9 @@ mod modelled_bound_refusal_wording;
 #[path = "all/next_token_refusal_wording.rs"]
 mod next_token_refusal_wording;
 
+#[path = "all/no_content_class_is_framed_alike.rs"]
+mod no_content_class_is_framed_alike;
+
 #[path = "all/paginated_page_size.rs"]
 mod paginated_page_size;
 
