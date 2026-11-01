@@ -1770,28 +1770,83 @@ pub fn is_resource_identifier(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
+/// The page walk a cursor belongs to: the operation that issued it, together with
+/// the collection that operation walked.
+///
+/// A `nextToken` names a position in ONE walk, so it is only a cursor of the walk
+/// that issued it: `ListClusters` pages the account's clusters, while `ListStreams`
+/// pages the streams of the ONE cluster it was addressed at, and neither of those
+/// positions means anything in the other walk. Both scopes are spelled here so the
+/// two readers cannot name their walks differently.
+pub fn cluster_page_scope() -> String {
+    "ListClusters/clusters".to_string()
+}
+
+/// See [`cluster_page_scope`]: `ListStreams` walks the streams of the cluster it
+/// was addressed at, so the addressed cluster is part of the walk a cursor resumes.
+pub fn stream_page_scope(cluster_identifier: &str) -> String {
+    format!("ListStreams/streams/{cluster_identifier}")
+}
+
+/// How many bytes of the integrity check a cursor carries: 16 of the 32 a
+/// SHA-256 digest holds, which is enough that no two walks or entries of this
+/// service share one and keeps the token short.
+const CURSOR_TAG_LEN: usize = 16;
+
+/// The integrity check a cursor carries: a one-way digest over the walk the
+/// cursor was issued by and the entry it resumes after.
+///
+/// This is what makes a value a cursor of ONE walk over ONE of its entries and of
+/// nothing else: the digest is not a secret, so it does not authenticate the
+/// caller — it binds the token, so a value this service issued for another walk,
+/// or never issued at all, carries a check that does not match the walk reading it
+/// and therefore names no page of it.
+///
+/// The scope and the identifier are fed in with a separator between them, so no
+/// two different pairs are one byte string.
+fn cursor_tag(scope: &str, identifier: &str) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(scope.as_bytes());
+    hasher.update([0]);
+    hasher.update(identifier.as_bytes());
+    hasher.finalize()[..CURSOR_TAG_LEN].to_vec()
+}
+
 /// Encode a list operation's pagination cursor: the identifier of the last entry
-/// the page returned, hex-encoded so the `nextToken` a client round-trips is an
-/// opaque token rather than a resource name.
+/// the page returned, carried behind the [`cursor_tag`] that binds it to `scope`,
+/// the walk that issued it, and hex-encoded so the `nextToken` a client
+/// round-trips is an opaque token rather than a resource name.
 ///
 /// Shared by every paginated reader of this service (`ListClusters` pages over
 /// `ClusterId` order, `ListStreams` over a cluster's `StreamId` order), so a
 /// cursor is spelled one way.
-pub fn encode_pagination_cursor(last_identifier: &str) -> String {
-    ::hex::encode(last_identifier.as_bytes())
+pub fn encode_pagination_cursor(scope: &str, last_identifier: &str) -> String {
+    let mut token = cursor_tag(scope, last_identifier);
+    token.extend_from_slice(last_identifier.as_bytes());
+    ::hex::encode(token)
 }
 
-/// Decode a cursor produced by [`encode_pagination_cursor`]: a hex-encoded
-/// 26-character resource identifier.
+/// Decode a cursor [`encode_pagination_cursor`] issued for `scope`: the identifier
+/// the page it ended stopped on.
 ///
-/// `None` for anything this service did not issue — not only a token that is not
-/// hex, but also one that decodes to anything other than a value
-/// [`is_resource_identifier`] accepts, so a fabricated cursor is refused rather
-/// than served as a page starting after some arbitrary key.
-pub fn decode_pagination_cursor(token: &str) -> Option<String> {
+/// `None` for every value this service did not issue for THIS walk — a token that
+/// is not hex, one whose identifier half is not a value [`is_resource_identifier`]
+/// accepts, one whose integrity check does not match the walk and the identifier it
+/// is read with (so a fabricated cursor, or one carrying an identifier no page of
+/// this walk ever stopped on, resolves to no page rather than to a seek after some
+/// arbitrary key), and one issued by a different walk, whose check is over that
+/// walk's scope.
+pub fn decode_pagination_cursor(scope: &str, token: &str) -> Option<String> {
     let decoded = ::hex::decode(token).ok()?;
-    let cursor = String::from_utf8(decoded).ok()?;
-    is_resource_identifier(&cursor).then_some(cursor)
+    if decoded.len() <= CURSOR_TAG_LEN {
+        return None;
+    }
+    let (tag, identifier) = decoded.split_at(CURSOR_TAG_LEN);
+    let identifier = String::from_utf8(identifier.to_vec()).ok()?;
+    if !is_resource_identifier(&identifier) {
+        return None;
+    }
+    (cursor_tag(scope, &identifier) == tag).then_some(identifier)
 }
 
 /// `maxResults`' published `@range` bounds. Both list operations bind the one
@@ -1826,6 +1881,10 @@ pub struct Page<S> {
 /// in the modelled default, the map walked and the summary built.
 #[derive(Debug)]
 pub struct PageBounds {
+    /// The walk this page belongs to: the cursor it issues is bound to it, and a
+    /// cursor issued by any other walk does not resolve against it
+    /// ([`cluster_page_scope`] / [`stream_page_scope`]).
+    scope: String,
     /// The identifier the previous page stopped on; this page starts after it.
     resume_after: Option<String>,
     /// The most items this page may hold.
@@ -1834,18 +1893,22 @@ pub struct PageBounds {
 
 impl PageBounds {
     /// Read a list call's `nextToken` and `maxResults` into the bounds its page
-    /// is cut at, refusing a `nextToken` this service never issued with the
-    /// modelled [`unissued_pagination_token`] refusal.
+    /// is cut at, refusing a `nextToken` no previous page of THIS walk issued
+    /// with the modelled [`unissued_pagination_token`] refusal.
     ///
-    /// `default_max_results` is the operation's own modelled `@default`.
+    /// `scope` is the walk the call is paging ([`cluster_page_scope`] /
+    /// [`stream_page_scope`]) and `default_max_results` is the operation's own
+    /// modelled `@default`.
     pub fn resolve(
+        scope: String,
         next_token: Option<&str>,
         max_results: i32,
         default_max_results: usize,
     ) -> Result<Self, ValidationException> {
         let resume_after = match next_token {
             Some(token) => Some(
-                decode_pagination_cursor(token).ok_or_else(|| unissued_pagination_token(token))?,
+                decode_pagination_cursor(&scope, token)
+                    .ok_or_else(|| unissued_pagination_token(token))?,
             ),
             None => None,
         };
@@ -1861,6 +1924,7 @@ impl PageBounds {
             .clamp(MAX_RESULTS_MIN, MAX_RESULTS_MAX);
 
         Ok(Self {
+            scope,
             resume_after,
             page_size,
         })
@@ -1906,7 +1970,7 @@ impl PageBounds {
         }
 
         let next_token = match (entries_remain, last_identifier) {
-            (true, Some(identifier)) => Some(encode_pagination_cursor(identifier)),
+            (true, Some(identifier)) => Some(encode_pagination_cursor(&self.scope, identifier)),
             _ => None,
         };
 

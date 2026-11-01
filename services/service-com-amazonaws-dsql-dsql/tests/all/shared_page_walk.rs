@@ -26,7 +26,8 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_dsql_dsql::state::{
-    encode_pagination_cursor, MAX_RESULTS_MAX, MAX_RESULTS_MIN,
+    cluster_page_scope, encode_pagination_cursor, stream_page_scope, MAX_RESULTS_MAX,
+    MAX_RESULTS_MIN,
 };
 
 use crate::harness::{Answer, Dsql};
@@ -63,6 +64,15 @@ const READERS: [Reader; 2] = [
         modeled_default: 10,
     },
 ];
+
+/// The walk `reader` pages, which the cursor it issues is bound to: the account's
+/// clusters, or the streams of the ONE cluster a stream page is addressed at.
+fn reader_scope(reader: Reader, cluster: &str) -> String {
+    match reader.name {
+        "ListClusters" => cluster_page_scope(),
+        _ => stream_page_scope(cluster),
+    }
+}
 
 /// One page from `reader`, addressed at `cluster` when the reader is scoped to a
 /// cluster.
@@ -221,8 +231,8 @@ async fn both_readers_walk_their_resource_by_the_same_page_rule() {
                     match (&token, identifiers.last()) {
                         (Some(cursor), Some(last)) => assert_eq!(
                             cursor,
-                            &encode_pagination_cursor(last),
-                            "case {case:?}: the token must be this service's cursor for \
+                            &encode_pagination_cursor(&reader_scope(reader, &cluster), last),
+                            "case {case:?}: the token must be this walk's cursor for \
                              the page's last identifier {last:?}, got {cursor:?}"
                         ),
                         (Some(cursor), None) => panic!(

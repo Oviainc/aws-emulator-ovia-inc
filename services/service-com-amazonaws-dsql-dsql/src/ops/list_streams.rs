@@ -170,12 +170,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Where this page starts and how many streams it may hold, read by the
         // page walk every paginated reader of this service shares. A `nextToken`
-        // this service never issued is refused with the service's OWN
+        // no previous page of THIS walk issued — a fabricated one, one the other
+        // paginated reader issued, or one this operation issued over a DIFFERENT
+        // cluster's streams — is refused with the service's OWN
         // `ValidationException`, so the refusal carries the modelled members a
         // client reads — `message`, the `@required` `reason` and the `fieldList`
         // naming `nextToken` — and, being about the cursor alone, is decided
         // before the addressed cluster is looked up.
         let bounds = crate::state::PageBounds::resolve(
+            crate::state::stream_page_scope(&input.cluster_identifier),
             input.next_token.as_deref(),
             input.max_results,
             MAX_RESULTS_DEFAULT,

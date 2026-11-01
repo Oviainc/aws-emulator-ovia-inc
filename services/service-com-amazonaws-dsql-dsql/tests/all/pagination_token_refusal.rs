@@ -52,9 +52,12 @@ const NEXT_TOKEN_MEMBER: &str = "nextToken";
 const MODELED_BODY_MEMBERS: &[&str] = &["__type", "message", "Message", "reason", "fieldList"];
 
 /// Values this service never issued as a cursor, spanning every form the failure
-/// takes: not hex at all (so it cannot decode), and hex of something that is not
-/// the `^[a-z0-9]{26}$` identifier a cursor encodes (wrong case, one character
-/// short, one character long, not UTF-8 at all, the empty string).
+/// takes: not hex at all (so it cannot decode), hex of something that is not the
+/// `^[a-z0-9]{26}$` identifier a cursor carries (wrong case, one character short,
+/// one character long, not UTF-8 at all, the empty string), and — the form that is
+/// well formed and still was never issued — the bare hex of such an identifier,
+/// which carries no integrity check binding it to a walk of this service and so
+/// names no page of either reader.
 fn unissued_tokens() -> Vec<(&'static str, String)> {
     vec![
         ("not hex", "not-a-cursor".to_string()),
@@ -79,6 +82,18 @@ fn unissued_tokens() -> Vec<(&'static str, String)> {
             ::hex::encode([0xff, 0xfe]),
         ),
         ("hex of the empty string", ::hex::encode("")),
+        (
+            "the bare hex of a well-formed identifier, all digits",
+            ::hex::encode("00000000000000000000000000"),
+        ),
+        (
+            "the bare hex of a well-formed identifier, all letters",
+            ::hex::encode("aaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        ),
+        (
+            "the bare hex of a well-formed identifier, mixed",
+            ::hex::encode(absent_identifier()),
+        ),
     ]
 }
 
@@ -110,7 +125,10 @@ async fn cursor_refusals(dsql: &Dsql, cluster: &str) -> Vec<Refusal> {
 
 /// Assert one refusal against the rule: 400, the `ValidationException` wire code,
 /// and exactly the modelled shape's members with `reason` and `fieldList` filled.
-fn assert_modeled_validation_exception(case: &str, answer: &Answer) {
+///
+/// Shared with `tests/all/pagination_cursor_binding.rs`, which asserts the same
+/// body shape for the cursors that are well formed but belong to another walk.
+pub fn assert_modeled_validation_exception(case: &str, answer: &Answer) {
     assert_eq!(
         answer.status, 400,
         "case {case:?}: an unissued cursor is refused with HTTP 400, got {} {:?}",
@@ -183,7 +201,10 @@ fn assert_modeled_validation_exception(case: &str, answer: &Answer) {
 }
 
 /// `count` streams on `cluster`, returning the identifiers `CreateStream` minted.
-async fn create_streams(dsql: &Dsql, cluster: &str, count: usize) -> BTreeSet<String> {
+///
+/// Shared with `tests/all/pagination_cursor_binding.rs`, which populates the same
+/// stream walk.
+pub async fn create_streams(dsql: &Dsql, cluster: &str, count: usize) -> BTreeSet<String> {
     let mut minted = BTreeSet::new();
     for index in 0..count {
         let created = dsql

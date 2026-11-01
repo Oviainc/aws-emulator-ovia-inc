@@ -59,6 +59,8 @@ mod multi_region_cluster_status;
 mod multi_region_witness;
 #[path = "all/nested_arn_not_found.rs"]
 mod nested_arn_not_found;
+#[path = "all/pagination_cursor_binding.rs"]
+mod pagination_cursor_binding;
 #[path = "all/pagination_token_refusal.rs"]
 mod pagination_token_refusal;
 #[path = "all/peering_unwound_by_deletion.rs"]
