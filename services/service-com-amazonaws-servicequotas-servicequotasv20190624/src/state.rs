@@ -3467,14 +3467,38 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         ),
         service(
             "kafka",
-            "Amazon Managed Streaming for Apache Kafka (MSK)",
-            // The recorded default-quota listing of this service states both the code
-            // AWS publishes this quota under and the name it publishes it as, so the
-            // row is published under AWS's code. The rest of the service's published
-            // catalog names no code this catalog can cite for the quota it names, so
-            // it is left to the default-quota-set gap rather than published under a
-            // stand-in the service answers to nothing under.
-            vec![quota("Number of brokers per cluster", 30.0).code("L-FAB9E493")],
+            // The ONE label this service code is reported under, taken from
+            // [`SEED_SERVICE_CATALOG`], which names this code (so this string is only
+            // the fallback for a code that table does not carry).
+            "Amazon Managed Streaming for Kafka (MSK)",
+            // The rows whose `QuotaCode`, name and default value the recorded
+            // default-quota listing of this service states, each published under AWS's
+            // own code. The rest of the service's published catalog names no code this
+            // catalog can cite for the quota it names (or no value for the quota a code
+            // names, such as the per-cluster data-channel quota), so it is left to the
+            // default-quota-set gap rather than published with a member this catalog
+            // would be inventing.
+            vec![
+                // This row's `Description` is the service's own published sentence, as
+                // the recorded listing carries it; the three below publish this
+                // catalog's own wording in the form AWS's quota descriptions take
+                // ("The maximum number of <what the quota counts>."), because the
+                // service's text for them is not among the data available here.
+                quota("Number of brokers per cluster", 30.0)
+                    .code("L-FAB9E493")
+                    .describe("The maximum number of brokers that a cluster can contain."),
+                quota("Number of configurations per account", 100.0)
+                    .code("L-B2FDE22A")
+                    .describe("The maximum number of configurations that an account can contain."),
+                quota("Number of revisions per configuration", 50.0)
+                    .code("L-36D29E8C")
+                    .describe(
+                        "The maximum number of revisions that a configuration can contain.",
+                    ),
+                quota("Number of replicators per account", 15.0)
+                    .code("L-8F940D28")
+                    .describe("The maximum number of replicators that an account can contain."),
+            ],
         ),
         service(
             "kinesis",
@@ -4347,7 +4371,10 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("iottwinmaker", "AWS IoT TwinMaker"),
     ("ivs", "Amazon Interactive Video Service"),
     ("ivschat", "Amazon IVS Chat"),
-    ("kafka", "Amazon Managed Streaming for Apache Kafka (Amazon MSK)"),
+    // The label the service's OWN published catalog carries on every row it serves
+    // for this code, which is the one name this emulator reports for it — here and in
+    // every quota row ([`seed_services`] is the single source both read).
+    ("kafka", "Amazon Managed Streaming for Kafka (MSK)"),
     ("kafkaconnect", "Amazon MSK Connect"),
     ("kendra", "Amazon Kendra"),
     ("kendra-ranking", "Amazon Kendra Intelligent Ranking"),

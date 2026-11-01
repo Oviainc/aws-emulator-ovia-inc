@@ -41,6 +41,8 @@ mod default_quota_catalog;
 mod default_quota_catalog_fidelity;
 #[path = "all/default_quota_published_codes.rs"]
 mod default_quota_published_codes;
+#[path = "all/default_quota_row_text.rs"]
+mod default_quota_row_text;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/history_filter_chain.rs"]

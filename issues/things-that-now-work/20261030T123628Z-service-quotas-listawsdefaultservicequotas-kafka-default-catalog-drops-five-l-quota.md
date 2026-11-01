@@ -50,6 +50,38 @@ Field divergences on the row that IS served:
 
 Fixed vs variable text: the ServiceName and Description strings above are the service's own catalog text for ServiceCode kafka and are fixed requirements of the response, not per-run values; the QuotaArn values in the recording (arn:aws:servicequotas:us-west-2::kafka/<QuotaCode>) vary only by region and quota code and are templated from the request's ServiceCode plus the row's QuotaCode. No error code or message is involved — both sides answer 200.
 
+## Resolution
+Both replay keys this report owns are closed: `$.Quotas[QuotaCode="L-FAB9E493"].ServiceName` and
+`.Description` no longer diverge (re-replay of
+`service-quotas-catalog-list-aws-default-service-quotas-kafka#task#1` drops both from the
+divergence set).
+
+* RULE: a default-quota row is served with the service's own catalog text — the ONE `ServiceName`
+  the `ServiceCode` is published under (the same string `ListServices` reports, on every row and in
+  every Region) and the quota's published `Description` — and a row is published only under the
+  `QuotaCode` the service answers to, carrying the members the catalog can cite for it.
+* ROOT CAUSE: `src/state.rs::SEED_SERVICE_CATALOG` labelled `kafka` with a product name the service
+  does not publish, and its `seed_quota_catalog` entry published one row with no `Description` and
+  left the service's other citable rows out.
+* CHANGE: the `kafka` label is the one the service publishes (`SEED_SERVICE_CATALOG`, which
+  `seed_services` makes the single source every row and the inventory read, so the label cannot
+  drift per row); `kafka/L-FAB9E493` carries the service's published description; and three further
+  rows the recording states — `L-B2FDE22A` (configurations per account, 100), `L-36D29E8C`
+  (revisions per configuration, 50) and `L-8F940D28` (replicators per account, 15) — are published
+  under AWS's own codes with their name, value, unit, adjustability and scope.
+* TESTS: `tests/all/default_quota_row_text.rs` — the one label per code over six services and two
+  Regions through both listings; the published description reported identically by the listing, the
+  default read and the applied read over seven rows of four services; the modelled
+  `QuotaDescription` bound (0..350, one line) over the WHOLE catalog; and the MSK rows read back one
+  by one with the members AWS publishes.
+* STILL OPEN (owned by `issues/things-that-do-not-work/20261030T005329Z-service-quotas-aws-coded-default-rows-for-ten-servicecodes-absent.md`,
+  whose `Issue-Key`s are the whole-entry keys): `kafka/L-9B45E609` ("Number of data channels per
+  cluster"), `L-03FD6822` and `L-EDD31C36`, for which no source available here states a default
+  value (or the quota a code names), so publishing them would mean inventing a member. The three
+  newly published rows match every member the recording states except `Description`, whose service
+  text no source here states; they carry this catalog's own wording in the form AWS's quota
+  descriptions take, as other services' rows already do.
+
 ## Steps to Reproduce
 1. Boot the emulator from this checkout and replay the simparity-wire-aws-v1 wire corpus (replay_wire_corpus).
 2. Or directly: call service-quotas ListAWSDefaultServiceQuotas with {"ServiceCode": "kafka"} against the emulator's data listener.
