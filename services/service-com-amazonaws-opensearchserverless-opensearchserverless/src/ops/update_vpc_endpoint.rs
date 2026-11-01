@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ValidationException {
                         message: Some(crate::state::validation_error_message(
                             member,
-                            &crate::state::rendered_id_list(named),
+                            &crate::state::rendered_item_count(named),
                             &crate::state::max_length_constraint(limit),
                         )),
                     },
@@ -310,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ValidationException {
                     message: Some(crate::state::validation_error_message(
                         "removeSubnetIds",
-                        &crate::state::rendered_id_list(
+                        &crate::state::rendered_item_count(
                             input.remove_subnet_ids.as_deref().unwrap_or_default(),
                         ),
                         &format!(
@@ -329,7 +329,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ValidationException {
                     message: Some(crate::state::validation_error_message(
                         "addSubnetIds",
-                        &crate::state::rendered_id_list(
+                        &crate::state::rendered_item_count(
                             input.add_subnet_ids.as_deref().unwrap_or_default(),
                         ),
                         &format!(
@@ -346,7 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ValidationException {
                     message: Some(crate::state::validation_error_message(
                         "addSecurityGroupIds",
-                        &crate::state::rendered_id_list(
+                        &crate::state::rendered_item_count(
                             input.add_security_group_ids.as_deref().unwrap_or_default(),
                         ),
                         &format!(

@@ -2708,9 +2708,17 @@ pub fn validation_error_message(member: &str, value: &str, constraint: &str) -> 
     )
 }
 
-/// A list of ids as a refusal names the value that failed it.
-pub fn rendered_id_list(entries: &[String]) -> String {
-    format!("[{}]", entries.join(", "))
+/// The value half of a LIST member's refusal: how many items the member carried, which is
+/// what the validation layer reports for a list.
+///
+/// A list's length violation names the count and not the entries — `Value '0 items' at
+/// 'names'` — so a handler refusing a list for its length reads exactly as the identical
+/// refusal made at the boundary does ([`validation_error_message`]). It also keeps the
+/// refusal's size independent of the request's: a list member the model puts no maximum on
+/// would otherwise be echoed back in full, letting one request choose how long the response
+/// body is.
+pub fn rendered_item_count(entries: &[String]) -> String {
+    format!("{} items", entries.len())
 }
 
 /// The constraint clause for a list longer than `limit`, as the boundary validator words a

@@ -61,6 +61,8 @@ mod lifecycle_policy_delete;
 mod lifecycle_policy_listing;
 #[path = "all/lifecycle_policy_update.rs"]
 mod lifecycle_policy_update;
+#[path = "all/list_length_refusal_clause.rs"]
+mod list_length_refusal_clause;
 #[path = "all/minted_identifiers.rs"]
 mod minted_identifiers;
 #[path = "all/policies_stats.rs"]

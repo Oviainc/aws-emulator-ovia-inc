@@ -593,8 +593,10 @@ async fn a_subnet_list_is_held_to_the_bound_that_keeps_it_finite() {
 
     // A refusal a handler makes is worded exactly as the identical one the boundary
     // validator makes — the sentence the suites beside this one pin for a modelled
-    // constraint failure (see `client_error_status.rs`), naming the member, the value the
-    // request carried and the constraint it failed.
+    // constraint failure (see `client_error_status.rs` for a scalar member and
+    // `reported_pattern.rs` for a list) — naming the member, the value the request carried
+    // as that layer renders it, and the constraint it failed. For a LIST that value is the
+    // item count, not the entries.
     let (_, _, answer) = update_endpoint(
         &router,
         json!({ "id": id, "addSubnetIds": list(&one_past_in_request) }),
@@ -603,9 +605,10 @@ async fn a_subnet_list_is_held_to_the_bound_that_keeps_it_finite() {
     assert_eq!(
         text(&answer, "message"),
         format!(
-            "1 validation error detected: Value '[{}]' at 'addSubnetIds' failed to satisfy \
-             constraint: Member must have length less than or equal to {MAX_SUBNET_IDS}",
-            one_past_in_request.join(", ")
+            "1 validation error detected: Value '{} items' at 'addSubnetIds' failed to \
+             satisfy constraint: Member must have length less than or equal to \
+             {MAX_SUBNET_IDS}",
+            one_past_in_request.len()
         ),
         "case the wording of a list-length refusal: expected the validation layer's own sentence, got {answer}"
     );

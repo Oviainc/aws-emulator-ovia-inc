@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ValidationException {
                     message: Some(crate::state::validation_error_message(
                         "subnetIds",
-                        &crate::state::rendered_id_list(&input.subnet_ids),
+                        &crate::state::rendered_item_count(&input.subnet_ids),
                         &crate::state::max_length_constraint(crate::state::MAX_SUBNET_IDS),
                     )),
                 },
