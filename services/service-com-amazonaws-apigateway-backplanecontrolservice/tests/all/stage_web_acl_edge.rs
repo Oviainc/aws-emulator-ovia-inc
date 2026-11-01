@@ -312,6 +312,9 @@ async fn associate(edge: &Edge, web_acl_arn: &str, api: &str, stage: &str) {
 /// says whether it reached the origin.
 struct Api {
     id: String,
+    /// The api's ROOT resource, so a case that needs a resource of its own can add one
+    /// beside the ones every case drives.
+    root: String,
 }
 
 impl Api {
@@ -325,7 +328,10 @@ impl Api {
             .as_str()
             .expect("the root resource id")
             .to_string();
-        let api = Self { id };
+        let api = Self {
+            id,
+            root: root.clone(),
+        };
 
         // A request validator that checks the method's request PARAMETERS, so a method
         // can declare a header required: that is what makes a header WAF inserted
@@ -365,6 +371,40 @@ impl Api {
     /// One resource under `root` with a method on `verb` and a `MOCK` integration that
     /// answers `200 {"at":"<path_part>"}`.
     async fn resource(&self, edge: &Edge, root: &str, path_part: &str, verb: &str, extra: Value) {
+        self.mock_resource(edge, root, path_part, verb, extra, &origin_body(path_part))
+            .await;
+    }
+
+    /// One `GET` resource under the api's root whose `MOCK` integration answers `200`
+    /// with a body ECHOING each name in `echoed`: one JSON member per name, carrying the
+    /// value the request reaching the ORIGIN held under that header, and the empty string
+    /// for a name it did not carry.
+    ///
+    /// This is what makes an inserted header observable as a CLIENT observes it: the body
+    /// a request is answered with reports, name by name, exactly the headers the
+    /// integration was reached with.
+    async fn echoing_resource(&self, edge: &Edge, path_part: &str, echoed: &[String]) {
+        let members: Vec<String> = echoed
+            .iter()
+            .map(|name| format!("\"{name}\":\"$input.params('{name}')\""))
+            .collect();
+        let template = format!("{{{}}}", members.join(","));
+        let root = self.root.clone();
+        self.mock_resource(edge, &root, path_part, "GET", json!({}), &template)
+            .await;
+    }
+
+    /// One resource under `root` with a method on `verb` and a `MOCK` integration whose
+    /// `200` response template is `template`.
+    async fn mock_resource(
+        &self,
+        edge: &Edge,
+        root: &str,
+        path_part: &str,
+        verb: &str,
+        extra: Value,
+        template: &str,
+    ) {
         let created = edge
             .api_ok(
                 "POST",
@@ -405,9 +445,7 @@ impl Api {
                 self.id
             ),
             Some(json!({
-                "responseTemplates": {
-                    "application/json": format!("{{\"at\":\"{path_part}\"}}")
-                }
+                "responseTemplates": { "application/json": template }
             })),
             201,
         )
@@ -1470,5 +1508,426 @@ async fn refused_control_plane_calls_leave_the_edge_deciding_as_it_did() {
             refusal.code
         );
         edge_decides(&edge, &api.id, refusal.case).await;
+    }
+}
+
+/// The prefix WAF puts on every header a `CustomRequestHandling` inserts.
+///
+/// `CustomHTTPHeader$Name`: "when WAF inserts the header into the request, it prefixes
+/// this name `x-amzn-waf-`, to avoid confusion with the headers that are already in the
+/// request. For example, for the header name `sample`, WAF inserts the header
+/// `x-amzn-waf-sample`."
+const INSERTED_HEADER_PREFIX: &str = "x-amzn-waf-";
+
+/// The header whose value the rules below inspect, so one request matches a counting rule
+/// and another does not.
+const TRIGGER_HEADER: &str = "x-waf-trigger";
+
+/// The name WAF inserts the configured header `name` under.
+fn inserted_as(name: &str) -> String {
+    format!("{INSERTED_HEADER_PREFIX}{name}")
+}
+
+/// A `CustomRequestHandling$InsertHeaders` list from `(configured name, value)` pairs.
+fn insert_headers(headers: &[(String, String)]) -> Value {
+    Value::Array(
+        headers
+            .iter()
+            .map(|(name, value)| json!({ "Name": name, "Value": value }))
+            .collect(),
+    )
+}
+
+/// The members the echoing resource's template wrote: the value the ORIGIN saw under each
+/// header name it reflects, with the empty string for a name the request did not carry.
+fn echoed_headers(answered: &Answered, case: &str) -> std::collections::BTreeMap<String, String> {
+    let parsed: Value = serde_json::from_str(&answered.body).unwrap_or_else(|error| {
+        panic!(
+            "case {case:?}: the origin's echo must be the JSON document its response \
+             template renders, got {:?} ({error})",
+            answered.body
+        )
+    });
+    parsed
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, value)| (name, value.as_str().unwrap_or_default().to_string()))
+        .collect()
+}
+
+/// The rule over a NON-TERMINATING action's `CustomRequestHandling`: a rule whose action
+/// COUNTS the request applies the custom request handling it configures — every header in
+/// `InsertHeaders` is inserted into the web request under its configured name with
+/// `x-amzn-waf-` prefixed and its value verbatim, never under the bare configured name —
+/// and then lets the evaluation continue, so the request reaches the origin carrying those
+/// headers and keeps the status the stage answers it with. A request the rule does not
+/// match carries neither form. `GetSampledRequests` reports the same insertion on the
+/// rule's own metric dimension, under the action that was applied to the request.
+///
+/// One row per thing the rule generalises over: how many headers one action configures,
+/// what the configured name looks like (a name that already reads as a header name, a bare
+/// word, a mixed-case name, a dotted one) and how long the name and the value are, at each
+/// bound `CustomHTTPHeader` publishes. Each row gets its own stage and its own web ACL, so
+/// the only thing deciding the row is that web ACL's one counting rule, and each row is
+/// driven three times — the request the rule matches, a request carrying the inspected
+/// header with another value, and a request carrying none of it.
+#[tokio::test]
+async fn a_counted_rules_custom_request_handling_reaches_the_origin_and_the_sample() {
+    let edge = Edge::new();
+    let api = Api::build(&edge, "edge-count-insert").await;
+
+    /// One counting rule's custom request handling, and the stage it decides.
+    struct Row {
+        case: &'static str,
+        /// The stage this row's web ACL is associated with.
+        stage: &'static str,
+        /// The value of [`TRIGGER_HEADER`] the rule's `ByteMatchStatement` matches
+        /// EXACTLY.
+        trigger: &'static str,
+        /// The headers the rule's `Count` action configures, by CONFIGURED name — the
+        /// name before WAF prefixes it.
+        insert: Vec<(String, String)>,
+    }
+
+    // The names and values below span what `CustomHTTPHeader` admits:
+    // `CustomHTTPHeader$Name` is modelled `length(min 1, max 64)` with pattern
+    // `^[a-zA-Z0-9._$-]+$`, and `CustomHTTPHeader$Value` `length(min 1, max 255)` with
+    // pattern `.*` — so the rows carry a one-glyph name and a 64-glyph one, a one-glyph
+    // value and a 255-glyph one, a dot inside a name and punctuation inside a value.
+    let longest_name = "n".repeat(64);
+    let longest_value = "v".repeat(255);
+    let rows = vec![
+        Row {
+            case: "one header whose configured name already reads as a header name",
+            stage: "recorded",
+            trigger: "trip-recorded",
+            insert: vec![("x-waf-inserted".to_string(), "counted-1".to_string())],
+        },
+        Row {
+            case: "two headers at once: the whole list the action configures is inserted",
+            stage: "pair",
+            trigger: "trip-pair",
+            insert: vec![
+                ("tenant".to_string(), "acme".to_string()),
+                ("score.v2".to_string(), "9".to_string()),
+            ],
+        },
+        Row {
+            case: "a mixed-case configured name and a punctuated value",
+            stage: "mixedcase",
+            trigger: "trip-mixed",
+            insert: vec![("Rule-Match".to_string(), "yes:maybe=true".to_string())],
+        },
+        Row {
+            case: "the shortest name and the longest value the member allows",
+            stage: "shortest",
+            trigger: "trip-short",
+            insert: vec![("c".to_string(), longest_value.clone())],
+        },
+        Row {
+            case: "the longest name and the shortest value the member allows",
+            stage: "longest",
+            trigger: "trip-long",
+            insert: vec![(longest_name.clone(), "x".to_string())],
+        },
+    ];
+
+    /// The stage whose web ACL counts and THEN blocks the same request.
+    const BLOCKED_STAGE: &str = "later-block";
+    /// The value the counting rule of [`BLOCKED_STAGE`] matches.
+    const BLOCKED_TRIGGER: &str = "trip-blocked";
+    /// The rule name — and so the metric dimension `GetSampledRequests` is asked for —
+    /// of the counting rule in every web ACL below.
+    const COUNTING_RULE: &str = "inserter";
+
+    // The origin's own view: one resource reflecting BOTH forms of every configured name
+    // any row inserts, plus the header the rules inspect. A name a row's rule did not
+    // insert is echoed as the empty string, which is how the absent form is asserted.
+    let mut echoed: Vec<String> = vec![TRIGGER_HEADER.to_string()];
+    for row in &rows {
+        for (name, _) in &row.insert {
+            echoed.push(inserted_as(name));
+            echoed.push(name.clone());
+        }
+    }
+    api.echoing_resource(&edge, "echo", &echoed).await;
+
+    for stage in rows
+        .iter()
+        .map(|row| row.stage)
+        .chain(std::iter::once(BLOCKED_STAGE))
+    {
+        api.deploy(&edge, stage).await;
+    }
+
+    /// The counting rule of a row: it inspects [`TRIGGER_HEADER`] and, on a match,
+    /// counts the request with the custom request handling the row configures.
+    fn counting_rule(trigger: &str, insert: &[(String, String)]) -> Value {
+        rule(
+            COUNTING_RULE,
+            0,
+            byte_match(
+                json!({ "SingleHeader": { "Name": TRIGGER_HEADER } }),
+                trigger,
+                "EXACTLY",
+            ),
+            json!({
+                "Count": {
+                    "CustomRequestHandling": { "InsertHeaders": insert_headers(insert) }
+                }
+            }),
+        )
+    }
+
+    for row in &rows {
+        let (_, web_acl_arn, _) = create_web_acl(
+            &edge,
+            row.stage,
+            json!({ "Allow": {} }),
+            json!([counting_rule(row.trigger, &row.insert)]),
+            json!({}),
+        )
+        .await;
+        associate(&edge, &web_acl_arn, &api.id, row.stage).await;
+
+        let path = format!("/{}/echo", row.stage);
+
+        // The request the counting rule matches: `Count` "enables WAF to count requests
+        // that match the rule, without otherwise affecting the request", so the stage
+        // still serves it, and the origin sees every configured header under its
+        // prefixed name with its value verbatim.
+        let matched = edge
+            .invoke(
+                &api.id,
+                "GET",
+                &path,
+                &[(TRIGGER_HEADER, row.trigger)],
+                &[],
+            )
+            .await;
+        assert_eq!(
+            matched.status, 200,
+            "case {:?}: a counted request is not settled by the count, so the stage \
+             answers it 200, got {} with {:?}",
+            row.case, matched.status, matched.body
+        );
+        let seen = echoed_headers(&matched, row.case);
+        for (name, value) in &row.insert {
+            let prefixed = inserted_as(name);
+            assert_eq!(
+                seen.get(&prefixed).map(String::as_str),
+                Some(value.as_str()),
+                "case {:?}: the origin must see the configured header under {prefixed:?} \
+                 with its value verbatim, got {:?}",
+                row.case,
+                seen.get(&prefixed)
+            );
+            assert_eq!(
+                seen.get(name).map(String::as_str),
+                Some(""),
+                "case {:?}: the BARE configured name {name:?} is never what WAF inserts, \
+                 got {:?}",
+                row.case,
+                seen.get(name)
+            );
+        }
+        assert_eq!(
+            seen.get(TRIGGER_HEADER).map(String::as_str),
+            Some(row.trigger),
+            "case {:?}: the header the client sent reaches the origin unchanged, got {:?}",
+            row.case,
+            seen.get(TRIGGER_HEADER)
+        );
+
+        // The same stage for requests the rule does NOT match: neither form of any
+        // configured name is inserted.
+        for (control, headers) in [
+            (
+                "the inspected header carrying another value",
+                vec![(TRIGGER_HEADER, "not-the-trigger")],
+            ),
+            ("no inspected header at all", Vec::new()),
+        ] {
+            let answered = edge.invoke(&api.id, "GET", &path, &headers, &[]).await;
+            assert_eq!(
+                answered.status, 200,
+                "case {:?} with {control}: expected 200, got {} with {:?}",
+                row.case, answered.status, answered.body
+            );
+            let seen = echoed_headers(&answered, row.case);
+            for (name, _) in &row.insert {
+                for form in [inserted_as(name), name.clone()] {
+                    assert_eq!(
+                        seen.get(&form).map(String::as_str),
+                        Some(""),
+                        "case {:?} with {control}: a request the rule does not match \
+                         carries no {form:?}, got {:?}",
+                        row.case,
+                        seen.get(&form)
+                    );
+                }
+            }
+        }
+
+        // WAF's own account of the same insertion. The population of the counting rule's
+        // dimension is the one request it matched — the two control requests belong to no
+        // dimension of it — and `SampledHTTPRequest$RequestHeadersInserted` is "custom
+        // request headers inserted by WAF into the request, according to the custom
+        // request configuration for the matching rule action".
+        let sampled = edge
+            .waf_ok(
+                "GetSampledRequests",
+                json!({
+                    "WebAclArn": web_acl_arn,
+                    "RuleMetricName": COUNTING_RULE,
+                    "Scope": SCOPE,
+                    "MaxItems": 500,
+                    "TimeWindow": { "StartTime": 0, "EndTime": 99_999_999_999_i64 },
+                }),
+            )
+            .await;
+        let samples = sampled["SampledRequests"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            samples.len(),
+            1,
+            "case {:?}: the counting rule's dimension holds exactly the one request it \
+             matched, got {sampled}",
+            row.case
+        );
+        let sample = &samples[0];
+        assert_eq!(
+            sample["Action"].as_str(),
+            Some("COUNT"),
+            "case {:?}: the action WAF applied to the sampled request is the count, got \
+             {sample}",
+            row.case
+        );
+        let reported: Vec<(String, String)> = sample["RequestHeadersInserted"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|header| {
+                (
+                    header["Name"].as_str().unwrap_or_default().to_string(),
+                    header["Value"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, String)> = row
+            .insert
+            .iter()
+            .map(|(name, value)| (inserted_as(name), value.clone()))
+            .collect();
+        assert_eq!(
+            reported, expected,
+            "case {:?}: the sample must report exactly the headers WAF inserted, under \
+             the names it inserted them with, got {sample}",
+            row.case
+        );
+    }
+
+    // The prefix is what lets the origin TRUST that the header came from WAF: a client
+    // that sends the prefixed name itself has its value REPLACED by the one the rule's
+    // action configures, rather than added to.
+    let spoofing = rows
+        .iter()
+        .find(|row| row.stage == "pair")
+        .expect("the row whose action inserts a tenant header");
+    let (spoofed_name, spoofed_value) = &spoofing.insert[0];
+    let answered = edge
+        .invoke(
+            &api.id,
+            "GET",
+            &format!("/{}/echo", spoofing.stage),
+            &[
+                (TRIGGER_HEADER, spoofing.trigger),
+                ("x-amzn-waf-tenant", "sent-by-the-client"),
+            ],
+            &[],
+        )
+        .await;
+    let case = "a client sending the prefixed name itself";
+    assert_eq!(
+        answered.status, 200,
+        "case {case:?}: expected 200, got {} with {:?}",
+        answered.status, answered.body
+    );
+    let seen = echoed_headers(&answered, case);
+    let prefixed = inserted_as(spoofed_name);
+    assert_eq!(
+        seen.get(&prefixed).map(String::as_str),
+        Some(spoofed_value.as_str()),
+        "case {case:?}: the origin sees the value the rule's action configures, not the \
+         one the client sent, got {:?}",
+        seen.get(&prefixed)
+    );
+
+    // A COUNT does not settle the request: the rules after it still run. The same
+    // counting rule, followed by one that BLOCKS the same request, is answered by the
+    // block — and the request never reaches an origin to carry the inserted headers to.
+    let blocked_insert = vec![("tenant".to_string(), "acme".to_string())];
+    let (_, blocked_arn, _) = create_web_acl(
+        &edge,
+        BLOCKED_STAGE,
+        json!({ "Allow": {} }),
+        json!([
+            counting_rule(BLOCKED_TRIGGER, &blocked_insert),
+            rule(
+                "after-the-count",
+                1,
+                byte_match(
+                    json!({ "SingleHeader": { "Name": TRIGGER_HEADER } }),
+                    BLOCKED_TRIGGER,
+                    "EXACTLY",
+                ),
+                json!({ "Block": {} }),
+            ),
+        ]),
+        json!({}),
+    )
+    .await;
+    associate(&edge, &blocked_arn, &api.id, BLOCKED_STAGE).await;
+
+    let path = format!("/{BLOCKED_STAGE}/echo");
+    let settled = edge
+        .invoke(&api.id, "GET", &path, &[(TRIGGER_HEADER, BLOCKED_TRIGGER)], &[])
+        .await;
+    assert_eq!(
+        settled.status, 403,
+        "case a count followed by a block: the count does not settle the request, so the \
+         later block does, got {} with {:?}",
+        settled.status, settled.body
+    );
+    assert_eq!(
+        settled.message(),
+        "Forbidden",
+        "case a count followed by a block: the blocked request is answered through the \
+         api's own WAF_FILTERED gateway response, got {:?}",
+        settled.body
+    );
+    let admitted = edge.get(&api.id, &path).await;
+    assert_eq!(
+        admitted.status, 200,
+        "case a count followed by a block, for a request neither rule matches: expected \
+         200, got {} with {:?}",
+        admitted.status, admitted.body
+    );
+    let seen = echoed_headers(&admitted, "a count followed by a block, unmatched");
+    for (name, _) in &blocked_insert {
+        for form in [inserted_as(name), name.clone()] {
+            assert_eq!(
+                seen.get(&form).map(String::as_str),
+                Some(""),
+                "case a count followed by a block, for a request neither rule matches: \
+                 no {form:?} is inserted, got {:?}",
+                seen.get(&form)
+            );
+        }
     }
 }
