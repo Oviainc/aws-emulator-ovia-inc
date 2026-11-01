@@ -3477,13 +3477,25 @@ pub fn encode_pagination_token(marker: &str, resume_after: &[&str]) -> String {
 /// hex-decodable string would be read as a continuation, and one list's token would
 /// resume another's. A listing scoped to a parent resource puts that parent's name in
 /// the key, so the caller can also check a token was issued for the resource it is
-/// resuming.
+/// resuming. The value is read in the exact spelling [`encode_pagination_token`] writes
+/// and no other: a token is opaque, so a client passes back what it was handed rather
+/// than a value of its own that happens to carry the same bytes.
 pub fn decode_pagination_token(
     marker: &str,
     token: &str,
     components: usize,
 ) -> Option<Vec<String>> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    // A token is honoured only when it is the value a page actually handed out, character
+    // for character. The hex layer is where that can be lost: decoding admits `A`-`F` as
+    // well as the `a`-`f` [`encode_pagination_token`] writes, so without this check every
+    // re-spelling of an issued token's digits — a client upper-casing it, an intermediary
+    // normalising its case — would decode to the same bytes and be read as the same resume
+    // point, although no page of this service ever issued that value. Re-encoding the
+    // bytes gives the one spelling the encoder would have written for them, so a token
+    // that is not identical to it names no resume point.
+    let bytes = hex::decode(token).ok()?;
+    (hex::encode(&bytes) == token).then_some(())?;
+    let decoded = String::from_utf8(bytes).ok()?;
     let resume_after = decoded.strip_prefix(marker)?;
     // `splitn` so only the components BEFORE the last one are delimited: the last
     // component keeps any separator it contains, rather than inflating the arity and
