@@ -1493,6 +1493,9 @@ pub const TOKEN_SCOPE_PAGES_BY_CONTACT: &str = "pages-by-contact";
 /// The `NextToken` scope `ListRotationOverrides` issues and accepts.
 pub const TOKEN_SCOPE_ROTATION_OVERRIDES: &str = "rotation-overrides";
 
+/// The `NextToken` scope `ListRotationShifts` issues and accepts.
+pub const TOKEN_SCOPE_ROTATION_SHIFTS: &str = "rotation-shifts";
+
 /// The `NextToken` scope `ListPageReceipts` issues and accepts.
 pub const TOKEN_SCOPE_PAGE_RECEIPTS: &str = "page-receipts";
 
@@ -1556,6 +1559,10 @@ pub use account_gate::{
 /// WHEN a rotation's shifts fall and WHO is on call during each, which every operation that
 /// reports shifts computes the same way: see [`rotation_shifts`].
 pub mod rotation_shifts;
+
+/// How a STORED rotation is read as that computation's input, which is one reading for every
+/// operation that reports a stored rotation's shifts: see [`rotation_schedule`].
+pub mod rotation_schedule;
 
 /// The message a plan is refused with when one of its lists is longer than the resolver
 /// walks: it names the member, the length the request carried and the ceiling.
