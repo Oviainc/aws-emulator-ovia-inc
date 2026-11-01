@@ -145,6 +145,8 @@ mod open_id_connect_client_ids;
 mod open_id_connect_provider_absence_wording;
 #[path = "all/open_id_connect_provider_listing.rs"]
 mod open_id_connect_provider_listing;
+#[path = "all/open_id_connect_provider_tag_absence_wording.rs"]
+mod open_id_connect_provider_tag_absence_wording;
 #[path = "all/open_id_connect_provider_tag_listing.rs"]
 mod open_id_connect_provider_tag_listing;
 #[path = "all/open_id_connect_provider_tag_removal.rs"]

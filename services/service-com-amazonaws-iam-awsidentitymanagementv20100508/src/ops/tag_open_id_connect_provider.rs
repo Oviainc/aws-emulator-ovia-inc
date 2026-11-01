@@ -256,8 +256,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The write is addressed exactly as a read of the same ARN is, so it reaches the
         // one record `GetOpenIDConnectProvider` reports; an ARN the account holds no
         // provider under "referenced a resource entity that does not exist", which IAM
-        // words for an OIDC provider by naming the ARN it found none under — the same
-        // wording this provider's reporting half answers with.
+        // words for a call that CHANGES a provider's tags with the tag-mutation sentence —
+        // not the one the provider's reporting half and the client-ID calls answer with.
         let Some(provider) = store
             .open_id_connect_providers
             .get_mut(&input.open_id_connect_provider_arn)
@@ -265,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 TagOpenIDConnectProviderErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
-                        message: Some(crate::state::open_id_connect_provider_not_found(
+                        message: Some(crate::state::open_id_connect_provider_cannot_be_found(
                             &input.open_id_connect_provider_arn,
                         )),
                     },

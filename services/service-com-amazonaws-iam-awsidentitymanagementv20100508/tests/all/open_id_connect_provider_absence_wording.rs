@@ -5,17 +5,21 @@
 //! wire.
 //!
 //! The rule under test: an operation addressed by an `OpenIDConnectProviderArn` that
-//! resolves no provider answers `404` `NoSuchEntity` whose message is the fixed text
-//! `OpenIDConnect Provider not found for arn ` followed by the ARN the request supplied,
-//! echoed byte for byte, with nothing after it. The sentence belongs to the MEMBER, not to
-//! the handler, so no operation on a provider may compose one of its own and none may
-//! normalise, re-order or punctuate the ARN on the way into it.
+//! resolves no provider answers `404` `NoSuchEntity` whose message is its FAMILY's fixed
+//! text with the ARN the request supplied echoed into it byte for byte — the provider-record
+//! operations word that absence `OpenIDConnect Provider not found for arn <arn>`, and the
+//! calls that change the provider's TAGS word it `OpenId connect Provider <arn> cannot be
+//! found.` The sentence belongs to the FAMILY, not to the individual handler, so no
+//! operation may compose one of its own and none may normalise, re-order or punctuate the
+//! ARN on the way into it.
 //!
 //! This is the one place the whole `OpenIDConnectProviderArn`-addressed surface is held to
-//! that wording at once, and the one place the template is spelled out as a literal rather
-//! than read from the helper the per-operation suites share
-//! (`tests/all/open_id_connect_providers.rs`): a suite that asks the helper what the
-//! sentence is cannot notice the helper changing, so the text itself is pinned here.
+//! those wordings at once, and one of the two places a template is spelled out as a literal
+//! rather than read from the helpers the per-operation suites share
+//! (`tests/all/open_id_connect_providers.rs`; the other is
+//! `tests/all/open_id_connect_provider_tag_absence_wording.rs`): a suite that asks a helper
+//! what the sentence is cannot notice the helper changing, so the texts themselves are
+//! pinned here.
 //!
 //! `DeleteOpenIDConnectProvider` is not here: "this operation is idempotent; it does not
 //! fail or return an error if you call the operation for a provider that does not exist"
@@ -71,20 +75,36 @@ const ADDED_TAG_VALUE: &str = "platform";
 /// (`smithy_query(query="shape", shape="thumbprintType")`).
 const REPLACEMENT_THUMBPRINT: &str = "00000000000000000000000000000000000000ff";
 
-/// IAM's `NoSuchEntityException` message for an `OpenIDConnectProviderArn` the account holds
-/// no OIDC provider under.
-///
-/// Spelled out as a literal, deliberately: this suite is what pins the TEMPLATE, so it may
-/// not ask the implementation (or the helper the other suites share) what the template is.
-/// The single variable part is the ARN the request supplied.
-fn expected_absence_message(arn: &str) -> String {
-    format!("OpenIDConnect Provider not found for arn {arn}")
+/// Which of IAM's two `NoSuchEntityException` sentences an operation words a provider's
+/// absence with.
+#[derive(Clone, Copy, Debug)]
+enum AbsenceWording {
+    /// The operations whose subject is the provider RECORD: reporting it, changing its
+    /// client IDs or its thumbprints, reporting its tags.
+    ProviderRecord,
+    /// The calls that CHANGE the provider's tags.
+    TagMutation,
 }
 
-/// One operation addressed by an `OpenIDConnectProviderArn`, plus the other members the
-/// request must carry for the ARN to be the only thing that can refuse it.
+/// IAM's `NoSuchEntityException` message for an `OpenIDConnectProviderArn` the account holds
+/// no OIDC provider under, in the wording the calling operation's family uses.
+///
+/// Spelled out as literals, deliberately: this suite is what pins the TEMPLATES, so it may
+/// not ask the implementation (or the helpers the other suites share) what they are. The
+/// single variable part of each is the ARN the request supplied.
+fn expected_absence_message(wording: AbsenceWording, arn: &str) -> String {
+    match wording {
+        AbsenceWording::ProviderRecord => format!("OpenIDConnect Provider not found for arn {arn}"),
+        AbsenceWording::TagMutation => format!("OpenId connect Provider {arn} cannot be found."),
+    }
+}
+
+/// One operation addressed by an `OpenIDConnectProviderArn`, the sentence it words a missing
+/// provider with, plus the other members the request must carry for the ARN to be the only
+/// thing that can refuse it.
 struct ProviderArnCall {
     action: &'static str,
+    wording: AbsenceWording,
     extra: &'static [(&'static str, &'static str)],
 }
 
@@ -94,26 +114,32 @@ struct ProviderArnCall {
 const PROVIDER_ARN_CALLS: &[ProviderArnCall] = &[
     ProviderArnCall {
         action: "GetOpenIDConnectProvider",
+        wording: AbsenceWording::ProviderRecord,
         extra: &[],
     },
     ProviderArnCall {
         action: "AddClientIDToOpenIDConnectProvider",
+        wording: AbsenceWording::ProviderRecord,
         extra: &[("ClientID", ADDED_CLIENT_ID)],
     },
     ProviderArnCall {
         action: "RemoveClientIDFromOpenIDConnectProvider",
+        wording: AbsenceWording::ProviderRecord,
         extra: &[("ClientID", HELD_CLIENT_ID)],
     },
     ProviderArnCall {
         action: "UpdateOpenIDConnectProviderThumbprint",
+        wording: AbsenceWording::ProviderRecord,
         extra: &[("ThumbprintList.member.1", REPLACEMENT_THUMBPRINT)],
     },
     ProviderArnCall {
         action: "ListOpenIDConnectProviderTags",
+        wording: AbsenceWording::ProviderRecord,
         extra: &[],
     },
     ProviderArnCall {
         action: "TagOpenIDConnectProvider",
+        wording: AbsenceWording::TagMutation,
         extra: &[
             ("Tags.member.1.Key", ADDED_TAG_KEY),
             ("Tags.member.1.Value", ADDED_TAG_VALUE),
@@ -121,6 +147,7 @@ const PROVIDER_ARN_CALLS: &[ProviderArnCall] = &[
     },
     ProviderArnCall {
         action: "UntagOpenIDConnectProvider",
+        wording: AbsenceWording::TagMutation,
         extra: &[("TagKeys.member.1", HELD_TAG_KEY)],
     },
 ];
@@ -229,8 +256,8 @@ fn arns_the_account_holds_nothing_under(account: &str) -> Vec<(&'static str, Str
 }
 
 /// RULE: every operation addressed by an `OpenIDConnectProviderArn` that resolves no OIDC
-/// provider refuses the request with `404` `NoSuchEntity` whose message is AWS's fixed text
-/// followed by the ARN exactly as supplied, and writes nothing.
+/// provider refuses the request with `404` `NoSuchEntity` whose message is its family's fixed
+/// text carrying the ARN exactly as supplied, and writes nothing.
 #[tokio::test]
 async fn an_unresolvable_provider_arn_is_refused_with_aws_wording() {
     let (router, held) = fixture().await;
@@ -255,11 +282,11 @@ async fn an_unresolvable_provider_arn_is_refused_with_aws_wording() {
             );
             let message = element(&body, "Message");
             // The one variable part is the ARN the request supplied, echoed as supplied:
-            // this equality is exact, so it also pins that the sentence carries no trailing
-            // punctuation and that neither the case nor the path of the ARN is normalised.
+            // this equality is exact, so it also pins each sentence's punctuation and that
+            // neither the case nor the path of the ARN is normalised.
             assert_eq!(
                 message,
-                expected_absence_message(arn),
+                expected_absence_message(call_under_test.wording, arn),
                 "case {case:?}: expected AWS's NoSuchEntity wording, got {message:?}"
             );
         }
@@ -296,7 +323,7 @@ async fn an_unresolvable_provider_arn_is_refused_with_aws_wording() {
         let message = element(&body, "Message");
         assert_eq!(
             message,
-            expected_absence_message(arn),
+            expected_absence_message(AbsenceWording::ProviderRecord, arn),
             "case {what:?}: the read-back must word the absence the same way, got {message:?}"
         );
     }

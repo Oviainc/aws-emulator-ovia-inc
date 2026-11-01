@@ -131,16 +131,33 @@ pub(crate) fn expected_arn(url: &str) -> String {
     )
 }
 
-/// The `NoSuchEntityException` message IAM refuses a request naming an ARN the account
-/// holds no OIDC provider under with: its fixed text, then the ARN the request carried.
+/// The `NoSuchEntityException` message IAM refuses a request that LOOKS a provider up by an
+/// ARN the account holds no OIDC provider under with: its fixed text, then the ARN the
+/// request carried.
 ///
 /// ONE reader of that wording for the suites that drive an absent provider as part of a
-/// wider rule, so they all assert the same message. The one suite that does NOT take it is
-/// `tests/all/open_id_connect_provider_absence_wording.rs`, whose subject IS the template:
-/// a suite that asks this helper what the sentence is cannot notice the sentence drifting,
-/// so that one spells it out as a literal instead.
+/// wider rule, so they all assert the same message. A call that CHANGES a provider's tags is
+/// refused with the other sentence ([`tagging_absence_message`]). The suites that do NOT take
+/// either helper are `tests/all/open_id_connect_provider_absence_wording.rs` and
+/// `tests/all/open_id_connect_provider_tag_absence_wording.rs`, whose subject IS the
+/// templates: a suite that asks this helper what the sentence is cannot notice the sentence
+/// drifting, so those spell them out as literals instead.
 pub(crate) fn absence_message(arn: &str) -> String {
     format!("OpenIDConnect Provider not found for arn {arn}")
+}
+
+/// The `NoSuchEntityException` message IAM refuses a TAG-MUTATION call naming an ARN the
+/// account holds no OIDC provider under with: its own fixed text, around the ARN the request
+/// carried.
+///
+/// A different sentence from [`absence_message`], which the provider-record operations word
+/// their refusal with. ONE reader of the tag-mutation wording for the suites that drive an
+/// absent provider through a tag or an untag as part of a wider rule; the template itself is
+/// spelled out as a literal in
+/// `tests/all/open_id_connect_provider_tag_absence_wording.rs`, whose subject IS the two
+/// sentences and how they differ.
+pub(crate) fn tagging_absence_message(arn: &str) -> String {
+    format!("OpenId connect Provider {arn} cannot be found.")
 }
 
 /// The ISSUER form of a URL: the URL with its `https://` scheme removed, which is what a

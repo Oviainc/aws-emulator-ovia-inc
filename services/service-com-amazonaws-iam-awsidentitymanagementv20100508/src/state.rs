@@ -5040,16 +5040,37 @@ pub fn policy_not_found(arn: &str) -> String {
     format!("Policy {arn} was not found.")
 }
 
-/// The message IAM refuses an operation addressed by `OpenIDConnectProviderArn` with
-/// when the account holds no OIDC identity provider under that ARN — the
-/// `NoSuchEntityException` message, whose fixed text is `OpenIDConnect Provider not found
-/// for arn ` followed by the ARN the request supplied, with no trailing period.
+/// The message IAM refuses an operation that LOOKS a provider up by
+/// `OpenIDConnectProviderArn` with when the account holds no OIDC identity provider under
+/// that ARN — the `NoSuchEntityException` message, whose fixed text is `OpenIDConnect
+/// Provider not found for arn ` followed by the ARN the request supplied, with no trailing
+/// period.
 ///
-/// ONE wording, shared by every operation taking an `OpenIDConnectProviderArn`, so a
-/// read, a tag call and a thumbprint update cannot describe the same missing provider
-/// three different ways.
+/// ONE wording, shared by the operations whose subject is the provider RECORD — reporting
+/// it, registering or removing a client ID on it, replacing its thumbprint list — so a read
+/// and a client-ID change cannot describe the same missing provider two different ways.
+///
+/// IAM does NOT word every absence of a provider this way: the calls that change the
+/// provider's TAGS answer the sentence [`open_id_connect_provider_cannot_be_found`] builds
+/// instead, so the two families stay separate templates rather than one helper bent to
+/// cover both.
 pub fn open_id_connect_provider_not_found(arn: &str) -> String {
     format!("OpenIDConnect Provider not found for arn {arn}")
+}
+
+/// The message IAM refuses an operation that CHANGES an OIDC identity provider's tags with
+/// when the account holds no provider under the `OpenIDConnectProviderArn` it was addressed
+/// by — the `NoSuchEntityException` message, whose fixed text is `OpenId connect Provider `
+/// and ` cannot be found.` around the ARN the request supplied.
+///
+/// A different sentence from [`open_id_connect_provider_not_found`], deliberately: IAM's
+/// tag-mutation surface for this resource words the same absence its own way (that spelling
+/// of the resource, the ARN in the middle, a trailing period), and both wordings are part of
+/// the wire contract a client matching the message sees. ONE wording, shared by the
+/// tag-mutation calls, so adding a tag and removing one cannot describe the same missing
+/// provider two different ways.
+pub fn open_id_connect_provider_cannot_be_found(arn: &str) -> String {
+    format!("OpenId connect Provider {arn} cannot be found.")
 }
 
 /// The message IAM refuses an operation of the policy-ATTACHMENT family with when the
