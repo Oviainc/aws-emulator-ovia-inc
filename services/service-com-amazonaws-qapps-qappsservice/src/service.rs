@@ -39,10 +39,27 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## This service's two front doors
+//!
+//! Q Apps authorizes a caller before it looks at anything else about a request, and it
+//! does so in two different ways — which is why `override_operation` below is not the
+//! default:
+//!
+//! - [`identity_center`] is the door in front of every operation whose model declares
+//!   `UnauthorizedException` (every one but the three tagging operations): a caller
+//!   carrying no IAM Identity Center identity is refused 401 there, ahead of state
+//!   lookup, input validation and stub dispatch alike. Every modelled operation is
+//!   served THROUGH that door, so the decision is taken once rather than per handler.
+//! - [`authorization`] is the door in front of the resource-tagging surface, which
+//!   declares no 401 and authorizes through the caller's IAM policy against the ARN it
+//!   names; that decision needs the ARN the request carried, so the three handlers take
+//!   it as their first step.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+pub mod authorization;
+pub mod identity_center;
+
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// The `com-amazonaws-qapps-qappsservice` emulated service: the generated [`ServiceDefinition`] plus
@@ -52,6 +69,10 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The authorization front door every modelled operation is served through, built
+    /// once from the SAME shared engine the generated entry threaded into each
+    /// operation — never a store of its own.
+    front_door: identity_center::FrontDoor<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +81,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            front_door: identity_center::FrontDoor::new(engine),
         }
     }
 }
@@ -87,12 +109,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every MODELLED operation is served behind this service's authorization front
+        // door ([`identity_center`]), which decides before the request is deserialized,
+        // validated or dispatched and then hands it to the operation the model's own
+        // routing table names. A request whose routing key names no modelled operation
+        // is left alone here, so it still gets the protocol-correct routing answer.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.entry.routing_table().get(key)?;
+        Some(&self.front_door)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

@@ -271,6 +271,29 @@ impl ComAmazonawsSsoSwbportalserviceState {
         }
     }
 
+    /// Who the role credential `access_key_id` speaks for: the subject of the sign-in
+    /// session this portal issued that credential to, while the credential itself is
+    /// still usable at `now`.
+    ///
+    /// This is the IAM Identity Center identity a request signed with that credential
+    /// carries, which is what a service requiring a federated caller resolves a request
+    /// through. `None` for every credential this portal did not issue (a long-term IAM
+    /// access key, a session another service minted) and for one whose own duration has
+    /// run out: neither carries an Identity Center identity.
+    ///
+    /// A credential whose sign-in session `Logout` ENDED still speaks for the same
+    /// subject until its own expiration, which is why the session's usability is not
+    /// required here: the credentials already minted for a session go on working for
+    /// the rest of their own duration (see [`Self::invalidate_session`]), so the
+    /// identity they carry cannot stop existing earlier than they do.
+    pub fn signed_in_subject(&self, access_key_id: &str, now: SystemTime) -> Option<&str> {
+        self.issued_credentials
+            .iter()
+            .find(|(_, record)| record.access_key_id == access_key_id && record.is_valid_at(now))
+            .and_then(|((access_token, _, _), _)| self.sessions.get(access_token))
+            .map(|session| session.subject.as_str())
+    }
+
     /// The accounts `session` is assigned to, ascending by account id, skipping an
     /// assignment whose account this service holds no record of (there is nothing to
     /// report for it).

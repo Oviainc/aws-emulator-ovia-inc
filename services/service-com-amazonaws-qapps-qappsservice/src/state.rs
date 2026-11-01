@@ -293,6 +293,16 @@ pub const MAX_LIBRARY_ITEMS_TOTAL: usize = 1_000;
 /// sees a quota refusal rather than an emulator that grows.
 pub const MAX_REVIEWS_PER_LIBRARY_ITEM: usize = 100;
 
+/// How many tags one resource of this service holds at once.
+///
+/// "You can add up to 50 tags to each AWS resource" (AWS tagging limits, which
+/// this API's `Tags` map does not restate): the model bounds each KEY (1..128) and
+/// each VALUE (0..256) but not how many entries a caller may submit, so this is
+/// what bounds the tags a record carries. Charged by `TagResource` against the
+/// tags the resource would hold after the request, so repeated calls cannot grow a
+/// record without limit.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 /// The longest principal this service stores against a record.
 ///
 /// [`caller_principal`] reads the access key id out of the request's
@@ -343,6 +353,47 @@ impl ComAmazonawsQappsQappsserviceState {
             .keys()
             .filter(|(instance, _)| instance == instance_id)
             .count()
+    }
+
+    /// The tags held against the resource `resource` names, or `None` when this
+    /// store holds no such resource.
+    ///
+    /// One reader for the whole tagging surface: `CreateQApp` and
+    /// `StartQAppSession` store the tags their caller submitted on the record
+    /// itself, so the tags of a resource are the record's and nothing keeps a
+    /// second copy. WHERE a resource lives is [`TaggedResource::store_key`]'s
+    /// answer, shared with the revising reader below so the two cannot drift: a
+    /// session ARN names the app it runs, so a session id read under the WRONG app
+    /// names no resource — the same answer as an id the store never held.
+    pub fn resource_tags(&self, resource: &TaggedResource) -> Option<&HashMap<String, String>> {
+        let key = resource.store_key();
+        match resource {
+            TaggedResource::App { .. } => self.apps.get(&key).map(|app| &app.tags),
+            TaggedResource::Session { app_id, .. } => self
+                .sessions
+                .get(&key)
+                .filter(|session| &session.app_id == app_id)
+                .map(|session| &session.tags),
+        }
+    }
+
+    /// The same tags, for a request that revises them (`TagResource`,
+    /// `UntagResource`). `None` is the same "no such resource" answer
+    /// [`Self::resource_tags`] gives, decided from the same key and the same
+    /// session-to-app check.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource: &TaggedResource,
+    ) -> Option<&mut HashMap<String, String>> {
+        let key = resource.store_key();
+        match resource {
+            TaggedResource::App { .. } => self.apps.get_mut(&key).map(|app| &mut app.tags),
+            TaggedResource::Session { app_id, .. } => self
+                .sessions
+                .get_mut(&key)
+                .filter(|session| &session.app_id == app_id)
+                .map(|session| &mut session.tags),
+        }
     }
 
     /// How many apps this emulator holds across every instance, for the total
@@ -581,7 +632,7 @@ pub fn caller_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Strin
 /// namespace the model declares.
 pub fn app_arn(region: &str, instance_id: &str, app_id: &str) -> String {
     ::engine::emulator_arn(
-        "qapps",
+        SIGNING_NAME,
         region,
         &format!("application/{instance_id}/qapp/{app_id}"),
     )
@@ -590,10 +641,115 @@ pub fn app_arn(region: &str, instance_id: &str, app_id: &str) -> String {
 /// The ARN of a Q App session, which hangs off the app it runs.
 pub fn session_arn(region: &str, instance_id: &str, app_id: &str, session_id: &str) -> String {
     ::engine::emulator_arn(
-        "qapps",
+        SIGNING_NAME,
         region,
         &format!("application/{instance_id}/qapp/{app_id}/session/{session_id}"),
     )
+}
+
+/// This service's namespace: the `arnNamespace` of its `awsService` trait
+/// (`smithy_query(query="service_info")`), which is both the vendor field of every
+/// ARN it mints and the prefix of every IAM action it is authorized by.
+pub const SIGNING_NAME: &str = "qapps";
+
+/// A Q Apps resource that carries tags, as the ARN a tagging request names
+/// addresses it.
+///
+/// The two forms are the ones [`app_arn`] and [`session_arn`] build, which are the
+/// resources this service mints: a Q App, and a session of one. The instance is
+/// part of both, because an instance is this API's tenant boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    App {
+        instance_id: String,
+        app_id: String,
+    },
+    Session {
+        instance_id: String,
+        app_id: String,
+        session_id: String,
+    },
+}
+
+impl TaggedResource {
+    /// The `resourceType` a refusal about this resource names, as the records
+    /// `ResourceNotFoundException` already carries elsewhere in this service spell
+    /// them.
+    pub fn resource_type(&self) -> &'static str {
+        match self {
+            Self::App { .. } => "qapp",
+            Self::Session { .. } => "session",
+        }
+    }
+
+    /// The `resourceId` a refusal about this resource names: the id of the resource
+    /// itself, not of the instance holding it.
+    pub fn resource_id(&self) -> &str {
+        match self {
+            Self::App { app_id, .. } => app_id,
+            Self::Session { session_id, .. } => session_id,
+        }
+    }
+
+    /// The `(instanceId, resourceId)` key the store holds this resource under —
+    /// `apps` for a Q App and `sessions` for a session, both keyed the same way,
+    /// since an instance is this API's tenant boundary.
+    ///
+    /// Stated once so the reading and the revising tag accessors cannot look in two
+    /// different places.
+    fn store_key(&self) -> (String, String) {
+        match self {
+            Self::App {
+                instance_id,
+                app_id,
+            } => (instance_id.clone(), app_id.clone()),
+            Self::Session {
+                instance_id,
+                session_id,
+                ..
+            } => (instance_id.clone(), session_id.clone()),
+        }
+    }
+}
+
+/// The Q Apps resource the ARN `value` names, or `None` when it names none.
+///
+/// Read through the ONE ARN reader this tree has
+/// ([`::service_common::arn::parse`]) rather than by splitting the value again, and
+/// then against the resource forms this service's own ARN builders produce:
+/// `application/<instanceId>/qapp/<appId>` and that followed by
+/// `/session/<sessionId>`. A value that is not an ARN, one of another vendor, and
+/// one whose resource field is any other shape all name no resource here.
+///
+/// The ACCOUNT and the REGION are deliberately not judged here: who may address an
+/// ARN is the authorization question (`crate::service::authorization`), and which
+/// region an id lives in is not part of this store's keys.
+pub fn tagged_resource(value: &str) -> Option<TaggedResource> {
+    let arn = ::service_common::arn::parse(value)?;
+    if arn.vendor != SIGNING_NAME {
+        return None;
+    }
+    let segments: Vec<&str> = arn.resource.split('/').collect();
+    match segments[..] {
+        ["application", instance_id, "qapp", app_id]
+            if !instance_id.is_empty() && !app_id.is_empty() =>
+        {
+            Some(TaggedResource::App {
+                instance_id: instance_id.to_string(),
+                app_id: app_id.to_string(),
+            })
+        }
+        ["application", instance_id, "qapp", app_id, "session", session_id]
+            if !instance_id.is_empty() && !app_id.is_empty() && !session_id.is_empty() =>
+        {
+            Some(TaggedResource::Session {
+                instance_id: instance_id.to_string(),
+                app_id: app_id.to_string(),
+                session_id: session_id.to_string(),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// The opaque `nextToken` marking "resume after this app". Hex-encoded so the

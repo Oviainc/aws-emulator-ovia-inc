@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: associates the submitted tags with the Q Apps resource the request's
+//! `resourceARN` names, after the plain-IAM authorization this surface is gated on.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +141,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // AUTHORIZATION FIRST, on the ARN the REQUEST carried (see
+        // `crate::service::authorization`): nothing is read or written for a caller
+        // whose policies do not permit the action.
+        let resource = crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.resource_arn,
+        )
+        .map_err(TagResourceErrorModeled::AccessDeniedException)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the qapps store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let mut store = state.lock();
+        let not_found = || {
+            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Resource {} was not found", input.resource_arn),
+                resource_id: resource.resource_id().to_string(),
+                resource_type: resource.resource_type().to_string(),
+            })
+        };
+        let held = store.resource_tags(&resource).ok_or_else(not_found)?;
+        // The tags the resource would hold AFTER this request: a key it already holds
+        // is revised rather than added, so re-tagging an existing key is not growth.
+        // Charged before anything is written, so a request past the bound changes
+        // nothing.
+        let added = input
+            .tags
+            .keys()
+            .filter(|key| !held.contains_key(*key))
+            .count();
+        let would_hold = held.len() + added;
+        if would_hold > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: too_many_tags(would_hold),
+                },
+            )
+            .into());
+        }
+
+        let tags = store.resource_tags_mut(&resource).ok_or_else(not_found)?;
+        for (key, value) in &input.tags {
+            tags.insert(key.clone(), value.clone());
+        }
+        Ok(TagResourceOutput {})
     }
+}
+
+/// How this request is refused when the tags it submits would leave the resource holding
+/// `would_hold` of them, past [`crate::state::MAX_TAGS_PER_RESOURCE`].
+///
+/// The sentence is AWS's own for a MAP member over a length bound, rendered by the ONE
+/// renderer of that envelope in this tree (`service_common::aws_validation_refusal`, over
+/// the framework's own `Violation`), so this refusal reads exactly like the refusal of a
+/// map whose bound the model states: the member name, the bound and the envelope all come
+/// from there rather than from a sentence written here. The entry count is rendered the way
+/// the framework's own constraint walk renders a map's size, which is what makes that
+/// renderer drop the value half — a map has no scalar rendering to quote.
+fn too_many_tags(would_hold: usize) -> String {
+    let violation = ::aws_smithy_schema_server::Violation {
+        path: "tags".to_string(),
+        kind: ::aws_smithy_schema_server::ViolationKind::MaxLength(
+            i64::try_from(crate::state::MAX_TAGS_PER_RESOURCE).unwrap_or(i64::MAX),
+        ),
+        value: Some(format!("{would_hold} entries")),
+    };
+    // The framework's own clause for the same violation, for the unreachable case below:
+    // a sentence is never written here.
+    let clause = violation.message();
+    ::service_common::aws_validation_refusal(&::smithy_server_runtime::Refusal::Invalid(vec![
+        violation,
+    ]))
+    .map(|refused| refused.message)
+    // UNREACHABLE: that renderer restates every constraint violation. The framework's
+    // clause stands rather than a second sentence of this crate's own.
+    .unwrap_or(clause)
 }

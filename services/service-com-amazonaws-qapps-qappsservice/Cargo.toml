@@ -23,6 +23,18 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # The opaque `nextToken` ListQApps pages with is hex-encoded.
 hex = { workspace = true }
+# The IAM Identity Center portal store, for the identity a request's credential carries:
+# this service serves only a caller federated through Identity Center, and the portal is
+# where a credential it issued to a signed-in user is recorded.
+service-com-amazonaws-sso-swbportalservice = { workspace = true }
+# The STS store, for the principal `sts:GetCallerIdentity` answers for the credentials a
+# request signed with — who the resource-tagging surface's refusal names — and, through
+# its own `iam_state` accessor, the identity-based policy documents in force on it.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# `arn` (the one ARN reader) and `iam_authorization` (the shared evaluation of policy
+# documents against an action on a resource), plus the one reader of the access key id a
+# request presents, so this service reads an ARN and authorizes as every other one does.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -30,6 +42,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# RFC 3986 percent-encoding, so a test can put a whole ARN in the single path segment
+# the tagging operations bind `resourceARN` to. TEST-ONLY.
+percent-encoding = "2.3"
 
 [lints]
 workspace = true

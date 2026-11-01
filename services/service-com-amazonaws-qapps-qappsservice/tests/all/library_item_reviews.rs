@@ -57,6 +57,14 @@ fn build_router(engine: &Arc<engine::InMemoryEngine>) -> Arc<MultiServiceRouter>
     // header below still carries the caller's identity and the route key.
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(engine)));
+    // Q Apps serves only a caller federated through IAM Identity Center
+    // (`crate::identity_center`), so every caller these tests sign as is signed in
+    // first. The suite's own subject is what the reviews surface does for an
+    // AUTHORIZED caller; the front door itself is pinned in
+    // `tests/all/identity_center_front_door.rs`.
+    for index in 0..=MAX_REVIEWS_PER_LIBRARY_ITEM + 1 {
+        crate::identity_center::federate(engine, &caller(index));
+    }
     Arc::new(router)
 }
 
@@ -497,6 +505,12 @@ async fn a_credential_too_long_to_be_an_access_key_id_names_no_user() {
     // The published bound, and one character past it.
     let at_bound = "A".repeat(MAX_PRINCIPAL_LENGTH);
     let past_bound = "A".repeat(MAX_PRINCIPAL_LENGTH + 1);
+    // Each of these callers is federated, so what the assertions below observe is the
+    // ATTRIBUTION rule in the handlers rather than the Identity Center front door,
+    // which would refuse any caller it has no sign-in for whatever its length.
+    for akid in ["AKIDSHORT", at_bound.as_str(), past_bound.as_str()] {
+        crate::identity_center::federate(&engine, akid);
+    }
     // (case, the access key id, expected status)
     let cases: [(&str, &str, u16); 3] = [
         ("a short access key id", "AKIDSHORT", 200),

@@ -37,6 +37,11 @@ const CARD_C: &str = "cccccccc-3333-4333-a333-333333333333";
 /// `QPluginCardInput$pluginId` is `length(min: 36, max: 36)` in the model.
 const PLUGIN_ID: &str = "dddddddd-4444-4444-b444-444444444444";
 
+/// The access key id these tests sign as: a credential the IAM Identity Center
+/// portal issued to a signed-in user, which is what Q Apps serves (see
+/// [`crate::identity_center`]).
+const CALLER: &str = "AKIDLIFECYCLE0001";
+
 /// The emulator under test: the production router with this one service mounted
 /// on a shared engine.
 struct Emulator {
@@ -50,7 +55,11 @@ impl Emulator {
         // Signatures are not the subject of these tests; routing still keys on
         // the credential scope below.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // The lifecycle is what this suite asserts, so its caller is signed in
+        // through Identity Center first; the front door that requires it is pinned
+        // in `tests/all/identity_center_front_door.rs`.
+        crate::identity_center::federate(&engine, CALLER);
         Self { router }
     }
 
@@ -73,9 +82,11 @@ impl Emulator {
             .header("content-type", "application/json")
             .header(
                 "authorization",
-                "AWS4-HMAC-SHA256 \
-                 Credential=AKIDEXAMPLE/20260101/us-east-1/qapps/aws4_request, \
-                 SignedHeaders=host, Signature=deadbeef",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential={CALLER}/20260101/us-east-1/qapps/aws4_request, \
+                     SignedHeaders=host, Signature=deadbeef"
+                ),
             )
             .body(payload)
             .expect("build the request");
