@@ -227,7 +227,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // What this checkout is allowed, against the entitlements the license declares
-        // and the units the grants already held on it consume.
+        // and the units the grants already held on it consume. The decision and the
+        // grant it writes below happen under the ONE store guard taken above, so the
+        // units a concurrent burst of checkouts is admitted can never exceed what the
+        // entitlement caps: a caller whose grant would take an entitlement past its
+        // maximum count reads the refusal, whatever else is in flight.
         let granted = store
             .allow_checkout(&license, &input.entitlements)
             .map_err(|refusal| match refusal {
