@@ -143,6 +143,15 @@
 //!   Retry the request later.
 //! * `ValidationException` (HTTP 400) — The input does not satisfy the constraints specified
 //!   by the service.
+//!
+//! ## Beside the model
+//!
+//! The recorded 201 carries one further top-level member the model declares on no shape:
+//! `id`, the created image's own identity, projected out of the stored record through
+//! [`crate::state::MicrovmImage::recorded_id_member`] under the member schema
+//! [`IMAGE_ID_ON_CREATE_RESPONSE`] — the same projection `GetMicrovmImage`,
+//! `ListMicrovmImages` and `UpdateMicrovmImage` answer with, so the create and every
+//! later answer about the image report one identity.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -213,7 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for CreateMicrovmImage<Eng>
 {
     type Input = CreateMicrovmImageInput;
-    type Output = CreateMicrovmImageOutput;
+    type Output = CreateMicrovmImageResponse;
     type Error = CreateMicrovmImageError;
 
     const NAME: &'static str = "CreateMicrovmImage";
@@ -392,6 +401,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.images.insert(
             input.name.clone(),
             MicrovmImage {
+                // The image's own identity, minted once with the record: the handle a
+                // client stores for the image it just created and joins every later
+                // read and listing row back to.
+                id: crate::state::mint_microvm_image_id(),
                 image_arn: image_arn.clone(),
                 name: input.name.clone(),
                 state: crate::state::IMAGE_STATE_CREATING.to_string(),
@@ -463,8 +476,29 @@ fn stored<'a>(
     Some((image, image.versions.get(image_version)?))
 }
 
-/// The modelled response for a stored image and one of its versions.
-fn output_of(image: &MicrovmImage, version: &MicrovmImageVersion) -> CreateMicrovmImageOutput {
+/// What `CreateMicrovmImage` answers: the modelled `CreateMicrovmImageResponse` plus
+/// the recorded top-level `id`.
+pub type CreateMicrovmImageResponse = RecordedMembers<CreateMicrovmImageOutput>;
+
+/// The response for a stored image and one of its versions: the modelled payload read
+/// out of the record, and the record's own `id` beside it — the one projection of the
+/// stored id every answer about this image uses
+/// ([`crate::state::MicrovmImage::recorded_id_member`]).
+fn output_of(
+    image: &MicrovmImage,
+    version: &MicrovmImageVersion,
+) -> CreateMicrovmImageResponse {
+    CreateMicrovmImageResponse::new(
+        output_payload_of(image, version),
+        image.recorded_id_member(&IMAGE_ID_ON_CREATE_RESPONSE),
+    )
+}
+
+/// The modelled half of the response for a stored image and one of its versions.
+fn output_payload_of(
+    image: &MicrovmImage,
+    version: &MicrovmImageVersion,
+) -> CreateMicrovmImageOutput {
     CreateMicrovmImageOutput {
         image_arn: image.image_arn.clone(),
         name: image.name.clone(),

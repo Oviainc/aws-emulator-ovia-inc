@@ -10,7 +10,9 @@
 //! (`emulator`, `call`, `image_body`, …) is the one `microvm_lifecycle` already owns.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::next_image_version;
+use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
+    next_image_version, FIRST_IMAGE_VERSION,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::microvm_lifecycle::{
@@ -412,6 +414,11 @@ async fn the_created_image_projection_carries_every_modelled_member() {
         crate::microvm_lifecycle::REGION
     );
 
+    // The version a request that pins no `baseImageVersion` gets: the `major.minor`
+    // initial version (`state::FIRST_IMAGE_VERSION`), rather than a literal of this
+    // suite.
+    let resolved_base_version = json!(FIRST_IMAGE_VERSION);
+
     // Rows differ in which of the two resolved members the request carries, because
     // each one is resolved, stored and projected independently of the other.
     let rows: Vec<(&str, &str, Value, Value, Value)> = vec![
@@ -419,7 +426,7 @@ async fn the_created_image_projection_carries_every_modelled_member() {
             "neither member named",
             "bare",
             json!({}),
-            json!("1.0"),
+            resolved_base_version.clone(),
             json!([default_connector.clone()]),
         ),
         (
@@ -433,7 +440,7 @@ async fn the_created_image_projection_carries_every_modelled_member() {
             "egress connectors only",
             "connected",
             json!({"egressNetworkConnectors": [default_connector.clone()]}),
-            json!("1.0"),
+            resolved_base_version.clone(),
             json!([default_connector.clone()]),
         ),
         (

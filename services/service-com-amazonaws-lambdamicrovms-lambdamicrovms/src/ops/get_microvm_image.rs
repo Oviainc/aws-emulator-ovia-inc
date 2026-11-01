@@ -83,6 +83,14 @@
 //!   Retry the request later.
 //! * `ValidationException` (HTTP 400) — The input does not satisfy the constraints specified
 //!   by the service.
+//!
+//! ## Beside the model
+//!
+//! The recorded 200 carries one further top-level member the model declares on no shape:
+//! `id`, the image's own identity, projected out of the stored record through
+//! [`crate::state::MicrovmImage::recorded_id_member`] under the member schema
+//! [`IMAGE_ID_ON_GET_OUTPUT`] — the same projection the create answered with, so the two
+//! are byte-identical for one image.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -146,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetMicrovmImage<Eng>
 {
     type Input = GetMicrovmImageInput;
-    type Output = GetMicrovmImageOutput;
+    type Output = GetMicrovmImageResponse;
     type Error = GetMicrovmImageError;
 
     const NAME: &'static str = "GetMicrovmImage";
@@ -222,7 +230,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        Ok(GetMicrovmImageOutput {
+        Ok(rendered(image))
+    }
+}
+
+/// What `GetMicrovmImage` answers: the modelled `GetMicrovmImageOutput` plus the
+/// recorded top-level `id`.
+pub type GetMicrovmImageResponse = RecordedMembers<GetMicrovmImageOutput>;
+
+/// The STORED image record as this operation's response: the modelled payload read out
+/// of the record, and the record's own `id` beside it — the one projection of the
+/// stored id ([`crate::state::MicrovmImage::recorded_id_member`]), so the id this read
+/// answers is byte-identical to the one the create returned.
+fn rendered(image: &crate::state::MicrovmImage) -> GetMicrovmImageResponse {
+    GetMicrovmImageResponse::new(
+        GetMicrovmImageOutput {
             image_arn: image.image_arn.clone(),
             name: image.name.clone(),
             state: image.state.clone(),
@@ -233,6 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // client reading it always gets a map to iterate.
             tags: crate::state::wire_map_present(&image.tags),
             updated_at: image.updated_at,
-        })
-    }
+        },
+        image.recorded_id_member(&IMAGE_ID_ON_GET_OUTPUT),
+    )
 }

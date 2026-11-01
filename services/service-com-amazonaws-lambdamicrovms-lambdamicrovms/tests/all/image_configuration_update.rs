@@ -24,11 +24,11 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     base_image_not_found_message, default_log_group, image_not_found_message,
-    image_not_updatable_message, invalid_arn_format_message, latest_managed_base_image_version,
-    managed_base_image_arn, managed_network_connector_arn, next_image_version, service_state,
+    image_not_updatable_message, invalid_arn_format_message, managed_base_image_arn,
+    managed_network_connector_arn, next_image_version, service_state,
     too_many_image_versions_message, ACCESS_DENIED_MESSAGE, CODE_ARTIFACT_URI_REQUIREMENT,
     DEFAULT_CPU_ARCHITECTURE, DEFAULT_EGRESS_NETWORK_CONNECTOR, DEFAULT_MINIMUM_MEMORY_IN_MIB,
-    MANAGED_BASE_IMAGE_IDS, MAX_MICROVM_IMAGE_VERSIONS,
+    FIRST_IMAGE_VERSION, MANAGED_BASE_IMAGE_IDS, MAX_MICROVM_IMAGE_VERSIONS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -147,7 +147,10 @@ async fn create_image(router: &MultiServiceRouter, name: &str, extra: Value) -> 
 /// from a record that never named it.
 fn service_supplied(name: &str, member: &str) -> Value {
     match member {
-        "baseImageVersion" => json!(latest_managed_base_image_version(MANAGED_BASE_IMAGE_IDS[0])),
+        // A build that pins no `baseImageVersion` records the `major.minor` INITIAL
+        // version, whatever generation the AWS-managed catalogue publishes for the base
+        // image (`state::resolve_base_image_version`).
+        "baseImageVersion" => json!(FIRST_IMAGE_VERSION),
         "egressNetworkConnectors" => json!([managed_network_connector_arn(
             REGION,
             DEFAULT_EGRESS_NETWORK_CONNECTOR

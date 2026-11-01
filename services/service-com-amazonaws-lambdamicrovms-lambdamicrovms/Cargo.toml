@@ -26,7 +26,8 @@ tracing = { workspace = true }
 # Encodes/decodes the opaque `nextToken` ListMicrovms pages with, and renders the
 # digest a MicroVM endpoint recognises an authentication token by.
 hex = { workspace = true }
-# Digests a MicroVM endpoint authentication token, so the store holds no token secret.
+# Digests a MicroVM endpoint authentication token, so the store holds no token secret,
+# and the opaque bytes a minted MicroVM image `id` is rendered from.
 sha2 = { workspace = true }
 
 [build-dependencies]

@@ -88,6 +88,14 @@
 //!   Retry the request later.
 //! * `ValidationException` (HTTP 400) — The input does not satisfy the constraints specified
 //!   by the service.
+//!
+//! ## Beside the model
+//!
+//! Each recorded row carries one further member the model declares on no shape:
+//! `supportedCpuConfigurations`, the CPU architectures that published generation of the
+//! base image supports, projected out of the catalogue table through
+//! [`crate::state::ManagedBaseImageVersion::recorded_supported_cpu_configurations_member`]
+//! under the member schema [`SUPPORTED_CPU_CONFIGURATIONS_ON_MANAGED_VERSION`].
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -227,13 +235,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .lock()
             .managed_base_image_versions(&image_id, &crate::state::request_region(ctx));
 
-        // The versions enumerate in one stable order, so "after this version" is a
-        // cursor that stays valid even when another version is published between two
-        // pages.
+        // The versions enumerate in one stable order — newest generation first, the
+        // order the catalogue publishes them in — so "after this version" is a cursor
+        // that stays valid even when another generation is published between two pages.
         let mut remaining = versions.iter().filter(|entry| {
             after.as_deref().is_none_or(|cursor| {
                 crate::state::version_order(&entry.image_version)
-                    > crate::state::version_order(cursor)
+                    < crate::state::version_order(cursor)
             })
         });
         let page: Vec<&crate::state::ManagedBaseImageVersion> =
@@ -250,12 +258,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `items` is `@required`, so it is always projected — an empty page included.
             items: page
                 .into_iter()
-                .map(|entry| ManagedMicrovmImageVersion {
-                    image_arn: entry.image_arn.clone(),
-                    image_version: entry.image_version.clone(),
-                    status: Some(entry.status.clone()),
-                    created_at: entry.created_at,
-                    updated_at: entry.updated_at,
+                .map(|entry| {
+                    ManagedMicrovmImageVersionRow::new(
+                        ManagedMicrovmImageVersion {
+                            image_arn: entry.image_arn.clone(),
+                            image_version: entry.image_version.clone(),
+                            status: Some(entry.status.clone()),
+                            created_at: entry.created_at,
+                            updated_at: entry.updated_at,
+                        },
+                        // Which architectures the generation supports, read from the one
+                        // catalogue table rather than from the request, so a caller can
+                        // select a base image by architecture.
+                        entry.recorded_supported_cpu_configurations_member(
+                            &SUPPORTED_CPU_CONFIGURATIONS_ON_MANAGED_VERSION,
+                        ),
+                    )
                 })
                 .collect(),
         })

@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    CloudWatchLogging, CodeArtifact, CpuConfiguration, Hooks, IdlePolicy, Logging, Resources,
-    SnapshotBuild,
+    CloudWatchLogging, CodeArtifact, CpuConfiguration, Hooks, IdlePolicy, Logging, RecordedMember,
+    Resources, SnapshotBuild, ARCHITECTURE_VALUES,
 };
 
 /// The MicroVM endpoint: the address a MicroVM is published on, the tokens that
@@ -375,18 +375,28 @@ pub fn managed_base_image_arn(region: &str, image_id: &str) -> String {
     format!("arn:aws:lambda:{region}:{MANAGED_RESOURCE_ACCOUNT}:microvm-image:{image_id}")
 }
 
-/// The versions the AWS-managed catalogue publishes, as `(base image id, version)`.
+/// The generations the AWS-managed catalogue publishes, as `(base image id,
+/// generation, the CPU architectures that generation supports)`.
 ///
-/// A managed base image is versioned the same way an account's own image is — a
-/// `major.minor` string a client feeds back as `CreateMicrovmImage$baseImageVersion`
-/// ("The specific version of the base MicroVM image to use") — so the published
-/// version set is what that member is resolved against: each image of
-/// [`MANAGED_BASE_IMAGE_IDS`] is published at its initial version
-/// ([`FIRST_IMAGE_VERSION`]), which is therefore the version a create that names none
-/// gets ([`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_base_image_version`]).
-/// `ListManagedMicrovmImageVersions` serves this same set, so a listing of an image's
-/// versions and a create that builds on one cannot disagree.
-pub const MANAGED_BASE_IMAGE_VERSIONS: &[(&str, &str)] = &[("al2023-1", FIRST_IMAGE_VERSION)];
+/// An AWS-PUBLISHED base image is versioned by a plain integer GENERATION counter —
+/// not the `major.minor` form this service mints for an account's own images
+/// ([`FIRST_IMAGE_VERSION`]) — and AWS publishes several generations of one base image
+/// at once, so a client can pin an older generation for a reproducible build.
+/// `ListManagedMicrovmImageVersions` serves this table, so what a client DISCOVERS to
+/// pin as `CreateMicrovmImage$baseImageVersion` ("The specific version of the base
+/// MicroVM image to use") is what the table publishes. A create's own version is not
+/// checked against it — the service records whatever version the request pinned — and
+/// what a create that pins NONE records is not a generation of this table either; see
+/// [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_base_image_version`].
+///
+/// Each generation also publishes the architectures a MicroVM built on it can target,
+/// which is how a caller selects a base image by architecture; the catalogue's images
+/// support every architecture this API models (`ARCHITECTURE_VALUES`, the values
+/// `smithy_query(query="shape",shape="Architecture")` lists).
+pub const MANAGED_BASE_IMAGE_VERSIONS: &[(&str, &str, &[&str])] = &[
+    ("al2023-1", "1", ARCHITECTURE_VALUES),
+    ("al2023-1", "0", ARCHITECTURE_VALUES),
+];
 
 /// A `ManagedMicrovmImageVersionStatus` value
 /// (`MANAGED_MICROVM_IMAGE_VERSION_STATUS_VALUES`): "the version is available for
@@ -397,37 +407,65 @@ pub const MANAGED_BASE_IMAGE_VERSIONS: &[(&str, &str)] = &[("al2023-1", FIRST_IM
 /// every entry it serves is available for use.
 pub const MANAGED_VERSION_STATUS_AVAILABLE: &str = "AVAILABLE";
 
-/// The versions the catalogue publishes for the base image `image_id`, in the order a
-/// listing pages them (see [`version_order`]). Empty for an id the catalogue does not
-/// publish, which holds no versions either.
+/// The generations the catalogue publishes for the base image `image_id`, in the order
+/// a listing pages them: NEWEST generation first, which is the order AWS publishes a
+/// base image's generations in (see [`version_order`] for the order itself). Empty for
+/// an id the catalogue does not publish, which holds no generations either.
 pub fn published_managed_base_image_versions(image_id: &str) -> Vec<&'static str> {
     let mut versions: Vec<&'static str> = match is_published_managed_base_image(image_id) {
         true => MANAGED_BASE_IMAGE_VERSIONS
             .iter()
-            .filter(|(id, _)| *id == image_id)
-            .map(|(_, version)| *version)
+            .filter(|(id, _, _)| *id == image_id)
+            .map(|(_, version, _)| *version)
             .collect(),
         false => Vec::new(),
     };
     versions.sort_unstable_by_key(|version| version_order(version));
+    versions.reverse();
     versions
 }
 
-/// The newest version the catalogue publishes for the base image `image_id` — the one
-/// a build that pins no `baseImageVersion` is resolved to.
+/// The architectures the catalogue publishes `image_version` of the base image
+/// `image_id` as supporting, as the modelled `CpuConfiguration` structures a listing
+/// reports them in. Empty for a generation the catalogue does not publish.
+pub fn managed_base_image_supported_architectures(
+    image_id: &str,
+    image_version: &str,
+) -> Vec<CpuConfiguration> {
+    MANAGED_BASE_IMAGE_VERSIONS
+        .iter()
+        .filter(|(id, version, _)| *id == image_id && *version == image_version)
+        .flat_map(|(_, _, architectures)| architectures.iter())
+        .map(|architecture| CpuConfiguration {
+            architecture: (*architecture).to_string(),
+        })
+        .collect()
+}
+
+/// The newest generation the catalogue publishes for the base image `image_id`: the
+/// published order is newest first ([`published_managed_base_image_versions`]), so this
+/// is the first row `ListManagedMicrovmImageVersions` serves for it.
+///
+/// A published-order ACCESSOR, not a resolution rule: nothing resolves a request
+/// against it (see
+/// [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_base_image_version`] for
+/// what an unpinned build records), and the listing's own order check reads it.
 pub fn latest_managed_base_image_version(image_id: &str) -> Option<&'static str> {
     published_managed_base_image_versions(image_id)
         .into_iter()
-        .next_back()
+        .next()
 }
 
-/// The order versions of one image sort in: as the `major.minor` pair the version
-/// names, so `1.10` follows `1.9` rather than preceding it (see
-/// [`FIRST_IMAGE_VERSION`]). A version in no such form (nothing this service
-/// publishes is) sorts after every version that is, by its own text, so the order is
-/// total whatever is stored.
+/// The order versions of one image sort in, oldest first: as the `major.minor` pair the
+/// version names, so `1.10` follows `1.9` rather than preceding it (see
+/// [`FIRST_IMAGE_VERSION`]), and as its own integer for a plain generation counter, so
+/// generation `10` follows generation `9` (see [`MANAGED_BASE_IMAGE_VERSIONS`]). A
+/// version in neither form (nothing this service publishes is) sorts after every
+/// version that is, by its own text, so the order is total whatever is stored.
 pub fn version_order(version: &str) -> (u64, u64, String) {
-    let (major, minor) = parse_image_version(version).unwrap_or((u64::MAX, u64::MAX));
+    let (major, minor) = parse_image_version(version)
+        .or_else(|| version.parse().ok().map(|generation| (generation, 0)))
+        .unwrap_or((u64::MAX, u64::MAX));
     (major, minor, version.to_string())
 }
 
@@ -822,6 +860,11 @@ pub struct MicrovmImageVersion {
 /// A MicroVM image, keyed in [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::images`] by its name.
 #[derive(Debug)]
 pub struct MicrovmImage {
+    /// The image's own identity, minted with the record and never written again — see
+    /// [`mint_microvm_image_id`]. Every response that reports this record reports this
+    /// one value ([`Self::recorded_id_member`]), so a client can key its own records on
+    /// it and join a later read or listing back to the create.
+    pub id: String,
     pub image_arn: String,
     pub name: String,
     /// A `MicrovmImageState`.
@@ -835,6 +878,74 @@ pub struct MicrovmImage {
     /// When this image's asynchronous deletion removes it; `None` while no delete is
     /// in flight.
     pub delete_due_at: Option<Instant>,
+}
+
+impl MicrovmImage {
+    /// This image's `id`, as the recorded-only member a response writes beside its
+    /// modelled payload, under the member schema `member` of the shape answering.
+    ///
+    /// The ONE projection of the stored id, so the create that minted the image, a
+    /// later read of it and a listing row for it cannot report different identities —
+    /// and so a client that keyed its own records on the create's id finds the same
+    /// value in every later answer. See [`crate::ops::types::RecordedMembers`] for why
+    /// the member is written beside the payload rather than on it.
+    pub fn recorded_id_member(
+        &self,
+        member: &'static ::aws_smithy_schema::Schema,
+    ) -> Vec<RecordedMember> {
+        vec![RecordedMember::Text(member, self.id.clone())]
+    }
+}
+
+/// Mint a MicroVM image's `id`: the identity the service hands back for the image it
+/// just created, and answers for that image from then on.
+///
+/// A lowercase hyphenated 8-4-4-4-12 version-4 UUID, minted once per image and stored
+/// on the record, so it is unique across the images this store holds and stable across
+/// every read of one. The TEXT form is the workspace's one rendering of 16 opaque bytes
+/// as such a UUID (`service_common::uuid_from_random_bytes`, which computes the version
+/// and variant bits and the group boundaries with the maintained `uuid` crate), so
+/// neither the bits nor the boundaries are spelled out here.
+///
+/// The bytes are this store's own ([`minted_bytes`]): an identity is not a credential,
+/// so what it needs is to be unique, not unpredictable.
+pub fn mint_microvm_image_id() -> String {
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&minted_bytes()[..16]);
+    ::service_common::uuid_from_random_bytes(id)
+}
+
+/// 32 opaque bytes for one minted identifier.
+///
+/// A digest over a process-wide counter (what makes two mints of the same instant
+/// differ), the wall clock (what makes two runs differ) and one keyed hash of both from
+/// the standard library's own randomly seeded hasher. The digest is the `sha2` this
+/// crate already carries for the MicroVM endpoint's token digests, so nothing here
+/// hand-writes a hash.
+fn minted_bytes() -> [u8; 32] {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use ::sha2::{Digest, Sha256};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default();
+
+    let mut keyed = std::collections::hash_map::RandomState::new().build_hasher();
+    keyed.write_u64(seq);
+    keyed.write_u128(nanos);
+
+    let mut digest = Sha256::new();
+    digest.update(seq.to_be_bytes());
+    digest.update(nanos.to_be_bytes());
+    digest.update(keyed.finish().to_be_bytes());
+    digest.finalize().into()
 }
 
 /// A running (or terminated) MicroVM, keyed in
@@ -996,6 +1107,28 @@ pub struct ManagedBaseImageVersion {
     pub created_at: DateTime,
     /// When the version was last written, as [`ManagedBaseImage::updated_at`].
     pub updated_at: Option<DateTime>,
+    /// The CPU architectures this published generation supports — see
+    /// [`managed_base_image_supported_architectures`].
+    pub supported_cpu_configurations: Vec<CpuConfiguration>,
+}
+
+impl ManagedBaseImageVersion {
+    /// This entry's `supportedCpuConfigurations`, as the recorded-only member a listing
+    /// row writes beside its modelled payload, under the member schema `member`.
+    ///
+    /// The ONE projection of the published architectures, read from the catalogue table
+    /// rather than from the request, so what the catalogue publishes and what a listing
+    /// reports cannot disagree. See [`crate::ops::types::RecordedMembers`] for why the
+    /// member is written beside the payload rather than on it.
+    pub fn recorded_supported_cpu_configurations_member(
+        &self,
+        member: &'static ::aws_smithy_schema::Schema,
+    ) -> Vec<RecordedMember> {
+        vec![RecordedMember::CpuConfigurations(
+            member,
+            self.supported_cpu_configurations.clone(),
+        )]
+    }
 }
 
 impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
@@ -1143,7 +1276,8 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     }
 
     /// The versions the AWS-managed catalogue publishes for the base image `image_id`,
-    /// in the order a listing pages them and projected into `region`.
+    /// in the order a listing pages them (newest generation first) and projected into
+    /// `region`.
     ///
     /// The same catalogue [`Self::managed_base_images`] serves, read one image deep
     /// ([`MANAGED_BASE_IMAGE_VERSIONS`]), so a listing of an image's versions, the
@@ -1163,6 +1297,10 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
                 status: MANAGED_VERSION_STATUS_AVAILABLE.to_string(),
                 created_at: self.managed_catalogue_published_at,
                 updated_at: Some(self.managed_catalogue_published_at),
+                supported_cpu_configurations: managed_base_image_supported_architectures(
+                    image_id,
+                    image_version,
+                ),
             })
             .collect()
     }
@@ -1338,11 +1476,15 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     ///
     /// `baseImageVersion` is "the specific version of the base MicroVM image to use",
     /// so the service resolves one rather than recording none: the base image's own
-    /// active version when this account holds it, the newest version the AWS-managed
-    /// catalogue publishes for it when the ARN names a managed image
-    /// ([`latest_managed_base_image_version`] — the same set
-    /// `ListManagedMicrovmImageVersions` serves), and otherwise the initial version,
+    /// active version when this account holds it, and otherwise the initial version,
     /// [`FIRST_IMAGE_VERSION`].
+    ///
+    /// A reference into the AWS-managed catalogue takes that same initial version
+    /// rather than the newest GENERATION the catalogue publishes for it
+    /// ([`latest_managed_base_image_version`]), so the catalogue is deliberately NOT
+    /// consulted here: the recorded create answers the `major.minor` initial version
+    /// for an unpinned build on a managed base image, while a build that pins a
+    /// generation records the generation it pinned.
     pub fn resolve_base_image_version(&self, base_image_arn: &str) -> String {
         if let Some(active) = self
             .image(base_image_arn)
@@ -1350,10 +1492,7 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
         {
             return active;
         }
-        managed_microvm_image_id(base_image_arn)
-            .and_then(latest_managed_base_image_version)
-            .unwrap_or(FIRST_IMAGE_VERSION)
-            .to_string()
+        FIRST_IMAGE_VERSION.to_string()
     }
 
     /// The MicroVM `identifier` names, for mutation.

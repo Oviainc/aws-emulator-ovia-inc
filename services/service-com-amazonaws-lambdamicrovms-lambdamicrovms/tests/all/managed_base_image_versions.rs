@@ -7,9 +7,14 @@
 //! the `imageIdentifier` names — resolved by either form `MicrovmImageIdentifier`
 //! accepts — each carrying that image's AWS-owned ARN in the region the request was
 //! signed for, its version, its lifecycle status and the instants the entry was
-//! published, paged by the operation's `@paginated` contract; a well-formed reference the
-//! catalogue does not publish has an empty published version set and so pages through to
-//! an empty page, and a value that is no identifier of this API is HTTP 400.
+//! published, NEWEST generation first, paged by the operation's `@paginated` contract; a
+//! well-formed reference the catalogue does not publish has an empty published version
+//! set and so pages through to an empty page, and a value that is no identifier of this
+//! API is HTTP 400.
+//!
+//! The form of a published generation's id, the set of generations one base image
+//! publishes and the architectures each supports are the subject of
+//! `managed_base_image_generations`.
 //!
 //! Each test states that rule and exercises it over a SET of inputs; the values any one
 //! row happens to carry are examples, not the specification. The wire harness
@@ -410,12 +415,13 @@ async fn a_next_token_this_listing_did_not_issue_is_refused() {
     }
 }
 
-/// RULE: the version listing is the version side of the ONE managed catalogue — the
-/// newest version it reports for an image is the one a build that pins no
-/// `baseImageVersion` is resolved to — and reading it changes nothing a later caller
-/// sees.
+/// RULE: the version listing is the version side of the ONE managed catalogue — every
+/// generation it reports for an image is one a build may PIN, and the newest is the
+/// FIRST row it serves — and reading it changes nothing a later caller sees. Which
+/// generation an unpinned build records is the subject of
+/// `managed_base_image_generations`.
 #[tokio::test]
-async fn the_newest_listed_version_is_the_one_a_build_resolves() {
+async fn every_listed_version_is_one_a_build_can_pin() {
     let router = emulator();
 
     // Rows: one per image the catalogue publishes, read through both identifier forms,
@@ -430,8 +436,11 @@ async fn the_newest_listed_version_is_the_one_a_build_resolves() {
             let (status, first) = list_versions(&router, &identifier, "").await;
             assert_eq!(status, 200, "case {case}: expected 200, got {status} {first}");
             let listed = page_versions(&first, &case);
+            // The catalogue publishes a base image's generations newest first
+            // (`state::published_managed_base_image_versions`), so the newest is the
+            // row the listing serves first.
             let newest = listed
-                .last()
+                .first()
                 .unwrap_or_else(|| panic!("case {case}: the image publishes a version, got {first}"))
                 .clone();
 
@@ -442,7 +451,10 @@ async fn the_newest_listed_version_is_the_one_a_build_resolves() {
                 "/2025-09-09/microvm-images",
                 Some(image_body(
                     &name,
-                    json!({"baseImageArn": base_image_arn.clone()}),
+                    json!({
+                        "baseImageArn": base_image_arn.clone(),
+                        "baseImageVersion": newest.clone(),
+                    }),
                 )),
             )
             .await;
@@ -450,8 +462,7 @@ async fn the_newest_listed_version_is_the_one_a_build_resolves() {
             assert_eq!(
                 created["baseImageVersion"].as_str(),
                 Some(newest.as_str()),
-                "case {case}: a build that pins no version gets the newest published one, got \
-                 {:?}",
+                "case {case}: a build pins the generation it named, got {:?}",
                 created["baseImageVersion"]
             );
 

@@ -30,6 +30,7 @@ pub mod list_microvm_image_versions_types;
 pub mod list_microvm_images_types;
 pub mod list_microvms_types;
 pub mod list_tags_types;
+pub mod recorded_wire;
 pub mod resume_microvm_types;
 pub mod run_microvm_types;
 pub mod shared_types;
@@ -72,6 +73,8 @@ pub use list_microvm_images_types::*;
 pub use list_microvms_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_tags_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use recorded_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use resume_microvm_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

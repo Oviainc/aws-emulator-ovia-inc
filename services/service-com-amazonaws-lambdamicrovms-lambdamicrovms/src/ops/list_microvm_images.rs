@@ -79,6 +79,14 @@
 //!   Retry the request later.
 //! * `ValidationException` (HTTP 400) — The input does not satisfy the constraints specified
 //!   by the service.
+//!
+//! ## Beside the model
+//!
+//! Each recorded row carries one further member the model declares on no shape: `id`,
+//! that image's own identity, projected out of the stored record through
+//! [`crate::state::MicrovmImage::recorded_id_member`] under the member schema
+//! [`IMAGE_ID_ON_SUMMARY`] — the same projection the create and the read answer with, so
+//! a reconciliation sweep can match a row to the resource it created.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -198,22 +206,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => true,
         });
 
-        let items: Vec<MicrovmImageSummary> = remaining
+        let items: Vec<MicrovmImageRow> = remaining
             .by_ref()
             .take(page_size)
-            .map(|image| MicrovmImageSummary {
-                image_arn: image.image_arn.clone(),
-                name: image.name.clone(),
-                state: image.state.clone(),
-                latest_active_image_version: image.latest_active_image_version.clone(),
-                latest_failed_image_version: image.latest_failed_image_version.clone(),
-                created_at: image.created_at,
+            .map(|image| {
+                MicrovmImageRow::new(
+                    MicrovmImageSummary {
+                        image_arn: image.image_arn.clone(),
+                        name: image.name.clone(),
+                        state: image.state.clone(),
+                        latest_active_image_version: image.latest_active_image_version.clone(),
+                        latest_failed_image_version: image.latest_failed_image_version.clone(),
+                        created_at: image.created_at,
+                    },
+                    // The row carries the image's own identity, through the one
+                    // projection of the stored id the create and the read answer with,
+                    // so a client can join a listing back to the resources it created.
+                    image.recorded_id_member(&IMAGE_ID_ON_SUMMARY),
+                )
             })
             .collect();
 
         // A `nextToken` is returned only when the page did not exhaust the matches.
         let next_token = match (items.last(), remaining.next()) {
-            (Some(last), Some(_)) => Some(encode_token(&last.name)),
+            (Some(last), Some(_)) => Some(encode_token(&last.payload.name)),
             _ => None,
         };
 

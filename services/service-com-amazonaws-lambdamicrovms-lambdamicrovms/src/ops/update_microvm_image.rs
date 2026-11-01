@@ -138,6 +138,14 @@
 //!   Retry the request later.
 //! * `ValidationException` (HTTP 400) — The input does not satisfy the constraints specified
 //!   by the service.
+//!
+//! ## Beside the model
+//!
+//! The recorded 200 carries one further top-level member the model declares on no shape:
+//! `id`, the image's own identity, projected out of the stored record through
+//! [`crate::state::MicrovmImage::recorded_id_member`] under the member schema
+//! [`IMAGE_ID_ON_UPDATE_RESPONSE`]. The id is the IMAGE's, not a version's, so an update
+//! that mints a new version reports the identity the create handed back.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -208,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for UpdateMicrovmImage<Eng>
 {
     type Input = UpdateMicrovmImageInput;
-    type Output = UpdateMicrovmImageOutput;
+    type Output = UpdateMicrovmImageResponse;
     type Error = UpdateMicrovmImageError;
 
     const NAME: &'static str = "UpdateMicrovmImage";
@@ -478,12 +486,33 @@ fn stored<'a>(
     Some((image, image.versions.get(image_version)?))
 }
 
-/// The modelled response for a stored image and the version this call minted.
+/// What `UpdateMicrovmImage` answers: the modelled `UpdateMicrovmImageResponse` plus
+/// the recorded top-level `id`.
+pub type UpdateMicrovmImageResponse = RecordedMembers<UpdateMicrovmImageOutput>;
+
+/// The response for a stored image and the version this call minted: the modelled
+/// payload read out of the record, and the record's own `id` beside it — the one
+/// projection of the stored id ([`crate::state::MicrovmImage::recorded_id_member`]), so
+/// an update reports the identity the create handed back rather than a second one.
 ///
 /// `updatedAt` is `@required` on this response, and the image this operation answers
 /// for has just been written, so the stamp the record carries is the one reported; a
 /// record carrying none would be one no write has ever touched.
-fn output_of(image: &MicrovmImage, version: &MicrovmImageVersion) -> UpdateMicrovmImageOutput {
+fn output_of(
+    image: &MicrovmImage,
+    version: &MicrovmImageVersion,
+) -> UpdateMicrovmImageResponse {
+    UpdateMicrovmImageResponse::new(
+        output_payload_of(image, version),
+        image.recorded_id_member(&IMAGE_ID_ON_UPDATE_RESPONSE),
+    )
+}
+
+/// The modelled half of the response for a stored image and one of its versions.
+fn output_payload_of(
+    image: &MicrovmImage,
+    version: &MicrovmImageVersion,
+) -> UpdateMicrovmImageOutput {
     UpdateMicrovmImageOutput {
         image_arn: image.image_arn.clone(),
         name: image.name.clone(),

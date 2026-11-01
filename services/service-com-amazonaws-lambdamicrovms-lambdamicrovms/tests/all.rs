@@ -33,6 +33,8 @@ mod image_version_listing;
 mod list_tags_read_path;
 #[path = "all/managed_base_image_catalogue.rs"]
 mod managed_base_image_catalogue;
+#[path = "all/managed_base_image_generations.rs"]
+mod managed_base_image_generations;
 #[path = "all/managed_base_image_versions.rs"]
 mod managed_base_image_versions;
 #[path = "all/managed_namespace_authorization.rs"]
@@ -45,6 +47,8 @@ mod microvm_image_and_instance_paths;
 mod microvm_lifecycle;
 #[path = "all/microvm_runtime_path.rs"]
 mod microvm_runtime_path;
+#[path = "all/recorded_image_identity.rs"]
+mod recorded_image_identity;
 #[path = "all/resource_tag_removal.rs"]
 mod resource_tag_removal;
 #[path = "all/resource_tagging.rs"]
