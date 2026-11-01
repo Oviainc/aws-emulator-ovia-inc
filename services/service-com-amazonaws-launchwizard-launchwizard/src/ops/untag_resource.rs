@@ -193,10 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `@idempotent`: removing a key the resource does not carry is a no-op, so the
-        // same request twice leaves the same tag set and answers the same way.
-        for key in &tag_keys {
-            deployment.tags.remove(key);
-        }
+        // same request twice leaves the same tag set and answers the same way. The set
+        // is part of the deployment RECORD, so a removal that changes it refreshes that
+        // record's `modifiedAt` and one that removes nothing leaves the whole record
+        // alone — both on the record itself (`state::Deployment::remove_tags`), the way
+        // `TagResource` writes it.
+        deployment.remove_tags(tag_keys.iter().map(String::as_str), now);
 
         Ok(UntagResourceOutput {})
     }

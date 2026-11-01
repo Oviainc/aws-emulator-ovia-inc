@@ -732,6 +732,15 @@ pub struct Deployment {
     /// [`Deployment::workload_version_name`].
     pub pattern_version_name: String,
     pub created_at: SystemTime,
+    /// `DeploymentData$modifiedAt` / `DeploymentDataSummary$modifiedAt`: the instant
+    /// this record last CHANGED.
+    ///
+    /// Every write of the record refreshes it — the settings and status a call applies
+    /// (`UpdateDeployment`, `DeleteDeployment`), the status steps the clock owes
+    /// ([`Deployment::materialize_due`]) and the tag set the tagging operations write
+    /// ([`Deployment::merge_tags`], [`Deployment::remove_tags`]) — so no reader is ever
+    /// told the record last changed before something it reports in the same response
+    /// was written. A call that changes nothing is not a write and leaves it alone.
     pub modified_at: SystemTime,
     pub deleted_at: Option<SystemTime>,
     /// The events this deployment's history still holds, oldest first — at most
@@ -769,6 +778,54 @@ impl Deployment {
             self.resource_group = Some(resource_group_name(&self.name));
         }
         self.status = status;
+    }
+
+    /// Merge `tags` into this deployment's tag set — the write `TagResource` makes —
+    /// and record that the deployment was modified at `at` if the set it now carries is
+    /// not the one it carried before.
+    ///
+    /// `modifiedAt` names the instant of the last change to this RECORD, and the tag set
+    /// is part of it ([`Deployment::to_data`] reports both), so a tag write that changes
+    /// the set is as much a modification as a settings write is: without this, a reader
+    /// would be told the record last changed before the tags reported beside that
+    /// timestamp were written. A request that leaves every key at the value it already
+    /// had changes nothing and therefore moves nothing, which is what keeps repeating a
+    /// tagging call observably a no-op.
+    pub fn merge_tags<I>(&mut self, tags: I, at: SystemTime)
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let mut changed = false;
+        for (key, value) in tags {
+            match self.tags.get(&key) {
+                Some(held) if *held == value => {}
+                _ => {
+                    self.tags.insert(key, value);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.modified_at = at;
+        }
+    }
+
+    /// Drop every key in `keys` from this deployment's tag set — the write
+    /// `UntagResource` makes — recording the modification at `at` the way
+    /// [`Deployment::merge_tags`] does: a key the resource does not carry is removed
+    /// from nothing, so a request naming only such keys leaves the record, `modifiedAt`
+    /// included, exactly as it was.
+    pub fn remove_tags<'key, I>(&mut self, keys: I, at: SystemTime)
+    where
+        I: IntoIterator<Item = &'key str>,
+    {
+        let mut changed = false;
+        for key in keys {
+            changed |= self.tags.remove(key).is_some();
+        }
+        if changed {
+            self.modified_at = at;
+        }
     }
 
     /// Append `event` to this deployment's history, dropping the OLDEST events once

@@ -231,9 +231,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        for (key, value) in tags {
-            deployment.tags.insert(key, value);
-        }
+        // The merged set is part of the deployment RECORD, so a write that changes it
+        // also refreshes that record's `modifiedAt`. The merge and that refresh live
+        // together on the record itself (`state::Deployment::merge_tags`), so this
+        // handler and `UntagResource` cannot disagree about what writing a tag does to
+        // the deployment.
+        deployment.merge_tags(tags, now);
 
         Ok(TagResourceOutput {})
     }
