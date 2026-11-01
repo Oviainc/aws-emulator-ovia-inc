@@ -20,6 +20,11 @@
 //! request the service does not understand and is refused with HTTP 400 under the
 //! `InvalidInputException` class.
 //!
+//! Dropping a record changes WHICH records the detector holds, so `GetDetector`'s
+//! `UpdatedAt` moves to the instant of the call, exactly as it does when the detector
+//! loses a sub-resource of any of its other collections. A call that dropped no
+//! record — every account reported in `UnprocessedAccounts` — leaves it where it was.
+//!
 //! The contract below also refuses the call "with autoEnableOrganizationMembers
 //! configuration for your organization set to ALL": while the administrator's stored
 //! organization configuration auto-enables GuardDuty for every account in the
@@ -211,6 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             ));
         }
+        // The instant a record this call drops is dropped at, read WITHOUT being
+        // taken off the clock: whether any record is dropped at all is answered only
+        // by the loop below, because an account the administrator holds no record for
+        // and one it still monitors are reported rather than dropped.
+        let now = state.pending_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // Unreachable: the detector was resolved above and the lock has not been
             // released since. Answered rather than panicked, because a handler owes
@@ -219,6 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut unprocessed = Vec::new();
+        let mut dropped = false;
         let mut seen = ::std::collections::BTreeSet::new();
         for account_id in &input.account_ids {
             // `AccountIds` names a SET of accounts: a repeated id is processed once,
@@ -244,12 +255,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
                 Some(_) => {
                     detector.members.remove(account_id);
+                    dropped = true;
                 }
                 None => unprocessed.push(UnprocessedAccount {
                     account_id: account_id.clone(),
                     result: crate::state::MEMBER_NOT_DELETED_MESSAGE.to_string(),
                 }),
             }
+        }
+
+        if dropped {
+            // The detector holds fewer sub-resources than before, which is the same
+            // change `CreateMembers` records on it in the other direction and the
+            // same one every other saved sub-resource delete records: the answer does
+            // not depend on which collection of the detector the records live in. A
+            // call whose every account was reported dropped nothing, so it moves
+            // neither the detector nor an instant of the clock, and a refused call
+            // returned above.
+            detector.updated_at_millis = now;
+            state.commit_millis(now);
         }
 
         Ok(DeleteMembersOutput {

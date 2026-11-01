@@ -25,6 +25,12 @@
 //! `DetectorId` this account/Region does not own is refused with HTTP 400 under the
 //! `InvalidInputException` class.
 //!
+//! Recording an account the administrator held no record for changes WHICH records
+//! the detector holds, so `GetDetector`'s `UpdatedAt` moves to the instant of the
+//! call, exactly as it does when the detector gains a sub-resource of any of its
+//! other collections. Re-stating an existing member's details leaves that set
+//! unchanged and so leaves the detector's own `UpdatedAt` where it was.
+//!
 //! What this does NOT model yet, belonging to its own operation: enabling GuardDuty
 //! in the member account, whose own detector is not a resource this emulator holds.
 //! A recorded member's `RelationshipStatus` is `Created` until `InviteMembers`
@@ -244,6 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut unprocessed = Vec::new();
         let mut wrote = false;
+        let mut membership_changed = false;
         let mut seen = ::std::collections::BTreeSet::new();
         for detail in &input.account_details {
             // One account is one member: a second entry for an account already
@@ -327,8 +334,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     );
                     detector.members.insert(detail.account_id.clone(), member);
                     wrote = true;
+                    // The detector holds one more sub-resource than before, which is
+                    // the condition every other collection of the detector records on
+                    // it: re-stating an existing member's details leaves the set of
+                    // records unchanged and so leaves the detector where it was, the
+                    // way an update of a saved sub-resource does.
+                    membership_changed = true;
                 }
             }
+        }
+
+        if membership_changed {
+            // The set of records this detector holds changed, which is the same change
+            // `DeleteMembers` records on it in the other direction and the same one
+            // every other sub-resource create records: the answer does not depend on
+            // which collection of the detector the records live in.
+            detector.updated_at_millis = now;
         }
 
         // The instant is taken off the clock only now that a member has really been

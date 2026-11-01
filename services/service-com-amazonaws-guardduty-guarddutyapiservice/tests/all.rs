@@ -167,6 +167,8 @@ mod member_detector_configuration;
 mod member_detector_empty_report;
 #[path = "all/member_detector_organization_managed_switches.rs"]
 mod member_detector_organization_managed_switches;
+#[path = "all/member_detector_timestamp.rs"]
+mod member_detector_timestamp;
 #[path = "all/member_invitation.rs"]
 mod member_invitation;
 #[path = "all/member_monitoring.rs"]
