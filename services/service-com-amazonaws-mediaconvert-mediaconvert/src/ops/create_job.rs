@@ -258,14 +258,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A hop destination's `Queue` is a reference to a queue resource exactly as the
-        // member above is, so a value carrying no characters is the same problem in the
-        // request, answered here — before any reference is resolved — rather than as a
-        // lookup of a name nothing could hold.
+        // What the `HopDestinations` the REQUEST states say about themselves — an entry's
+        // `Queue` has to carry a reference at all, and its `WaitMinutes` has to be a wait
+        // inside the range the member publishes — is decided from the request alone, so it
+        // is answered HERE, before any reference is resolved against the store: the one
+        // test every operation that accepts hop destinations takes
+        // (`crate::state::hop_destinations_problem`), in the one place each takes it, so one
+        // hop list cannot be a request problem at this door and a lookup refusal at
+        // another. A list inherited from a job template was already held to it by the
+        // operation that stored the template.
         if let Some(problem) = input
             .hop_destinations
             .as_deref()
-            .and_then(crate::state::hop_destination_blank_queue_problem)
+            .and_then(crate::state::hop_destinations_problem)
         {
             return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
                 message: Some(problem),
@@ -432,20 +437,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .acceleration_settings
             .or_else(|| inherited.map(|record| record.acceleration_settings.clone()))
             .unwrap_or_else(crate::state::default_acceleration_settings);
-        // Every hop destination the REQUEST states has to state a wait inside the range
-        // the member publishes, or it sets up no hop at all — the one test every operation
-        // that accepts hop destinations takes, so a list inherited from a job template was
-        // already held to it by the operation that stored the template.
-        if let Some(problem) = input
-            .hop_destinations
-            .as_deref()
-            .and_then(crate::state::hop_wait_problem)
-        {
-            return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
-                message: Some(problem),
-            })
-            .into());
-        }
         let hop_destinations = input.hop_destinations.unwrap_or_else(|| {
             inherited
                 .map(|record| record.hop_destinations.clone())

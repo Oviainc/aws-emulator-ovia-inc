@@ -1098,24 +1098,39 @@ pub fn hop_destination_queue_name(hop: &HopDestination) -> &str {
 /// `HopDestination$WaitMinutes` is a wait the CALLER asked for, in minutes, so it keeps the
 /// value the request stated. `None` for a hop destination that states no wait, which
 /// therefore sets up no hop; every operation that accepts hop destinations refuses such an
-/// entry up front ([`hop_wait_problem`]), so a stored job only ever carries hops that have
-/// one.
+/// entry up front ([`hop_destinations_problem`]), so a stored job only ever carries hops
+/// that have one.
 pub fn hop_wait(hop: &HopDestination) -> Option<Duration> {
     let minutes = u64::try_from(hop.wait_minutes?).ok()?;
     minutes.checked_mul(60).map(Duration::from_secs)
 }
 
-/// Why the hop destinations a request carries cannot set up a hop, or `None` when every
-/// entry can.
+/// Why the hop destinations a request carries cannot set up a hop AT ALL — what is wrong
+/// with the member's own value — or `None` when every entry can set one up.
+///
+/// The ONE test every operation that accepts `HopDestinations` takes on the member, and the
+/// only hop-destination test taken BEFORE the store is consulted: both halves are decided
+/// from the request alone — an entry's `Queue` has to carry a reference at all, and its
+/// `WaitMinutes` has to be a wait inside the range the member publishes — so a list that
+/// describes no hop is the modelled bad request wherever it is sent, whatever the store
+/// holds (see `hop_destination_blank_queue_problem` and `hop_wait_problem`). The doors
+/// call this and never the halves, so one hop list cannot be answered with a request
+/// problem at one door and a lookup refusal at another.
+pub fn hop_destinations_problem(hops: &[HopDestination]) -> Option<String> {
+    // In the order the member spells its own fields: the reference first, then the wait.
+    hop_destination_blank_queue_problem(hops).or_else(|| hop_wait_problem(hops))
+}
+
+/// Why the wait a hop destination states cannot set up a hop, or `None` when every entry's
+/// wait can. One half of [`hop_destinations_problem`], which is what the doors take.
 ///
 /// `HopDestination$WaitMinutes`: "Required for setting up a job to use queue hopping.
 /// Minimum wait time in minutes until the job can hop to the destination queue. Valid range
 /// is 1 to 4320 minutes, inclusive." The member is a bare `__integer` in the model, so
-/// nothing refuses a missing or out-of-range wait before a handler runs. Every operation
-/// that accepts hop destinations takes this one test, so what they accept cannot drift
-/// apart; the wording is built from the member and its published range, as every other
-/// member-naming refusal in this module is (see [`not_found_message`]).
-pub fn hop_wait_problem(hops: &[HopDestination]) -> Option<String> {
+/// nothing refuses a missing or out-of-range wait before a handler runs. The wording is
+/// built from the member and its published range, as every other member-naming refusal in
+/// this module is (see [`not_found_message`]).
+fn hop_wait_problem(hops: &[HopDestination]) -> Option<String> {
     for hop in hops {
         let Some(minutes) = hop.wait_minutes else {
             return Some(
@@ -1146,10 +1161,9 @@ pub fn hop_wait_problem(hops: &[HopDestination]) -> Option<String> {
 /// nor the member left out — which is "the job will move to the default queue" — so it is
 /// the bad request [`blank_member_message`] words rather than a lookup of a name nothing
 /// could hold. The member is named by its path from the request, as the service's other
-/// nested-member refusals are, because the request also carries a top-level `Queue`. One
-/// function for the three operations that accept hop destinations, exactly as
-/// [`hop_wait_problem`] is, so what they accept cannot drift apart.
-pub fn hop_destination_blank_queue_problem(hops: &[HopDestination]) -> Option<String> {
+/// nested-member refusals are, because the request also carries a top-level `Queue`. The
+/// other half of [`hop_destinations_problem`], which is what the doors take.
+fn hop_destination_blank_queue_problem(hops: &[HopDestination]) -> Option<String> {
     hop_destination_queues(hops)
         .any(carries_no_characters)
         .then(|| blank_member_message("HopDestinations.Queue"))

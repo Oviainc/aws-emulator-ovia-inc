@@ -47,6 +47,8 @@ mod created_resource_defaults;
 mod error_envelope;
 #[path = "all/foreign_arn_reference.rs"]
 mod foreign_arn_reference;
+#[path = "all/hop_destination_refusal_order.rs"]
+mod hop_destination_refusal_order;
 #[path = "all/idempotent_repeats.rs"]
 mod idempotent_repeats;
 #[path = "all/input_probe.rs"]

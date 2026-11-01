@@ -211,6 +211,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // What a new `HopDestinations` list says about itself — an entry's `Queue` has to
+        // carry a reference at all, and its `WaitMinutes` has to be a wait inside the range
+        // the member publishes — is decided from the request alone, so it is answered here,
+        // before the store is consulted: the one test every operation that accepts hop
+        // destinations takes (`crate::state::hop_destinations_problem`), in the one place
+        // each takes it, so one hop list cannot be a request problem at `CreateJob` and a
+        // lookup refusal here.
+        if let Some(problem) = input
+            .hop_destinations
+            .as_deref()
+            .and_then(crate::state::hop_destinations_problem)
+        {
+            return Err(UpdateJobTemplateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(problem),
+                },
+            )
+            .into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         // The stored key is the name exactly as `CreateJobTemplate` persisted it, so the
@@ -226,25 +246,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|queue| !state.queues.contains_key(queue));
         // A hop destination's `Queue` is a reference to a queue resource exactly as the
         // member above is, so a new hop list is resolved the same way, under the same
-        // guard, before anything is applied.
+        // guard, before anything is applied. What the list says about ITSELF was already
+        // decided above, before this store was reached.
         let hop_queue_missing = input.hop_destinations.as_deref().is_some_and(|hops| {
             crate::state::hop_destination_queues(hops)
                 .any(|reference| !state.holds_queue(reference))
         });
-        // And a hop destination that states a `Queue` carrying no characters is the same
-        // problem in the request the member above is: the modelled 400 naming the member,
-        // not a lookup of a name nothing could hold.
-        let hop_blank_queue_problem = input
-            .hop_destinations
-            .as_deref()
-            .and_then(crate::state::hop_destination_blank_queue_problem);
-        // And every entry of a new hop list has to state a wait inside the range the
-        // member publishes, or it sets up no hop at all — the same test `CreateJob` and
-        // `CreateJobTemplate` take.
-        let hop_wait_problem = input
-            .hop_destinations
-            .as_deref()
-            .and_then(crate::state::hop_wait_problem);
         // A `Settings` the caller sent REPLACES the stored graph, so the graph this
         // request would leave behind is the one it carries, and it takes the same test a
         // graph takes on the way in: a template is "all the transcode settings ... that
@@ -278,26 +285,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        if let Some(problem) = hop_blank_queue_problem {
-            return Err(UpdateJobTemplateErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(problem),
-                },
-            )
-            .into());
-        }
         if hop_queue_missing {
             return Err(UpdateJobTemplateErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::not_found_message("hopDestinations")),
             })
-            .into());
-        }
-        if let Some(problem) = hop_wait_problem {
-            return Err(UpdateJobTemplateErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(problem),
-                },
-            )
             .into());
         }
         // Refused BEFORE any member is applied, so a request carrying a graph the service

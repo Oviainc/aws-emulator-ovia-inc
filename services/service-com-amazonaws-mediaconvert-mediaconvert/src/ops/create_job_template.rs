@@ -226,6 +226,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // What the `HopDestinations` this request states say about themselves — an entry's
+        // `Queue` has to carry a reference at all, and its `WaitMinutes` has to be a wait
+        // inside the range the member publishes — is decided from the request alone, so it
+        // is answered here, before the store is consulted: the one test every operation
+        // that accepts hop destinations takes (`crate::state::hop_destinations_problem`),
+        // in the one place each takes it, so one hop list cannot be a request problem at
+        // `CreateJob` and a lookup refusal here.
+        if let Some(problem) = input
+            .hop_destinations
+            .as_deref()
+            .and_then(crate::state::hop_destinations_problem)
+        {
+            return Err(CreateJobTemplateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(problem),
+                },
+            )
+            .into());
+        }
+
         // `Tags` is written onto the record itself, the one tag map `TagResource`,
         // `UntagResource` and `ListTagsForResource` work on, so the set this request
         // carries takes the record's own tests before it is stored — the one rule in
@@ -257,38 +277,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A hop destination names the queue a job created from this template may move to,
         // which is a reference to a queue resource exactly as the member above is: one
         // that resolves to nothing is the same modelled 404, naming the member it came
-        // from.
+        // from. What the list says about ITSELF was already decided above, before this
+        // store was reached.
         let hop_destinations = input.hop_destinations.unwrap_or_default();
-        // A `Queue` carrying no characters is no reference at all, on this member as on the
-        // one above: the modelled 400 naming the member it arrived in, taken before the
-        // store is consulted.
-        if let Some(problem) =
-            crate::state::hop_destination_blank_queue_problem(&hop_destinations)
-        {
-            return Err(CreateJobTemplateErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(problem),
-                },
-            )
-            .into());
-        }
         if crate::state::hop_destination_queues(&hop_destinations)
             .any(|reference| !state.holds_queue(reference))
         {
             return Err(CreateJobTemplateErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::not_found_message("hopDestinations")),
-                },
-            )
-            .into());
-        }
-        // And every hop destination has to state a wait inside the range the member
-        // publishes, or it sets up no hop at all — the same test `CreateJob` takes, so a
-        // template cannot store a hop a job could not use.
-        if let Some(problem) = crate::state::hop_wait_problem(&hop_destinations) {
-            return Err(CreateJobTemplateErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(problem),
                 },
             )
             .into());
