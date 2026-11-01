@@ -51,6 +51,8 @@ mod entity_type_projections;
 mod filter_validation;
 #[path = "all/filter_value_forms.rs"]
 mod filter_value_forms;
+#[path = "all/framework_id_validation.rs"]
+mod framework_id_validation;
 #[path = "all/model_declared_sort_attributes.rs"]
 mod model_declared_sort_attributes;
 #[path = "all/modelled_member_lengths.rs"]

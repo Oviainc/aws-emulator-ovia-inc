@@ -4032,22 +4032,54 @@ pub fn is_entity_type_reference(reference: &str) -> bool {
     }
     match reference.split_once('@') {
         Some((entity_type, version)) => {
-            is_entity_type(entity_type) && is_entity_type_version(version)
+            is_entity_type(entity_type) && is_version_suffix(version)
         }
         None => is_entity_type(reference),
     }
 }
 
-/// Whether `version` is the `@<version>` part of an `Entity$Type`: a non-empty
-/// run of alphanumerics separated by dots, which is the form the model's own
-/// versioned ids take (`VersionedFrameworkId`'s doc: "frameworkId@version (for
-/// example, AMISecurity@1.0)").
-fn is_entity_type_version(version: &str) -> bool {
+/// Whether `version` is the `@<version>` part of one of this service's versioned
+/// ids: a non-empty run of alphanumerics separated by dots, which is the form the
+/// model's own versioned ids take (`VersionedFrameworkId`'s doc: "frameworkId@version
+/// (for example, AMISecurity@1.0)", `Entity$Type`'s `DataProduct@1.0`).
+///
+/// One form for every versioned id this service reads, so an entity type at a
+/// schema version and a framework at a framework version are judged alike.
+fn is_version_suffix(version: &str) -> bool {
     !version.is_empty()
         && version.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
         && !version.starts_with('.')
         && !version.ends_with('.')
         && !version.contains("..")
+}
+
+/// Whether `framework_id` names a framework this catalog assesses against: one
+/// of [`ASSESSMENT_FRAMEWORKS`] on its own — the unversioned form
+/// `ListAssessmentsRequest$FrameworkId` documents ("For example, AMISecurity")
+/// — or that framework at a version, the `frameworkId@version` form
+/// `VersionedFrameworkId` states.
+///
+/// The member's own `@length` and `@pattern` are judged at the boundary, so what
+/// is left is the one thing a published set decides: whether the value names a
+/// framework this catalog HAS. One that does not names no framework an
+/// assessment can have been performed against.
+pub fn is_assessment_framework_id(framework_id: &str) -> bool {
+    let framework = match framework_id.split_once('@') {
+        Some((framework, version)) if is_version_suffix(version) => framework,
+        Some(_) => return false,
+        None => framework_id,
+    };
+    ASSESSMENT_FRAMEWORKS.contains(&framework)
+}
+
+/// The modelled `ValidationException` payload for a `FrameworkId` naming no
+/// framework this catalog assesses against.
+///
+/// Stated like every other closed-set refusal of this service
+/// ([`invalid_choice`]), and the set it quotes is the unversioned ids
+/// `FrameworkId`'s own documentation gives, which is what a caller sends.
+pub fn invalid_framework_id(framework_id: &str) -> ValidationException {
+    invalid_choice("framework", framework_id, ASSESSMENT_FRAMEWORKS)
 }
 
 /// The syntax the service documents for `Entity$Identifier`, which it reports in

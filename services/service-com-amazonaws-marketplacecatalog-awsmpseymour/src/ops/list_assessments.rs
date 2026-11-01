@@ -179,6 +179,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListAssessmentsErrorModeled::ValidationException(fault).into());
         }
 
+        // "The unique identifier of a framework. When specified, only assessments
+        // performed against this framework are returned" — the frameworks this
+        // catalog assesses against are the ones the model's `FrameworkSummary` /
+        // `FrameworkFilters` members name (`crate::state::ASSESSMENT_FRAMEWORKS`),
+        // so a value naming one of them narrows the page — an empty one while no
+        // assessment of that framework is held — while a value naming no framework
+        // at all names nothing an assessment can have been performed against and is
+        // refused before anything is selected, as every other value of this service
+        // outside a set the model publishes is.
+        if let Some(framework_id) = input.framework_id.as_deref() {
+            if !crate::state::is_assessment_framework_id(framework_id) {
+                return Err(ListAssessmentsErrorModeled::ValidationException(
+                    crate::state::invalid_framework_id(framework_id),
+                )
+                .into());
+            }
+        }
+
         // "Filters the list of assessments to those performed against a specific
         // entity or change set" — both members are optional, and one the filter
         // leaves absent constrains nothing (`AssessmentRecord::matches_target`), so
