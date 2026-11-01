@@ -157,6 +157,8 @@ mod site_operating_address_windows;
 mod site_rack_properties_order_hold;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/store_ceiling_wording.rs"]
+mod store_ceiling_wording;
 #[path = "all/supported_instance_types.rs"]
 mod supported_instance_types;
 #[path = "all/supported_instance_types_order_scope.rs"]

@@ -226,14 +226,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|record| record.site.site_arn.clone())
             .ok_or_else(site_not_found)?;
         // See `CreateSite`: the store's growth is capped and refused with the quota
-        // error this operation models.
+        // error this operation models, worded by `crate::state::store_full`.
         if store.outposts.len() >= crate::state::MAX_RESOURCES {
             return Err(CreateOutpostErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "the number of Outposts would exceed the limit of {}",
-                        crate::state::MAX_RESOURCES
-                    )),
+                    message: Some(crate::state::store_full("Outposts")),
                 },
             )
             .into());

@@ -396,14 +396,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // See `MAX_RESOURCES`: an order is never released (`GetOrder` must still
         // answer it), so the store this insert grows is capped, and past the cap the
-        // create is refused with the quota error this operation models.
+        // create is refused with the quota error this operation models, worded by
+        // `crate::state::store_full`.
         if store.orders.len() >= crate::state::MAX_RESOURCES {
             return Err(CreateOrderErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "the number of orders would exceed the limit of {}",
-                        crate::state::MAX_RESOURCES
-                    )),
+                    message: Some(crate::state::store_full("orders")),
                 },
             )
             .into());

@@ -238,15 +238,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // See `CreateSite`: the store's growth is capped. `CreateQuote` models no
         // quota error, so the cap is reported as what it is from the caller's side —
         // a request this service will not accept (400 `ValidationException`) — and
-        // never as a 501 or an invented error code. The wording is the one the two
-        // creates that DO model the quota error use.
+        // never as a 501 or an invented error code. The body is the one wording this
+        // crate states that ceiling in (`crate::state::store_full`), which every
+        // capped path of this service refuses with whatever error its own model
+        // carries.
         if store.quotes.len() >= crate::state::MAX_RESOURCES {
             return Err(CreateQuoteErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "the number of quotes would exceed the limit of {}",
-                        crate::state::MAX_RESOURCES
-                    )),
+                    message: Some(crate::state::store_full("quotes")),
                 },
             )
             .into());

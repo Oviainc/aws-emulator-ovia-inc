@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::ops::types::Quote;
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
-    timestamp, QuoteRecord, MAX_RESOURCES, QUOTE_STATUS_CREATED, QUOTE_VALIDITY,
+    store_full, timestamp, QuoteRecord, MAX_RESOURCES, QUOTE_STATUS_CREATED, QUOTE_VALIDITY,
 };
 
 use crate::quote_lifecycle::{create_quote, get_quote, request};
@@ -37,10 +37,12 @@ use crate::site_and_outpost_lifecycle::{is_minted_id, text, Outposts, HOME_REGIO
 ///
 /// The ceiling is the emulator's own bound and no AWS rule fixes its wording; what a
 /// caller branches on is the modelled code and status, which the rows below assert
-/// too. The wording is the one every capped create of this service uses, so the
-/// refusal names the resource kind and the bound rather than blaming the request.
+/// too. The wording is the one every capped path of this service states that ceiling
+/// in, so the refusal names the emulator, the resource kind and the bound rather than
+/// blaming the request ([`crate::store_ceiling_wording`] states that rule across the
+/// service).
 fn store_full_message() -> String {
-    format!("the number of quotes would exceed the limit of {MAX_RESOURCES}")
+    store_full("quotes")
 }
 
 /// Fill the quote store with `count` quotes, each under an id of the modelled

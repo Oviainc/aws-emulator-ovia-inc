@@ -55,13 +55,16 @@ const DEVICE_INDEXES: [i32; 2] = [0, 1];
 
 /// Which capped store a row of [`every_store_ceiling_refusal_is_a_modelled_client_error`]
 /// is about. Shared with [`crate::outpost_deletion_cascade`], which fills the
-/// connection store through [`fill_to_ceiling`] too.
+/// connection store through [`fill_to_ceiling`] too, and with
+/// [`crate::store_ceiling_wording`], which states what every one of these ceilings is
+/// WORDED as.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Store {
     Connections,
     Quotes,
     Sites,
     Outposts,
+    Orders,
 }
 
 /// Fill `map` up to [`MAX_RESOURCES`] entries with copies of the one record a real
@@ -104,11 +107,14 @@ pub(crate) fn fill_to_ceiling(outposts: &Outposts, which: Store) {
         Store::Outposts => pad(&mut store.outposts, "outpost", |record, key| {
             record.outpost.outpost_id = Some(key.to_string());
         }),
+        Store::Orders => pad(&mut store.orders, "order", |record, key| {
+            record.order.order_id = Some(key.to_string());
+        }),
     }
 }
 
 /// How many entries the store `which` names holds right now.
-fn held(outposts: &Outposts, which: Store) -> usize {
+pub(crate) fn held(outposts: &Outposts, which: Store) -> usize {
     let state = outposts.store();
     let store = state.lock();
     match which {
@@ -116,6 +122,7 @@ fn held(outposts: &Outposts, which: Store) -> usize {
         Store::Quotes => store.quotes.len(),
         Store::Sites => store.sites.len(),
         Store::Outposts => store.outposts.len(),
+        Store::Orders => store.orders.len(),
     }
 }
 

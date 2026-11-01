@@ -278,8 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // See `MAX_RESOURCES`: a renewal is never released, so what this contract
         // grows is capped. `CreateRenewal` models no quota error, so the cap is
         // reported as what it is from the caller's side — a request this service will
-        // not accept (400 `ValidationException`) — exactly as `CreateQuote` reports
-        // its own, and never as a 501 or an invented error code.
+        // not accept (400 `ValidationException`) — and never as a 501 or an invented
+        // error code. The body is the one wording this crate states that ceiling in
+        // (`crate::state::store_full`), the same one `CreateQuote` reports its own
+        // ceiling with.
         if store.renewals_held() >= crate::state::MAX_RESOURCES {
             return Err(CreateRenewalErrorModeled::ValidationException(
                 ValidationException {

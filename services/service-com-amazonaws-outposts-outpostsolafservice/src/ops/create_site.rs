@@ -163,14 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // The store grows by one site per call and lives for the life of the
         // process, so the growth is capped; past the cap the service answers the
-        // quota error it models rather than accepting another entry.
+        // quota error it models rather than accepting another entry, worded by the
+        // one statement this crate makes of that ceiling
+        // (`crate::state::store_full`).
         if store.sites.len() >= crate::state::MAX_RESOURCES {
             return Err(CreateSiteErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "the number of sites would exceed the limit of {}",
-                        crate::state::MAX_RESOURCES
-                    )),
+                    message: Some(crate::state::store_full("sites")),
                 },
             )
             .into());

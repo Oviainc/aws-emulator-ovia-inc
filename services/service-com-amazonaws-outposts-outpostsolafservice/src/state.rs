@@ -6997,7 +6997,9 @@ pub const MAX_RESOURCES: usize = 5_000;
 /// The ceiling is the emulator's own, so no AWS rule fixes this wording; what the
 /// caller branches on is the modelled code and status. The message names the
 /// emulator, the kind of resource and the bound, so the refusal cannot be mistaken
-/// for a statement about the caller's request or about a real AWS quota.
+/// for a statement about the caller's request or about a real AWS quota. Every path
+/// that refuses a call for this ceiling words it here, whatever modelled error its
+/// own operation carries, so one ceiling reads as one refusal across the service.
 pub fn store_full(resource: &str) -> String {
     format!(
         "this emulator holds the maximum of {MAX_RESOURCES} {resource} it can keep in \
