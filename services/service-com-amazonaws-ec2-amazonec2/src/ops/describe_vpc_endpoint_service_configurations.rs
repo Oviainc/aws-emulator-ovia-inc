@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVpcEndpointServiceConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVpcEndpointServiceConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVpcEndpointServiceConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +138,298 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVpcEndpointServiceConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVpcEndpointServiceConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use ::std::collections::BTreeSet;
+
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // "This value can be between 5 and 1,000" (`MaxResults`). The model declares no
+        // `@range` on the member — it targets a plain `Integer` — so the handler is the only
+        // place that bound is enforced. The upper end is NOT an error: "if MaxResults is
+        // given a value larger than 1,000, only 1,000 results are returned", so a larger
+        // page size is clamped below rather than refused here.
+        if input
+            .max_results
+            .is_some_and(|max_results| max_results < MIN_PAGE_SIZE)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{}' for MaxResults. It must be between {MIN_PAGE_SIZE} and \
+                 {max}",
+                input.max_results.unwrap_or_default(),
+                max = state::MAX_PAGE_SIZE,
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored configurations and the
+        // model bounds none of them, so the request-controlled factors are capped here,
+        // before any work proportional to them is done — and their PRODUCT is charged to one
+        // [`crate::state::MatchBudget`] below, which is the bound the per-factor caps cannot
+        // give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > state::MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {supplied} filters, above the maximum of {maximum}",
+                supplied = filters.len(),
+                maximum = state::MAX_FILTERS,
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // configuration would have matched it, so an unsupported filter can never read as
+        // "no results".
+        let mut selectors: Vec<state::CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let documented = documented_filter_name(name).ok_or_else(|| {
+                state::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > state::MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {supplied} values, above the maximum of \
+                     {maximum}",
+                    supplied = values.len(),
+                    maximum = state::MAX_FILTER_VALUES,
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > state::MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {supplied} bytes, above the \
+                     maximum of {maximum}",
+                    supplied = oversize.len(),
+                    maximum = state::MAX_FILTER_VALUE_BYTES,
+                )));
+            }
+            // Each value is parsed into its pattern ONCE here, not once per candidate.
+            selectors.push(state::CompiledFilter::new(
+                documented.to_string(),
+                values.to_vec(),
+            ));
+        }
+
+        // "The IDs of the endpoint services" (`ServiceIds`): naming one service twice asks
+        // for it once, the list is bounded before any per-id work, and a value that is not a
+        // service id at all is refused as malformed — so "not an id of this kind" never
+        // reads as "no such service".
+        let requested_ids = state::deduplicate_ids(input.service_ids.as_deref().unwrap_or_default());
+        if requested_ids.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "ServiceIds carries {supplied} ids, above the maximum of {maximum}",
+                supplied = requested_ids.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
+        }
+        for service_id in &requested_ids {
+            state::require_well_formed_id(
+                state::VPC_ENDPOINT_SERVICE_ID_PREFIX,
+                service_id,
+                state::INVALID_VPC_ENDPOINT_SERVICE_ID_MALFORMED,
+            )?;
+        }
+
+        // "The token to retrieve the next page of results" (`NextToken`) — anything else is
+        // refused rather than read as a cursor, with the refusal naming the token that could
+        // not be read.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // DryRun sits AFTER every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused with
+        // that reason instead. "If you have the required permissions, the error response is
+        // DryRunOperation" (`DryRun`), and every caller of this emulator is permitted.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let store = state_handle.lock();
+
+        // "Describes the VPC endpoint service configurations in your ACCOUNT (your services)":
+        // the request carries nothing that names a Region and the operation documents no
+        // Region narrowing, so the whole account's configurations are described whichever
+        // regional endpoint the request was signed for — which is why nothing here reads the
+        // request's own Region. The Region a described service is HOSTED in is the one its
+        // stored name carries ([`crate::state::parse_endpoint_service_name`]), reported as part
+        // of that name.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVpcEndpointServiceConfigurations"))
+        // A `ServiceId` this account offers no service under names nothing, so it is refused
+        // rather than reported as an absent row — which is what lets a client tell a service it
+        // does not own from one that simply matched no filter.
+        if let Some(unknown) = requested_ids
+            .iter()
+            .find(|service_id| !store.vpc_endpoint_services.contains_key(service_id.as_str()))
+        {
+            return Err(state::invalid_vpc_endpoint_service_id_not_found(unknown));
+        }
+        let named: BTreeSet<&str> = requested_ids.iter().map(String::as_str).collect();
+
+        // The default is to describe every service the account offers: `ServiceIds` narrows
+        // that to the ids given, and every filter must then hold ("If you specify multiple
+        // filters, the filters are joined with an AND" — `Filter`). Every comparison is
+        // charged to ONE budget — one step per candidate even when no filter was given — so
+        // the PRODUCT of configurations, filters, values, held values and value length is
+        // bounded however the caller combines them, which is also what bounds how long this
+        // holds the state lock.
+        let mut budget = state::MatchBudget::new(state::MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&ServiceConfiguration> = Vec::new();
+        for (service_id, configuration) in &store.vpc_endpoint_services {
+            if budget.exhausted() {
+                break;
+            }
+            let wanted = named.is_empty() || named.contains(service_id.as_str());
+            if wanted
+                && state::matches_every_filter(&selectors, &mut budget, &|name| {
+                    filter_values(configuration, name)
+                })
+            {
+                selected.push(configuration);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {steps} comparisons to evaluate; \
+                 narrow them or page with MaxResults",
+                steps = state::MAX_FILTER_MATCH_STEPS,
+            )));
+        }
+
+        // Page in `ServiceId` order, which the cursor names a position in: the store is an
+        // ordered map keyed by that id, so the walk above already produced that order and a
+        // token naming the service the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|configuration| {
+                configuration.service_id.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this service serves, and
+        // one that asks for more than that gets that same largest page: "if MaxResults is
+        // given a value larger than 1,000, only 1,000 results are returned".
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(state::MAX_PAGE_SIZE)
+            .clamp(1, state::MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more results to return"
+        // (`DescribeVpcEndpointServiceConfigurationsResult$NextToken`): a token only when a
+        // configuration follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|configuration| configuration.service_id.as_deref())
+            .map(state::encode_page_token);
+
+        // The records as the store holds them, so this describe and the create that stored
+        // one cannot drift apart.
+        Ok(DescribeVpcEndpointServiceConfigurationsOutput {
+            service_configurations: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|configuration| (*configuration).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The smallest page size this operation serves: "This value can be between 5 and 1,000"
+/// (`DescribeVpcEndpointServiceConfigurationsRequest$MaxResults`). The largest is
+/// [`crate::state::MAX_PAGE_SIZE`], the same 1,000 that sentence names.
+const MIN_PAGE_SIZE: i32 = 5;
+
+/// The filter names this operation documents, from
+/// `DescribeVpcEndpointServiceConfigurationsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeVpcEndpointServiceConfigurationsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather than
+/// listed here. Every entry must be answered by [`filter_values`].
+const VPC_ENDPOINT_SERVICE_CONFIGURATION_FILTERS: [&str; 5] = [
+    "service-id",
+    "service-name",
+    "service-state",
+    "supported-ip-address-types",
+    "tag-key",
+];
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None` when
+/// this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other misspelling.
+/// The `tag:<key>` family keeps its whole name, the key being part of what it selects on.
+fn documented_filter_name(name: &str) -> Option<&str> {
+    if name
+        .strip_prefix(crate::state::TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some(name);
+    }
+    VPC_ENDPOINT_SERVICE_CONFIGURATION_FILTERS
+        .contains(&name)
+        .then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against this service configuration.
+///
+/// A filter naming an attribute the configuration does not carry compares against NO values, so
+/// it selects nothing rather than everything — the answer a service with no tags gives `tag-key`.
+/// `name` is a name [`documented_filter_name`] resolved.
+fn filter_values<'a>(
+    configuration: &'a ServiceConfiguration,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let tags = configuration.tags.iter().flatten();
+    if let Some(key) = name.strip_prefix(crate::state::TAG_FILTER_PREFIX) {
+        return tags
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "service-id" => text(configuration.service_id.as_deref()),
+        "service-name" => text(configuration.service_name.as_deref()),
+        // The state in the spelling the filter's own doc list publishes, which is what
+        // `ServiceConfiguration$ServiceState` carries — see
+        // [`crate::state::SERVICE_STATE_AVAILABLE`].
+        "service-state" => text(configuration.service_state.as_deref()),
+        "supported-ip-address-types" => configuration
+            .supported_ip_address_types
+            .iter()
+            .flatten()
+            .map(|address_type| Cow::Borrowed(address_type.as_str()))
+            .collect(),
+        "tag-key" => tags
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // Unreachable: `documented_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
     }
 }

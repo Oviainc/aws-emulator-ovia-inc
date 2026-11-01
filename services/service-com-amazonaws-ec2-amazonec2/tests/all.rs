@@ -263,6 +263,15 @@ mod deleted_resources_and_dependencies;
 // neighbourhood is where every new ec2 suite inserts its lines.
 #[path = "all/create_vpc_endpoint.rs"]
 mod create_vpc_endpoint;
+// What `CreateVpcEndpointServiceConfiguration` stores for an endpoint service the account offers
+// — the load balancers behind it, the acceptance, address types, Regions, private DNS name and
+// tags it was configured with, and the name, base DNS name and verification record derived from
+// the `ServiceId` it mints — what it refuses, and what `DescribeVpcEndpointServiceConfigurations`
+// and `DescribeVpcEndpointServices` then report out of that store. Declared beside the endpoint
+// suite above rather than at the tail or in sorted position, for the reason the header note
+// gives: both of those are where every new ec2 suite inserts its lines.
+#[path = "all/create_vpc_endpoint_service_configuration.rs"]
+mod create_vpc_endpoint_service_configuration;
 // Associating a virtual interface group with a local gateway route table, and reading the
 // association back. Declared beside `prefix_lists` for the reason the note above gives: the
 // sorted region AND the tail of this file are where every new ec2 suite inserts its lines,

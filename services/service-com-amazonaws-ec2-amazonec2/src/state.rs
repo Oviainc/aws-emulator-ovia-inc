@@ -1673,7 +1673,8 @@ use crate::ops::types::{
     NetworkInterfacePermissionState, NetworkInterfacePrivateIpAddress,
     OperatorResponse, PathFilter, PeeringAttachmentStatus,
     PlacementGroup, PrefixListId, PtrUpdateStatus,
-    PrivateDnsDetails, PrivateDnsNameOptionsOnLaunch, ReferencedSecurityGroup,
+    PrivateDnsDetails, PrivateDnsNameConfiguration, PrivateDnsNameOptionsOnLaunch,
+    ReferencedSecurityGroup,
     SecurityGroupRule, SecurityGroupVpcAssociation,
     DnsEntry, PayerResponsibilityEntry, ProductCode,
     Region, ReplaceRootVolumeTask, RequestLaunchTemplateData, RevokedSecurityGroupRule,
@@ -4037,6 +4038,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// "Unique, case-sensitive identifier that you provide to ensure the idempotency of the
     /// request" (`CreateVpcEndpointRequest$ClientToken`).
     pub vpc_endpoint_client_tokens: HashMap<String, String>,
+    /// A `CreateVpcEndpointServiceConfiguration` `ClientToken` and the `ServiceId` it
+    /// minted, so a repeat of the same request answers with that service configuration
+    /// instead of offering the same service twice: "Unique, case-sensitive identifier that
+    /// you provide to ensure the idempotency of the request"
+    /// (`CreateVpcEndpointServiceConfigurationRequest$ClientToken`). Beside
+    /// [`Self::vpc_endpoint_services`] rather than inside it, the way
+    /// [`Self::vpc_endpoint_client_tokens`] sits beside the endpoint store, because that
+    /// store holds the modelled shape itself.
+    pub vpc_endpoint_service_client_tokens: HashMap<String, String>,
     /// Every connection notification the account holds, by `ConnectionNotificationId`, as
     /// the modelled [`ConnectionNotification`] shape itself — see the module docs. Ordered
     /// by that id, which is the order `DescribeVpcEndpointConnectionNotifications` reports
@@ -4748,6 +4758,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_endpoints: BTreeMap::new(),
             vpc_endpoint_moves: BTreeMap::new(),
             vpc_endpoint_client_tokens: HashMap::new(),
+            vpc_endpoint_service_client_tokens: HashMap::new(),
             vpc_endpoint_connection_notifications: BTreeMap::new(),
             vpc_endpoint_associations: BTreeMap::new(),
             customer_gateways: BTreeMap::new(),
@@ -31772,6 +31783,181 @@ pub fn endpoint_service_id(service_name: &str) -> String {
         "{VPC_ENDPOINT_SERVICE_ID_PREFIX}-{:08x}",
         stable_derived_id_hash(service_name) & 0xffff_ffff
     )
+}
+
+/// A service configuration that is in service: the `ServiceState` enum's `Available` member
+/// ([`crate::ops::types::SERVICE_STATE_VALUES`]). A service is offered as soon as it has been
+/// configured — the load balancers behind it already exist, which is the prerequisite
+/// `CreateVpcEndpointServiceConfiguration` documents ("before you create an endpoint service, you
+/// must create one of the following for your service") — so a created configuration is reported
+/// in this terminal state and the clock owes it no move.
+pub const SERVICE_STATE_AVAILABLE: &str = "Available";
+
+/// A private DNS name whose ownership has NOT been proven yet: the `DnsNameState` enum's
+/// `pendingVerification` member ([`crate::ops::types::DNS_NAME_STATE_VALUES`]). "If you set the
+/// private DNS name, you must prove that you own the private DNS domain name"
+/// (`CreateVpcEndpointServiceConfiguration`), so a name the owner has just assigned starts here
+/// rather than at [`DNS_NAME_STATE_VERIFIED`], which is what a service of the Region's own
+/// catalog reports.
+pub const DNS_NAME_STATE_PENDING_VERIFICATION: &str = "pendingVerification";
+
+/// The `ResourceType` enum's `vpc-endpoint-service` member
+/// ([`crate::ops::types::RESOURCE_TYPE_VALUES`]): the one type a
+/// `CreateVpcEndpointServiceConfiguration` `TagSpecification` may name, since an endpoint service
+/// configuration is the resource it creates.
+pub const RESOURCE_TYPE_VPC_ENDPOINT_SERVICE: &str = "vpc-endpoint-service";
+
+/// "The endpoint service verification type, for example TXT"
+/// (`PrivateDnsNameConfiguration$Type`): the kind of DNS record the owner of a private DNS name
+/// publishes the verification value in.
+pub const PRIVATE_DNS_VERIFICATION_RECORD_TYPE: &str = "TXT";
+
+/// `VpcEndpointServiceLimitExceeded` (HTTP 400): the account already offers as many endpoint
+/// services as this emulator stores.
+pub const VPC_ENDPOINT_SERVICE_LIMIT_EXCEEDED: &str = "VpcEndpointServiceLimitExceeded";
+
+/// Refuse a create that would take the account past the number of endpoint service configurations
+/// this emulator stores: HTTP 400 [`VPC_ENDPOINT_SERVICE_LIMIT_EXCEEDED`] — the same
+/// quota-code-and-emulator-ceiling contract [`vpc_endpoint_limit_exceeded`] has for one endpoint
+/// too many.
+pub fn vpc_endpoint_service_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        VPC_ENDPOINT_SERVICE_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "This emulator stores at most {max} VPC endpoint service configurations",
+            max = MAX_STORED_RECORDS_PER_STORE,
+        ),
+    )
+}
+
+/// The name of an endpoint service the ACCOUNT offers, for the service `service_id` hosted in
+/// `region`.
+///
+/// The partner form of a service name — `com.amazonaws.vpce.<region>.<service-id>`
+/// ([`AWS_ENDPOINT_SERVICE_PREFIX`], [`PARTNER_ENDPOINT_SERVICE_LABEL`]) — whose service label is
+/// the service's own id, which is how a service nobody at Amazon Web Services named gets a name
+/// no other service can collide with. Derived from the minted id rather than stored twice, and
+/// read back by [`parse_endpoint_service_name`], so the Region this name says the service is
+/// hosted in is the Region it was created in.
+pub fn account_endpoint_service_name(region: &str, service_id: &str) -> String {
+    format!("{AWS_ENDPOINT_SERVICE_PREFIX}{PARTNER_ENDPOINT_SERVICE_LABEL}{region}.{service_id}")
+}
+
+/// "The DNS names for the service" (`ServiceConfiguration$BaseEndpointDnsNames`) of one the
+/// account offers: the service's own label under its Region beneath [`ENDPOINT_DNS_SUFFIX`].
+///
+/// Built exactly as [`endpoint_services_in_region`] builds the base name of a service of the
+/// Region's catalog, so the name an interface endpoint's own names extend is spelled one way
+/// whichever of the two sources the service came from.
+pub fn account_endpoint_service_base_dns_name(region: &str, service_id: &str) -> String {
+    format!("{service_id}.{region}.{ENDPOINT_DNS_SUFFIX}")
+}
+
+/// The verification record the owner of `private_dns_name` has to publish for the service
+/// `service_id` before consumers may use that name.
+///
+/// "If you set the private DNS name, you must prove that you own the private DNS domain name"
+/// (`CreateVpcEndpointServiceConfiguration`), so the name starts
+/// [`DNS_NAME_STATE_PENDING_VERIFICATION`] and the configuration carries what the proof is: "the
+/// name of the record subdomain the service provider needs to create"
+/// (`PrivateDnsNameConfiguration$Name`) and "the value the service provider adds to the private
+/// DNS name domain record before verification" (`$Value`), in the record type
+/// [`PRIVATE_DNS_VERIFICATION_RECORD_TYPE`]. Both are DERIVED from the service and the name
+/// through [`stable_derived_id_hash`], the way a derived resource id is: every read of one
+/// service's configuration reports the same record, and two services asked to verify one name are
+/// given different ones. Nothing here is a secret — the record only has to be unguessable to
+/// nobody, since this emulator verifies ownership of nothing.
+pub fn private_dns_name_verification(
+    service_id: &str,
+    private_dns_name: &str,
+) -> PrivateDnsNameConfiguration {
+    let subdomain = stable_derived_id_hash(&format!("name/{service_id}/{private_dns_name}"));
+    let value = stable_derived_id_hash(&format!("value/{service_id}/{private_dns_name}"));
+    PrivateDnsNameConfiguration {
+        state: Some(DNS_NAME_STATE_PENDING_VERIFICATION.to_string()),
+        r#type: Some(PRIVATE_DNS_VERIFICATION_RECORD_TYPE.to_string()),
+        value: Some(format!("vpce:{value:016x}")),
+        name: Some(format!("_{subdomain:016x}")),
+    }
+}
+
+/// Is `arn` the ARN of an Elastic Load Balancing load balancer —
+/// `arn:<partition>:elasticloadbalancing:<region>:<account>:loadbalancer/<rest>`?
+///
+/// The shape of the members that name the load balancers an endpoint service is served by
+/// (`CreateVpcEndpointServiceConfigurationRequest$NetworkLoadBalancerArns` and
+/// `$GatewayLoadBalancerArns`). A load balancer is a resource of ANOTHER service, which this
+/// store holds none of, so a value is held to the form of a load balancer ARN and no further: the
+/// account is not held to this emulator's own, for the reason [`iam_role_arn_is_well_formed`]
+/// gives, and WHICH kind of load balancer one is stays the business of the member it was given
+/// in, since the two members are exactly how the request says which kind it means.
+pub fn load_balancer_arn_is_well_formed(arn: &str) -> bool {
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    let [prefix, partition, service, region, account, resource] = fields.as_slice() else {
+        return false;
+    };
+    let labelled = |value: &str| -> bool {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    };
+    *prefix == "arn"
+        && labelled(partition)
+        && *service == ELASTIC_LOAD_BALANCING_ARN_SERVICE
+        && labelled(region)
+        && !account.is_empty()
+        && account.bytes().all(|byte| byte.is_ascii_digit())
+        && resource
+            .strip_prefix(LOAD_BALANCER_ARN_RESOURCE_PREFIX)
+            .is_some_and(|name| !name.is_empty())
+}
+
+/// The ARN service namespace of Elastic Load Balancing, which a load balancer's ARN sits in.
+const ELASTIC_LOAD_BALANCING_ARN_SERVICE: &str = "elasticloadbalancing";
+
+/// The resource-type prefix of a load balancer's ARN resource field — the type every load
+/// balancer ARN opens with, whatever kind of load balancer it names.
+const LOAD_BALANCER_ARN_RESOURCE_PREFIX: &str = "loadbalancer/";
+
+/// The longest a DNS name may be, in bytes: the 253 characters a fully qualified domain name
+/// holds (RFC 1035's 255-octet wire form, less the length and root bytes).
+pub const MAX_DOMAIN_NAME_BYTES: usize = 253;
+
+/// The longest one label of a DNS name may be, in bytes (RFC 1035).
+pub const MAX_DNS_LABEL_BYTES: usize = 63;
+
+/// Is `name` a domain name a caller could assign to a resource of this service and prove
+/// ownership of?
+///
+/// The shape of a member that carries a name consumers RESOLVE, as
+/// `CreateVpcEndpointServiceConfigurationRequest$PrivateDnsName` does ("the private DNS name to
+/// assign to the VPC endpoint service"): dot-separated labels of letters, digits and inner
+/// hyphens, each within [`MAX_DNS_LABEL_BYTES`] and the whole within [`MAX_DOMAIN_NAME_BYTES`],
+/// and more than one label, nobody owning a top-level domain. The ONE reading of a domain name
+/// in this crate, so every operation that takes one agrees on its shape.
+pub fn domain_name_is_well_formed(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_DOMAIN_NAME_BYTES {
+        return false;
+    }
+    let well_formed = |label: &str| -> bool {
+        !label.is_empty()
+            && label.len() <= MAX_DNS_LABEL_BYTES
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    };
+    let mut labels = 0usize;
+    for label in name.split('.') {
+        if !well_formed(label) {
+            return false;
+        }
+        labels += 1;
+    }
+    labels > 1
 }
 
 /// One of the account's own stored service configurations as an endpoint service a caller can

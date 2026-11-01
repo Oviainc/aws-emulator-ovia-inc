@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpcEndpointServiceConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpcEndpointServiceConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpcEndpointServiceConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +147,415 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpcEndpointServiceConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpcEndpointServiceConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpcEndpointServiceConfiguration"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // "Before you create an endpoint service, you must create one of the following for
+        // your service: A Network Load Balancer … A Gateway Load Balancer" — the two members
+        // that name them. Each list is deduplicated (naming one load balancer twice puts it
+        // behind the service once) and bounded before any per-entry work is done: the member
+        // targets `ValueStringList`, on which the model publishes no bound at all.
+        let network_load_balancer_arns = state::deduplicate_ids(
+            input.network_load_balancer_arns.as_deref().unwrap_or_default(),
+        );
+        let gateway_load_balancer_arns = state::deduplicate_ids(
+            input.gateway_load_balancer_arns.as_deref().unwrap_or_default(),
+        );
+        for (member, arns) in [
+            ("networkLoadBalancerArn", &network_load_balancer_arns),
+            ("gatewayLoadBalancerArn", &gateway_load_balancer_arns),
+        ] {
+            if arns.len() > state::MAX_RESOURCE_IDS {
+                return Err(state::invalid_parameter_value(format!(
+                    "{member} carries {supplied} ARNs, above the maximum of {maximum}",
+                    supplied = arns.len(),
+                    maximum = state::MAX_RESOURCE_IDS,
+                )));
+            }
+            // "The Amazon Resource Names (ARNs) of the Network Load Balancers": a value that
+            // is not a load balancer's ARN names no load balancer, so it is refused rather
+            // than stored and reported back as one of the service's.
+            if let Some(malformed) = arns
+                .iter()
+                .find(|arn| !state::load_balancer_arn_is_well_formed(arn))
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({malformed}) for parameter {member} is invalid. \
+                     This is not the ARN of a load balancer."
+                )));
+            }
+        }
+
+        // Which kind of load balancer is behind the service is what decides the kind of
+        // endpoint a consumer reaches it through: "A Network Load Balancer. Service consumers
+        // connect to your service using an interface endpoint. A Gateway Load Balancer.
+        // Service consumers connect to your service using a Gateway Load Balancer endpoint."
+        // So one of the two has to be named — a service with no load balancer behind it
+        // serves nothing — and not both, there being one kind of endpoint per service.
+        let service_type = match (
+            network_load_balancer_arns.is_empty(),
+            gateway_load_balancer_arns.is_empty(),
+        ) {
+            (true, true) => {
+                return Err(state::missing_parameter(
+                    "The request must contain the parameter NetworkLoadBalancerArn or \
+                     GatewayLoadBalancerArn",
+                ))
+            }
+            (false, false) => {
+                return Err(state::invalid_parameter_combination(
+                    "NetworkLoadBalancerArn and GatewayLoadBalancerArn cannot both be \
+                     specified for one endpoint service",
+                ))
+            }
+            (false, true) => state::VPC_ENDPOINT_TYPE_INTERFACE,
+            (true, false) => state::VPC_ENDPOINT_TYPE_GATEWAY_LOAD_BALANCER,
+        };
+        let interface = service_type == state::VPC_ENDPOINT_TYPE_INTERFACE;
+
+        // "The supported IP address types. The possible values are ipv4 and ipv6"
+        // (`SupportedIpAddressTypes`): a value outside that pair names no address type, and
+        // the pair itself is what bounds the list the configuration reports
+        // (`ServiceConfiguration$SupportedIpAddressTypes` carries `length` 0..2), which the
+        // deduplicated request already satisfies.
+        let mut supported_ip_address_types = state::deduplicate_ids(
+            input.supported_ip_address_types.as_deref().unwrap_or_default(),
+        );
+        if let Some(unknown) = supported_ip_address_types.iter().find(|address_type| {
+            *address_type != state::IP_ADDRESS_TYPE_IPV4
+                && *address_type != state::IP_ADDRESS_TYPE_IPV6
+        }) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({unknown}) for parameter supportedIpAddressType is invalid. \
+                 The possible values are {ipv4} and {ipv6}.",
+                ipv4 = state::IP_ADDRESS_TYPE_IPV4,
+                ipv6 = state::IP_ADDRESS_TYPE_IPV6,
+            )));
+        }
+        // A service has to be reachable over SOMETHING, and an endpoint to it is created with
+        // the IPv4 address type unless the consumer asks otherwise
+        // (`CreateVpcEndpointRequest$IpAddressType`), so a request that named no type offers
+        // exactly the type an endpoint defaults to — the one type a service of the Region's
+        // own catalog reports too ([`crate::state::endpoint_services_in_region`]).
+        if supported_ip_address_types.is_empty() {
+            supported_ip_address_types.push(state::IP_ADDRESS_TYPE_IPV4.to_string());
+        }
+
+        // "The Regions from which service consumers can access the service"
+        // (`SupportedRegions`): a value that names no Region of the Region catalog names no
+        // consumers either, so it is refused rather than stored as a Region nothing is in.
+        let supported_regions =
+            state::deduplicate_ids(input.supported_regions.as_deref().unwrap_or_default());
+        if supported_regions.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "supportedRegion carries {supplied} Regions, above the maximum of {maximum}",
+                supplied = supported_regions.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
+        }
+        if let Some(unknown) = supported_regions
+            .iter()
+            .find(|region| !state::is_catalog_region(region))
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({unknown}) for parameter supportedRegion is invalid. \
+                 This is not a Region name."
+            )));
+        }
+
+        // "(Interface endpoint configuration) The private DNS name to assign to the VPC
+        // endpoint service" (`PrivateDnsName`): a name consumers resolve, so a value that is
+        // not a domain name at all is refused; and a Gateway Load Balancer endpoint resolves
+        // no name — it is reached as a route target — so the member is refused for a service
+        // behind one rather than stored where nothing would use it.
+        let private_dns_name = input
+            .private_dns_name
+            .as_deref()
+            .filter(|name| !name.is_empty());
+        if let Some(name) = private_dns_name {
+            if !interface {
+                return Err(state::invalid_parameter_combination(
+                    "PrivateDnsName cannot be specified for a service behind a Gateway Load \
+                     Balancer",
+                ));
+            }
+            if !state::domain_name_is_well_formed(name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({name}) for parameter privateDnsName is invalid. \
+                     This is not a domain name."
+                )));
+            }
+        }
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`ClientToken`) — a caller-chosen string this store retains, so it is
+        // held to the length EC2 documents for a client token.
+        if let Some(token) = input.client_token.as_deref() {
+            if token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value for clientToken: it may carry at most {max} characters",
+                    max = state::MAX_CLIENT_TOKEN_CHARS,
+                )));
+            }
+        }
+
+        // "The tags to associate with the service" — the shared tag-specification reader
+        // every create of this crate uses, so the resource-type rule, the tag ceilings and
+        // the reserved-key refusal cannot drift per operation.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_VPC_ENDPOINT_SERVICE,
+            Self::NAME,
+        )?;
+
+        // "Indicates whether requests from service consumers to create an endpoint to your
+        // service must be accepted manually" (`AcceptanceRequired`). The model publishes no
+        // default for the member, and the service owner is the only party who can waive the
+        // acceptance of a connection to their own service, so a request that said nothing
+        // leaves it required — which is also the state `AcceptVpcEndpointConnections` exists
+        // to serve.
+        let acceptance_required = input.acceptance_required.unwrap_or(true);
+
+        let services = state::require_service_state(&*self.engine)?;
+        let region = state::request_region(ctx.parts());
+        let mut store = services.lock();
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request": a repeat of a request this store already served answers with the
+        // configuration it created then, and creates nothing. Compared on what the REQUEST
+        // chose — never on the values the service selected itself, which a repeat could not
+        // have asked for — and answered before any ceiling is asked about, so a replay is
+        // neither charged again nor refused for a store that has since filled up.
+        let replayed: Option<ServiceConfiguration> = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.vpc_endpoint_service_client_tokens.get(token))
+            .and_then(|service_id| store.vpc_endpoint_services.get(service_id))
+            .cloned();
+        if let Some(stored) = replayed {
+            let stored_regions: Vec<String> = stored
+                .supported_regions
+                .iter()
+                .flatten()
+                .filter_map(|supported| supported.region.clone())
+                .collect();
+            let same_request = stored.acceptance_required == Some(acceptance_required)
+                && stored.private_dns_name.as_deref() == private_dns_name
+                && stored
+                    .network_load_balancer_arns
+                    .as_deref()
+                    .unwrap_or_default()
+                    == network_load_balancer_arns
+                && stored
+                    .gateway_load_balancer_arns
+                    .as_deref()
+                    .unwrap_or_default()
+                    == gateway_load_balancer_arns
+                && stored
+                    .supported_ip_address_types
+                    .as_deref()
+                    .unwrap_or_default()
+                    == supported_ip_address_types
+                && stored_regions == supported_regions
+                && state::same_tags(stored.tags.as_deref().unwrap_or_default(), &tags);
+            if !same_request {
+                return Err(state::idempotent_parameter_mismatch());
+            }
+            // A dry run never makes the request, and an idempotent repeat is still the
+            // request: "If you have the required permissions, the error response is
+            // DryRunOperation" (`DryRun`).
+            if input.dry_run.unwrap_or(false) {
+                return Err(state::dry_run_operation());
+            }
+            return Ok(CreateVpcEndpointServiceConfigurationOutput {
+                service_configuration: Some(stored),
+                client_token: input.client_token.clone(),
+            });
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_vpc_endpoint_service_capacity() {
+            return Err(state::vpc_endpoint_service_limit_exceeded());
+        }
+        // What this request would retain beyond the record and its tags (what
+        // `insert_vpc_endpoint_service` charges): the caller-chosen ARNs, private DNS name,
+        // Regions and client token, and the names derived from the id the insert mints.
+        let caller_supplied_bytes = caller_supplied_payload_bytes(
+            &network_load_balancer_arns,
+            &gateway_load_balancer_arns,
+            private_dns_name,
+            &supported_regions,
+            input.client_token.as_deref(),
+        );
+        let payload_bytes = caller_supplied_bytes
+            .saturating_add(state::STORED_RECORD_OVERHEAD_BYTES)
+            .saturating_add(state::tag_list_bytes(&tags))
+            .saturating_add(derived_name_bytes(&region));
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "The Availability Zones in which the service is available"
+        // (`ServiceConfiguration$AvailabilityZones`): the zones of the Region the service is
+        // hosted in, read through the one derivation of a Region's zones — the same one
+        // `DescribeVpcEndpointServices` reports for a service of the Region's catalog, so the
+        // two sources of an endpoint service cannot disagree about where a service of a
+        // Region is available.
+        let zones = state::availability_zones_in_region(&region);
+        let configuration = ServiceConfiguration {
+            service_type: Some(vec![ServiceTypeDetail {
+                service_type: Some(service_type.to_string()),
+            }]),
+            // Minted by the insert below, which is the one writer of a `ServiceId`.
+            service_id: None,
+            // Derived from that id, so the name and the id cannot disagree.
+            service_name: None,
+            service_state: Some(state::SERVICE_STATE_AVAILABLE.to_string()),
+            availability_zones: Some(zones.iter().map(|zone| zone.zone_name.clone()).collect()),
+            availability_zone_ids: Some(zones.iter().map(|zone| zone.zone_id.clone()).collect()),
+            acceptance_required: Some(acceptance_required),
+            // "Indicates whether the service manages its VPC endpoints. Management of the
+            // service VPC endpoints using the VPC endpoint API is restricted"
+            // (`ManagesVpcEndpoints`): an endpoint to a service the account configured here
+            // is the consumer's own to create and delete.
+            manages_vpc_endpoints: Some(false),
+            network_load_balancer_arns: Some(network_load_balancer_arns.clone()),
+            gateway_load_balancer_arns: Some(gateway_load_balancer_arns.clone()),
+            supported_ip_address_types: Some(supported_ip_address_types.clone()),
+            // Derived from the minted id below, for the interface services that answer on a
+            // name at all.
+            base_endpoint_dns_names: None,
+            private_dns_name: private_dns_name.map(str::to_string),
+            private_dns_name_configuration: None,
+            // "The payer responsibility" (`PayerResponsibility`): the owner of the service
+            // pays until `ModifyVpcEndpointServicePayerResponsibility` says otherwise, which
+            // is the one member the `PayerResponsibility` enum has.
+            payer_responsibility: Some(state::PAYER_RESPONSIBILITY_SERVICE_OWNER.to_string()),
+            tags: Some(tags),
+            // "The supported Regions" (`SupportedRegions`), each reported in the state the
+            // service is in there — which is the state of the service itself, this slice
+            // holding one service in one state rather than a per-Region rollout of it.
+            supported_regions: Some(
+                supported_regions
+                    .iter()
+                    .map(|supported| SupportedRegionDetail {
+                        region: Some(supported.clone()),
+                        service_state: Some(state::SERVICE_STATE_AVAILABLE.to_string()),
+                    })
+                    .collect(),
+            ),
+            // "Indicates whether consumers can access the service from a Region other than
+            // the Region where the service is hosted" (`RemoteAccessEnabled`) — true exactly
+            // when the request named such a Region.
+            remote_access_enabled: Some(
+                supported_regions
+                    .iter()
+                    .any(|supported| *supported != region),
+            ),
+        };
+        let Some(service_id) = store.insert_vpc_endpoint_service(configuration) else {
+            return Err(state::vpc_endpoint_service_limit_exceeded());
+        };
+        store.add_stored_bytes(caller_supplied_bytes);
+
+        // The name, the base DNS name and the private DNS verification record are all built
+        // from the id the insert just minted, so they are written onto the stored record
+        // rather than assembled for this reply: a later describe reports the same strings.
+        let service_name = state::account_endpoint_service_name(&region, &service_id);
+        // "The DNS names for the service": the base name an interface endpoint's own names
+        // sit under. A Gateway Load Balancer endpoint mints no names and is reached as a
+        // route target, so a service behind one answers on none.
+        let base_endpoint_dns_names = if interface {
+            vec![state::account_endpoint_service_base_dns_name(
+                &region,
+                &service_id,
+            )]
+        } else {
+            Vec::new()
+        };
+        let verification = private_dns_name
+            .map(|name| state::private_dns_name_verification(&service_id, name));
+        store.add_stored_bytes(
+            service_name.len()
+                + base_endpoint_dns_names
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+        );
+        if let Some(stored) = store.vpc_endpoint_services.get_mut(&service_id) {
+            stored.service_name = Some(service_name);
+            stored.base_endpoint_dns_names = Some(base_endpoint_dns_names);
+            stored.private_dns_name_configuration = verification;
+        }
+        if let Some(token) = input.client_token.clone() {
+            store
+                .vpc_endpoint_service_client_tokens
+                .insert(token, service_id.clone());
+        }
+
+        // The answer is the record as it was stored, so this create and every describe of
+        // the same service cannot drift apart.
+        let Some(stored) = store.vpc_endpoint_services.get(&service_id).cloned() else {
+            return Err(state::internal_error(
+                "the VPC endpoint service configuration just created could not be read back",
+            ));
+        };
+        Ok(CreateVpcEndpointServiceConfigurationOutput {
+            service_configuration: Some(stored),
+            client_token: input.client_token.clone(),
+        })
     }
+}
+
+/// The caller-chosen bytes one stored service configuration holds beyond the record and its tags:
+/// the load balancer ARNs behind it, the private DNS name assigned to it, the Regions it is
+/// offered from, and the client token that minted it.
+///
+/// Charged against the store's byte budget by the create, so a request cannot retain unbounded
+/// caller-supplied data under a record ceiling that only counts records.
+fn caller_supplied_payload_bytes(
+    network_load_balancer_arns: &[String],
+    gateway_load_balancer_arns: &[String],
+    private_dns_name: Option<&str>,
+    supported_regions: &[String],
+    client_token: Option<&str>,
+) -> usize {
+    let total = |values: &[String]| -> usize { values.iter().map(String::len).sum() };
+    total(network_load_balancer_arns)
+        .saturating_add(total(gateway_load_balancer_arns))
+        .saturating_add(total(supported_regions))
+        .saturating_add(private_dns_name.map_or(0, str::len))
+        .saturating_add(client_token.map_or(0, str::len))
+}
+
+/// An upper bound on the bytes of the names derived from the minted `ServiceId` — the service's
+/// own name and its base endpoint DNS name — which the create's byte-budget question asks about
+/// BEFORE that id has been minted.
+///
+/// The bound is exact up to the fixed width of a minted id, which is what a budget gate needs: a
+/// request is refused when storing it would pass the budget, not accounted to the byte.
+fn derived_name_bytes(region: &str) -> usize {
+    // `vpce-svc-` and 17 hexadecimal digits (`ComAmazonawsEc2Amazonec2State::next_id`).
+    const MINTED_ID_BYTES: usize = 32;
+    let per_name = MINTED_ID_BYTES
+        + region.len()
+        + crate::state::AWS_ENDPOINT_SERVICE_PREFIX.len()
+        + crate::state::PARTNER_ENDPOINT_SERVICE_LABEL.len()
+        + crate::state::ENDPOINT_DNS_SUFFIX.len()
+        // The separating dots of the longest form.
+        + 4;
+    per_name.saturating_mul(2)
 }
