@@ -34,16 +34,16 @@ use crate::billing_views::{
 
 /// The `@pattern` of `BillingViewArn`, as the model declares it minus its
 /// anchors. Source: `smithy_query(query="shape", shape="com.amazonaws.billing#BillingViewArn")`.
-const ARN_PATTERN: &str =
+pub(crate) const ARN_PATTERN: &str =
     r"arn:aws[a-z-]*:(billing)::[0-9]{12}:billingview/[a-zA-Z0-9/:_\+=\.\-@]{0,75}[a-zA-Z0-9]";
 
 /// The `@pattern` of `EnterpriseSupportBillingMonth`, minus its anchors.
 /// Source: `smithy_query(query="operation", operation="GetEnterpriseSupportChargeSummary")`.
-const MONTH_PATTERN: &str = r"\d{4}-(0[1-9]|1[0-2])";
+pub(crate) const MONTH_PATTERN: &str = r"\d{4}-(0[1-9]|1[0-2])";
 
 /// The `@pattern` of `BillingViewName` (a `@sensitive` member), minus its
 /// anchors. Source: `smithy_query(query="operation", operation="CreateBillingView")`.
-const NAME_PATTERN: &str = r"[ a-zA-Z0-9_\+=\.\-@]+";
+pub(crate) const NAME_PATTERN: &str = r"[ a-zA-Z0-9_\+=\.\-@]+";
 
 /// The `@pattern` of `BillingViewDescription` (a `@sensitive` member), minus its
 /// anchors. Source: `smithy_query(query="operation", operation="CreateBillingView")`.

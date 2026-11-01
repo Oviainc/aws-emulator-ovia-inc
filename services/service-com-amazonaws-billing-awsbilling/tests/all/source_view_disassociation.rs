@@ -396,8 +396,20 @@ async fn a_view_whose_association_is_not_the_callers_is_refused() {
     );
     let (status, primary) = call(&router, "GetBillingView", &json!({ "arn": PRIMARY_ARN })).await;
     assert_eq!(
-        (status, primary["billingView"]["sourceViewCount"].as_u64()),
-        (200, Some(0)),
-        "case \"PRIMARY after the refusals\": it is untouched, got {status} {primary:?}"
+        status, 200,
+        "case \"PRIMARY after the refusals\": got {status} {primary:?}"
+    );
+    // The PRIMARY view is the one the service manages, so `GetBillingView`
+    // reports no source count for it at all; that it is untouched is read off
+    // the source views it holds.
+    assert!(
+        primary["billingView"].get("sourceViewCount").is_none(),
+        "case \"PRIMARY after the refusals\": a service-managed view reports no \
+         sourceViewCount, got {primary:?}"
+    );
+    let (listed, _) = read_back(&router, "PRIMARY after the refusals", PRIMARY_ARN).await;
+    assert!(
+        listed.is_empty(),
+        "case \"PRIMARY after the refusals\": it is untouched, got {listed:?}"
     );
 }

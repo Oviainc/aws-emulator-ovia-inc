@@ -31,9 +31,10 @@ use crate::billing_views::{
 use crate::credit_allocation_history::at;
 use crate::rejection_fidelity::message;
 
-/// The `@pattern` of `BillingViewDescription`, minus its anchors. Source:
-/// `smithy_query(query="operation", operation="CreateBillingView")`.
-const DESCRIPTION_CHARACTERS: &str = " abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_+=.-@";
+/// The fixed first half of the description the service writes for the account's
+/// default `PRIMARY` billing view; the owning account id completes it. Spelled
+/// out here so the expectation is written independently of the service code.
+const PRIMARY_DESCRIPTION_PREFIX: &str = "Primary billing view for accountId: ";
 
 /// The fixed sentence the tagging APIs answer for a resource that does not
 /// exist (`state::RESOURCE_NOT_FOUND_MESSAGE`).
@@ -70,22 +71,45 @@ async fn the_default_primary_view_carries_every_documented_member() {
         "description",
         "billingViewType",
         "ownerAccountId",
-        "createdAt",
     ] {
         assert!(
             !view[member].is_null(),
             "case \"seeded PRIMARY\": expected member {member:?} to be populated, got {view:?}"
         );
     }
+    // And the members it must NOT carry: the default view is one the service
+    // manages, not one a caller created, so this surface reports none of the
+    // lifecycle metadata that belongs to a created view.
+    for member in ["createdAt", "sourceViewCount", "derivedViewCount"] {
+        assert!(
+            view.get(member).is_none(),
+            "case \"seeded PRIMARY\": a service-managed view reports no {member:?}, got {view:?}"
+        );
+    }
+    // Its description is one the SERVICE wrote, and it names the account that
+    // owns the view — so two accounts' default views do not describe themselves
+    // identically. (The modelled `BillingViewDescription` pattern admits no
+    // colon: it constrains what a CALLER may send, which `rejection_fidelity.rs`
+    // pins, not what the service writes for its own resource.)
     let description = view["description"].as_str().unwrap_or_default();
-    assert!(
-        !description.is_empty()
-            && description
-                .chars()
-                .all(|c| DESCRIPTION_CHARACTERS.contains(c)),
-        "case \"seeded PRIMARY\": the description must satisfy BillingViewDescription's \
-         pattern, got {description:?}"
+    assert_eq!(
+        description,
+        format!("{PRIMARY_DESCRIPTION_PREFIX}{ACCOUNT_ID}"),
+        "case \"seeded PRIMARY\": the description names the owning account, got {description:?}"
     );
+    // Both health-status members are populated, and under both spellings the
+    // surface carries them in: a client keyed on either reads the same value.
+    for (code, reasons) in [("statusCode", "statusReasons"), ("StatusCode", "StatusReasons")] {
+        assert_eq!(
+            (
+                view["healthStatus"][code].as_str(),
+                view["healthStatus"][reasons].as_array().map(Vec::len)
+            ),
+            (Some("HEALTHY"), Some(0)),
+            "case \"seeded PRIMARY\": expected {code}/{reasons} on a healthy view, got {:?}",
+            view["healthStatus"]
+        );
+    }
 
     // A read reports the same description every time, and a REFUSED write leaves
     // it where it was: the rows are the ways a caller can try to move it.

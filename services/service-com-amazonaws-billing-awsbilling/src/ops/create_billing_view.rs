@@ -262,6 +262,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at: None,
             view_definition_last_updated_at: None,
             health_status_code: crate::state::BILLING_VIEW_STATUS_HEALTHY.to_string(),
+            // A view that is HEALTHY has nothing to explain, so it carries the
+            // empty reason list: see `BillingView::health_status_reasons`.
+            health_status_reasons: Vec::new(),
             tags: input
                 .resource_tags
                 .unwrap_or_default()

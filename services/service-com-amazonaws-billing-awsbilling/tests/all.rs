@@ -15,6 +15,8 @@
 mod billing_feature_access;
 #[path = "all/billing_preferences.rs"]
 mod billing_preferences;
+#[path = "all/billing_view_wire_fidelity.rs"]
+mod billing_view_wire_fidelity;
 #[path = "all/billing_views.rs"]
 mod billing_views;
 #[path = "all/credit_allocation_history.rs"]

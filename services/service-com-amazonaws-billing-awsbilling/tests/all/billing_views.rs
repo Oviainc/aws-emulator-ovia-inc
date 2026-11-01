@@ -72,6 +72,17 @@ pub(crate) async fn call(
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
+    let (status, _headers, value) = call_with_headers(router, operation, body).await;
+    (status, value)
+}
+
+/// As [`call`], handing back the response HEADERS too — for the suite that
+/// asserts on one (the content-type this surface answers with).
+pub(crate) async fn call_with_headers(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, http::HeaderMap, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -89,13 +100,13 @@ pub(crate) async fn call(
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
-    let bytes = response.into_body();
+    let (parts, bytes) = response.into_parts();
     let value = if bytes.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
-    (status, value)
+    (status, parts.headers, value)
 }
 
 /// The `__type` an awsJson error body carries, without its namespace prefix.
@@ -339,18 +350,39 @@ async fn every_created_view_appears_in_the_list_and_derived_counts_follow_the_so
         "case \"no filters\": views are listed in ARN order, got {arns:?}"
     );
 
-    // Three of the four rows name the PRIMARY view as a source, so the PRIMARY
-    // view's derivedViewCount is derived from those records, not stored.
-    let expected_derived = rows
-        .iter()
-        .filter(|row| row.source_views.iter().any(|source| source == PRIMARY_ARN))
-        .count() as u64;
+    // Three of the four rows name the PRIMARY view as a source, and the PRIMARY
+    // view is the one the service manages: it reports no source/derived counts
+    // at all, so the rule that a count follows the stored records is asserted on
+    // a view a caller created and this test then makes a source of another.
     let (_, primary) = call(&router, "GetBillingView", &json!({ "arn": PRIMARY_ARN })).await;
+    for member in ["createdAt", "sourceViewCount", "derivedViewCount"] {
+        assert!(
+            primary["billingView"].get(member).is_none(),
+            "case \"service-managed PRIMARY\": expected no {member:?}, got {:?}",
+            primary["billingView"]
+        );
+    }
+    let source = created_arns[0].clone();
+    let (status, derived) = call(
+        &router,
+        "CreateBillingView",
+        &json!({
+            "name": "derives from a custom view",
+            "sourceViews": [source.clone()],
+            "clientToken": "tok-derived",
+        }),
+    )
+    .await;
     assert_eq!(
-        primary["billingView"]["derivedViewCount"].as_u64(),
-        Some(expected_derived),
-        "case \"derivedViewCount\": expected {expected_derived} views sourcing PRIMARY, got {:?}",
-        primary["billingView"]["derivedViewCount"]
+        status, 200,
+        "case \"derivedViewCount\": the harness create must answer 200, got {status} {derived:?}"
+    );
+    let (_, sourced) = call(&router, "GetBillingView", &json!({ "arn": source })).await;
+    assert_eq!(
+        sourced["billingView"]["derivedViewCount"].as_u64(),
+        Some(1),
+        "case \"derivedViewCount\": expected the one view that sources it, got {:?}",
+        sourced["billingView"]["derivedViewCount"]
     );
 }
 

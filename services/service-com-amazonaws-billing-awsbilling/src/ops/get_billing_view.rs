@@ -3,10 +3,15 @@
 //! @op GetBillingView
 //! Reads one persisted billing view out of this service's state and renders it as
 //! a `BillingViewElement`, with `sourceViewCount` and `derivedViewCount` derived
-//! from the stored records. An ARN outside the caller's own account is an
-//! `AccessDeniedException` (403), refused before any lookup; an ARN in the
-//! caller's account that no view is stored under is a
-//! `ResourceNotFoundException` (404).
+//! from the stored records — a view the service manages on the account's behalf
+//! carries neither, nor a `createdAt`, because nobody created it. An ARN outside
+//! the caller's own account is an `AccessDeniedException` (403), refused before
+//! any lookup; an ARN in the caller's account that no view is stored under is a
+//! `ResourceNotFoundException` (404). A request member outside its modelled
+//! constraints is a `ValidationException` (400) carrying `reason` and the
+//! `fieldList` entry that names the member — see
+//! [`crate::service::ConstraintRefusals`], which this operation is served
+//! through.
 //!
 //! ## Shape of an operation
 //!
@@ -146,9 +151,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The modeled `arn` pattern is refused by the boundary validator before
-        // this runs; what is left to decide is whether the ARN is scoped to the
-        // caller's own account and, if so, whether a view is stored under it.
+        // The modeled `arn` pattern is refused before this runs — by
+        // `crate::service::ConstraintRefusals`, in the modelled
+        // `ValidationException` shape; what is left to decide is whether the ARN
+        // is scoped to the caller's own account and, if so, whether a view is
+        // stored under it.
         // The account boundary is enforced BEFORE any existence lookup, so this
         // service never reveals whether a view exists in another account: a
         // well-formed ARN whose embedded account id is not the caller's own is
@@ -184,9 +191,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // billing view" and `derivedViewCount` "the number of billing views that
         // use this billing view as a source": both are derived from the stored
         // records on every read, never kept as a copy that could go stale.
-        let source_view_count = i32::try_from(view.source_views.len()).unwrap_or(i32::MAX);
-        let derived_view_count =
-            i32::try_from(state.derived_view_arns(&view.arn).len()).unwrap_or(i32::MAX);
+        //
+        // A view the service manages on the account's behalf (its default
+        // PRIMARY view — see `BillingView::is_managed`) is not a resource a
+        // caller created, and this surface reports none of the lifecycle
+        // metadata that belongs to a caller-created one: no creation time and
+        // neither count. So a client can tell the two apart by whether the
+        // record carries that metadata at all.
+        let caller_created = !view.is_managed();
+        let source_view_count = caller_created
+            .then(|| i32::try_from(view.source_views.len()).unwrap_or(i32::MAX));
+        let derived_view_count = caller_created
+            .then(|| i32::try_from(state.derived_view_arns(&view.arn).len()).unwrap_or(i32::MAX));
 
         Ok(GetBillingViewOutput {
             billing_view: BillingViewElement {
@@ -197,17 +213,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 owner_account_id: Some(view.owner_account_id.clone()),
                 source_account_id: view.source_account_id.clone(),
                 data_filter_expression: view.data_filter_expression.clone(),
-                created_at: Some(crate::state::timestamp(view.created_at)),
+                created_at: caller_created.then(|| crate::state::timestamp(view.created_at)),
                 updated_at: view.updated_at.map(crate::state::timestamp),
-                derived_view_count: Some(derived_view_count),
-                source_view_count: Some(source_view_count),
+                derived_view_count,
+                source_view_count,
                 view_definition_last_updated_at: view
                     .view_definition_last_updated_at
                     .map(crate::state::timestamp),
-                health_status: Some(BillingViewHealthStatus {
-                    status_code: Some(view.health_status_code.clone()),
-                    status_reasons: None,
-                }),
+                health_status: Some(crate::state::health_status(view)),
             },
         })
     }

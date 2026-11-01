@@ -376,10 +376,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     owner_account_id: Some(view.owner_account_id.clone()),
                     source_account_id: view.source_account_id.clone(),
                     billing_view_type: Some(view.billing_view_type.clone()),
-                    health_status: Some(BillingViewHealthStatus {
-                        status_code: Some(view.health_status_code.clone()),
-                        status_reasons: None,
-                    }),
+                    health_status: Some(crate::state::health_status(view)),
                 })
                 .collect(),
             next_token,

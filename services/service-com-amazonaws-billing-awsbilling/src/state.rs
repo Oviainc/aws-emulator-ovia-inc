@@ -30,8 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
 
 use crate::ops::types::{
-    AccessDeniedException, Expression, ValidationException, ValidationExceptionField,
-    BILLING_FEATURE_VALUES,
+    AccessDeniedException, BillingViewHealthStatus, Expression, ValidationException,
+    ValidationExceptionField, BILLING_FEATURE_VALUES,
 };
 
 /// `CUSTOM`, the `BillingViewType` a view created through `CreateBillingView`
@@ -113,6 +113,16 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 /// other`).
 pub const VALIDATION_REASON_FIELD: &str = "fieldValidationFailed";
 
+/// What a refusal puts where it would otherwise echo the value that was
+/// rejected.
+///
+/// This service states a constraint violation WITHOUT the submitted value —
+/// several of its constrained members are `@sensitive` and none of them belongs
+/// in a 400 body — so where the sentence has a place for the value, that place
+/// carries this marker instead. See `crate::service`, which renders the
+/// refusals.
+pub const REDACTED_VALUE: &str = "[redacted]";
+
 /// The `ValidationExceptionReason` a refusal that is about the caller rather
 /// than about one request member carries.
 pub const VALIDATION_REASON_OTHER: &str = "other";
@@ -158,17 +168,28 @@ const PRIMARY_VIEW_ID: &str = "primary";
 /// The name AWS gives the account's default `PRIMARY` billing view.
 const PRIMARY_VIEW_NAME: &str = "Primary View";
 
-/// The description the account's default `PRIMARY` billing view carries.
+/// The fixed first half of the description the account's default `PRIMARY`
+/// billing view carries; [`primary_view_description`] completes it.
+const PRIMARY_VIEW_DESCRIPTION_PREFIX: &str = "Primary billing view for accountId: ";
+
+/// The description the service itself writes for the default `PRIMARY` billing
+/// view of the account `owner_account_id` owns.
 ///
 /// `BillingViewElement$description` is "The description of the billing view",
-/// and the view every account owns by default is a resource the service itself
-/// seeded, so it arrives WITH one: a reader of the default view gets a value,
-/// not an absent member. The sentence restates the `ListBillingViews` doc's own
-/// account of what that view is — "a unique `PRIMARY` billing view that
-/// represents the billing data available by default" — and stays inside the
-/// modelled `BillingViewDescription` pattern
-/// `^([ a-zA-Z0-9_\+=\.\-@]+)?$`, which admits no other punctuation.
-const PRIMARY_VIEW_DESCRIPTION: &str = "Represents the billing data available by default";
+/// and the view every account owns by default is a resource the service seeded,
+/// so it arrives WITH one. The value is not a constant: it names the owning
+/// account, so two accounts' default views describe themselves differently —
+/// [`PRIMARY_VIEW_DESCRIPTION_PREFIX`] followed by the id of the account that
+/// owns the view.
+///
+/// The modelled `BillingViewDescription` pattern (`^([ a-zA-Z0-9_\+=\.\-@]+)?$`)
+/// admits no colon, so this value is outside it. That pattern constrains what a
+/// CALLER may send — `CreateBillingView` and `UpdateBillingView` are still
+/// refused outside it at the request boundary — and the description of a
+/// service-written resource is what the surface answers with, not caller input.
+pub fn primary_view_description(owner_account_id: &str) -> String {
+    format!("{PRIMARY_VIEW_DESCRIPTION_PREFIX}{owner_account_id}")
+}
 
 /// The `BillingFeature` values whose preferences a caller reaches only once
 /// Billing-console access is activated for the account.
@@ -305,6 +326,14 @@ pub struct BillingView {
     pub view_definition_last_updated_at: Option<SystemTime>,
     /// A `BillingViewStatus` value, e.g. [`BILLING_VIEW_STATUS_HEALTHY`].
     pub health_status_code: String,
+    /// The `BillingViewStatusReason` values explaining
+    /// [`BillingView::health_status_code`], e.g. `SOURCE_VIEW_UNHEALTHY`
+    /// (`BILLING_VIEW_STATUS_REASON_VALUES` in `ops::types`).
+    ///
+    /// A list, not an `Option`: the health status a read reports always carries
+    /// both members, and a status that needs no explaining — a `HEALTHY` view —
+    /// carries the EMPTY list rather than an absent one.
+    pub health_status_reasons: Vec<String>,
     /// The view's resource tags, by key.
     pub tags: BTreeMap<String, String>,
     /// The resource-based policy document attached to this view, as
@@ -549,12 +578,13 @@ impl Default for ComAmazonawsBillingAwsbillingState {
         // The account's default PRIMARY view exists before any API call: see
         // BILLING_VIEW_TYPE_PRIMARY for the `ListBillingViews` doc sentence.
         let now = SystemTime::now();
+        let owner_account_id = ::engine::emulator_account_id().to_string();
         let primary = BillingView {
             arn: billing_view_arn(PRIMARY_VIEW_ID),
             name: PRIMARY_VIEW_NAME.to_string(),
-            description: Some(PRIMARY_VIEW_DESCRIPTION.to_string()),
+            description: Some(primary_view_description(&owner_account_id)),
             billing_view_type: BILLING_VIEW_TYPE_PRIMARY.to_string(),
-            owner_account_id: ::engine::emulator_account_id().to_string(),
+            owner_account_id,
             source_account_id: None,
             source_views: Vec::new(),
             data_filter_expression: None,
@@ -562,6 +592,7 @@ impl Default for ComAmazonawsBillingAwsbillingState {
             updated_at: None,
             view_definition_last_updated_at: None,
             health_status_code: BILLING_VIEW_STATUS_HEALTHY.to_string(),
+            health_status_reasons: Vec::new(),
             tags: BTreeMap::new(),
             resource_policy: None,
         };
@@ -1128,6 +1159,20 @@ pub fn decode_page_token(token: &str) -> Option<String> {
     ::hex::decode(token)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+/// The `BillingViewHealthStatus` a read reports for `view`.
+///
+/// Both members are always present: the stored status code and the stored
+/// reason list, which is EMPTY for a status that needs no explaining rather
+/// than absent (see [`BillingView::health_status_reasons`]). Shared by every
+/// read that projects a billing view, so `GetBillingView` and
+/// `ListBillingViews` cannot report one view's health two ways.
+pub fn health_status(view: &BillingView) -> BillingViewHealthStatus {
+    BillingViewHealthStatus {
+        status_code: Some(view.health_status_code.clone()),
+        status_reasons: Some(view.health_status_reasons.clone()),
+    }
 }
 
 /// A stored instant as the modeled `Timestamp` the wire carries.

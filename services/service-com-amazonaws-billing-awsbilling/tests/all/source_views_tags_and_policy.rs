@@ -47,16 +47,16 @@ async fn create_view(router: &MultiServiceRouter, name: &str, sources: &[String]
         .to_string()
 }
 
-/// The `sourceViewCount` `GetBillingView` derives for `arn`.
-async fn source_view_count(router: &MultiServiceRouter, arn: &str) -> u64 {
+/// The `sourceViewCount` `GetBillingView` reports for `arn`, or `None` when it
+/// reports none: a view the service manages on the account's behalf carries no
+/// source/derived counts at all, so absence is an answer here and not a failure.
+async fn source_view_count(router: &MultiServiceRouter, arn: &str) -> Option<u64> {
     let (status, body) = call(router, "GetBillingView", &json!({ "arn": arn })).await;
     assert_eq!(
         status, 200,
         "GetBillingView({arn}) must answer 200, got {status} {body:?}"
     );
-    body["billingView"]["sourceViewCount"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("GetBillingView({arn}) reported no sourceViewCount: {body:?}"))
+    body["billingView"]["sourceViewCount"].as_u64()
 }
 
 /// The `derivedViewCount` `GetBillingView` derives for `arn`.
@@ -210,8 +210,8 @@ async fn associating_sources_is_reported_by_both_reads_for_every_count() {
         let count = source_view_count(&router, &target).await;
         assert_eq!(
             count,
-            expected.len() as u64,
-            "case {case:?}: sourceViewCount must count the stored sources, got {count}"
+            Some(expected.len() as u64),
+            "case {case:?}: sourceViewCount must count the stored sources, got {count:?}"
         );
         for source in &sources {
             let derived = derived_view_count(&router, source).await;
@@ -309,7 +309,7 @@ async fn a_view_can_never_end_up_in_its_own_source_chain() {
         let after = source_view_count(&router, &arn).await;
         assert_eq!(
             after, before,
-            "case {case:?}: a refused associate must change no source: {before} -> {after}"
+            "case {case:?}: a refused associate must change no source: {before:?} -> {after:?}"
         );
     }
 }
@@ -414,8 +414,9 @@ async fn a_view_cannot_be_pushed_past_the_modeled_source_view_maximum() {
     );
     let count = source_view_count(&router, &target).await;
     assert_eq!(
-        count, 10,
-        "case \"up to the maximum\": expected 10 stored sources, got {count}"
+        count,
+        Some(10),
+        "case \"up to the maximum\": expected 10 stored sources, got {count:?}"
     );
 
     let (status, body) = call(
@@ -435,8 +436,9 @@ async fn a_view_cannot_be_pushed_past_the_modeled_source_view_maximum() {
     );
     let count = source_view_count(&router, &target).await;
     assert_eq!(
-        count, 10,
-        "case \"one past the maximum\": the refusal must store nothing, got {count}"
+        count,
+        Some(10),
+        "case \"one past the maximum\": the refusal must store nothing, got {count:?}"
     );
 }
 
