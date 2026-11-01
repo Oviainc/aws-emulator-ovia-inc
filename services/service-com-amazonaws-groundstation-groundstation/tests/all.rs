@@ -35,6 +35,8 @@ mod config_defaults_and_references;
 mod config_listing;
 #[path = "all/config_reference_integrity.rs"]
 mod config_reference_integrity;
+#[path = "all/config_update_reach.rs"]
+mod config_update_reach;
 #[path = "all/config_update_refusal_precedence.rs"]
 mod config_update_refusal_precedence;
 #[path = "all/contact_cancellation.rs"]

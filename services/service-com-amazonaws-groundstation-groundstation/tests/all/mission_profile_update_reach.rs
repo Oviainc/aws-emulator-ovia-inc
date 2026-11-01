@@ -156,7 +156,15 @@ async fn update_profile(router: &MultiServiceRouter, case: &str, profile_id: &st
 }
 
 /// The `dataflowList` a contact read reports, or `None` when it reports none at all.
-async fn dataflows(router: &MultiServiceRouter, case: &str, contact_id: &str) -> Option<Value> {
+///
+/// `pub(crate)` here and on [`version_dataflows`] below: the sibling suite
+/// `tests/all/config_update_reach.rs` asks the same two readers how far an update of a
+/// CONFIG reaches, so the two reads are written once rather than stood up twice.
+pub(crate) async fn dataflows(
+    router: &MultiServiceRouter,
+    case: &str,
+    contact_id: &str,
+) -> Option<Value> {
     let described = send(router, "GET", &format!("/contact/{contact_id}"), None).await;
     assert_eq!(
         described.status, 200,
@@ -168,7 +176,7 @@ async fn dataflows(router: &MultiServiceRouter, case: &str, contact_id: &str) ->
 
 /// The `dataflowList` `DescribeContactVersion` reports for the contact's FIRST version —
 /// the other reader of a contact's dataflows, which must describe the same wiring.
-async fn version_dataflows(
+pub(crate) async fn version_dataflows(
     router: &MultiServiceRouter,
     case: &str,
     contact_id: &str,

@@ -1496,6 +1496,19 @@ pub struct Contact {
     /// profile was deleted without ever having been rewired under it still reports no
     /// wiring at all rather than an empty one.
     pub reserved_dataflow_edges: Option<Vec<Vec<String>>>,
+    /// The parameters of the configs this contact's pass is flown with, once a config's
+    /// stored parameters are no longer the ones this contact reached: the `configData` a
+    /// config carried at the moment an update of it replaced them, keyed by the
+    /// `(configType, configId)` pair
+    /// [`ComAmazonawsGroundstationGroundstationState::configs`] is keyed on
+    /// ([`ComAmazonawsGroundstationGroundstationState::freeze_contact_config_data`]).
+    ///
+    /// EMPTY while every config this contact's wiring reaches still holds the parameters
+    /// the contact was scheduled with, which is every contact until such an update lands —
+    /// so there is ONE record of each config's parameters for as long as the config and the
+    /// contact agree about them, exactly as [`Contact::reserved_dataflow_edges`] keeps one
+    /// record of each edge.
+    pub reserved_config_data: HashMap<(String, String), ConfigTypeData>,
 }
 
 /// The model's `VersionStatus` values, whose full set is `UPDATING`, `ACTIVE`,
@@ -4493,20 +4506,24 @@ struct DataflowEnd {
     region: String,
 }
 
-/// One dataflow edge of a mission profile as a `DataflowDetail`: its first `ConfigArn` is
+/// One dataflow edge of `contact`'s pass as a `DataflowDetail`: its first `ConfigArn` is
 /// the dataflow's SOURCE and its second the DESTINATION (a `DataflowEdge` is a list of
 /// exactly two — `smithy_query(query="shape", shape="DataflowEdge")`).
+///
+/// Each end is described by the parameters THIS contact's pass is flown with
+/// ([`ComAmazonawsGroundstationGroundstationState::contact_config_data`]), so a config
+/// updated after the contact was scheduled does not move what it reports.
 ///
 /// `errorMessage` carries nothing: no dataflow has run in this emulator, so none has
 /// failed.
 fn dataflow_detail(
     state: &ComAmazonawsGroundstationGroundstationState,
+    contact: &Contact,
     edge: &[String],
-    contact_region: &str,
 ) -> DataflowDetail {
     let source = edge
         .first()
-        .and_then(|arn| dataflow_end(state, arn, contact_region))
+        .and_then(|arn| dataflow_end(state, contact, arn))
         .map(|end| Source {
             config_type: Some(end.config_type),
             config_id: Some(end.config_id),
@@ -4515,7 +4532,7 @@ fn dataflow_detail(
         });
     let destination = edge
         .get(1)
-        .and_then(|arn| dataflow_end(state, arn, contact_region))
+        .and_then(|arn| dataflow_end(state, contact, arn))
         .map(|end| Destination {
             config_type: Some(end.config_type),
             config_id: Some(end.config_id),
@@ -4533,7 +4550,10 @@ fn dataflow_detail(
 /// config at all.
 ///
 /// The type and the id are the ARN's own ([`config_arn_parts`]), so an edge is reported by
-/// the config it names rather than echoed back whole. The details are the config's, for the
+/// the config it names rather than echoed back whole. The details are built from the
+/// parameters `contact`'s pass is flown with
+/// ([`ComAmazonawsGroundstationGroundstationState::contact_config_data`]) — the config's
+/// own until an update of it replaced them — for the
 /// three capability types `ConfigDetails` has a member for — "additional details for a
 /// `Config`, if type is `dataflow-endpoint` or `antenna-downlink-demod-decode`", plus
 /// `s3RecordingDetails` (`smithy_query(query="shape", shape="ConfigDetails")`) — and absent
@@ -4554,11 +4574,12 @@ fn dataflow_detail(
 /// end is at the region the contact itself was reserved in.
 fn dataflow_end(
     state: &ComAmazonawsGroundstationGroundstationState,
+    contact: &Contact,
     arn: &str,
-    contact_region: &str,
 ) -> Option<DataflowEnd> {
     let (config_type, config_id) = config_arn_parts(arn)?;
-    let config_data = state.config_by_arn(arn).map(|config| &config.config_data);
+    let contact_region = contact.region.as_str();
+    let config_data = state.contact_config_data(contact, arn);
 
     let config_details = match config_data {
         Some(ConfigTypeData::dataflowEndpointConfig(endpoint_config)) => state
@@ -4594,6 +4615,36 @@ fn dataflow_end(
         config_details,
         region,
     })
+}
+
+/// The endpoint names the dataflow graph `edges` selects, in the order the graph names them
+/// and without repeats, where `config_data` is what resolves each end's `ConfigArn` to the
+/// parameters it is read with.
+///
+/// An edge ends at the config its `ConfigArn` names and a `dataflowEndpointConfig` selects
+/// an endpoint of this account by name (`dataflowEndpointName`), so those names are what a
+/// contact flown through this graph is wired to. An end whose ARN resolves to no parameters
+/// contributes nothing.
+///
+/// The ONE reader of a graph's endpoint selections, so the question asked of a graph being
+/// WRITTEN ([`ComAmazonawsGroundstationGroundstationState::dataflow_endpoint_names_wired_by`])
+/// and the one asked of a graph a contact is flown through
+/// ([`ComAmazonawsGroundstationGroundstationState::contact_wired_dataflow_endpoint_names`])
+/// differ only in which parameters each resolves an end with.
+fn endpoint_names_selected_by<'a>(
+    edges: &[Vec<String>],
+    mut config_data: impl FnMut(&str) -> Option<&'a ConfigTypeData>,
+) -> Vec<&'a str> {
+    let mut names: Vec<&str> = Vec::new();
+    for arn in edges.iter().flatten() {
+        if let Some(ConfigTypeData::dataflowEndpointConfig(endpoint_config)) = config_data(arn) {
+            let name = endpoint_config.dataflow_endpoint_name.as_str();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 impl ComAmazonawsGroundstationGroundstationState {
@@ -5067,25 +5118,15 @@ impl ComAmazonawsGroundstationGroundstationState {
     ///
     /// Written against a graph rather than a stored profile, so the writes that take one
     /// ([`Self::dataflow_endpoint_group_fault`]) and the reads of one that was stored
-    /// ([`Self::contact_wired_dataflow_endpoint_names`]) resolve it the same way.
+    /// ([`Self::contact_wired_dataflow_endpoint_names`]) resolve it the same way. The
+    /// selections are read from the configs as they stand NOW, which is what a write that
+    /// is being judged is judged against; a read of one CONTACT's graph resolves them
+    /// through the parameters that contact's pass is flown with instead
+    /// ([`Self::contact_wired_dataflow_endpoint_names`]).
     pub fn dataflow_endpoint_names_wired_by<'a>(&'a self, edges: &[Vec<String>]) -> Vec<&'a str> {
-        let mut names: Vec<&str> = Vec::new();
-        let selected = edges
-            .iter()
-            .flatten()
-            .filter_map(|arn| self.config_by_arn(arn))
-            .filter_map(|config| match &config.config_data {
-                ConfigTypeData::dataflowEndpointConfig(endpoint_config) => {
-                    Some(endpoint_config.dataflow_endpoint_name.as_str())
-                }
-                _ => None,
-            });
-        for name in selected {
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-        names
+        endpoint_names_selected_by(edges, |arn| {
+            self.config_by_arn(arn).map(|config| &config.config_data)
+        })
     }
 
     /// Why the dataflow graph `edges` cannot be flown as ONE contact, as the modelled
@@ -5255,9 +5296,37 @@ impl ComAmazonawsGroundstationGroundstationState {
         Some(
             edges
                 .iter()
-                .map(|edge| dataflow_detail(self, edge, &contact.region))
+                .map(|edge| dataflow_detail(self, contact, edge))
                 .collect(),
         )
+    }
+
+    /// The parameters `contact`'s pass is flown with at the end of a dataflow the
+    /// `ConfigArn` `arn` names, or `None` when nothing is known about that end's config.
+    ///
+    /// A config's parameters reach a contact when the contact is scheduled, and an update
+    /// of the config does not reach a contact already scheduled with it, so the answer is
+    /// the `configData` the contact holds for that config once an update replaced it
+    /// ([`Contact::reserved_config_data`]) and otherwise the config's own — one record of
+    /// those parameters for as long as the two agree about them, exactly as
+    /// [`Self::contact_dataflow_edges`] keeps one record of each edge.
+    ///
+    /// The ONE answer to "with what parameters is this contact flown through that config",
+    /// so a read of its dataflows ([`dataflow_end`]) and the question of what resources its
+    /// pass still depends on ([`Self::contact_wired_dataflow_endpoint_names`]) cannot
+    /// disagree. An ARN naming one NODE of a config is the same config's parameters, since
+    /// the pair the frozen copy is keyed on is the ARN's own ([`config_arn_parts`]).
+    pub fn contact_config_data<'a>(
+        &'a self,
+        contact: &'a Contact,
+        arn: &str,
+    ) -> Option<&'a ConfigTypeData> {
+        if let Some(key) = config_arn_parts(arn) {
+            if let Some(frozen) = contact.reserved_config_data.get(&key) {
+                return Some(frozen);
+            }
+        }
+        self.config_by_arn(arn).map(|config| &config.config_data)
     }
 
     /// Keep the dataflow wiring of every contact an update of the mission profile
@@ -5295,6 +5364,63 @@ impl ComAmazonawsGroundstationGroundstationState {
                 && contact.reserved_dataflow_edges.is_none()
             {
                 contact.reserved_dataflow_edges = Some(edges.clone());
+            }
+        }
+    }
+
+    /// Keep the parameters of the config `(config_type, config_id)` addresses on every
+    /// contact an update of that config must not reach, to be called BEFORE that update
+    /// replaces them.
+    ///
+    /// "Updating a `Config` will not update the execution parameters for existing future
+    /// contacts scheduled with this `Config`" (`smithy_query(query="doc",
+    /// shape="UpdateConfig")`), and a config's `configData` IS the execution parameters of
+    /// every dataflow end its ARN is wired to — the endpoint a `dataflowEndpointConfig`
+    /// selects and the region it sits in, the bucket and key template an `s3RecordingConfig`
+    /// records under ([`dataflow_end`]). So a contact still to be flown
+    /// ([`Contact::is_non_terminal`]) that is scheduled with this config — one whose own
+    /// wiring ([`Self::contact_dataflow_edges`]) names it, whether as a whole or by one of
+    /// its nodes ([`addresses_config`]) — keeps the parameters it was scheduled with, and
+    /// the update then moves the config alone.
+    ///
+    /// A contact that already holds parameters of its own for this config keeps them: those
+    /// are older, so they are the ones that contact was scheduled with, and a second update
+    /// cannot reach it either. A contact ALREADY terminal when the update lands has no pass
+    /// left to fly and keeps nothing, so what it reports stays the config's; a contact that
+    /// goes terminal LATER keeps what it was flown with, which is the record of that pass —
+    /// the same division [`Self::freeze_contact_dataflow_edges`] makes.
+    pub fn freeze_contact_config_data(&mut self, config_type: &str, config_id: &str) {
+        let key = (config_type.to_string(), config_id.to_string());
+        let Some(config) = self.configs.get(&key) else {
+            return;
+        };
+        let config_arn = config.config_arn.clone();
+        let config_data = config.config_data.clone();
+        // Which contacts reach the config is asked of the store as a whole (a contact's
+        // wiring can be its profile's), so the holders are collected first and the copies
+        // written afterwards.
+        let holders: Vec<String> = self
+            .contacts
+            .values()
+            .filter(|contact| {
+                contact.is_non_terminal()
+                    && !contact.reserved_config_data.contains_key(&key)
+                    && self
+                        .contact_dataflow_edges(contact)
+                        .is_some_and(|edges| {
+                            edges
+                                .iter()
+                                .flatten()
+                                .any(|arn| addresses_config(arn, &config_arn))
+                        })
+            })
+            .map(|contact| contact.contact_id.clone())
+            .collect();
+        for contact_id in holders {
+            if let Some(contact) = self.contacts.get_mut(&contact_id) {
+                contact
+                    .reserved_config_data
+                    .insert(key.clone(), config_data.clone());
             }
         }
     }
@@ -5392,10 +5518,12 @@ impl ComAmazonawsGroundstationGroundstationState {
     /// A dataflow edge ends at the config its `ConfigArn` names, and a
     /// `dataflowEndpointConfig` selects an endpoint of this account by name
     /// (`dataflowEndpointName`), so those names are what the pass is wired to. The graph is
-    /// the contact's own ([`Self::contact_dataflow_edges`]) — the same graph a read of the
-    /// contact reports the endpoint behind each edge end of ([`dataflow_end`]), so the
+    /// the contact's own ([`Self::contact_dataflow_edges`]) and each end is resolved with
+    /// the parameters that contact's pass is flown with
+    /// ([`Self::contact_config_data`]) — the same graph and the same parameters a read of
+    /// the contact reports the endpoint behind each edge end of ([`dataflow_end`]), so the
     /// in-use question and the read cannot disagree about what a pass is wired to. Its
-    /// endpoint selections are resolved by [`Self::dataflow_endpoint_names_wired_by`], the
+    /// endpoint selections are resolved by [`endpoint_names_selected_by`], the
     /// one reader of a graph's selections, and the names are then sorted so a refusal
     /// listing them reads the same on every call.
     pub fn contact_wired_dataflow_endpoint_names<'a>(
@@ -5405,7 +5533,8 @@ impl ComAmazonawsGroundstationGroundstationState {
         let Some(edges) = self.contact_dataflow_edges(contact) else {
             return Vec::new();
         };
-        let mut names = self.dataflow_endpoint_names_wired_by(edges);
+        let mut names =
+            endpoint_names_selected_by(edges, |arn| self.contact_config_data(contact, arn));
         names.sort_unstable();
         names.dedup();
         names

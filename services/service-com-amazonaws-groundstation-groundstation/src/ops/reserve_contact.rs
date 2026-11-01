@@ -363,6 +363,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // so one edge is recorded once and a contact whose profile is gone says
             // nothing about a wiring nothing knows any more.
             reserved_dataflow_edges: None,
+            // And the parameters of the pass are the configs' own for as long as those
+            // configs hold the ones this contact was scheduled with: a config's
+            // `configData` is copied onto the contact only when an update of that config
+            // replaces it
+            // (`crate::state::ComAmazonawsGroundstationGroundstationState::freeze_contact_config_data`),
+            // so those parameters too are recorded once.
+            reserved_config_data: ::std::collections::HashMap::new(),
         };
 
         // A contact has an ARN even though no operation in this slice returns one: it is

@@ -249,7 +249,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Still addressed under this lock: the bucket resolution above released it, so
         // a delete could have landed in between, and that is the same answer as an id
-        // that was never there.
+        // that was never there. Asked before anything below is written, so a refused
+        // update leaves the store as it was.
+        if !guard.configs.contains_key(&key) {
+            return Err(not_found().into());
+        }
+
+        // "Updating a `Config` will not update the execution parameters for existing future
+        // contacts scheduled with this `Config`", and a config's `configData` IS the
+        // execution parameters of every dataflow end wired to it, so the parameters this
+        // config holds now are kept on each contact still to be flown through it before the
+        // replacement below moves the config alone
+        // (`state::freeze_contact_config_data`). Which contacts those are is a question
+        // about statuses the clock moves on its own — a contact is confirmed, carried
+        // through its pass and its release completed at instants its own timestamps
+        // recorded — so the moves owed at this instant are materialised first.
+        guard.settle_due_contacts();
+        guard.freeze_contact_config_data(&input.config_type, &input.config_id);
+
+        // Addressed by the same key once more, answering the missing config rather than
+        // panicking: the two readers of this key are then one expression apart and neither
+        // can outlive the other's answer.
         let stored = guard.configs.get_mut(&key).ok_or_else(not_found)?;
 
         // Both members are required, so an update REPLACES the config's name and its
