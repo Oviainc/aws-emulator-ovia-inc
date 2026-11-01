@@ -15,9 +15,10 @@
 //!   configuration the caller supplied and the strategies minted for it, so
 //!   `GetMemory` and any later memory read answer from one store;
 //! * the harness (`/harnesses/`): one [`HarnessRecord`] per `harnessId`, holding
-//!   the whole agent-loop configuration `CreateHarness` persisted, so
-//!   `GetHarness` reports exactly that and `DeleteHarness` reports what it
-//!   removed;
+//!   the whole agent-loop configuration `CreateHarness` persisted and the
+//!   endpoints created on it ([`HarnessEndpointRecord`]), because an endpoint is
+//!   addressed only through its harness, so `GetHarness` reports exactly that and
+//!   `DeleteHarness` reports what it removed;
 //! * the registry (`/registries/`): one [`RegistryRecord`] per `registryId`,
 //!   holding the catalog's configuration and the status the clock owes it, so
 //!   `GetRegistry` and any later registry read answer from one store;
@@ -70,6 +71,7 @@ use crate::ops::types::{
     GatewayProtocolConfiguration, GatewaySummary, GetGatewayOutput, GetGatewayTargetOutput,
     GetConfigurationBundleOutput, GetRegistryOutput,
     Harness, HarnessAgentCoreRuntimeEnvironment, HarnessAgentCoreRuntimeEnvironmentRequest,
+    HarnessEndpoint,
     HarnessEnvironmentArtifact, HarnessEnvironmentProvider, HarnessEnvironmentProviderRequest,
     HarnessHook, HarnessMemoryConfiguration, HarnessModelConfiguration, HarnessSkill,
     HarnessSystemContentBlock, HarnessTool, HarnessTruncationConfiguration, HarnessVersionSummary,
@@ -218,6 +220,25 @@ pub fn gateway_status_conflict(operation: &str, status: &str) -> ValidationExcep
         reason: VALIDATION_REASON_RESOURCE_CONFLICT.to_string(),
         field_list: None,
     }
+}
+
+/// How this service words the refusal of a `DeleteHarness` for a harness that
+/// still holds endpoints: the harness, by the name it was created with, and what
+/// the caller has to delete before the harness can go.
+///
+/// An endpoint is addressed only THROUGH the harness that holds it, so the
+/// harness is not destroyed while any endpoint is attached: the delete is
+/// refused and the caller deletes the endpoints first, rather than the endpoints
+/// being silently cascaded away with the harness they front. The sentence around
+/// the name is fixed; the name itself is the one the request's harness carries.
+///
+/// Shared by the handlers rather than written per operation, so the one refusal
+/// cannot be worded two ways.
+pub fn harness_has_endpoints(harness_name: &str) -> String {
+    format!(
+        "Harness {harness_name} has endpoints that must be deleted before the harness can be \
+         deleted."
+    )
 }
 
 /// The modelled not-found error for a resource of this service that is not
@@ -888,6 +909,25 @@ pub const HARNESS_SETTLE_DELAY: Duration = Duration::from_millis(500);
 /// another one, and it is not implemented, so a stored harness is at version 1.
 pub const FIRST_HARNESS_VERSION: u32 = 1;
 
+/// How many endpoints ONE harness will hold.
+///
+/// `CreateHarnessEndpoint` models `ServiceQuotaExceededException` (HTTP 402) for
+/// exceeding the real service's quota. The number is NOT a fidelity claim about
+/// that quota: it is the emulator's own ceiling, set generously so no realistic
+/// workflow meets it, so that a caller looping on create cannot grow this
+/// process's memory without bound.
+pub const MAX_ENDPOINTS_PER_HARNESS: usize = 1_000;
+
+/// How long a freshly created harness endpoint stays `CREATING` before the clock
+/// owes it `READY`.
+///
+/// AWS documents no duration for this transition, so the span is chosen: long
+/// enough that a caller acting straight after the call still observes the
+/// transient status, short enough to keep a client script quick. An endpoint is
+/// served BY its harness, so the span runs from the instant the HARNESS itself is
+/// ready ([`HarnessRecord::settles_at`]), not from the create call.
+pub const HARNESS_ENDPOINT_SETTLE_DELAY: Duration = Duration::from_secs(2);
+
 /// `HarnessTruncationStrategy` for "do not truncate". The enum's full value list
 /// is `sliding_window | summarization | none`
 /// (`smithy_query shape=HarnessTruncationStrategy`), and `Harness.truncation` is
@@ -926,6 +966,40 @@ pub fn harness_not_found(harness_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Agent with name {harness_id} not found.")),
     }
+}
+
+/// The modelled not-found error for an endpoint the named harness does not hold.
+///
+/// Worded like the harness's own 404 ([`harness_not_found`]) — this control plane
+/// words a missing resource of the harness family in terms of the agent it runs —
+/// with the endpoint named by the one identifier its route addresses it by.
+/// Shared by the handlers rather than written per operation, so one endpoint
+/// cannot be reported missing in two different sentences by two operations.
+pub fn harness_endpoint_not_found(endpoint_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Agent endpoint with name {endpoint_name} not found.")),
+    }
+}
+
+/// How this service words the conflict a SECOND endpoint under one name on one
+/// harness is: the name the request asked for and the harness that already holds
+/// an endpoint under it.
+///
+/// The name is what an endpoint's route and its ARN address it by, so one harness
+/// holds one endpoint per name. The sentence takes the form every create of this
+/// service refuses a duplicate name in (`CreateHarness`, `CreateGateway`,
+/// `CreateMemory` and the rest): the resource, the name the request carried, and
+/// the resource that already holds it.
+pub fn harness_endpoint_name_taken(endpoint_name: &str, harness_id: &str) -> String {
+    format!("an endpoint named {endpoint_name} already exists on harness {harness_id}")
+}
+
+/// How this service words [`MAX_ENDPOINTS_PER_HARNESS`] being met: the harness
+/// the request named and the ceiling it is at, in the form every ceiling of this
+/// service is reported in (`CreateGatewayTarget`'s targets per gateway,
+/// `UpdateAgentRuntime`'s versions per runtime).
+pub fn harness_endpoint_quota_met(harness_id: &str) -> String {
+    format!("harness {harness_id} already holds the maximum of {MAX_ENDPOINTS_PER_HARNESS} endpoints")
 }
 
 /// One harness version's key in the version-ordered map a listing pages over:
@@ -982,6 +1056,12 @@ pub struct HarnessRecord {
     pub max_tokens: Option<i32>,
     pub timeout_seconds: Option<i32>,
     pub tags: BTreeMap<String, String>,
+    /// The endpoints created on this harness, keyed by `endpointName` — the one
+    /// identifier every harness-endpoint route addresses an endpoint by, and what
+    /// its ARN ends in. An endpoint is reached only THROUGH its harness, so it is
+    /// held here rather than in a map of its own: a harness and its endpoints
+    /// cannot drift apart, and deleting the harness takes them with it.
+    pub endpoints: BTreeMap<String, HarnessEndpointRecord>,
 }
 
 impl HarnessRecord {
@@ -1087,6 +1167,90 @@ impl HarnessRecord {
             timeout_seconds: self.timeout_seconds,
             // Reported only for a harness in a failed status; one this emulator
             // drives reaches READY, which has no failure.
+            failure_reason: None,
+        }
+    }
+}
+
+/// One endpoint of a harness: the stable name callers invoke, the harness
+/// version it serves, and the status the clock drives.
+///
+/// `CreateHarnessEndpoint` and every later read of the endpoint report the SAME
+/// `HarnessEndpoint` structure, so it is rendered from this one record
+/// ([`Self::endpoint`]) rather than in any handler: a member the create reports
+/// and a read does not would be a difference no stored state justifies. The
+/// harness's own id and name are NOT copied in — they are read from the harness
+/// that holds the record, so a rename cannot leave two spellings behind.
+#[derive(Debug, Clone)]
+pub struct HarnessEndpointRecord {
+    pub endpoint_name: String,
+    pub endpoint_arn: String,
+    pub description: Option<String>,
+    /// The harness version this endpoint points to, as a number; rendered like
+    /// [`HarnessRecord::version_string`] does.
+    pub target_version: u32,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// The status until [`settles_at`](Self::settles_at) passes.
+    pub transient_status: String,
+    /// The status from [`settles_at`](Self::settles_at) onwards.
+    pub settled_status: String,
+    /// The instant the transient status is owed its transition. Stored, never
+    /// slept on: a read materialises the transition the clock already made due.
+    pub settles_at: SystemTime,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl HarnessEndpointRecord {
+    /// The status this endpoint reports at `now`: the transient one until the
+    /// transition the clock owes comes due, the settled one afterwards.
+    pub fn status_at(&self, now: SystemTime) -> &str {
+        if now < self.settles_at {
+            &self.transient_status
+        } else {
+            &self.settled_status
+        }
+    }
+
+    /// The version this endpoint is SERVING at `now`.
+    ///
+    /// An endpoint serves the version it points to only once it has finished
+    /// transitioning onto it: until then the target version is the one it is
+    /// moving to and nothing is live behind the name yet, which is exactly the
+    /// difference the model documents between `liveVersion` and `targetVersion`.
+    fn live_version(&self, now: SystemTime) -> Option<String> {
+        (self.status_at(now) == STATUS_READY).then(|| self.target_version.to_string())
+    }
+
+    /// This endpoint as every harness-endpoint operation reports it at `now`, for
+    /// the harness that holds it.
+    pub fn endpoint(&self, harness_id: &str, harness_name: &str, now: SystemTime) -> HarnessEndpoint {
+        self.endpoint_with_status(harness_id, harness_name, self.status_at(now).to_string(), now)
+    }
+
+    /// This endpoint reported with `status` instead of the one the clock resolves
+    /// — the delete path, which reports the endpoint it just removed as
+    /// `DELETING`.
+    pub fn endpoint_with_status(
+        &self,
+        harness_id: &str,
+        harness_name: &str,
+        status: String,
+        now: SystemTime,
+    ) -> HarnessEndpoint {
+        HarnessEndpoint {
+            harness_id: harness_id.to_string(),
+            harness_name: harness_name.to_string(),
+            endpoint_name: self.endpoint_name.clone(),
+            arn: self.endpoint_arn.clone(),
+            status,
+            created_at: timestamp(self.created_at),
+            updated_at: timestamp(self.updated_at),
+            live_version: self.live_version(now),
+            target_version: Some(self.target_version.to_string()),
+            description: self.description.clone(),
+            // Reported only for an endpoint whose create or update failed; one
+            // this emulator drives reaches READY, which has no failure.
             failure_reason: None,
         }
     }
@@ -1789,6 +1953,17 @@ pub fn harness_runtime_environment(
 /// `HarnessArn`'s pattern.
 pub fn harness_arn(region: &str, harness_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("harness/{harness_id}"))
+}
+
+/// `arn:aws:bedrock-agentcore:{region}:{account}:harness/{harnessId}/harness-endpoint/{endpointName}`
+/// — `HarnessEndpointArn`'s pattern, which nests the endpoint under the harness
+/// that holds it.
+pub fn harness_endpoint_arn(region: &str, harness_id: &str, endpoint_name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("harness/{harness_id}/harness-endpoint/{endpoint_name}"),
+    )
 }
 
 /// How many workload identities this emulator will hold.
@@ -2745,6 +2920,7 @@ impl ConfigurationBundleRecord {
 /// the memories (and with them their 1:1 name index),
 /// [`MAX_STRATEGIES_PER_MEMORY`] the strategies one memory holds,
 /// [`MAX_HARNESSES`] the harnesses (and with them their 1:1 name index),
+/// [`MAX_ENDPOINTS_PER_HARNESS`] the endpoints one harness holds,
 /// [`MAX_REGISTRIES`] the registries (and with them their 1:1 name index),
 /// [`MAX_BROWSERS`] the browsers (and with them their 1:1 name index),
 /// [`MAX_BROWSER_PROFILES`] the browser profiles (and with them their 1:1 name
@@ -2838,6 +3014,16 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::harness_idempotency`] in the order they were first
     /// recorded, so the oldest record is the one evicted at the ceiling.
     harness_idempotency_order: VecDeque<String>,
+    /// `<operation>/<clientToken>` -> the (harness, endpointName) that token
+    /// first produced, so a replayed `CreateHarnessEndpoint` answers with its
+    /// first result instead of adding a second endpoint. Separate from
+    /// [`Self::harness_idempotency`] because the record is validated against the
+    /// endpoints of a harness rather than against the harness itself; the key
+    /// carries the operation for the same reason as there.
+    harness_endpoint_idempotency: BTreeMap<String, (String, String)>,
+    /// The keys of [`Self::harness_endpoint_idempotency`] in the order they were
+    /// first recorded, so the oldest record is the one evicted at the ceiling.
+    harness_endpoint_idempotency_order: VecDeque<String>,
     /// Every registry, keyed by `registryId` — the identifier every registry
     /// route addresses it by. The key order is the deterministic list order a
     /// registry listing pages over.
@@ -3302,12 +3488,59 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
     }
 
     /// Drop the idempotency records naming a harness that no longer exists, for
-    /// the same reason [`Self::forget_client_tokens_for`] does.
+    /// the same reason [`Self::forget_client_tokens_for`] does. The endpoint
+    /// records naming it go with them: the endpoints were removed with the
+    /// harness, so neither record can ever replay anything again.
     pub fn forget_harness_client_tokens_for(&mut self, harness_id: &str) {
         self.harness_idempotency.retain(|_, id| id != harness_id);
         let live = &self.harness_idempotency;
         self.harness_idempotency_order
             .retain(|token| live.contains_key(token));
+        self.harness_endpoint_idempotency
+            .retain(|_, (id, _)| id != harness_id);
+        let live = &self.harness_endpoint_idempotency;
+        self.harness_endpoint_idempotency_order
+            .retain(|token| live.contains_key(token));
+    }
+
+    /// The (harness, endpointName) a previous request to `operation` carrying
+    /// this `clientToken` produced, if the record is still held and the endpoint
+    /// it names still exists.
+    pub fn replayed_harness_endpoint_result(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+    ) -> Option<(String, String)> {
+        let (harness_id, endpoint_name) = self
+            .harness_endpoint_idempotency
+            .get(&token_key(operation, client_token?))?;
+        self.harnesses
+            .get(harness_id)?
+            .endpoints
+            .contains_key(endpoint_name)
+            .then(|| (harness_id.clone(), endpoint_name.clone()))
+    }
+
+    /// Record what a `clientToken` produced for `operation`, evicting the oldest
+    /// record once [`MAX_REMEMBERED_CLIENT_TOKENS`] are held. An evicted token is
+    /// indistinguishable from one whose idempotency window has passed: the next
+    /// request carrying it is served as a fresh one.
+    pub fn remember_harness_endpoint_client_token(
+        &mut self,
+        operation: &str,
+        client_token: Option<String>,
+        harness_id: &str,
+        endpoint_name: &str,
+    ) {
+        let Some(token) = client_token else {
+            return;
+        };
+        remember_token(
+            &mut self.harness_endpoint_idempotency,
+            &mut self.harness_endpoint_idempotency_order,
+            token_key(operation, &token),
+            (harness_id.to_string(), endpoint_name.to_string()),
+        );
     }
 
     /// Record what a `clientToken` produced for `operation`, evicting the oldest

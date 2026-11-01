@@ -5,6 +5,8 @@
 //! Removes one stored harness from [`crate::state`] and reports the harness it removed,
 //! in the `DELETING` status a just-deleted resource carries. A second delete of the same
 //! harness finds nothing and answers `ResourceNotFoundException`, as does any later read.
+//! A harness that still holds endpoints is not removed at all: its children are deleted
+//! first ([`crate::ops::delete_harness_endpoint`]).
 //!
 //! HAND-AUTHORED, not generated: the scaffold's op-stub generator declined this operation
 //! ("shape missing from model: smithy.api#Unit", see `src/ops/SKIPPED_STUBS.md`), so it
@@ -129,10 +131,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
+        // An endpoint is addressed only through the harness that holds it, so a harness
+        // that still has one is not destroyed: the delete is refused as the conflict with
+        // the harness's own state that it is, and the caller deletes the endpoints first,
+        // rather than the endpoints being silently cascaded away with the harness they
+        // front.
+        if let Some(harness) = store.harnesses.get(&input.harness_id) {
+            if !harness.endpoints.is_empty() {
+                return Err(DeleteHarnessErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::harness_has_endpoints(&harness.harness_name)),
+                })
+                .into());
+            }
+        }
+
         let record = store.harnesses.remove(&input.harness_id).ok_or_else(|| {
-            DeleteHarnessErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("no harness {} in this account", input.harness_id)),
-            })
+            DeleteHarnessErrorModeled::ResourceNotFoundException(crate::state::harness_not_found(
+                &input.harness_id,
+            ))
         })?;
         store.harness_names.remove(&record.harness_name);
         // An idempotency record naming a harness that is gone can never replay anything

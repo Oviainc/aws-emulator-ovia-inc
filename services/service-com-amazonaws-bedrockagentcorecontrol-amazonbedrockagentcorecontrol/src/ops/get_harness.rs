@@ -131,12 +131,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         let not_found = || {
-            GetHarnessErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "no harness {} in this account",
-                    input.harness_id
-                )),
-            })
+            GetHarnessErrorModeled::ResourceNotFoundException(crate::state::harness_not_found(
+                &input.harness_id,
+            ))
         };
         let record = store.harnesses.get(&input.harness_id).ok_or_else(not_found)?;
         // A `harnessVersion` no stored version matches is as absent as an unknown id.

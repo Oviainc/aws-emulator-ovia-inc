@@ -47,6 +47,8 @@ mod gateway_target_update_validation;
 mod gateway_wire_shape;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/harness_endpoint_lifecycle.rs"]
+mod harness_endpoint_lifecycle;
 #[path = "all/harness_lifecycle.rs"]
 mod harness_lifecycle;
 #[path = "all/harness_version_listing.rs"]

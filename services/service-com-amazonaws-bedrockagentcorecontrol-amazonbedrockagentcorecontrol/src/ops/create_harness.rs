@@ -239,6 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             timeout_seconds: input.timeout_seconds,
             tags: crate::state::sorted_map(input.tags),
             harness_id: harness_id.clone(),
+            // A harness is created with no endpoints: only
+            // `CreateHarnessEndpoint` adds one.
+            endpoints: ::std::collections::BTreeMap::new(),
         };
         let output = CreateHarnessOutput {
             harness: record.harness(now),

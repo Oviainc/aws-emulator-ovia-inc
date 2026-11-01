@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHarnessEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHarnessEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHarnessEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an endpoint ON a stored harness and PERSISTS it in [`crate::state`]: the stable
+//! name callers invoke, the harness version it points to, and the `CREATING` -> `READY`
+//! transition the clock owes it. Every later read of the endpoint
+//! ([`crate::ops::get_harness_endpoint`]) comes from that record.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +160,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHarnessEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHarnessEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHarnessEndpoint"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateHarnessEndpointErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the harness store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the endpoint
+        // that token first produced, rather than minting a second one.
+        if let Some((harness_id, endpoint_name)) =
+            store.replayed_harness_endpoint_result(Self::NAME, input.client_token.as_deref())
+        {
+            if let Some(harness) = store.harnesses.get(&harness_id) {
+                if let Some(endpoint) = harness.endpoints.get(&endpoint_name) {
+                    return Ok(CreateHarnessEndpointOutput {
+                        endpoint: endpoint.endpoint(&harness_id, &harness.harness_name, now),
+                    });
+                }
+            }
+        }
+
+        // An endpoint is a named reference to a version OF a harness, so it is addressed
+        // only through one: a create for a harness this account does not hold is the
+        // modelled 404, in the sentence every harness operation reports a missing harness
+        // in. The harness is taken MUTABLY here, the one borrow this call both decides on
+        // and writes through, so the record below cannot be reported as created without
+        // being stored.
+        let harness = store.harnesses.get_mut(&input.harness_id).ok_or_else(|| {
+            CreateHarnessEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::harness_not_found(&input.harness_id),
+            )
+        })?;
+
+        // `targetVersion` names the harness version the endpoint serves invocations
+        // from, so it has to be a version the harness actually holds; one it does not is
+        // as absent as an unknown harness, which is how every read of this service
+        // resolves a version nothing was published for. Absent, the endpoint points at
+        // the version the harness holds now.
+        if !harness.holds_version(input.target_version.as_deref()) {
+            return Err(CreateHarnessEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::harness_not_found(&input.harness_id),
+            )
+            .into());
+        }
+
+        // One endpoint per name on one harness — the name is what the endpoint's route
+        // and its ARN address it by — so a repeated name is a conflict, not a second
+        // endpoint later reads cannot tell apart.
+        if harness.endpoints.contains_key(&input.endpoint_name) {
+            return Err(CreateHarnessEndpointErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::harness_endpoint_name_taken(
+                    &input.endpoint_name,
+                    &input.harness_id,
+                )),
+            })
+            .into());
+        }
+
+        // The endpoints one harness holds are bounded, so a caller looping on create
+        // meets the modelled quota instead of this process's memory limit.
+        if harness.endpoints.len() >= crate::state::MAX_ENDPOINTS_PER_HARNESS {
+            return Err(CreateHarnessEndpointErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(crate::state::harness_endpoint_quota_met(&input.harness_id)),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::HarnessEndpointRecord {
+            endpoint_arn: crate::state::harness_endpoint_arn(
+                &region,
+                &input.harness_id,
+                &input.endpoint_name,
+            ),
+            endpoint_name: input.endpoint_name.clone(),
+            description: input.description,
+            target_version: harness.version,
+            created_at: now,
+            updated_at: now,
+            // A new endpoint is created, not ready: the transition to READY is owed by
+            // the clock, not by this call. `HarnessEndpointStatus` declares the same
+            // members `HarnessStatus` does, so the two resources share these constants.
+            transient_status: crate::state::STATUS_CREATING.to_string(),
+            settled_status: crate::state::STATUS_READY.to_string(),
+            // The endpoint serves invocations of the harness, so it cannot be ready
+            // before the harness it fronts is: its own span runs from the harness's
+            // settle instant when that is still ahead.
+            settles_at: harness.settles_at.max(now) + crate::state::HARNESS_ENDPOINT_SETTLE_DELAY,
+            tags: crate::state::sorted_map(input.tags),
+        };
+        let output = CreateHarnessEndpointOutput {
+            endpoint: record.endpoint(&input.harness_id, &harness.harness_name, now),
+        };
+        harness.endpoints.insert(input.endpoint_name.clone(), record);
+
+        store.remember_harness_endpoint_client_token(
+            Self::NAME,
+            input.client_token,
+            &input.harness_id,
+            &input.endpoint_name,
+        );
+
+        Ok(output)
     }
 }
