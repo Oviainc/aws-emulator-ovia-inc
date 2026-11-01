@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRepositoryLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRepositoryLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRepositoryLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation writes the members the request supplies onto the stored
+//! repository-link record and answers out of that record, so every later reader serves
+//! the updated association. This is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +121,25 @@ impl From<UpdateRepositoryLinkErrorModeled> for UpdateRepositoryLinkError {
     }
 }
 
+/// How this operation answers a `RepositoryLinkId` it holds no link under: the modeled
+/// `ResourceNotFoundException`, worded and statused exactly as every other operation
+/// addressing a link by its id words it (`crate::state::repository_link_not_found_message`,
+/// and `crate::state::REPOSITORY_LINK_NOT_FOUND_STATUS` for the status this endpoint's
+/// recorded wire answers its client errors with).
+///
+/// One function, so the refusal reads the same whichever of the handler's two resolutions
+/// of the id found it absent.
+fn link_not_found(repository_link_id: &str) -> UpdateRepositoryLinkError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        UpdateRepositoryLinkErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: Some(crate::state::repository_link_not_found_message(
+                repository_link_id,
+            )),
+        }),
+        crate::state::REPOSITORY_LINK_NOT_FOUND_STATUS,
+    )
+}
+
 /// The `UpdateRepositoryLink` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -163,18 +176,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRepositoryLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRepositoryLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRepositoryLinkErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "CodeStar connections state is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // An id this service holds no link under names a resource that is ABSENT, which is
+        // the modeled `ResourceNotFoundException` (see [`link_not_found`]). Nothing is
+        // written on this path, so a refused update leaves state untouched.
+        let Some(link) = store.repository_links.get(&input.repository_link_id) else {
+            return Err(link_not_found(&input.repository_link_id));
+        };
+        let stored_provider_type = link.provider_type.clone();
+
+        // A new association is RESOLVED against the connection store before anything is
+        // written, exactly as `CreateRepositoryLink` resolves the one it registers: a link
+        // must never name a connection that is not there. This operation models no
+        // `ResourceNotFoundException` for the CONNECTION (its `ResourceNotFoundException`
+        // answers the link the request addresses), so an unresolvable `ConnectionArn` is
+        // the modeled `InvalidInputException`, naming the member whose value could not be
+        // resolved.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRepositoryLink"))
+        // The doc states the one condition on a new association: "The updated connection
+        // ARN must have the same providerType (such as GitHub) as the original connection
+        // ARN for the repo link" — so the provider type of the proposed connection is
+        // compared with the link's own, and `RepositoryLinkInfo.ProviderType` stays what
+        // the connection the link names reports. Both checks run BEFORE the write, so a
+        // refused update changes nothing.
+        let new_connection_arn = match input.connection_arn {
+            None => None,
+            Some(connection_arn) => {
+                let Some(connection) = store.connections.get(&connection_arn) else {
+                    return Err(UpdateRepositoryLinkErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(format!(
+                                "The input is not valid. ConnectionArn names no connection in this account: {connection_arn}"
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                if connection.provider_type.as_deref() != Some(stored_provider_type.as_str()) {
+                    return Err(UpdateRepositoryLinkErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(format!(
+                                "The input is not valid. The updated connection ARN must have the same providerType ({stored_provider_type}) as the original connection ARN for the repository link."
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Some(connection_arn)
+            }
+        };
+
+        // "Updates the association between your connection and a specified external Git
+        // repository": each optional member REPLACES the stored one when the request
+        // carries it and is left as it was when the request omits it, so an update never
+        // silently clears a value the caller did not mention. The write lands on the ONE
+        // stored record, so `GetRepositoryLink` and `ListRepositoryLinks` report the
+        // updated association from then on; the link keeps its id, ARN, owner, repository
+        // name and provider type, none of which this operation models a member for.
+        let Some(link) = store.repository_links.get_mut(&input.repository_link_id) else {
+            return Err(link_not_found(&input.repository_link_id));
+        };
+        if let Some(connection_arn) = new_connection_arn {
+            link.connection_arn = connection_arn;
+        }
+        if let Some(encryption_key_arn) = input.encryption_key_arn {
+            link.encryption_key_arn = Some(encryption_key_arn);
+        }
+        // Report the row that is STORED, projected by the store's own single projection
+        // onto the wire shape, so this response and what a later reader answers are the
+        // same record rather than two renderings of the request.
+        let repository_link_info = link.to_repository_link_info();
+        drop(store);
+
+        // Audit record for a state-changing operation: who presented which access key id,
+        // what changed, and the outcome. No secret is logged — the access key id is the
+        // public half the request already carries in its SigV4 scope.
+        ::tracing::info!(
+            operation = "UpdateRepositoryLink",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            repository_link_id = %input.repository_link_id,
+            outcome = "updated",
+            "repository link updated"
+        );
+
+        // The remaining modeled errors describe conditions this emulator never reaches:
+        // `ConditionalCheckFailedException` and `UpdateOutOfSyncException` report a
+        // concurrent or out-of-sync write (the store lock serialises every call, so no
+        // second operation is ever in flight here), and `AccessDeniedException` /
+        // `ThrottlingException` are not conditions of the request's content.
+        Ok(UpdateRepositoryLinkOutput {
+            repository_link_info,
+        })
     }
 }

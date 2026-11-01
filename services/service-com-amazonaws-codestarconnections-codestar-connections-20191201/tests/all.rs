@@ -33,6 +33,8 @@ mod repository_link_lifecycle;
 mod repository_link_listing;
 #[path = "all/repository_link_reads.rs"]
 mod repository_link_reads;
+#[path = "all/repository_link_update.rs"]
+mod repository_link_update;
 #[path = "all/repository_sync_definitions.rs"]
 mod repository_sync_definitions;
 #[path = "all/repository_sync_status.rs"]
