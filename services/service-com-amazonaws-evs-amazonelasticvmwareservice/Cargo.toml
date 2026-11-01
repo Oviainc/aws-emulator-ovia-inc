@@ -23,7 +23,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
 # `iam_authorization`: the shared evaluation of IAM policy documents against
-# (action, resource), which this service's authorization gate runs on every request.
+# (action, resource), which this service's authorization gate runs on every request;
+# `page_tokens`: the ONE authenticated minter behind every `nextToken` of this emulator.
 service-common = { path = "../common" }
 # The IAM store holds the identity-based policies of the principal a request speaks
 # for, and the STS store resolves which principal that is: this service reads both

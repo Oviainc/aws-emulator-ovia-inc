@@ -2789,6 +2789,14 @@ pub struct ComAmazonawsEvsAmazonelasticvmwareserviceState {
     /// Mixed into every minted id so ids are not guessable from a sequence. Seeded
     /// on first use (a zero salt means "not seeded yet").
     id_salt: u64,
+    /// The secret THIS store's `nextToken`s are authenticated under, drawn from the
+    /// system's randomness when the store is created ([`PageTokenKey`]).
+    ///
+    /// One key per store, so a token minted against one store names no position in
+    /// another — another emulator process, a restarted one, or a second store in this
+    /// one. `Copy`, so a paginated read takes the key off the store and goes on to
+    /// borrow the records it is about to report in the same call.
+    pub page_token_key: PageTokenKey,
 }
 
 impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
@@ -3454,23 +3462,139 @@ pub enum PageTokenError {
     Expired,
 }
 
-/// Encode a pagination cursor — the key of the first item of the NEXT page — as a
-/// `nextToken`.
+/// The secret this service's page tokens are authenticated under — the shared one every
+/// paginated read of this emulator uses, so no two services disagree about what makes a
+/// continuation token one the service ISSUED. One key per store
+/// ([`ComAmazonawsEvsAmazonelasticvmwareserviceState::page_token_key`]).
+pub use ::service_common::page_tokens::PageTokenKey;
+
+/// How many bytes of authenticator a minted token carries ahead of its payload, from the
+/// shared minter: re-exported so a test can build a value with the SHAPE of a minted
+/// token without restating the width.
+pub use ::service_common::page_tokens::AUTHENTICATOR_BYTES;
+
+/// The LISTING a `nextToken` is a position in: the operation that issued it, the Region
+/// endpoint it was issued at, and the request members that SELECT which items that
+/// listing pages over.
 ///
-/// The token carries the cursor and the instant it was issued, hex-encoded so it is
-/// opaque to the caller (AWS documents no structure for these tokens) while staying
-/// exactly resumable.
-pub fn encode_page_token(cursor: &str) -> String {
-    ::hex::encode(format!("{}:{cursor}", now_ms()))
+/// "Make the call again using the returned token with all other arguments unchanged to
+/// retrieve the next page" (the `nextToken` doc every `@paginated` operation of this
+/// service carries): a token is a position in ONE listing, so the scope travels inside
+/// the authenticated payload ([`encode_page_token`]) and is compared with the scope of
+/// the listing the token comes back to ([`decode_page_token`]). A token another
+/// operation, another Region's endpoint or another selection minted names no position in
+/// this listing, so it is refused exactly like a token this service never issued, rather
+/// than honoured as a place to start this scan.
+///
+/// `maxResults` is deliberately not part of a scope: it bounds how many items a page
+/// reports, not which items the listing pages over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageScope(String);
+
+impl PageScope {
+    /// The scope of `operation`'s listing at the endpoint of `region` — the two halves
+    /// every listing of this service has.
+    pub fn new(operation: &str, region: &str) -> Self {
+        let mut scope = Self(String::new());
+        scope.push(operation);
+        scope.push(region);
+        scope
+    }
+
+    /// The same scope with one more selector — a request member that decides which
+    /// items the listing pages over (the resource it is addressed to, a filter it
+    /// applies). An operation adds its selectors in one fixed order, so one request
+    /// builds one scope.
+    #[must_use]
+    pub fn selecting(mut self, selector: &str) -> Self {
+        self.push(selector);
+        self
+    }
+
+    fn push(&mut self, part: &str) {
+        self.0.push_str(&page_token_field(part));
+    }
 }
 
-/// Decode a `nextToken` produced by [`encode_page_token`] back to its cursor.
-pub fn decode_page_token(token: &str) -> Result<String, PageTokenError> {
-    let decoded = ::hex::decode(token)
+/// One field of a token's payload, length-prefixed so that a sequence of fields encodes
+/// injectively: no two different sequences build one text, so no scope or cursor can be
+/// smuggled through the text of another.
+fn page_token_field(part: &str) -> String {
+    format!("{}:{part}", part.len())
+}
+
+/// The first length-prefixed field of `text` ([`page_token_field`]) and what follows it,
+/// or `None` when `text` does not open with one.
+fn take_page_token_field(text: &str) -> Option<(&str, &str)> {
+    let (length, rest) = text.split_once(':')?;
+    let length: usize = length.parse().ok()?;
+    rest.is_char_boundary(length).then(|| rest.split_at(length))
+}
+
+/// What a token authenticates: the listing it is a position in, the instant it was issued
+/// and the cursor it carries — so none of the three can be changed, and no token of
+/// another listing can be replayed here, without the authenticator failing.
+fn page_token_payload(scope: &PageScope, issued_at_ms: i64, cursor: &str) -> String {
+    format!(
+        "{}{}{}",
+        scope.0,
+        page_token_field(&issued_at_ms.to_string()),
+        page_token_field(cursor)
+    )
+}
+
+/// Encode a pagination cursor — the key of the first item of the NEXT page of `scope`'s
+/// listing — as a `nextToken`.
+///
+/// Hex is this service's spelling for an opaque token (AWS documents no structure for
+/// these): the authenticated bytes the shared minter returns, rendered once, so the token
+/// is a value a caller round-trips rather than constructs while staying exactly resumable.
+pub fn encode_page_token(key: &PageTokenKey, scope: &PageScope, cursor: &str) -> String {
+    encode_page_token_issued_at(key, scope, cursor, now_ms())
+}
+
+/// [`encode_page_token`] with the instant of issue NAMED rather than read from the
+/// clock: the one place that instant enters a token, so the [`PAGE_TOKEN_TTL`] rule can
+/// be exercised without waiting a day for it.
+pub fn encode_page_token_issued_at(
+    key: &PageTokenKey,
+    scope: &PageScope,
+    cursor: &str,
+    issued_at_ms: i64,
+) -> String {
+    ::hex::encode(key.mint(&page_token_payload(scope, issued_at_ms, cursor)))
+}
+
+/// The cursor a `nextToken` resumes `scope`'s listing at.
+///
+/// A token resumes a listing only when THIS store issued it FOR that listing: the shared
+/// minter recovers the payload only for a token its key authenticated, and the payload
+/// then has to be exactly this listing's scope followed by an instant and a cursor. So a
+/// token a caller built, one another listing or another selection minted, one another
+/// store minted, and one whose bytes were edited all carry no position here and are
+/// refused ([`PageTokenError::Malformed`]) instead of being honoured as a place to start
+/// the scan. Only a token this store really did issue for this listing can then be too
+/// old to resume ([`PageTokenError::Expired`]).
+pub fn decode_page_token(
+    key: &PageTokenKey,
+    scope: &PageScope,
+    token: &str,
+) -> Result<String, PageTokenError> {
+    let payload = ::hex::decode(token)
         .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|bytes| key.cursor_of(&bytes))
         .ok_or(PageTokenError::Malformed)?;
-    let (issued_at_ms, cursor) = decoded.split_once(':').ok_or(PageTokenError::Malformed)?;
+    let fields = payload
+        .strip_prefix(&scope.0)
+        .ok_or(PageTokenError::Malformed)?;
+    let (issued_at_ms, fields) =
+        take_page_token_field(fields).ok_or(PageTokenError::Malformed)?;
+    let (cursor, rest) = take_page_token_field(fields).ok_or(PageTokenError::Malformed)?;
+    // Nothing may follow the cursor: the payload is this listing's scope and these two
+    // fields, so a longer scope whose text merely opens with this one is refused too.
+    if !rest.is_empty() {
+        return Err(PageTokenError::Malformed);
+    }
     let issued_at_ms: i64 = issued_at_ms.parse().map_err(|_| PageTokenError::Malformed)?;
     if now_ms().saturating_sub(issued_at_ms) > PAGE_TOKEN_TTL.as_millis() as i64 {
         return Err(PageTokenError::Expired);

@@ -188,15 +188,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
 
-        // The cursor is the store key of the entitlement the next page starts at.
-        let start_at = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => Some(crate::state::decode_page_token(token).map_err(|error| {
-                ListVmEntitlementsErrorModeled::ValidationException(
-                    crate::state::invalid_next_token(error),
-                )
-            })?),
-        };
+        // The listing a `nextToken` of this operation is a position in: this operation,
+        // at this endpoint's Region, over the entitlements the request's environment,
+        // connector and entitlement type select — all three decide which entitlements
+        // are paged over, so a token minted for one selection resumes no scan of another.
+        let scope = crate::state::PageScope::new(Self::NAME, &region)
+            .selecting(&input.environment_id)
+            .selecting(&input.connector_id)
+            .selecting(&input.entitlement_type);
         // The one page bound this service's paginated operations share.
         let page_size = crate::state::page_size(input.max_results);
 
@@ -204,6 +203,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting only: this materialises the entitlement status changes the clock
         // already owed, which were due whether or not anybody listed them.
         state.materialise_due_transitions();
+
+        // The secret THIS store authenticates its own page tokens under, taken off the
+        // store before the records it is about to report are borrowed.
+        let page_token_key = state.page_token_key;
+        // The cursor is the store key of the entitlement the next page starts at.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(&page_token_key, &scope, token).map_err(
+                    |error| {
+                        ListVmEntitlementsErrorModeled::ValidationException(
+                            crate::state::invalid_next_token(error),
+                        )
+                    },
+                )?,
+            ),
+        };
 
         // Regional resource: the entitlements of an environment are only listable at
         // the endpoint of the Region that environment was created in.
@@ -266,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The next page starts at the first entitlement this one did not report.
         let next_token = matching
             .next()
-            .map(|(key, _)| crate::state::encode_page_token(key));
+            .map(|(key, _)| crate::state::encode_page_token(&page_token_key, &scope, key));
 
         Ok(ListVmEntitlementsOutput {
             next_token,

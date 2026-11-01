@@ -171,22 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
 
-        // The cursor is the VLAN id the next page starts at.
-        let start_at = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => {
-                let cursor = crate::state::decode_page_token(token).map_err(|error| {
-                    ListEnvironmentVlansErrorModeled::ValidationException(
-                        crate::state::invalid_next_token(error),
-                    )
-                })?;
-                Some(cursor.parse::<i32>().map_err(|_| {
-                    ListEnvironmentVlansErrorModeled::ValidationException(
-                        crate::state::invalid_next_token(crate::state::PageTokenError::Malformed),
-                    )
-                })?)
-            }
-        };
+        // The listing a `nextToken` of this operation is a position in: this operation,
+        // at this endpoint's Region, over the VLANs of the environment the request
+        // addresses — the one member that decides which VLANs are paged over.
+        let scope = crate::state::PageScope::new(Self::NAME, &region)
+            .selecting(&input.environment_id);
         // The one page bound this service's paginated operations share.
         let page_size = crate::state::page_size(input.max_results);
 
@@ -194,6 +183,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting only: this materialises the VLAN state changes the clock already
         // owed, which were due whether or not anybody listed them.
         state.materialise_due_transitions();
+
+        // The secret THIS store authenticates its own page tokens under, taken off the
+        // store before the records it is about to report are borrowed.
+        let page_token_key = state.page_token_key;
+        // The cursor is the VLAN id the next page starts at.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let cursor = crate::state::decode_page_token(&page_token_key, &scope, token)
+                    .map_err(|error| {
+                        ListEnvironmentVlansErrorModeled::ValidationException(
+                            crate::state::invalid_next_token(error),
+                        )
+                    })?;
+                Some(cursor.parse::<i32>().map_err(|_| {
+                    ListEnvironmentVlansErrorModeled::ValidationException(
+                        crate::state::invalid_next_token(crate::state::PageTokenError::Malformed),
+                    )
+                })?)
+            }
+        };
 
         // Regional resource: the VLANs of an environment are only listable at the
         // endpoint of the Region that environment was created in.
@@ -225,7 +235,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The next page starts at the first VLAN this one did not report.
         let next_token = matching
             .next()
-            .map(|vlan| crate::state::encode_page_token(&vlan.vlan_id.to_string()));
+            .map(|vlan| {
+                crate::state::encode_page_token(
+                    &page_token_key,
+                    &scope,
+                    &vlan.vlan_id.to_string(),
+                )
+            });
 
         Ok(ListEnvironmentVlansOutput {
             next_token,

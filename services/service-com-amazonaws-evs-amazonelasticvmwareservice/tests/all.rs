@@ -104,6 +104,8 @@ mod list_vm_entitlements_connector;
 mod list_while_initializing;
 #[path = "all/page_size_bound.rs"]
 mod page_size_bound;
+#[path = "all/page_token_binding.rs"]
+mod page_token_binding;
 #[path = "all/public_vlan_netmask.rs"]
 mod public_vlan_netmask;
 #[path = "all/put_account_settings_due_transitions.rs"]

@@ -164,26 +164,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
 
-        let start_after = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => Some(crate::state::decode_page_token(token).map_err(|error| {
-                ListEnvironmentsErrorModeled::ValidationException(
-                    crate::state::invalid_next_token(error),
-                )
-            })?),
-        };
-        // The one page bound this service's paginated operations share.
-        let page_size = crate::state::page_size(input.max_results);
-        let wanted_states = input.state.unwrap_or_default();
         // "Lists the Amazon EVS environments in your Amazon Web Services account in the
         // specified Amazon Web Services Region": an environment is a regional resource,
         // so only the ones created at this endpoint's Region are listed.
         let region = crate::state::request_region(ctx.parts());
+        let wanted_states = input.state.unwrap_or_default();
+        // The listing a `nextToken` of this operation is a position in: this operation,
+        // at this endpoint's Region, filtered to these states. The `state` filter decides
+        // WHICH environments are paged over, so a token minted under one filter resumes
+        // no scan under another. Sorted and deduplicated, because two requests naming the
+        // same states in another order, or naming one of them twice, select the same
+        // environments and so page over one listing.
+        let scope = {
+            let mut states: Vec<&str> = wanted_states.iter().map(String::as_str).collect();
+            states.sort_unstable();
+            states.dedup();
+            states.into_iter().fold(
+                crate::state::PageScope::new(Self::NAME, &region),
+                crate::state::PageScope::selecting,
+            )
+        };
+
+        // The one page bound this service's paginated operations share.
+        let page_size = crate::state::page_size(input.max_results);
 
         let mut state = state.lock();
         // Reporting only: this materialises the state changes the clock already owed,
         // so the filter and the page report the states that are due at this instant.
         state.materialise_due_transitions();
+
+        // The secret THIS store authenticates its own page tokens under, taken off the
+        // store before the records it is about to report are borrowed.
+        let page_token_key = state.page_token_key;
+        let start_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(&page_token_key, &scope, token).map_err(
+                    |error| {
+                        ListEnvironmentsErrorModeled::ValidationException(
+                            crate::state::invalid_next_token(error),
+                        )
+                    },
+                )?,
+            ),
+        };
 
         let mut matching = state
             .environments
@@ -207,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The next page starts at the first environment this one did not report.
         let next_token = matching
             .next()
-            .map(|(id, _)| crate::state::encode_page_token(id));
+            .map(|(id, _)| crate::state::encode_page_token(&page_token_key, &scope, id));
 
         Ok(ListEnvironmentsOutput {
             next_token,
