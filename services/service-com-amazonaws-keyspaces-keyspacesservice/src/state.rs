@@ -296,14 +296,15 @@ pub const MULTI_REGION_STRATEGY: &str = "MULTI_REGION";
 ///   `dropped_columns`, `triggers`, `views`, `functions`, `aggregates`, `indexes`).
 /// * `system_schema_mcs`: Amazon Keyspaces' own copy of that catalog — the schema views
 ///   it serves (`SELECT * FROM system_schema_mcs.keyspaces`, `... .tables`,
-///   `... .columns` in the Amazon Keyspaces Developer Guide) plus the two
-///   Keyspaces-specific views the same guide reads a table's AWS settings out of,
-///   `tags` and `autoscaling`.
-/// * `system`: the node-local metadata Cassandra drivers read on connect; Amazon
-///   Keyspaces serves `system.local` and `system.peers` for exactly that handshake.
+///   `... .columns` in the Amazon Keyspaces Developer Guide), the history view of the
+///   same table catalog (`tables_history`), plus the two Keyspaces-specific views the
+///   same guide reads a table's AWS settings out of, `tags` and `autoscaling`.
+/// * `system`: the node-local and cluster-local metadata a Cassandra driver reads, which
+///   is the whole Cassandra `system` keyspace, not only the `local`/`peers` pair a
+///   connect handshake reads.
 /// * `system_multiregion_info`: the multi-Region replication status catalog, read as
 ///   `SELECT * FROM system_multiregion_info.tables` in the Developer Guide's
-///   multi-Region section.
+///   multi-Region section, beside that keyspace's other per-Region views.
 ///
 /// Ordered as a [`std::collections::BTreeMap`] would order it, so the seed is written in
 /// the one total order every listing reports.
@@ -314,12 +315,43 @@ pub const SERVICE_MANAGED_KEYSPACES: &[(&str, &[&str])] = &[
     ("system_schema_mcs", SYSTEM_SCHEMA_MCS_TABLES),
 ];
 
-/// The tables of the `system` keyspace. See [`SERVICE_MANAGED_KEYSPACES`].
-pub const SYSTEM_TABLES: &[&str] = &["local", "peers"];
+/// The tables of the `system` keyspace: the whole Cassandra system catalog Amazon
+/// Keyspaces publishes, which is what a recorded `ListTables` on an untouched account
+/// reports for it — the `local` and `peers` tables a driver reads on connect are two
+/// entries of it, not the catalog.
+///
+/// The other entries are the rest of the Cassandra `system` keyspace: the index and
+/// view build records (`IndexInfo`, `built_views`, `views_builds_in_progress`), the
+/// write-path records (`batches`, `paxos`), the streaming and range records
+/// (`available_ranges`, `range_xfers`, `transferred_ranges`), the node-event and
+/// statistics records (`peer_events`, `compaction_history`, `sstable_activity`,
+/// `size_estimates`) and the prepared-statement cache (`prepared_statements`). The
+/// pre-3.0 write-path tables (`batchlog`, `hints`) are deliberately NOT here: the
+/// recorded catalog carries neither. See [`SERVICE_MANAGED_KEYSPACES`].
+pub const SYSTEM_TABLES: &[&str] = &[
+    "IndexInfo",
+    "available_ranges",
+    "batches",
+    "built_views",
+    "compaction_history",
+    "local",
+    "paxos",
+    "peer_events",
+    "peers",
+    "prepared_statements",
+    "range_xfers",
+    "size_estimates",
+    "sstable_activity",
+    "transferred_ranges",
+    "views_builds_in_progress",
+];
 
-/// The tables of the `system_multiregion_info` keyspace. See
-/// [`SERVICE_MANAGED_KEYSPACES`].
-pub const SYSTEM_MULTIREGION_INFO_TABLES: &[&str] = &["tables"];
+/// The tables of the `system_multiregion_info` keyspace: the per-Region views of the
+/// multi-Region catalog — the replication status of a keyspace's `tables`, of the
+/// `keyspaces` themselves and of their `types`, plus the per-Region `autoscaling`
+/// settings. See [`SERVICE_MANAGED_KEYSPACES`].
+pub const SYSTEM_MULTIREGION_INFO_TABLES: &[&str] =
+    &["autoscaling", "keyspaces", "tables", "types"];
 
 /// The tables of the `system_schema` keyspace: Cassandra's ten schema views, which is
 /// what a recorded `ListTables` on an untouched account reports for it. See
@@ -338,9 +370,10 @@ pub const SYSTEM_SCHEMA_TABLES: &[&str] = &[
 ];
 
 /// The tables of the `system_schema_mcs` keyspace: the schema views Amazon Keyspaces
-/// serves in its own copy of the catalog, plus the Keyspaces-specific `tags` and
-/// `autoscaling` views. `dropped_columns` is deliberately NOT here: it is a
-/// `system_schema` view that the recorded `system_schema_mcs` catalog does not carry.
+/// serves in its own copy of the catalog, the `tables_history` view of the table
+/// catalog, plus the Keyspaces-specific `tags` and `autoscaling` views.
+/// `dropped_columns` is deliberately NOT here: it is a `system_schema` view that the
+/// recorded `system_schema_mcs` catalog does not carry.
 /// See [`SERVICE_MANAGED_KEYSPACES`].
 pub const SYSTEM_SCHEMA_MCS_TABLES: &[&str] = &[
     "aggregates",
@@ -350,6 +383,7 @@ pub const SYSTEM_SCHEMA_MCS_TABLES: &[&str] = &[
     "indexes",
     "keyspaces",
     "tables",
+    "tables_history",
     "tags",
     "triggers",
     "types",
