@@ -180,6 +180,14 @@
 //! `GetDataQualityRuleRecommendationRun` takes and nothing else, so the data source a run
 //! covers is recorded on the run rather than the run on the table.
 //!
+//! DATA QUALITY RULESET EVALUATION RUNS — the runs
+//! `StartDataQualityRulesetEvaluationRun` starts of stored rulesets over one data source —
+//! sit beside the catalog tree in their own per-account list
+//! ([`ComAmazonawsGlueAwsglueState::data_quality_ruleset_evaluation_runs`]), for the same
+//! reason a recommendation run does: `GetDataQualityRulesetEvaluationRun` addresses a run
+//! by the `RunId` the start minted and nothing else, so the data source and the rulesets a
+//! run evaluates are recorded on the run.
+//!
 //! DATA QUALITY RULESETS — the DQDL rule sets `CreateDataQualityRuleset` registers — sit
 //! beside the catalog tree in a per-account namespace keyed by ruleset name
 //! ([`ComAmazonawsGlueAwsglueState::data_quality_rulesets`]), because every operation that
@@ -267,7 +275,8 @@ use crate::ops::types::{
     CreateSecurityConfigurationInput, CreateSessionInput, CreateTriggerInput, CreateWorkflowInput,
     CustomEntityType,
     DataCatalogEncryptionSettings, DataLakeAccessPropertiesOutput, DataLakePrincipal,
-    DataQualityRuleRecommendationRunAdditionalRunOptions, DataQualityRulesetFilterCriteria,
+    DataQualityRuleRecommendationRunAdditionalRunOptions, DataQualityEvaluationRunAdditionalRunOptions,
+    DataQualityRulesetFilterCriteria,
     DataQualityRulesetListDetails, DataQualityTargetTable,
     DataSource, Database, DatabaseIdentifier, DatabaseInput,
     Edge, EncryptionAtRest, EncryptionConfiguration, ErrorDetail, EventBatchingCondition,
@@ -286,6 +295,7 @@ use crate::ops::types::{
     SourceProcessingProperties, SourceTableConfig,
     StartColumnStatisticsTaskRunInput,
     StartDataQualityRuleRecommendationRunInput,
+    StartDataQualityRulesetEvaluationRunInput,
     StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput,
     Statement, StatementOutput,
     TableVersion, TargetRedshiftCatalog,
@@ -1052,6 +1062,16 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// ([`DataQualityRuleRecommendationRunEntry`]). Kept in start order and bounded by
     /// [`MAX_DATA_QUALITY_RULE_RECOMMENDATION_RUNS`].
     pub data_quality_rule_recommendation_runs: Vec<DataQualityRuleRecommendationRunEntry>,
+    /// Every data quality ruleset evaluation run this emulator holds, oldest first.
+    ///
+    /// A run lives BESIDE the catalog tree rather than on the table it evaluates, for the
+    /// same reason a rule recommendation run does:
+    /// `GetDataQualityRulesetEvaluationRun` addresses one by `RunId` alone, with no
+    /// catalog, database or table member, so the namespace is per account and the data
+    /// source and the rulesets a run evaluates are recorded ON the run
+    /// ([`DataQualityRulesetEvaluationRunEntry`]). Kept in start order and bounded by
+    /// [`MAX_DATA_QUALITY_RULESET_EVALUATION_RUNS`].
+    pub data_quality_ruleset_evaluation_runs: Vec<DataQualityRulesetEvaluationRunEntry>,
     /// Every data quality ruleset this emulator holds, keyed by its name, in name order.
     ///
     /// Per account and beside the catalog tree, like crawlers and custom entity types:
@@ -1379,16 +1399,39 @@ impl ComAmazonawsGlueAwsglueState {
         &self,
         run: &DataQualityRuleRecommendationRunEntry,
     ) -> RecommendationRunOutcome {
-        let Some(database) = self.database(&run.catalog_id, &run.database_name) else {
-            return RecommendationRunOutcome::NothingToAnalyse(messages::database_not_found(
-                &run.database_name,
-            ));
+        if let Some(reason) =
+            self.catalog_table_miss(&run.catalog_id, &run.database_name, &run.table_name)
+        {
+            return RecommendationRunOutcome::NothingToAnalyse(reason);
+        }
+        let columns = self
+            .database(&run.catalog_id, &run.database_name)
+            .and_then(|database| database.tables.get(&fold_name(&run.table_name)))
+            .map(table_column_names)
+            .unwrap_or_default();
+        RecommendationRunOutcome::Recommended(columns)
+    }
+
+    /// Why the catalog offers a data quality run nothing to read at this address — the
+    /// database it does not hold, or the table that database does not hold — or `None` when
+    /// it holds the table.
+    ///
+    /// Every data quality run resolves its data source against the catalog in these same
+    /// terms, so the reason a run carries for a data source the catalog holds nothing for is
+    /// worded here once rather than once per kind of run.
+    pub fn catalog_table_miss(
+        &self,
+        catalog_id: &str,
+        database_name: &str,
+        table_name: &str,
+    ) -> Option<String> {
+        let Some(database) = self.database(catalog_id, database_name) else {
+            return Some(messages::database_not_found(database_name));
         };
-        match database.tables.get(&fold_name(&run.table_name)) {
-            Some(table) => RecommendationRunOutcome::Recommended(table_column_names(table)),
-            None => RecommendationRunOutcome::NothingToAnalyse(messages::table_not_found(
-                &run.table_name,
-            )),
+        if database.tables.contains_key(&fold_name(table_name)) {
+            None
+        } else {
+            Some(messages::table_not_found(table_name))
         }
     }
 
@@ -1461,6 +1504,79 @@ impl ComAmazonawsGlueAwsglueState {
             let overflow = self.data_quality_rule_recommendation_runs.len()
                 - MAX_DATA_QUALITY_RULE_RECOMMENDATION_RUNS;
             self.data_quality_rule_recommendation_runs.drain(..overflow);
+        }
+    }
+
+    /// Give every data quality ruleset evaluation run the state the CLOCK already owed it at
+    /// `now`, exactly as [`Self::settle_due_data_quality_rule_recommendation_runs`] does for
+    /// a recommendation run.
+    ///
+    /// What a due run settles into is read off the catalog — whether it still holds every
+    /// table the run evaluates — so the outcome of every run still due is resolved first and
+    /// applied afterwards: one walk reads the catalog, the next writes the runs.
+    pub fn settle_due_data_quality_ruleset_evaluation_runs(&mut self, now: SystemTime) {
+        let misses: Vec<(usize, Option<String>)> = self
+            .data_quality_ruleset_evaluation_runs
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| run.is_due(now))
+            .map(|(index, run)| (index, self.evaluated_tables_miss(run)))
+            .collect();
+        for (index, miss) in misses {
+            if let Some(run) = self.data_quality_ruleset_evaluation_runs.get_mut(index) {
+                run.settle(miss);
+            }
+        }
+    }
+
+    /// Why the catalog offers `run` nothing to evaluate — the first of its data sources it
+    /// holds no table for, in the order the run records them, named as the start spelled it —
+    /// or `None` when it holds every one of them.
+    fn evaluated_tables_miss(&self, run: &DataQualityRulesetEvaluationRunEntry) -> Option<String> {
+        run.evaluated_tables().find_map(|table| {
+            self.catalog_table_miss(&table.catalog_id, &table.database_name, &table.table_name)
+        })
+    }
+
+    /// The stored data quality ruleset evaluation run with this id, or `None` when this
+    /// account holds no such run.
+    pub fn data_quality_ruleset_evaluation_run(
+        &self,
+        id: &str,
+    ) -> Option<&DataQualityRulesetEvaluationRunEntry> {
+        self.data_quality_ruleset_evaluation_runs
+            .iter()
+            .find(|run| run.id == id)
+    }
+
+    /// The evaluation run an earlier start with this `ClientToken` recorded, if one did.
+    ///
+    /// `StartDataQualityRulesetEvaluationRunRequest$ClientToken` is "used for idempotency
+    /// … to avoid creating or starting multiple instances of the same resource", so a start
+    /// carrying a token already recorded is the duplicate the service refuses rather than a
+    /// second run.
+    pub fn data_quality_ruleset_evaluation_run_of_client_token(
+        &self,
+        client_token: &str,
+    ) -> Option<&DataQualityRulesetEvaluationRunEntry> {
+        self.data_quality_ruleset_evaluation_runs
+            .iter()
+            .find(|run| run.client_token.as_deref() == Some(client_token))
+    }
+
+    /// Append a data quality ruleset evaluation run, keeping at most
+    /// [`MAX_DATA_QUALITY_RULESET_EVALUATION_RUNS`] of them.
+    pub fn record_data_quality_ruleset_evaluation_run(
+        &mut self,
+        run: DataQualityRulesetEvaluationRunEntry,
+    ) {
+        self.data_quality_ruleset_evaluation_runs.push(run);
+        if self.data_quality_ruleset_evaluation_runs.len()
+            > MAX_DATA_QUALITY_RULESET_EVALUATION_RUNS
+        {
+            let overflow = self.data_quality_ruleset_evaluation_runs.len()
+                - MAX_DATA_QUALITY_RULESET_EVALUATION_RUNS;
+            self.data_quality_ruleset_evaluation_runs.drain(..overflow);
         }
     }
 
@@ -11684,6 +11800,15 @@ pub mod messages {
         format!("Idempotent start Data Quality run with token {client_token}")
     }
 
+    /// A data quality ruleset evaluation run lookup
+    /// (`GetDataQualityRulesetEvaluationRun`) for an id no run in this account has. NOT
+    /// recorded: the sentence follows the per-resource template of
+    /// [`data_quality_rule_recommendation_run_not_found`], built from the requested id,
+    /// which is the whole address of a run.
+    pub fn data_quality_ruleset_evaluation_run_not_found(run_id: &str) -> String {
+        format!("Data quality ruleset evaluation run with id {run_id} does not exist")
+    }
+
     /// A data quality run start whose `DataSource` carries neither kind of Glue table. NOT
     /// recorded: what is pinned is the behaviour — 400 with the operation's modelled
     /// `InvalidInputException` — and the sentence names the members the input has to carry
@@ -11693,7 +11818,8 @@ pub mod messages {
 
     /// A data quality ruleset lookup for a name this account holds no ruleset under — the
     /// miss of every operation that addresses one by `Name` (`GetDataQualityRuleset`, and
-    /// the update and delete that address a ruleset the same way).
+    /// the update and delete that address a ruleset the same way), and of the evaluation
+    /// start that names the rulesets to evaluate in its `RulesetNames`.
     ///
     /// Recorded template: the sentence names the account whose namespace was searched and
     /// then the ruleset the request addressed, because a ruleset's name is "a unique name
@@ -13883,15 +14009,9 @@ impl DataQualityRuleRecommendationRunEntry {
     }
 
     /// How long the run consumed resources, in whole seconds: `ExecutionTime`, "the amount
-    /// of time (in seconds) that the run consumed resources", which is the span between the
-    /// instant it started and the instant it completed. A run still in flight has consumed
-    /// no completed time, so it reports the member's own default of 0.
+    /// of time (in seconds) that the run consumed resources".
     pub fn execution_time_seconds(&self) -> i32 {
-        self.completed_on
-            .and_then(|completed| completed.duration_since(self.started_on).ok())
-            .map_or(0, |consumed| {
-                i32::try_from(consumed.as_secs()).unwrap_or(i32::MAX)
-            })
+        data_quality_run_execution_time_seconds(self.started_on, self.completed_on)
     }
 
     /// Close this run at the DUE instant the clock set for it, and answer that instant;
@@ -13956,6 +14076,262 @@ impl DataQualityRuleRecommendationRunEntry {
         );
         true
     }
+}
+
+/// How long a data quality run that started at `started_on` consumed resources, in whole
+/// seconds, given the instant it completed: `ExecutionTime`, "the amount of time (in
+/// seconds) that the run consumed resources", which is the span between the instant it
+/// started and the instant it completed. A run still in flight has consumed no completed
+/// time, so it reports the member's own default of 0.
+///
+/// Shared by every kind of data quality run, which all model that member the same way.
+fn data_quality_run_execution_time_seconds(
+    started_on: SystemTime,
+    completed_on: Option<SystemTime>,
+) -> i32 {
+    completed_on
+        .and_then(|completed| completed.duration_since(started_on).ok())
+        .map_or(0, |consumed| {
+            i32::try_from(consumed.as_secs()).unwrap_or(i32::MAX)
+        })
+}
+
+/// How long a data quality ruleset evaluation run stays in
+/// [`DATA_QUALITY_RUN_STATE_STARTING`] before the clock owes it its terminal status.
+///
+/// The span a rule recommendation run is given
+/// ([`DATA_QUALITY_RULE_RECOMMENDATION_RUN_SETTLES_AFTER`]): both are data quality runs this
+/// emulator accepts and finishes on its own clock, and Glue publishes a duration for
+/// neither, so one chosen span serves both — deliberately not zero, so a caller that reads
+/// `GetDataQualityRulesetEvaluationRun` straight after starting a run still observes it in
+/// flight, and the refusal that goes with a run in flight.
+pub const DATA_QUALITY_RULESET_EVALUATION_RUN_SETTLES_AFTER: Duration =
+    DATA_QUALITY_RULE_RECOMMENDATION_RUN_SETTLES_AFTER;
+
+/// How many data quality ruleset evaluation runs this account keeps, for the same reason
+/// and with the same window as [`MAX_DATA_QUALITY_RULE_RECOMMENDATION_RUNS`]. The OLDEST
+/// record is dropped first.
+pub const MAX_DATA_QUALITY_RULESET_EVALUATION_RUNS: usize =
+    MAX_DATA_QUALITY_RULE_RECOMMENDATION_RUNS;
+
+/// How many data quality ruleset evaluation run ids this process has minted. A nonce source
+/// for [`new_data_quality_ruleset_evaluation_run_id`], exactly as
+/// [`MINTED_DATA_QUALITY_RULE_RECOMMENDATION_RUN_IDS`] is for a recommendation run id.
+static MINTED_DATA_QUALITY_RULESET_EVALUATION_RUN_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh `RunId`: the id the service assigns a data quality ruleset evaluation run when it
+/// starts.
+///
+/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is inside `HashString`'s
+/// `length 1..255`, exactly as [`new_data_quality_rule_recommendation_run_id`] mints a
+/// recommendation run's. It is stored on the run, so every later read of that run reports
+/// the same id.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_data_quality_ruleset_evaluation_run_id() -> String {
+    mint_hex_id(
+        &MINTED_DATA_QUALITY_RULESET_EVALUATION_RUN_IDS,
+        DATA_QUALITY_RUN_ID_WORDS,
+    )
+}
+
+/// One catalog table a data quality ruleset evaluation run evaluates: the run reads every
+/// one of them, so each is kept as an address the catalog can be asked about rather than as
+/// the `DataSource` it arrived in.
+///
+/// The two names are kept AS THE REQUEST SPELLED THEM, because they are what a refusal and a
+/// failed run's `ErrorString` name the table by; every lookup goes through
+/// [`ComAmazonawsGlueAwsglueState::catalog_table_miss`], which folds them the way the catalog
+/// stores a name, so another casing of a stored table still resolves to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluatedTable {
+    /// The catalog the table was resolved in, as [`resolve_catalog_id`] resolved it.
+    pub catalog_id: String,
+    /// The database's name, as the request spelled it.
+    pub database_name: String,
+    /// The table's name, as the request spelled it.
+    pub table_name: String,
+}
+
+impl EvaluatedTable {
+    /// The address `table` names inside `catalog_id`.
+    pub fn of(table: &DataSourceTable, catalog_id: &str) -> Self {
+        Self {
+            catalog_id: catalog_id.to_string(),
+            database_name: table.database_name.clone(),
+            table_name: table.table_name.clone(),
+        }
+    }
+}
+
+/// One data quality ruleset evaluation run, as `StartDataQualityRulesetEvaluationRun`
+/// recorded it.
+///
+/// A run carries the data sources it evaluates and the rulesets it evaluates over them, the
+/// configuration the request named — with each member the request left unset filled in with
+/// the default the model documents for it — plus the members only a run has: its id, its
+/// status and the instants it moved between statuses.
+#[derive(Debug, Clone)]
+pub struct DataQualityRulesetEvaluationRunEntry {
+    /// `RunId`, minted by [`new_data_quality_ruleset_evaluation_run_id`].
+    pub id: String,
+    /// The `DataSource` the start named, reported back as it arrived.
+    pub data_source: DataSource,
+    /// The table that `DataSource` addresses, as the catalog stores it.
+    pub primary_table: EvaluatedTable,
+    /// `AdditionalDataSources`: "a map of reference strings to additional data sources you
+    /// can specify for an evaluation run", reported back as they arrived.
+    pub additional_data_sources: Option<HashMap<String, DataSource>>,
+    /// The tables those additional data sources address, in the order of the reference
+    /// strings they arrived under, so the run reads them in one deterministic order.
+    pub additional_tables: Vec<EvaluatedTable>,
+    /// `Role`: "an IAM role supplied to encrypt the results of the run."
+    pub role: String,
+    /// `NumberOfWorkers`, defaulting to [`DEFAULT_DATA_QUALITY_RUN_WORKERS`].
+    pub number_of_workers: i32,
+    /// `Timeout` in minutes, defaulting to [`DEFAULT_DATA_QUALITY_RUN_TIMEOUT_MINUTES`].
+    pub timeout: i32,
+    /// The `ClientToken` the start carried, which is what makes a repeat of that start the
+    /// duplicate the service refuses instead of a second run.
+    pub client_token: Option<String>,
+    /// `AdditionalRunOptions`, as the start named them.
+    pub additional_run_options: Option<DataQualityEvaluationRunAdditionalRunOptions>,
+    /// `RulesetNames`: the rulesets this run evaluates, as the start listed them.
+    pub ruleset_names: Vec<String>,
+    /// One of the modelled `TaskStatusType` values.
+    pub status: String,
+    /// The instant the clock owes this run its next status; `None` once it has settled.
+    pub settles_at: Option<SystemTime>,
+    /// `StartedOn`: "the date and time when this run started."
+    pub started_on: SystemTime,
+    /// `LastModifiedOn`: "the date and time when this run was modified."
+    pub last_modified_on: SystemTime,
+    /// `CompletedOn`: "the date and time when this run was completed", absent until the run
+    /// has finished.
+    pub completed_on: Option<SystemTime>,
+    /// `ErrorString`: "the error strings that are associated with the run", absent unless
+    /// the run failed.
+    pub error_string: Option<String>,
+    /// `ResultIds`: "a list of result IDs for the data quality results for the run" — one id
+    /// per ruleset the run evaluated, minted when the run finishes evaluating them, so a run
+    /// still in flight and a run that could not evaluate anything carry none.
+    pub result_ids: Vec<String>,
+}
+
+impl DataQualityRulesetEvaluationRunEntry {
+    /// Record a run of the rulesets a `StartDataQualityRulesetEvaluationRun` request lists
+    /// over the data sources it names, in [`DATA_QUALITY_RUN_STATE_STARTING`] with its
+    /// terminal status due [`DATA_QUALITY_RULESET_EVALUATION_RUN_SETTLES_AFTER`] out.
+    ///
+    /// `primary_table` is the table the request's `DataSource` addresses and
+    /// `additional_tables` the ones its `AdditionalDataSources` address, each already
+    /// resolved into the catalog that serves it.
+    pub fn start(
+        input: &StartDataQualityRulesetEvaluationRunInput,
+        primary_table: EvaluatedTable,
+        additional_tables: Vec<EvaluatedTable>,
+        id: String,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            id,
+            data_source: input.data_source.clone(),
+            primary_table,
+            additional_data_sources: input.additional_data_sources.clone(),
+            additional_tables,
+            role: input.role.clone(),
+            number_of_workers: input
+                .number_of_workers
+                .unwrap_or(DEFAULT_DATA_QUALITY_RUN_WORKERS),
+            timeout: input
+                .timeout
+                .unwrap_or(DEFAULT_DATA_QUALITY_RUN_TIMEOUT_MINUTES),
+            client_token: input.client_token.clone(),
+            additional_run_options: input.additional_run_options.clone(),
+            ruleset_names: input.ruleset_names.clone(),
+            status: DATA_QUALITY_RUN_STATE_STARTING.to_string(),
+            settles_at: Some(
+                now.checked_add(DATA_QUALITY_RULESET_EVALUATION_RUN_SETTLES_AFTER)
+                    .unwrap_or(now),
+            ),
+            started_on: now,
+            last_modified_on: now,
+            completed_on: None,
+            // Nothing has been evaluated yet, and nothing has failed.
+            error_string: None,
+            result_ids: Vec::new(),
+        }
+    }
+
+    /// Every table this run evaluates: the one its `DataSource` addresses, then the ones its
+    /// `AdditionalDataSources` do.
+    pub fn evaluated_tables(&self) -> impl Iterator<Item = &EvaluatedTable> {
+        ::std::iter::once(&self.primary_table).chain(self.additional_tables.iter())
+    }
+
+    /// Whether the clock owed this run its next status at `now`.
+    pub fn is_due(&self, now: SystemTime) -> bool {
+        self.settles_at.is_some_and(|due| due <= now)
+    }
+
+    /// How long the run consumed resources, in whole seconds: `ExecutionTime`, "the amount
+    /// of time (in seconds) that the run consumed resources".
+    pub fn execution_time_seconds(&self) -> i32 {
+        data_quality_run_execution_time_seconds(self.started_on, self.completed_on)
+    }
+
+    /// Move this run into the status the clock owed it: it was due to leave
+    /// [`DATA_QUALITY_RUN_STATE_STARTING`] at [`Self::settles_at`] whether or not anybody
+    /// called.
+    ///
+    /// A run the catalog still holds every evaluated table for finishes
+    /// [`DATA_QUALITY_RUN_STATE_SUCCEEDED`], carrying one freshly minted result id per
+    /// ruleset it evaluated: "the evaluation computes results which you can retrieve with the
+    /// GetDataQualityResult API", and a result is what one ruleset's evaluation produced. One
+    /// whose table the catalog holds no longer cannot evaluate anything over it, so it
+    /// finishes [`DATA_QUALITY_RUN_STATE_FAILED`] carrying `miss`, the catalog's own reason,
+    /// as its `ErrorString` and no result at all.
+    ///
+    /// The instants recorded are the DUE instant rather than the instant somebody read the
+    /// run, so two reads of a settled run report the same run.
+    pub fn settle(&mut self, miss: Option<String>) {
+        let Some(due) = self.settles_at else {
+            return;
+        };
+        self.settles_at = None;
+        self.completed_on = Some(due);
+        self.last_modified_on = due;
+        match miss {
+            Some(reason) => {
+                self.status = DATA_QUALITY_RUN_STATE_FAILED.to_string();
+                self.error_string = Some(reason);
+            }
+            None => {
+                self.status = DATA_QUALITY_RUN_STATE_SUCCEEDED.to_string();
+                self.result_ids = self
+                    .ruleset_names
+                    .iter()
+                    .map(|_| new_data_quality_result_id())
+                    .collect();
+            }
+        }
+    }
+}
+
+/// How many data quality result ids this process has minted. A nonce source for
+/// [`new_data_quality_result_id`], exactly as
+/// [`MINTED_DATA_QUALITY_RULESET_EVALUATION_RUN_IDS`] is for an evaluation run id.
+static MINTED_DATA_QUALITY_RESULT_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh data quality result id: what a finished evaluation run reports in its
+/// `ResultIds`, and the id the data quality result surface addresses one result by.
+///
+/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is inside the
+/// `DataQualityResultIdList` member type's `length 1..255`. It is stored on the run that
+/// minted it, so every later read of that run reports the same ids.
+pub fn new_data_quality_result_id() -> String {
+    mint_hex_id(&MINTED_DATA_QUALITY_RESULT_IDS, DATA_QUALITY_RUN_ID_WORDS)
 }
 
 /// The most bytes a recommended ruleset may carry: the model's own `length 1..65536` on

@@ -48,6 +48,12 @@ const PRINCIPAL: &str = "cognito-identity.amazonaws.com";
 /// don't provide an expiration time, the token is valid for 15 minutes."
 const DEFAULT_TOKEN_SECONDS: i64 = 900;
 
+/// The shortest window a token held across several wire calls below may have and still be
+/// spendable when they are over. A row asking for less mints a fresh token for the exchange
+/// instead, so the exchange is decided by the rule under test and not by how loaded the test
+/// host was.
+const MIN_SPENDABLE_SECONDS: i64 = 60;
+
 /// A well-formed `IdentityId` that nothing ever minted.
 const ABSENT_IDENTITY_ID: &str = "us-east-1:22222222-2222-2222-2222-222222222222";
 
@@ -410,14 +416,32 @@ async fn a_developer_login_resolves_one_identity_and_mints_a_token_per_call() {
         );
 
         // And the identity it resolved is a real one: credentials can be vended for it,
-        // presented with the token this call minted — a login of that identity, which is
-        // what authorizes the exchange for it.
+        // presented with a token minted for that identity, which is what authorizes the
+        // exchange for it.
+        //
+        // A row whose window is only seconds long mints a FRESH token for this call, under
+        // the documented default window: the calls above are a mint, four reads and a
+        // re-mint over the wire, which on a loaded host take longer than a one-second
+        // window, so spending the first token here would fail this test for its timing
+        // rather than for the rule it asserts. The window itself is asserted above, from
+        // the claims, and that the exchange honours it is `login_token_window`'s rule.
+        let spent = if token_duration.unwrap_or(DEFAULT_TOKEN_SECONDS) >= MIN_SPENDABLE_SECONDS {
+            token.clone()
+        } else {
+            let reminted = emulator
+                .ok(OPERATION, &token_request(&pool_id, &logins, None, None))
+                .await;
+            reminted["Token"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: a Token is answered: {reminted}"))
+                .to_string()
+        };
         let credentials = emulator
             .ok(
                 "GetCredentialsForIdentity",
                 &json!({
                     "IdentityId": identity_id,
-                    "Logins": { "cognito-identity.amazonaws.com": &token },
+                    "Logins": { "cognito-identity.amazonaws.com": &spent },
                 }),
             )
             .await;

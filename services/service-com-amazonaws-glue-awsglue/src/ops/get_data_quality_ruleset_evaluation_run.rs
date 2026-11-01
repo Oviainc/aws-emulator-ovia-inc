@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataQualityRulesetEvaluationRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataQualityRulesetEvaluationRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataQualityRulesetEvaluationRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the ruleset evaluation run `StartDataQualityRulesetEvaluationRun` recorded under
+//! the requested `RunId`: the data sources it evaluates, the rulesets it evaluates over
+//! them, the configuration the start named and the status the run is in. An id this account
+//! holds no run under is the operation's modelled `EntityNotFoundException`.
+//!
+//! This REPORTS a run; the only write it makes is materialising the status the CLOCK had
+//! already made due ([`crate::state::ComAmazonawsGlueAwsglueState::settle_due_data_quality_ruleset_evaluation_runs`]),
+//! which was owed at that same instant whether or not anybody called.
+//!
+//! `ResultIds` names the data quality results a finished run computed: the ids the run
+//! minted when the clock finished it, one per ruleset it evaluated, so a run still in flight
+//! and a run that could not evaluate anything report none. What each of those results
+//! CONTAINS is the data quality result surface's own ground (`GetDataQualityResult` and the
+//! two listings are still scaffolds with their own open issues).
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +175,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataQualityRulesetEvaluationRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDataQualityRulesetEvaluationRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataQualityRulesetEvaluationRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no store fault of its own, so an unreachable store is
+            // reported as its timeout error, the way the catalog's other reads report it.
+            return Err(
+                GetDataQualityRulesetEvaluationRunErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write a read makes: the statuses the clock had already made due.
+        store.settle_due_data_quality_ruleset_evaluation_runs(now);
+
+        // `RunId` is `@required` with `length 1..255`, so an absent or over-long one is
+        // refused at the boundary: reaching here, the only question is whether this account
+        // holds a run under that id.
+        let Some(run) = store.data_quality_ruleset_evaluation_run(&input.run_id) else {
+            return Err(
+                GetDataQualityRulesetEvaluationRunErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(
+                            crate::state::messages::data_quality_ruleset_evaluation_run_not_found(
+                                &input.run_id,
+                            ),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetDataQualityRulesetEvaluationRunOutput {
+            run_id: Some(run.id.clone()),
+            data_source: Some(run.data_source.clone()),
+            additional_data_sources: run.additional_data_sources.clone(),
+            role: Some(run.role.clone()),
+            number_of_workers: Some(run.number_of_workers),
+            timeout: Some(run.timeout),
+            additional_run_options: run.additional_run_options.clone(),
+            status: Some(run.status.clone()),
+            error_string: run.error_string.clone(),
+            started_on: Some(crate::state::to_date_time(run.started_on)),
+            last_modified_on: Some(crate::state::to_date_time(run.last_modified_on)),
+            completed_on: run.completed_on.map(crate::state::to_date_time),
+            execution_time: run.execution_time_seconds(),
+            ruleset_names: Some(run.ruleset_names.clone()),
+            // `ResultIds` is `length 1..10`, so a run that has minted none reports the member
+            // as absent rather than as an empty list the model does not admit.
+            result_ids: if run.result_ids.is_empty() {
+                None
+            } else {
+                Some(run.result_ids.clone())
+            },
+        })
     }
 }
