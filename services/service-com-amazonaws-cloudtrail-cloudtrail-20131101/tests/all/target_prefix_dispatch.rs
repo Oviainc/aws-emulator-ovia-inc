@@ -180,6 +180,9 @@ impl Reply {
 /// dispatched through the production router.
 struct Emulator {
     router: smithy_server_runtime::MultiServiceRouter,
+    /// The shared engine, kept so a trail's log-delivery destination can be recorded in
+    /// the one object store before a request names it. See [`Emulator::call_signed_or_not`].
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -189,9 +192,11 @@ impl Emulator {
         // Signature verification is the emulator's concern, not this service's.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_cloudtrail_cloudtrail_20131101::EmulatedService::new(engine),
+            service_com_amazonaws_cloudtrail_cloudtrail_20131101::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
         );
-        Self { router }
+        Self { router, engine }
     }
 
     /// Call the operation named by the whole `target`, with `body`, SIGNED unless
@@ -201,6 +206,20 @@ impl Emulator {
     /// credential scope is routed by its `X-Amz-Target` alone, which is the other half
     /// of the rule under test.
     async fn call_signed_or_not(&self, target: &str, signed: bool, body: &Value) -> Reply {
+        // A trail's log-delivery destination is a bucket of the account, resolved in the
+        // one object store by `CreateTrail` and `UpdateTrail`, so the bucket a request
+        // names is recorded there first — the `CreateBucket` a client makes before it
+        // points a trail anywhere. This suite's subject is the target header, not the
+        // destination.
+        if let Some(bucket) = body
+            .get("S3BucketName")
+            .and_then(Value::as_str)
+            .filter(|bucket| !bucket.is_empty())
+        {
+            let objects = service_com_amazonaws_s3_amazons3::state::service_state(&*self.engine)
+                .expect("the in-memory engine carries the object store");
+            let _ = objects.lock().create_bucket(bucket, REGION);
+        }
         let mut request = http::Request::builder()
             .method("POST")
             .uri("/")

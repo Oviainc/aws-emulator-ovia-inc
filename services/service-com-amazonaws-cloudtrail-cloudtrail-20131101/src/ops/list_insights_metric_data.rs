@@ -13,10 +13,13 @@
 //!   request names; the model declares all four on the response as well.
 //! * the WINDOW is `[StartTime, EndTime)` — the start "is inclusive", the end "is
 //!   exclusive" — defaulting to "90 days before the time of request" and to "the time
-//!   of request", then clamped to what the service can hold: no data point exists
-//!   after the time of request, and none before the requested `Period`'s retention
-//!   cutoff (60s/15 days, 300s/63 days, 3600s/90 days; each cutoff is inclusive). So
-//!   how many periods a report spans is the service's to bound, not the caller's.
+//!   of request". A `StartTime` further in the past than the longest retention the
+//!   service carries is refused with `InvalidParameterException`, because no period
+//!   ever held a data point there; inside that window the bounds are clamped to what
+//!   the service can hold: no data point exists after the time of request, and none
+//!   before the requested `Period`'s retention cutoff (60s/15 days, 300s/63 days,
+//!   3600s/90 days; each cutoff is inclusive). So how many periods a report spans is
+//!   the service's to bound, not the caller's.
 //! * the DATA POINTS sit on multiples of `Period` since the epoch, so one instant
 //!   falls in the same data point whatever window asks about it, and a `Period` the
 //!   service does not serve is refused with `InvalidParameterException`.
@@ -235,6 +238,33 @@ fn retention_seconds(period: i32) -> Option<i64> {
         .map(|(_, days)| days * SECONDS_PER_DAY)
 }
 
+/// How far into the past a `StartTime` may reach: the longest retention any `Period`
+/// this service serves carries ([`PERIOD_RETENTION_DAYS`]), in days.
+///
+/// A start older than that asks about data points no period of this service ever held,
+/// so there is no window to clamp it into — which is why the recorded response refuses
+/// it instead of answering with a shorter series. It is also the lookback `StartTime`
+/// defaults to ("the default is 90 days before the time of request"), read off the
+/// retention table so the bound and the cutoffs cannot drift apart.
+fn max_lookback_days() -> i64 {
+    PERIOD_RETENTION_DAYS
+        .iter()
+        .map(|(_, days)| *days)
+        .max()
+        .unwrap_or(DEFAULT_LOOKBACK_DAYS)
+}
+
+/// The refusal text for a `StartTime` further in the past than [`max_lookback_days`]:
+/// the fixed sentence the recorded response carries, stating the bound the service
+/// enforces and no part of the request — neither the start it was given, nor the
+/// member's name, nor the age it computed.
+fn start_time_too_old_message() -> String {
+    format!(
+        "The start time cannot be greater than {} days in the past.",
+        max_lookback_days()
+    )
+}
+
 /// The periods this service serves, for a refusal that names the rule it broke.
 fn served_periods() -> String {
     PERIOD_RETENTION_DAYS
@@ -364,6 +394,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_start = input
             .start_time
             .map_or(now - DEFAULT_LOOKBACK_DAYS * SECONDS_PER_DAY, |at| at.secs());
+        // Insights metric data is queryable only over the window the service retains
+        // ([`max_lookback_days`]): a start further back than that is a parameter that
+        // is not valid, rather than a window silently shortened to what is held.
+        if requested_start < now - max_lookback_days() * SECONDS_PER_DAY {
+            return Err(invalid_parameter(start_time_too_old_message()));
+        }
         if requested_start > requested_end {
             return Err(invalid_parameter(format!(
                 "StartTime ({requested_start}) must not be later than EndTime \

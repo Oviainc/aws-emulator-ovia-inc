@@ -27,9 +27,10 @@
 //! * `DescribeTrails` SELECTS: an entry that names no trail of the account — a name
 //!   nothing carries, or a value that can name no trail at all — narrows the answer
 //!   instead of failing the request;
-//! * `PutEventConfiguration` resolves the resource it was given BEFORE the parameter
-//!   rules, so an identifier that names nothing is a not-found however the rest of
-//!   the request is shaped.
+//! * `PutEventConfiguration` judges the request's OWN parameters before it resolves
+//!   the resource they are for, so a call that states no configuration is refused on
+//!   the parameters whatever the registry holds, and a resource's absence is reported
+//!   once the parameters hold.
 //!
 //! The event data store registry is seeded through the service's public `state` module
 //! because `CreateEventDataStore` is still a scaffold stub; every call under test goes
@@ -43,7 +44,8 @@ use service_com_amazonaws_cloudtrail_cloudtrail_20131101::ops::types::{
 use service_com_amazonaws_cloudtrail_cloudtrail_20131101::state::{
     event_data_store_arn, trail_arn, EventDataStoreRecord, EventDataStoreState,
     ADVANCED_SELECTOR_VALUES_PER_TRAIL_LIMIT, DATA_RESOURCES_PER_TRAIL_LIMIT,
-    EVENT_SELECTORS_PER_TRAIL_LIMIT, TRAIL_NAME_MAX_LEN, TRAIL_NAME_MIN_LEN,
+    EVENT_SELECTORS_PER_TRAIL_LIMIT, MISSING_EVENT_DATA_STORE_CONFIGURATION_MESSAGE,
+    TRAIL_NAME_MAX_LEN, TRAIL_NAME_MIN_LEN,
 };
 
 use super::emulator::{Emulator, HOME_REGION};
@@ -838,30 +840,41 @@ async fn describe_trails_omits_every_entry_that_names_no_trail() {
     }
 }
 
-/// `PutEventConfiguration` resolves the resource it was given BEFORE the rules about
-/// which parameters may come together, so an identifier that names no resource is
-/// that resource kind's not-found however the rest of the request is shaped — the
-/// order its three siblings already resolve in. The rows differ in which parameter
-/// rule the request would otherwise have broken.
+/// `PutEventConfiguration` judges the request's OWN parameters BEFORE it resolves the
+/// resource it was given, which is the order the recorded CloudTrail response shows: a
+/// call that does not state the configuration to apply is refused on the parameters
+/// whether or not a store of that identifier exists, and the store's absence is
+/// reported only once the parameters hold. The rows differ in which parameter the
+/// request is missing or cannot combine.
 #[tokio::test]
-async fn put_event_configuration_resolves_the_resource_before_the_parameter_rules() {
+async fn put_event_configuration_judges_its_parameters_before_its_resource() {
     let emulator = Emulator::new();
     let absent_store = "44444444-4444-4444-8444-444444444444";
     let absent_arn = event_data_store_arn(HOME_REGION, absent_store);
     let selectors = json!([{ "Type": "RequestContext", "Equals": ["ctx:Key0"] }]);
     let store_not_found = format!("The event data store {absent_arn} was not found.");
 
-    // (case, the members the request carries beside the absent store) — each would
-    // break a parameter rule if the store existed.
-    let rows: Vec<(&str, Value)> = vec![
+    // (case, the members the request carries beside the absent store, the error code
+    // and the refusal text it is answered with).
+    let rows: Vec<(&str, Value, &str, String)> = vec![
         (
-            "context key selectors with a Standard maximum event size",
-            json!({ "MaxEventSize": "Standard", "ContextKeySelectors": selectors }),
+            "neither the size nor the selectors",
+            json!({}),
+            "ValidationException",
+            MISSING_EVENT_DATA_STORE_CONFIGURATION_MESSAGE.to_string(),
         ),
-        ("neither the size nor the selectors", json!({})),
         (
             "the size but no selectors member",
             json!({ "MaxEventSize": "Large" }),
+            "ValidationException",
+            MISSING_EVENT_DATA_STORE_CONFIGURATION_MESSAGE.to_string(),
+        ),
+        (
+            "context key selectors with a Standard maximum event size",
+            json!({ "MaxEventSize": "Standard", "ContextKeySelectors": selectors }),
+            "InvalidParameterCombinationException",
+            "MaxEventSize must be Large when ContextKeySelectors are set, got Standard."
+                .to_string(),
         ),
         (
             "a trail-level member",
@@ -870,17 +883,22 @@ async fn put_event_configuration_resolves_the_resource_before_the_parameter_rule
                 "ContextKeySelectors": selectors,
                 "AggregationConfigurations": aggregations(),
             }),
+            "InvalidParameterCombinationException",
+            "AggregationConfigurations configures a trail, so it cannot be set with \
+             EventDataStore."
+                .to_string(),
         ),
         (
-            // A combination that would SUCCEED against a store that exists, so the
-            // row shows existence is answered first and not merely before the
-            // refusals.
+            // The one row whose parameters HOLD: with nothing left to refuse about the
+            // request, the store it names is resolved and its absence reported.
             "a combination a stored store would accept",
             json!({ "MaxEventSize": "Large", "ContextKeySelectors": [] }),
+            "EventDataStoreNotFoundException",
+            store_not_found.clone(),
         ),
     ];
 
-    for (case, members) in rows {
+    for (case, members, code, expected) in rows {
         for identifier in [absent_store.to_string(), absent_arn.clone()] {
             let mut request = json!({ "EventDataStore": identifier });
             for (member, value) in members.as_object().expect("the row is an object") {
@@ -888,18 +906,18 @@ async fn put_event_configuration_resolves_the_resource_before_the_parameter_rule
             }
             let case = format!("PutEventConfiguration on an absent store with {case}");
             let reply = emulator.call("PutEventConfiguration", &request).await;
-            reply.expect_error(&case, NOT_FOUND_STATUS, "EventDataStoreNotFoundException");
+            reply.expect_error(&case, NOT_FOUND_STATUS, code);
             assert_eq!(
                 reply.message(),
-                store_not_found,
-                "case {case}: expected {store_not_found:?}, got {:?}",
+                expected,
+                "case {case}: expected {expected:?}, got {:?}",
                 reply.message()
             );
         }
     }
 
-    // The three siblings that address the same store answer the same refusal, which
-    // is the parity this rule restores.
+    // The three siblings that address the same store carry no configuration members at
+    // all, so each answers the not-found of the store it was given.
     for (operation, request) in [
         (
             "EnableFederation",
@@ -924,8 +942,8 @@ async fn put_event_configuration_resolves_the_resource_before_the_parameter_rule
         );
     }
 
-    // The parameter rules still hold for a store that EXISTS: existence dominating
-    // them does not retire them.
+    // The parameter rules hold for a store that EXISTS too: the order they are judged
+    // in does not retire them.
     let store_id = "11111111-1111-4111-8111-111111111111";
     emulator.state().lock().event_data_stores.insert(
         store_id.to_string(),

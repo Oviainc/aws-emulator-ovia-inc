@@ -408,6 +408,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTrail<Eng> 
             .into());
         }
 
+        // "Creates a trail that specifies the settings for delivery of log data to an
+        // Amazon S3 bucket": the destination has to be a name Amazon S3 holds a bucket
+        // under at all, and then a bucket the account actually holds. Both are decided
+        // BEFORE the trail is persisted, so a trail that could never deliver a log file
+        // is never created. The name rule is the shared one
+        // ([`service_common::s3_bucket_name`]); the store is read with no guard of this
+        // service's own held ([`crate::state::destination_bucket_exists`]).
+        if !::service_common::s3_bucket_name::is_well_formed(&input.s3_bucket_name) {
+            return Err(CreateTrailErrorModeled::InvalidS3BucketNameException(
+                InvalidS3BucketNameException {
+                    message: Some(crate::state::invalid_s3_bucket_name_message(
+                        &input.s3_bucket_name,
+                    )),
+                },
+            )
+            .into());
+        }
+        if crate::state::destination_bucket_exists(&*self.engine, &input.s3_bucket_name)
+            == Some(false)
+        {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                CreateTrailErrorModeled::S3BucketDoesNotExistException(
+                    S3BucketDoesNotExistException {
+                        message: Some(crate::state::s3_bucket_does_not_exist_message(
+                            &input.s3_bucket_name,
+                        )),
+                    },
+                ),
+                crate::state::S3_BUCKET_DOES_NOT_EXIST_STATUS,
+            ));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateTrailErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
                 message: Some(

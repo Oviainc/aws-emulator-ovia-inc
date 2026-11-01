@@ -51,6 +51,10 @@ uuid = { version = "1", features = ["v4"] }
 # opaque `LookupEvents` one (`src/ops/lookup_events.rs`), which it also reads back, and
 # the one `ListEventDataStores` issues through the shared `state::page_token` reader.
 hex = { workspace = true }
+# The account's S3 BUCKETS: a trail delivers its log files into one, so `CreateTrail`
+# and `UpdateTrail` resolve the destination `S3BucketName` in the one object store
+# (`state::destination_bucket_exists`) rather than in a copy of it here.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

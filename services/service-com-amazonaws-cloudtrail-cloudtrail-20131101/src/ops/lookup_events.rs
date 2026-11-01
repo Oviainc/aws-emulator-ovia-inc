@@ -244,11 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some(token) => Some(read_token(token, &fingerprint).ok_or_else(|| {
                 LookupEventsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
-                    message: Some(
-                        "NextToken is not valid: pass the token exactly as the previous \
-                         LookupEvents call returned it, with the same lookup parameters"
-                            .to_string(),
-                    ),
+                    message: Some(UNREADABLE_NEXT_TOKEN_MESSAGE.to_string()),
                 })
             })?),
         };
@@ -311,6 +307,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// start time occurs after the end time, or the time range is outside the range of
 /// possible values", and the recorded refusal of an inverted window is this one sentence.
 const INVERTED_TIME_RANGE_MESSAGE: &str = "The start time precedes the end time.";
+
+/// How CloudTrail words a `NextToken` it cannot read: the fixed sentence for that
+/// error class, carrying no part of the request.
+///
+/// A lookup's pagination token is an opaque marker the service itself seals, so a token
+/// it did not issue — one that was altered, one from another lookup's filter, or one
+/// that is not a marker at all — is one it cannot decrypt, and the recorded refusal of
+/// each of those is this one sentence. It names neither the token nor the parameters,
+/// so the wording is the same whichever way the token failed to belong to this lookup.
+const UNREADABLE_NEXT_TOKEN_MESSAGE: &str = "Can't decrypt marker";
 
 /// `MaxResults`'s modelled lower bound (`range 1..50`).
 const MAX_RESULTS_MIN: i32 = 1;

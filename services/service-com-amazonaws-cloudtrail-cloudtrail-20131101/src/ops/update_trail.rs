@@ -406,6 +406,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A request that REPLACES the trail's destination resolves the new bucket in
+        // the account's object store, exactly as `CreateTrail` resolves the
+        // destination it is created with: a trail must never be pointed at a
+        // destination it could not deliver a log file to. Every value the member
+        // carries is held to the same rule as `CreateTrail`'s, the empty string
+        // included — it names no bucket either, so it is the same malformed parameter
+        // here as there. It is resolved HERE, before the registry is reached, so no
+        // guard of this service's store is held across the object store's lock
+        // ([`crate::state::destination_bucket_exists`]); the refusal it feeds is
+        // raised only once the trail the call addresses has been located, because a
+        // trail that does not exist cannot be pointed anywhere.
+        let destination = input.s3_bucket_name.as_deref();
+        let destination_absent = destination.is_some_and(|bucket| {
+            crate::state::destination_bucket_exists(&*self.engine, bucket) == Some(false)
+        });
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateTrailErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
                 message: Some(
@@ -460,6 +476,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
         };
+
+        // The trail exists, so the destination the request names now decides whether it
+        // may be pointed there: a name Amazon S3 holds no bucket under is refused as the
+        // malformed parameter it is (the shared rule,
+        // [`service_common::s3_bucket_name`]), and a well-formed name the account holds
+        // no bucket under as a destination that does not exist.
+        if let Some(bucket) = destination {
+            if !::service_common::s3_bucket_name::is_well_formed(bucket) {
+                return Err(UpdateTrailErrorModeled::InvalidS3BucketNameException(
+                    InvalidS3BucketNameException {
+                        message: Some(crate::state::invalid_s3_bucket_name_message(bucket)),
+                    },
+                )
+                .into());
+            }
+        }
+        if destination_absent {
+            let bucket = destination.unwrap_or_default().to_string();
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                UpdateTrailErrorModeled::S3BucketDoesNotExistException(
+                    S3BucketDoesNotExistException {
+                        message: Some(crate::state::s3_bucket_does_not_exist_message(&bucket)),
+                    },
+                ),
+                crate::state::S3_BUCKET_DOES_NOT_EXIST_STATUS,
+            ));
+        }
 
         // Each member the request carries replaces the stored value; each member it
         // leaves out keeps the one the trail already has. Neither the trail's name,

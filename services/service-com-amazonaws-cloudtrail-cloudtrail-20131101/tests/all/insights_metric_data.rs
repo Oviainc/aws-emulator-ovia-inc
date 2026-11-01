@@ -43,6 +43,11 @@ const SECONDS_PER_DAY: i64 = 86_400;
 /// available for 90 days."
 const PERIOD_RETENTION_DAYS: [(i64, i64); 3] = [(60, 15), (300, 63), (3600, 90)];
 
+/// How far into the past a `StartTime` may reach: the longest of the retentions
+/// [`PERIOD_RETENTION_DAYS`] lists, which is also `StartTime`'s documented default
+/// ("the default is 90 days before the time of request").
+const MAX_LOOKBACK_DAYS: i64 = 90;
+
 /// One row of [`the_reported_series_is_the_one_the_request_names`]'s table: the
 /// case, the `EventSource`, the `EventName`, the `InsightType`, the `ErrorCode` the
 /// request sends, and the `ErrorCode` the response is expected to report.
@@ -446,6 +451,12 @@ async fn the_retention_cutoff_bounds_how_far_back_a_data_point_reaches() {
     for (period, days) in PERIOD_RETENTION_DAYS {
         let case = format!("period {period}, {days} days of retention");
         let now = now_secs();
+        // The oldest start the service answers at all, kept an hour inside the bound so
+        // the clock moving between this line and the handler cannot push it past it: a
+        // start FURTHER back than the longest retention is refused rather than clamped
+        // (`request_validation.rs`), so what is clamped here is a start inside the
+        // queryable window but before THIS period's own cutoff.
+        let start = now - MAX_LOOKBACK_DAYS * SECONDS_PER_DAY + 3600;
         let reply = emulator
             .call(
                 "ListInsightsMetricData",
@@ -455,8 +466,7 @@ async fn the_retention_cutoff_bounds_how_far_back_a_data_point_reaches() {
                     "InsightType": "ApiCallRateInsight",
                     "Period": period,
                     "DataType": "FillWithZeros",
-                    // Well before every published cutoff.
-                    "StartTime": now - 200 * SECONDS_PER_DAY,
+                    "StartTime": start,
                     "MaxResults": 1,
                 }),
             )
@@ -464,6 +474,9 @@ async fn the_retention_cutoff_bounds_how_far_back_a_data_point_reaches() {
         let body = reply.expect_ok(&case).clone();
         let reported = timestamps(&body);
         let cutoff = now - days * SECONDS_PER_DAY;
+        // The oldest data point the window can hold: this period's cutoff, or the
+        // requested start where that is later than the cutoff.
+        let floor = cutoff.max(start);
         assert_eq!(
             reported.len(),
             1,
@@ -471,16 +484,16 @@ async fn the_retention_cutoff_bounds_how_far_back_a_data_point_reaches() {
         );
         let first = reported[0];
         assert!(
-            first >= cutoff,
-            "case {case}: the oldest data point must not precede the cutoff {cutoff}, \
+            first >= floor - 2,
+            "case {case}: the oldest data point must not precede the floor {floor}, \
              got {first}"
         );
-        // The first point is the first period boundary at or after the cutoff, plus
+        // The first point is the first period boundary at or after the floor, plus
         // whatever the clock moved between this test reading it and the handler.
         assert!(
-            first <= cutoff + period + 2,
+            first <= floor + period + 2,
             "case {case}: the oldest data point must be the first period boundary at \
-             or after the cutoff {cutoff}, got {first}"
+             or after the floor {floor}, got {first}"
         );
         assert!(
             body.get("NextToken").is_some(),

@@ -792,34 +792,34 @@ async fn create_trail_refuses_values_outside_their_documented_bounds() {
     let rows: Vec<(&str, Value, &str)> = vec![
         (
             "S3KeyPrefix at the maximum",
-            json!({"Name": "prefix-ok", "S3BucketName": "b", "S3KeyPrefix": "p".repeat(state)}),
+            json!({"Name": "prefix-ok", "S3BucketName": "bucket-bounds", "S3KeyPrefix": "p".repeat(state)}),
             "",
         ),
         (
             "S3KeyPrefix one over the maximum",
-            json!({"Name": "prefix-long", "S3BucketName": "b", "S3KeyPrefix": "p".repeat(state + 1)}),
+            json!({"Name": "prefix-long", "S3BucketName": "bucket-bounds", "S3KeyPrefix": "p".repeat(state + 1)}),
             "InvalidS3PrefixException",
         ),
         (
             "SnsTopicName at the maximum",
-            json!({"Name": "topic-ok", "S3BucketName": "b", "SnsTopicName": "t".repeat(topic)}),
+            json!({"Name": "topic-ok", "S3BucketName": "bucket-bounds", "SnsTopicName": "t".repeat(topic)}),
             "",
         ),
         (
             "SnsTopicName one over the maximum",
-            json!({"Name": "topic-long", "S3BucketName": "b", "SnsTopicName": "t".repeat(topic + 1)}),
+            json!({"Name": "topic-long", "S3BucketName": "bucket-bounds", "SnsTopicName": "t".repeat(topic + 1)}),
             "InvalidSnsTopicNameException",
         ),
         (
             "tags one over the limit",
-            json!({"Name": "tags-many", "S3BucketName": "b", "TagsList": tag_list(tags + 1)}),
+            json!({"Name": "tags-many", "S3BucketName": "bucket-bounds", "TagsList": tag_list(tags + 1)}),
             "TagsLimitExceededException",
         ),
         (
             "a duplicated tag key",
             json!({
                 "Name": "tags-dup",
-                "S3BucketName": "b",
+                "S3BucketName": "bucket-bounds",
                 "TagsList": [{"Key": "k", "Value": "1"}, {"Key": "k", "Value": "2"}],
             }),
             "InvalidTagParameterException",

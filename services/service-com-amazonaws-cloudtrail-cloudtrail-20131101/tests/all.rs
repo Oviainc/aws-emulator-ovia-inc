@@ -186,3 +186,9 @@ mod event_history_of_every_served_call;
 // nothing at all, and that the refusal leaves the trail's selectors untouched.
 #[path = "all/selectors_that_log_nothing.rs"]
 mod selectors_that_log_nothing;
+// `request_validation` pins what this service checks about a REQUEST before it acts on
+// it: the destination bucket a trail is pointed at, the window an Insights metric read
+// may ask about, the fixed sentences a lookup refusal carries, and that an event
+// configuration call is judged on its parameters before its target.
+#[path = "all/request_validation.rs"]
+mod request_validation;

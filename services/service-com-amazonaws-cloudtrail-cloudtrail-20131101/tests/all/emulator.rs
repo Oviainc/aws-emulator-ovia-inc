@@ -6,6 +6,11 @@
 //! `X-Amz-Target: CloudTrail_20131101.<Operation>` through the same
 //! `MultiServiceRouter` the production router serves, so what a suite asserts is
 //! what a client sees — including the HTTP status and the error code.
+//!
+//! A trail's log-delivery destination is a bucket in the one object store, so a request
+//! that names one has that bucket recorded there before it is dispatched — the
+//! `CreateBucket` a client makes first. [`Emulator::without_provisioned_destinations`]
+//! is the emulator that does not, for the suite whose subject IS the destination.
 
 use serde_json::Value;
 use std::sync::Arc;
@@ -29,6 +34,9 @@ pub type ServiceState = engine::ServiceState<
 pub struct Emulator {
     router: smithy_server_runtime::MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
+    /// Whether the bucket a request's `S3BucketName` names is recorded in the one
+    /// object store before the request is dispatched. See [`Emulator::call_in`].
+    provision_destinations: bool,
 }
 
 /// One answer from the emulator: the HTTP status and the parsed JSON body.
@@ -82,6 +90,17 @@ impl Reply {
 
 impl Emulator {
     pub fn new() -> Self {
+        Self::with_destination_provisioning(true)
+    }
+
+    /// The same emulator with the trail DESTINATION left alone: the bucket a request's
+    /// `S3BucketName` names is not recorded for it, which is how the refusal of a
+    /// destination no bucket backs is asserted (`tests/all/request_validation.rs`).
+    pub fn without_provisioned_destinations() -> Self {
+        Self::with_destination_provisioning(false)
+    }
+
+    fn with_destination_provisioning(provision_destinations: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = smithy_server_runtime::MultiServiceRouter::new();
         // Signature verification is the emulator's concern, not this service's;
@@ -93,7 +112,24 @@ impl Emulator {
                 Arc::clone(&engine),
             ),
         );
-        Self { router, engine }
+        Self {
+            router,
+            engine,
+            provision_destinations,
+        }
+    }
+
+    /// Record a bucket named `bucket` in `region` in the one object store — what a
+    /// client does with Amazon S3's `CreateBucket` before it points a trail at it.
+    ///
+    /// A trail's log-delivery destination is resolved THERE by `CreateTrail` and
+    /// `UpdateTrail` (`state::destination_bucket_exists`), so a suite whose subject is
+    /// the trail registry rather than the destination needs the bucket its requests
+    /// name to exist. Recording the same name twice leaves the first bucket alone.
+    pub fn provision_bucket(&self, bucket: &str, region: &str) {
+        let state = service_com_amazonaws_s3_amazons3::state::service_state(&*self.engine)
+            .expect("the in-memory engine carries the object store");
+        let _ = state.lock().create_bucket(bucket, region);
     }
 
     /// This service's store in the shared engine — the SAME store every handler
@@ -125,7 +161,23 @@ impl Emulator {
 
     /// Call with a verbatim `X-Amz-Target`, for pinning how a target header is
     /// read.
+    ///
+    /// An `S3BucketName` in the body names a trail's log-delivery destination, which
+    /// CloudTrail resolves in the one object store before it accepts the trail. Every
+    /// suite but the one about that destination is about the trail registry instead, so
+    /// the harness records the bucket first ([`Emulator::provision_bucket`]) — the
+    /// `CreateBucket` a client makes before pointing a trail anywhere — unless it was
+    /// built with [`Emulator::without_provisioned_destinations`].
     pub async fn call_with_target(&self, target: &str, region: &str, body: &Value) -> Reply {
+        if self.provision_destinations {
+            if let Some(bucket) = body
+                .get("S3BucketName")
+                .and_then(Value::as_str)
+                .filter(|bucket| !bucket.is_empty())
+            {
+                self.provision_bucket(bucket, region);
+            }
+        }
         // The Region a request is served in comes from its SigV4 credential scope,
         // which is also how the router resolves the service.
         let authorization = format!(

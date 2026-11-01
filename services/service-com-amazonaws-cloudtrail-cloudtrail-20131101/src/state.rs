@@ -678,6 +678,65 @@ pub fn trail_already_exists_message(name: &str) -> String {
     )
 }
 
+/// The HTTP status a destination-bucket not-found refusal answers with.
+///
+/// The model annotates `S3BucketDoesNotExistException` `@httpError(404)`, but
+/// CloudTrail answers 400 for it on the wire: the recorded response of `CreateTrail`
+/// against a bucket that was never created is HTTP 400 with `__type`
+/// `S3BucketDoesNotExistException`. The error CODE and the body stay the model's;
+/// only the status is stated here, through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`] — the same deviation
+/// [`TRAIL_NOT_FOUND_STATUS`] already carries.
+pub const S3_BUCKET_DOES_NOT_EXIST_STATUS: u16 = 400;
+
+/// The refusal text for `S3BucketDoesNotExistException`: the destination bucket the
+/// request named, inside the fixed sentence the recorded response carries.
+///
+/// Request-derived — the `S3BucketName` the caller sent, verbatim — because the
+/// caller fixes the call by naming a bucket that exists or by creating that one.
+pub fn s3_bucket_does_not_exist_message(bucket: &str) -> String {
+    format!("S3 bucket {bucket} does not exist!")
+}
+
+/// The refusal text for `InvalidS3BucketNameException`: the name the request gave,
+/// inside the fixed sentence the recorded response carries.
+///
+/// A name outside the Amazon S3 naming rules
+/// ([`service_common::s3_bucket_name::is_well_formed`]) names no bucket anywhere, so it
+/// is refused as a malformed PARAMETER before any store is asked about it — which is
+/// the error the model declares for it ("thrown when the provided S3 bucket name is not
+/// valid"), and not the destination-does-not-exist one.
+pub fn invalid_s3_bucket_name_message(bucket: &str) -> String {
+    format!("S3 bucket name {bucket} is not valid")
+}
+
+/// Whether the account's one object store holds a bucket named `bucket`: whether the
+/// log-delivery destination a trail request names resolves to anything.
+///
+/// A trail delivers its log files INTO a bucket, so the destination has to be a bucket
+/// that exists — and the buckets of this emulated account live in the Amazon S3
+/// service's own store, not in a copy of them here, so that store is where the name is
+/// resolved. Both operations that set a trail's destination (`CreateTrail` and
+/// `UpdateTrail`) read it through here, so neither can disagree with the other about
+/// which destinations exist.
+///
+/// `None` when that store cannot be reached at all — an engine this emulator's object
+/// store is not mounted on — which is a fact about the engine and not about the bucket,
+/// so a caller is served rather than refused on a resolution that never happened.
+///
+/// LOCK ORDER: it takes the object store's lock, holds no other while it does and hands
+/// back an owned value, so it must be called with NO guard of this service's own store
+/// held. That keeps the cross-service access one-directional and a lock cycle between
+/// the two stores unreachable.
+pub fn destination_bucket_exists<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    bucket: &str,
+) -> Option<bool> {
+    let state = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
+    let store = state.lock();
+    Some(store.bucket(bucket).is_some())
+}
+
 /// The refusal text for `InsightNotEnabledException`, shared by every operation that
 /// reports or reads Insights events on a resource that has none enabled
 /// (`GetInsightSelectors` and the Insights data operations).
