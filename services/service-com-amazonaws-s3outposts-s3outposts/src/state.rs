@@ -51,7 +51,10 @@
 //! one account — is declared by the operator running this emulator instead,
 //! through [`PROVISIONED_OUTPOSTS_ENV`]. Unset — the default — means no shared
 //! capacity, and an account whose control plane holds no S3-capable Outpost
-//! either has none at all, which is what a new AWS account has.
+//! either has none at all, which is what a new AWS account has. The gate above is
+//! what it declares AGAINST, never around: an id that control plane holds an
+//! Outpost under is that control plane's to answer for, so the declaration is the
+//! answer only for an id it holds none under ([`outpost_inventory`]).
 //!
 //! ## Which Region a resource belongs to
 //!
@@ -789,7 +792,14 @@ pub type OutpostInventory = BTreeMap<String, OutpostRecord>;
 /// plane holds NOW — an Outpost created, ordered for or decommissioned there is one
 /// this service answers for from the next call on. A declared entry for an id the
 /// control plane also holds is overridden by the control plane's own record, which
-/// is the authority on that resource.
+/// is the authority on that resource — in BOTH directions: that control plane
+/// holding the id with S3 capacity puts its own record in, and holding the id
+/// WITHOUT it (still provisioning, being decommissioned, or with no order that
+/// bought S3 storage capacity) takes the declared entry out, because an
+/// `OutpostId` names one Outpost and a declaration cannot keep the authority's
+/// own "no" out of the answer. Only an id that control plane holds no Outpost
+/// under at all is the declaration's to answer for, which is the shared Outpost
+/// of another account it serves none of.
 ///
 /// `store` is this service's own store, already locked by the caller; the control
 /// plane's store is locked for the length of the projection and released before the
@@ -800,8 +810,11 @@ pub fn outpost_inventory<Eng: Send + Sync + 'static>(
     store: &ComAmazonawsS3outpostsS3outpostsState,
 ) -> OutpostInventory {
     let mut inventory = store.outposts.clone();
-    for record in control_plane_outposts(engine) {
-        inventory.insert(record.outpost_id.clone(), record);
+    for (outpost_id, held) in control_plane_outposts(engine) {
+        match held {
+            Some(record) => inventory.insert(outpost_id, record),
+            None => inventory.remove(&outpost_id),
+        };
     }
     inventory
 }
@@ -829,13 +842,23 @@ pub fn settled_inventory<Eng: Send + Sync + 'static>(
     inventory
 }
 
-/// The Outposts the co-hosted AWS Outposts control plane has S3 on Outposts
-/// capacity provisioned on, or none at all when this process hosts no such control
-/// plane: an emulator without it holds no Outposts of the account's own, exactly as
-/// an account with no Outposts does.
-fn control_plane_outposts<Eng: Send + Sync + 'static>(engine: &Eng) -> Vec<OutpostRecord> {
+/// The verdict of the co-hosted AWS Outposts control plane on every `OutpostId` it
+/// holds an Outpost under: the record this service reports that Outpost as, or
+/// `None` when it holds the id but the Outpost under it is not one with S3 on
+/// Outposts capacity for this account to reach ([`s3_provisioned_outpost`]).
+///
+/// A negative verdict is an answer about that id, not the absence of one, which is
+/// what lets [`outpost_inventory`] honour the authority in both directions; an id
+/// absent from this map is one that control plane holds no Outpost under at all.
+type ControlPlaneVerdicts = BTreeMap<String, Option<OutpostRecord>>;
+
+/// What the co-hosted AWS Outposts control plane holds, keyed by the `OutpostId` it
+/// holds each Outpost under, or nothing at all when this process hosts no such
+/// control plane: an emulator without it holds no Outposts of the account's own,
+/// exactly as an account with no Outposts does.
+fn control_plane_outposts<Eng: Send + Sync + 'static>(engine: &Eng) -> ControlPlaneVerdicts {
     let Some(control_plane) = outposts_state::service_state(engine) else {
-        return Vec::new();
+        return ControlPlaneVerdicts::new();
     };
     let mut control_plane = control_plane.lock();
     // Whether an Outpost has finished provisioning is a fact about the instant it is
@@ -851,8 +874,13 @@ fn control_plane_outposts<Eng: Send + Sync + 'static>(engine: &Eng) -> Vec<Outpo
     let provisioned = control_plane.provisioned_s3_capacity();
     control_plane
         .outposts
-        .values()
-        .filter_map(|record| s3_provisioned_outpost(&provisioned, record))
+        .iter()
+        .map(|(outpost_id, record)| {
+            (
+                outpost_id.clone(),
+                s3_provisioned_outpost(&provisioned, record),
+            )
+        })
         .collect()
 }
 

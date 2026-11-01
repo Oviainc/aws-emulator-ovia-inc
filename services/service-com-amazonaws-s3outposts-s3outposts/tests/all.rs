@@ -47,6 +47,8 @@ mod outpost_cursor_scope;
 mod outpost_departure;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
+#[path = "all/shadowed_outpost_authority.rs"]
+mod shadowed_outpost_authority;
 #[path = "all/shared_endpoint_listing.rs"]
 mod shared_endpoint_listing;
 #[path = "all/shared_test_harness.rs"]

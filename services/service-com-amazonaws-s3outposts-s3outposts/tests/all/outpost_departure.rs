@@ -75,16 +75,16 @@ struct Row {
 }
 
 /// An endpoint a case placed, as the service reported it.
-struct Placed {
-    arn: String,
-    endpoint_id: String,
-    outpost_id: String,
-    subnet_id: String,
-    cidr_block: String,
+pub(crate) struct Placed {
+    pub(crate) arn: String,
+    pub(crate) endpoint_id: String,
+    pub(crate) outpost_id: String,
+    pub(crate) subnet_id: String,
+    pub(crate) cidr_block: String,
 }
 
 /// Every endpoint `ListEndpoints` reports in `region`.
-async fn listed_endpoints(emulator: &Emulator, region: &str) -> Vec<Value> {
+pub(crate) async fn listed_endpoints(emulator: &Emulator, region: &str) -> Vec<Value> {
     let reply = emulator.endpoints_in(region).await;
     assert_eq!(
         reply.status, 200,
@@ -98,7 +98,7 @@ async fn listed_endpoints(emulator: &Emulator, region: &str) -> Vec<Value> {
 }
 
 /// The `EndpointArn`s `ListEndpoints` reports in `region`.
-async fn reported_arns(emulator: &Emulator, region: &str) -> BTreeSet<String> {
+pub(crate) async fn reported_arns(emulator: &Emulator, region: &str) -> BTreeSet<String> {
     listed_endpoints(emulator, region)
         .await
         .iter()
@@ -109,7 +109,7 @@ async fn reported_arns(emulator: &Emulator, region: &str) -> BTreeSet<String> {
 /// `CreateEndpoint` on `outpost_id` in `region`, as the record the service minted for it
 /// — its id read off the ARN it answered and its CIDR read back through `ListEndpoints`,
 /// so nothing here is assumed about either.
-async fn place_endpoint(
+pub(crate) async fn place_endpoint(
     emulator: &Emulator,
     region: &str,
     outpost_id: &str,
@@ -161,7 +161,7 @@ async fn place_endpoint(
 /// reports the absence of a record, so this case reads the store for them. A subnet
 /// mapping is keyed by the Region the subnet belongs to as well; these rows all place
 /// their endpoints in one Region, so the subnet half is what they look at.
-fn stored(emulator: &Emulator) -> (BTreeSet<(String, String)>, BTreeSet<String>) {
+pub(crate) fn stored(emulator: &Emulator) -> (BTreeSet<(String, String)>, BTreeSet<String>) {
     let store = emulator.s3_store();
     let store = store.lock();
     (
@@ -176,7 +176,7 @@ fn stored(emulator: &Emulator) -> (BTreeSet<(String, String)>, BTreeSet<String>)
 
 /// The CIDR blocks the stored endpoints still commit — the set the next `/26` is chosen
 /// outside of, so a block absent from it is one a later endpoint can be committed.
-fn committed_cidrs(emulator: &Emulator) -> BTreeSet<String> {
+pub(crate) fn committed_cidrs(emulator: &Emulator) -> BTreeSet<String> {
     let store = emulator.s3_store();
     let store = store.lock();
     store
