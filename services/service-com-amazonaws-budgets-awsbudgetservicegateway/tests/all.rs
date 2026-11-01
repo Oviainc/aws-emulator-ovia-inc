@@ -89,6 +89,8 @@ mod notification_threshold_identity;
 mod notification_update;
 #[path = "all/page_size_resolution.rs"]
 mod page_size_resolution;
+#[path = "all/pagination_token_opacity.rs"]
+mod pagination_token_opacity;
 #[path = "all/per_notification_page_sizes.rs"]
 mod per_notification_page_sizes;
 #[path = "all/percentage_budget_limit_amount.rs"]

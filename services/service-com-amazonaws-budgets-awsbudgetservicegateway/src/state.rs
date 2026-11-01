@@ -1619,9 +1619,17 @@ pub fn encode_next_token(offset: usize) -> String {
 ///
 /// `None` for anything else — the caller answers that with
 /// `InvalidNextTokenException` ("The pagination token is invalid").
+///
+/// A pagination token is opaque, so the ONLY tokens that decode are the exact byte
+/// strings this service hands out: the decoded offset is re-minted and the result must
+/// equal the token presented, character for character. That identity check is what
+/// rejects every other spelling of the same offset — a payload `str::parse::<usize>()`
+/// also accepts (a leading `+`, leading zeros) and hex digits `hex::encode` never writes
+/// (upper case) — none of which any call of this service ever handed out.
 pub fn decode_next_token(token: &str) -> Option<usize> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    decoded.strip_prefix(NEXT_TOKEN_PREFIX)?.parse().ok()
+    let offset: usize = decoded.strip_prefix(NEXT_TOKEN_PREFIX)?.parse().ok()?;
+    (encode_next_token(offset) == token).then_some(offset)
 }
 
 /// One page of `items`, plus the token for the page after it.
