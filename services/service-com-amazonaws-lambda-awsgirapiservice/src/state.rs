@@ -2930,7 +2930,15 @@ impl FunctionRecord {
             alias_arn: Some(self.versioned_arn(&alias.name)),
             name: Some(alias.name.clone()),
             function_version: Some(alias.function_version.clone()),
-            description: alias.description.clone(),
+            // `Description` is a member of every `AliasConfiguration` AWS reports — the
+            // alias's own read, the write that answers it and each listing entry: an
+            // alias created without one carries it as the empty string rather than not
+            // at all, exactly as a function configuration does (see
+            // [`FunctionRecord::configuration`]), so a client can read the member
+            // unconditionally. The member's own bound (`@length(min: 0, max: 256)`)
+            // admits the empty string, so "no description" and "the empty description"
+            // are one value on the wire.
+            description: Some(alias.description.clone().unwrap_or_default()),
             routing_config: alias.routing_config(),
             revision_id: Some(alias.revision_id.clone()),
         }

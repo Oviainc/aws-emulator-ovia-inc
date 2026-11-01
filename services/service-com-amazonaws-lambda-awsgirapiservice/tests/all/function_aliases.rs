@@ -5,7 +5,8 @@
 //!
 //! The rule under test: `CreateAlias` persists, on the function the request names, ONE
 //! alias of the name it gives — invoking the version `FunctionVersion` names, carrying
-//! the description exactly as supplied and the traffic-shifting configuration exactly as
+//! the description exactly as supplied (the empty string when none was) and the
+//! traffic-shifting configuration exactly as
 //! supplied, with a revision id minted once and an ARN that is the function's own ARN
 //! qualified by the alias name — and answers that stored configuration; it refuses a
 //! name the function already has an alias of, a version the function does not hold, and
@@ -19,7 +20,8 @@
 //! through `GetAlias`, so an alias that was answered but never stored fails here. The
 //! rows differ along what the rule generalises over: the version the alias invokes
 //! (unpublished and published), the alias name (its modelled length bounds, hyphens and
-//! underscores), the description (absent, empty, at the modelled maximum), the routing
+//! underscores), the description (absent — reported as the empty string — empty, and at
+//! the modelled maximum), the routing
 //! configuration (absent, and a weight at each published bound) and the documented
 //! `FunctionName` form the request addresses the function by.
 
@@ -304,7 +306,9 @@ fn alias_cases() -> Vec<AliasCase> {
             alias: "dev".to_string(),
             request: json!({ "Name": "dev", "FunctionVersion": VERSION_LATEST }),
             expected_version: VERSION_LATEST,
-            expected_description: None,
+            // An alias created without a description still reports the member, as the
+            // empty string.
+            expected_description: Some(String::new()),
             expected_routing: Value::Null,
         },
         // A published version, described, addressed by the function's full ARN.
@@ -337,7 +341,7 @@ fn alias_cases() -> Vec<AliasCase> {
                 "RoutingConfig": { "AdditionalVersionWeights": { "2": 0.25 } },
             }),
             expected_version: "1",
-            expected_description: None,
+            expected_description: Some(String::new()),
             expected_routing: json!({ "AdditionalVersionWeights": { "2": 0.25 } }),
         },
         // A weight at the bottom of the published `Weight` range, an alias name carrying
@@ -356,7 +360,8 @@ fn alias_cases() -> Vec<AliasCase> {
             }),
             expected_version: "3",
             // An empty description is a description in its own right (`@length(min: 0)`),
-            // and is reported as configured rather than dropped.
+            // and is reported as configured rather than dropped — which is also what an
+            // alias configured with no description at all reports.
             expected_description: Some(String::new()),
             expected_routing: json!({ "AdditionalVersionWeights": { "2": WEIGHT_MIN } }),
         },
@@ -388,7 +393,7 @@ fn alias_cases() -> Vec<AliasCase> {
             alias: "x".to_string(),
             request: json!({ "Name": "x", "FunctionVersion": "2" }),
             expected_version: "2",
-            expected_description: None,
+            expected_description: Some(String::new()),
             expected_routing: Value::Null,
         },
     ]
@@ -536,7 +541,13 @@ async fn an_alias_is_created_from_the_request_and_read_back() {
             vec![(
                 case.alias.clone(),
                 case.expected_version.to_string(),
-                case.expected_description.clone()
+                // The store holds the description exactly as supplied, so an alias the
+                // request stated none for holds none — the empty string the wire reports
+                // for it is how the member is RENDERED, not what is stored.
+                case.request
+                    .get("Description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
             )],
             "case {label:?}: expected one stored alias {:?} on version {:?}, got {stored:?}",
             case.alias,

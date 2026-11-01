@@ -307,7 +307,9 @@ fn update_cases() -> Vec<UpdateCase> {
             created: json!({ "Name": "live", "FunctionVersion": "2" }),
             update: json!({ "FunctionVersion": LATEST }),
             reference: |name| format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}"),
-            expected: (LATEST, None, Value::Null),
+            // An alias created without a description reports the member as the empty
+            // string, and an update that states no description keeps it.
+            expected: (LATEST, Some(""), Value::Null),
         },
         UpdateCase {
             name: "the description alone",
@@ -327,7 +329,7 @@ fn update_cases() -> Vec<UpdateCase> {
             reference: |name| format!("function:{name}"),
             expected: (
                 "1",
-                None,
+                Some(""),
                 json!({ "AdditionalVersionWeights": { "2": 0.25 } }),
             ),
         },

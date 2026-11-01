@@ -23,6 +23,8 @@ mod account_settings;
 mod account_settings_deprecated_runtime;
 #[path = "all/alias_deletion.rs"]
 mod alias_deletion;
+#[path = "all/alias_description_member.rs"]
+mod alias_description_member;
 #[path = "all/alias_listing.rs"]
 mod alias_listing;
 #[path = "all/alias_name_constraint.rs"]
