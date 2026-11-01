@@ -3086,16 +3086,26 @@ pub fn invalid_resource_id<E: ModeledFailure>() -> E {
 /// The refusal of a `NextToken` this service did not issue, or issued for another
 /// listing.
 ///
-/// The diagnostic is `InvalidNextTokenException`'s own documented sentence
-/// (`smithy_query(query="shape",shape="InvalidNextTokenException")`: "The `NextToken`
-/// value is not valid."), with the family-wide request-id suffix [`refusal`] appends.
-/// The recorded text of this particular refusal is withheld by the corpus, so the
-/// sentence stated here is the model's own rather than a recorded one. The error SHAPE
-/// is the variant the caller constructs this into, because not every paginated operation
-/// of this service models `InvalidNextTokenException` for it.
+/// The diagnostic is [`INVALID_NEXT_TOKEN`] — the sentence this service words for a
+/// rejected page token, which names the MEMBER whose value it rejected — with the
+/// family-wide request-id suffix [`refusal`] appends. The error SHAPE is the variant the
+/// caller constructs this into, because not every paginated operation of this service
+/// models `InvalidNextTokenException` for it.
 pub fn invalid_next_token<E: ModeledFailure>() -> E {
     refusal(INVALID_NEXT_TOKEN)
 }
+
+/// The diagnostic every paginated listing of this service refuses an unusable
+/// `NextToken` with, which [`invalid_next_token`] is what builds the refusal from.
+///
+/// Directory Service states this refusal as a rejected PARAMETER VALUE — it names the
+/// input member whose value it would not accept, and quotes neither the token nor the
+/// listing — so one text serves every paginated operation of this service and discloses
+/// nothing about the token it was handed. It is NOT the error shape's documentation prose
+/// ("The `NextToken` value is not valid."), which describes the class to a reader of the
+/// model rather than stating what the service puts on the wire. [`refusal`] appends the
+/// request id, once.
+pub const INVALID_NEXT_TOKEN: &str = "Invalid value passed for the NextToken parameter.";
 
 /// The tag family's diagnostic, without either request-id suffix: see
 /// [`invalid_resource_id`], which is what builds the refusal.
@@ -3165,11 +3175,6 @@ pub fn no_such_domain_controller(domain_controller_id: &str) -> String {
 pub fn no_such_assessment(assessment_id: &str) -> String {
     format!("Assessment Id {assessment_id} does not exist.")
 }
-
-/// The `InvalidNextTokenException` diagnostic for a token this service did not issue:
-/// the sentence the error shape's own documentation states, which [`invalid_next_token`]
-/// is what refuses the call with.
-pub const INVALID_NEXT_TOKEN: &str = "The NextToken value is not valid.";
 
 /// What a handler answers when [`service_state`] cannot reach this service's store.
 ///

@@ -57,6 +57,8 @@ mod ldaps;
 mod log_subscriptions;
 #[path = "all/microsoft_ad.rs"]
 mod microsoft_ad;
+#[path = "all/pagination_token_refusal.rs"]
+mod pagination_token_refusal;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/request_id_header.rs"]

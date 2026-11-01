@@ -47,8 +47,11 @@ const ABSENT_DIRECTORY_IDS: [&str; 3] = ["d-0000000000", "d-1234567890", "d-0dea
 /// request carries one, and a request-derived diagnostic must not vary with it.
 const SIGNING_REGIONS: [&str; 3] = ["us-east-1", "us-west-2", "eu-central-1"];
 
-/// The `InvalidNextTokenException` diagnostic for a token this service did not issue.
-const INVALID_NEXT_TOKEN: &str = "The NextToken value is not valid.";
+/// The diagnostic for a page token this service did not issue: it names the input member
+/// whose value was rejected, and is this service's recorded text rather than the
+/// `InvalidNextTokenException` shape's documentation prose. The rule it belongs to is
+/// `crate::pagination_token_refusal`'s; here it is one row of the envelope table.
+const INVALID_NEXT_TOKEN: &str = "Invalid value passed for the NextToken parameter.";
 
 /// The tag family's diagnostic for a `ResourceId` that names no taggable resource. It
 /// quotes no id — unlike [`directory_not_found`] — and the recorded refusal carries the
