@@ -75,6 +75,8 @@ mod refusals_and_gateway_attach_points;
 mod region_scoped_connections;
 #[path = "all/region_scoped_environment_catalog.rs"]
 mod region_scoped_environment_catalog;
+#[path = "all/request_faults_precede_resource_verdicts.rs"]
+mod request_faults_precede_resource_verdicts;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_tags.rs"]

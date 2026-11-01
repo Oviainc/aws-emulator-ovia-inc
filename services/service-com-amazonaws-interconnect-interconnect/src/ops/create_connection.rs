@@ -172,9 +172,58 @@ enum StoreVerdict {
     Create(Environment),
 }
 
+/// Judge everything the REQUEST ITSELF carries, before anything the request NAMES is
+/// resolved.
+///
+/// A tag set outside what this service stores, and a value outside the constraints the
+/// model puts on the union member that carries it — `AttachPoint`'s and
+/// `RemoteAccountIdentifier`'s alike, neither of which the boundary validator reaches,
+/// because both constraints sit on a member one level down — are faults in the INPUT
+/// whatever the `environmentId` names, so they are judged here and no verdict about a
+/// resource (an `environmentId` this endpoint's catalog does not hold, a `clientToken`
+/// that already created a different connection) can mask them. The same ordering, and
+/// the same rules, the acceptance that writes the other half of these members applies.
+///
+/// Whether `remoteAccount` is NEEDED at all is the Environment's to say, so that half of
+/// its rule stays with the Environment below; what an identifier may CARRY is the
+/// member's own and is judged here.
+fn judge_request(input: &CreateConnectionInput) -> Result<(), CreateConnectionError> {
+    // The entries the request carries, each inside the lengths the model gives `TagKey`
+    // and `TagValue` and none of them in the namespace AWS reserves for its own system
+    // tags. (The boundary validator holds a LIST's members to their target's constraints
+    // but not a MAP's keys, so a tag map is checked here.) The entry-count bound on the
+    // merged set is judged where the resource is known.
+    if let Some(message) = input
+        .tags
+        .as_ref()
+        .and_then(|tags| crate::state::tag_write_violation(None, tags))
+    {
+        return Err(CreateConnectionErrorModeled::InterconnectValidationException(
+            InterconnectValidationException { message },
+        )
+        .into());
+    }
+
+    // What the `remoteAccount` union CARRIES, against the member's own modelled length
+    // and pattern (`crate::state::remote_identifier_violation`).
+    if let Some(message) = crate::state::remote_identifier_violation(input.remote_account.as_ref())
+    {
+        return Err(CreateConnectionErrorModeled::InterconnectValidationException(
+            InterconnectValidationException { message },
+        )
+        .into());
+    }
+
+    // What the `attachPoint` union carries, against its own member's modelled length and
+    // pattern, by the one rule every reader of an `AttachPoint` applies
+    // (`crate::state::judge_attach_point_value`).
+    crate::state::judge_attach_point_value::<CreateConnectionError>(&input.attach_point)
+}
+
 /// Judge a request against everything this service's OWN store answers: the idempotent
-/// replay, the Environment, its state, the bandwidth it offers, the identifying
-/// information it asks for, the tag set, and the `arn` attach point.
+/// replay, the Environment, its state, the bandwidth it offers, whether it asks for
+/// identifying information, and the `arn` attach point. What the request itself carries
+/// is [`judge_request`]'s, judged before any of this.
 ///
 /// `region` is the Region the request addressed, which is the scope every connection
 /// this judgement resolves is looked up in: a connection belongs to the Region it was
@@ -277,9 +326,11 @@ fn judge_against_store(
     // `Environment$remoteIdentifierType` names the kind of identifying information
     // the partner of THIS Environment will verify the remote side by, so an
     // Environment that declares one needs a `remoteAccount` on every create against
-    // it and one that declares none needs nothing. Beyond that presence, the only
-    // rules on the identifier are the union member's own modelled length and
-    // pattern — the identity itself is verified later, at the partner portal.
+    // it and one that declares none needs nothing. That PRESENCE is this Environment's
+    // to say, which is why it is judged here; what an identifier the request did carry
+    // may hold is the member's own rule and was judged on the request alone
+    // ([`judge_request`]) — the identity itself is verified later, at the partner
+    // portal.
     if let Some(message) =
         crate::state::remote_account_violation(&environment, input.remote_account.as_ref())
     {
@@ -289,22 +340,11 @@ fn judge_against_store(
         .into());
     }
 
-    // The tag set the new connection would carry, judged by the one rule every
-    // writer of a connection's tags uses: each entry inside the lengths the model
-    // gives `TagKey` and `TagValue`, no key in the namespace AWS reserves for its
-    // own system tags, and no more entries than a resource holds.
-    // A resource created with tags is therefore bounded the same way one tagged
-    // later is, so neither path can store a set the other would refuse.
-    if let Some(message) = input
-        .tags
-        .as_ref()
-        .and_then(|tags| crate::state::tag_write_violation(None, tags))
-    {
-        return Err(CreateConnectionErrorModeled::InterconnectValidationException(
-            InterconnectValidationException { message },
-        )
-        .into());
-    }
+    // The tag set the new connection would carry is judged on the REQUEST alone
+    // ([`judge_request`]): a create allocates a fresh resource, so the set it would be
+    // left holding IS the set the request carries — there is no held set to merge with
+    // — and the one rule every writer of a connection's tags uses
+    // (`crate::state::tag_write_violation`) is applied there, ahead of every lookup.
 
     // The attach point the request selected, judged by the one rule both writers of a
     // connection's attach point apply to it
@@ -360,6 +400,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // What the request itself carries is judged BEFORE anything it names is
+        // resolved, so no verdict about a resource can mask a fault in the input.
+        judge_request(&input)?;
         // Every ARN this call mints carries the region the request was signed for.
         let region = crate::state::request_region(ctx);
 

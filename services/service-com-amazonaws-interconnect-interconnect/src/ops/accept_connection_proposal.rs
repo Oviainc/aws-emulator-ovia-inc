@@ -157,6 +157,52 @@ impl<Eng> AcceptConnectionProposal<Eng> {
     }
 }
 
+/// Judge everything the REQUEST ITSELF carries, before anything the request NAMES is
+/// resolved.
+///
+/// A tag set outside what this service stores, and a value outside the constraints the
+/// model puts on the `AttachPoint` member that carries it, are faults in the INPUT
+/// whatever the `activationKey` names — so judging them here is what keeps a verdict
+/// about a resource (a key that resolves to no proposal, a proposal whose acceptance has
+/// already been made, a connection an acceptance can no longer be made on) from masking
+/// them, and a caller branching on the error code can tell "I sent something that is not
+/// an attach-point identifier" or "I sent a tag key I may not write" from "this proposal
+/// does not exist" or "this proposal was already accepted". The same ordering both
+/// sibling tag writers of this crate (`TagResource`, `UntagResource`) and the sibling
+/// reader of this union (`ListConnections`) apply, through the same two rules
+/// (`crate::state::tag_write_violation`, `crate::state::judge_attach_point_value`).
+///
+/// Nothing is written and nothing is resolved here, so a refused acceptance leaves the
+/// proposal exactly as it was. What the acceptance would LEAVE on the connection — the
+/// merged tag set — and the resource the attach point names are judged against the store
+/// in [`judge_against_store`], once the proposal has been resolved.
+fn judge_request(
+    input: &AcceptConnectionProposalInput,
+) -> Result<(), AcceptConnectionProposalError> {
+    // The entries the request carries, each inside the lengths the model gives `TagKey`
+    // and `TagValue` and none of them in the namespace AWS reserves for its own system
+    // tags. (The boundary validator holds a LIST's members to their target's
+    // constraints but not a MAP's keys, so a tag map is checked here.)
+    if let Some(message) = input
+        .tags
+        .as_ref()
+        .and_then(|tags| crate::state::tag_write_violation(None, tags))
+    {
+        return Err(
+            AcceptConnectionProposalErrorModeled::InterconnectValidationException(
+                InterconnectValidationException { message },
+            )
+            .into(),
+        );
+    }
+
+    // The value the union carries, against its own member's modelled `@length` and
+    // `@pattern`, which nothing before the handler holds it to: the constraint sits on a
+    // union member one level down, and the boundary validator reaches only the top-level
+    // member.
+    crate::state::judge_attach_point_value::<AcceptConnectionProposalError>(&input.attach_point)
+}
+
 /// What this service's own store says about an `AcceptConnectionProposal` request.
 enum StoreVerdict {
     /// The proposal the `activationKey` names has not been accepted yet: this is the
@@ -215,12 +261,14 @@ fn judge_against_store(
     };
     let connection = &stored.connection;
 
-    // The tag set the accepted connection would carry, judged by the one rule every
-    // writer of a connection's tags uses: each entry inside the lengths the model
-    // gives `TagKey` and `TagValue`, no key in the namespace AWS reserves for its own
-    // system tags, and no more entries than a resource holds once the write is
-    // merged. Judged BEFORE anything is written, so a refused acceptance leaves the
-    // proposal exactly as it was.
+    // The tag set the accepted connection would be LEFT holding, judged once the
+    // proposal is resolved by the one rule every writer of a connection's tags uses:
+    // each entry inside the lengths the model gives `TagKey` and `TagValue`, no key in
+    // the namespace AWS reserves for its own system tags, and no more entries than a
+    // resource holds once the write is merged. What the REQUEST itself carries was
+    // judged ahead of the lookup above ([`judge_request`]), so the entry-count bound on
+    // the merged set is what this adds. Judged BEFORE anything is written, so a refused
+    // acceptance leaves the proposal exactly as it was.
     if let Some(message) = input
         .tags
         .as_ref()
@@ -368,6 +416,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        // What the request itself carries is judged BEFORE anything it names is
+        // resolved, so no verdict about a resource can mask a fault in the input.
+        judge_request(&input)?;
         // The Region the request was signed for, which is the scope the proposal and
         // the attach point are both resolved in.
         let region = crate::state::request_region(ctx);

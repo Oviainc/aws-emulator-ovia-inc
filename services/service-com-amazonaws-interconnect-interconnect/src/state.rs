@@ -875,15 +875,34 @@ pub fn attach_point_violation(attach_point: &AttachPoint) -> Option<String> {
 /// owns, and each scopes itself to the Environment by the same predicate
 /// ([`environment_offers_attach_points`]), so neither member names an attach point valid
 /// for an Environment the other would refuse.
+/// Judge the VALUE an `AttachPoint` carries against its own member's modelled
+/// constraints ([`attach_point_violation`]), through the refusal channel the calling
+/// operation declares: the half of [`judge_attach_point_in_store`] that needs no store
+/// and no Environment at all.
+///
+/// Separated out because a value outside the member's constraints is a fault in the
+/// REQUEST, which every handler that carries this union judges BEFORE it resolves any
+/// resource the request names — so no verdict about a resource (an identifier that
+/// resolves to nothing, a proposal already accepted) is ever reported for a request that
+/// is not a well-formed one to begin with. The judgement itself stays in one place, so
+/// the same malformed value is refused the same way and worded the same way whichever
+/// operation carried it.
+pub fn judge_attach_point_value<E: direct_connect::AttachPointRefusal>(
+    attach_point: &AttachPoint,
+) -> Result<(), E> {
+    match attach_point_violation(attach_point) {
+        Some(message) => Err(E::invalid_attach_point(message)),
+        None => Ok(()),
+    }
+}
+
 pub fn judge_attach_point_in_store<E: direct_connect::AttachPointRefusal>(
     store: &ComAmazonawsInterconnectInterconnectState,
     region: &str,
     attach_point: &AttachPoint,
     environment_id: &str,
 ) -> Result<(), E> {
-    if let Some(message) = attach_point_violation(attach_point) {
-        return Err(E::invalid_attach_point(message));
-    }
+    judge_attach_point_value::<E>(attach_point)?;
     let AttachPoint::Arn(arn) = attach_point else {
         return Ok(());
     };
@@ -929,7 +948,9 @@ fn is_remote_identifier_text(identifier: &str) -> bool {
 /// type: that Environment's partner would have nothing to verify the remote side
 /// with, and the connection could never be confirmed on its portal.
 ///
-/// PRESENCE and the member's OWN modelled rules are all that is judged. The union
+/// PRESENCE and the member's OWN modelled rules are all that is judged, the latter
+/// through [`remote_identifier_violation`], which is also what a create judges on the
+/// request alone. The union
 /// offers a single generic `identifier` — "a generic bit of identifying information.
 /// Can be used in place of any of the more specific types" — so what it may carry is
 /// its `@length` and its `@pattern` and nothing else: the identity behind it is
@@ -940,11 +961,33 @@ pub fn remote_account_violation(
     environment: &Environment,
     supplied: Option<&RemoteAccountIdentifier>,
 ) -> Option<String> {
-    let Some(RemoteAccountIdentifier::Identifier(identifier)) = supplied else {
+    if supplied.is_none() {
         return environment
             .remote_identifier_type
             .as_ref()
             .map(|_| format!("{REFUSAL_ENVELOPE}remoteAccount.identifier is required"));
+    }
+    remote_identifier_violation(supplied)
+}
+
+/// Why the identifier a `remoteAccount` CARRIES is not one the member may hold — or
+/// `None` when it is inside the member's own modelled `@length` and `@pattern`, and for
+/// a request that carries no `remoteAccount` at all.
+///
+/// The member-constraint half of [`remote_account_violation`], separated out because it
+/// is a fault in the REQUEST and needs no Environment: a create judges it before it
+/// resolves the Environment the request names, so an unresolvable `environmentId` cannot
+/// mask it, while PRESENCE — the half that is the Environment's to say — stays with the
+/// Environment.
+///
+/// Checked by hand because the boundary validator holds a top-level member to its
+/// target's constraints but not a member one level down, inside a union (the same gap
+/// [`attach_point_violation`] fills for the sibling union).
+pub fn remote_identifier_violation(
+    supplied: Option<&RemoteAccountIdentifier>,
+) -> Option<String> {
+    let Some(RemoteAccountIdentifier::Identifier(identifier)) = supplied else {
+        return None;
     };
     // `@length` on a string counts characters, not bytes, so the identifier is
     // measured the way the model measures it.
