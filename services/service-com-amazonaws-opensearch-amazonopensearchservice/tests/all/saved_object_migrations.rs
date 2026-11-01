@@ -45,7 +45,11 @@ use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFI
 
 /// The ARN of the data source a row migrates saved objects out of, unless it names
 /// another.
-const SOURCE: &str = "arn:aws:es:us-east-1:123456789012:domain/saved-objects-source";
+///
+/// Saved objects are exported from a search COLLECTION, which is the shape
+/// `StartMigration` validates its source ARN against, so every row that expects a start
+/// to be served names one.
+const SOURCE: &str = "arn:aws:aoss:us-east-1:123456789012:collection/savedobjects";
 
 /// `StartMigration`: `POST /2021-01-01/opensearch/app-migrations`.
 async fn start_migration(emulator: &Emulator, body: Value) -> Answer {
@@ -190,7 +194,7 @@ fn rows() -> Vec<Row> {
                 "workspace": {
                     "createWorkspace": true,
                     "name": "Imported dashboards",
-                    "type": "private",
+                    "type": "OBSERVABILITY",
                 },
                 "exportOptions": { "objects": [{ "type": "search", "id": "late-orders" }] },
                 "conflictResolution": CONFLICT_RESOLUTION_VALUES[0],
@@ -214,10 +218,13 @@ fn rows() -> Vec<Row> {
             selected: 2,
         },
         Row {
-            case: "a source ARN carrying no region or account",
-            name: "migration-partitionless-source",
+            case: "a source ARN in another partition",
+            name: "migration-other-partition",
             options: json!({
-                "source": { "datasourceArn": "arn:aws:aoss:::collection/saved-objects" },
+                "source": {
+                    "datasourceArn":
+                        "arn:aws-us-gov:aoss:us-gov-west-1:123456789012:collection/savedobjects",
+                },
                 "workspace": { "workspaceId": "ws-reporting" },
                 "exportOptions": { "objects": [{ "type": "index-pattern", "id": "orders-*" }] },
             }),

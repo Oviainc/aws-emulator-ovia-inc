@@ -39,7 +39,48 @@
 //! The SIZE of the message is bounded by the framework's own two ceilings on the walk
 //! it comes from — how many violations one request accumulates, and how many bytes of a
 //! value one of them echoes — and grouping only ever folds violations together, so a
-//! refusal worded here is no larger than the one the framework would have worded.
+//! refusal worded here is no larger than the one the framework would have worded. The one
+//! statement that can ADD a clause ([`STATED`], whose recorded surface bounds a member's
+//! requirements at two) adds at most one per violation, so the ceiling still holds as a
+//! constant of this module rather than something one request chooses.
+//!
+//! # What a clause STATES, where that is not what the model declares
+//!
+//! A constraint clause reports the REQUIREMENT this service validates with, and three
+//! renderings of it are the service's rather than the model's text:
+//!
+//! * a `@pattern` requirement quotes the expression the service advertises, which is the
+//!   model's text without the whole-value pair the model wrapped that expression in —
+//!   dropped only where what the pair encloses carries no anchor of its own, since an
+//!   expression whose branches are each anchored was a whole-value expression before any
+//!   wrapping ([`::service_common::validation::unanchored_keeping_inner_anchors`], this
+//!   tree's home for that rendering). The CHECK is unchanged — the boundary runs the
+//!   model's pattern as written — so only the quoting drops the pair;
+//! * an enumerated type's value set the walk reported is stated in lexicographic order
+//!   ([`::service_common::validation_message::in_sorted_enum_order`]), which is how this
+//!   service lists a set the MODEL declares in an order of its own. A set an OPERATION
+//!   declares itself, for a member the model types as a plain string, is stated in the
+//!   order that operation states it: that order is part of what it states, and there is no
+//!   model order to normalise;
+//! * a member whose live validation surface the model has not caught up with states THAT
+//!   surface ([`STATED`]): the expression the service quotes, and a bound it states a
+//!   clause of its own for. Which members those are, and why each is there, is recorded
+//!   on that table.
+//!
+//! Two things about the message as a WHOLE are the service's too: the order the clauses
+//! are stated in ([`STATED_FIRST`]), and one refusal that replaces the report entirely —
+//! a request whose IAM role ARN cannot be read as one is answered with
+//! [`invalid_role_arn`] and no constraint report at all, because that check runs before
+//! the input's constraints are reported on.
+//!
+//! Every refusal of this service is worded by ONE function, [`worded`] — the boundary's
+//! refusal, a constraint a HANDLER checks ([`constraint_report`]) and the input an
+//! OPERATION validates for itself (`crate::service`'s seam over
+//! `crate::ops::start_migration`, through [`stated_report`]) all go through it — so none of
+//! them can word one constraint two ways. What differs between them is only where a
+//! requirement CAME FROM: the two renderings above recover what the service states from
+//! what the MODEL declares, so they are applied to the requirements the model declared and
+//! not to the ones the stating code already stated.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -49,6 +90,8 @@ use aws_smithy_schema_server::constraints::{
     self, ElementConstraintsTrait, EnumTrait, LengthTrait, PatternTrait, RangeTrait,
 };
 use aws_smithy_schema_server::{Violation, ViolationKind};
+use service_common::validation::unanchored_keeping_inner_anchors;
+use service_common::validation_message::in_sorted_enum_order;
 use smithy_server_runtime::{Refusal, Refused};
 
 /// The error code AWS answers a constraint refusal with on the JSON protocols, and the
@@ -90,13 +133,17 @@ const MAX_DEPTH: usize = 2;
 /// clause can never be worded differently from the clause a non-collection violation
 /// keeps verbatim. `None` for a class whose sentence does not follow that shape, which
 /// leaves that violation with the framework's own clause.
+///
+/// Stated through [`restated`], so a requirement read off the MODEL here and one read off
+/// a violation carry the same renderings; both are idempotent, so a kind that already
+/// went through it is unchanged by going through it again.
 fn requirement(kind: &ViolationKind) -> Option<String> {
     let probe = Violation {
         path: String::new(),
         kind: kind.clone(),
         value: None,
     };
-    probe
+    restated(&probe)
         .message()
         .split_once(CONSTRAINT_MARKER)
         .map(|(_, requirement)| requirement.to_string())
@@ -117,6 +164,217 @@ fn render_bound(bound: f64) -> String {
     }
 }
 
+/// One violation as this service STATES it: the framework's own structure, with the
+/// `@pattern` rendering every clause of this service uses applied — the expression the
+/// service advertises, which is the model's text without the whole-value pair the model
+/// wrapped that expression in.
+///
+/// The pair is the model's wrapping only where what it encloses carries no anchor of its
+/// OWN: an expression whose BRANCHES are each anchored (`^[0-9]{12}$|^GLOBAL$`) was
+/// already a whole-value expression before any wrapping, and this service's refusals quote
+/// such a text exactly as the model declares it. That is
+/// [`::service_common::validation::unanchored_keeping_inner_anchors`], this tree's home
+/// for that rendering, called rather than restated here so this service cannot drift from
+/// the others recorded stating it.
+///
+/// The CHECK is untouched either way: the boundary runs the model's pattern as written.
+fn restated(violation: &Violation) -> Violation {
+    let quoted = match &violation.kind {
+        ViolationKind::Pattern(regex) => {
+            Some(ViolationKind::Pattern(unanchored_keeping_inner_anchors(regex)))
+        }
+        _ => None,
+    };
+    match quoted {
+        Some(kind) => Violation {
+            kind,
+            ..violation.clone()
+        },
+        None => violation.clone(),
+    }
+}
+
+// =============================================================================
+// The constraints this service VALIDATES, where the model has not caught up
+// =============================================================================
+
+/// One requirement this service states for an input member, in the class the framework
+/// words the sentence for.
+#[derive(Debug)]
+enum Stated {
+    /// The expression the member's `@pattern` clause QUOTES, in place of the model's own
+    /// text. Stated verbatim: it is the expression the service advertises, not a model
+    /// `@pattern` to take the whole-value pair off.
+    Pattern(&'static str),
+    /// A maximum length this service states a clause of its own for, which this model
+    /// declares no `@length` for at all.
+    MaxLength(i64),
+}
+
+/// The input members whose validation surface is NOT the one this model declares, with
+/// the requirements this service states for each in the order it states them.
+///
+/// Every entry is a member whose refusals show the service validating something the
+/// model's traits do not express, which is why it cannot be read off a schema:
+///
+/// * an application `id` is validated against an expression that admits hyphens inside
+///   the id and refuses a leading one, and that whole expression — a lookahead included,
+///   which is no model `@pattern` wrapping — is what the clause quotes. The model's
+///   `@pattern` for `Id` admits neither hyphens nor the lookahead;
+/// * an `applicationId` is validated against the hyphen-admitting character class too,
+///   and its length is bounded SEPARATELY, so a value past 30 characters is refused with
+///   two clauses: the expression it is outside of, then the bound it is past. The model
+///   declares the bound inside the pattern's repetition and no `@length` beside it, so
+///   the boundary can only ever report the one clause;
+/// * a `capabilityName` is validated against an expression the service states WITH the
+///   anchors, so that member's clause quotes the expression as the model writes it rather
+///   than without the pair every other member's clause drops.
+///
+/// What is keyed here is the MEMBER PATH, because that is all a boundary violation carries
+/// — so an entry holds for every operation that declares the member. An operation that
+/// validates its OWN input before the boundary does states its own surface beside its own
+/// rule, and `crate::ops::start_migration` is the one that does; its `applicationId` is a
+/// plain identifier it is handed rather than the id of an application it resolves, and the
+/// refusal recorded for that operation quotes it accordingly, so the two surfaces differ
+/// by operation and each is stated where that operation's rule lives.
+///
+/// A member absent from here states what the model declares, which is every other member
+/// of every operation: this is the surface the model has not caught up with, not a second
+/// copy of it.
+const STATED: &[(&str, &[Stated])] = &[
+    ("id", &[Stated::Pattern(r"^(?!-)[a-z0-9\-]{3,30}$")]),
+    (
+        "applicationId",
+        &[Stated::Pattern("[a-z0-9-]{3,30}"), Stated::MaxLength(30)],
+    ),
+    ("capabilityName", &[Stated::Pattern("^[a-zA-Z0-9-]+$")]),
+];
+
+/// The clauses this service states for one ALREADY-RESTATED violation: the requirements
+/// [`STATED`] records for that member, and the violation itself for every member it
+/// records none for.
+///
+/// A recorded requirement is stated when the request BROKE it: the member's `@pattern`
+/// clause when the boundary found the value outside the model's expression for it (the
+/// two expressions describe the same class of value, which is why the model's check is
+/// evidence for the service's), and a recorded bound when the value is past it. A
+/// violation none of them covers — a minimum the model declares, an absent member —
+/// keeps its own clause, so a refusal always states what it refused.
+///
+/// A requirement substituted here is already the expression the service QUOTES, so it is
+/// not put through [`restated`]: that rendering recovers the service's expression from a
+/// model `@pattern`, and these did not come from one.
+fn stated_violations(violation: &Violation) -> Vec<Violation> {
+    let Some((_, requirements)) = STATED.iter().find(|(path, _)| *path == violation.path) else {
+        return vec![violation.clone()];
+    };
+    let length = violation
+        .value
+        .as_deref()
+        .map(|value| value.chars().count())
+        .and_then(|length| i64::try_from(length).ok());
+    let stated: Vec<Violation> = requirements
+        .iter()
+        .filter_map(|requirement| match requirement {
+            Stated::Pattern(expression) => matches!(violation.kind, ViolationKind::Pattern(_))
+                .then(|| ViolationKind::Pattern((*expression).to_owned())),
+            Stated::MaxLength(max) => length
+                .is_some_and(|length| length > *max)
+                .then_some(ViolationKind::MaxLength(*max)),
+        })
+        .map(|kind| Violation {
+            path: violation.path.clone(),
+            kind,
+            value: violation.value.clone(),
+        })
+        .collect();
+    if stated.is_empty() {
+        return vec![violation.clone()];
+    }
+    stated
+}
+
+/// The members this service states a clause for AHEAD of the members the validating walk
+/// reported first, highest precedence first.
+///
+/// The clauses of one refusal follow the order the service states its input members in,
+/// which is the order the walk found them for every operation but one pair: an operation
+/// naming a CAPABILITY of an application states the capability's own name before the id
+/// of the application that scopes it, while this model lists the id first. The members
+/// here are named, not the operations, because a violation carries the member path and
+/// not the operation it came from — and `capabilityName` is declared by exactly the
+/// operations that name a capability.
+const STATED_FIRST: &[&str] = &["capabilityName"];
+
+/// `violations` in the order this service states their clauses.
+///
+/// A STABLE sort on one key, so every member [`STATED_FIRST`] does not name keeps the
+/// position the walk found it at, and the clauses of ONE member keep the order they were
+/// stated in ([`stated_violations`]).
+fn in_stated_order(mut violations: Vec<Violation>) -> Vec<Violation> {
+    violations.sort_by_key(|violation| {
+        STATED_FIRST
+            .iter()
+            .position(|stated| *stated == violation.path)
+            .unwrap_or(STATED_FIRST.len())
+    });
+    violations
+}
+
+/// The member every operation that takes an IAM role ARN carries it at, as the validation
+/// path spells it — a leaf member of the data-source type union, whatever branch of it a
+/// request names.
+const ROLE_ARN_MEMBER: &str = "roleArn";
+
+/// The role ARN a request carried, when what the boundary refused is that this value
+/// cannot be read as an IAM role ARN at all.
+fn unreadable_role_arn(violations: &[Violation]) -> Option<&str> {
+    violations
+        .iter()
+        .find(|violation| leaf_member(&violation.path) == ROLE_ARN_MEMBER)?
+        .value
+        .as_deref()
+}
+
+/// The last segment of a validation path: the member a clause is about, inside whatever
+/// structure or union carried it.
+fn leaf_member(path: &str) -> &str {
+    path.rsplit_once('.').map_or(path, |(_, member)| member)
+}
+
+/// The refusal of a request whose IAM role ARN cannot be read as one.
+///
+/// This service resolves the ROLE a data source is read under before it reports on the
+/// input's constraints, so a value no role ARN can be parsed out of is refused by that
+/// step: the answer names the ARN the request carried and states no constraint report at
+/// all — not even for the other members of the same request, which that step never got
+/// past.
+fn invalid_role_arn(role_arn: &str) -> String {
+    format!("Invalid Role Arn : {role_arn}")
+}
+
+/// The `ValidationException` message for ONE constraint a HANDLER found broken — a
+/// constraint the request boundary does not enforce, so no violation of it ever reaches
+/// the refusal seam.
+///
+/// The envelope, the clause and the member path are the ones a boundary refusal states
+/// ([`envelope`], and `constraints::path` for the lowerCamel member spelling), so a
+/// caller cannot tell a constraint this service checks itself from one the model's traits
+/// carry. `member` is the member's name as the MODEL spells it.
+pub(crate) fn constraint_report(member: &str, value: &str, kind: ViolationKind) -> String {
+    let violation = Violation {
+        path: constraints::path::member(member),
+        kind,
+        value: Some(value.to_owned()),
+    };
+    // Through [`stated_report`], the one path every refusal of this service is worded by.
+    // One violation always states one clause, so a message is always rendered; the clause
+    // alone is the fallback rather than an empty message.
+    stated_report(std::slice::from_ref(&violation))
+        .map(|refused| refused.message)
+        .unwrap_or_else(|| restated(&violation).message())
+}
+
 // =============================================================================
 // The element constraint sets this model declares
 // =============================================================================
@@ -134,7 +392,9 @@ fn constraint_trait<'map, T: 'static>(traits: &'map TraitMap, id: &ShapeId) -> O
 /// length a Smithy `@length` can bound.
 ///
 /// Each sentence comes from [`requirement`], so it is the framework's own wording for
-/// that bound rather than a second spelling of it.
+/// that bound rather than a second spelling of it, over the kind [`restated`] renders —
+/// so the `@pattern` an element set quotes and the one a clause of its own quotes are the
+/// same expression.
 ///
 /// Empty when the element shape declares no constraint at all.
 fn element_requirements(traits: &TraitMap) -> Vec<String> {
@@ -450,6 +710,34 @@ fn envelope(violations: &[Violation]) -> Option<String> {
     }
 }
 
+/// The refusal `violations` are stated as: this service's clause order over the clauses
+/// handed in, under the code every constraint refusal of this service travels with.
+///
+/// THE ONE wording of a refusal, so nothing can word one constraint two ways. Everything
+/// a CALLER decides happens before it, and only where the requirement came FROM decides
+/// it (see [`stated_report`] and [`aws_validation_refusal`]).
+fn worded(violations: Vec<Violation>) -> Option<Refused> {
+    Some(Refused {
+        code: VALIDATION_EXCEPTION.to_owned(),
+        message: envelope(&in_stated_order(violations))?,
+    })
+}
+
+/// The refusal for violations whose requirements are the ones the stating code ALREADY
+/// decided: an OPERATION that validates its own input before the boundary reports on the
+/// model's traits (`crate::service`'s seam over `crate::ops::start_migration`), and a
+/// constraint a HANDLER checked ([`constraint_report`]).
+///
+/// The shared `@pattern` rendering is applied — those requirements are declared the way a
+/// model declares one, so the expression a clause quotes is recovered by the same rule
+/// every other clause's is — and nothing is substituted: [`STATED`] records what this
+/// service states INSTEAD of a requirement the MODEL stated, and there is no such
+/// requirement here. Which value set and which expression those violations carry is the
+/// stating code's own, recorded where that code's rule lives.
+pub(crate) fn stated_report(violations: &[Violation]) -> Option<Refused> {
+    worded(violations.iter().map(restated).collect())
+}
+
 /// State `refusal` the way this service states it, or `None` to keep the framework's own
 /// wording.
 ///
@@ -458,16 +746,36 @@ fn envelope(violations: &[Violation]) -> Option<String> {
 /// on this service's `restJson1` protocol — carrying [`envelope`]'s message, so the code
 /// a client branches on travels with the message it is given.
 ///
+/// What the message states is decided in four steps, in this order: a request whose IAM
+/// role ARN cannot be read as one is answered with [`invalid_role_arn`] alone, because
+/// that step runs before the input's constraints are reported on; every enumerated type's
+/// value set the walk reported is stated in lexicographic order
+/// ([`::service_common::validation_message::in_sorted_enum_order`]), which is how this
+/// service lists a set the MODEL declares in an order of its own; every `@pattern` is
+/// quoted as the service advertises it ([`restated`]); and every member [`STATED`] records
+/// a surface for states that surface instead of the model's. The clauses are then worded
+/// by [`worded`], the one wording every refusal of this service goes through.
+///
 /// `None` for anything that is not a constraint refusal (an unauthenticated caller keeps
 /// the framework's 403 code and wording), and `None` when there is nothing to state.
 pub(super) fn aws_validation_refusal(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
     };
-    Some(Refused {
-        code: VALIDATION_EXCEPTION.to_owned(),
-        message: envelope(violations)?,
-    })
+    if let Some(role_arn) = unreadable_role_arn(violations) {
+        return Some(Refused {
+            code: VALIDATION_EXCEPTION.to_owned(),
+            message: invalid_role_arn(role_arn),
+        });
+    }
+    worded(
+        violations
+            .iter()
+            .map(in_sorted_enum_order)
+            .map(|violation| restated(&violation))
+            .flat_map(|violation| stated_violations(&violation))
+            .collect(),
+    )
 }
 
 /// Every INPUT shape of this service, as the generated schema statics.
@@ -698,7 +1006,9 @@ mod tests {
     }
 
     /// RULE: the element constraint set a clause states is read off the MODEL, so it
-    /// carries a member's constraints whether or not the request broke them.
+    /// carries a member's constraints whether or not the request broke them — each stated
+    /// the way this service states that requirement, the `@pattern` expression included
+    /// (quoted as the model declares it here, since both of its branches are anchored).
     #[test]
     fn the_element_constraint_catalog_is_built_from_the_model() {
         let sets = ELEMENT_CONSTRAINTS
@@ -714,6 +1024,104 @@ mod tests {
                 ]),
             "expected PackageUser's whole constraint set in model order, got {sets:?}"
         );
+    }
+
+    /// RULE: a violation at a member whose live validation surface the model lags states
+    /// THAT surface — the expression the service quotes, and a bound it states a clause of
+    /// its own for when the value is past it.
+    #[test]
+    fn a_stated_member_reports_the_surface_the_service_validates() {
+        // One value past the recorded 30-character bound, which the model declares no
+        // `@length` for, so the walk reports the pattern alone.
+        let refusal = Refusal::Invalid(vec![violation(
+            "applicationId",
+            ViolationKind::Pattern("^[a-z0-9]{3,30}$".to_owned()),
+            "thirty-one-characters-long-x-id",
+        )]);
+        let stated = aws_validation_refusal(&refusal).expect("a constraint refusal is stated");
+        assert_eq!(
+            stated.message,
+            "2 validation errors detected: Value 'thirty-one-characters-long-x-id' at \
+             'applicationId' failed to satisfy constraint: Member must satisfy regular \
+             expression pattern: [a-z0-9-]{3,30}; Value 'thirty-one-characters-long-x-id' at \
+             'applicationId' failed to satisfy constraint: Member must have length less than \
+             or equal to 30",
+            "expected the expression this service quotes and the bound it states, got {:?}",
+            stated.message
+        );
+    }
+
+    /// RULE: the clauses are stated in the order this service states its input members,
+    /// which for a capability's name and the application id that scopes it is not the
+    /// order the walk reported them in.
+    #[test]
+    fn a_capability_name_is_stated_before_the_application_that_scopes_it() {
+        let refusal = Refusal::Invalid(vec![
+            violation(
+                "applicationId",
+                ViolationKind::Pattern("^[a-z0-9]{3,30}$".to_owned()),
+                "probe_BAD",
+            ),
+            violation(
+                "capabilityName",
+                ViolationKind::Pattern("^[a-zA-Z0-9-]+$".to_owned()),
+                "BAD_NAME",
+            ),
+        ]);
+        let stated = aws_validation_refusal(&refusal).expect("a constraint refusal is stated");
+        assert_eq!(
+            stated.message,
+            "2 validation errors detected: Value 'BAD_NAME' at 'capabilityName' failed to \
+             satisfy constraint: Member must satisfy regular expression pattern: \
+             ^[a-zA-Z0-9-]+$; Value 'probe_BAD' at 'applicationId' failed to satisfy \
+             constraint: Member must satisfy regular expression pattern: [a-z0-9-]{3,30}",
+            "expected the capability's own name stated first, got {:?}",
+            stated.message
+        );
+    }
+
+    /// RULE: a role ARN that cannot be read as one replaces the whole report, whichever
+    /// requirement of that member the value broke and whatever else the request broke.
+    #[test]
+    fn an_unreadable_role_arn_replaces_the_whole_report() {
+        // (case, the violation at the role ARN member, the ARN the sentence names)
+        let rows = [
+            (
+                "a role ARN outside its expression",
+                violation(
+                    "dataSourceType.cloudWatchLog.roleArn",
+                    ViolationKind::Pattern("^arn:aws:iam::".to_owned()),
+                    "arn:aws:iam::role/not-a-role-arn",
+                ),
+                "arn:aws:iam::role/not-a-role-arn",
+            ),
+            (
+                "a role ARN shorter than its minimum",
+                violation(
+                    "dataSourceType.s3GlueDataCatalog.roleArn",
+                    ViolationKind::MinLength(20),
+                    "arn:aws:iam::role/x",
+                ),
+                "arn:aws:iam::role/x",
+            ),
+        ];
+        for (case, role_arn_violation, role_arn) in rows {
+            let refusal = Refusal::Invalid(vec![
+                violation(
+                    "dataSourceName",
+                    ViolationKind::Pattern("^[a-z][a-z0-9_]+$".to_owned()),
+                    "probe-BAD",
+                ),
+                role_arn_violation,
+            ]);
+            let stated = aws_validation_refusal(&refusal).expect("a refusal is stated");
+            let expected = format!("Invalid Role Arn : {role_arn}");
+            assert_eq!(
+                stated.message, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                stated.message
+            );
+        }
     }
 
     /// RULE: a refusal that is no constraint failure at all keeps the framework's wording.

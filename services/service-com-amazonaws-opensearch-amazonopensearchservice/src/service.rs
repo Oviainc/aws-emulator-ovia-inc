@@ -52,12 +52,12 @@
 //! [`override_routing_error`](Service::override_routing_error) for one presenting none.
 
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
 pub mod domain_rest;
-mod validation;
+pub(crate) mod validation;
 
 /// Whether the request these `parts` came from resolves to this service's signing name
 /// AND addresses a first URI path segment this model publishes
@@ -112,6 +112,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// Held in a field, built once, because `override_operation` hands back a reference
     /// borrowed from `&self`.
     credentialed_data_plane: CredentialedDataPlane<Eng>,
+    /// `StartMigration` with that operation's own validation of its input run first
+    /// ([`StatedStartMigration`]). Held in a field for the same reason as the data plane:
+    /// `override_operation` hands back a reference borrowed from `&self`.
+    stated_start_migration: StatedStartMigration,
 }
 
 /// The auth schemes a credentialed data-plane request is verified under.
@@ -168,8 +172,62 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             credentialed_data_plane: CredentialedDataPlane {
                 engine: Arc::clone(&engine),
             },
+            stated_start_migration: StatedStartMigration {
+                // The generated operation's own name, so this can never name a routing
+                // key the generated table does not hold.
+                routing_key: <crate::ops::start_migration::StartMigration<Eng> as Operation>::NAME,
+            },
             engine,
         }
+    }
+}
+
+/// `StartMigration` with that operation's own validation of the request's input run
+/// BEFORE the request boundary reports on the constraints this model declares.
+///
+/// WHY a seam and not the handler: that operation states ONE constraint report over every
+/// member of its input it refuses, and two of those members carry no constraint trait in
+/// this model at all — so the boundary, which reports only the traits and answers before
+/// any handler runs, can neither state those clauses nor let a handler state them. What
+/// the report SAYS is the operation's own rule
+/// ([`crate::ops::start_migration::stated_input_violations`]); this type only runs it
+/// first, and hands every request it refuses nothing in to the generated operation
+/// unchanged.
+struct StatedStartMigration {
+    /// The routing key the generated operation is wired under.
+    routing_key: &'static str,
+}
+
+impl ErasedOperation for StatedStartMigration {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // A body the runtime has not buffered carries no member to validate, so this
+            // validation states nothing and the request goes on to the generated
+            // operation — where the boundary refuses it for the members the model
+            // requires. Nothing is accepted that would otherwise have been refused.
+            let body = req.body().bytes().unwrap_or_default();
+            let violations = crate::ops::start_migration::stated_input_violations(body);
+            if let Some(refused) = validation::stated_report(&violations) {
+                // The clauses, the envelope and the code are the ones every other refusal
+                // of this service states; the status and the error envelope are the
+                // protocol's own for a refused input.
+                return svc.definition().refusal_response(
+                    aws_smithy_schema_server::ProtocolError::Invalid(violations),
+                    Some(refused),
+                );
+            }
+            match svc.definition().routing_table().get(self.routing_key) {
+                Some(operation) => operation.run(svc, req, ctx).await,
+                // Unreachable: the key is the generated operation's own name, and the
+                // generated table wires every modelled operation under it.
+                None => svc.definition().routing_error_response(req),
+            }
+        })
     }
 }
 
@@ -237,17 +295,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         {
             return Some(&self.credentialed_data_plane);
         }
+        // `StartMigration` is served through the seam that runs that operation's own
+        // validation of the input first (see [`StatedStartMigration`]). WHICH request that
+        // is comes from the model: the protocol resolves a request's routing key off the
+        // method and the URI pattern the model declares, so this names no path of its own.
+        if self.entry.protocol().routing_key(req).ok()
+            == Some(self.stated_start_migration.routing_key)
+        {
+            return Some(&self.stated_start_migration);
+        }
         None
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this service
-        // reword it. The words live in [`validation`], which keeps the framework's own
-        // clause for every violation but one class: a violation on an ELEMENT of a
-        // collection member, which this service states as ONE validation error about
-        // that member carrying the element shape's whole constraint set. The code
-        // travels with the message, as it must.
+        // reword it. The words live in [`validation`], which states the framework's own
+        // clause for every violation with the renderings this service's refusals use —
+        // the `@pattern` expression it advertises, an enumerated value set in sorted
+        // order, the surface it validates a member against where the model has not caught
+        // up — plus two statements about the message as a whole: a violation on an ELEMENT
+        // of a collection member becomes ONE validation error about that member carrying
+        // the element shape's whole constraint set, and a role ARN that cannot be read as
+        // one replaces the report entirely. The code travels with the message, as it must.
         validation::aws_validation_refusal(refusal)
     }
 

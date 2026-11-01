@@ -296,3 +296,211 @@ fn started(migration: &Migration) -> StartMigrationOutput {
         status: Some(migration.status.clone()),
     }
 }
+
+// =============================================================================
+// The input this operation validates ITSELF
+// =============================================================================
+//
+// This operation states ONE constraint report over the members of its input IT validates,
+// and two of them carry no constraint trait in this model at all: the workspace TYPE (a
+// plain `String`) and the SHAPE of the source ARN (`ARN`'s `@pattern` is `.*`). The
+// request boundary can only report the traits the model declares, and it answers before
+// any handler runs — so the report has to be stated before it, which is what
+// `crate::service` runs [`stated_input_violations`] from.
+//
+// Nothing about the SENTENCE is written here: the clauses, the member paths and the
+// envelope come from the framework and from `crate::service::validation`'s one refusal
+// path, exactly as they do for a member the boundary reports on — and so does the
+// `@pattern` quoting, which is why each expression below is declared in the shape a model
+// declares one in (anchored for the whole value) rather than twice.
+//
+// KNOWN LIMIT, recorded rather than papered over: a request that breaks one of these three
+// requirements AND a constraint the MODEL declares is answered with these clauses alone.
+// The model's own violations are walked over the DESERIALIZED input, which exists only
+// past this point, so merging the two reports would mean deserializing the request twice,
+// once here; what a caller is told is a subset of what it broke, never a clause about
+// something it did not break.
+
+use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use ::aws_smithy_schema_server::constraints::{validate, EnumTrait, PatternTrait};
+use ::aws_smithy_schema_server::Violation;
+use ::std::sync::LazyLock;
+
+/// This service's Smithy namespace, for the shadow member schemas below.
+const NAMESPACE: &str = "com.amazonaws.opensearch";
+
+/// The member paths this operation's own report names, as the validation path spells
+/// them — a member inside `migrationOptions` under the containers it sits in.
+const WORKSPACE_TYPE_PATH: &str = "migrationOptions.workspace.type";
+const DATASOURCE_ARN_PATH: &str = "migrationOptions.source.datasourceArn";
+const APPLICATION_ID_PATH: &str = "applicationId";
+
+/// The workspace types a migration can target, in the order this operation lists them
+/// when it refuses a value outside the set.
+///
+/// `MigrationWorkspace$type` is modelled as a plain `String`
+/// (`smithy_query(query="closure",operation="StartMigration")`), so BOTH the set and its
+/// order are the service's own: no enumerated type declares them, which is why they are
+/// not sorted the way a clause states a set read off the model. The source for both is the
+/// wire refusal recorded for this operation, which lists them in exactly this order; three
+/// of the five are what the model documents for the sibling member a data-source
+/// attachment creates a workspace with (`WorkspaceConfigurationInput$workspaceType`:
+/// "valid values are OBSERVABILITY, SECURITY_ANALYTICS, and SEARCH"), and the two that
+/// model text does not name — the whole-workspace and the essentials feature set — are the
+/// recorded refusal's.
+const WORKSPACE_TYPES: &[&str] = &[
+    "ALL",
+    "OBSERVABILITY",
+    "ESSENTIALS",
+    "SECURITY_ANALYTICS",
+    "SEARCH",
+];
+
+/// The expression a migration SOURCE's ARN has to satisfy over its WHOLE value: a
+/// collection of the serverless search service, in any partition, in a region, under a
+/// 12-digit account.
+///
+/// Saved objects are exported from a search COLLECTION — "migrate saved objects from a
+/// data source to an Amazon OpenSearch Service application workspace" over that data
+/// source — so an ARN naming any other resource names nothing this operation can export
+/// from. The model declares `ARN` with `@pattern(".*")`, which admits every string, so
+/// this expression is the service's; it is the one the wire refusal recorded for this
+/// operation quotes, and it is declared here the way a model declares a whole-value
+/// pattern, so the CHECK below runs it as written and the clause quotes it through the
+/// service's one `@pattern` rendering.
+const DATASOURCE_ARN_PATTERN: &str =
+    r"^arn:aws[a-z\-]*:aoss:[a-z0-9\-]+:[0-9]{12}:collection/[a-z0-9]+$";
+
+/// The expression the application id has to satisfy over its whole value.
+///
+/// A migration is handed the id of the application it imports INTO, and this operation
+/// validates it as the plain lower-case identifier the wire refusal recorded for it quotes
+/// — not as the id of an application it resolves, which is the surface the application
+/// APIs state (`crate::service::validation`'s `STATED`, where that difference is recorded
+/// beside it).
+const APPLICATION_ID_PATTERN: &str = "^[a-z0-9]+$";
+
+/// The workspace type's trait map: the value set, which the walk reports a value outside
+/// of as an enumerated type's violation.
+static WORKSPACE_TYPE_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(EnumTrait::new(WORKSPACE_TYPES)));
+    traits
+});
+
+/// The source ARN's trait map.
+static DATASOURCE_ARN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(PatternTrait::new(DATASOURCE_ARN_PATTERN)));
+    traits
+});
+
+/// The application id's trait map.
+static APPLICATION_ID_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(PatternTrait::new(APPLICATION_ID_PATTERN)));
+    traits
+});
+
+/// The shadow member schemas the walk reads: each one's name is the path its clause is
+/// stated at, and its trait map carries the constraint.
+static M_WORKSPACE_TYPE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.opensearch#StatedMigrationInput$migrationOptions.workspace.type",
+        NAMESPACE,
+        WORKSPACE_TYPE_PATH,
+    ),
+    ShapeType::String,
+    WORKSPACE_TYPE_PATH,
+    0,
+)
+.with_traits(&WORKSPACE_TYPE_TRAITS);
+
+static M_DATASOURCE_ARN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.opensearch#StatedMigrationInput$migrationOptions.source.datasourceArn",
+        NAMESPACE,
+        DATASOURCE_ARN_PATH,
+    ),
+    ShapeType::String,
+    DATASOURCE_ARN_PATH,
+    1,
+)
+.with_traits(&DATASOURCE_ARN_TRAITS);
+
+static M_APPLICATION_ID: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.opensearch#StatedMigrationInput$applicationId",
+        NAMESPACE,
+        APPLICATION_ID_PATH,
+    ),
+    ShapeType::String,
+    APPLICATION_ID_PATH,
+    2,
+)
+.with_traits(&APPLICATION_ID_TRAITS);
+
+/// The root of the shadow input the walk is driven over. Its member list is empty on
+/// purpose: the walk visits what [`StatedInput`] WRITES, and a root struct schema carries
+/// no member name, so it contributes no path segment.
+static STATED_INPUT_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.opensearch#StatedMigrationInput",
+        NAMESPACE,
+        "StatedMigrationInput",
+    ),
+    ShapeType::Structure,
+    &[],
+);
+
+/// One request's three validated members, written for the walk the way the codec writes a
+/// string member — in the ORDER this operation states their clauses, which is the order
+/// the walk reports them in. A member the request did not carry is not written, so it is
+/// not reported: absence is the boundary's to refuse, against the model's `@required`.
+struct StatedInput<'a> {
+    workspace_type: Option<&'a str>,
+    datasource_arn: Option<&'a str>,
+    application_id: Option<&'a str>,
+}
+
+impl SerializableStruct for StatedInput<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        if let Some(workspace_type) = self.workspace_type {
+            s.write_string(&M_WORKSPACE_TYPE, workspace_type)?;
+        }
+        if let Some(datasource_arn) = self.datasource_arn {
+            s.write_string(&M_DATASOURCE_ARN, datasource_arn)?;
+        }
+        if let Some(application_id) = self.application_id {
+            s.write_string(&M_APPLICATION_ID, application_id)?;
+        }
+        Ok(())
+    }
+}
+
+/// Everything this operation's own validation of `body` refuses, in the order it states
+/// the clauses — empty for a body it refuses nothing in.
+///
+/// `body` is the request's bytes, read as the JSON object `restJson1` carries this
+/// operation's input in; a body that is not one is left to the boundary's own codec
+/// refusal, which is what answers it today. Only the three STRING leaves below are read
+/// out of it, and each one's clause echoes it under the framework's own echo ceiling, so
+/// what this can state is bounded by the model rather than by the request.
+///
+/// Each violation carries the model-shaped expression its check ran, which
+/// `crate::service::validation` then quotes through this service's ONE `@pattern`
+/// rendering — so the expression a clause of this operation states and the expression a
+/// clause of any other states are rendered by the same rule.
+pub(crate) fn stated_input_violations(body: &[u8]) -> Vec<Violation> {
+    let Ok(request) = ::serde_json::from_slice::<::serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let member = |pointer: &str| request.pointer(pointer).and_then(::serde_json::Value::as_str);
+    let input = StatedInput {
+        workspace_type: member("/migrationOptions/workspace/type"),
+        datasource_arn: member("/migrationOptions/source/datasourceArn"),
+        application_id: member("/applicationId"),
+    };
+    validate(&input, &STATED_INPUT_SCHEMA)
+}

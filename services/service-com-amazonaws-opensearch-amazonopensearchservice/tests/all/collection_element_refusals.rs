@@ -54,7 +54,10 @@ const WELL_FORMED_PACKAGE_ID: &str = "pkg-0123456789abcdef";
 ///
 /// From the model: `PackageUser` is `@length(min: 6, max: 12)` with
 /// `@pattern("^[0-9]{12}$|^GLOBAL$")`
-/// (`smithy_query(query="shape",shape="PackageUser")`).
+/// (`smithy_query(query="shape",shape="PackageUser")`). The expression is QUOTED as the
+/// model declares it, anchors included: its two BRANCHES each carry the whole-value pair,
+/// so the pair at the ends of that text is not a wrapping this service's refusals drop —
+/// the expression was a whole-value expression before any wrapping.
 const PACKAGE_USER_SET: &str = "Member must satisfy constraint: [Member must have length less \
                                 than or equal to 12, Member must have length greater than or \
                                 equal to 6, Member must satisfy regular expression pattern: \
@@ -66,11 +69,13 @@ const PACKAGE_USER_SET: &str = "Member must satisfy constraint: [Member must hav
 ///
 /// From the model: `VpcEndpointId` is `@length(min: 5, max: 256)` with
 /// `@pattern("^aos-[a-zA-Z0-9]*$")`
-/// (`smithy_query(query="shape",shape="VpcEndpoint")`).
+/// (`smithy_query(query="shape",shape="VpcEndpoint")`) — one expression the model DID wrap,
+/// since what the pair encloses carries no anchor of its own, so the clause quotes it
+/// without that pair.
 const VPC_ENDPOINT_ID_SET: &str = "Member must satisfy constraint: [Member must have length \
                                    less than or equal to 256, Member must have length greater \
                                    than or equal to 5, Member must satisfy regular expression \
-                                   pattern: ^aos-[a-zA-Z0-9]*$]";
+                                   pattern: aos-[a-zA-Z0-9]*]";
 
 /// The `message` of a refusal, with the case named on failure.
 fn message(answer: &Answer, case: &str) -> String {

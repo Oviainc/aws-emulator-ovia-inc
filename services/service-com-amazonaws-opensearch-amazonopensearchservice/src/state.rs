@@ -7922,11 +7922,15 @@ pub fn malformed_engine_version(member: &str, value: &str) -> ValidationExceptio
 /// catalog it was resolved against — the same set `ListVersions` advertises, so a
 /// caller is told which releases it could have asked for and the two catalog answers
 /// cannot disagree.
+///
+/// The catalog is listed in the order it is PUBLISHED in
+/// ([`published_engine_versions`], newest release first), which is the order a caller
+/// reads it in everywhere else this service hands it over.
 pub fn unsupported_engine_version(value: &str) -> ValidationException {
     ValidationException {
         message: Some(format!(
             "Unsupported Version: {value}, allowed Versions are: [{}]",
-            SUPPORTED_ENGINE_VERSIONS.join(", ")
+            published_engine_versions().join(", ")
         )),
     }
 }
@@ -10391,7 +10395,9 @@ pub fn index_exists(domain_name: &str, index_name: &str) -> ResourceAlreadyExist
 
 /// The `ValidationException` payload for a member that must be an `IndexName` and
 /// is not ([`is_index_name`]). It names the member and the value, so the caller can
-/// fix the request from the refusal alone — the same shape as [`malformed_guid`].
+/// fix the request from the refusal alone. It is NOT a constraint report: the rule it
+/// states is the search engine's own naming rule for an index, which no `@pattern` of
+/// this model declares, so there is no expression to quote.
 pub fn malformed_index_name(member: &str, value: &str) -> ValidationException {
     ValidationException {
         message: Some(format!(
@@ -10433,6 +10439,12 @@ pub fn mapping_type_immutable(conflict: &MappingTypeConflict) -> ValidationExcep
 
 /// The widths of a `GUID`'s five hexadecimal groups.
 const GUID_GROUP_WIDTHS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// `GUID`'s own `@pattern`, as the model declares it
+/// (`smithy_query(query="shape",shape="GUID")`): the five hexadecimal groups
+/// [`GUID_GROUP_WIDTHS`] states, as the expression a refusal of a malformed one quotes.
+const GUID_PATTERN: &str =
+    r"^\p{XDigit}{8}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{12}$";
 
 /// Whether `value` is a `GUID`: `@length(min: 36, max: 36)` with pattern
 /// `^\p{XDigit}{8}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{12}$`.
@@ -10482,12 +10494,17 @@ pub fn dry_run_not_found(domain_name: &str, dry_run_id: Option<&str>) -> Resourc
 
 /// The `ValidationException` payload for a member that must be a `GUID` and is not.
 ///
-/// It names the member and the shape the value had to have, so a caller can fix the
-/// request from the refusal alone.
+/// Stated as the constraint report every other value outside its member's declared
+/// expression is refused with ([`crate::service::validation::constraint_report`]): the
+/// request boundary enforces `GUID`'s `@length` but not its `@pattern`, so this is the
+/// SAME constraint reported one step later, and a caller cannot tell the two apart.
+/// `member` is the member's name as the model spells it.
 pub fn malformed_guid(member: &str, value: &str) -> ValidationException {
     ValidationException {
-        message: Some(format!(
-            "{member} must be a GUID of the form xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx: {value}"
+        message: Some(crate::service::validation::constraint_report(
+            member,
+            value,
+            ::aws_smithy_schema_server::ViolationKind::Pattern(GUID_PATTERN.to_owned()),
         )),
     }
 }
@@ -10496,11 +10513,15 @@ pub fn malformed_guid(member: &str, value: &str) -> ValidationException {
 /// modelled `@range` sets, in the envelope AWS states a constraint violation in: the
 /// value the request carried, the member it was carried at as the wire names it, and
 /// the bound it broke.
+///
+/// Stated through [`crate::service::validation::constraint_report`], the one builder of
+/// that envelope, so a bound a handler checks reads like one the boundary checked.
 pub fn below_range_minimum(member: &str, value: i32, minimum: i32) -> ValidationException {
     ValidationException {
-        message: Some(format!(
-            "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
-             constraint: Member must have value greater than or equal to {minimum}"
+        message: Some(crate::service::validation::constraint_report(
+            member,
+            &value.to_string(),
+            ::aws_smithy_schema_server::ViolationKind::MinValue(minimum.to_string()),
         )),
     }
 }

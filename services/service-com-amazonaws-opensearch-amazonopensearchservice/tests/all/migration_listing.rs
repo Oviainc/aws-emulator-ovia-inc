@@ -39,8 +39,9 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 use super::data_source_attachments::application;
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX};
 
-/// The ARN of the data source every job below migrates saved objects out of.
-const SOURCE: &str = "arn:aws:es:us-east-1:123456789012:domain/listed-objects-source";
+/// The ARN of the data source every job below migrates saved objects out of: the search
+/// COLLECTION shape `StartMigration` validates a source against.
+const SOURCE: &str = "arn:aws:aoss:us-east-1:123456789012:collection/listedobjects";
 
 /// `ListMigrations`: `GET /2021-01-01/opensearch/app-migrations?applicationId=…`.
 async fn list_migrations(emulator: &Emulator, application_id: &str, query: &str) -> Answer {

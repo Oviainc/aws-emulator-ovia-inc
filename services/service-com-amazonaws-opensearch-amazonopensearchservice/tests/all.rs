@@ -35,6 +35,8 @@ mod config_change_cancellation;
 mod connection_decisions;
 #[path = "all/connection_records_at_rest.rs"]
 mod connection_records_at_rest;
+#[path = "all/constraint_refusal_messages.rs"]
+mod constraint_refusal_messages;
 #[path = "all/cross_cluster_connections.rs"]
 mod cross_cluster_connections;
 #[path = "all/data_source_attachment_authorization.rs"]
@@ -197,3 +199,5 @@ mod vpc_endpoints;
 mod vpc_endpoints_for_domain;
 #[path = "all/vpc_endpoints_for_domain_status.rs"]
 mod vpc_endpoints_for_domain_status;
+#[path = "all/zz_probe.rs"]
+mod zz_probe;
