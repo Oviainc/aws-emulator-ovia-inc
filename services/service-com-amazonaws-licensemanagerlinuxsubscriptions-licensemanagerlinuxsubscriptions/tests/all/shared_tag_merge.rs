@@ -19,6 +19,10 @@
 //! The rows differ along what the rule generalises over: how many pairs are stored, how
 //! many of the requested keys are already stored (overwrites) and how many are new, taking
 //! the resultant set below the bound, exactly to it, and past it by one and by more.
+//!
+//! A request whose map names NO pair is not a row: `TagResource` refuses it as invalid input
+//! before it resolves the resource (`tag_plane_authorization.rs`), so it is not a merge the
+//! two paths share.
 
 use std::collections::BTreeMap;
 
@@ -50,10 +54,10 @@ struct Row {
 fn rows() -> Vec<Row> {
     vec![
         Row {
-            label: "an empty write onto an empty set",
+            label: "one new key onto an empty set",
             stored: 0,
             overwrites: 0,
-            added: 0,
+            added: 1,
             accepted: true,
         },
         Row {

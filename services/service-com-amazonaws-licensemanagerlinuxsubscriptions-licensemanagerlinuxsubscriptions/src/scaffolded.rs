@@ -47,13 +47,19 @@
 //! taxonomy rather than the generic `ValidationException` their models list: a
 //! `resourceArn` the service cannot parse as a resource ARN is HTTP 400
 //! `BadRequestException` ([`Scaffolded::invalid_resource_arn`], and the same refusal at
-//! the request boundary is worded in `crate::service::validation`), one that addresses no
-//! resource is HTTP 404 `NotFoundException` ([`Scaffolded::not_found`]), and a tag
+//! the request boundary is worded in `crate::service::validation`), a tag write naming no
+//! pair at all is HTTP 400 `BadRequestException` too ([`Scaffolded::non_empty_tags`]), one
+//! that addresses no
+//! resource is HTTP 404 `NotFoundException` ([`Scaffolded::not_found`]), one the caller may
+//! not reach at all is HTTP 403 `AccessDeniedException` ([`Scaffolded::access_denied`], the
+//! verdict `crate::service::authorization` reaches), and a tag
 //! selection past the size a resource may carry — a write's tag map or a removal's tag-key
 //! list alike — is HTTP 400 `BadRequestException`
 //! ([`Scaffolded::tag_limit_exceeded`]). None of those codes is a shape this service's
 //! model declares, so they travel as [`Scaffolded::Unmodeled`], each carrying the status
 //! that goes with ITS code rather than one status for every client error.
+
+use std::borrow::Cow;
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -261,22 +267,59 @@ pub const TAG_LIMIT_MESSAGE: &str = "The resultant tag set must not have more th
 /// constraint envelope `crate::service::validation` states for every other member.
 pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
 
+/// The wire error code the tag APIs answer when the caller may not reach the resource
+/// `resourceArn` names at all — a resource field naming an account other than the one this
+/// request is served for.
+///
+/// This service's model declares no shape for an authorization refusal on these operations
+/// (`smithy_query(query="operation",operation="TagResource")` lists `InternalServerException`,
+/// `ResourceNotFoundException` and `ValidationException`), so the code goes on the wire as
+/// the recorded service's own: a client branches on the code, and AWS states this class with
+/// the standard IAM denial.
+pub const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
+/// The HTTP status that refusal carries.
+///
+/// 403, the status of an authorization failure, which a client reads as a PERMANENT refusal
+/// to be surfaced to the operator — as opposed to the 404 of
+/// [`NOT_FOUND_STATUS`], which invites a create-then-retry or is swallowed as an idempotent
+/// miss.
+pub const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The text `TagResource` refuses a request whose tag map names no pair with: a CONSTANT,
+/// with no variable part.
+///
+/// It is one of the tagging surface's own refusals, so it travels with that surface's
+/// [`BAD_REQUEST_CODE`] / [`BAD_REQUEST_STATUS`] rather than with the generic
+/// `ValidationException` the operation models: the request itself is wrong, and this surface
+/// states every wrong request of its own with that one code (compare
+/// [`INVALID_RESOURCE_ARN_MESSAGE`] and [`TAG_LIMIT_MESSAGE`], whose sentences are worded the
+/// same way). The model does not express the bound at all:
+/// `TagResourceRequest$tags` is `@required` with `@length(min: 0, max: 50)`, so an empty map
+/// is model-legal and only the recorded service refuses it.
+pub const NON_EMPTY_TAGS_MESSAGE: &str = "Invalid request input, expected non-empty tags map";
+
 /// One refusal this service states with an error code its model does not declare.
 ///
 /// It carries its own wire code, HTTP status and message precisely because the shape is
 /// not in the model, so there is no `#[operation_error]` variant that could render it.
-/// The three this service states are [`not_found`](Self::not_found) (HTTP 404
-/// `NotFoundException`), [`tag_limit_exceeded`](Self::tag_limit_exceeded) and
+/// The four this service states are [`not_found`](Self::not_found) (HTTP 404
+/// `NotFoundException`), [`access_denied`](Self::access_denied) (HTTP 403
+/// `AccessDeniedException`), [`tag_limit_exceeded`](Self::tag_limit_exceeded) and
 /// [`invalid_resource_arn`](Self::invalid_resource_arn) (HTTP 400
 /// `BadRequestException`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The message is a [`Cow`] because most of these refusals are CONSTANT text — they name
+/// nothing from the request, which is what keeps a sensitive tag selection and an ARN out of
+/// them — while the authorization denial has one variable part, the calling principal, which
+/// is server-derived rather than taken from the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnmodeledRefusal {
     /// The wire error code (`__type`, and `x-amzn-errortype` where the protocol sets it).
     pub code: &'static str,
     /// The HTTP status.
     pub status: u16,
-    /// The constant message this refusal carries.
-    pub message: &'static str,
+    /// The message this refusal carries.
+    pub message: Cow<'static, str>,
 }
 
 impl UnmodeledRefusal {
@@ -286,7 +329,20 @@ impl UnmodeledRefusal {
         Self {
             code: NOT_FOUND_CODE,
             status: NOT_FOUND_STATUS,
-            message: NOT_FOUND_MESSAGE,
+            message: Cow::Borrowed(NOT_FOUND_MESSAGE),
+        }
+    }
+
+    /// The tag APIs' refusal of a `resourceArn` the caller may not reach at all: HTTP 403
+    /// `AccessDeniedException`, naming `principal` — the identity whose authorization was
+    /// evaluated — and nothing about what it asked for.
+    pub fn access_denied(principal: &str) -> Self {
+        Self {
+            code: ACCESS_DENIED_CODE,
+            status: ACCESS_DENIED_STATUS,
+            message: Cow::Owned(
+                ::service_common::iam_authorization::not_authorized_to_access_resource(principal),
+            ),
         }
     }
 
@@ -297,7 +353,7 @@ impl UnmodeledRefusal {
         Self {
             code: BAD_REQUEST_CODE,
             status: BAD_REQUEST_STATUS,
-            message: TAG_LIMIT_MESSAGE,
+            message: Cow::Borrowed(TAG_LIMIT_MESSAGE),
         }
     }
 
@@ -308,7 +364,17 @@ impl UnmodeledRefusal {
         Self {
             code: BAD_REQUEST_CODE,
             status: BAD_REQUEST_STATUS,
-            message: INVALID_RESOURCE_ARN_MESSAGE,
+            message: Cow::Borrowed(INVALID_RESOURCE_ARN_MESSAGE),
+        }
+    }
+
+    /// The tagging surface's refusal of a tag write whose map names no pair: HTTP 400
+    /// `BadRequestException`, stated before the addressed resource is resolved.
+    pub const fn non_empty_tags() -> Self {
+        Self {
+            code: BAD_REQUEST_CODE,
+            status: BAD_REQUEST_STATUS,
+            message: Cow::Borrowed(NON_EMPTY_TAGS_MESSAGE),
         }
     }
 }
@@ -319,11 +385,12 @@ impl std::fmt::Display for UnmodeledRefusal {
     }
 }
 
+
 impl std::error::Error for UnmodeledRefusal {}
 
 impl SerializableStruct for UnmodeledRefusal {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
-        s.write_string(&UNMODELED_REFUSAL_MESSAGE, self.message)?;
+        s.write_string(&UNMODELED_REFUSAL_MESSAGE, self.message.as_ref())?;
         Ok(())
     }
 }
@@ -365,11 +432,26 @@ impl<E> Scaffolded<E> {
         Self::Unmodeled(UnmodeledRefusal::not_found())
     }
 
+    /// Refuse the request the way the tag APIs refuse a `resourceArn` the caller may not
+    /// reach at all: HTTP 403 `AccessDeniedException`, naming `principal`.
+    ///
+    /// Reached through `crate::service::authorization`, which is where the verdict itself
+    /// lives; this constructor is only how it is WORDED.
+    pub fn access_denied(principal: &str) -> Self {
+        Self::Unmodeled(UnmodeledRefusal::access_denied(principal))
+    }
+
     /// Refuse a tag request selecting more tags than a resource may carry — a write whose
     /// resultant tag set would be over the limit, or a removal naming more keys than the
     /// limit: HTTP 400 `BadRequestException`.
     pub const fn tag_limit_exceeded() -> Self {
         Self::Unmodeled(UnmodeledRefusal::tag_limit_exceeded())
+    }
+
+    /// Refuse a tag write whose map names no pair, the way the tagging surface refuses it:
+    /// HTTP 400 `BadRequestException`, before the addressed resource is resolved.
+    pub const fn non_empty_tags() -> Self {
+        Self::Unmodeled(UnmodeledRefusal::non_empty_tags())
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.

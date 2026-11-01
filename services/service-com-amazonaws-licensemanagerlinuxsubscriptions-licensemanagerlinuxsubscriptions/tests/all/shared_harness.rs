@@ -58,11 +58,6 @@ struct TagCase {
 
 const TAG_CASES: &[TagCase] = &[
     TagCase {
-        label: "no pairs",
-        id: "00000000-0000-4000-8000-000000000001",
-        pairs: &[],
-    },
-    TagCase {
         label: "one pair",
         id: "00000000-0000-4000-8000-000000000002",
         pairs: &[("env", "prod")],

@@ -18,14 +18,18 @@
 //!
 //! * every tag operation of the service — `TagResource` (`PUT`), `ListTagsForResource`
 //!   (`GET`) and `UntagResource` (`DELETE`);
-//! * eight classes of well-formed ARN that address no resource of this account (never
-//!   registered, deregistered, another region, another account, another resource kind,
-//!   another service, another partition, a one-character resource id), with a LIVE
+//! * seven classes of well-formed ARN that address no resource of this account (never
+//!   registered, deregistered, another region, another resource kind, another service,
+//!   another partition, a one-character resource id), with a LIVE
 //!   provider in the store throughout, so the refusal is about the ARN and not about an
 //!   empty store;
 //! * the payload the call carries (how many tag pairs a write names, how many keys a
 //!   removal names), which the status must not depend on;
 //! * a repeat of the same call, since the refusal is idempotent.
+//!
+//! An ARN in ANOTHER ACCOUNT is not a row of this rule: the surface decides authorization
+//! from the account field before it resolves anything, so such an ARN is denied rather than
+//! reported absent — `tag_plane_authorization.rs` owns that stage.
 //!
 //! `error_taxonomy.rs` owns the codes and texts of this taxonomy; what this suite adds is
 //! the STATUS each of them carries, and the boundary of the rule: the non-tag surface's
@@ -35,7 +39,7 @@ use serde_json::{json, Map, Value};
 
 use crate::harness::{
     deregister, get_provider, harness, list_tags, provider_arn_for, seed_provider, tag, untag,
-    Reply, ACCOUNT, REGION, SIGNING_NAME,
+    Reply, REGION, SIGNING_NAME,
 };
 
 /// A Secrets Manager ARN satisfying the modelled `SecretArn` pattern.
@@ -96,9 +100,12 @@ fn tag_keys(count: usize) -> Vec<String> {
     (0..count).map(|index| format!("key-{index:02}")).collect()
 }
 
-/// The ARN classes that are inside the modelled `resourceArn` grammar and address no
-/// resource of this account, given the `live` provider's ARN and one `gone` ARN whose
+/// The ARN classes that are inside the modelled `resourceArn` grammar, name THIS account
+/// and address no resource of it, given the `live` provider's ARN and one `gone` ARN whose
 /// record was deregistered.
+///
+/// Every row carries the caller's own account: an ARN naming another account is denied
+/// before it is resolved (`tag_plane_authorization.rs`), so it could not report absence.
 fn unregistered(live: &str, gone: &str) -> Vec<(String, String)> {
     vec![
         (
@@ -109,10 +116,6 @@ fn unregistered(live: &str, gone: &str) -> Vec<(String, String)> {
         (
             "the live provider's id in another region".to_string(),
             live.replace(REGION, "eu-west-1"),
-        ),
-        (
-            "the live provider's id in another account".to_string(),
-            live.replace(ACCOUNT, "123456789012"),
         ),
         (
             "another resource kind".to_string(),
@@ -155,8 +158,10 @@ async fn an_unregistered_resource_arn_is_reported_absent_with_http_404() {
     for (label, arn) in unregistered(&live, &gone) {
         for attempt in 0..2 {
             // A write: the status must not depend on how many pairs it names, so the row
-            // walks none, one and the modelled maximum of 50.
-            for pairs in [0_usize, 1, 50] {
+            // walks one, two and the modelled maximum of 50. (A write naming NO pair is
+            // refused as invalid input before the ARN is resolved, so it is not a row of
+            // this rule — `tag_plane_authorization.rs` pins that refusal.)
+            for pairs in [1_usize, 2, 50] {
                 let case = format!("TagResource on {label} with {pairs} pair(s), attempt {attempt}");
                 assert_refused(&tag(&h, &arn, &tag_map(pairs)).await, &case, NOT_FOUND);
             }

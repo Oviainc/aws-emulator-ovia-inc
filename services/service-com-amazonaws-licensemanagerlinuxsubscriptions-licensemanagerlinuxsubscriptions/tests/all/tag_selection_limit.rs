@@ -287,9 +287,10 @@ async fn a_tag_selection_within_the_modelled_maximum_is_accepted() {
         );
     }
 
-    // A write names between none and the maximum, and the resource reports exactly what
-    // it stored.
-    for count in [0_usize, 1, MAX_TAG_SELECTION - 1, MAX_TAG_SELECTION] {
+    // A write names between one pair and the maximum, and the resource reports exactly what
+    // it stored. (A write naming NO pair is a different refusal and not a row of this rule —
+    // `tag_plane_authorization.rs` pins what that refusal is.)
+    for count in [1_usize, 2, MAX_TAG_SELECTION - 1, MAX_TAG_SELECTION] {
         let case = format!("TagResource with {count} pair(s)");
         let label = format!("write-{count}");
         let arn = seed(&h, &label, 0);

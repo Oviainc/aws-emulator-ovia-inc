@@ -6,7 +6,10 @@
 //! reporting operation — it writes nothing.
 //!
 //! `resourceArn` is a `SubscriptionProviderArn`, so the resource it addresses is a
-//! registered subscription provider; an ARN naming none is refused with the HTTP 404
+//! registered subscription provider; an ARN whose account field is not the one this request
+//! is served for is refused with the HTTP 403 `AccessDeniedException`
+//! ([`crate::service::authorization`]) ahead of any lookup, an ARN naming no registration of
+//! this account is refused with the HTTP 404
 //! `NotFoundException` the tag APIs answer ([`crate::scaffolded::NOT_FOUND_CODE`] /
 //! [`crate::scaffolded::NOT_FOUND_STATUS`]), and
 //! one that is not a parseable resource ARN at all never reaches here — the request
@@ -159,6 +162,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `resourceArn`'s modelled pattern is refused by the framework before this
         // handler runs.
+        //
+        // AUTHORIZATION first, from the `resourceArn` alone and ahead of the lookup: a read
+        // of a resource in another account is denied rather than reported absent, so a
+        // caller enumerating ARNs across accounts learns that it lacks access instead of
+        // concluding the resources do not exist.
+        crate::service::authorization::authorize_resource_arn(&input.resource_arn)?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
 
         let store = state.lock();

@@ -31,7 +31,7 @@ use serde_json::{Map, Value};
 
 use crate::harness::{
     deregister, get_provider, harness, provider_arn_for, reported_tags_of, seed_provider,
-    stored_provider_count, tag, untag, Harness, Reply, ACCOUNT, ACTIVE, RED_HAT,
+    stored_provider_count, tag, untag, Harness, Reply, ACCOUNT, ACTIVE, RED_HAT, REGION,
 };
 
 /// The largest number of keys one removal may name: the modelled `tagKeys` list is
@@ -316,8 +316,10 @@ async fn a_refused_removal_leaves_every_stored_set_as_it_was() {
 
     // The ARN classes whose refusal could still have touched the store: one this account
     // never held, one whose record is gone, and one differing from the LIVE resource's
-    // ARN only in the account segment — the case a lookup keyed on anything less than the
-    // whole ARN would answer from the live record.
+    // ARN only in the region segment — the case a lookup keyed on anything less than the
+    // whole ARN would answer from the live record. (An ARN differing only in the ACCOUNT
+    // segment is denied before it is resolved, so it is a row of
+    // `tag_plane_authorization.rs` rather than of this rule.)
     let unknown = [
         (
             "an id nothing was ever registered under",
@@ -325,8 +327,8 @@ async fn a_refused_removal_leaves_every_stored_set_as_it_was() {
         ),
         ("a deregistered provider", gone),
         (
-            "the live provider's id in another account",
-            live.replace(ACCOUNT, "123456789012"),
+            "the live provider's id in another region",
+            live.replace(REGION, "eu-west-1"),
         ),
     ];
 

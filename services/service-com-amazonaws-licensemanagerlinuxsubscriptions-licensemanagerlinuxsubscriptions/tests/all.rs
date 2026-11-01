@@ -57,6 +57,8 @@ mod subscription_providers;
 mod tag_api_refusal_code;
 #[path = "all/tag_not_found_status.rs"]
 mod tag_not_found_status;
+#[path = "all/tag_plane_authorization.rs"]
+mod tag_plane_authorization;
 #[path = "all/tag_removal.rs"]
 mod tag_removal;
 #[path = "all/tag_selection_limit.rs"]

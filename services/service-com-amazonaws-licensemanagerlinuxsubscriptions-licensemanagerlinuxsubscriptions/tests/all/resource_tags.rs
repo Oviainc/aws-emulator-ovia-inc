@@ -29,10 +29,14 @@
 //!   as it was.
 //!
 //! The tables span the class each rule covers rather than the one recorded tag set: the
-//! number of pairs written (none, one, three, the modelled maximum of 50), keys and
+//! number of pairs written (one, three, the modelled maximum of 50), keys and
 //! values that are non-ASCII or URI-significant, a write that overwrites a stored key, a
 //! write disjoint from the stored keys, and — for the maximum — the published bound, one
 //! below it and one past it.
+//!
+//! A write naming NO pair at all is not a row here: the surface refuses it as invalid input
+//! before the resource is resolved, which `tag_plane_authorization.rs` owns — as it does the
+//! denial of a `resourceArn` in another account.
 
 use std::collections::BTreeMap;
 
@@ -155,10 +159,10 @@ struct MergeCase {
 fn merge_cases() -> Vec<MergeCase> {
     let mut cases = vec![
         MergeCase {
-            case: "no pairs leaves the stored set alone".to_string(),
+            case: "one pair leaves the stored key it does not name alone".to_string(),
             stored: pairs(&[("owner", "platform")]),
-            written: Vec::new(),
-            want: pairs(&[("owner", "platform")]),
+            written: pairs(&[("env", "prod")]),
+            want: pairs(&[("owner", "platform"), ("env", "prod")]),
         },
         MergeCase {
             case: "one pair onto an empty set".to_string(),
@@ -331,10 +335,6 @@ async fn an_arn_addressing_no_resource_is_refused_by_both_tag_operations() {
         (
             "the live provider's id in another region".to_string(),
             live.replace(REGION, "eu-west-1"),
-        ),
-        (
-            "the live provider's id in another account".to_string(),
-            live.replace(ACCOUNT, "123456789012"),
         ),
         (
             "another resource kind".to_string(),

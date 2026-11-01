@@ -34,7 +34,8 @@
 //! How a refusal is WORDED lives here too, for the same reason the decision does:
 //! [`not_authorized_by_resource_policy`] is the one sentence an AWS service refuses an
 //! unauthorized request with, built from the principal, the action and the resource the
-//! request named.
+//! request named, and [`not_authorized_to_access_resource`] the one a service states when
+//! the caller may not reach the named resource at all, which names the principal alone.
 //!
 //! `Action`/`NotAction`, `Resource`/`NotResource` and `Principal`/`NotPrincipal` are each
 //! either one string or a list of them, and the `Not…` spelling matches everything its
@@ -542,6 +543,25 @@ pub fn not_authorized_by_resource_policy(principal: &str, action: &str, resource
         "User: {principal} is not authorized to perform: {action} on resource: {resource} \
          because no resource-based policy allows the {action} action"
     )
+}
+
+/// The sentence AWS refuses a request with when the caller may not reach the named resource
+/// AT ALL: the calling principal, and nothing else.
+///
+/// It is the denial of the services whose refusal is decided from the request's own resource
+/// ARN rather than from a policy evaluation — a resource field naming another account, which
+/// no document of this account can grant over — so it names neither an action nor a
+/// resource: a caller must not be able to learn from a denial what exists in an account that
+/// is not its own. That is also why it can be stated before anything is looked up.
+///
+/// `service-com-amazonaws-snowdevicemanagement-snowdevicemanagement/src/state.rs` and
+/// `service-com-amazonaws-sagemakerjobruntime-agenticrftruntimeservice/src/service/authorization.rs`
+/// each still carry their own spelling of this sentence, inlined before it lived here and
+/// pinned by their own suites; they are to be migrated onto this one rather than copied
+/// again.
+#[must_use]
+pub fn not_authorized_to_access_resource(principal: &str) -> String {
+    format!("User: {principal} is not authorized to access this resource")
 }
 
 /// Whether `pattern` matches `value`, with IAM's `*` (any run of characters, including

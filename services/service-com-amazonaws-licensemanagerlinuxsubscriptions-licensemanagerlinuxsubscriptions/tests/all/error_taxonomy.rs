@@ -18,10 +18,12 @@
 //!    anchors;
 //! 5. an enum violation on an ELEMENT of a list is reported at the LIST member, with the
 //!    element's constraint nested;
-//! 6. the tag APIs answer their own taxonomy in two ordered stages, each with the HTTP
+//! 6. the tag APIs answer their own taxonomy in ordered stages, each with the HTTP
 //!    status that goes with its code: HTTP 400 `BadRequestException` for a `resourceArn`
-//!    outside the modelled grammar, HTTP 404 `NotFoundException` for one that addresses
-//!    no resource, and the tag removal they perform is readable back;
+//!    outside the modelled grammar, HTTP 403 `AccessDeniedException` for one naming another
+//!    account, HTTP 404 `NotFoundException` for one that addresses
+//!    no resource of this account, and the tag removal they perform is readable back
+//!    (`tag_plane_authorization.rs` owns the denial stage in full);
 //! 7. a not-found refusal on a subscription-provider ARN carries FIXED text and nothing
 //!    from the request, and is idempotent.
 
@@ -431,12 +433,42 @@ async fn the_tag_apis_separate_a_bad_arn_from_a_missing_resource() {
         }
     }
 
-    // Stage 2 — EXISTENCE: values inside that grammar which address no resource of this
-    // account, including ARNs of another resource kind and another service.
+    // Stage 2 — AUTHORIZATION: the same two shapes of ARN with the account field naming
+    // another account. Decided from the ARN, so it is the answer whether or not this account
+    // holds a resource under that id, and it names the calling principal rather than
+    // anything the request carried.
+    let foreign = [
+        format!("arn:aws:{SIGNING_NAME}:{REGION}:123456789012:subscription-provider/other"),
+        format!("arn:aws:{SIGNING_NAME}:eu-central-1:999999999999:subscription-provider/other"),
+    ];
+    let denial = format!(
+        "User: {} is not authorized to access this resource",
+        service_common::caller_principal::ambient_user_arn()
+    );
+    for arn in &foreign {
+        for (op, reply) in [
+            ("UntagResource", untag(&h, arn, &["a"]).await),
+            ("ListTagsForResource", list_tags(&h, arn).await),
+        ] {
+            let case = format!("{op} with {arn}");
+            reply.error(&case, 403, "AccessDeniedException");
+            assert_eq!(
+                reply.message(),
+                denial,
+                "case {case:?}: expected {denial:?}, got {:?}",
+                reply.message()
+            );
+        }
+    }
+
+    // Stage 3 — EXISTENCE: values inside that grammar which name THIS account and address
+    // no resource of it, including ARNs of another resource kind and another service. (An
+    // ARN naming another account is denied at the stage before this one, so it is not a row
+    // here.)
     let unregistered = [
         provider_arn_for("55555555-5555-5555-5555-555555555555"),
         provider_arn_for("00000000-0000-4000-8000-000000000001"),
-        format!("arn:aws:{SIGNING_NAME}:eu-central-1:123456789012:subscription-provider/other"),
+        format!("arn:aws:{SIGNING_NAME}:eu-central-1:{ACCOUNT}:subscription-provider/other"),
         format!("arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT}:linux-subscription/abc"),
         "arn:aws:iam:us-west-2:000000000000:role/not-a-provider".to_string(),
     ];

@@ -7,7 +7,14 @@
 //! had), so `ListTagsForResource` afterwards reports the union of every write.
 //!
 //! `resourceArn` is a `SubscriptionProviderArn`, so the resource it addresses is a
-//! registered subscription provider; an ARN naming none is refused with the HTTP 404
+//! registered subscription provider. The request is answered in THREE ordered stages, so
+//! that a refusal the service reaches without the resource cannot be replaced by one about
+//! the resource: the `resourceArn`'s account field decides authorization first
+//! ([`crate::service::authorization`], HTTP 403 `AccessDeniedException`), the `tags` map the
+//! body carries is validated next (a map naming no pair is refused with the tagging
+//! surface's HTTP 400 `BadRequestException` /
+//! [`crate::scaffolded::NON_EMPTY_TAGS_MESSAGE`]), and only then is
+//! the ARN resolved — an ARN naming no registration is refused with the HTTP 404
 //! `NotFoundException` the tag APIs answer ([`crate::scaffolded::NOT_FOUND_CODE`] /
 //! [`crate::scaffolded::NOT_FOUND_STATUS`]), and a
 //! write whose resultant set would pass [`crate::state::MAX_TAGS_PER_RESOURCE`] is
@@ -157,12 +164,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `resourceArn`'s modelled pattern and the 0..50 bound on the `tags` map the
         // REQUEST carries are refused by the framework before this handler runs.
+        //
+        // AUTHORIZATION first, from the `resourceArn` alone: a resource field naming another
+        // account is one no policy of the account this request is served for can grant over,
+        // so the verdict is already settled and no lookup may turn it into a report about
+        // the resource.
+        crate::service::authorization::authorize_resource_arn(&input.resource_arn)?;
+
+        // Then the request BODY. "The metadata tags to assign": a write that assigns none is
+        // refused as a wrong request, in the tagging surface's own `BadRequestException` (as
+        // every other wrong request of this surface is), and before the ARN is resolved — a
+        // wrong request is the caller's to fix whether or not the resource it named exists.
+        if input.tags.is_empty() {
+            return Err(TagResourceError::non_empty_tags());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
 
         let mut store = state.lock();
         // The tag APIs address a resource by ARN and nothing else, so an ARN this
-        // account holds no resource for is a not-found refusal — stated before any tag
-        // is written, so a refused call leaves the store untouched.
+        // account holds no resource for is a not-found refusal — the EXISTENCE stage,
+        // behind the two above, and stated before any tag is written, so a refused call
+        // leaves the store untouched.
         let tags = store
             .resource_tags_mut(&input.resource_arn)
             .ok_or_else(TagResourceError::not_found)?;

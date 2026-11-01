@@ -6,7 +6,7 @@
 //! `ListTagsForResource` reports what is left. A key the resource does not carry is not
 //! an error — the request states the keys that must be gone, and they are.
 //!
-//! The resource is addressed by `resourceArn` and checked in two ORDERED,
+//! The resource is addressed by `resourceArn` and checked in three ORDERED,
 //! distinguishable stages, which is the tag APIs' own taxonomy:
 //!
 //! 1. FORMAT — a value that is not a parseable resource ARN is refused with HTTP 400
@@ -21,13 +21,18 @@
 //!    parameter is refused at that boundary with that same code and the sentence naming
 //!    the parameter it has to add — every refusal of this surface is the surface's own,
 //!    whatever the violated constraint.
-//! 2. EXISTENCE — an ARN addressing no resource of this account is refused with HTTP 404
+//! 2. AUTHORIZATION — an ARN whose account field is not the one this request is served for
+//!    is refused with HTTP 403 `AccessDeniedException`
+//!    ([`crate::service::authorization`]), decided from the ARN alone and therefore ahead
+//!    of the lookup: a denied removal must not read as an already-clean resource.
+//! 3. EXISTENCE — an ARN addressing no resource of this account is refused with HTTP 404
 //!    `NotFoundException` ([`crate::scaffolded::NOT_FOUND_CODE`] /
 //!    [`crate::scaffolded::NOT_FOUND_STATUS`]), the same status, code and text as the
 //!    other tag APIs: an absent resource is reported as absent, not as a bad request.
 //!
-//! Neither code is in this operation's modelled error set (`ResourceNotFoundException`,
-//! `InternalServerException`), so both travel through `crate::scaffolded::Scaffolded`'s
+//! None of those codes is in this operation's modelled error set
+//! (`ResourceNotFoundException`, `InternalServerException`), so they all travel through
+//! `crate::scaffolded::Scaffolded`'s
 //! unmodeled channel. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -160,6 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `resourceArn`'s modelled pattern is refused before this handler runs, so the
         // FORMAT stage is already behind us; `ctx` carries nothing this operation needs.
         let _ = ctx;
+        // AUTHORIZATION next, from the `resourceArn` alone and ahead of the lookup: a
+        // removal on a resource in another account is denied rather than reported absent, so
+        // a caller cannot read the failed mutation as an already-clean resource.
+        crate::service::authorization::authorize_resource_arn(&input.resource_arn)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the service state is unavailable".to_string()),

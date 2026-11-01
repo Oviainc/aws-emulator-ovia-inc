@@ -156,6 +156,12 @@ async fn a_stored_set_is_reported_through_the_shared_projection() {
 async fn a_written_set_is_reported_through_the_shared_projection() {
     let h = harness();
     for (index, row) in rows().into_iter().enumerate() {
+        if row.pairs.is_empty() {
+            // `TagResource` refuses a tag map naming no pair, so the empty set is not one a
+            // WRITE can leave behind (`tag_plane_authorization.rs` pins that refusal); the
+            // seeded form above and the removal below project it.
+            continue;
+        }
         let case = format!("TagResource writing {}", row.case);
         let arn = seed(&h, index, &[]);
         tag(&h, &arn, &tag_map(&row.pairs)).await.ok(&case);
