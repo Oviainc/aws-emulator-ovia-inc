@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAppInstanceBot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAppInstanceBot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAppInstanceBot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +141,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAppInstanceBot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAppInstanceBotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAppInstanceBotErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the AppInstance store is unavailable".to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        // A reporting operation: it reads the stored bot and writes nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAppInstanceBot"))
+        // Resolving the `AppInstanceBotArn` is an ACCESS decision rather than a lookup
+        // that reports absence: an ARN this service holds no bot for names a bot this
+        // caller may not read, so the answer is the permanent 403 refusal, and it tells
+        // the caller nothing about whether such a bot exists anywhere. The only resource
+        // the request names is the one being resolved, so the modelled 404 — for
+        // resources a request names BESIDE the one it addresses — never applies here.
+        let Some(record) = state.bot(&input.app_instance_bot_arn) else {
+            return Err(DescribeAppInstanceBotErrorModeled::ForbiddenException(
+                ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeAppInstanceBotOutput {
+            app_instance_bot: Some(AppInstanceBot {
+                app_instance_bot_arn: Some(record.arn.clone()),
+                // `Name` and `Metadata` are optional on the create, so a bot reports
+                // exactly what it was created with — absent included.
+                name: record.name.clone(),
+                metadata: record.metadata.clone(),
+                // `Configuration` is required on the create, so a stored bot always has
+                // one, reported verbatim.
+                configuration: Some(record.configuration.clone()),
+                created_timestamp: Some(crate::state::wire_timestamp(record.created_timestamp)),
+                // A bot is stamped from creation, so this member is always reported;
+                // every write to the bot re-stamps it.
+                last_updated_timestamp: Some(crate::state::wire_timestamp(
+                    record.last_updated_timestamp,
+                )),
+            }),
+        })
     }
 }
+
+/// The `Message` an authorization refusal of an Amazon Chime SDK Identity ARN carries.
+///
+/// One sentence, whichever resource the caller asked for and whatever left the ARN
+/// unresolvable: a client branches on the `Code` (`Forbidden`), and the reason a
+/// particular request was refused stays in the comment at the refusal rather than being
+/// disclosed to a caller that may not read the resource.
+const FORBIDDEN_REQUEST_MESSAGE: &str = "You are not allowed to make this request.";
