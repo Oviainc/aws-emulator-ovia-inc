@@ -1293,24 +1293,3 @@ async fn reads_do_not_change_what_a_later_caller_sees() {
         "case repeated read: the catalog changed between two reads"
     );
 }
-
-/// The operation this slice leaves unimplemented still answers 501, so a
-/// caller can tell "not written yet" from an empty success.
-#[tokio::test]
-async fn the_remaining_operations_are_still_scaffolded() {
-    let router = router();
-    let cases: [(&str, Value); 1] = [(
-        "ListEfficiencyMetrics",
-        json!({
-            "granularity": "Monthly",
-            "timePeriod": {"start": "2026-01-01", "end": "2026-02-01"},
-        }),
-    )];
-    for (operation, body) in &cases {
-        let (status, payload) = call(&router, operation, body).await;
-        assert_eq!(
-            status, 501,
-            "case {operation}: expected HTTP 501, got {status} with {payload}"
-        );
-    }
-}

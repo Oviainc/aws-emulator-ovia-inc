@@ -43,13 +43,13 @@ use crate::cost_optimization_hub::{
 const MEMBER_ACTIVE: &str = "111122223333";
 const MEMBER_INACTIVE: &str = "444455556666";
 
-/// Every paginated read of this service, with the request that makes it answer
-/// more than one row (so a page size of one issues a token) — the operations
-/// that each enforce the token rule.
+/// Every paginated read of this service whose rows are a list of records, with
+/// the request that makes it answer more than one row (so a page size of one
+/// issues a token) — the operations that each enforce the token rule.
 ///
-/// `ListEfficiencyMetrics` is the service's fourth paginated operation and is
-/// not implemented yet (it answers 501), so it has no page to resume and no row
-/// here.
+/// `ListEfficiencyMetrics` is this service's fourth paginated read; it pages
+/// over GROUPS of a time series rather than records, so the same rule is driven
+/// through it by the `efficiency_metrics` suite instead of by this table.
 fn paginated_reads() -> Vec<(&'static str, Value)> {
     vec![
         (

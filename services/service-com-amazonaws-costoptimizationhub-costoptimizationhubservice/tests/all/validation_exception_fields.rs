@@ -17,8 +17,7 @@
 //! (`@pattern`, `@range`, `@length`, enum membership, `@required`), the positions
 //! a violation can hold (a scalar member, a member of a nested structure, an
 //! element of a nested list), the number of violations in one request, and the
-//! operations that declare them — including one whose handler is still
-//! scaffolded, because validation precedes the handler.
+//! operations that declare them.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_costoptimizationhub_costoptimizationhubservice as cost_optimization_hub;
@@ -293,7 +292,7 @@ async fn a_constraint_refusal_names_every_member_and_its_constraint() {
             )],
         ),
         (
-            "enum membership on a scaffolded operation's member",
+            "enum membership on an operation's enum member",
             "ListEfficiencyMetrics",
             json!({
                 "granularity": "Hourly",
@@ -456,9 +455,8 @@ async fn a_handler_raised_refusal_names_its_member_too() {
 
 /// A request inside every constraint it declares is served, not refused: each
 /// published bound of a `@range`, every value of an enum, a list at its minimum
-/// length, and a 12-digit account id. An operation whose handler is still
-/// scaffolded answers 501 — the refusal layer added for the field list must not
-/// turn a valid request into a 400.
+/// length, and a 12-digit account id — the refusal layer added for the field
+/// list must not turn a valid request into a 400.
 #[tokio::test]
 async fn every_request_inside_its_constraints_is_served() {
     let router = router();
@@ -496,13 +494,13 @@ async fn every_request_inside_its_constraints_is_served() {
             200,
         ),
         (
-            "a valid request to a scaffolded operation".to_string(),
+            "a valid request to a time-series read".to_string(),
             "ListEfficiencyMetrics",
             json!({
                 "granularity": "Monthly",
                 "timePeriod": {"start": "2026-01-01", "end": "2026-02-01"},
             }),
-            501,
+            200,
         ),
         (
             "a valid request to an implemented list operation".to_string(),

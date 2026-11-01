@@ -16,9 +16,7 @@
 //! Asserted over a table holding, for every paginated operation of this
 //! service, each published bound (accepted) and one value past each (refused
 //! with HTTP 400 `ValidationException`, whose `fields` entry states the bound
-//! that operation declares) — including the operations whose handler is still
-//! scaffolded, because a bad request is a 400 whether or not the operation is
-//! written yet.
+//! that operation declares).
 
 use serde_json::{json, Value};
 
@@ -28,8 +26,7 @@ use crate::cost_optimization_hub::{
 
 /// One paginated operation: its name, the rest of a well-formed request for it,
 /// the bounds its own `maxResults` member declares, and the status a request
-/// inside those bounds gets — 200 for an implemented operation, 501 for one
-/// that is still scaffolded (its own stub issue, not this bound).
+/// inside those bounds gets.
 struct Paginated {
     operation: &'static str,
     request: Value,
@@ -69,7 +66,7 @@ fn paginated_operations() -> Vec<Paginated> {
             }),
             min: 0,
             max: 1000,
-            served: 501,
+            served: 200,
         },
     ]
 }

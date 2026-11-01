@@ -1,15 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEfficiencyMetrics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEfficiencyMetrics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEfficiencyMetrics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports cost efficiency as a TIME SERIES over the recommendation catalog the
+//! calling account may read — the same view `ListRecommendations`,
+//! `GetRecommendation` and `ListRecommendationSummaries` are served
+//! (`crate::state::...::readable_recommendation_view`), so no reader of this
+//! service disagrees with another about what the account spends or could save.
+//!
+//! The rows are first reduced to ONE recommendation per resource
+//! (`crate::state::dedupe_by_resource`), because a resource's alternatives are
+//! mutually exclusive: a caller can adopt only one of them, so the resource
+//! contributes its cost once and its best saving once. Those rows are totalled
+//! per value of the `groupBy` dimension — or into one group covering every
+//! resource, where the request names no dimension — giving each group what its
+//! resources cost per month (`spend`) and what adopting their recommendations
+//! would remove from that (`savings`), both under the caller's effective
+//! `savingsEstimationMode` preference.
+//!
+//! Each group's series carries one data point per interval of the requested
+//! `granularity` that the requested `timePeriod` reaches (start inclusive, end
+//! exclusive), and a point's figures are the month's figures prorated by the
+//! days of that month the point covers inside the period. One rule for both
+//! granularities: a day of a 31-day month carries a thirty-first of it, a whole
+//! month carries all of it, and a month the period only partly covers carries
+//! the share of its days that fall inside the period — so the daily points of a
+//! month inside the period add up to that month's monthly point.
+//!
+//! `score` is the efficiency score of the group: the percentage of its spend
+//! that is NOT identified as removable, so a group with nothing left to save
+//! scores 100 and a higher score is better optimization. It is a share of
+//! spend, so it is the same at every point of a group's series.
+//!
+//! A group whose resources have no spend over the period has nothing to compute
+//! a score or a share from, so it reports no `metricsByTime` and carries the
+//! `message` explaining why instead — which is how an account that is not
+//! enrolled, or whose analysis is not due yet, reads.
 //!
 //! ## Shape of an operation
 //!
@@ -172,35 +198,664 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEfficiencyMetricsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Cost Optimization Hub store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
         // This operation's own `@range` on `maxResults` (min 0, max 1000), which
         // overrides the narrower range of the `MaxResults` shape it targets and
         // so is not enforced by the schema's constraint walk (`skip_validation`
-        // on `ListEfficiencyMetricsInput`). A request outside it is refused
-        // whether or not the operation itself is implemented yet.
+        // on `ListEfficiencyMetricsInput`).
         if let Some(refused) =
             crate::service::out_of_range("maxResults", input.max_results, 0, MAX_RESULTS_MAX)
         {
             return Err(ListEfficiencyMetricsErrorModeled::ValidationException(refused).into());
         }
-        // Implement `ListEfficiencyMetrics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEfficiencyMetricsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them —
-        // every one but `maxResults`', which the check above owns.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEfficiencyMetrics"))
+
+        // `granularity` targets the modelled `GranularityType` enum, whose value
+        // set the constraint walk refuses outside of before this handler runs;
+        // the same set is stated here so the interval the series is built from
+        // is resolved from a value this operation recognises rather than
+        // assumed.
+        if let Some(refused) = crate::service::not_in_enum(
+            "granularity",
+            &input.granularity,
+            GRANULARITY_TYPE_VALUES,
+        ) {
+            return Err(ListEfficiencyMetricsErrorModeled::ValidationException(refused).into());
+        }
+        let granularity = if input.granularity == GRANULARITY_DAILY {
+            Granularity::Daily
+        } else {
+            Granularity::Monthly
+        };
+
+        // The intervals the series carries one data point per: the requested
+        // period read as dates, then cut at the requested granularity. A period
+        // this operation cannot read, or cannot report as a series, is refused
+        // rather than answered with a series about another period.
+        let period = period(&input.time_period)?;
+        let intervals = granularity.intervals(period)?;
+
+        // A `groupBy` that names no dimension these metrics can be grouped by
+        // cannot be honoured, so the request is refused rather than silently
+        // aggregated along another dimension — or across all resources, which is
+        // what naming NO dimension asks for.
+        let dimension = match &input.group_by {
+            None => None,
+            Some(group_by) if group_by.trim().is_empty() => return Err(no_group_dimension()),
+            Some(group_by) => match crate::state::parse_group_dimension(group_by) {
+                Some(dimension) => Some(dimension),
+                None => return Err(unknown_group_by(group_by)),
+            },
+        };
+
+        // An `orderBy` the request SETS is honoured as a whole, or the request is
+        // refused rather than served in another order: `dimension` says which
+        // values the groups are put in order of, so an `orderBy` carrying none is
+        // refused like one naming a member these groups do not carry.
+        let order = match &input.order_by {
+            None => None,
+            Some(order_by) => {
+                let dimension = order_by.dimension.as_deref().unwrap_or_default();
+                if dimension.trim().is_empty() {
+                    return Err(no_order_dimension());
+                }
+                match MetricDimension::parse(dimension) {
+                    Some(parsed) => Some((parsed, order_by.order.as_deref() == Some(ORDER_DESC))),
+                    None => return Err(unknown_order_dimension(dimension)),
+                }
+            }
+        };
+
+        // The rows this caller may read, under its effective savings estimation
+        // mode: the one view every recommendation reader of this service is
+        // served, so these metrics are taken over exactly the recommendations
+        // `ListRecommendations` reports. This operation carries no member that
+        // names another account, so its scope is the caller's own record
+        // (widened to the organization where the caller manages it) and reaches
+        // past nobody.
+        let view = state
+            .lock()
+            .readable_recommendation_view(crate::state::caller_account_id());
+        let mode = view.savings_estimation_mode;
+        let mode = mode.as_deref();
+
+        // One recommendation per resource: a resource's alternatives are
+        // mutually exclusive, so its spend is counted once and the saving
+        // credited to it is the best one available — the same de-duplicated view
+        // `ListRecommendationSummaries` totals its de-duped savings over.
+        let rows = crate::state::dedupe_by_resource(&view.rows, mode);
+        let mut groups = totals_by_group(&rows, dimension, mode);
+        sort_groups(&mut groups, order);
+
+        // The page this read answers, under the one pagination-token rule every
+        // paginated read of this service applies (`crate::service::page`). The
+        // page is of GROUPS — which is what `maxResults` bounds and `nextToken`
+        // resumes — so every group it carries reports the whole series.
+        let page = crate::service::page(
+            Self::NAME,
+            PAGE_KIND,
+            &groups,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(ListEfficiencyMetricsErrorModeled::ValidationException)?;
+
+        Ok(ListEfficiencyMetricsOutput {
+            efficiency_metrics_by_group: Some(
+                page.items
+                    .iter()
+                    .map(|group| render(group, &intervals))
+                    .collect(),
+            ),
+            next_token: page.next_token,
+        })
     }
 }
+
+/// The list a `nextToken` from this operation belongs to.
+const PAGE_KIND: &str = "efficiency-metrics";
 
 /// The largest page this operation accepts, from the `@range` its OWN
 /// `maxResults` member declares
 /// (`smithy_query(query="operation", operation="ListEfficiencyMetrics")`:
 /// `maxResults` `range` min 0 max 1000).
 const MAX_RESULTS_MAX: i64 = 1000;
+
+/// The `GranularityType` values, from the model's enum of the same name
+/// (`shared_types::GRANULARITY_TYPE_VALUES`): one aggregates the series by day
+/// and the other by month.
+const GRANULARITY_DAILY: &str = "Daily";
+const GRANULARITY_MONTHLY: &str = "Monthly";
+
+/// The `Order` value that reverses the sort; the other value (`Asc`) is the
+/// order a dimension's values take on their own, and is what an absent `order`
+/// leaves them in (`shared_types::ORDER_VALUES`).
+const ORDER_DESC: &str = "Desc";
+
+/// How many characters of a rendered instant a daily timestamp is: the model's
+/// `GranularityType.DAILY` documents the form as `YYYY-MM-DD`, and
+/// `Format::DateTime` renders `YYYY-MM-DDThh:mm:ssZ`, so a date is the first ten
+/// characters of it.
+const DAY_TEXT_LEN: usize = 10;
+
+/// The same for a monthly timestamp, which `GranularityType.MONTHLY` documents
+/// as `YYYY-MM`: the first seven characters of the same rendering.
+const MONTH_TEXT_LEN: usize = 7;
+
+/// Seconds in a UTC day, for moving between an instant and the day it falls on.
+const SECONDS_PER_DAY: i64 = 86_400;
+
+/// The last month of a year, after which the next month is the first of the
+/// next year.
+const MONTHS_PER_YEAR: u32 = 12;
+
+/// The two forms a `timePeriod` date is accepted in, which the member documents
+/// as "either YYYY-MM-DD format or YYYY-MM format": a month on its own names its
+/// first day.
+const DATE_FORMATS: &str = "YYYY-MM-DD or YYYY-MM";
+
+/// The longest series this operation reports for one group.
+///
+/// A response pages over GROUPS — `maxResults` bounds them and `nextToken`
+/// resumes them — so there is no member a caller could resume a truncated series
+/// at: a period whose granularity asks for more points than this is refused
+/// instead, rather than answered with part of the series it asked for. The bound
+/// is this emulator's, chosen to match the largest page of groups the operation
+/// accepts ([`MAX_RESULTS_MAX`]), so one response carries a bounded series
+/// however many groups it carries.
+const MAX_DATA_POINTS: usize = 1000;
+
+/// What a group whose resources have no spend over the requested period reports
+/// in place of a series: `metricsByTime` is modelled as "null when efficiency
+/// metrics cannot be calculated for the group, in which case the message field
+/// provides an explanation", and the explanation that member documents is
+/// insufficient or inconclusive cost and usage data over the period
+/// (`smithy_query(query="doc", shape="EfficiencyMetricsByGroup", member="message")`).
+const INSUFFICIENT_DATA: &str =
+    "Insufficient or inconclusive cost and usage data for the specified time period.";
+
+/// The highest efficiency score, reached by a group with nothing left to save:
+/// the score is the percentage of a group's spend that is not identified as
+/// removable, so it runs from 0 to 100.
+const MAX_SCORE: f64 = 100.0;
+
+/// The time granularity a request asks its series at: the length of one data
+/// point's interval and the form its timestamp takes
+/// (`smithy_query(query="shape", shape="GranularityType")`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Granularity {
+    Daily,
+    Monthly,
+}
+
+/// One interval of a group's series: the timestamp the data point carries and
+/// the share of its month's figures the interval covers.
+#[derive(Debug, Clone)]
+struct Interval {
+    timestamp: String,
+    /// The days of the month this interval covers inside the requested period,
+    /// over the days that month has — so a day of a 31-day month carries a
+    /// thirty-first of the month's figures, a whole month carries all of them,
+    /// and a month the period only partly covers carries the share of its days
+    /// that fall inside it.
+    share: f64,
+}
+
+/// A day of the calendar, as its number of days since the Unix epoch — the form
+/// the days of a period are counted and stepped in, with the calendar itself
+/// (month lengths, leap years) left to the date library every modelled timestamp
+/// of this emulator is parsed and rendered by ([`day_text`], [`parse_day`]).
+type EpochDay = i64;
+
+/// The period a request asks about: its start (inclusive) and its end
+/// (exclusive).
+#[derive(Debug, Clone, Copy)]
+struct Period {
+    start: EpochDay,
+    end: EpochDay,
+}
+
+impl Granularity {
+    /// The intervals of `period` at this granularity, in time order, or the
+    /// refusal of a period whose series would be longer than this operation
+    /// reports ([`MAX_DATA_POINTS`]).
+    fn intervals(self, period: Period) -> Result<Vec<Interval>, ListEfficiencyMetricsError> {
+        let mut intervals: Vec<Interval> = Vec::new();
+        // A daily series starts on the period's first day; a monthly one starts
+        // at the month that day falls in, because a data point of a monthly
+        // series is a month.
+        let mut cursor = match self {
+            Self::Daily => Some(period.start),
+            Self::Monthly => month_start(period.start),
+        };
+        while let Some(day) = cursor.filter(|day| *day < period.end) {
+            if intervals.len() == MAX_DATA_POINTS {
+                return Err(too_many_data_points(self));
+            }
+            let (next, timestamp, covered) = match self {
+                Self::Daily => (Some(day + 1), day_text(day), 1),
+                Self::Monthly => {
+                    let next = next_month(day);
+                    // The days of this month that fall inside the period: all of
+                    // them where the period covers the month, and the part it
+                    // covers at either end of the period.
+                    let covered_end = next.map_or(period.end, |next| next.min(period.end));
+                    (next, month_text(day), covered_end - day.max(period.start))
+                }
+            };
+            // A month the calendar cannot state the length of, or a day it
+            // cannot name, is not an interval this operation can report, so the
+            // series ends rather than carrying a point with no timestamp.
+            let (Some(timestamp), Some(days)) = (timestamp, days_in_month(day)) else {
+                break;
+            };
+            intervals.push(Interval {
+                timestamp,
+                share: days_as_f64(covered) / days,
+            });
+            match next {
+                Some(next) => cursor = Some(next),
+                // The calendar has no interval after this one, so the series
+                // ends here however far the period reaches.
+                None => break,
+            }
+        }
+        Ok(intervals)
+    }
+
+    /// This granularity as the model names it, for a refusal that states the
+    /// granularity the refused series would have been reported at.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Daily => GRANULARITY_DAILY,
+            Self::Monthly => GRANULARITY_MONTHLY,
+        }
+    }
+}
+
+/// A count of days as a figure a share can be taken with; a count no number of
+/// days of one month can be is zero, which is no share of it.
+fn days_as_f64(days: i64) -> f64 {
+    f64::from(i32::try_from(days).unwrap_or_default())
+}
+
+/// The `YYYY-MM-DD` text of a day, or `None` for a day number the calendar
+/// cannot name.
+///
+/// The conversion between a day number and a calendar date is the date
+/// library's: `Format::DateTime` renders an instant as RFC 3339 in UTC
+/// (`YYYY-MM-DDThh:mm:ssZ`), so the date is its first [`DAY_TEXT_LEN`]
+/// characters.
+fn day_text(day: EpochDay) -> Option<String> {
+    let rendered = ::aws_smithy_types::DateTime::from_secs(day.checked_mul(SECONDS_PER_DAY)?)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()?;
+    rendered.get(..DAY_TEXT_LEN).map(str::to_string)
+}
+
+/// The `YYYY-MM` text of the month a day falls in — the first
+/// [`MONTH_TEXT_LEN`] characters of the same rendering.
+fn month_text(day: EpochDay) -> Option<String> {
+    let rendered = ::aws_smithy_types::DateTime::from_secs(day.checked_mul(SECONDS_PER_DAY)?)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()?;
+    rendered.get(..MONTH_TEXT_LEN).map(str::to_string)
+}
+
+/// The first day of the month `day` falls in.
+fn month_start(day: EpochDay) -> Option<EpochDay> {
+    parse_day(&format!("{}-01", month_text(day)?))
+}
+
+/// The first day of the month after the one `day` falls in, or `None` where the
+/// calendar has no such month.
+fn next_month(day: EpochDay) -> Option<EpochDay> {
+    let month = month_text(day)?;
+    let (year, number) = month.split_once('-')?;
+    let year: i64 = year.parse().ok()?;
+    let number: u32 = number.parse().ok()?;
+    let (year, number) = if number >= MONTHS_PER_YEAR {
+        (year.checked_add(1)?, 1)
+    } else {
+        (year, number + 1)
+    };
+    parse_day(&format!("{year:04}-{number:02}-01"))
+}
+
+/// How many days the month `day` falls in has — 28, 29, 30 or 31, which is what
+/// one day of it is a share of — or `None` where the calendar cannot state it.
+fn days_in_month(day: EpochDay) -> Option<f64> {
+    let start = month_start(day)?;
+    let next = next_month(day)?;
+    Some(days_as_f64(next - start)).filter(|days| *days > 0.0)
+}
+
+/// The requested period as days of the calendar, or the refusal of a period this
+/// operation cannot report: one whose dates it cannot read, and one whose start
+/// is not before its end — the start being inclusive and the end exclusive, such
+/// a period reaches no interval at all.
+fn period(requested: &TimePeriod) -> Result<Period, ListEfficiencyMetricsError> {
+    let start =
+        parse_date(&requested.start).ok_or_else(|| unreadable_date(START, &requested.start))?;
+    let end = parse_date(&requested.end).ok_or_else(|| unreadable_date(END, &requested.end))?;
+    if start >= end {
+        return Err(empty_period());
+    }
+    Ok(Period { start, end })
+}
+
+/// One `timePeriod` date in either form the member accepts: a day, or a month,
+/// which names that month's first day.
+fn parse_date(value: &str) -> Option<EpochDay> {
+    parse_day(value).or_else(|| parse_month(value))
+}
+
+/// A `YYYY-MM-DD` date as a day of the calendar, or `None` for text that is not
+/// one.
+///
+/// The text is parsed as an instant by the date library, then rendered back and
+/// compared, so a value the parser would normalise or pad differently — a day
+/// the month does not have, a month the year does not have, an unpadded or
+/// surrounded value — is not read as a date rather than read as another one.
+fn parse_day(value: &str) -> Option<EpochDay> {
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        &format!("{value}T00:00:00Z"),
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .ok()?;
+    let day = parsed.secs().div_euclid(SECONDS_PER_DAY);
+    (day_text(day)?.as_str() == value).then_some(day)
+}
+
+/// A `YYYY-MM` month as the first day of that month, under the same
+/// round-trip rule [`parse_day`] reads a date by.
+fn parse_month(value: &str) -> Option<EpochDay> {
+    let day = parse_day(&format!("{value}-01"))?;
+    (month_text(day)?.as_str() == value).then_some(day)
+}
+
+/// What one group of the answer reports before its series is built: the value of
+/// the grouping dimension it covers — absent where the request asked for no
+/// grouping, so the one group covers every resource — and what the resources
+/// under it cost and could save per month.
+#[derive(Debug, Clone)]
+struct GroupTotals {
+    group: Option<String>,
+    spend: f64,
+    savings: f64,
+}
+
+/// Total the rows per value of the grouping dimension: one group per distinct
+/// value, carrying what its resources cost per month and what adopting their
+/// recommendations would take off that.
+///
+/// A request that names NO dimension asks for "metrics aggregated across all
+/// resources in the specified time period", so it gets exactly one group, with
+/// no dimension value to report — including when the caller has no readable
+/// resource at all, which is a group with no spend and so the answer that no
+/// metrics could be calculated.
+fn totals_by_group(
+    rows: &[crate::state::StoredRecommendation],
+    dimension: Option<crate::state::Dimension>,
+    mode: Option<&str>,
+) -> Vec<GroupTotals> {
+    let Some(dimension) = dimension else {
+        return vec![GroupTotals {
+            group: None,
+            spend: crate::state::round_cents(rows.iter().map(|row| row.monthly_cost(mode)).sum()),
+            savings: crate::state::round_cents(
+                rows.iter().map(|row| row.monthly_savings(mode)).sum(),
+            ),
+        }];
+    };
+    let mut groups: Vec<GroupTotals> = Vec::new();
+    for row in rows {
+        let label = row.group_label(dimension);
+        let spend = row.monthly_cost(mode);
+        let savings = row.monthly_savings(mode);
+        match groups
+            .iter_mut()
+            .find(|group| group.group.as_deref() == Some(label.as_str()))
+        {
+            Some(group) => {
+                group.spend += spend;
+                group.savings += savings;
+            }
+            None => groups.push(GroupTotals {
+                group: Some(label),
+                spend,
+                savings,
+            }),
+        }
+    }
+    for group in &mut groups {
+        group.spend = crate::state::round_cents(group.spend);
+        group.savings = crate::state::round_cents(group.savings);
+    }
+    groups
+}
+
+/// Put the groups in the order the answer carries them: the one the request
+/// asked for, else by the dimension value they report, which is a total order
+/// over the groups and so a stable place for a page to resume at.
+fn sort_groups(groups: &mut [GroupTotals], order: Option<(MetricDimension, bool)>) {
+    let (dimension, descending) = order.unwrap_or((MetricDimension::Group, false));
+    groups.sort_by(|a, b| {
+        let ordering = match dimension {
+            MetricDimension::Group => a.group.cmp(&b.group),
+            MetricDimension::Score => score(a).total_cmp(&score(b)),
+            MetricDimension::Savings => a.savings.total_cmp(&b.savings),
+            MetricDimension::Spend => a.spend.total_cmp(&b.spend),
+        };
+        // Ties are broken by the dimension value, so the order is total whichever
+        // dimension was asked for and a page resumes at the same group on every
+        // call.
+        let ordering = if descending {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        ordering.then_with(|| a.group.cmp(&b.group))
+    });
+}
+
+/// A group's efficiency score: the percentage of its spend that is NOT
+/// identified as removable, so a group with nothing left to save scores
+/// [`MAX_SCORE`] and a higher score means better optimization.
+///
+/// The score is a share of spend, so it is the same at every point of the
+/// group's series; the clamp keeps it inside the percentage it is, whatever the
+/// savings credited to the group.
+fn score(group: &GroupTotals) -> f64 {
+    crate::state::round_cents(
+        (MAX_SCORE - crate::state::percentage_of(group.savings, group.spend)).clamp(0.0, MAX_SCORE),
+    )
+}
+
+/// One group of the answer: its series over the requested intervals, or — where
+/// its resources have no spend for a score and a share to be taken of — no
+/// series and the message explaining that none could be calculated.
+fn render(group: &GroupTotals, intervals: &[Interval]) -> EfficiencyMetricsByGroup {
+    if group.spend <= 0.0 {
+        return EfficiencyMetricsByGroup {
+            metrics_by_time: None,
+            group: group.group.clone(),
+            message: Some(INSUFFICIENT_DATA.to_string()),
+        };
+    }
+    let score = score(group);
+    let metrics_by_time = intervals
+        .iter()
+        .map(|interval| MetricsByTime {
+            score: Some(score),
+            savings: Some(crate::state::round_cents(group.savings * interval.share)),
+            spend: Some(crate::state::round_cents(group.spend * interval.share)),
+            timestamp: Some(interval.timestamp.clone()),
+        })
+        .collect();
+    EfficiencyMetricsByGroup {
+        metrics_by_time: Some(metrics_by_time),
+        group: group.group.clone(),
+        message: None,
+    }
+}
+
+/// A dimension this operation's groups can be ordered by: a member of the group
+/// a request asks for, or of the metrics that group reports
+/// (`smithy_query(query="shape", shape="EfficiencyMetricsByGroup,MetricsByTime")`:
+/// `group`, and `score`, `savings`, `spend`). A metric dimension orders the
+/// groups by the figure over the whole reported period, which is what the
+/// request asked to see them by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetricDimension {
+    Group,
+    Score,
+    Savings,
+    Spend,
+}
+
+impl MetricDimension {
+    /// Resolve an `orderBy.dimension` value, or `None` when it names no member
+    /// these groups carry. Compared case-insensitively, as every other dimension
+    /// of this service is (`crate::state::Dimension::parse`).
+    fn parse(dimension: &str) -> Option<Self> {
+        match dimension.trim().to_ascii_lowercase().as_str() {
+            "group" => Some(Self::Group),
+            "score" => Some(Self::Score),
+            "savings" => Some(Self::Savings),
+            "spend" => Some(Self::Spend),
+            _ => None,
+        }
+    }
+}
+
+/// The members a refused `timePeriod` date is attributed to: the one carrying
+/// the date the request has to change to be served.
+const START: &str = "timePeriod.start";
+const END: &str = "timePeriod.end";
+
+/// Refuse a `groupBy` that names no dimension these metrics can be grouped by.
+fn unknown_group_by(group_by: &str) -> ListEfficiencyMetricsError {
+    stated_refusal(
+        format!("Invalid groupBy specified. Cannot group by {group_by} for this operation."),
+        "groupBy",
+        format!("{group_by} is not a dimension cost efficiency metrics can be grouped by"),
+    )
+}
+
+/// Refuse a `groupBy` that names no dimension at all: a blank value asks for a
+/// grouping while leaving out what it would be grouped by, which this operation
+/// cannot honour — aggregating across all resources is what naming no dimension
+/// asks for — so it is refused rather than served along a dimension the caller
+/// did not name.
+fn no_group_dimension() -> ListEfficiencyMetricsError {
+    stated_refusal(
+        "Invalid groupBy specified. Cannot group by an unspecified dimension for this operation."
+            .to_string(),
+        "groupBy",
+        "a dimension cost efficiency metrics can be grouped by is required whenever groupBy is \
+         specified"
+            .to_string(),
+    )
+}
+
+/// Refuse an `orderBy.dimension` that names no member these groups carry.
+fn unknown_order_dimension(dimension: &str) -> ListEfficiencyMetricsError {
+    stated_refusal(
+        format!("Invalid orderBy specified. Cannot order by {dimension} for this operation."),
+        ORDER_DIMENSION,
+        format!("{dimension} is not a dimension cost efficiency metrics can be sorted by"),
+    )
+}
+
+/// Refuse an `orderBy` that names no dimension at all: one whose `dimension` is
+/// absent or blank. Such a request asks for an ordering while leaving out what
+/// it would be ordered on — an `order` on its own does not say which values it
+/// orders — so it is refused instead of being served in an order the caller did
+/// not ask for.
+fn no_order_dimension() -> ListEfficiencyMetricsError {
+    stated_refusal(
+        "Invalid orderBy specified. Cannot order by an unspecified dimension for this operation."
+            .to_string(),
+        ORDER_DIMENSION,
+        "a dimension cost efficiency metrics can be sorted by is required whenever orderBy is \
+         specified"
+            .to_string(),
+    )
+}
+
+/// The member every refusal of an `orderBy` is attributed to: the one that says
+/// which dimension the groups are ordered on.
+const ORDER_DIMENSION: &str = "orderBy.dimension";
+
+/// Refuse a `timePeriod` date this operation cannot read as a date.
+fn unreadable_date(member: &str, value: &str) -> ListEfficiencyMetricsError {
+    stated_refusal(
+        format!(
+            "Invalid timePeriod specified. Cannot read {value} as a date in {DATE_FORMATS} format."
+        ),
+        member,
+        format!("{value} is not a date in {DATE_FORMATS} format"),
+    )
+}
+
+/// Refuse a `timePeriod` that reaches no interval: the start is inclusive and
+/// the end exclusive, so a period whose start is not before its end covers no
+/// time for metrics to be aggregated over.
+fn empty_period() -> ListEfficiencyMetricsError {
+    stated_refusal(
+        "Invalid timePeriod specified. The start date must be earlier than the end date."
+            .to_string(),
+        END,
+        "the end date must be later than the start date".to_string(),
+    )
+}
+
+/// Refuse a `timePeriod` whose series at the requested granularity would be
+/// longer than this operation reports for one group ([`MAX_DATA_POINTS`]).
+fn too_many_data_points(granularity: Granularity) -> ListEfficiencyMetricsError {
+    let granularity = granularity.as_str();
+    stated_refusal(
+        format!(
+            "Invalid timePeriod specified. Cannot report more than {MAX_DATA_POINTS} \
+             {granularity} data points for this operation."
+        ),
+        "timePeriod",
+        format!(
+            "the {granularity} metrics over this period would carry more than \
+             {MAX_DATA_POINTS} data points"
+        ),
+    )
+}
+
+/// One refused request, attributed to the member it is about: the shape every
+/// handler-raised refusal in this service answers with — `statement` as the
+/// top-level `message`, naming the rejected member and the rule that rejects it
+/// because every rule this operation enforces itself is one the model cannot
+/// express, `reason` = `FieldValidationFailed`, and the same diagnosis in
+/// `fields`, built by [`crate::service::stated_validation_exception`], the one
+/// place that envelope is built.
+fn stated_refusal(
+    statement: String,
+    field_name: &str,
+    field_message: String,
+) -> ListEfficiencyMetricsError {
+    ListEfficiencyMetricsErrorModeled::ValidationException(
+        crate::service::stated_validation_exception(
+            statement,
+            vec![ValidationExceptionDetail {
+                field_name: field_name.to_string(),
+                message: field_message,
+            }],
+        ),
+    )
+    .into()
+}

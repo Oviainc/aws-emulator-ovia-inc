@@ -17,6 +17,8 @@ mod account_scoped_reads;
 mod commitment_purchase_savings;
 #[path = "all/cost_optimization_hub.rs"]
 mod cost_optimization_hub;
+#[path = "all/efficiency_metrics.rs"]
+mod efficiency_metrics;
 #[path = "all/enrollment_read_scope_gate.rs"]
 mod enrollment_read_scope_gate;
 #[path = "all/management_account_gating.rs"]
