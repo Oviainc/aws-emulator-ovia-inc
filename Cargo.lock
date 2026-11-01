@@ -15806,6 +15806,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "rcgen",
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-common",
@@ -15813,6 +15814,7 @@ dependencies = [
  "ssh-key",
  "tokio",
  "tracing",
+ "x509-cert",
 ]
 
 [[package]]

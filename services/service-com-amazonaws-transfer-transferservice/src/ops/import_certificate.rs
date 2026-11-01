@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Imports an X.509 certificate — and optionally its chain and its private key — as an
+//! account-level certificate record this service's AS2 profiles reference by id.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The serial and the validity period a certificate reader reports are read OUT of the
+//! material by `crate::state::parse_certificate`, so a body this emulator cannot read
+//! as a PEM-encoded certificate is refused rather than stored with invented values.
+//! What is stored is the certificate MESSAGE the request framed, and separately the
+//! chain — `Certificate` may carry both — so a reader serves the material back as the
+//! record holds it (`crate::state::split_certificate_material`). The
+//! `ActiveDate`/`InactiveDate` window follows the resolution rule the model documents
+//! for both of this resource's writes (`crate::state::Certificate::apply_window`), and
+//! `Status` stays DERIVED from that window and the clock.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +189,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as st;
+
+        // The certificate's OWN properties come from the MATERIAL, read before
+        // anything is persisted: a body this emulator cannot read as an X.509
+        // certificate has no serial and no validity period to report, and neither may
+        // be invented, so the import is refused with the modelled
+        // `InvalidRequestException` (HTTP 400) the model documents as "thrown when the
+        // client submits a malformed request".
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportCertificate"))
+        // The record holds the certificate and its chain separately, and `Certificate`
+        // may carry both, so the member is split into the certificate being imported
+        // and the chain that body also carried; the request's own `CertificateChain`
+        // is the chain where it uses that member instead.
+        let unreadable = || {
+            ImportCertificateErrorModeled::InvalidRequestException(
+                st::unreadable_certificate_body(),
+            )
+        };
+        let Some((message, embedded_chain)) = st::split_certificate_material(&input.certificate)
+        else {
+            return Err(unreadable().into());
+        };
+        let Some(material) = st::parse_certificate(message) else {
+            return Err(unreadable().into());
+        };
+        let body = message.to_string();
+        let chain = input
+            .certificate_chain
+            .as_deref()
+            .map(st::certificate_chain_material)
+            .or(embedded_chain)
+            .map(str::to_string);
+
+        // The window the request states, as instants. A value no instant can hold is
+        // refused rather than stored as a different date.
+        let active_date = match input.active_date.map(st::cert_date_instant) {
+            Some(None) => {
+                return Err(ImportCertificateErrorModeled::InvalidRequestException(
+                    st::unholdable_cert_date("ActiveDate"),
+                )
+                .into())
+            }
+            held => held.flatten(),
+        };
+        let inactive_date = match input.inactive_date.map(st::cert_date_instant) {
+            Some(None) => {
+                return Err(ImportCertificateErrorModeled::InvalidRequestException(
+                    st::unholdable_cert_date("InactiveDate"),
+                )
+                .into())
+            }
+            held => held.flatten(),
+        };
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            ImportCertificateErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+        let region = st::request_region(ctx.parts());
+
+        let mut guard = state.lock();
+
+        // The certificate store is BOUNDED: past its capacity an import is refused
+        // rather than adding another record. The modelled
+        // `ServiceUnavailableException` is the refusal that says the service cannot
+        // take this request; `DeleteCertificate` releases the capacity again.
+        if !guard.has_certificate_capacity() {
+            return Err(ImportCertificateErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(format!(
+                        "the account already holds the maximum of {} certificates; \
+                         delete one before importing another",
+                        st::MAX_STORED_CERTIFICATES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Minted and written under ONE lock, so the answer never names a certificate
+        // the store does not hold. Every import mints a NEW identifier: importing the
+        // same material twice is two records, each with its own usage, window and
+        // tags.
+        let certificate_id = guard.mint_id("cert");
+        let mut certificate = st::Certificate {
+            arn: st::certificate_arn(&region, &certificate_id),
+            certificate_id: certificate_id.clone(),
+            // `Usage` is a modelled enum, so a value outside
+            // `[SIGNING, ENCRYPTION, TLS]` is refused before this handler runs.
+            usage: input.usage,
+            // "If a private key has been specified for the certificate, its type is
+            // `CERTIFICATE_WITH_PRIVATE_KEY`. If there is no private key, the type is
+            // `CERTIFICATE`" (`DescribedCertificate.Type`) — so the key decides the
+            // type, which is the one thing this service reports about it, and the key
+            // itself is not persisted.
+            certificate_type: if input.private_key.is_some() {
+                st::CERTIFICATE_TYPE_WITH_PRIVATE_KEY.to_string()
+            } else {
+                st::CERTIFICATE_TYPE_CERTIFICATE.to_string()
+            },
+            // The material, as the request carried it: a certificate reader serves
+            // back the certificate it was given and, separately, the chain — whichever
+            // member carried it. Neither is re-encoded, and the chain is not parsed:
+            // no member this service reports is read out of it.
+            body,
+            chain,
+            serial: Some(material.serial),
+            not_before: Some(material.not_before),
+            not_after: Some(material.not_after),
+            // Resolved by `apply_window` below, from the request and the certificate's
+            // own dates.
+            active_date: None,
+            inactive_date: None,
+            description: input.description,
+            tags: input.tags.unwrap_or_default(),
+        };
+        certificate.apply_window(active_date, inactive_date);
+        guard
+            .certificates
+            .insert(certificate_id.clone(), certificate);
+
+        Ok(ImportCertificateOutput { certificate_id })
     }
 }

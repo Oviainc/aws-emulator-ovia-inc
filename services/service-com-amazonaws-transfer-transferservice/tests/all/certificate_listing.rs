@@ -197,6 +197,11 @@ fn seed_certificates<'a>(
             active_date: case.active_offset.map(|offset| shift(base, offset)),
             inactive_date: case.inactive_offset.map(|offset| shift(base, offset)),
             description: case.description.clone(),
+            // The members an IMPORT reads out of the certificate material (its body,
+            // chain, serial and `NotBefore`/`NotAfter`) are not what this suite is
+            // about, so each row leaves them at the record's default; the certificate
+            // round trip through `ImportCertificate` covers them.
+            ..Certificate::default()
         };
         guard.certificates.insert(certificate_id.clone(), certificate);
         seeded.push((certificate_id, case));
@@ -221,6 +226,7 @@ fn seed_plain_certificates(emulator: &Emulator, count: usize) -> Vec<String> {
             active_date: None,
             inactive_date: None,
             description: None,
+            ..Certificate::default()
         };
         guard.certificates.insert(certificate_id.clone(), certificate);
         ids.push(certificate_id);
@@ -605,6 +611,7 @@ async fn a_certificates_status_follows_the_clock_into_its_window() {
             active_date: Some(now + WINDOW_OPENS_IN),
             inactive_date: None,
             description: None,
+            ..Certificate::default()
         };
         guard.certificates.insert(certificate_id, certificate);
     }
@@ -647,6 +654,7 @@ fn the_status_rule_is_a_half_open_window() {
         active_date: Some(opens),
         inactive_date: Some(closes),
         description: None,
+        ..Certificate::default()
     };
     let open_start = Certificate {
         active_date: None,

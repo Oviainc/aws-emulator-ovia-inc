@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates the validity window — and the description — of one stored certificate.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ActiveDate`/`InactiveDate` follow the resolution rule the model documents for this
+//! operation's members as well as for `ImportCertificate`'s, so both writes of this
+//! resource share it (`crate::state::Certificate::apply_window`): a bound the request
+//! names is set, a bound it does not name takes the certificate's own
+//! `NotBeforeDate`/`NotAfterDate`. `Description` has no documented default, so it is
+//! replaced only when the request carries one.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +155,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCertificate"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+
+        // The window the request states, as instants, read BEFORE the store is
+        // touched: a value no instant can hold is refused rather than written as a
+        // different date — the same reading `ImportCertificate` gives these members.
+        let active_date = match input.active_date.map(st::cert_date_instant) {
+            Some(None) => {
+                return Err(UpdateCertificateErrorModeled::InvalidRequestException(
+                    st::unholdable_cert_date("ActiveDate"),
+                )
+                .into())
+            }
+            held => held.flatten(),
+        };
+        let inactive_date = match input.inactive_date.map(st::cert_date_instant) {
+            Some(None) => {
+                return Err(UpdateCertificateErrorModeled::InvalidRequestException(
+                    st::unholdable_cert_date("InactiveDate"),
+                )
+                .into())
+            }
+            held => held.flatten(),
+        };
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            UpdateCertificateErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        // `CertificateId`'s modelled length and pattern are enforced before this
+        // handler runs, so an id reaching here is well-formed: the only way the update
+        // can fail is that the store holds no such certificate — never imported, or
+        // already deleted — which is this service's not-found refusal, and it changes
+        // nothing.
+        let stored = guard
+            .certificates
+            .get_mut(&input.certificate_id)
+            .ok_or_else(|| {
+                st::not_found(UpdateCertificateErrorModeled::ResourceNotFoundException(
+                    st::unknown_certificate(&input.certificate_id),
+                ))
+            })?;
+
+        // The ONE window-resolution rule, shared with the import.
+        stored.apply_window(active_date, inactive_date);
+        // `Description` has no documented default to fall back to, so a request that
+        // names none leaves the stored one as it is.
+        if let Some(description) = input.description {
+            stored.description = Some(description);
+        }
+
+        Ok(UpdateCertificateOutput {
+            certificate_id: input.certificate_id,
+        })
     }
 }

@@ -1595,9 +1595,9 @@ pub struct Profile {
     pub as2_id: String,
     /// `LOCAL` or `PARTNER` — the `ProfileType` enum, enforced before a handler runs.
     pub profile_type: String,
-    /// The certificate identifiers the create named, stored as given: this service
-    /// holds no certificate records yet (`ImportCertificate` is still a scaffold with
-    /// its own issue), so there is nothing to resolve them against.
+    /// The certificate identifiers the create named, stored as given: a profile
+    /// REFERENCES certificates by id, and no operation of this service resolves that
+    /// reference against the certificate map, so nothing here rewrites or drops an id.
     pub certificate_ids: Vec<String>,
     pub tags: Vec<Tag>,
 }
@@ -3503,6 +3503,12 @@ impl ComAmazonawsTransferTransferserviceState {
         self.workflows.len() < MAX_STORED_WORKFLOWS
     }
 
+    /// Whether the store can take another imported certificate, i.e. is below
+    /// [`MAX_STORED_CERTIFICATES`].
+    pub fn has_certificate_capacity(&self) -> bool {
+        self.certificates.len() < MAX_STORED_CERTIFICATES
+    }
+
     /// The ids of the servers that currently attach `workflow_id`, in `ServerId` order.
     ///
     /// A workflow attached to a server is in use by it; `DeleteWorkflow` refuses while
@@ -4085,15 +4091,181 @@ pub fn certificate_arn(region: &str, certificate_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("certificate/{certificate_id}"))
 }
 
+/// `ResourceType` for the imported-certificate resource, addressed by its
+/// `CertificateId`. Same convention as [`RESOURCE_TYPE_SERVER`].
+pub const RESOURCE_TYPE_CERTIFICATE: &str = "Certificate";
+
+/// A `CertificateId` nothing in the store answers to — never imported, or already
+/// deleted. Its own entry in the not-found table, like every other kind.
+pub const NOT_FOUND_CERTIFICATE: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_CERTIFICATE,
+    message: "Unknown certificate",
+};
+
+/// The not-found payload for a `CertificateId` the store does not hold. Same
+/// construction as [`unknown_profile`]: the service's fixed text for the condition,
+/// with the unresolved identifier in `Resource` alone.
+pub fn unknown_certificate(certificate_id: &str) -> ResourceNotFoundException {
+    resource_not_found(&NOT_FOUND_CERTIFICATE, certificate_id)
+}
+
+/// How many certificates the store holds before `ImportCertificate` refuses with the
+/// modelled `ServiceUnavailableException` instead of growing.
+///
+/// Chosen on the same basis as [`MAX_STORED_PROFILES`] — the emulator's own bound on
+/// the store, not a claim about any account's Service Quota — and `DeleteCertificate`
+/// releases one. Each stored record is itself bounded by the modelled lengths of the
+/// members it holds (`Certificate` `len 1..16384`, `CertificateChain`
+/// `len 1..2097152`, `Description` `len 1..200`, `Tags` `len 1..50`), which the
+/// framework's boundary validator enforces before a handler runs.
+pub const MAX_STORED_CERTIFICATES: usize = 200;
+
+/// What an imported certificate itself states: the values a handler must read OUT of
+/// the certificate rather than invent for it.
+#[derive(Debug, Clone)]
+pub struct ParsedCertificate {
+    /// The X.509 `serialNumber`, rendered by [`certificate_serial`].
+    pub serial: String,
+    /// The `notBefore` bound of the certificate's own validity period.
+    pub not_before: SystemTime,
+    /// Its `notAfter` bound.
+    pub not_after: SystemTime,
+}
+
+/// A certificate's serial number as the model lets this service report it: the bytes
+/// of the X.509 serial the issuing CA assigned, each as exactly two lowercase hex
+/// digits, with no separator.
+///
+/// `CertSerial` is `len 0..48`, pattern `^[0-9a-fA-F{}:?]*$`
+/// (`smithy_query(query="shape",shape="CertSerial")`). RFC 5280 section 4.1.2.2 bounds
+/// a serial at 20 octets, which is 40 digits unseparated and 59 colon-separated — so
+/// the unseparated rendering is the only one that fits the modelled length for every
+/// serial a conforming CA can assign.
+pub fn certificate_serial(bytes: &[u8]) -> String {
+    ::hex::encode(bytes)
+}
+
+/// The wall-clock instant a modelled `CertDate` names, or `None` when the value is
+/// outside the range this host can hold as an instant.
+///
+/// `CertDate` is a plain `timestamp` with no modelled range, so a caller can send a
+/// value no `SystemTime` can represent; the conversion is fallible for exactly that
+/// case and a write refuses it rather than storing a different date
+/// ([`unholdable_cert_date`]).
+pub fn cert_date_instant(at: ::aws_smithy_types::DateTime) -> Option<SystemTime> {
+    SystemTime::try_from(at).ok()
+}
+
+/// The refusal for a `CertDate` member whose value this service cannot hold as an
+/// instant: the modelled `InvalidRequestException` ("thrown when the client submits a
+/// malformed request"), under a fixed text naming the MEMBER and no value from the
+/// request.
+pub fn unholdable_cert_date(member: &str) -> InvalidRequestException {
+    InvalidRequestException {
+        message: format!("{member} is not a date this service can represent"),
+    }
+}
+
+/// The refusal for a `Certificate` body that is not a PEM-encoded X.509 certificate.
+///
+/// The import reports the certificate's own serial and validity period
+/// ([`parse_certificate`]), so material it cannot read has none to report and may not
+/// be stored with invented ones. The modelled `InvalidRequestException` is the refusal
+/// for a request the service will not act on, and the text names the member and the
+/// encoding it must carry, exactly as this service's other material refusal does.
+pub fn unreadable_certificate_body() -> InvalidRequestException {
+    InvalidRequestException {
+        message: "Certificate must be a PEM-encoded X.509 certificate".to_string(),
+    }
+}
+
+/// The pre- and post-encapsulation boundaries of a PEM-framed X.509 certificate
+/// (RFC 7468 section 5.1).
+const PEM_CERTIFICATE_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+const PEM_CERTIFICATE_END: &str = "-----END CERTIFICATE-----";
+
+/// The bounds of the PEM-framed certificate message(s) `text` carries — from the
+/// first pre-encapsulation boundary to the end of the `last` post-encapsulation
+/// boundary when `last` is true, or of the FIRST one when it is false — or `None` when
+/// `text` frames no certificate at all.
+///
+/// RFC 7468 section 5.2 allows explanatory text around an encapsulated message, and
+/// `Certificate`'s doc allows a body carrying the certificate AND its chain ("you can
+/// provide both the certificate and its chain in this parameter"), so what a
+/// certificate member CARRIES is the message span and what surrounds it — a line
+/// ending, a subject line a tool printed — is framing rather than material. Only the
+/// BOUNDARIES are located here, by the labels the RFC defines; every byte between them
+/// is decoded by the X.509 parser ([`parse_certificate`]), never here.
+fn certificate_message_bounds(text: &str, last: bool) -> Option<(usize, usize)> {
+    let start = text.find(PEM_CERTIFICATE_BEGIN)?;
+    let message = text.get(start..)?;
+    let closed = if last {
+        message.rfind(PEM_CERTIFICATE_END)?
+    } else {
+        message.find(PEM_CERTIFICATE_END)?
+    } + PEM_CERTIFICATE_END.len();
+    Some((start, start + closed))
+}
+
+/// The material a `Certificate` member carries, as `(the certificate, the chain it
+/// also carried)`.
+///
+/// A certificate record holds the certificate and its chain SEPARATELY — the model
+/// reports them as two members — while the `Certificate` member may carry both
+/// ("without needing to use the `CertificateChain` parameter"). So the certificate is
+/// the LEADING message of that member and the messages after it are the chain the body
+/// carried. `None` when the body frames no certificate at all.
+pub fn split_certificate_material(body: &str) -> Option<(&str, Option<&str>)> {
+    let (start, end) = certificate_message_bounds(body, false)?;
+    let certificate = body.get(start..end)?;
+    let after = body.get(end..)?;
+    let chain = certificate_message_bounds(after, true)
+        .and_then(|(start, end)| after.get(start..end));
+    Some((certificate, chain))
+}
+
+/// The chain a `CertificateChain` member carries, as the record holds it: the message
+/// span it frames, on the same rule as the certificate's own material, and the text as
+/// given when it frames no certificate message at all — nothing this service reports
+/// is read out of a chain, so a chain it cannot recognise is kept rather than refused.
+pub fn certificate_chain_material(text: &str) -> &str {
+    certificate_message_bounds(text, true)
+        .and_then(|(start, end)| text.get(start..end))
+        .unwrap_or(text)
+}
+
+/// What the PEM certificate message `message` carries, or `None` when it does not
+/// decode as an X.509 certificate.
+///
+/// `message` is the certificate message [`split_certificate_material`] separated out of
+/// a `Certificate` member. The PEM framing and the DER inside it are decoded by the
+/// `x509-cert` parser rather than by anything written here, so the serial and validity
+/// window a reader reports are the certificate's OWN values, and material this emulator
+/// cannot read is refused by the import instead of stored with invented ones.
+pub fn parse_certificate(message: &str) -> Option<ParsedCertificate> {
+    use ::x509_cert::der::DecodePem;
+
+    let certificate = ::x509_cert::Certificate::from_pem(message.as_bytes()).ok()?;
+    let validity = &certificate.tbs_certificate.validity;
+    Some(ParsedCertificate {
+        serial: certificate_serial(certificate.tbs_certificate.serial_number.as_bytes()),
+        not_before: validity.not_before.to_system_time(),
+        not_after: validity.not_after.to_system_time(),
+    })
+}
+
 /// One imported certificate, keyed by `CertificateId`.
 ///
 /// Holds what a certificate READER reports about the record: the minted id, its ARN,
-/// how the certificate is used, its type, the validity window its status follows and
-/// the caller's description. The certificate material itself, its serial and its
-/// `NotBefore`/`NotAfter` dates belong to `DescribeCertificate`'s projection and
-/// arrive with the import that can parse them (`ImportCertificate` is still a scaffold
-/// with its own issue), so nothing is invented for them here.
-#[derive(Debug, Clone)]
+/// how the certificate is used, its type, the material the import carried, the serial
+/// and validity period read OUT of that material, the window its status follows, the
+/// caller's description and its tag set.
+///
+/// The `PrivateKey` an import may carry is NOT held: no operation of this service
+/// reports it and none uses it, and it is the one member of the import that is a
+/// secret — so what it decides, [`Self::certificate_type`], is resolved at import time
+/// and the key itself is not persisted.
+#[derive(Debug, Clone, Default)]
 pub struct Certificate {
     /// The minted `cert-` + 17 hex-digit identifier (`^cert-([0-9a-f]{17})$`).
     pub certificate_id: String,
@@ -4104,6 +4276,22 @@ pub struct Certificate {
     /// `CertificateType`: [`CERTIFICATE_TYPE_CERTIFICATE`] or
     /// [`CERTIFICATE_TYPE_WITH_PRIVATE_KEY`].
     pub certificate_type: String,
+    /// The PEM certificate message the import carried, boundaries included: the
+    /// material itself, without the line ending or explanatory text the request framed
+    /// it with. `DescribeCertificate` serves it back as stored, never a re-encoding of
+    /// it.
+    pub body: String,
+    /// The chain the import carried, kept the same way — in `CertificateChain`, or
+    /// after the certificate in the `Certificate` member; absent when it carried none.
+    pub chain: Option<String>,
+    /// The certificate's own `serialNumber`, as [`certificate_serial`] renders it.
+    pub serial: Option<String>,
+    /// `NotBeforeDate`: "the earliest date that the certificate is valid" — the
+    /// certificate's own `notBefore`, read out of the material at import time.
+    pub not_before: Option<SystemTime>,
+    /// `NotAfterDate`: "the final date that the certificate is valid" — its own
+    /// `notAfter`, read the same way.
+    pub not_after: Option<SystemTime>,
     /// `ActiveDate`: when the certificate becomes active, resolved at import time from
     /// the caller's value or the certificate's own `NotBeforeDate`. `None` leaves the
     /// window open at the start, so the certificate is active from the first read.
@@ -4113,6 +4301,9 @@ pub struct Certificate {
     pub inactive_date: Option<SystemTime>,
     /// The caller's `Description`, absent when the import named none.
     pub description: Option<String>,
+    /// The tag set the import carried, which `TagResource`/`UntagResource` then
+    /// rewrite in place like every other taggable resource's.
+    pub tags: Vec<Tag>,
 }
 
 impl Certificate {
@@ -4134,6 +4325,22 @@ impl Certificate {
         } else {
             CERTIFICATE_STATUS_ACTIVE
         }
+    }
+
+    /// Apply the validity window a write states, under the ONE documented resolution
+    /// rule both writes of this resource follow.
+    ///
+    /// `ActiveDate` is "an optional date that specifies when the certificate becomes
+    /// active. If you do not specify a value, `ActiveDate` takes the same value as
+    /// `NotBeforeDate`, which is specified by the CA", and `InactiveDate` the same from
+    /// `NotAfterDate` — the model states that for `ImportCertificate`'s members AND for
+    /// `UpdateCertificate`'s, so a write that names a bound sets it and a write that
+    /// names none leaves that end of the window at the certificate's own date. A
+    /// certificate whose material states no date leaves that end open, which
+    /// [`Self::status`] reads as unbounded.
+    pub fn apply_window(&mut self, active_date: Option<SystemTime>, inactive_date: Option<SystemTime>) {
+        self.active_date = active_date.or(self.not_before);
+        self.inactive_date = inactive_date.or(self.not_after);
     }
 }
 
@@ -4279,6 +4486,13 @@ impl ComAmazonawsTransferTransferserviceState {
             .agreements
             .values()
             .map(|r| (r.arn.as_str(), r.tags.as_slice()));
+        // An imported certificate takes `Tags` at import, reports them through
+        // `DescribeCertificate` and has an `arn` of its own, so it is taggable on the
+        // same terms as every kind above.
+        let certificates = self
+            .certificates
+            .values()
+            .map(|r| (r.arn.as_str(), r.tags.as_slice()));
         servers
             .chain(users)
             .chain(host_keys)
@@ -4287,6 +4501,7 @@ impl ComAmazonawsTransferTransferserviceState {
             .chain(connectors)
             .chain(workflows)
             .chain(agreements)
+            .chain(certificates)
     }
 
     /// The tag set of the resource `arn` identifies, or `None` when no stored resource
@@ -4328,6 +4543,9 @@ impl ComAmazonawsTransferTransferserviceState {
             return Some(&mut found.tags);
         }
         if let Some(found) = self.agreements.values_mut().find(|r| r.arn == arn) {
+            return Some(&mut found.tags);
+        }
+        if let Some(found) = self.certificates.values_mut().find(|r| r.arn == arn) {
             return Some(&mut found.tags);
         }
         None

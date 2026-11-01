@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one stored certificate: the material the import carried, the serial and
+//! validity period read out of it, the window the writes resolved and the record's
+//! usage, type, description and tags.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation: it reads the record and writes nothing. `Status` is the one
+//! member that is not stored — it is DERIVED from the stored window and the clock
+//! (`crate::state::Certificate::status`), so a certificate whose `InactiveDate` has
+//! passed reads as `INACTIVE` without any caller having to touch it.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +150,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCertificate"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            DescribeCertificateErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        // ONE instant for the whole read, the same way `ListCertificates` takes one per
+        // page, so the status reported is the status at a single clock value.
+        let now = ::std::time::SystemTime::now();
+
+        let guard = state.lock();
+
+        // `CertificateId`'s modelled length and pattern are enforced before this
+        // handler runs, so an id reaching here is well-formed: the only way the read
+        // can fail is that the store holds no such certificate — never imported, or
+        // already deleted — which is this service's not-found refusal.
+        let stored = guard
+            .certificates
+            .get(&input.certificate_id)
+            .ok_or_else(|| {
+                st::not_found(DescribeCertificateErrorModeled::ResourceNotFoundException(
+                    st::unknown_certificate(&input.certificate_id),
+                ))
+            })?;
+
+        let certificate = DescribedCertificate {
+            arn: stored.arn.clone(),
+            certificate_id: Some(stored.certificate_id.clone()),
+            usage: Some(stored.usage.clone()),
+            // Derived from the stored window and the one instant above, so a
+            // certificate whose window has closed cannot read as active.
+            status: Some(stored.status(now).to_string()),
+            certificate: Some(stored.body.clone()),
+            certificate_chain: stored.chain.clone(),
+            active_date: stored.active_date.map(::aws_smithy_types::DateTime::from),
+            inactive_date: stored
+                .inactive_date
+                .map(::aws_smithy_types::DateTime::from),
+            serial: stored.serial.clone(),
+            not_before_date: stored.not_before.map(::aws_smithy_types::DateTime::from),
+            not_after_date: stored.not_after.map(::aws_smithy_types::DateTime::from),
+            r#type: Some(stored.certificate_type.clone()),
+            description: stored.description.clone(),
+            // `Tags` is an optional list modelled `len 1..50`, which an empty list does
+            // not satisfy, so an untagged certificate carries no member — the same
+            // rendering every other `Describe*` in this service gives an empty tag set.
+            tags: Some(stored.tags.clone()).filter(|tags| !tags.is_empty()),
+        };
+
+        Ok(DescribeCertificateOutput { certificate })
     }
 }

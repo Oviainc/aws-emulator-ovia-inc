@@ -116,3 +116,8 @@ mod write_validation_and_normalization;
 // neighbouring insertion. Fold it into the list once the churn settles.
 #[path = "all/connector_deletion.rs"]
 mod connector_deletion;
+// `certificate_import` is declared HERE rather than in its alphabetical place beside
+// `certificate_listing`, for the reason the two notes above record: the sorted list is
+// where every concurrent change inserts. Fold it into the list once the churn settles.
+#[path = "all/certificate_import.rs"]
+mod certificate_import;
