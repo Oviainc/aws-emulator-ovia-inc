@@ -875,7 +875,7 @@ impl MultiplexRecord {
     /// behind both rules below, so the two cannot drift apart — the id names a
     /// record a reader goes on reporting, and nothing may write to it again.
     fn delete_accepted(&self) -> bool {
-        self.state == multiplex_state::DELETING || self.state == multiplex_state::DELETED
+        self.state == multiplex_state::DELETING || self.is_deleted()
     }
 
     /// Whether this multiplex has reached the terminal `DELETED` state: its
@@ -1968,10 +1968,16 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// named.
     ///
     /// A program's own delete removes it from the multiplex, which is what ends
-    /// its token's window; the multiplex it lives in is resolved through
-    /// [`MultiplexRecord::is_deleted`] for the same reason, since a program of a
-    /// multiplex that has reached the terminal `DELETED` state is no more a
-    /// caller's to use than one that was deleted on its own.
+    /// its token's window.
+    ///
+    /// The multiplex's LIVENESS is part of the lookup too, through the same
+    /// [`MultiplexRecord::accepts_programs`] the insert resolves the multiplex
+    /// by ([`Self::insert_multiplex_program`]): once a delete has been accepted
+    /// for a multiplex — inside the transient `DELETING` window as in the
+    /// terminal `DELETED` state it keeps — it holds no program a caller may use
+    /// or create, so a token spent on one of its programs has no window left to
+    /// replay and the retried create is answered with the refusal a first
+    /// attempt gets rather than with a program of a multiplex that is gone.
     pub fn multiplex_program_for_token(
         &self,
         multiplex_id: &str,
@@ -1983,7 +1989,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         let program = self
             .multiplexes
             .get(multiplex_id)
-            .filter(|multiplex| !multiplex.is_deleted())?
+            .filter(|multiplex| multiplex.accepts_programs())?
             .programs
             .get(program_name)?;
         Some(program.program_name.as_str())

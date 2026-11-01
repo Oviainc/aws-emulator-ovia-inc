@@ -7,9 +7,10 @@
 //! and every value the response carries is read back out of the stored record or derived
 //! from the rest of the store, never built from the request in flight. A retry carrying
 //! the same `@idempotencyToken` `RequestId` to the SAME multiplex's endpoint answers with
-//! the program the first call created; the same token presented for another multiplex is
-//! a different create, because the multiplex is part of the endpoint the token was
-//! presented to. The `ProgramName` is the program's identity — the key it is stored
+//! the program the first call created, for as long as that multiplex is one a program may
+//! be created in; the same token presented for another multiplex is a different create,
+//! because the multiplex is part of the endpoint the token was presented to. The
+//! `ProgramName` is the program's identity — the key it is stored
 //! at and the path segment the operations that name one program carry — so a request
 //! supplying an empty one is refused with the modelled 400 rather than storing a
 //! program no later request could name.
@@ -180,7 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a token spent on another multiplex's program names a program this
         // call was not asked for, and answering with it would report a resource
         // the request did not ask to exist while storing nothing in the
-        // multiplex the path named.
+        // multiplex the path named. The lookup resolves the multiplex through
+        // the same liveness the insert below does, so a token cannot turn a
+        // create this operation refuses into one it serves: on a multiplex whose
+        // delete has been accepted nothing replays and the request falls through
+        // to the refusal a first attempt gets.
         if let Some(program_name) = state
             .multiplex_program_for_token(&input.multiplex_id, &input.request_id)
             .map(str::to_string)
@@ -208,8 +213,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(|refusal| refused(refusal, &input.multiplex_id, &input.program_name))?;
         // Bounded, evicting write: a caller-chosen token can neither accumulate
         // past the cap nor resolve to anything once the program it created is
-        // gone (`multiplex_program_for_token` answers only for a program that
-        // exists).
+        // gone, nor once its multiplex is one no program may be created in any
+        // more (`multiplex_program_for_token`).
         state.record_multiplex_program_token(
             &input.multiplex_id,
             input.request_id,

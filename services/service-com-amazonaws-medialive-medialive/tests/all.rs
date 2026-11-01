@@ -410,6 +410,9 @@ mod shared_position_cursor_rule;
 #[path = "all/shared_request_rules.rs"]
 mod shared_request_rules;
 
+#[path = "all/shared_token_replay_parent_liveness_rule.rs"]
+mod shared_token_replay_parent_liveness_rule;
+
 #[path = "all/signal_map_deletion.rs"]
 mod signal_map_deletion;
 

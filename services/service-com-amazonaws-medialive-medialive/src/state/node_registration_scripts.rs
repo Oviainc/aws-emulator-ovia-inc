@@ -30,7 +30,11 @@
 //! [`MAX_NODE_REGISTRATION_SCRIPTS`]: the operation models no resource to delete
 //! a script through, so the oldest is dropped rather than letting the emulator's
 //! heap grow without bound, and a token whose script has been dropped that way
-//! issues a fresh one.
+//! issues a fresh one. A token whose cluster — or whose re-registered node — has
+//! since had its delete accepted has no window left either: what the script was
+//! issued for is what it is issued against, so the retry is refused there exactly
+//! as a first attempt is
+//! ([`ComAmazonawsMedialiveMedialiveState::node_registration_script_for_token`]).
 //!
 //! The script's TEXT is composed here ([`rendered_registration_script`]), out of
 //! the cluster and node ids the store holds and the parameters the request
@@ -230,10 +234,22 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// id presented under another names no script a caller of that cluster's
     /// endpoint may read.
     pub fn node_registration_script(&self, cluster_id: &str, id: &str) -> Option<&str> {
+        self.node_registration_script_record(cluster_id, id)
+            .map(|record| record.script.as_str())
+    }
+
+    /// The same script as its stored RECORD — the one place a script is resolved
+    /// against the cluster it was issued for, so the rule of
+    /// [`Self::node_registration_script`] is stated once however many readers
+    /// this slice grows.
+    fn node_registration_script_record(
+        &self,
+        cluster_id: &str,
+        id: &str,
+    ) -> Option<&NodeRegistrationScriptRecord> {
         self.node_registration_scripts
             .get(id)
             .filter(|record| record.cluster_id == cluster_id)
-            .map(|record| record.script.as_str())
     }
 
     /// Record `token` as having issued the script `id` for `cluster_id`, evicting
@@ -253,11 +269,20 @@ impl ComAmazonawsMedialiveMedialiveState {
     }
 
     /// The script a stored `RequestId` issued for `cluster_id`, if the ring still
-    /// holds it.
+    /// holds it and it is still one a caller may use.
     ///
     /// The cluster is part of the key AND re-checked on the record, exactly as
     /// the node slice re-checks it: a token presented to one cluster's endpoint
     /// says nothing about another's.
+    ///
+    /// LIVENESS is part of the lookup, through the same resolutions
+    /// [`Self::issue_node_registration_script`] performs — the live cluster, and
+    /// the node a re-registration script names — so a token cannot turn a request
+    /// this operation refuses into one it serves: once the delete of the cluster
+    /// the script registers nodes in, or of the node it re-registers, has been
+    /// accepted, there is nothing for a hardware unit to register against, so the
+    /// retry is refused exactly as a first attempt is instead of being handed a
+    /// script that would run against a resource that is gone.
     pub fn node_registration_script_for_token(
         &self,
         cluster_id: &str,
@@ -266,7 +291,19 @@ impl ComAmazonawsMedialiveMedialiveState {
         let id = self
             .node_registration_script_tokens
             .created(&node_registration_script_token_key(cluster_id, request_id))?;
-        self.node_registration_script(cluster_id, id)
+        let record = self.node_registration_script_record(cluster_id, id)?;
+        self.live_cluster(cluster_id)?;
+        if record
+            .node_id
+            .as_deref()
+            .is_some_and(|node_id| {
+                self.node(cluster_id, node_id)
+                    .is_none_or(|node| node.is_delete_accepted())
+            })
+        {
+            return None;
+        }
+        Some(record.script.as_str())
     }
 }
 

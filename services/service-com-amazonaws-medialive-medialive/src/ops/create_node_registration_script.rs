@@ -186,6 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A retried request (the same `@idempotencyToken` `RequestId`, presented
         // to the same cluster's endpoint) must answer with the script that one
         // issued: a second script would register a second node per hardware unit.
+        // The lookup resolves the cluster, and the node a re-registration script
+        // names, through the same liveness the issue below does, so a token
+        // cannot turn a request this operation refuses into one it serves.
         if let Some(issued) = input
             .request_id
             .as_deref()
