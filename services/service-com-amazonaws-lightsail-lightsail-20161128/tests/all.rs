@@ -37,6 +37,8 @@ mod auto_snapshots;
 mod availability_zone_publication;
 #[path = "all/blueprint_catalog.rs"]
 mod blueprint_catalog;
+#[path = "all/block_storage_region_scope.rs"]
+mod block_storage_region_scope;
 #[path = "all/bucket_access_keys.rs"]
 mod bucket_access_keys;
 #[path = "all/bucket_access_log_destination_delete.rs"]
@@ -147,6 +149,8 @@ mod disk_snapshot;
 mod disk_snapshot_delete;
 #[path = "all/disk_snapshot_listing.rs"]
 mod disk_snapshot_listing;
+#[path = "all/disk_snapshot_listing_region_scope.rs"]
+mod disk_snapshot_listing_region_scope;
 #[path = "all/distribution_bundle_update.rs"]
 mod distribution_bundle_update;
 #[path = "all/distribution_bundles.rs"]

@@ -18,7 +18,7 @@
 //! disks in one Region, the one every call of this suite is served in; the Region
 //! scope itself is the subject of `disk_listing_region_scope.rs`.
 //!
-//! The rows span what that rule generalises over: how many disks the account
+//! The rows span what that rule generalises over: how many disks the Region
 //! holds (none, one, exactly a page, one past a page, several pages and a
 //! remainder), the creation order against the reported order (every row is
 //! created in reverse name order, so a listing that merely echoed the creation
@@ -188,7 +188,7 @@ async fn wait_for_available(emulator: &Emulator, name: &str) {
 // The listing table
 // ---------------------------------------------------------------------------
 
-/// One account's worth of disks: how many it holds, and the name prefix that
+/// One Region's worth of disks: how many it holds, and the name prefix that
 /// tells this row's records apart.
 #[derive(Debug, Clone, Copy)]
 struct Row {
@@ -200,12 +200,12 @@ struct Row {
 /// The table. The counts straddle every page boundary the rule can turn on.
 const ROWS: &[Row] = &[
     Row {
-        case: "an account holding nothing",
+        case: "a Region holding nothing",
         prefix: "empty",
         count: 0,
     },
     Row {
-        case: "an account holding one",
+        case: "a Region holding one",
         prefix: "solo",
         count: 1,
     },

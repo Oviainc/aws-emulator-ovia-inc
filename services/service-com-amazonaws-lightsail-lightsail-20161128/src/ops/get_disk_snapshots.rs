@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDiskSnapshots
-//! Answers the disk snapshot records this service's store holds, one page at a
-//! time in the store's own total order by snapshot name.
+//! Answers the disk snapshot records this service's store holds in the Region the
+//! request is signed for, one page at a time in the store's own total order by
+//! snapshot name.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -162,35 +163,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // This operation reports what the account holds; it takes no location, so
-        // nothing here reads the request's credential scope. A snapshot the
-        // singular `GetDiskSnapshot` answers for is one this listing reports too,
-        // whatever zone its source was in.
-        let _ = ctx;
+        // The model scopes this listing to one Region — "all block storage disk
+        // snapshots in your AWS account and region" — and a disk snapshot belongs
+        // to the Region it was taken in, which is the one its stored location
+        // names (moving one between Regions is what `CopySnapshot` is for). So
+        // the Region this request is signed for is what decides which of the
+        // account's snapshots it reports.
+        let region = crate::state::request_region(ctx.parts());
 
         // `pageToken` NAMES the snapshot a page starts at — the name the previous
-        // page reported as its `nextPageToken` — so a page is the stored snapshots
-        // from that one onward in the store's own total order. Naming the snapshot
-        // rather than carrying an index means a snapshot deleted between two pages
-        // cannot make the walk skip or repeat another one, and a token naming no
-        // snapshot is refused rather than resumed at the next name after it. An
-        // absent — or empty — token asks for the first page. The walk itself is
-        // the ONE page walk every listing of this service shares
-        // (`crate::state::resource_page`).
+        // page reported as its `nextPageToken` — so a page is this Region's
+        // stored snapshots from that one onward in the store's own total order.
+        // Naming the snapshot rather than carrying an index means a snapshot
+        // deleted between two pages cannot make the walk skip or repeat another
+        // one, and a token naming no snapshot of this Region is refused rather
+        // than resumed at the next name after it. An absent — or empty — token
+        // asks for the first page. The walk itself is the ONE page walk every
+        // listing of this service shares (`crate::state::resource_page`).
         let page_token = input.page_token.filter(|token| !token.is_empty());
 
         crate::state::with_state(&*self.engine, |store| {
             let (disk_snapshots, next_page_token) = crate::state::resource_page(
-                crate::state::records_from(&store.disk_snapshots, page_token.as_deref()),
+                crate::state::records_in_region_from(
+                    &store.disk_snapshots,
+                    &region,
+                    page_token.as_deref(),
+                    |snapshot| snapshot.location.region_name.as_str(),
+                ),
                 page_token.as_deref(),
                 crate::state::DISK_SNAPSHOT_PAGE_SIZE,
                 |_, snapshot| snapshot.view(),
             )
             .ok_or_else(|| invalid_page_token(page_token.as_deref().unwrap_or_default()))?;
             Ok(GetDiskSnapshotsOutput {
-                // An account with no disk snapshots reports an empty list, not an
-                // absent one: the caller asked what it has, and the answer is
-                // "nothing".
+                // A Region holding no disk snapshot of this account reports an
+                // empty list, not an absent one: the caller asked what it has,
+                // and the answer is "nothing".
                 disk_snapshots: Some(disk_snapshots),
                 next_page_token,
             })
@@ -199,10 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// `pageToken` names no disk snapshot this listing reports, so there is no page to
-/// answer: the modelled `InvalidInputException`, documented as "user input does
-/// not conform to the validation rules of an input field". The message is built
-/// from the request and says what a page token is.
+/// `pageToken` names no disk snapshot this listing reports — a snapshot of
+/// another Region included — so there is no page to answer: the modelled
+/// `InvalidInputException`, documented as "user input does not conform to the
+/// validation rules of an input field". The message is built from the request and
+/// says what a page token is.
 fn invalid_page_token(token: &str) -> GetDiskSnapshotsError {
     GetDiskSnapshotsErrorModeled::InvalidInputException(InvalidInputException {
         message: Some(crate::state::invalid_page_token_message(

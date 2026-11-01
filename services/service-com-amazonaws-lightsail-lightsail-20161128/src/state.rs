@@ -1165,6 +1165,32 @@ pub fn regional_records_from<'a, R>(
         .map(|((_, name), record)| (name.as_str(), record))
 }
 
+/// The records of a name-keyed map that are LOCATED in `region` — `region_of`
+/// reads the Region off each record — from the one `page_token` names onward, in
+/// name order.
+///
+/// What a listing the model scopes to "your AWS account and region" reports: the
+/// resource is keyed by name alone, because its name is unique across the
+/// account, but it was created in one Region and keeps that Region on its stored
+/// location, so the Region the request is signed for is what decides whether this
+/// listing reports it. The same narrowing [`regional_records_from`] gets from the
+/// key pair of a resource whose identity includes its Region, expressed as the
+/// filter [`resource_page`] documents — so the page size counts the records
+/// reported, the next page starts at the first record of this Region after them,
+/// and a token naming a record of ANOTHER Region names no page of this listing.
+///
+/// TOTAL on every input, including an arbitrary caller-supplied token: the token
+/// and the Region are only ever COMPARED against the records, so there is no
+/// indexing, no slicing, no unwrap and no arithmetic that can overflow or panic.
+pub fn records_in_region_from<'a, R>(
+    records: &'a BTreeMap<String, R>,
+    region: &'a str,
+    page_token: Option<&str>,
+    region_of: impl Fn(&R) -> &str + 'a,
+) -> impl Iterator<Item = (&'a str, &'a R)> {
+    records_from(records, page_token).filter(move |(_, record)| region_of(record) == region)
+}
+
 /// One page of a resource listing: at most `page_size` of `records`, each as
 /// `view_of` reports it, plus the name of the first record AFTER them — named only
 /// while records remain.
@@ -1178,12 +1204,12 @@ pub fn regional_records_from<'a, R>(
 ///
 /// Shared by every stored-resource listing this service pages, so each one walks
 /// its records exactly the same way; [`catalog_page`] is the same walk over this
-/// service's static catalogs. The start of the page comes from [`records_from`] or
-/// [`regional_records_from`], and a listing whose request NARROWS which records it
-/// reports puts that filter on the iterator ([`Iterator::filter`]): the page size
-/// then counts the records reported, the next page starts at the first record
-/// after them that this listing reports too, and a token naming a record this
-/// listing does not report names no page of it.
+/// service's static catalogs. The start of the page comes from [`records_from`],
+/// [`regional_records_from`] or [`records_in_region_from`], and a listing whose
+/// request NARROWS which records it reports puts that filter on the iterator
+/// ([`Iterator::filter`]): the page size then counts the records reported, the
+/// next page starts at the first record after them that this listing reports too,
+/// and a token naming a record this listing does not report names no page of it.
 ///
 /// TOTAL on every input: the token is only ever COMPARED against the names, records
 /// are only ever taken from the iterator in order and the page is bounded by

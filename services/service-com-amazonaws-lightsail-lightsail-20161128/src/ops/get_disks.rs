@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDisks
-//! Reports the block storage disks the account holds in the region the request
-//! was made in, one page at a time, each entry read out of the same stored
-//! record `GetDisk` reports.
+//! Reports the block storage disks the account holds in the Region the request is
+//! signed for, one page at a time, each entry read out of the same stored record
+//! `GetDisk` reports.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -162,34 +162,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A disk is a LOCATED record and this listing is scoped to one region —
-        // "all block storage disks in your AWS account and region" — so the
-        // region the request is signed for selects which stored records answer.
-        // A disk's own region is the one the `availabilityZone` its create named
-        // belongs to, which is what the stored location carries, so no record
-        // has to be re-derived here.
+        // The model scopes this listing to one Region — "all block storage disks
+        // in your AWS account and region" — and a disk is a LOCATED record: its
+        // own Region is the one the `availabilityZone` its create named belongs
+        // to, which is what the stored location carries, so nothing has to be
+        // re-derived here. The Region this request is signed for is what decides
+        // which of the account's disks it reports.
         let region = crate::state::request_region(ctx.parts());
 
         // `pageToken` NAMES the disk a page starts at — the name the previous page
-        // reported as its `nextPageToken` — so a page is this region's stored
+        // reported as its `nextPageToken` — so a page is this Region's stored
         // disks from that one onward in the store's own total order. Naming the
         // disk rather than carrying an index means a disk created or deleted
         // between two pages cannot make the walk skip or repeat another one, and a
-        // token naming no disk of this region is refused rather than resumed at the
-        // next name after it. An absent — or empty — token asks for the first page.
-        // The walk itself is the ONE page walk every listing of this service shares
-        // (`crate::state::resource_page`).
+        // token naming no disk of this Region is refused rather than resumed at
+        // the next name after it. An absent — or empty — token asks for the first
+        // page. The walk itself is the ONE page walk every listing of this service
+        // shares (`crate::state::resource_page`).
         let page_token = input.page_token.filter(|token| !token.is_empty());
 
         crate::state::with_state(&*self.engine, |store| {
             let (disks, next_page_token) = crate::state::resource_page(
                 // The store keys disks by name alone — the identifier every disk
-                // operation takes — so this region's records are selected on the
+                // operation takes — so this Region's records are selected on the
                 // walk, which is what the shared page walk takes a filter for:
                 // the page size counts the disks reported and the next page opens
-                // at the first disk of this region after them.
-                crate::state::records_from(&store.disks, page_token.as_deref())
-                    .filter(|(_, disk)| disk.location.region_name == region),
+                // at the first disk of this Region after them.
+                crate::state::records_in_region_from(
+                    &store.disks,
+                    &region,
+                    page_token.as_deref(),
+                    |disk| disk.location.region_name.as_str(),
+                ),
                 page_token.as_deref(),
                 crate::state::DISK_PAGE_SIZE,
                 // The SAME view `GetDisk` reports: one stored record read by two
@@ -198,9 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .ok_or_else(|| invalid_page_token(page_token.as_deref().unwrap_or_default()))?;
             Ok(GetDisksOutput {
-                // A region holding no disks reports an empty list, not an absent
-                // one: the caller asked what it has, and the answer is
-                // "nothing".
+                // A Region holding no disk of this account reports an empty list,
+                // not an absent one: the caller asked what it has, and the answer
+                // is "nothing".
                 disks: Some(disks),
                 next_page_token,
             })
@@ -209,10 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// `pageToken` names no disk this listing reports, so there is no page to answer:
-/// the modelled `InvalidInputException`, documented as "user input does not
-/// conform to the validation rules of an input field". The message is built from
-/// the request and says what a page token is.
+/// `pageToken` names no disk this listing reports — a disk of another Region
+/// included — so there is no page to answer: the modelled
+/// `InvalidInputException`, documented as "user input does not conform to the
+/// validation rules of an input field". The message is built from the request and
+/// says what a page token is.
 fn invalid_page_token(token: &str) -> GetDisksError {
     GetDisksErrorModeled::InvalidInputException(InvalidInputException {
         message: Some(crate::state::invalid_page_token_message(token, "a disk")),

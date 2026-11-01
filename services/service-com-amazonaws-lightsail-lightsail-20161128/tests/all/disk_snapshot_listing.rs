@@ -9,15 +9,22 @@
 //! handlers and the awsJson error envelope are all exercised rather than
 //! bypassed.
 //!
-//! The rule under test: a listing of a stored resource reports the account's
-//! persisted records — every member of every entry read out of the one record the
-//! create persisted, so a listed entry is exactly what the singular reader
-//! answers for the same name — in the store's own total order by that resource's
-//! name, at most one page at a time, with `nextPageToken` NAMING the first record
-//! of the page after it and absent once none remain; an account holding none is
-//! told so with an empty list; and the listing is a report, so walking it twice
-//! changes nothing, while a create or a delete is visible in the next walk.
+//! The rule under test: a listing of a stored resource reports the persisted
+//! records the account holds in the Region the request is signed for, as this
+//! operation's modelled sentence scopes it ("all block storage disk snapshots in
+//! your AWS account and region") — every member of every entry read out of the one
+//! record the create persisted, so a listed entry is exactly what the singular
+//! reader answers for the same name — in the store's own total order by that
+//! resource's name, at most one page at a time, with `nextPageToken` NAMING the
+//! first record of the page after it and absent once none remain; a Region holding
+//! none is told so with an empty list; and the listing is a report, so walking it
+//! twice changes nothing, while a create or a delete is visible in the next walk.
+//!
+//! Which Region each listing reports, across the Regions one account holds records
+//! in, is `block_storage_region_scope.rs`; here every record is created in the
+//! Region the walk is made in, so these cases are about the records themselves.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -34,32 +41,43 @@ const PAGE_SIZE: usize = 10;
 // Driving the service
 // ---------------------------------------------------------------------------
 
-/// One page of `GetDiskSnapshots`: the entries it reports, and the token for the
-/// page after it when one remains.
-async fn snapshot_page(emulator: &Emulator, token: Option<&str>) -> (Vec<Value>, Option<String>) {
-    let body = match token {
-        Some(token) => {
-            emulator
-                .ok("GetDiskSnapshots", json!({"pageToken": token}))
-                .await
-        }
-        None => emulator.ok("GetDiskSnapshots", json!({})).await,
+/// One page of `GetDiskSnapshots`, made in `region` when one is named — a request
+/// naming none is made in the default Region: the entries it reports, and the
+/// token for the page after it when one remains.
+async fn snapshot_page_in(
+    emulator: &Emulator,
+    region: Option<&str>,
+    token: Option<&str>,
+) -> (Vec<Value>, Option<String>) {
+    let request = match token {
+        Some(token) => json!({"pageToken": token}),
+        None => json!({}),
     };
+    let body = emulator
+        .ok_at(None, region, "GetDiskSnapshots", request)
+        .await;
     let entries = body["diskSnapshots"]
         .as_array()
         .unwrap_or_else(|| {
-            panic!("case listing snapshots at {token:?}: expected an array, got {body:?}")
+            panic!(
+                "case listing snapshots in {region:?} at {token:?}: expected an array, got {body:?}"
+            )
         })
         .clone();
     (entries, body["nextPageToken"].as_str().map(str::to_string))
 }
 
-/// Every snapshot the listing reports, walking every page.
-async fn all_snapshots(emulator: &Emulator) -> Vec<Value> {
+/// The same page, for a case whose records are in the default Region.
+async fn snapshot_page(emulator: &Emulator, token: Option<&str>) -> (Vec<Value>, Option<String>) {
+    snapshot_page_in(emulator, None, token).await
+}
+
+/// Every snapshot the listing made in `region` reports, walking every page.
+async fn all_snapshots_in(emulator: &Emulator, region: Option<&str>) -> Vec<Value> {
     let mut all: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
     loop {
-        let (entries, next) = snapshot_page(emulator, token.as_deref()).await;
+        let (entries, next) = snapshot_page_in(emulator, region, token.as_deref()).await;
         all.extend(entries);
         match next {
             // A page carries at least one entry whenever a next token is
@@ -79,9 +97,10 @@ fn names_of(entries: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// The listed snapshot `name`, which must be reported exactly once.
-async fn listed(emulator: &Emulator, name: &str) -> Value {
-    let all = all_snapshots(emulator).await;
+/// The snapshot `name` as the listing of `region` reports it, which must report it
+/// exactly once.
+async fn listed(emulator: &Emulator, region: &str, name: &str) -> Value {
+    let all = all_snapshots_in(emulator, Some(region)).await;
     let matching: Vec<&Value> = all
         .iter()
         .filter(|entry| entry["name"].as_str() == Some(name))
@@ -146,9 +165,8 @@ enum Source {
 /// The rows differ along everything the rule generalises over: the KIND of
 /// source (a block storage disk, an instance's system volume), the source
 /// volume's size — from the smallest disk Lightsail creates to a large one — the
-/// Availability Zone and so the region the record carries, the region the LIST
-/// call is signed for (this operation reports what the account holds, so it
-/// changes nothing), the number of tags, and the form of the snapshot name
+/// Availability Zone and so the Region the record carries and the Region whose
+/// listing reports it, the number of tags, and the form of the snapshot name
 /// (hyphens, underscores, digits, mixed case).
 struct Row {
     case: &'static str,
@@ -216,10 +234,9 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// The region each listing walk in the first case is signed for, cycling so the
-/// walk is made from more than one credential scope: this operation reports what
-/// the ACCOUNT holds, so the scope must change nothing.
-const LIST_REGIONS: &[Option<&str>] = &[None, Some("us-east-1"), Some("eu-west-1")];
+/// A Region the service serves that none of the rows creates a record in, so its
+/// listing reports none of them.
+const REGION_HOLDING_NONE: &str = "ap-northeast-1";
 
 /// Create `row`'s source resource.
 async fn create_source(emulator: &Emulator, row: &Row) {
@@ -279,8 +296,8 @@ fn create_body(row: &Row) -> Value {
 
 /// RULE: a listed entry is the ONE persisted record, every member of it — so it
 /// is exactly what the singular reader answers for the same name — and the
-/// listing reports every record the account holds, once each, in name order,
-/// whatever scope the walk is signed for.
+/// listing of a Region reports every record the account holds THERE, once each,
+/// in name order.
 #[tokio::test]
 async fn created_disk_snapshots_are_listed_exactly() {
     let emulator = Emulator::new();
@@ -294,7 +311,7 @@ async fn created_disk_snapshots_are_listed_exactly() {
 
         // The listed entry and the singular read are two reads of ONE record,
         // so they agree member for member.
-        let from_listing = listed(&emulator, name).await;
+        let from_listing = listed(&emulator, row.region, name).await;
         let from_singular = singular(&emulator, name).await;
         assert_eq!(
             from_listing, from_singular,
@@ -353,42 +370,61 @@ async fn created_disk_snapshots_are_listed_exactly() {
         }
     }
 
-    // Every created snapshot, once each, in the store's own order by name — and
-    // the same answer whatever scope the walk is signed for, because the
-    // operation reports what the account holds.
-    let mut want_names: Vec<String> = ROWS.iter().map(|row| row.snapshot_name.to_string()).collect();
-    want_names.sort();
-    let first = all_snapshots(&emulator).await;
-    assert_eq!(
-        names_of(&first),
-        want_names,
-        "case listing every created snapshot: expected the created names in name order, got {:?}",
-        names_of(&first)
-    );
-    for region in LIST_REGIONS {
-        let body = emulator
-            .ok_at(None, *region, "GetDiskSnapshots", json!({}))
-            .await;
+    // Every created snapshot, once each, in the store's own order by name — under
+    // the Region whose records it is: the modelled sentence scopes this listing to
+    // "your AWS account and region", and a snapshot belongs to the Region it was
+    // taken in.
+    let mut by_region: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for row in ROWS {
+        by_region
+            .entry(row.region)
+            .or_default()
+            .push(row.snapshot_name.to_string());
+    }
+    for names in by_region.values_mut() {
+        names.sort();
+    }
+    let mut walked: Vec<(&str, Vec<Value>)> = Vec::new();
+    for (region, want_names) in &by_region {
+        let (entries, next) = snapshot_page_in(&emulator, Some(region), None).await;
         assert_eq!(
-            body["diskSnapshots"],
-            Value::Array(first.clone()),
-            "case listing from {region:?}: expected the same records the account holds, got \
-             {body:?}"
+            names_of(&entries),
+            *want_names,
+            "case listing the snapshots {region} holds: expected its created names in name \
+             order, got {:?}",
+            names_of(&entries)
         );
-        assert!(
-            body["nextPageToken"].is_null(),
-            "case listing from {region:?}: {} snapshots fit one page of {PAGE_SIZE}, so no next \
-             token is reported, got {body:?}",
-            ROWS.len()
+        assert_eq!(
+            next, None,
+            "case listing the snapshots {region} holds: {} of them fit one page of {PAGE_SIZE}, \
+             so no next token is reported, got {next:?}",
+            want_names.len()
         );
+        walked.push((region, entries));
     }
 
-    // A read must not change what a later caller sees.
-    let again = all_snapshots(&emulator).await;
-    assert_eq!(
-        again, first,
-        "case listing twice: a read must not change what a later caller sees, got {again:?}"
+    // A Region this account holds no snapshot in is told so, rather than handed
+    // another Region's.
+    let (none_held, next) = snapshot_page_in(&emulator, Some(REGION_HOLDING_NONE), None).await;
+    assert!(
+        none_held.is_empty(),
+        "case listing the snapshots {REGION_HOLDING_NONE} holds: expected none, got {none_held:?}"
     );
+    assert_eq!(
+        next, None,
+        "case listing the snapshots {REGION_HOLDING_NONE} holds: expected no next page token, got \
+         {next:?}"
+    );
+
+    // A read must not change what a later caller sees.
+    for (region, first) in &walked {
+        let (again, _) = snapshot_page_in(&emulator, Some(region), None).await;
+        assert_eq!(
+            &again, first,
+            "case listing {region} twice: a read must not change what a later caller sees, got \
+             {again:?}"
+        );
+    }
 }
 
 /// RULE: an account holding no record of the listed kind is told so — an EMPTY
@@ -517,6 +553,9 @@ async fn the_listing_pages_in_name_order() {
 #[tokio::test]
 async fn a_deleted_snapshot_leaves_the_listing() {
     let emulator = Emulator::new();
+    // The source — and so every snapshot taken of it — is in a Region of its own,
+    // which is the Region this case's walks are made in.
+    let region = "eu-central-1";
     emulator
         .ok(
             "CreateDisk",
@@ -552,7 +591,7 @@ async fn a_deleted_snapshot_leaves_the_listing() {
         .filter(|name| !gone.contains(name))
         .cloned()
         .collect();
-    let walked = names_of(&all_snapshots(&emulator).await);
+    let walked = names_of(&all_snapshots_in(&emulator, Some(region)).await);
     assert_eq!(
         walked, want,
         "case after deleting {gone:?}: expected every remaining snapshot exactly once in name \
