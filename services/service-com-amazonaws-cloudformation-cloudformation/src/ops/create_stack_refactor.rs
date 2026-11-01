@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStackRefactor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStackRefactor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStackRefactor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Plans a refactor across several stacks — "creates a refactor across multiple stacks, with
+//! the list of stacks and resources that are affected" — and hands back the
+//! `StackRefactorId` every later read addresses it by.
+//!
+//! The refactor is a RECORD of this account and Region ([`crate::state::stack_refactors`]):
+//! this call stores the stacks the request named, the final template each one is to end up
+//! with and the moves it was asked for, resolves those stack names against the stacks the
+//! store holds, and works out whether the refactor can be carried out at all
+//! ([`crate::state::stack_refactors::plan`]). Creating it is asynchronous, so the record is
+//! answered `CREATE_IN_PROGRESS` with nothing executable and its conclusion falls due a
+//! moment later, where `DescribeStackRefactor` reads it back.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +140,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStackRefactor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStackRefactorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStackRefactor"))
+        use crate::state::stack_refactors as refactors;
+
+        let region = crate::state::request_region(ctx.parts());
+        // What ONE stored record may carry, refused before anything is read or written: both
+        // lists are caller-counted and the model carries no `@length` for either
+        // (`refactors::MAX_STACKS_PER_REFACTOR`, `MAX_RESOURCE_MAPPINGS_PER_REFACTOR`).
+        refactors::validate_submitted_sizes(
+            input.stack_definitions.len(),
+            input.resource_mappings.as_ref().map_or(0, Vec::len),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // "StackDefinitions: The stacks being refactored" is required, so a refactor over no
+        // stack at all is a bad request rather than a record that refactors nothing. (A
+        // request that OMITS the member is refused by the boundary validator before this
+        // handler runs; this is the empty list.)
+        if input.stack_definitions.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "StackDefinitions must specify at least one stack",
+            ));
+        }
+
+        // Each definition's final template is resolved and VALIDATED before the store lock
+        // is taken: reading an object a `TemplateURL` addresses and evaluating a
+        // caller-sized body is caller-sized work, which never happens while every other
+        // request waits on that lock.
+        let mut definitions: Vec<refactors::RefactorStackDefinition> =
+            Vec::with_capacity(input.stack_definitions.len());
+        for definition in &input.stack_definitions {
+            // `StackDefinition$StackName` is "the name associated with the stack": a
+            // definition that names no stack addresses nothing to refactor.
+            let Some(stack_name) = definition
+                .stack_name
+                .clone()
+                .filter(|stack_name| !stack_name.is_empty())
+            else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    "Each StackDefinition must specify a StackName",
+                ));
+            };
+            let template_body = match (&definition.template_body, &definition.template_url) {
+                // The same conditional every operation of this service that takes a
+                // template is held to: a body and a reference are two spellings of one
+                // document, so naming both says two things at once.
+                (Some(_), Some(_)) => {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        "You cannot specify both TemplateBody and TemplateURL",
+                    ))
+                }
+                (Some(body), None) => Some(body.clone()),
+                // A `TemplateURL` says WHERE the template is, not what it means: the object
+                // it addresses is read from this emulator's own Amazon S3 and becomes the
+                // body the refactor records, so a final state submitted by reference and
+                // the same one submitted inline describe the same stack
+                // (`crate::state::template_url`).
+                (None, Some(url)) => Some(
+                    crate::state::template_url::fetch(ctx, &region, url)
+                        .await
+                        .map_err(crate::scaffolded::Scaffolded::validation_error)?,
+                ),
+                // "The stacks being refactored" may include one whose own template the
+                // refactor does not change, which is a definition carrying neither.
+                (None, None) => None,
+            };
+            if let Some(body) = template_body.as_deref() {
+                // The template rules every operation that SUBMITS a body is held to, so a
+                // refactor cannot record a final state a stack could not be given.
+                crate::state::validate_template_body(body)
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                crate::state::validate_template_quotas(body)
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                crate::state::validate_resource_types(body)
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            }
+            definitions.push(refactors::RefactorStackDefinition {
+                stack_name,
+                template_body,
+            });
+        }
+
+        let mappings: Vec<refactors::RefactorResourceMapping> = input
+            .resource_mappings
+            .iter()
+            .flatten()
+            .map(|mapping| refactors::RefactorResourceMapping {
+                source: stored_location(&mapping.source),
+                destination: stored_location(&mapping.destination),
+            })
+            .collect();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no store to record a refactor in,
+            // so this answers 501 rather than an id nothing stands behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateStackRefactor",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // Settled FIRST, so the stacks the refactor is resolved against are the ones this
+        // Region really holds at this instant rather than ones whose own operations the
+        // clock has already concluded.
+        store.settle(now);
+
+        // Every stack the refactor NAMES — in a definition or at either end of a move — in
+        // the order it was first named, resolved exactly once.
+        let covered: Vec<crate::state::stack_refactors::CoveredStack> =
+            named_stacks(&definitions, &mappings)
+                .iter()
+                .map(|stack_name| store.covered_stack(&region, stack_name))
+                .collect();
+        // What the creation CONCLUDES, computed once here against those stacks: the ids of
+        // the stacks the refactor covers, and the reason it cannot be carried out if there
+        // is one.
+        let enable_stack_creation = input.enable_stack_creation.unwrap_or(false);
+        let plan = refactors::plan(&mappings, enable_stack_creation, &covered);
+
+        let stack_refactor_id = crate::state::new_stack_refactor_id();
+        store.record_stack_refactor(refactors::StoredStackRefactor::creating(
+            refactors::SubmittedRefactor {
+                stack_refactor_id: stack_refactor_id.clone(),
+                region,
+                description: input.description.clone(),
+                // "Determines if a new stack is created with the refactor" — a request that
+                // says nothing asks for no stack to be created.
+                enable_stack_creation,
+                stack_definitions: definitions,
+                resource_mappings: mappings,
+            },
+            plan,
+            now,
+        ));
+
+        Ok(CreateStackRefactorOutput { stack_refactor_id })
     }
+}
+
+/// One end of a move, as the record holds it: "the location of the resource in a stack
+/// template", which is a stack name and a logical resource id.
+fn stored_location(
+    location: &ResourceLocation,
+) -> crate::state::stack_refactors::RefactorResourceLocation {
+    crate::state::stack_refactors::RefactorResourceLocation {
+        stack_name: location.stack_name.clone(),
+        logical_resource_id: location.logical_resource_id.clone(),
+    }
+}
+
+/// Every stack name the refactor uses, in the order it first used one and without repeats: a
+/// stack named by a definition and by both ends of a move is ONE stack, so it is resolved
+/// once and reports one id.
+fn named_stacks(
+    definitions: &[crate::state::stack_refactors::RefactorStackDefinition],
+    mappings: &[crate::state::stack_refactors::RefactorResourceMapping],
+) -> Vec<String> {
+    let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+    let mut named: Vec<String> = Vec::new();
+    let from_definitions = definitions
+        .iter()
+        .map(|definition| definition.stack_name.as_str());
+    let from_mappings = mappings.iter().flat_map(|mapping| {
+        [
+            mapping.source.stack_name.as_str(),
+            mapping.destination.stack_name.as_str(),
+        ]
+    });
+    for stack_name in from_definitions.chain(from_mappings) {
+        if seen.insert(stack_name) {
+            named.push(stack_name.to_string());
+        }
+    }
+    named
 }

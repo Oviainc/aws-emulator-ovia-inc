@@ -39,14 +39,18 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The bucket a client stages its templates in, as `cdk deploy` stages a synthesized
 /// template in the bootstrap bucket before it creates the change set.
-const STAGING_BUCKET: &str = "cfn-staging-templates";
+pub(crate) const STAGING_BUCKET: &str = "cfn-staging-templates";
 
 /// The `Description` every staged template carries and NO request member does: an answer
 /// reporting it can only have come from the object that was read.
 const STAGED_DESCRIPTION: &str = "staged in Amazon S3, not inline";
 
 /// Create the staging bucket, once per router.
-async fn create_staging_bucket(router: &MultiServiceRouter) {
+///
+/// `pub(crate)` because more than one suite stages a template object: `stack_refactors.rs`
+/// submits a refactor's final state by reference, which is the same staging this suite
+/// performs, so there is ONE way a test puts a template in Amazon S3.
+pub(crate) async fn create_staging_bucket(router: &MultiServiceRouter) {
     let created = s3(router, "PUT", &format!("/{STAGING_BUCKET}"), b"").await;
     assert_eq!(
         created.status, 200,
@@ -56,7 +60,7 @@ async fn create_staging_bucket(router: &MultiServiceRouter) {
 }
 
 /// Stage one template object, as a client's own `PutObject` stores it.
-async fn stage(router: &MultiServiceRouter, key: &str, body: &str) {
+pub(crate) async fn stage(router: &MultiServiceRouter, key: &str, body: &str) {
     let stored = s3(
         router,
         "PUT",

@@ -160,15 +160,20 @@ fn error_envelope_request_id(case: &str, body: &str) -> String {
     ids.into_iter().next().expect("one id")
 }
 
-/// A request id has the 8-4-4-4-12 lowercase-hex form AWS answers with, whether it came
-/// from an error envelope or from a successful response's `ResponseMetadata`.
-fn assert_request_id_shape(case: &str, request_id: &str) {
+/// An identifier has the 8-4-4-4-12 lowercase-hex form AWS answers with — a request id,
+/// whether it came from an error envelope or from a successful response's `ResponseMetadata`,
+/// and every other id this service mints in that form.
+///
+/// `what` names the kind of id under assertion, so one helper serves every caller: this is
+/// the ONE spelling of that check in this test crate, reused by `stack_refactors.rs` for the
+/// `StackRefactorId` a create hands out.
+pub(crate) fn assert_identifier_shape(case: &str, what: &str, request_id: &str) {
     let groups: Vec<&str> = request_id.split('-').collect();
     let widths = [8usize, 4, 4, 4, 12];
     assert_eq!(
         groups.len(),
         widths.len(),
-        "case {case:?}: expected five hyphen-separated groups, got {request_id:?}"
+        "case {case:?}: expected a {what} of five hyphen-separated groups, got {request_id:?}"
     );
     for (group, width) in groups.iter().zip(widths) {
         assert!(
@@ -176,10 +181,15 @@ fn assert_request_id_shape(case: &str, request_id: &str) {
                 && group
                     .chars()
                     .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
-            "case {case:?}: expected a {width}-character lowercase-hex group, got {group:?} \
-             in {request_id:?}"
+            "case {case:?}: expected a {width}-character lowercase-hex group in a {what}, got \
+             {group:?} in {request_id:?}"
         );
     }
+}
+
+/// [`assert_identifier_shape`] for a request id, which is what this suite asserts.
+fn assert_request_id_shape(case: &str, request_id: &str) {
+    assert_identifier_shape(case, "request id", request_id);
 }
 
 fn members_of(case: &ErrorCase) -> Vec<(String, String)> {

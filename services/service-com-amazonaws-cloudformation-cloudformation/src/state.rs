@@ -90,6 +90,9 @@
 //! progress record (oldest-first),
 //! [`resource_scans::MAX_RESOURCE_SCANS`] recorded resource scans (oldest-first), each
 //! one carrying the resources this store already holds and so bounded by the ceilings above,
+//! [`stack_refactors::MAX_STACK_REFACTORS`] stack refactors (oldest-first), each one carrying
+//! at most [`stack_refactors::MAX_STACKS_PER_REFACTOR`] stack definitions and
+//! [`stack_refactors::MAX_RESOURCE_MAPPINGS_PER_REFACTOR`] resource mappings,
 //! and [`registry::MAX_PUBLISHED_VERSIONS`] versions published onto one public extension
 //! record (oldest-first), the registry's one caller-counted growth site.
 //!
@@ -230,6 +233,15 @@
 //! in-progress status, so it lifts as those conclude. `DeleteGeneratedTemplate` removes a
 //! record outright — nothing in that feature reports a generated template that was deleted,
 //! so no read keeps one addressable the way a deleted stack's summary is kept.
+//!
+//! ## Stack refactors
+//!
+//! It also holds this account and Region's STACK REFACTORS ([`stack_refactors`]):
+//! `CreateStackRefactor` records one across the stacks it names and hands back its id, and
+//! `DescribeStackRefactor` reads the refactor's own status back. Its creation rides a clock
+//! of its own — answered `CREATE_IN_PROGRESS` with nothing executable and concluded
+//! [`STATUS_TRANSITION_DELAY`] later — and the conclusion is computed once, by the call that
+//! creates the refactor, against the stacks this store held at that instant.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -316,6 +328,10 @@ pub mod handler_progress;
 /// The generated templates this account and Region holds: what `CreateGeneratedTemplate`
 /// starts and `DescribeGeneratedTemplate` reads the progress of.
 pub mod generated_template;
+
+/// The stack refactors this account and Region holds: what `CreateStackRefactor` plans
+/// across several stacks and `DescribeStackRefactor` reads the status of.
+pub mod stack_refactors;
 
 /// The resource-signal waits of one stack operation: the barrier an
 /// `AWS::CloudFormation::WaitCondition` or a `CreationPolicy`'s `ResourceSignal` puts in a
@@ -4723,6 +4739,13 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// clock owes it is its own conclusion, which [`Self::settle`] materialises, and it is
     /// bounded at [`registry::MAX_TYPE_REGISTRATIONS`], oldest reclaimed first.
     pub type_registrations: Vec<registry::StoredTypeRegistration>,
+    /// Every stack refactor this account and Region holds, in creation order, so
+    /// `DescribeStackRefactor` reads back exactly what `CreateStackRefactor` wrote (see
+    /// [`stack_refactors`]). A refactor is a record of its own rather than a stack's, so it
+    /// is neither settled on the stack clock nor reclaimed with a stack; the one transition
+    /// the clock owes it is its own creation concluding, which [`Self::settle`] materialises,
+    /// and it is bounded at [`stack_refactors::MAX_STACK_REFACTORS`], oldest reclaimed first.
+    pub stack_refactors: Vec<stack_refactors::StoredStackRefactor>,
 }
 
 impl ComAmazonawsCloudformationCloudformationState {
@@ -4773,6 +4796,13 @@ impl ComAmazonawsCloudformationCloudformationState {
         }
         for scan in &mut self.resource_scans {
             scan.settle(now);
+        }
+        // A refactor's own creation is asynchronous too: the call is answered with an id
+        // while CloudFormation is still working out which stacks and resources the refactor
+        // affects, so the conclusion the clock has made due is installed here rather than
+        // invented by the read that reports it.
+        for refactor in &mut self.stack_refactors {
+            refactor.settle(now);
         }
         for stack_set in &mut self.stack_sets {
             stack_set.settle(now);
@@ -5078,6 +5108,62 @@ impl ComAmazonawsCloudformationCloudformationState {
             self.resource_scans.remove(0);
         }
         self.resource_scans.push(scan);
+    }
+
+    /// Record one stack refactor. The oldest record is reclaimed past
+    /// [`stack_refactors::MAX_STACK_REFACTORS`], so the store cannot grow without limit.
+    ///
+    /// This is the ONLY way a refactor enters the store: `CreateStackRefactor` is what
+    /// creates one, and [`stack_refactors`] is where what writes one is written down.
+    pub fn record_stack_refactor(&mut self, refactor: stack_refactors::StoredStackRefactor) {
+        while self.stack_refactors.len() >= stack_refactors::MAX_STACK_REFACTORS {
+            self.stack_refactors.remove(0);
+        }
+        self.stack_refactors.push(refactor);
+    }
+
+    /// The stack refactor `stack_refactor_id` addresses in the request's Region, if this
+    /// store holds it: a refactor is addressed by the id `CreateStackRefactor` handed back,
+    /// and nothing outside that Region is addressable.
+    pub fn resolve_stack_refactor(
+        &self,
+        region: &str,
+        stack_refactor_id: &str,
+    ) -> Option<&stack_refactors::StoredStackRefactor> {
+        self.stack_refactors
+            .iter()
+            .find(|refactor| refactor.is_addressed_by(region, stack_refactor_id))
+    }
+
+    /// What one stack a refactor NAMES looks like in this store right now: its id, if this
+    /// Region holds a live stack of that name, and the logical resource ids it currently
+    /// holds.
+    ///
+    /// The one place a refactor resolves a stack name, so the ids it reports and the moves it
+    /// validates read the same stacks ([`stack_refactors::plan`] is what judges them).
+    /// Accurate only once [`Self::settle`] has installed the deployments the clock already
+    /// completed; every caller settles first.
+    pub fn covered_stack(
+        &self,
+        region: &str,
+        stack_name: &str,
+    ) -> stack_refactors::CoveredStack {
+        let live = self
+            .resolve(region, stack_name)
+            .filter(|stack| stack.is_live());
+        stack_refactors::CoveredStack {
+            stack_name: stack_name.to_string(),
+            stack_id: live.map(|stack| stack.stack_id.clone()),
+            logical_resource_ids: live
+                .map(|stack| {
+                    stack
+                        .current_resources()
+                        .into_iter()
+                        .map(|resource| resource.logical_id)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
     }
 
     /// The scans of one Region, NEWEST FIRST: `ListResourceScans` "list[s] the resource
@@ -6223,6 +6309,17 @@ pub fn new_generated_template_id(region: &str, generated_template_name: &str) ->
 /// [`resource_scans::resource_scan_arn`] builds.
 pub fn new_resource_scan_id(region: &str) -> String {
     resource_scans::resource_scan_arn(region, &new_identifier("resource-scan"))
+}
+
+/// Mint a stack refactor's id — `CreateStackRefactorOutput$StackRefactorId`, which
+/// `DescribeStackRefactor` reads the refactor back by.
+///
+/// The same 8-4-4-4-12 lowercase-hex identifier every other id this service mints carries:
+/// the model constrains `StackRefactorId` with neither a length nor a pattern, and the
+/// refactor is a record of this account and Region rather than a resource with an ARN of its
+/// own, so there is nothing else for the id to be.
+pub fn new_stack_refactor_id() -> String {
+    new_identifier("stack-refactor")
 }
 
 /// The message CloudFormation answers when a request names a change set that is not
