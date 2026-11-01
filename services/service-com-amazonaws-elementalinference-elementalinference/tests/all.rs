@@ -71,6 +71,8 @@ mod output_config_defaults;
 mod output_list_rule;
 #[path = "all/output_provenance.rs"]
 mod output_provenance;
+#[path = "all/page_token_spelling.rs"]
+mod page_token_spelling;
 #[path = "all/pagination_token_binding.rs"]
 mod pagination_token_binding;
 #[path = "all/put_feed_policy_scope.rs"]

@@ -2500,8 +2500,8 @@ pub const PAGE_TOKEN_OTHER_REQUEST_MESSAGE: &str =
 /// of this service; they differ only in what the message tells the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageTokenRejection {
-    /// Not a token this service issues: not hex, or hex that carries none of the
-    /// fields a token has.
+    /// Not a token this service issues: not hex as this service writes hex, or hex
+    /// that carries none of the fields a token has.
     Malformed,
     /// A token of this service, issued for another request — another operation,
     /// another endpoint, or other search criteria.
@@ -2578,6 +2578,23 @@ fn page_criteria_digest(criteria: &str) -> String {
     ::hex::encode(&digest[..PAGE_TOKEN_DIGEST_BYTES])
 }
 
+/// The bytes one hex field of a `nextToken` carries, or `None` when the field is not
+/// hex AS THIS SERVICE WRITES IT.
+///
+/// A `nextToken` is opaque, so the only tokens there are, are the byte strings the
+/// encoder handed out, and the encoder writes one spelling of hex per byte string (two
+/// lower-case characters a byte, as `::hex::encode` writes it). A field is therefore
+/// read only when
+/// it is byte-identical to the encoding of the bytes it decodes to: any other spelling
+/// of the same bytes — an upper-case or mixed-case re-spelling — is a string this
+/// service never issued in any request, so it names no page. Used for BOTH hex layers
+/// of a token, the outer envelope and the criteria digest inside it, so neither layer
+/// accepts a spelling the encoder cannot produce.
+fn token_hex(field: &str) -> Option<Vec<u8>> {
+    let bytes = ::hex::decode(field).ok()?;
+    (::hex::encode(&bytes) == field).then_some(bytes)
+}
+
 /// Encode an opaque `nextToken` that resumes the request whose criteria are
 /// `criteria` after `last_id`.
 ///
@@ -2599,13 +2616,14 @@ pub fn encode_page_token(criteria: &str, last_id: &str) -> String {
 /// criteria are `criteria`.
 ///
 /// [`PageTokenRejection::Malformed`] for a token this service never issues in any
-/// request — one that is not hex, or that carries none of a token's fields — and
+/// request — one that is not hex as this service writes it ([`token_hex`]), or that
+/// carries none of a token's fields — and
 /// [`PageTokenRejection::OtherRequest`] for one whose digest is another request's;
 /// the handlers refuse both as a `ValidationException`. A token that does decode
 /// names a POSITION in the id order rather than an item that must still be there, so
 /// paging survives an item that disappeared between two pages.
 pub fn decode_page_token(criteria: &str, token: &str) -> Result<String, PageTokenRejection> {
-    let bytes = ::hex::decode(token).map_err(|_| PageTokenRejection::Malformed)?;
+    let bytes = token_hex(token).ok_or(PageTokenRejection::Malformed)?;
     let decoded = String::from_utf8(bytes).map_err(|_| PageTokenRejection::Malformed)?;
     // The id a page ends on may itself hold the separator, so it is whatever
     // follows the first two fields.
@@ -2617,7 +2635,7 @@ pub fn decode_page_token(criteria: &str, token: &str) -> Result<String, PageToke
     };
     if layout != PAGE_TOKEN_LAYOUT
         || last_id.is_empty()
-        || ::hex::decode(digest).map(|raw| raw.len()) != Ok(PAGE_TOKEN_DIGEST_BYTES)
+        || token_hex(digest).map(|raw| raw.len()) != Some(PAGE_TOKEN_DIGEST_BYTES)
     {
         return Err(PageTokenRejection::Malformed);
     }
