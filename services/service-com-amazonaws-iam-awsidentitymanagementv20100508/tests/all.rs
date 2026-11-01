@@ -189,6 +189,8 @@ mod policy_tags;
 mod policy_variable_scoping;
 #[path = "all/policy_version_creation.rs"]
 mod policy_version_creation;
+#[path = "all/policy_version_creation_absence_wording.rs"]
+mod policy_version_creation_absence_wording;
 #[path = "all/policy_version_deletion.rs"]
 mod policy_version_deletion;
 #[path = "all/policy_version_listing.rs"]

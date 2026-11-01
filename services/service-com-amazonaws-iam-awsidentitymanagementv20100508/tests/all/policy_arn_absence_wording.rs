@@ -8,8 +8,10 @@
 //! supplied, echoed byte for byte, between its OPERATION FAMILY's fixed text — `Policy `
 //! and ` was not found.` for the operations acting on the policy RESOURCE (read and
 //! write alike), `Policy ` and ` does not exist or is not attachable.` for the operations
-//! whose subject is the ATTACHMENT of that policy to an entity. The sentence belongs to
-//! the family, not to the handler, so no operation may compose one of its own.
+//! whose subject is the ATTACHMENT of that policy to an entity, among them the create of
+//! the version that takes effect for the identities the policy is attached to. The
+//! sentence belongs to the family, not to the handler, so no operation may compose one of
+//! its own.
 //!
 //! This is the one place the whole `PolicyArn`-addressed surface is held to that rule at
 //! once, which is what keeps a single handler's wording from drifting while its family's
@@ -71,10 +73,11 @@ const HELD_PATH: &str = "/held/";
 #[derive(Clone, Copy, Debug)]
 enum Family {
     /// The operations acting on the managed policy RESOURCE — read it, list what it
-    /// holds, tag it, version it, delete it.
+    /// holds, tag it, delete it.
     Resource,
     /// The operations whose subject is whether the policy can be, or already is,
-    /// attached to an entity.
+    /// attached to an entity — among them the create of the version that takes effect for
+    /// the identities it is attached to.
     Attachment,
 }
 
@@ -122,7 +125,7 @@ const POLICY_ARN_CALLS: &[PolicyArnCall] = &[
     },
     PolicyArnCall {
         action: "CreatePolicyVersion",
-        family: Family::Resource,
+        family: Family::Attachment,
         extra: &[("PolicyDocument", POLICY_DOCUMENT)],
     },
     PolicyArnCall {

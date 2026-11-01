@@ -529,7 +529,7 @@ async fn an_arn_naming_no_account_policy_is_refused_by_its_kind() {
         if case.code == "NoSuchEntity" {
             assert_eq!(
                 element(&body, "Message"),
-                format!("Policy {} was not found.", case.arn),
+                format!("Policy {} does not exist or is not attachable.", case.arn),
                 "case {name:?}: the message must name the policy the request referenced: {body}"
             );
         }
@@ -738,7 +738,7 @@ async fn a_version_cannot_be_added_to_a_policy_that_was_deleted() {
             );
             assert_eq!(
                 element(&body, "Message"),
-                format!("Policy {arn} was not found."),
+                format!("Policy {arn} does not exist or is not attachable."),
                 "case {case:?} {attempt}: the message must name the policy referenced: {body}"
             );
         }

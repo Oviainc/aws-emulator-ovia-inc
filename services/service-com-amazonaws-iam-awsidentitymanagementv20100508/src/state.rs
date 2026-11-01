@@ -5030,12 +5030,16 @@ pub fn uncarried_aws_managed_policy(arn: &str, what: &str) -> crate::scaffolded:
 /// message, whose fixed text is `Policy ` and ` was not found.` around the ARN the
 /// request supplied.
 ///
-/// ONE wording, shared by every operation taking a `PolicyArn`, so a read, a tag call
-/// and a delete cannot describe the same missing policy three different ways. It is also
-/// what the DETACH family answers for a policy the named entity does not carry: what such
-/// a request addresses is the policy, so the sentence carries the ARN and nothing of the
-/// entity, which is why `Detach`/`User`/`Role`/`GroupPolicy` all word that absence here
-/// rather than each composing a clause naming its own entity.
+/// ONE wording, shared by every operation whose subject is the policy RESOURCE itself, so a
+/// read, a tag call and a delete cannot describe the same missing policy three different
+/// ways. It is also what the DETACH family answers for a policy the named entity does not
+/// carry: what such a request addresses is the policy, so the sentence carries the ARN and
+/// nothing of the entity, which is why `Detach`/`User`/`Role`/`GroupPolicy` all word that
+/// absence here rather than each composing a clause naming its own entity.
+///
+/// NOT for an operation of the policy-ATTACHMENT family, which words the same absence as
+/// [`policy_not_attachable`]: the two sentences are separate templates, and which of them an
+/// operation emits is part of the wire contract a client matching the message sees.
 pub fn policy_not_found(arn: &str) -> String {
     format!("Policy {arn} was not found.")
 }
@@ -5080,10 +5084,13 @@ pub fn open_id_connect_provider_cannot_be_found(arn: &str) -> String {
 ///
 /// The trailing clause is what separates that family — the operations whose subject is
 /// whether a managed policy can be, or already is, attached to an entity (`AttachRolePolicy`,
-/// `AttachUserPolicy`, `ListEntitiesForPolicy`) — from a plain read, write or delete of the
-/// policy resource itself, which reports the same absence as [`policy_not_found`]. An
-/// attachment call cannot tell "this ARN names nothing" from "it names something that
-/// cannot take part in an attachment", and its wording says so.
+/// `AttachUserPolicy`, `AttachGroupPolicy`, `ListEntitiesForPolicy`), together with
+/// `CreatePolicyVersion`, which writes the version that takes effect for the identities the
+/// policy is attached to and so resolves its `PolicyArn` through the same attachability
+/// check — from a plain read, tag or delete of the policy resource itself, which reports the
+/// same absence as [`policy_not_found`]. Such a call cannot tell "this ARN names nothing"
+/// from "it names something that cannot take part in an attachment", and its wording says
+/// so.
 pub fn policy_not_attachable(arn: &str) -> String {
     format!("Policy {arn} does not exist or is not attachable.")
 }

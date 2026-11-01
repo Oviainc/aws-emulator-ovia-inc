@@ -264,13 +264,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The write is addressed exactly as a read of the same ARN is, so it reaches the
         // one record `GetPolicy` reports; an ARN the account holds no policy under
-        // "referenced a resource entity that does not exist", through the one wording
-        // `crate::state` holds for a missing managed policy, which every operation taking
-        // a `PolicyArn` answers with.
+        // "referenced a resource entity that does not exist". What this call writes is
+        // the version that takes effect for the identities the policy is attached to, so
+        // IAM resolves the ARN through the same attachability check the attach calls make
+        // and words the miss with that family's sentence
+        // (`crate::state::policy_not_attachable`) rather than with the plain not-found
+        // sentence a read, a tag or a delete of the policy RESOURCE answers: such a
+        // caller cannot tell "this ARN names no policy" from "it names one no version can
+        // be added to", and the wording says so.
         let Some(held) = store.policy_by_arn_mut(&input.policy_arn) else {
             return Err(CreatePolicyVersionErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
+                    message: Some(crate::state::policy_not_attachable(&input.policy_arn)),
                 },
             )
             .into());
