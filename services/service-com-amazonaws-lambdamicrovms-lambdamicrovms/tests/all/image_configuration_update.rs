@@ -4,9 +4,9 @@
 //! account holds.
 //!
 //! RULE: the update carries the WHOLE configuration (PUT semantics), so it mints a
-//! further version of the image the `imageIdentifier` names — the next `major.minor`
-//! after the ones it holds — holding exactly the members the request carried plus the
-//! values the service supplies for the ones it left out; the image is reported in the
+//! further version of the image the `imageIdentifier` names — the next MAJOR, `<n>.0`,
+//! after the generations it holds — holding exactly the members the request carried plus
+//! the values the service supplies for the ones it left out; the image is reported in the
 //! progressive `UPDATING` state with that version's build in flight and reaches
 //! `UPDATED`, with the new version as its active one, once the clock has made the build
 //! due. An image whose own lifecycle work is still in flight has no settled record to
@@ -294,8 +294,8 @@ async fn an_update_mints_a_further_version_holding_the_configuration_it_carried(
         // was already serving still the active one.
         assert_eq!(
             updated["imageVersion"].as_str(),
-            Some("1.1"),
-            "case {case:?}: the update mints the next minor after {:?}, got {:?}",
+            Some("2.0"),
+            "case {case:?}: the update mints the next major after {:?}, got {:?}",
             created["imageVersion"],
             updated["imageVersion"]
         );
@@ -352,7 +352,7 @@ async fn an_update_mints_a_further_version_holding_the_configuration_it_carried(
             "case {case:?}: the active version is unchanged until the build settles, got {image}"
         );
 
-        let entry = version_entry(&router, &identifier, "1.1", case).await;
+        let entry = version_entry(&router, &identifier, "2.0", case).await;
         assert_eq!(
             entry["state"].as_str(),
             Some("IN_PROGRESS"),
@@ -387,11 +387,11 @@ async fn an_update_mints_a_further_version_holding_the_configuration_it_carried(
         );
         assert_eq!(
             settled["latestActiveImageVersion"].as_str(),
-            Some("1.1"),
+            Some("2.0"),
             "case {case:?}: the version the update built is the active one, got {settled}"
         );
 
-        let entry = version_entry(&router, &identifier, "1.1", case).await;
+        let entry = version_entry(&router, &identifier, "2.0", case).await;
         assert_eq!(
             entry["state"].as_str(),
             Some("SUCCESSFUL"),
@@ -412,9 +412,9 @@ async fn an_update_mints_a_further_version_holding_the_configuration_it_carried(
     }
 }
 
-/// RULE: each update mints the next `major.minor` after the versions the image already
-/// holds, so repeated updates accumulate versions on the one image record rather than
-/// replacing one.
+/// RULE: each update mints the next MAJOR version after the generations the image
+/// already holds, so repeated updates accumulate versions on the one image record rather
+/// than replacing one.
 #[tokio::test]
 async fn successive_updates_mint_successive_versions() {
     let router = emulator();
@@ -423,7 +423,7 @@ async fn successive_updates_mint_successive_versions() {
 
     // Rows differ in how many updates the image has already taken, which is what the
     // minting generalises over.
-    for (round, expected) in ["1.1", "1.2", "1.3"].iter().enumerate() {
+    for (round, expected) in ["2.0", "3.0", "4.0"].iter().enumerate() {
         let case = format!("update {} of the image", round + 1);
         let (status, updated) = update_image(
             &router,
@@ -826,7 +826,7 @@ async fn a_retried_update_replays_the_version_its_client_token_minted() {
     );
     assert_eq!(
         first["imageVersion"].as_str(),
-        Some("1.1"),
+        Some("2.0"),
         "the first update mints the next version, got {first}"
     );
 
@@ -873,7 +873,7 @@ async fn a_retried_update_replays_the_version_its_client_token_minted() {
     assert_eq!(status, 200, "the replay got {status} {settled}");
     assert_eq!(
         settled["imageVersion"].as_str(),
-        Some("1.1"),
+        Some("2.0"),
         "the replay reports the version the token minted, got {settled}"
     );
     assert_eq!(
@@ -892,7 +892,7 @@ async fn a_retried_update_replays_the_version_its_client_token_minted() {
     assert_eq!(status, 200, "a new token's update got {status} {next}");
     assert_eq!(
         next["imageVersion"].as_str(),
-        Some("1.2"),
+        Some("3.0"),
         "a different token mints the next version, got {next}"
     );
 }

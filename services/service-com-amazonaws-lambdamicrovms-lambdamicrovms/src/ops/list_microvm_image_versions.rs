@@ -2,10 +2,12 @@
 
 //! @op ListMicrovmImageVersions
 //!
-//! Pages through the versions the MicroVM image this request addresses holds, in the
-//! `major.minor` order of the versions themselves (so `1.10` follows `1.9`) and under
-//! the operation's `@paginated` contract: `maxResults` caps the page and a `nextToken`
-//! is issued, and accepted, while versions remain.
+//! Pages through the versions the MicroVM image this request addresses holds, NEWEST
+//! FIRST — the `major.minor` order of the versions themselves, descending (so `1.10`
+//! precedes `1.9`) — and under the operation's `@paginated` contract: `maxResults` caps
+//! the page and a `nextToken` is issued, and accepted, while versions remain. A build
+//! mints the next version of the image, so the newest row is the configuration the last
+//! build was given and a client picking "the latest version" reads the first row.
 //!
 //! Each entry is the summary of the stored version record, together with the ARN of the
 //! image holding it, so a version whose asynchronous build is still in flight is
@@ -240,18 +242,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The versions enumerate in ONE stable order, the `major.minor` order the
-        // versions themselves name (`crate::state::version_order`), so "after this
-        // version" is a cursor that stays valid even when another version is built
-        // between two pages.
+        // The versions enumerate NEWEST FIRST — the `major.minor` order the versions
+        // themselves name (`crate::state::version_order`), reversed — so the version the
+        // last build minted is the first row a client reads; "before this version" is
+        // then a cursor that stays valid even when another version is built between two
+        // pages.
         let mut ordered: Vec<&crate::state::MicrovmImageVersion> =
             image.versions.values().collect();
-        ordered.sort_by_key(|version| crate::state::version_order(&version.image_version));
+        ordered.sort_by_key(|version| {
+            ::std::cmp::Reverse(crate::state::version_order(&version.image_version))
+        });
 
         let mut remaining = ordered.into_iter().filter(|version| {
             after.as_deref().is_none_or(|cursor| {
                 crate::state::version_order(&version.image_version)
-                    > crate::state::version_order(cursor)
+                    < crate::state::version_order(cursor)
             })
         });
         let page: Vec<&crate::state::MicrovmImageVersion> =

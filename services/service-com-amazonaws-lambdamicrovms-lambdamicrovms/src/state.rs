@@ -688,17 +688,21 @@ pub const ACCESS_DENIED_MESSAGE: &str = "You do not have sufficient access to pe
 /// The version the NEXT build of an image is minted as, given the versions it
 /// already holds.
 ///
-/// Versions are `major.minor` (see [`FIRST_IMAGE_VERSION`]): the first build is
-/// `1.0` and every later build of the same image takes the next minor of the
-/// highest `major.minor` already minted. A stored version that is not in that form
-/// (nothing this service mints is) is ignored rather than crashing the mint.
+/// Versions are `major.minor` (see [`FIRST_IMAGE_VERSION`]) and a build of an image
+/// mints the NEXT MAJOR of the versions it holds, with a minor of `0`: the first build
+/// is `1.0`, the next is `2.0`, and so on — a build replaces the whole configuration of
+/// the image (`UpdateMicrovmImage` "uses PUT semantics"), so the version it mints is a
+/// new generation of the image rather than a point revision of the generation before
+/// it. A stored version that is not in the `major.minor` form (nothing this service
+/// mints is) is ignored rather than crashing the mint.
 pub fn next_image_version<'a>(existing: impl IntoIterator<Item = &'a str>) -> String {
     let highest = existing
         .into_iter()
         .filter_map(parse_image_version)
-        .max_by_key(|(major, minor)| (*major, *minor));
+        .map(|(major, _)| major)
+        .max();
     match highest {
-        Some((major, minor)) => format!("{major}.{}", minor + 1),
+        Some(major) => format!("{}.0", major + 1),
         None => FIRST_IMAGE_VERSION.to_string(),
     }
 }

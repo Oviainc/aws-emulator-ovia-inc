@@ -21,6 +21,8 @@ mod image_build_read_path;
 mod image_build_scope;
 #[path = "all/image_configuration_update.rs"]
 mod image_configuration_update;
+#[path = "all/image_identity_and_version_generations.rs"]
+mod image_identity_and_version_generations;
 #[path = "all/image_listing.rs"]
 mod image_listing;
 #[path = "all/image_read_authorization.rs"]

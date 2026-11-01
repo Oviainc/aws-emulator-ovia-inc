@@ -332,24 +332,24 @@ async fn every_not_found_carries_only_the_request_derived_message() {
 }
 
 /// RULE: a MicroVM image version is named in this service's `major.minor` form — the
-/// first build of an image is `1.0` and the next build of the same image takes the next
-/// minor of the highest version already minted — and that string is what the create
-/// reports and what a version-addressed call takes back.
+/// first build of an image is `1.0` and every later build of the same image takes the
+/// NEXT MAJOR, `<n>.0` — and that string is what the create reports and what a
+/// version-addressed call takes back.
 #[tokio::test]
 async fn image_versions_are_minted_in_major_minor_form() {
     // The minting rule over a set of version sets. Rows differ in how many versions
     // exist, in their ordering, and in their magnitude.
     let rows: Vec<(&str, Vec<&str>, &str)> = vec![
         ("no version yet", vec![], "1.0"),
-        ("the first build", vec!["1.0"], "1.1"),
-        ("minors already past the first", vec!["1.0", "1.1"], "1.2"),
+        ("the first build", vec!["1.0"], "2.0"),
+        ("generations already past the first", vec!["1.0", "2.0"], "3.0"),
         (
             "the highest version is not the last listed",
-            vec!["1.3", "1.0", "1.2"],
-            "1.4",
+            vec!["3.0", "1.0", "2.0"],
+            "4.0",
         ),
-        ("a minor past single digits", vec!["1.9", "1.10"], "1.11"),
-        ("a later major", vec!["1.0", "2.4"], "2.5"),
+        ("a major past single digits", vec!["9.0", "10.0"], "11.0"),
+        ("a version carrying a minor", vec!["1.0", "2.4"], "3.0"),
         ("a version in no recognised form is ignored", vec!["latest"], "1.0"),
     ];
     for (case, existing, expected) in rows {

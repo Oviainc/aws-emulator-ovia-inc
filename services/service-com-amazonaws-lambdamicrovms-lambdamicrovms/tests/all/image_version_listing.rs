@@ -5,8 +5,8 @@
 //!
 //! RULE: the listing reports the versions the image the `imageIdentifier` names holds —
 //! resolved by either form `MicrovmImageIdentifier` accepts — one entry per stored
-//! version record, in the `major.minor` order the versions themselves name, each
-//! carrying that image's ARN and the record's own build inputs, state, status and
+//! version record, NEWEST FIRST in the `major.minor` order the versions themselves name,
+//! each carrying that image's ARN and the record's own build inputs, state, status and
 //! instants, paged by the operation's `@paginated` contract; a well-formed identifier
 //! naming no image of this account is HTTP 404 and a value that is no identifier of this
 //! API is HTTP 400.
@@ -224,9 +224,9 @@ async fn walk(
 }
 
 /// RULE: however the pages are cut and however the image is addressed, the listing walks
-/// every version that image holds — each exactly once, in the `major.minor` order the
-/// versions name, at most `maxResults` per page — and hands back a `nextToken` only
-/// while versions remain.
+/// every version that image holds — each exactly once, NEWEST FIRST in the `major.minor`
+/// order the versions name, at most `maxResults` per page — and hands back a `nextToken`
+/// only while versions remain.
 #[tokio::test]
 async fn every_held_version_is_served_once_over_every_page_size() {
     let (router, engine) = emulator_with_store();
@@ -240,7 +240,7 @@ async fn every_held_version_is_served_once_over_every_page_size() {
 
     let mut expected: Vec<String> = seeded.iter().map(|v| (*v).to_string()).collect();
     expected.push("1.0".to_string()); // the version the create minted
-    expected.sort_by_key(|version| version_order(version));
+    expected.sort_by_key(|version| ::std::cmp::Reverse(version_order(version)));
     let held = expected.len();
 
     // Rows differ in the identifier form and in the page size: no `maxResults` at all,
@@ -267,8 +267,8 @@ async fn every_held_version_is_served_once_over_every_page_size() {
             .await;
             assert_eq!(
                 seen, expected,
-                "case {case}: expected every held version exactly once in major.minor order, \
-                 got {seen:?}"
+                "case {case}: expected every held version exactly once, newest first, got \
+                 {seen:?}"
             );
         }
     }
