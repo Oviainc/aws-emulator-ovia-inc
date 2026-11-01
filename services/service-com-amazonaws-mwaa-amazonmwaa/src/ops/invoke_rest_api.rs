@@ -18,7 +18,8 @@
 //! collection, and the body carries the entity a write creates or changes. Both documents
 //! are the JSON objects the model documents them as, so one of any other shape names no
 //! parameter and carries no entity, and is refused ([`object_document`]) rather than
-//! dropped.
+//! dropped — each of them on every call, whatever method and path the call addresses,
+//! since both documents belong to the request rather than to the endpoint it reaches.
 //!
 //! ## How an Apache Airflow answer becomes this operation's answer
 //!
@@ -400,6 +401,16 @@ fn serve(environment: &mut EnvironmentRecord, call: &Call<'_>) -> AirflowAnswer 
         Ok(query) => query,
         Err(refusal) => return refusal,
     };
+    // The body is the entity the request carries, and an entity is likewise built from the
+    // NAMED members of an object: a document of any other shape carries no entity at all,
+    // so it is refused in the same place and for the same reason as the query parameters —
+    // before the path is addressed, and for every method, since the body travels with the
+    // request whichever endpoint it is addressed to and whether or not that endpoint reads
+    // one — rather than read as if the caller had carried none.
+    let body = match object_document(call.body, REQUEST_BODY) {
+        Ok(body) => body,
+        Err(refusal) => return refusal,
+    };
     match call.segments.as_slice() {
         ["version"] => match call.method {
             GET => airflow_version(environment),
@@ -407,7 +418,7 @@ fn serve(environment: &mut EnvironmentRecord, call: &Call<'_>) -> AirflowAnswer 
         },
         [VARIABLES] => match call.method {
             GET => list_variables(&environment.airflow, query),
-            POST => set_variable(&mut environment.airflow, call),
+            POST => set_variable(&mut environment.airflow, body),
             _ => method_not_allowed(call),
         },
         // Every segment after `variables` belongs to the KEY, because this collection
@@ -416,14 +427,14 @@ fn serve(environment: &mut EnvironmentRecord, call: &Call<'_>) -> AirflowAnswer 
             let key = entity_key(key);
             match call.method {
                 GET => read_variable(&environment.airflow, &key),
-                PATCH => change_variable(&mut environment.airflow, &key, call),
+                PATCH => change_variable(&mut environment.airflow, &key, body),
                 DELETE => delete_variable(&mut environment.airflow, &key),
                 _ => method_not_allowed(call),
             }
         }
         [POOLS] => match call.method {
             GET => list_pools(&environment.airflow, query),
-            POST => create_pool(&mut environment.airflow, call),
+            POST => create_pool(&mut environment.airflow, body),
             _ => method_not_allowed(call),
         },
         // A pool's name is addressed the same way, and for the same reason.
@@ -431,7 +442,7 @@ fn serve(environment: &mut EnvironmentRecord, call: &Call<'_>) -> AirflowAnswer 
             let name = entity_key(name);
             match call.method {
                 GET => read_pool(&environment.airflow, &name),
-                PATCH => change_pool(&mut environment.airflow, &name, call),
+                PATCH => change_pool(&mut environment.airflow, &name, body),
                 DELETE => delete_pool(&mut environment.airflow, &name),
                 _ => method_not_allowed(call),
             }
@@ -567,8 +578,8 @@ fn list_variables(metadata: &AirflowMetadata, query: Option<&Document>) -> Airfl
 /// `POST /variables`: set the variable the body names, whether or not the key is already
 /// taken — a variable's key is its identity, and this endpoint SETS the value under that
 /// key rather than refusing a key that exists.
-fn set_variable(metadata: &mut AirflowMetadata, call: &Call<'_>) -> AirflowAnswer {
-    let requested = match requested_variable(call.body) {
+fn set_variable(metadata: &mut AirflowMetadata, body: Option<&Document>) -> AirflowAnswer {
+    let requested = match requested_variable(body) {
         Ok(requested) => requested,
         Err(refusal) => return refusal,
     };
@@ -594,8 +605,12 @@ fn read_variable(metadata: &AirflowMetadata, key: &str) -> AirflowAnswer {
 
 /// `PATCH /variables/{key}`: change the variable the path names. A body keyed to a
 /// different variable is refused rather than silently moving the value to another key.
-fn change_variable(metadata: &mut AirflowMetadata, key: &str, call: &Call<'_>) -> AirflowAnswer {
-    let requested = match requested_variable(call.body) {
+fn change_variable(
+    metadata: &mut AirflowMetadata,
+    key: &str,
+    body: Option<&Document>,
+) -> AirflowAnswer {
+    let requested = match requested_variable(body) {
         Ok(requested) => requested,
         Err(refusal) => return refusal,
     };
@@ -632,8 +647,8 @@ fn list_pools(metadata: &AirflowMetadata, query: Option<&Document>) -> AirflowAn
 
 /// `POST /pools`: create the pool the body names. A pool's name is its identity, so a
 /// name already taken is a conflict rather than a replacement.
-fn create_pool(metadata: &mut AirflowMetadata, call: &Call<'_>) -> AirflowAnswer {
-    let requested = match requested_pool(call.body) {
+fn create_pool(metadata: &mut AirflowMetadata, body: Option<&Document>) -> AirflowAnswer {
+    let requested = match requested_pool(body) {
         Ok(requested) => requested,
         Err(refusal) => return refusal,
     };
@@ -661,8 +676,12 @@ fn read_pool(metadata: &AirflowMetadata, name: &str) -> AirflowAnswer {
 
 /// `PATCH /pools/{name}`: change the pool the path names. As for a variable, a body naming
 /// a different pool is refused rather than renaming the one the path addresses.
-fn change_pool(metadata: &mut AirflowMetadata, name: &str, call: &Call<'_>) -> AirflowAnswer {
-    let requested = match requested_pool(call.body) {
+fn change_pool(
+    metadata: &mut AirflowMetadata,
+    name: &str,
+    body: Option<&Document>,
+) -> AirflowAnswer {
+    let requested = match requested_pool(body) {
         Ok(requested) => requested,
         Err(refusal) => return refusal,
     };
@@ -911,8 +930,12 @@ fn object_document<'d>(
 
 /// A write's body as the JSON object every one of these endpoints takes, which — unlike
 /// the query parameters — a write has to carry: a body stating nothing states no entity.
+///
+/// Its SHAPE was already judged for this call, whatever endpoint the call addresses
+/// ([`serve`]), so the body here is that object or nothing at all; what is left for a write
+/// is that it has to be there.
 fn object_body(body: Option<&Document>) -> Result<&Document, AirflowAnswer> {
-    object_document(body, REQUEST_BODY)?.ok_or_else(|| not_an_object(REQUEST_BODY))
+    body.ok_or_else(|| not_an_object(REQUEST_BODY))
 }
 
 /// Why a document this API takes as a JSON object could not be read as one.

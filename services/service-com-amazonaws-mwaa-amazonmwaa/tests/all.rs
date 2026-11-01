@@ -15,6 +15,8 @@
 mod airflow_description_bound_single_rule;
 #[path = "all/airflow_rest_api.rs"]
 mod airflow_rest_api;
+#[path = "all/airflow_rest_api_body_document.rs"]
+mod airflow_rest_api_body_document;
 #[path = "all/airflow_rest_api_entity_keys.rs"]
 mod airflow_rest_api_entity_keys;
 #[path = "all/create_replay_member_comparison.rs"]
