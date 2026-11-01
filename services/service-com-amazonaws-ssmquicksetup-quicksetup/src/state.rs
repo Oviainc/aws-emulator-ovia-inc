@@ -109,6 +109,27 @@ pub fn manager_not_found_message(manager_arn: &str) -> String {
     format!("Quick setup manager with arn: {manager_arn} could not be found.")
 }
 
+/// The sentence this service refuses with when a configuration-definition id a request
+/// supplied names no stored definition in the scope that request addressed it in.
+///
+/// `manager_arn` is the manager the same request named, when it named one: a definition
+/// id means something only against a manager, so a request that scoped its lookup to one
+/// is told which manager holds no such definition, while one that scoped it to nothing
+/// but the Region's endpoint is told only that the id names no definition. The model
+/// declares `ResourceNotFoundException` with a single `Message` member and states no text
+/// for it, so both wordings are this service's own, and both render only the id the
+/// REQUEST carried — nothing is re-derived from stored state. The one place the message
+/// lives, so every operation that addresses a configuration definition by id refuses an
+/// absent one the same way.
+pub fn definition_not_found_message(manager_arn: Option<&str>, id: &str) -> String {
+    match manager_arn {
+        Some(manager_arn) => format!(
+            "configuration manager {manager_arn} holds no configuration definition with ID {id}"
+        ),
+        None => format!("no configuration definition with ID {id} exists"),
+    }
+}
+
 /// Largest page either list operation will build, and the page size applied when the
 /// request names no `MaxItems`: the maximum of that member's modelled `@range(1,
 /// 100)`.
@@ -1365,6 +1386,44 @@ impl ComAmazonawsSsmquicksetupQuicksetupState {
         self.configurations
             .get(id)
             .filter(|configuration| self.serves_configuration(region, configuration))
+    }
+
+    /// The configuration definition `id` names as the endpoint of `region` serves it,
+    /// restricted to the manager `manager_arn` names when a request named one, and
+    /// `None` when that endpoint holds no such definition in that scope.
+    ///
+    /// A definition lives on the manager that declares it, so the manager is part of the
+    /// lookup: an id held by another manager than the one a request named is not the
+    /// definition that request addressed, exactly as an id held by a manager of another
+    /// Region is not one this endpoint holds. A request naming a manager resolves it by
+    /// key and looks no further; one naming none walks the managers this endpoint serves,
+    /// which [`MAX_CONFIGURATION_MANAGERS`] and [`MAX_CONFIGURATION_DEFINITIONS`] already
+    /// bound. The one place that resolution lives, so every operation addressing a
+    /// definition by id resolves it the same way.
+    pub fn definition_in(
+        &self,
+        region: &str,
+        manager_arn: Option<&str>,
+        id: &str,
+    ) -> Option<&ConfigurationDefinitionRecord> {
+        match manager_arn {
+            Some(manager_arn) => self.manager_in(region, manager_arn).and_then(|manager| {
+                manager
+                    .definitions
+                    .iter()
+                    .find(|definition| definition.id == id)
+            }),
+            None => self
+                .managers
+                .values()
+                .filter(|manager| manager.region == region)
+                .find_map(|manager| {
+                    manager
+                        .definitions
+                        .iter()
+                        .find(|definition| definition.id == id)
+                }),
+        }
     }
 
     /// The modelled `ServiceSettings` the endpoint of `region` reports.

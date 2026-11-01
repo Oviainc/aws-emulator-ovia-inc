@@ -327,9 +327,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateConfigurationDefinitionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "configuration manager {} holds no configuration definition with ID {}",
-                            input.manager_arn, input.id
+                        message: Some(crate::state::definition_not_found_message(
+                            Some(&input.manager_arn),
+                            &input.id,
                         )),
                     },
                 )

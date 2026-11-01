@@ -8,6 +8,10 @@
 //! `NextToken` names the configuration the next page starts at and is the empty string
 //! once the listing is exhausted.
 //!
+//! Both of those members ADDRESS a resource, so each is resolved against this
+//! endpoint's state before any page is built and one naming nothing there answers the
+//! modelled `ResourceNotFoundException` rather than an empty page.
+//!
 //! Reporting, not mutating: the only write it makes is materialising the status
 //! changes the clock already owes (see [`crate::state::ComAmazonawsSsmquicksetupQuicksetupState::settle`]).
 //!
@@ -208,6 +212,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(ListConfigurationsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(crate::state::manager_not_found_message(manager_arn)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The same rule for the other resource this request may address: a
+        // configuration-definition id is resolved against the definitions this
+        // endpoint holds — those of the manager the request named, or of every manager
+        // of this Region when it named none — and one that names none of them is
+        // reported as absent too, so "that definition deploys nothing" and "that
+        // definition does not exist" are not one answer. Narrowing by `Filters` is
+        // unaffected: a filter value selects records, it does not address a resource.
+        if let Some(id) = input.configuration_definition_id.as_deref() {
+            if store
+                .definition_in(&region, input.manager_arn.as_deref(), id)
+                .is_none()
+            {
+                return Err(ListConfigurationsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::definition_not_found_message(
+                            input.manager_arn.as_deref(),
+                            id,
+                        )),
                     },
                 )
                 .into());

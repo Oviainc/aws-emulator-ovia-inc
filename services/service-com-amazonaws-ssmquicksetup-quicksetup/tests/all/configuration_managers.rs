@@ -1026,11 +1026,6 @@ async fn the_configuration_listing_reports_one_record_per_deployed_target() {
             vec![(first.clone(), first_ids[1].clone(), local.clone())],
         ),
         (
-            "a definition id that manager does not own",
-            json!({ "ManagerArn": second, "ConfigurationDefinitionId": first_ids[0] }),
-            Vec::new(),
-        ),
-        (
             "a filter on the configuration type",
             json!({ "Filters": [{ "Key": "Type", "Values": ["AWSQuickSetupType-DHMC"] }] }),
             vec![(second.clone(), second_ids[0].clone(), local.clone())],
@@ -1109,18 +1104,30 @@ async fn the_configuration_listing_reports_one_record_per_deployed_target() {
         }
     }
 
-    // A manager that was never created is absent, not an empty page.
-    let (status, answer) =
-        list_configurations(&router, &json!({ "ManagerArn": UNKNOWN_MANAGER_ARN })).await;
-    assert_eq!(
-        status, 404,
-        "an unknown ManagerArn must answer 404, got {status} / {answer:?}"
-    );
-    assert_eq!(
-        error_code(&answer),
-        "ResourceNotFoundException",
-        "expected ResourceNotFoundException, got {answer:?}"
-    );
+    // A resource this endpoint does not hold is absent, not an empty page — for either
+    // identifier this listing accepts, including a definition id held by a manager other
+    // than the one the same request names.
+    for (case, request) in [
+        (
+            "a manager that was never created",
+            json!({ "ManagerArn": UNKNOWN_MANAGER_ARN }),
+        ),
+        (
+            "a definition id that manager does not own",
+            json!({ "ManagerArn": second, "ConfigurationDefinitionId": first_ids[0] }),
+        ),
+    ] {
+        let (status, answer) = list_configurations(&router, &request).await;
+        assert_eq!(
+            status, 404,
+            "case {case}: {request:?} must answer 404, got {status} / {answer:?}"
+        );
+        assert_eq!(
+            error_code(&answer),
+            "ResourceNotFoundException",
+            "case {case}: expected ResourceNotFoundException, got {answer:?}"
+        );
+    }
 }
 
 /// The configuration listing pages the same way the manager listing does.
