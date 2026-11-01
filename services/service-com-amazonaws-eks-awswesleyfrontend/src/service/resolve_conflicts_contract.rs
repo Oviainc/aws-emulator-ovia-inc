@@ -161,10 +161,12 @@ fn read<T: DeserializableStruct>(
 /// The value of `resolveConflicts` when the request carries one the enum does not
 /// declare, or `None` when it carries none or carries a declared one.
 ///
-/// The declared set is the generated `RESOLVE_CONFLICTS_VALUES`, so this layer and
-/// the framework's own walk read the SAME enum the model declares.
+/// The declared set is the generated `RESOLVE_CONFLICTS_VALUES` and the membership
+/// test is the service-wide one ([`super::off_enum_member_contract::off_enum`]), so
+/// this layer, the layer that answers the other members judged this way, and the
+/// framework's own walk all read the SAME enum the model declares.
 fn off_enum(value: Option<&str>) -> Option<&str> {
-    value.filter(|value| !RESOLVE_CONFLICTS_VALUES.contains(value))
+    super::off_enum_member_contract::off_enum(RESOLVE_CONFLICTS_VALUES, value)
 }
 
 /// Whether the framework's own validating walk finds anything wrong with this input

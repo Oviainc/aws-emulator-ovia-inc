@@ -20,7 +20,11 @@
 //!   `InvalidParameterException`, answered BEFORE the cluster is resolved;
 //! * an unknown `clusterName`, and a configuration name the cluster does not carry,
 //!   are each `ResourceNotFoundException` — the same 404
-//!   `DescribeIdentityProviderConfig` gives;
+//!   `DescribeIdentityProviderConfig` gives. This operation addresses the
+//!   configuration the `(cluster, name)` pair names rather than the cluster, so an
+//!   unresolvable cluster is reported WITHOUT being named: the generic sentence and no
+//!   identity member ([`crate::state::resource_not_found`]), the same payload
+//!   `DescribeIdentityProviderConfig` answers for the same pair;
 //! * a cluster `RegisterCluster` connected has no control plane to authenticate
 //!   against, which the connected-cluster gate reports as the `ClientException` this
 //!   operation models, as `AssociateIdentityProviderConfig` does;
@@ -184,10 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         };
+        // The CLUSTER half of an unresolvable request: this operation addresses the
+        // configuration the `(cluster, name)` pair names, not the cluster, so the
+        // cluster is not the resource it reports — the generic sentence and no identity
+        // member, the same payload `DescribeIdentityProviderConfig` answers for the
+        // same pair ([`state::resource_not_found`]). Naming the cluster is for the
+        // operations whose SUBJECT is the cluster ([`state::cluster_not_found`]).
         let not_found = || {
             DisassociateIdentityProviderConfigError::from(
                 DisassociateIdentityProviderConfigErrorModeled::ResourceNotFoundException(
-                    state::cluster_not_found(&input.cluster_name),
+                    state::resource_not_found(),
                 ),
             )
         };

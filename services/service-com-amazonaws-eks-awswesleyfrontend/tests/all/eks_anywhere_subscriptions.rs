@@ -18,7 +18,7 @@ use std::time::Duration;
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
     MAX_SUBSCRIPTION_LICENSE_QUANTITY, MIN_SUBSCRIPTION_LICENSE_QUANTITY,
     SUBSCRIPTION_ACTIVATION_DELAY, SUBSCRIPTION_LICENSE_TYPE_CLUSTER, SUBSCRIPTION_MONTH,
-    SUBSCRIPTION_TERM_DURATIONS, SUBSCRIPTION_TERM_UNIT_MONTHS,
+    SUBSCRIPTION_NOT_FOUND_MESSAGE, SUBSCRIPTION_TERM_DURATIONS, SUBSCRIPTION_TERM_UNIT_MONTHS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -404,7 +404,9 @@ async fn a_name_identifies_one_subscription_and_an_unknown_id_is_not_found() {
         "case duplicate name: expected InvalidParameterException, got {code:?}"
     );
 
-    // An id nothing in this Region carries, in the shapes a client can send.
+    // An id nothing in this Region carries, in the shapes a client can send. The
+    // refusal is worded for the subscription and names nothing the request sent;
+    // `refusal_selection` is the suite that spans that rule.
     for (case, unknown) in [
         ("a well-formed UUID nothing carries", "11111111-2222-4333-8444-555555555555"),
         ("a value that is not a UUID at all", "not-a-subscription"),
@@ -420,9 +422,15 @@ async fn a_name_identifies_one_subscription_and_an_unknown_id_is_not_found() {
             "case {case:?}: expected ResourceNotFoundException, got {code:?}"
         );
         assert_eq!(
+            described.body["message"].as_str(),
+            Some(SUBSCRIPTION_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the subscription's own not-found sentence, got {:?}",
+            described.body["message"]
+        );
+        assert_eq!(
             described.body["subscriptionId"],
-            serde_json::json!(unknown),
-            "case {case:?}: the not-found names the subscription asked for, got {described:?}"
+            serde_json::Value::Null,
+            "case {case:?}: the refusal names no subscription, got {described:?}"
         );
     }
 

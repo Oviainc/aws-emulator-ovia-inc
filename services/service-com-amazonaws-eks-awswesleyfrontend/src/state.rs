@@ -461,6 +461,16 @@ pub const CAPABILITY_TYPE_ACK: &str = "ACK";
 /// See [`CAPABILITY_TYPE_ACK`].
 pub const CAPABILITY_TYPE_ARGOCD: &str = "ARGOCD";
 
+/// The sentence `CreateCapability` refuses a `type` outside the modelled
+/// `CapabilityType` value set with (`crate::ops::types::CAPABILITY_TYPE_VALUES`).
+///
+/// FIXED TEXT in its entirety: it has no variable part and does not echo the value it
+/// rejected, because the request named no capability type at all — there is nothing of
+/// this service to name. The refusal is worded where it has to be decided, before the
+/// cluster the path names is resolved (see
+/// [`crate::service::off_enum_member_contract`]).
+pub const INVALID_CAPABILITY_TYPE_MESSAGE: &str = "Invalid capability type";
+
 /// How long a connected cluster has to apply its connector manifest before the
 /// registration lapses.
 ///
@@ -983,6 +993,31 @@ pub fn child_resource_not_found(message: String) -> ResourceNotFoundException {
 /// cluster carry).
 pub fn addon_not_found() -> ResourceNotFoundException {
     resource_not_found()
+}
+
+/// The sentence an operation addressed to ONE EKS Anywhere subscription refuses an
+/// `id` the Region carries no subscription for with.
+///
+/// A subscription is not a resource inside a cluster, and this service states the
+/// resource it could not resolve in the terms of the resource the operation addresses:
+/// the subscription reads answer their own fixed sentence, which names nothing from
+/// the request (see [`subscription_not_found`]).
+pub const SUBSCRIPTION_NOT_FOUND_MESSAGE: &str = "subscription not found.";
+
+/// The `ResourceNotFoundException` payload an operation addressed to ONE EKS Anywhere
+/// subscription answers for an id the Region carries no subscription for.
+///
+/// NO identity member at all: `ResourceNotFoundException$subscriptionId` names a
+/// subscription the service RESOLVED, and this refusal resolved none — the same half
+/// of the rule [`resource_not_found`] carries for a resource inside a cluster (see
+/// [`cluster_not_found`] for the whole rule). A caller reading that member to learn
+/// whether the service identified a concrete subscription must not find the id it
+/// just sent echoed back there.
+pub fn subscription_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(SUBSCRIPTION_NOT_FOUND_MESSAGE.to_string()),
+        ..Default::default()
+    }
 }
 
 /// The sentence every Amazon EKS-managed-plane operation refuses a cluster this

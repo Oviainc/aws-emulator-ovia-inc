@@ -7,9 +7,10 @@
 //! so a caller reads back exactly what `CreateEksAnywhereSubscription` wrote.
 //!
 //! An id no subscription of this Region carries is `ResourceNotFoundException` (404),
-//! the one not-found this operation models. The read materialises the status moves
-//! the clock already owes the record (its move out of `CREATING`, and `EXPIRED` once
-//! its term has run out) and writes nothing else.
+//! the one not-found this operation models, worded for the resource it addresses
+//! ([`crate::state::subscription_not_found`]) and naming nothing from the request. The
+//! read materialises the status moves the clock already owes the record (its move out
+//! of `CREATING`, and `EXPIRED` once its term has run out) and writes nothing else.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -145,8 +146,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A subscription is addressed by the id the create minted, and it belongs to
         // the Region it was created in, so this is the record of that id in the region
         // the request is signed for. An id this Region does not carry is the 404 this
-        // operation models, carrying the id the request named — the one member of the
-        // payload that identifies a subscription (`ResourceNotFoundException$subscriptionId`).
+        // operation models, worded for the resource it addresses and naming nothing
+        // from the request: the payload's `subscriptionId` names a subscription the
+        // service resolved, and this one resolved none
+        // ([`state::subscription_not_found`]).
         match guard
             .eks_anywhere_subscriptions
             .get(&(region, input.id.clone()))
@@ -156,11 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             None => Err(
                 DescribeEksAnywhereSubscriptionErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        subscription_id: Some(input.id.clone()),
-                        message: Some(state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                        ..Default::default()
-                    },
+                    state::subscription_not_found(),
                 )
                 .into(),
             ),

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What this service answers BEFORE a refusal of the request body: the pass-role
-//! authorization of a role the request hands Amazon EKS, and the resolution of the
-//! cluster the request is addressed to.
+//! authorization of a role the request hands Amazon EKS, the capability type a
+//! `CreateCapability` asks for, and the resolution of the cluster the request is
+//! addressed to.
 //!
 //! Every handler in `crate::ops` already keeps that order — the pass-role question
 //! is decided from the value alone and needs no state, and the `@httpLabel` cluster
@@ -11,7 +12,7 @@
 //! against the operation's generated schema and refuses a modelled constraint
 //! BEFORE `handle` runs (`vendor/smithy-server-runtime/src/operation.rs`), so for a
 //! request that breaks one of those constraints the body refusal reached the caller
-//! first and the two earlier answers were never given. A client keying on the
+//! first and the earlier answers were never given. A client keying on the
 //! missing cluster to create it and retry, or on the pass-role denial to fix its
 //! policy, saw a parameter complaint instead.
 //!
@@ -29,16 +30,25 @@
 //!   with the walk that would otherwise follow it. A request whose body the walk
 //!   accepts is NOT claimed: its handler already answers both questions in the right
 //!   order, and nothing here may change what it reports;
-//! * one of the two earlier answers actually fires — the value names no role this
-//!   caller can pass, or the store holds no such cluster. Otherwise the request falls
+//! * one of the earlier answers actually fires — the value names no role this
+//!   caller can pass, the request asks for a capability type this API does not define,
+//!   or the store holds no such cluster. Otherwise the request falls
 //!   through to the modelled operation, which refuses the body exactly as before.
 //!
-//! The two answers are the service's own modelled shapes, rendered through the same
+//! The answers are the service's own modelled shapes, rendered through the same
 //! protocol call the framework's error tail makes: `AccessDeniedException` (403) for
-//! the pass-role denial and `ResourceNotFoundException` (404) for the missing
-//! cluster. Each claimed operation answers that same shape and status from its own
+//! the pass-role denial, `InvalidParameterException` (400) for the capability type
+//! this API does not define, and `ResourceNotFoundException` (404) for the missing
+//! cluster. Each claimed operation answers those same shapes and statuses from its own
 //! handler, so a refusal worded here and one worded there are indistinguishable on
 //! the wire.
+//!
+//! WHY the capability type is answered here rather than by the handler, and why it
+//! comes before the cluster: see [`crate::service::off_enum_member_contract`], which
+//! states the rule and builds the refusal. `CreateCapability`'s `type` targets an
+//! enum, so the walk refuses an undeclared value before `handle` runs and the handler
+//! never sees it — and the value names no capability type at all, so no cluster could
+//! make the request answerable.
 
 use std::sync::Arc;
 
@@ -55,33 +65,52 @@ use smithy_server_runtime::{
 use crate::ops::types::{
     AccessDeniedException, AssociateIdentityProviderConfigInput, CreateAccessEntryInput,
     CreateAddonInput, CreateCapabilityInput, CreateClusterInput, CreateFargateProfileInput,
-    CreateNodegroupInput, CreatePodIdentityAssociationInput, ListAddonsInput,
-    ListCapabilitiesInput, ListNodegroupsInput, ListUpdatesInput, ResourceNotFoundException,
-    UpdateClusterConfigInput, ASSOCIATE_IDENTITY_PROVIDER_CONFIG_INPUT_SCHEMA,
-    CREATE_ACCESS_ENTRY_INPUT_SCHEMA, CREATE_ADDON_INPUT_SCHEMA, CREATE_CAPABILITY_INPUT_SCHEMA,
-    CREATE_CLUSTER_INPUT_SCHEMA, CREATE_FARGATE_PROFILE_INPUT_SCHEMA,
-    CREATE_NODEGROUP_INPUT_SCHEMA, CREATE_POD_IDENTITY_ASSOCIATION_INPUT_SCHEMA,
-    LIST_ADDONS_INPUT_SCHEMA, LIST_CAPABILITIES_INPUT_SCHEMA, LIST_NODEGROUPS_INPUT_SCHEMA,
-    LIST_UPDATES_INPUT_SCHEMA, SCHEMA_ACCESS_DENIED_EXCEPTION,
+    CreateNodegroupInput, CreatePodIdentityAssociationInput, InvalidParameterException,
+    ListAddonsInput, ListCapabilitiesInput, ListNodegroupsInput, ListUpdatesInput,
+    ResourceNotFoundException, UpdateClusterConfigInput,
+    ASSOCIATE_IDENTITY_PROVIDER_CONFIG_INPUT_SCHEMA, CREATE_ACCESS_ENTRY_INPUT_SCHEMA,
+    CREATE_ADDON_INPUT_SCHEMA, CREATE_CAPABILITY_INPUT_SCHEMA, CREATE_CLUSTER_INPUT_SCHEMA,
+    CREATE_FARGATE_PROFILE_INPUT_SCHEMA, CREATE_NODEGROUP_INPUT_SCHEMA,
+    CREATE_POD_IDENTITY_ASSOCIATION_INPUT_SCHEMA, LIST_ADDONS_INPUT_SCHEMA,
+    LIST_CAPABILITIES_INPUT_SCHEMA, LIST_NODEGROUPS_INPUT_SCHEMA, LIST_UPDATES_INPUT_SCHEMA,
+    SCHEMA_ACCESS_DENIED_EXCEPTION, SCHEMA_INVALID_PARAMETER_EXCEPTION,
     SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION, UPDATE_CLUSTER_CONFIG_INPUT_SCHEMA,
 };
+
+use super::off_enum_member_contract::undefined_capability_type;
 
 /// The error code a request that may not pass the role it names is refused with.
 const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
 /// The error code a request addressed to a cluster that does not exist is refused
 /// with.
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+/// The error code a request naming a value this API does not define is refused with.
+const INVALID_PARAMETER_EXCEPTION: &str = "InvalidParameterException";
 
-/// What the operation a claimed request was sent to answers before it judges the
-/// body: the roles the request asks Amazon EKS to pass, in the order its handler
-/// judges them, and the cluster it is addressed to.
+/// What the operation a claimed request was sent to answers before it judges the rest
+/// of the body: the roles the request asks Amazon EKS to pass, in the order its
+/// handler judges them, a member whose value this API does not define, and the cluster
+/// it is addressed to.
 ///
-/// Both are read from the request the dispatch sequence would have handed the
+/// All of them are read from the request the dispatch sequence would have handed the
 /// handler, so this layer reads exactly the values the handler would.
 #[derive(Debug, Default)]
 pub struct Addressed {
     passed_roles: Vec<String>,
+    /// The refusal a member whose value this API does not define earns, when the
+    /// request carries one: a question about the request alone, so it is answered
+    /// before the cluster is resolved (see
+    /// [`crate::service::off_enum_member_contract`]).
+    undefined_value: Option<InvalidParameterException>,
     cluster: Option<String>,
+}
+
+impl Addressed {
+    /// The same request, carrying the refusal its undefined value earns.
+    fn with_undefined_value(mut self, refusal: Option<InvalidParameterException>) -> Self {
+        self.undefined_value = refusal;
+        self
+    }
 }
 
 /// One answer this layer gives, as the shape and status the service models for it.
@@ -89,6 +118,9 @@ pub struct Addressed {
 enum Answer {
     /// The value names no role this caller may have Amazon EKS assume.
     PassRoleDenied(AccessDeniedException),
+    /// A member of the request carries a value this API does not define, so it names
+    /// nothing for any cluster to hold.
+    ValueNotDefined(InvalidParameterException),
     /// The cluster the request is addressed to does not exist.
     ClusterMissing(ResourceNotFoundException),
 }
@@ -97,6 +129,7 @@ impl OperationError for Answer {
     fn as_serializable(&self) -> &dyn SerializableStruct {
         match self {
             Self::PassRoleDenied(exception) => exception,
+            Self::ValueNotDefined(exception) => exception,
             Self::ClusterMissing(exception) => exception,
         }
     }
@@ -104,6 +137,7 @@ impl OperationError for Answer {
     fn variant_schema(&self) -> &'static Schema {
         match self {
             Self::PassRoleDenied(_) => &SCHEMA_ACCESS_DENIED_EXCEPTION,
+            Self::ValueNotDefined(_) => &SCHEMA_INVALID_PARAMETER_EXCEPTION,
             Self::ClusterMissing(_) => &SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
         }
     }
@@ -111,16 +145,20 @@ impl OperationError for Answer {
     fn shape_name(&self) -> &'static str {
         match self {
             Self::PassRoleDenied(_) => ACCESS_DENIED_EXCEPTION,
+            Self::ValueNotDefined(_) => INVALID_PARAMETER_EXCEPTION,
             Self::ClusterMissing(_) => RESOURCE_NOT_FOUND_EXCEPTION,
         }
     }
 
-    /// The statuses the model pins on the two shapes: `@httpError 403` on
-    /// `AccessDeniedException` and `@httpError 404` on `ResourceNotFoundException`
-    /// (`smithy_query(query="operation",operation="UpdateCapability",…)` reports both).
+    /// The statuses the model pins on the three shapes: `@httpError 403` on
+    /// `AccessDeniedException`, `@httpError 400` on `InvalidParameterException` and
+    /// `@httpError 404` on `ResourceNotFoundException`
+    /// (`smithy_query(query="operation",operation="CreateCapability",…)` reports all
+    /// three).
     fn http_status(&self) -> u16 {
         match self {
             Self::PassRoleDenied(_) => 403,
+            Self::ValueNotDefined(_) => 400,
             Self::ClusterMissing(_) => 404,
         }
     }
@@ -136,6 +174,7 @@ impl std::fmt::Display for Answer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PassRoleDenied(exception) => write!(f, "{exception}"),
+            Self::ValueNotDefined(exception) => write!(f, "{exception}"),
             Self::ClusterMissing(exception) => write!(f, "{exception}"),
         }
     }
@@ -155,6 +194,7 @@ impl Answer {
         let code = self.shape_name().to_string();
         let message = match &self {
             Self::PassRoleDenied(exception) => exception.message.clone(),
+            Self::ValueNotDefined(exception) => exception.message.clone(),
             Self::ClusterMissing(exception) => exception.message.clone(),
         }
         .unwrap_or_default();
@@ -216,15 +256,15 @@ fn addressed_with<T: DeserializableStruct + SerializableStruct>(
 fn passes_roles(roles: Vec<String>) -> Addressed {
     Addressed {
         passed_roles: roles,
-        cluster: None,
+        ..Default::default()
     }
 }
 
 /// The cluster the request is addressed to, and no role to authorize.
 fn addresses_cluster(cluster: &str) -> Addressed {
     Addressed {
-        passed_roles: Vec::new(),
         cluster: Some(cluster.to_string()),
+        ..Default::default()
     }
 }
 
@@ -234,6 +274,7 @@ fn passes_roles_and_addresses_cluster(roles: Vec<String>, cluster: &str) -> Addr
     Addressed {
         passed_roles: roles,
         cluster: Some(cluster.to_string()),
+        ..Default::default()
     }
 }
 
@@ -284,6 +325,10 @@ fn addressed(
                 )
             },
         ),
+        // `type` says WHICH capability to create, and a value outside the modelled
+        // `CapabilityType` names none at all, so it is answered after the pass-role
+        // authorization and before the cluster — the one question of this body that
+        // needs neither the cluster nor another service to decide.
         "CreateCapability" => addressed_with(
             protocol,
             CREATE_CAPABILITY_INPUT_SCHEMA,
@@ -293,6 +338,7 @@ fn addressed(
                     vec![input.role_arn.clone()],
                     &input.cluster_name,
                 )
+                .with_undefined_value(undefined_capability_type(&input.r#type))
             },
         ),
         "CreateFargateProfile" => addressed_with(
@@ -404,8 +450,8 @@ impl<Eng: Send + Sync + 'static> std::fmt::Debug for PrecedenceFirst<Eng> {
 }
 
 impl<Eng: Send + Sync + 'static> PrecedenceFirst<Eng> {
-    /// The answer this layer owes `addressed`, or `None` when neither check fires and
-    /// the modelled operation should serve the request after all.
+    /// The answer this layer owes `addressed`, or `None` when none of the checks fires
+    /// and the modelled operation should serve the request after all.
     fn answer(
         &self,
         addressed: &Addressed,
@@ -419,6 +465,13 @@ impl<Eng: Send + Sync + 'static> PrecedenceFirst<Eng> {
                     message: Some(why),
                 }));
             }
+        }
+        // THE VALUE THIS API DOES NOT DEFINE NEXT: it is decided from the request
+        // alone, like the authorization above, and it names nothing any cluster could
+        // hold, so no resolution can precede it (see
+        // [`crate::service::off_enum_member_contract`]).
+        if let Some(exception) = addressed.undefined_value.clone() {
+            return Some(Answer::ValueNotDefined(exception));
         }
         // THE CLUSTER NEXT. A cluster name identifies a cluster only within one
         // region, so it is resolved in the region the request is signed for — the same

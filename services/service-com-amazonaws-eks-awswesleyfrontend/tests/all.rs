@@ -111,6 +111,8 @@ mod pass_role_authorization;
 mod peer_resolution_is_grounded;
 #[path = "all/pod_identity_associations.rs"]
 mod pod_identity_associations;
+#[path = "all/refusal_selection.rs"]
+mod refusal_selection;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_contract.rs"]

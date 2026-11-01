@@ -34,9 +34,16 @@
 //! ORDER: `clusterName` is this operation's `@httpLabel`, so the cluster it names is
 //! resolved BEFORE any member of the body is judged and before `roleArn` is resolved
 //! against IAM. A create against a cluster that does not exist therefore reports the
-//! missing cluster (404), never a complaint about a sibling member; only the pass-role
-//! authorization (403), which is decided from the value alone and names no resource of
-//! this service, precedes it.
+//! missing cluster (404), never a complaint about a sibling member. Only the two
+//! questions that need no resource of this service at all precede it: the pass-role
+//! authorization (403), decided from the value alone, and WHICH capability the request
+//! asks for — a `type` outside the modelled `CapabilityType` names no capability type,
+//! so it is `InvalidParameterException` (400) whatever cluster the path names
+//! ([`crate::state::INVALID_CAPABILITY_TYPE_MESSAGE`]). Both are answered before this
+//! handler runs, because an off-enum `type` never reaches it: the framework's
+//! validating walk refuses the value first, so the service words the refusal in the
+//! one seam ahead of dispatch (`crate::service::off_enum_member_contract`, answered by
+//! `crate::service::precedence`).
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -334,7 +341,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // It is resolved before the body is validated and before `roleArn` is resolved
         // against IAM, so a create against a cluster that does not exist reports the
         // MISSING CLUSTER rather than a complaint about a sibling member: the caller's
-        // recovery is to create the parent and retry.
+        // recovery is to create the parent and retry. The ONE member judged ahead of it
+        // is `type`, which names no capability type of this API at all and so is
+        // answered before dispatch (see the ORDER note in this module's header).
         //
         // The lock is taken for the resolution alone and released again, because the IAM
         // call below is an `await` and this store's guard is not held across one.
