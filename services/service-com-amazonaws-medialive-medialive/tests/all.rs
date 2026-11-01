@@ -323,6 +323,9 @@ mod node_creation_cluster_phase;
 #[path = "all/node_deletion_idle_precondition.rs"]
 mod node_deletion_idle_precondition;
 
+#[path = "all/node_idempotency_after_deregistration.rs"]
+mod node_idempotency_after_deregistration;
+
 #[path = "all/node_lifecycle.rs"]
 mod node_lifecycle;
 
