@@ -5296,8 +5296,18 @@ pub fn to_wire_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 }
 
 /// `at` as the RFC 3339 instant the `time` field of an event envelope carries.
+///
+/// The envelope's `time` is an instant at WHOLE-SECOND precision closed by `Z`
+/// (`2026-01-01T00:00:00Z`): every event AWS delivers carries it in that one form,
+/// which is why a consumer reads it with that one format. A server clock reading is
+/// finer than that, so the sub-second remainder is DROPPED before the instant is
+/// formatted — the field names the second the event was published in, and a
+/// fractional part no delivered envelope carries is not written into it.
 pub fn to_event_time(at: SystemTime) -> String {
-    to_wire_timestamp(at)
+    // Truncating the instant, rather than trimming the text, is what keeps the form
+    // the same for every reading: a clock reading whose remainder happens to be zero
+    // formats identically to one whose does not.
+    ::aws_smithy_types::DateTime::from_secs(to_wire_timestamp(at).secs())
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_default()
 }

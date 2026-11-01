@@ -58,19 +58,24 @@ const REFUSAL_ERROR: &str = "StepFunctions.AWSStepFunctionsException";
 
 /// The fragments the cause of that refusal carries: the code the answer came back
 /// under, and the resource the call was refused ON.
-const REFUSAL_CODE: &str = "Error Code: AccessDeniedException";
+pub(crate) const REFUSAL_CODE: &str = "Error Code: AccessDeniedException";
 
 /// A child definition that finishes at once.
 const CHILD: &str = r#"{"StartAt":"Done","States":{"Done":{"Type":"Pass","End":true}}}"#;
 
 /// Step Functions and IAM over ONE engine, so a state machine's execution role is the
 /// role IAM's own handlers hold.
-struct Chain {
+///
+/// `pub(crate)` because `tests/all/task_target_authorization.rs` holds the same rule over
+/// the other integrations and drives it through this same pair of services: `tests/all.rs`
+/// is one crate root, so the wiring, the two wire protocols and the trust policy are
+/// stated here once.
+pub(crate) struct Chain {
     router: MultiServiceRouter,
 }
 
 impl Chain {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -82,7 +87,7 @@ impl Chain {
     }
 
     /// Call one Step Functions operation, requiring a 200.
-    async fn sfn(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn sfn(&self, operation: &str, body: &Value) -> Value {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential={ACCOUNT_KEY}/20260101/{REGION}/states/aws4_request, \
              SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
@@ -110,7 +115,7 @@ impl Chain {
     }
 
     /// One awsQuery call to IAM, signed with the same credential.
-    async fn iam(&self, action: &str, params: &[(&str, String)]) -> String {
+    pub(crate) async fn iam(&self, action: &str, params: &[(&str, String)]) -> String {
         let mut body = format!("Action={action}&Version=2010-05-08");
         for (name, value) in params {
             body.push('&');
@@ -143,7 +148,7 @@ impl Chain {
     }
 
     /// An IAM role carrying `policy` as its inline policy, by its own ARN.
-    async fn role(&self, name: &str, policy: &Value) -> String {
+    pub(crate) async fn role(&self, name: &str, policy: &Value) -> String {
         let created = self
             .iam(
                 "CreateRole",
@@ -168,7 +173,7 @@ impl Chain {
     }
 
     /// Create a state machine under `role_arn` and return its ARN.
-    async fn machine(&self, name: &str, definition: &str, role_arn: &str) -> String {
+    pub(crate) async fn machine(&self, name: &str, definition: &str, role_arn: &str) -> String {
         let created = self
             .sfn(
                 "CreateStateMachine",
@@ -179,7 +184,7 @@ impl Chain {
     }
 
     /// Start one execution and report it once it has left `RUNNING`.
-    async fn ran(&self, machine_arn: &str, name: &str, case: &str) -> (String, Value) {
+    pub(crate) async fn ran(&self, machine_arn: &str, name: &str, case: &str) -> (String, Value) {
         let started = self
             .sfn(
                 "StartExecution",
@@ -207,7 +212,7 @@ impl Chain {
     }
 
     /// The events of one execution's history.
-    async fn history(&self, execution_arn: &str) -> Vec<Value> {
+    pub(crate) async fn history(&self, execution_arn: &str) -> Vec<Value> {
         let answered = self
             .sfn(
                 "GetExecutionHistory",
@@ -238,7 +243,7 @@ impl Chain {
 
 /// The trust document a Step Functions execution role carries, which is what lets this
 /// service act as it.
-fn trust_document() -> Value {
+pub(crate) fn trust_document() -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{

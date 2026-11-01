@@ -546,6 +546,11 @@ mod glue_jobs_are_regional_while_their_role_is_global;
 // both of those are where every concurrently landing suite puts its line.
 #[path = "all/sfn_glue_run_a_job_sync.rs"]
 mod sfn_glue_run_a_job_sync;
+// Declared beside the other Step Functions suite, for the reason the lines below give:
+// the head and the tail of this file are where every concurrently landing suite puts its
+// line, so a declaration there conflicts with all of them.
+#[path = "all/sfn_task_target_authorization.rs"]
+mod sfn_task_target_authorization;
 // Declared HERE, in the sorted list at its own name, rather than at the head or the tail
 // of this file: both of those are where every concurrently landing suite puts its line, so
 // a declaration there conflicts with all of them, while these neighbouring lines are

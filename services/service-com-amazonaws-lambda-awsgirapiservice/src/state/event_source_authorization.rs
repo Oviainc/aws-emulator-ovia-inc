@@ -93,7 +93,8 @@ enum Refusal {
         tail: &'static str,
     },
     /// A QUEUE, whose reads are each a call of the queue's own API: one sentence naming the
-    /// call the role may not make, and the service it would have been made to.
+    /// call the role may not make, and the service it would have been made to. The role is
+    /// named as the FUNCTION's execution role, which is whose grant is short.
     Call {
         /// How that sentence names the service.
         service: &'static str,
@@ -279,6 +280,11 @@ impl EventSourceAccess {
 
     /// The sentence Lambda refuses the mapping with, for an event source whose read
     /// `withheld` names is one the role may not make.
+    ///
+    /// A QUEUE's sentence names the role as the FUNCTION's execution role — "The function
+    /// execution role does not have permissions to call ReceiveMessage on SQS" — which is
+    /// how the service worded this refusal when it was observed. Only the CALL and the
+    /// service it would have been made to vary with the request; the rest is fixed text.
     fn message(&self, event_source_arn: &str, withheld: &str) -> String {
         match self.refusal {
             Refusal::Shards { noun, tail } => format!(
@@ -287,7 +293,7 @@ impl EventSourceAccess {
                 actions = self.action_list()
             ),
             Refusal::Call { service } => format!(
-                "The provided execution role does not have permissions to call {withheld} on \
+                "The function execution role does not have permissions to call {withheld} on \
                  {service}"
             ),
         }

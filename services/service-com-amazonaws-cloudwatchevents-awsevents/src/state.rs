@@ -576,8 +576,13 @@ pub fn to_system_time(stamp: ::aws_smithy_types::DateTime) -> SystemTime {
 
 /// `time` as the RFC3339 stamp the event document's `time` field carries
 /// (`EventTime` is "per RFC3339").
+///
+/// It is an instant at WHOLE-SECOND precision closed by `Z`
+/// (`2026-01-01T00:00:00Z`), which is the one form every event AWS delivers carries
+/// it in — so a server clock reading, which is finer, has its sub-second remainder
+/// dropped before the instant is formatted rather than written into the field.
 pub fn rfc3339(time: SystemTime) -> String {
-    ::aws_smithy_types::DateTime::from(time)
+    ::aws_smithy_types::DateTime::from_secs(::aws_smithy_types::DateTime::from(time).secs())
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_default()
 }

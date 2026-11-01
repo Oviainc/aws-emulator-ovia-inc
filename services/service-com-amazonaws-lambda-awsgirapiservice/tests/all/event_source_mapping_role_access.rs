@@ -286,7 +286,7 @@ pub(crate) fn stream_refusal(event_source_arn: &str, actions: &[&str], tail: &st
 
 /// How it words the refusal of a role that may not make one call on a QUEUE.
 fn queue_refusal(action: &str) -> String {
-    format!("The provided execution role does not have permissions to call {action} on SQS")
+    format!("The function execution role does not have permissions to call {action} on SQS")
 }
 
 /// A statement allowing `actions` of `namespace` on `resource`.

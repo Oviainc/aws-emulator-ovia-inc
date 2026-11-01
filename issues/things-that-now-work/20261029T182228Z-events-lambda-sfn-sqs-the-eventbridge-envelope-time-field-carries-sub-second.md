@@ -17,6 +17,32 @@ Issue-Commit: b1cd28f1ca277d6a032df605f83af5017e934043
 
 > _Note: this issue was identified against the code base at commit `b1cd28f1ca277d6a032df605f83af5017e934043`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+Causes 1, 4 and 5 are FIXED, and their four replay keys pass: the EventBridge event envelope's `time` is
+written as an ISO-8601 instant at whole-second precision closed by `Z` in both events crates' envelope
+serializers; Lambda words the refusal of an event source mapping whose function execution role cannot
+receive from the source queue as the service words that error class; and a `Task` state's integration call is
+authorized against the state machine's execution role over the integration's own published IAM action and the
+ARN of the resource its request addresses, with the optimized `lambda:invoke` integration now a call this
+emulator makes through Lambda's own REST binding — so a denied call fails the task with the invoked service's
+access-denied refusal instead of `States.Runtime`.
+
+Causes 2 and 3 are NOT fixed and are NOT closed: both need the invoked function's deployment package to RUN,
+and this emulator has no in-process runtime for one — `Invoke` answers 501 for a `RequestResponse` invocation
+(`services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/invoke.rs`), the recorded functions of these
+checks are `python3.12` packages, and the platform provides no Python execution engine. Everything around that
+gap is already in place and is not the defect: EventBridge invokes a Lambda target per matching rule inside
+its fan-out loop (`put_events.rs`, `TargetKind::Function`), and the event source mapping poller already polls
+its queue, filters, invokes and deletes on success only (`src/state/sqs_poller.rs`) — each meets that same 501.
+Their five replay keys
+(`eventbridge-to-lambda-invokes-with-resource-policy`, `eventbridge-to-lambda-blocked-without-resource-policy`,
+`eventbridge-fanout-lambda-sqs-sfn`, `sqs-to-lambda-esm-preserves-attributes`,
+`sqs-to-lambda-esm-handler-error-returns-message`) therefore still fail, and the defect behind them is the one
+described by the open report that owns it,
+`issues/things-that-do-not-work/20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md`.
+No refusal was re-worded to make either cause look served.
+
 ## Operation
 PutEvents
 

@@ -24,12 +24,14 @@
 //! name the AWS SDKs give it in the second ([`Api::sdk_token`]) — and one of that
 //! service's API operations by its name in lowerCamel. The call is made when that
 //! service has an
-//! [`APIS`] entry — the services whose protocol carries the request as ONE JSON
-//! document, the `awsJson1_0` and `awsJson1_1` protocols, whose body IS the
-//! operation's input document, which is exactly what a payload template builds. One
-//! entry per service, and EVERY operation of a listed service is reachable through
-//! it: the operation name is derived from the action, so nothing here is written per
-//! action.
+//! [`APIS`] entry, which carries how a request to it is bound to HTTP ([`Wire`]).
+//! For an `awsJson1_0` or `awsJson1_1` service the request BODY is the operation's
+//! input document, which is exactly what a payload template builds, so one entry
+//! covers every operation that service models: the operation name is derived from the
+//! action, and nothing is written per action. A `restJson1` service spreads an
+//! operation's input over the path, the query, the headers and one payload member, so
+//! its entry carries those bindings per operation ([`Rest`]) and a call is made only
+//! for an operation whose bindings are stated.
 //!
 //! The parameters of a `Task` state's integration are written in the integration's
 //! own convention, PascalCase, whatever the invoked API spells its own members in,
@@ -49,10 +51,11 @@
 //! [`super::asl::RUNTIME_ERROR`] and a cause saying what was not run:
 //!
 //! * a service with no entry — one whose protocol binds its request to a shape the
-//!   state's document is not (`awsQuery`'s form fields, a REST method and path with
-//!   the payload at one member), since handing such a service a JSON document would
-//!   not be its request, and equally one whose wire facts simply are not listed here
-//!   yet;
+//!   state's document is not (`awsQuery`'s form fields), since handing such a service
+//!   a JSON document would not be its request, and equally one whose wire facts
+//!   simply are not listed here yet;
+//! * an operation of a REST service whose own bindings are not carried, since where
+//!   each of its members goes on the wire is that operation's own fact;
 //! * the `.waitForTaskToken` integration pattern, which needs a later
 //!   `SendTaskSuccess` from outside the execution;
 //! * a run-a-job (`.sync`) pattern over an integration that is not in the
@@ -185,6 +188,13 @@ pub const MAX_CALL_DURATION: Duration = super::asl::MAX_INTERPRET_DURATION;
 /// `Resource` names Step Functions' own integration, not the target resource.
 const STATES_NAMESPACE: &str = "states";
 
+/// The ARN namespace of AWS Lambda, whose functions a `Task` state invokes
+/// (`awsService.arnNamespace`).
+const LAMBDA_NAMESPACE: &str = "lambda";
+
+/// The ARN namespace of Amazon SQS, whose queues a `Task` state sends to.
+const SQS_NAMESPACE: &str = "sqs";
+
 /// The `Resource` segment that selects the AWS SDK integration family
 /// (`arn:aws:states:::aws-sdk:<service>:<action>`).
 const AWS_SDK_SEGMENT: &str = "aws-sdk";
@@ -227,12 +237,9 @@ pub struct Api {
     pub signing_name: &'static str,
     /// The leading label of its endpoint host (`awsService.endpointPrefix`).
     pub endpoint_prefix: &'static str,
-    /// The `X-Amz-Target` prefix a client names an operation of this service under:
-    /// the service shape's own name, as the model spells it.
-    pub target_prefix: &'static str,
-    /// The AWS JSON protocol version its model declares (`awsJson1_0` -> `1.0`),
-    /// which names the media type of the request body.
-    pub json_version: &'static str,
+    /// How a request to it is bound to HTTP, which its model's protocol decides
+    /// ([`Wire`]).
+    pub wire: Wire,
     /// Its SDK id (`awsService.sdkId`), which names the service half of a task
     /// error ([`Failed::error`]) and — lower-cased — the token an AWS SDK
     /// integration's `Resource` names this service by ([`Api::sdk_token`]).
@@ -249,9 +256,25 @@ impl Api {
         format!("{}.{region}.amazonaws.com", self.endpoint_prefix)
     }
 
-    /// The media type this service's protocol version names.
+    /// The media type this service's protocol names for a request body.
     fn content_type(&self) -> String {
-        format!("application/x-amz-json-{}", self.json_version)
+        match self.wire {
+            Wire::Json { version, .. } => format!("application/x-amz-json-{version}"),
+            // `restJson1` carries a request body as plain JSON; a payload member that
+            // is a blob is the bytes themselves, which is what the one REST operation
+            // bound here sends.
+            Wire::Rest(_) => REST_CONTENT_TYPE.to_string(),
+        }
+    }
+
+    /// The REST binding of `operation`, for a service whose requests are bound that
+    /// way; `None` for an AWS JSON service, whose every operation takes the same
+    /// request shape, and for an operation of a REST service no binding is stated for.
+    fn rest(&self, operation: &str) -> Option<&'static Rest> {
+        match self.wire {
+            Wire::Json { .. } => None,
+            Wire::Rest(bound) => bound.iter().find(|rest| rest.operation == operation),
+        }
     }
 
     /// The token an AWS SDK integration's `Resource`
@@ -271,7 +294,98 @@ impl Api {
     }
 }
 
-/// How one service's model spells the members of an operation's input.
+/// How a request to one service is bound to HTTP, which is what its model's protocol
+/// decides.
+///
+/// A `Task` state's integration parameters are the invoked operation's INPUT, and the
+/// protocol says where that input goes on the wire: an AWS JSON protocol carries the
+/// whole of it as the request body, while a REST protocol spreads it over the path,
+/// the query, the headers and one payload member — so the binding is read per
+/// operation for such a service ([`Rest`]).
+#[derive(Debug)]
+pub enum Wire {
+    /// `awsJson1_0` or `awsJson1_1`: the request body IS the operation's input
+    /// document, and the operation is named in a header.
+    Json {
+        /// The `X-Amz-Target` prefix a client names an operation of this service
+        /// under: the service shape's own name, as the model spells it.
+        target_prefix: &'static str,
+        /// The protocol version its model declares (`awsJson1_0` -> `1.0`), which
+        /// names the media type of the request body.
+        version: &'static str,
+    },
+    /// `restJson1`: each operation binds its input members to a method, a URI, the
+    /// query, headers and one payload, so a call is made only for an operation whose
+    /// bindings are stated here.
+    Rest(&'static [Rest]),
+}
+
+/// The media type a `restJson1` request and the body of its answer carry.
+const REST_CONTENT_TYPE: &str = "application/json";
+
+/// How ONE operation of a REST service binds its input and output members to HTTP.
+///
+/// Every field is read from that operation's own
+/// `smithy_query(query="operation")` — `http`, `httpLabel`, `httpQuery`,
+/// `httpHeader`, `httpPayload` and `httpResponseCode` — so this table states no wire
+/// detail of its own. An operation with no entry is one no call is made for, which
+/// [`read`] says rather than sending a request its protocol does not describe.
+#[derive(Debug)]
+pub struct Rest {
+    /// The operation this binds, as its model spells it.
+    pub operation: &'static str,
+    /// Its request method (`http.method`).
+    pub method: &'static str,
+    /// Its request URI (`http.uri`), in which `{<member>}` is an `httpLabel` member
+    /// standing for the value the request names it with.
+    pub uri: &'static str,
+    /// The member the request carries as its BODY (`httpPayload`).
+    pub payload: &'static str,
+    /// The members the request carries as HEADERS (`httpHeader`), each with the field
+    /// name it goes under.
+    pub headers: &'static [(&'static str, &'static str)],
+    /// The members the request carries in the QUERY string (`httpQuery`), each with
+    /// the parameter name it goes under.
+    pub query: &'static [(&'static str, &'static str)],
+    /// The output member the answer's BODY is (`httpPayload`).
+    pub response_payload: &'static str,
+    /// The output member the answer's STATUS is (`httpResponseCode`).
+    pub response_status: &'static str,
+    /// The output members the answer carries as HEADERS, each with the field name it
+    /// is read from.
+    pub response_headers: &'static [(&'static str, &'static str)],
+}
+
+/// The REST bindings of the Lambda operations a `Task` state's integration calls.
+///
+/// `smithy_query(query="operation",operation="Invoke",model_path="services/
+/// service-com-amazonaws-lambda-awsgirapiservice/smithy-model/
+/// com-amazonaws-lambda-awsgirapiservice.json")`: `http` POST
+/// `/2015-03-31/functions/{FunctionName}/invocations`, `FunctionName` an `httpLabel`,
+/// `Payload` the `httpPayload`, `InvocationType`, `LogType` and `ClientContext`
+/// `httpHeader`s, `Qualifier` an `httpQuery`; the output's `StatusCode` is its
+/// `httpResponseCode`, `Payload` its `httpPayload`, and `ExecutedVersion`,
+/// `FunctionError` and `LogResult` its headers.
+const LAMBDA_REST: &[Rest] = &[Rest {
+    operation: "Invoke",
+    method: "POST",
+    uri: "/2015-03-31/functions/{FunctionName}/invocations",
+    payload: "Payload",
+    headers: &[
+        ("InvocationType", "x-amz-invocation-type"),
+        ("LogType", "x-amz-log-type"),
+        ("ClientContext", "x-amz-client-context"),
+    ],
+    query: &[("Qualifier", "Qualifier")],
+    response_payload: "Payload",
+    response_status: "StatusCode",
+    response_headers: &[
+        ("ExecutedVersion", "x-amz-executed-version"),
+        ("FunctionError", "x-amz-function-error"),
+        ("LogResult", "x-amz-log-result"),
+    ],
+}];
+
 ///
 /// A `Task` state's integration parameters are written in PascalCase whatever the
 /// invoked API spells its own members in — `StateMachineArn` for a nested execution
@@ -300,12 +414,15 @@ impl MemberCase {
     }
 }
 
-/// The services a `Task` state's integration call is made to: those whose protocol
-/// carries the request as one JSON document, so the document the state built IS the
-/// operation's input.
+/// The services a `Task` state's integration call is made to, and how a request to
+/// each is bound to HTTP ([`Wire`]) — so the document the state built IS the
+/// operation's input, wherever that protocol puts it.
 ///
-/// One entry per SERVICE, never per action: the action of a `Resource` names the
-/// operation, so every operation each of these services models is reachable.
+/// One entry per SERVICE, never per action: for an AWS JSON service the action of a
+/// `Resource` names the operation, so every operation it models is reachable. A REST
+/// service binds each operation's members to the path, the query, the headers and one
+/// payload separately, so its entry lists the operations whose bindings are stated and
+/// [`read`] makes no call for any other.
 ///
 /// It is a LIST rather than a rule because each entry's wire facts are that
 /// service's own model's, which this crate cannot read; a service whose model is
@@ -319,8 +436,10 @@ pub const APIS: &[Api] = &[
         namespace: "athena",
         signing_name: "athena",
         endpoint_prefix: "athena",
-        target_prefix: "AmazonAthena",
-        json_version: "1.1",
+        wire: Wire::Json {
+            target_prefix: "AmazonAthena",
+            version: "1.1",
+        },
         sdk_id: "Athena",
         // `StartQueryExecution`'s input: `QueryString`, `WorkGroup`.
         member_case: MemberCase::Pascal,
@@ -333,8 +452,10 @@ pub const APIS: &[Api] = &[
         namespace: "dynamodb",
         signing_name: "dynamodb",
         endpoint_prefix: "dynamodb",
-        target_prefix: "DynamoDB_20120810",
-        json_version: "1.0",
+        wire: Wire::Json {
+            target_prefix: "DynamoDB_20120810",
+            version: "1.0",
+        },
         sdk_id: "DynamoDB",
         // `PutItem`'s input: `TableName`, `Item`.
         member_case: MemberCase::Pascal,
@@ -346,8 +467,10 @@ pub const APIS: &[Api] = &[
         namespace: "sqs",
         signing_name: "sqs",
         endpoint_prefix: "sqs",
-        target_prefix: "AmazonSQS",
-        json_version: "1.0",
+        wire: Wire::Json {
+            target_prefix: "AmazonSQS",
+            version: "1.0",
+        },
         sdk_id: "SQS",
         // `SendMessage`'s input: `QueueUrl`, `MessageBody`.
         member_case: MemberCase::Pascal,
@@ -359,8 +482,10 @@ pub const APIS: &[Api] = &[
         namespace: "events",
         signing_name: "events",
         endpoint_prefix: "events",
-        target_prefix: "AWSEvents",
-        json_version: "1.1",
+        wire: Wire::Json {
+            target_prefix: "AWSEvents",
+            version: "1.1",
+        },
         sdk_id: "EventBridge",
         // `PutEvents`' input: `Entries`, `EndpointId`.
         member_case: MemberCase::Pascal,
@@ -373,8 +498,10 @@ pub const APIS: &[Api] = &[
         namespace: STATES_NAMESPACE,
         signing_name: STATES_NAMESPACE,
         endpoint_prefix: STATES_NAMESPACE,
-        target_prefix: "AWSStepFunctions",
-        json_version: "1.0",
+        wire: Wire::Json {
+            target_prefix: "AWSStepFunctions",
+            version: "1.0",
+        },
         sdk_id: "SFN",
         // `StartExecution`'s input: `stateMachineArn`, `name`, `input`.
         member_case: MemberCase::LowerCamel,
@@ -387,8 +514,10 @@ pub const APIS: &[Api] = &[
         namespace: "kinesis",
         signing_name: "kinesis",
         endpoint_prefix: "kinesis",
-        target_prefix: "Kinesis_20131202",
-        json_version: "1.1",
+        wire: Wire::Json {
+            target_prefix: "Kinesis_20131202",
+            version: "1.1",
+        },
         sdk_id: "Kinesis",
         // `PutRecord`'s input: `StreamName`, `Data`, `PartitionKey`.
         member_case: MemberCase::Pascal,
@@ -400,8 +529,10 @@ pub const APIS: &[Api] = &[
         namespace: "ssm",
         signing_name: "ssm",
         endpoint_prefix: "ssm",
-        target_prefix: "AmazonSSM",
-        json_version: "1.1",
+        wire: Wire::Json {
+            target_prefix: "AmazonSSM",
+            version: "1.1",
+        },
         sdk_id: "SSM",
         // `GetParameter`'s input: `Name`, `WithDecryption`.
         member_case: MemberCase::Pascal,
@@ -414,8 +545,10 @@ pub const APIS: &[Api] = &[
         namespace: "ecs",
         signing_name: "ecs",
         endpoint_prefix: "ecs",
-        target_prefix: "AmazonEC2ContainerServiceV20141113",
-        json_version: "1.1",
+        wire: Wire::Json {
+            target_prefix: "AmazonEC2ContainerServiceV20141113",
+            version: "1.1",
+        },
         sdk_id: "ECS",
         // `RunTask`'s input: `cluster`, `taskDefinition`, `overrides`.
         member_case: MemberCase::LowerCamel,
@@ -427,10 +560,25 @@ pub const APIS: &[Api] = &[
         namespace: "glue",
         signing_name: "glue",
         endpoint_prefix: "glue",
-        target_prefix: "AWSGlue",
-        json_version: "1.1",
+        wire: Wire::Json {
+            target_prefix: "AWSGlue",
+            version: "1.1",
+        },
         sdk_id: "Glue",
         // `StartJobRun`'s input: `JobName`, `Arguments`, `Timeout`.
+        member_case: MemberCase::Pascal,
+    },
+    // `services/service-com-amazonaws-lambda-awsgirapiservice/smithy-model/
+    // com-amazonaws-lambda-awsgirapiservice.json`: restJson1, sigv4Name `lambda`,
+    // endpointPrefix `lambda`, sdkId `Lambda` — a REST protocol, so each operation's
+    // own bindings are what a request to it is built from ([`LAMBDA_REST`]).
+    Api {
+        namespace: LAMBDA_NAMESPACE,
+        signing_name: LAMBDA_NAMESPACE,
+        endpoint_prefix: LAMBDA_NAMESPACE,
+        wire: Wire::Rest(LAMBDA_REST),
+        sdk_id: "Lambda",
+        // `Invoke`'s input: `FunctionName`, `Payload`, `InvocationType`.
         member_case: MemberCase::Pascal,
     },
 ];
@@ -442,6 +590,10 @@ pub struct Call {
     pub api: &'static Api,
     /// The operation name as the service's model spells it, derived from the action.
     pub operation: String,
+    /// How this operation binds its members to HTTP, for a service whose protocol is
+    /// a REST one ([`Rest`]); `None` for an AWS JSON service, whose request body IS
+    /// the operation's input document.
+    pub rest: Option<&'static Rest>,
     /// The run-a-job pattern this call STARTS, for a `Resource` that asked for one
     /// (`.sync`, `.sync:2`): the task is finished when the job this call starts is,
     /// so the walk parks at it instead of placing the response as the result.
@@ -477,20 +629,26 @@ pub struct Call {
     pub targets: Option<&'static TargetResource>,
 }
 
-/// Where an integration's request names the resource its call acts ON, and how a
-/// refusal of that call is reported to the `Task` state.
+/// Where an integration's request names the resource its call acts ON, which IAM
+/// action that call is subject to, and how a refusal of it is reported to the `Task`
+/// state.
 ///
 /// A `Task` state's integration call is made AS the state machine's execution role,
 /// so it is subject to that role's own policies — an IAM access request over an
-/// `(action, resource)` pair. The ACTION is the IAM action the operation publishes,
-/// which is the invoked service's action namespace (an [`Api`]'s `arnNamespace`) and
-/// the operation's own name, so nothing is stated per action here. The RESOURCE is
-/// the integration's own: which member of the request names it is a fact of that
-/// integration, which is why there is one entry per integration rather than a rule.
+/// `(action, resource)` pair. Both halves are the integration's own: the action is the
+/// one the invoked operation publishes, which is not always the operation's own name,
+/// and which member of the request names the resource, and in what form, is a fact of
+/// that integration — which is why there is one entry per integration rather than a
+/// rule.
 #[derive(Debug)]
 pub struct TargetResource {
     /// The `<namespace>:<action>` the OPTIMIZED family names this integration by.
     pub integration: &'static str,
+    /// The IAM action this call is subject to, for an operation whose PUBLISHED
+    /// permission is not its own name (`lambda:InvokeFunction` for `Invoke`); `None`
+    /// where the action is the invoked service's namespace and the operation's name,
+    /// which is the usual case ([`access_request`]).
+    pub action: Option<&'static str>,
     /// The member of the integration's request that names the resource the call acts
     /// on, named in the integration's own PascalCase.
     pub member: &'static str,
@@ -511,8 +669,11 @@ pub struct TargetResource {
 /// member takes: an operation that addresses its resource by ARN carries the resource
 /// itself, while one that addresses it by NAME carries a name that is the ARN's last
 /// field, and the ARN it names is this account's own ARN for that resource in the
-/// Region the call is made in. Which of the two a member is, is a fact of the invoked
-/// operation's model, so it is stated per entry rather than guessed from the value.
+/// Region the call is made in. Some services address a resource by neither — a queue by
+/// its url, a function by any of the forms Lambda documents for one — and there the ARN
+/// is read the way that service addresses the resource. Which of these a member is, is
+/// a fact of the invoked operation's model, so it is stated per entry rather than
+/// guessed from the value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetNaming {
     /// The member carries the resource's ARN, so it IS the resource the access
@@ -529,16 +690,119 @@ pub enum TargetNaming {
         /// invoked service writes it under (`table/`).
         prefix: &'static str,
     },
+    /// The member carries a queue's `QueueUrl`, whose last path segment is the
+    /// `QueueName` the queue's ARN carries
+    /// (`arn:<partition>:sqs:<region>:<account>:<QueueName>`) and whose endpoint host
+    /// names the Region that ARN is in.
+    QueueUrl,
+    /// The member carries a `FunctionName` in one of the forms Lambda documents for
+    /// it: `my-function[:qualifier]`, the function's ARN, or the partial
+    /// `<account>:function:my-function[:qualifier]`
+    /// (`smithy_query(query="shape",shape="NamespacedFunctionName",model_path="services/
+    /// service-com-amazonaws-lambda-awsgirapiservice/smithy-model/
+    /// com-amazonaws-lambda-awsgirapiservice.json")`). Each names the same function,
+    /// whose ARN is what `lambda:InvokeFunction` is taken on.
+    FunctionName,
 }
+
+impl TargetNaming {
+    /// The ARN of the resource `named` names, as read in the Region `region` the call
+    /// is made in.
+    ///
+    /// A value already written as an ARN is the resource itself whichever of these a
+    /// member is: such a member is one the invoked operation takes either way, and the
+    /// resource the access request is over is the same one. `None` for a value that
+    /// names no resource of the kind at all — there is nothing to decide an access
+    /// request over, which the caller leaves to the invoked operation's own refusal.
+    fn arn_of(self, named: &str, region: &str) -> Option<String> {
+        if named.is_empty() {
+            return None;
+        }
+        if named.starts_with(ARN_PREFIX) {
+            return Some(named.to_string());
+        }
+        match self {
+            Self::Arn => Some(named.to_string()),
+            Self::Named { service, prefix } => Some(::engine::emulator_arn(
+                service,
+                region,
+                &format!("{prefix}{named}"),
+            )),
+            // A queue url is `<endpoint>/<account>/<QueueName>`, so the name is its
+            // last path segment — and the queue's own Region is the one its endpoint
+            // host names (`sqs.<region>.amazonaws.com`), which is not always the
+            // Region the call is made in: a task may send to a queue in another one.
+            // An endpoint host that names none leaves the call's own Region, which is
+            // where a queue addressed through this emulator's own endpoint lives.
+            Self::QueueUrl => {
+                let name = named.trim_end_matches('/').rsplit('/').next()?;
+                (!name.is_empty()).then(|| {
+                    let endpoint = endpoint_region(named);
+                    ::engine::emulator_arn(
+                        SQS_NAMESPACE,
+                        endpoint.as_deref().unwrap_or(region),
+                        name,
+                    )
+                })
+            }
+            // Every partial form writes the function's name last, after the labels
+            // the longer ones carry before it; the qualifier a form may close with
+            // stays on the ARN, because a grant may be written for one version or
+            // alias of a function.
+            Self::FunctionName => {
+                let tail = named
+                    .rsplit_once(FUNCTION_RESOURCE_TYPE_PREFIX)
+                    .map_or(named, |(_, tail)| tail);
+                (!tail.is_empty()).then(|| {
+                    ::engine::emulator_arn(
+                        LAMBDA_NAMESPACE,
+                        region,
+                        &format!("{FUNCTION_RESOURCE_TYPE_PREFIX}{tail}"),
+                    )
+                })
+            }
+        }
+    }
+}
+
+/// The Region the endpoint host of `url` names, for a url addressed to one of a
+/// service's own regional endpoints (`<prefix>.<region>.<suffix>`); `None` for a url
+/// whose host names no Region, which is what this emulator's own endpoint does.
+///
+/// The authority and the bare host come from the ONE shared reading of a url's host
+/// (`service_common::data_plane_addressing`), and the label is held to the grammar every
+/// model's ARN pattern states for a Region field (`service_common::arn::region_label`),
+/// because it ends up in the ARN an access request is decided over. The Region is the
+/// SECOND of the host's dot-separated labels — the one an AWS regional endpoint host
+/// puts after the service's endpoint prefix — and a host with no label after it carries
+/// no Region at all.
+fn endpoint_region(url: &str) -> Option<String> {
+    let authority = ::service_common::data_plane_addressing::addressed_host(url, None)?;
+    let host = ::service_common::data_plane_addressing::host_only(&authority).to_string();
+    let mut labels = host.split('.');
+    let _prefix = labels.next()?;
+    let region = labels.next()?;
+    let further = labels.next().is_some();
+    let shaped = ::service_common::arn::region_label(region).is_some() && region.contains('-');
+    (further && shaped).then(|| region.to_string())
+}
+
+/// What every ARN opens with, which is what makes a value one rather than one of the
+/// shorter forms a service also addresses a resource by.
+const ARN_PREFIX: &str = "arn:";
+
+/// The resource-type label a function's ARN and the partial forms of a `FunctionName`
+/// write before the function's own name.
+const FUNCTION_RESOURCE_TYPE_PREFIX: &str = "function:";
 
 /// The integrations whose request names the resource their call acts on.
 ///
-/// One entry per integration, because which member names the target — and whether it
-/// names it by ARN or by name — is that integration's own fact. An entry also needs
-/// the invoked service's base SDK exception, the one a refusal its operation does not
-/// model is reported under, so an entry is added from that service's own model and
-/// SDK rather than guessed at. An integration with no entry is one no access request
-/// is formed for, and the call is made as before.
+/// One entry per integration, because which member names the target — and how that
+/// member spells it — is that integration's own fact. An entry also needs the invoked
+/// service's base SDK exception, the one a refusal its operation does not model is
+/// reported under, so an entry is added from that service's own model and SDK rather
+/// than guessed at. An integration with no entry is one no access request is formed
+/// for, and the call is made as before.
 ///
 /// An entry is keyed by the `<namespace>:<action>` the OPTIMIZED family writes, and
 /// serves BOTH families: the AWS SDK family names the same service and the same
@@ -548,8 +812,9 @@ pub enum TargetNaming {
 ///
 /// Nothing here is per ACTION beyond the entry: the IAM action an entry's call is
 /// subject to is the invoked service's namespace and the operation's own name
-/// ([`access_request`]), so two actions of one service differ only in which member
-/// names their target.
+/// ([`access_request`]) unless the entry states otherwise, which it does only where
+/// the invoked operation publishes its permission under a different name, so two
+/// actions of one service usually differ only in which member names their target.
 pub const TARGET_RESOURCES: &[TargetResource] = &[
     // `arn:aws:states:::states:startExecution` starts an execution of the state
     // machine its `StateMachineArn` parameter names, which is the resource
@@ -561,6 +826,7 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
     // Functions error into.
     TargetResource {
         integration: "states:startExecution",
+        action: None,
         member: "StateMachineArn",
         named: TargetNaming::Arn,
         refusal_error: "StepFunctions.AWSStepFunctionsException",
@@ -581,6 +847,7 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
     // SDK exception.
     TargetResource {
         integration: "dynamodb:putItem",
+        action: None,
         member: "TableName",
         named: DYNAMODB_TABLE,
         refusal_error: DYNAMODB_REFUSAL_ERROR,
@@ -588,6 +855,7 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
     },
     TargetResource {
         integration: "dynamodb:getItem",
+        action: None,
         member: "TableName",
         named: DYNAMODB_TABLE,
         refusal_error: DYNAMODB_REFUSAL_ERROR,
@@ -595,6 +863,7 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
     },
     TargetResource {
         integration: "dynamodb:updateItem",
+        action: None,
         member: "TableName",
         named: DYNAMODB_TABLE,
         refusal_error: DYNAMODB_REFUSAL_ERROR,
@@ -602,10 +871,43 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
     },
     TargetResource {
         integration: "dynamodb:deleteItem",
+        action: None,
         member: "TableName",
         named: DYNAMODB_TABLE,
         refusal_error: DYNAMODB_REFUSAL_ERROR,
         refusal_service: DYNAMODB_REFUSAL_SERVICE,
+    },
+    // `arn:aws:states:::sqs:sendMessage` sends to the queue its `QueueUrl` parameter
+    // addresses, which is the queue `sqs:SendMessage` is taken on
+    // (`smithy_query(query="operation",operation="SendMessage",model_path="services/
+    // service-com-amazonaws-sqs-amazonsqs/smithy-model/
+    // com-amazonaws-sqs-amazonsqs.json")`: `QueueUrl` is "the URL of the Amazon SQS
+    // queue to which a message is sent"). Amazon SQS models no access-denied error on
+    // `SendMessage`, so a refusal of it is reported under that service's base SDK
+    // exception.
+    TargetResource {
+        integration: "sqs:sendMessage",
+        action: None,
+        member: "QueueUrl",
+        named: TargetNaming::QueueUrl,
+        refusal_error: "SQS.AmazonSQSException",
+        refusal_service: "AmazonSQS",
+    },
+    // `arn:aws:states:::lambda:invoke` invokes the function its `FunctionName`
+    // parameter names. The action is `lambda:InvokeFunction` — the permission Lambda
+    // publishes for the `Invoke` API, which is not the operation's own name — and the
+    // resource is that function's ARN. `Invoke` models no access-denied error either
+    // (`smithy_query(query="operation",operation="Invoke",model_path="services/
+    // service-com-amazonaws-lambda-awsgirapiservice/smithy-model/
+    // com-amazonaws-lambda-awsgirapiservice.json")`), so a refusal of it is reported
+    // under Lambda's base SDK exception.
+    TargetResource {
+        integration: "lambda:invoke",
+        action: Some("lambda:InvokeFunction"),
+        member: "FunctionName",
+        named: TargetNaming::FunctionName,
+        refusal_error: "Lambda.AWSLambdaException",
+        refusal_service: "AWSLambda",
     },
 ];
 
@@ -630,31 +932,21 @@ impl TargetResource {
     /// integration's own PascalCase and the invoked model's ([`MemberCase`]) — because
     /// either reaches the operation ([`wire_request`]). What the value spells is the
     /// entry's own fact ([`TargetNaming`]): a NAME is the last field of this account's
-    /// ARN for that resource in this Region, and an ARN is the resource itself.
+    /// ARN for that resource in this Region, an ARN is the resource itself, and a url
+    /// or one of a service's own shorter forms is read the way that service addresses
+    /// the resource.
     fn resource_of(&self, request: &Value, region: &str) -> Option<String> {
         let named = [MemberCase::Pascal, MemberCase::LowerCamel]
             .into_iter()
             .find_map(|case| request.get(case.spell(self.member)))
             .and_then(Value::as_str)?;
-        if named.is_empty() {
-            return None;
-        }
-        match self.named {
-            TargetNaming::Arn => Some(named.to_string()),
-            // A member that takes a name takes an ARN too, so one already written as
-            // an ARN names the resource it names rather than a resource of that name.
-            TargetNaming::Named { service, prefix } => {
-                Some(match ::service_common::arn::parse(named) {
-                    Some(_) => named.to_string(),
-                    None => ::engine::emulator_arn(service, region, &format!("{prefix}{named}")),
-                })
-            }
-        }
+        self.named.arn_of(named, region)
     }
 }
 
 /// The access request this call is subject to: the IAM action the invoked operation
-/// publishes, and the ARN of the resource the request names.
+/// publishes, and the ARN of the resource the request names, as addressed in the
+/// Region `region` the call is made in.
 ///
 /// `region` is the Region the call is made in, which is where a resource the request
 /// named by NAME lives.
@@ -665,10 +957,13 @@ impl TargetResource {
 pub fn access_request(call: &Call, request: &Value, region: &str) -> Option<(String, String)> {
     let targets = call.targets?;
     let resource = targets.resource_of(request, region)?;
-    Some((
-        format!("{}:{}", call.api.namespace, call.operation),
-        resource,
-    ))
+    // The action is the invoked service's namespace and the operation's own name,
+    // unless the entry states the permission that operation PUBLISHES instead.
+    let action = targets.action.map_or_else(
+        || format!("{}:{}", call.api.namespace, call.operation),
+        str::to_string,
+    );
+    Some((action, resource))
 }
 
 /// The members an OPTIMIZED integration documents as a document while the operation
@@ -1159,9 +1454,25 @@ pub fn read(resource: &str) -> Result<Call, String> {
         true => &[][..],
         false => members_of(EPOCH_MILLIS_MEMBERS, &integration),
     };
+    let operation = operation_of(action);
+    // A REST service binds each operation's members to the path, the query, the
+    // headers and one payload separately, so a call is made only for an operation
+    // whose bindings this emulator carries; one with none is reported as work nothing
+    // was run for rather than sent as a request its protocol does not describe.
+    let rest = match api.wire {
+        Wire::Json { .. } => None,
+        Wire::Rest(_) => Some(api.rest(&operation).ok_or_else(|| {
+            format!(
+                "'{shown}' names the '{operation}' operation of {}, whose request this emulator \
+                 does not bind to that service's REST protocol, so nothing was run for it",
+                api.sdk_id
+            )
+        })?),
+    };
     Ok(Call {
         api,
-        operation: operation_of(action),
+        operation,
+        rest,
         job,
         parsed_output,
         json_text,
@@ -1252,6 +1563,9 @@ fn pattern_call(api: &'static Api, operation: &str) -> Call {
     Call {
         api,
         operation: operation.to_string(),
+        // Every run-a-job pattern this emulator performs is over an AWS JSON service
+        // ([`RUN_A_JOB`]), so neither of its own calls carries a REST binding.
+        rest: None,
         job: None,
         parsed_output: false,
         json_text: &[],
@@ -1590,6 +1904,190 @@ fn wire_request(call: &Call, request: &Value) -> Value {
     Value::Object(wire)
 }
 
+/// One request, built for the protocol the invoked service's model declares.
+struct Wired {
+    method: &'static str,
+    /// The request-target, which for an AWS JSON service is the root and for a REST
+    /// one is the operation's own path and query.
+    uri: String,
+    /// The operation's name as the AWS JSON protocol carries it
+    /// (`<target prefix>.<OperationName>`); `None` for a REST request, which names
+    /// the operation by its method and path.
+    target: Option<String>,
+    /// The headers this operation's own members are bound to, beside the ones every
+    /// request carries.
+    headers: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+}
+
+/// The request `call` makes with `request` as the operation's input, or why it could
+/// not be built.
+fn wired(call: &Call, request: &Value) -> Result<Wired, String> {
+    let document = wire_request(call, request);
+    let Some(rest) = call.rest else {
+        // An AWS JSON request body IS the operation's input document, posted to the
+        // root and named in a header.
+        let target = match call.api.wire {
+            Wire::Json { target_prefix, .. } => format!("{target_prefix}.{}", call.operation),
+            // A service whose protocol is a REST one reaches this only for a call
+            // carrying no binding, which [`read`] does not produce.
+            Wire::Rest(_) => {
+                return Err(format!(
+                    "the '{}' call of {} carries no request binding for that service's REST \
+                     protocol",
+                    call.operation, call.api.sdk_id
+                ))
+            }
+        };
+        let body = ::serde_json::to_vec(&document).map_err(|error| error.to_string())?;
+        return Ok(Wired {
+            method: "POST",
+            uri: "/".to_string(),
+            target: Some(target),
+            headers: Vec::new(),
+            body,
+        });
+    };
+    rest.wired(&document)
+}
+
+impl Rest {
+    /// The request this operation's bindings put `document` on the wire as.
+    fn wired(&self, document: &Value) -> Result<Wired, String> {
+        let mut uri = String::new();
+        let mut remaining = self.uri;
+        // Each `{<member>}` of the path stands for the value the request names that
+        // member with; a request naming none has no path to send, so the call is not
+        // made rather than made against a path with a hole in it.
+        while let Some((before, after)) = remaining.split_once('{') {
+            uri.push_str(before);
+            let (label, tail) = after
+                .split_once('}')
+                .ok_or_else(|| format!("the '{}' path binding is malformed", self.operation))?;
+            let named = member_text(document, label).ok_or_else(|| {
+                format!("this task's parameters name no '{label}', which the call's path needs")
+            })?;
+            uri.push_str(&one_component(&named, label, Component::Label)?);
+            remaining = tail;
+        }
+        uri.push_str(remaining);
+        let mut query = String::new();
+        for (member, parameter) in self.query {
+            let Some(named) = member_text(document, member) else {
+                continue;
+            };
+            query.push(if query.is_empty() { '?' } else { '&' });
+            query.push_str(parameter);
+            query.push('=');
+            query.push_str(&one_component(&named, member, Component::Query)?);
+        }
+        uri.push_str(&query);
+        let headers = self
+            .headers
+            .iter()
+            .filter_map(|(member, field)| Some((*field, member_text(document, member)?)))
+            .collect();
+        // The payload member IS the body: a value given as text is those bytes, and a
+        // document is its JSON text, which is what the member the integration
+        // documents as a document carries.
+        let body = match document.get(self.payload) {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::String(text)) => text.clone().into_bytes(),
+            Some(value) => ::serde_json::to_vec(value).map_err(|error| error.to_string())?,
+        };
+        Ok(Wired {
+            method: self.method,
+            uri,
+            target: None,
+            headers,
+            body,
+        })
+    }
+
+    /// The response document this operation's bindings read a 2xx answer as: the
+    /// status, the headers and the body each under the member they are bound to.
+    ///
+    /// Every value in it is the ANSWER's own, and a member the answer carried nothing
+    /// for is absent rather than filled in.
+    fn result(&self, answered: &Answered) -> Value {
+        let mut members = Map::new();
+        if !self.response_status.is_empty() {
+            members.insert(
+                self.response_status.to_string(),
+                Value::Number(answered.status.into()),
+            );
+        }
+        for (member, field) in self.response_headers {
+            if let Some(value) = answered.header(field) {
+                members.insert((*member).to_string(), Value::String(value));
+            }
+        }
+        if !answered.payload.is_empty() {
+            // The body is reported as the document it holds, which is what the
+            // integration's result carries; a body that is not one is reported as
+            // its own text rather than dropped.
+            let payload = ::serde_json::from_slice::<Value>(&answered.payload).unwrap_or_else(
+                |_| Value::String(String::from_utf8_lossy(&answered.payload).to_string()),
+            );
+            members.insert(self.response_payload.to_string(), payload);
+        }
+        Value::Object(members)
+    }
+}
+
+/// The text `document` names `member` with: a value given as a string is that string,
+/// and any other value is its JSON text, which is how a path, a query parameter or a
+/// header carries one. `None` for a member the document does not carry.
+fn member_text(document: &Value, member: &str) -> Option<String> {
+    match document.get(member) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(value) => Some(value.to_string()),
+    }
+}
+
+/// Which part of a request-target a member's value goes into, which decides one thing:
+/// whether an EMPTY value is one that part can carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Component {
+    /// A path label, which stands for one whole segment: an empty one would collapse
+    /// the path it is part of, so there is no request to send for it.
+    Label,
+    /// A query parameter's value, which an operation may model as admitting the empty
+    /// string (`Invoke`'s `Qualifier` does), and which a request carries as the
+    /// parameter with nothing after its `=`.
+    Query,
+}
+
+/// `value`, when it is text a request-target carries as ONE component — a path segment
+/// or a query parameter's value — and `Err` naming `member` when it is not.
+///
+/// A member an operation binds to the path or the query is one whose own modelled
+/// pattern admits only characters a URI component admits: a function's name, its ARN and
+/// a version qualifier are written with the unreserved characters plus `:` and `$`, all
+/// of which a component carries as they stand. A caller's parameter CAN hold anything,
+/// so a value outside that set is one the request cannot address — the delimiters are
+/// what would make it more than one component — and the call is not made rather than
+/// made against a target assembled out of it. Nothing is escaped here: a value that
+/// needed escaping names no resource of the invoked operation either.
+fn one_component(value: &str, member: &str, component: Component) -> Result<String, String> {
+    let carried = value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || URI_COMPONENT_PUNCTUATION.contains(&byte)
+    });
+    if (value.is_empty() && component == Component::Label) || !carried {
+        return Err(format!(
+            "this task's '{member}' is not text a request-target carries as one component, so it \
+             addresses nothing the call can be made against"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+/// The punctuation a URI component carries unescaped beside the alphanumerics: RFC
+/// 3986's unreserved set (`-`, `.`, `_`, `~`) and the two sub-delimiters an ARN and a
+/// version qualifier are written with (`:`, `$`).
+const URI_COMPONENT_PUNCTUATION: &[u8] = b"-._~:$";
+
 /// Make one integration call and read what the service answered.
 ///
 /// Public, because the calls a run-a-job pattern is made of besides the one the walk
@@ -1602,27 +2100,32 @@ pub async fn call_api(
     request: &Value,
 ) -> Answer {
     let api = call.api;
-    let body = match ::serde_json::to_vec(&wire_request(call, request)) {
-        Ok(body) => body,
-        Err(error) => {
+    let built = match wired(call, request) {
+        Ok(built) => built,
+        Err(why) => {
             return Err(Failed {
                 error: super::asl::RUNTIME_ERROR.to_string(),
                 cause: format!(
-                    "the document this task would have sent as its request could not be written: \
-                     {error}"
+                    "the request this task would have sent could not be built: {why}"
                 ),
             })
         }
     };
-    match dispatch(callback, api, region, &call.operation, body).await {
+    match dispatch(callback, api, region, built).await {
         Ok(answered) => {
-            let read = answer_of(
-                api,
-                &call.operation,
-                answered.status,
-                answered.error_type.as_deref(),
-                &answered.payload,
-            );
+            let read = match call.rest {
+                // A REST answer's members are spread over its status, its headers and
+                // its body, so the operation's own bindings are what reads it; a
+                // refusal is read the same way whichever protocol carried it.
+                Some(rest) if (200..300).contains(&answered.status) => Ok(rest.result(&answered)),
+                _ => answer_of(
+                    api,
+                    &call.operation,
+                    answered.status,
+                    answered.error_type.as_deref(),
+                    &answered.payload,
+                ),
+            };
             // The result of an OPTIMIZED integration is the literal SDK response of
             // the call, which renders each instant the response carries as whole
             // epoch milliseconds and carries the SDK's own response envelope beside
@@ -1860,16 +2363,21 @@ async fn dispatch(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     api: &Api,
     region: &str,
-    operation: &str,
-    body: Vec<u8>,
+    built: Wired,
 ) -> Result<Answered, String> {
-    let mut request = ::http::Request::builder()
-        .method("POST")
-        .uri("/")
+    let mut builder = ::http::Request::builder()
+        .method(built.method)
+        .uri(&built.uri)
         .header("host", api.host(region))
-        .header("content-type", api.content_type())
-        .header(TARGET_HEADER, format!("{}.{operation}", api.target_prefix))
-        .body(body)
+        .header("content-type", api.content_type());
+    if let Some(target) = &built.target {
+        builder = builder.header(TARGET_HEADER, target);
+    }
+    for (field, value) in &built.headers {
+        builder = builder.header(*field, value);
+    }
+    let mut request = builder
+        .body(built.body)
         .map_err(|error| error.to_string())?;
 
     let (access_key_id, secret_access_key) = credentials(callback).await?;
@@ -2059,6 +2567,15 @@ mod tests {
         Result<&'static str, &'static str>,
     );
 
+    /// One row of the REST request table: the case, the parameters the state built,
+    /// and the request-target, bound headers and body expected of it — `None` for
+    /// parameters no request can be built from.
+    type RestRow = (
+        &'static str,
+        Value,
+        Option<(&'static str, Vec<(&'static str, &'static str)>, &'static str)>,
+    );
+
     /// One row of the access-request table: the case, the `Resource`, the request the
     /// state built, and the `(action, resource)` pair the call is subject to.
     type AccessRow = (
@@ -2082,7 +2599,7 @@ mod tests {
     #[test]
     fn a_resource_names_the_call_its_action_does() {
         // (case, the Resource, the signing name and operation it names, parks at a job)
-        let rows: [ResourceRow; 22] = [
+        let rows: [ResourceRow; 25] = [
             (
                 "the optimized DynamoDB integration",
                 "arn:aws:states:::dynamodb:putItem",
@@ -2155,6 +2672,20 @@ mod tests {
                 Some(("ecs", "RunTask")),
                 false,
             ),
+            // A service whose protocol is a REST one: the call is made for the
+            // operation whose own bindings are carried, and for no other.
+            (
+                "the optimized Lambda integration",
+                "arn:aws:states:::lambda:invoke",
+                Some(("lambda", "Invoke")),
+                false,
+            ),
+            (
+                "the AWS SDK integration of that same operation",
+                "arn:aws:states:::aws-sdk:lambda:invoke",
+                Some(("lambda", "Invoke")),
+                false,
+            ),
             // The run-a-job pattern: the ACTION is what is called, and the task is
             // parked at the job that call starts.
             (
@@ -2177,7 +2708,13 @@ mod tests {
             ),
             // The forms that name no call.
             (
-                "a service whose request is not one JSON document",
+                "an operation of a REST service whose bindings are not carried",
+                "arn:aws:states:::aws-sdk:lambda:listFunctions",
+                None,
+                false,
+            ),
+            (
+                "a service with no entry at all",
                 "arn:aws:states:::sns:publish",
                 None,
                 false,
@@ -2612,17 +3149,21 @@ mod tests {
     /// The rows span what the rule generalises over: both spellings a definition may
     /// write the member in, the pattern suffixes (which name the same action), a
     /// member that names its resource by NAME rather than by ARN (and the same member
-    /// carrying an ARN instead), several actions of one service, an integration the
-    /// table carries no entry for, the AWS SDK family, and a request naming no
-    /// resource at all.
+    /// carrying an ARN instead), several actions of one service, an operation whose
+    /// published permission is not its own name, each form in which an integration
+    /// addresses its target by something other than an ARN ([`TargetNaming`]), an
+    /// integration the table carries no entry for, the AWS SDK family, and a request
+    /// naming no resource at all.
     #[test]
     fn an_access_request_is_the_action_and_the_resource_the_request_names() {
+        let region = "us-west-2";
         let child = "arn:aws:states:us-west-2:000000000000:stateMachine:child";
-        let region = "eu-west-1";
         let orders = ::engine::emulator_arn("dynamodb", region, "table/orders");
         let elsewhere = "arn:aws:dynamodb:us-east-2:000000000000:table/elsewhere";
+        let queue_arn = ::engine::emulator_arn(SQS_NAMESPACE, region, "orders");
+        let function_arn = ::engine::emulator_arn(LAMBDA_NAMESPACE, region, "function:handler");
         // (case, the Resource, the request the state built, the expected pair)
-        let rows: [AccessRow; 10] = [
+        let rows: [AccessRow; 17] = [
             (
                 "a nested execution, the member in the integration's own spelling",
                 "arn:aws:states:::states:startExecution",
@@ -2657,7 +3198,7 @@ mod tests {
                 "the AWS SDK family of that call, whose member its model spells lower",
                 "arn:aws:states:::aws-sdk:dynamodb:updateItem",
                 ::serde_json::json!({"tableName": "orders"}),
-                Some(("dynamodb:UpdateItem", orders.clone())),
+                Some(("dynamodb:UpdateItem", orders)),
             ),
             (
                 "the same member carrying an ARN, which names the table it names",
@@ -2667,8 +3208,8 @@ mod tests {
             ),
             (
                 "an integration no entry is carried for",
-                "arn:aws:states:::sqs:sendMessage",
-                ::serde_json::json!({"QueueUrl": "https://sqs.eu-west-1.amazonaws.com/0/q"}),
+                "arn:aws:states:::events:putEvents",
+                ::serde_json::json!({"Entries": []}),
                 None,
             ),
             (
@@ -2682,6 +3223,64 @@ mod tests {
                 "arn:aws:states:::states:startExecution",
                 ::serde_json::json!({"Input": {}}),
                 None,
+            ),
+            // A queue is addressed by its url, and the access request is about the
+            // queue's ARN.
+            (
+                "a send to a queue, addressed by its url",
+                "arn:aws:states:::sqs:sendMessage",
+                ::serde_json::json!({
+                    "QueueUrl": "https://sqs.us-west-2.amazonaws.com/000000000000/orders",
+                    "MessageBody": "{}",
+                }),
+                Some(("sqs:SendMessage", queue_arn.clone())),
+            ),
+            (
+                "the same queue named by its ARN, which is the resource itself",
+                "arn:aws:states:::sqs:sendMessage",
+                ::serde_json::json!({"QueueUrl": queue_arn.clone()}),
+                Some(("sqs:SendMessage", queue_arn.clone())),
+            ),
+            (
+                "the AWS SDK family of that send, which acts on the same queue",
+                "arn:aws:states:::aws-sdk:sqs:sendMessage",
+                ::serde_json::json!({
+                    "queueUrl": "https://sqs.us-west-2.amazonaws.com/000000000000/orders",
+                }),
+                Some(("sqs:SendMessage", queue_arn)),
+            ),
+            (
+                // The queue's own Region is the one its endpoint host names, which is
+                // not always the Region the call is made in.
+                "a send to a queue in another Region",
+                "arn:aws:states:::sqs:sendMessage",
+                ::serde_json::json!({
+                    "QueueUrl": "https://sqs.eu-west-1.amazonaws.com/000000000000/orders",
+                }),
+                Some((
+                    "sqs:SendMessage",
+                    ::engine::emulator_arn(SQS_NAMESPACE, "eu-west-1", "orders"),
+                )),
+            ),
+            // A function is invoked under `lambda:InvokeFunction`, which is not the
+            // operation's own name, on the function's ARN whichever form names it.
+            (
+                "an invocation, the function named by its bare name",
+                "arn:aws:states:::lambda:invoke",
+                ::serde_json::json!({"FunctionName": "handler", "Payload": {}}),
+                Some(("lambda:InvokeFunction", function_arn.clone())),
+            ),
+            (
+                "the same function named by its partial ARN",
+                "arn:aws:states:::lambda:invoke",
+                ::serde_json::json!({"FunctionName": "000000000000:function:handler"}),
+                Some(("lambda:InvokeFunction", function_arn.clone())),
+            ),
+            (
+                "the same function named by its ARN",
+                "arn:aws:states:::lambda:invoke",
+                ::serde_json::json!({"FunctionName": function_arn.clone()}),
+                Some(("lambda:InvokeFunction", function_arn)),
             ),
         ];
 
@@ -2769,6 +3368,204 @@ mod tests {
             "case \"a nested execution\": expected the start date among the instants its result \
              reports, got {:?}",
             call.epoch_millis
+        );
+    }
+
+    /// A REST integration's request carries each member where that operation's own
+    /// binding puts it: the path label, the query, the headers and the one payload.
+    ///
+    /// The rows span what the rule generalises over: a label named by each form the
+    /// member admits and one needing encoding to stay a single segment, a payload given
+    /// as a document and as the text of one and absent altogether, a header member
+    /// present and absent, the query parameter, and parameters naming no label at all.
+    #[test]
+    fn a_rest_integrations_request_binds_each_member_where_the_operation_does() {
+        let call = read("arn:aws:states:::lambda:invoke").expect("this names a call");
+        let path = "/2015-03-31/functions";
+        let rows: [RestRow; 9] = [
+            (
+                "a function named by its bare name, the payload a document",
+                ::serde_json::json!({"FunctionName": "handler", "Payload": {"a": 1}}),
+                Some((
+                    "/2015-03-31/functions/handler/invocations",
+                    Vec::new(),
+                    r#"{"a":1}"#,
+                )),
+            ),
+            (
+                "the same function named by its ARN, whose colons a segment admits",
+                ::serde_json::json!({
+                    "FunctionName": "arn:aws:lambda:us-west-2:000000000000:function:handler",
+                }),
+                Some((
+                    "/2015-03-31/functions/arn:aws:lambda:us-west-2:000000000000:function:handler\
+                     /invocations",
+                    Vec::new(),
+                    "",
+                )),
+            ),
+            (
+                "a name carrying a character a request-target does not carry as one \
+                 component",
+                ::serde_json::json!({"FunctionName": "two words"}),
+                None,
+            ),
+            (
+                "the payload given as the text of a document",
+                ::serde_json::json!({"FunctionName": "handler", "Payload": "{\"a\":1}"}),
+                Some((
+                    "/2015-03-31/functions/handler/invocations",
+                    Vec::new(),
+                    r#"{"a":1}"#,
+                )),
+            ),
+            (
+                "a header member the parameters name",
+                ::serde_json::json!({"FunctionName": "handler", "InvocationType": "Event"}),
+                Some((
+                    "/2015-03-31/functions/handler/invocations",
+                    vec![("x-amz-invocation-type", "Event")],
+                    "",
+                )),
+            ),
+            (
+                "every header member the operation binds",
+                ::serde_json::json!({
+                    "FunctionName": "handler",
+                    "InvocationType": "RequestResponse",
+                    "LogType": "Tail",
+                    "ClientContext": "e30=",
+                }),
+                Some((
+                    "/2015-03-31/functions/handler/invocations",
+                    vec![
+                        ("x-amz-invocation-type", "RequestResponse"),
+                        ("x-amz-log-type", "Tail"),
+                        ("x-amz-client-context", "e30="),
+                    ],
+                    "",
+                )),
+            ),
+            (
+                "the query parameter the operation binds",
+                ::serde_json::json!({"FunctionName": "handler", "Qualifier": "$LATEST"}),
+                Some((
+                    "/2015-03-31/functions/handler/invocations?Qualifier=$LATEST",
+                    Vec::new(),
+                    "",
+                )),
+            ),
+            (
+                // `Qualifier`'s own pattern admits the empty string, so the parameter
+                // is carried with nothing after its `=` rather than refused.
+                "the same parameter given as the empty string its member admits",
+                ::serde_json::json!({"FunctionName": "handler", "Qualifier": ""}),
+                Some((
+                    "/2015-03-31/functions/handler/invocations?Qualifier=",
+                    Vec::new(),
+                    "",
+                )),
+            ),
+            (
+                "parameters naming no function, which the path cannot be built without",
+                ::serde_json::json!({"Payload": {}}),
+                None,
+            ),
+        ];
+
+        for (case, parameters, expected) in rows {
+            match (wired(&call, &parameters), expected) {
+                (Ok(built), Some((uri, headers, body))) => {
+                    assert_eq!(
+                        built.uri, uri,
+                        "case {case:?}: expected the request-target {uri:?}, got {:?}",
+                        built.uri
+                    );
+                    let carried: Vec<(&str, &str)> = built
+                        .headers
+                        .iter()
+                        .map(|(field, value)| (*field, value.as_str()))
+                        .collect();
+                    assert_eq!(
+                        carried, headers,
+                        "case {case:?}: expected the headers {headers:?}, got {carried:?}"
+                    );
+                    let sent = String::from_utf8_lossy(&built.body).to_string();
+                    assert_eq!(
+                        sent, body,
+                        "case {case:?}: expected the body {body:?}, got {sent:?}"
+                    );
+                    assert!(
+                        built.target.is_none(),
+                        "case {case:?}: a REST request names its operation by method and path, \
+                         so it carries no target header, got {:?}",
+                        built.target
+                    );
+                    assert!(
+                        built.uri.starts_with(path),
+                        "case {case:?}: expected the operation's own path, got {:?}",
+                        built.uri
+                    );
+                }
+                (Err(why), None) => assert!(
+                    why.contains("'FunctionName'"),
+                    "case {case:?}: expected the member the request cannot be built from to be \
+                     named, got {why:?}"
+                ),
+                (Ok(built), None) => panic!(
+                    "case {case:?}: expected no request, got {} {}",
+                    built.method, built.uri
+                ),
+                (Err(why), Some(_)) => {
+                    panic!("case {case:?}: expected a request, got the refusal {why:?}")
+                }
+            }
+        }
+    }
+
+    /// A 2xx answer to a REST call is read into the members that operation's output
+    /// binds: the status, the headers and the body.
+    #[test]
+    fn a_rest_answer_is_read_into_the_members_its_output_binds() {
+        let rest = LAMBDA_REST
+            .iter()
+            .find(|rest| rest.operation == "Invoke")
+            .expect("the invocation is a call this emulator makes");
+        // The answer a function's invocation carries: the status, the version that ran
+        // and the payload it returned.
+        let answered = Answered {
+            status: 200,
+            error_type: None,
+            headers: vec![
+                ("x-amz-executed-version".to_string(), "$LATEST".to_string()),
+                ("x-amzn-requestid".to_string(), "r-1".to_string()),
+            ],
+            payload: br#"{"ok":true}"#.to_vec(),
+        };
+        let result = rest.result(&answered);
+        assert_eq!(
+            result,
+            ::serde_json::json!({
+                "StatusCode": 200,
+                "ExecutedVersion": "$LATEST",
+                "Payload": {"ok": true},
+            }),
+            "case \"an invocation that returned a document\": got {result}"
+        );
+
+        // A body that is not a document is reported as its own text, and a header the
+        // answer did not carry is reported by nothing.
+        let answered = Answered {
+            status: 202,
+            error_type: None,
+            headers: Vec::new(),
+            payload: b"not json".to_vec(),
+        };
+        let result = rest.result(&answered);
+        assert_eq!(
+            result,
+            ::serde_json::json!({ "StatusCode": 202, "Payload": "not json" }),
+            "case \"an answer carrying no document and no headers\": got {result}"
         );
     }
 }

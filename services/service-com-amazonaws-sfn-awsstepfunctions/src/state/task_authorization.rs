@@ -60,7 +60,6 @@ use ::service_common::iam_authorization::{self as iam, Decision};
 
 use super::integration::{access_request, Call, Failed, RoleGate};
 
-
 /// The IAM store a state machine's `roleArn` is resolved against.
 ///
 /// It is the IAM service's OWN state struct, reached through the SAME shared engine
@@ -82,7 +81,8 @@ const ACCESS_DENIED_STATUS: u16 = 400;
 ///
 /// `region` is the Region the walk's calls are made in — the execution's own — which
 /// is where a resource a request names by NAME rather than by ARN lives, so it is
-/// what the ARN the access request is over is formed in.
+/// what the ARN the access request is over is formed in
+/// ([`super::integration::TargetNaming`]).
 ///
 /// The gate is consulted once per call the walk asks for, so a statement withdrawn
 /// between two states of one execution stops granting from the next call: nothing is

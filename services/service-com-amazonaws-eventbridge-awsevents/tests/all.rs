@@ -43,6 +43,8 @@ mod cross_region_bus_target;
 mod dead_letter_error_code;
 #[path = "all/entry_level_semantics.rs"]
 mod entry_level_semantics;
+#[path = "all/envelope_time_precision.rs"]
+mod envelope_time_precision;
 #[path = "all/event_bus_configuration.rs"]
 mod event_bus_configuration;
 #[path = "all/event_bus_deletion.rs"]
