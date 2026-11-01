@@ -428,13 +428,14 @@ async fn a_teardown_removes_only_its_own_enablement() {
              got {operation:?}"
         );
 
-        // The sibling is still enabled, so its pair cannot be enabled a second time...
+        // The sibling is still enabled — and deployed, the settle span having passed — so
+        // its pair cannot be enabled a second time...
         let again = enable(&router, &rows[index]).await;
         assert_eq!(
             (again.status, again.error_code.as_deref()),
-            (409, Some("ConflictException")),
-            "case {case:?}: re-enabling a sibling's pair expected 409 ConflictException, \
-             got {:?} body {:?}",
+            (400, Some("ValidationException")),
+            "case {case:?}: re-enabling a sibling's deployed pair expected 400 \
+             ValidationException, got {:?} body {:?}",
             (again.status, again.error_code.as_deref()),
             again.body
         );

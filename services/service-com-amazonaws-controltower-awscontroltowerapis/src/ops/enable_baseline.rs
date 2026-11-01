@@ -18,6 +18,13 @@
 //! enablements into the one control store `ListEnabledControls`/`GetEnabledControl` read
 //! (`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::apply_governance_controls`);
 //! `DisableBaseline` withdraws them again.
+//!
+//! A baseline is enabled at most once per target, and the refusal of a repeat is
+//! classified by the STATE of the enablement already holding the pair, as `EnableControl`
+//! classifies its own: while that enablement is still being deployed the repeat would race
+//! a change in flight, the inconsistent state the modelled `ConflictException` (409)
+//! reports; once it is deployed nothing is in flight and the request asks for a resource
+//! that already exists, which the modelled `ValidationException` (400) reports.
 //!//! Implemented here because `GetBaselineOperation` has nothing to resolve until some call
 //! mints a baseline operation; the remaining baseline operations keep their own stub
 //! issues.
@@ -291,13 +298,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that name the same baseline is the same pair. The rule is read off the store, so
         // it holds whichever call enabled the existing one. (A baseline whose DISABLE has
         // become due is already out of the map above, so that pair enables again.)
-        if let Some(existing) =
-            store.enabled_baseline_on_target(baseline, &input.target_identifier)
+        //
+        // The refusal is classified by the STATE of the enablement the repeat collided
+        // with, the same way `EnableControl` classifies its own: a repeat while the first
+        // enablement is still being deployed would race that change, which is the
+        // inconsistent state `ConflictException` reports; once it is deployed nothing is
+        // in flight and the request simply asks for a resource that already exists, which
+        // is a constraint on the input the modelled `ValidationException` reports.
+        if let Some(existing) = store.enabled_baseline_on_target(baseline, &input.target_identifier)
         {
-            return Err(EnableBaselineErrorModeled::ConflictException(
-                ConflictException {
+            let existing_arn = existing.arn.clone();
+            if existing.status == crate::state::EnablementStatus::UnderChange {
+                return Err(EnableBaselineErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "enabled baseline {existing_arn} is still being deployed on \
+                             target {}; enabling baseline {} again now would leave it in an \
+                             inconsistent state",
+                            input.target_identifier, input.baseline_identifier
+                        ),
+                    },
+                )
+                .into());
+            }
+            return Err(EnableBaselineErrorModeled::ValidationException(
+                ValidationException {
                     message: format!(
-                        "baseline {} is already enabled on target {} as {existing}",
+                        "baseline {} is already enabled on target {} as {existing_arn}",
                         input.baseline_identifier, input.target_identifier
                     ),
                 },

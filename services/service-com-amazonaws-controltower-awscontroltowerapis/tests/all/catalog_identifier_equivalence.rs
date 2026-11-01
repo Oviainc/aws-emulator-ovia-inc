@@ -43,7 +43,7 @@ pub(crate) fn ou(suffix: &str) -> String {
 /// form admits them: the partition, the region and the account segment of a baseline ARN
 /// select nothing — the same catalog is published in every partition, region and account
 /// — so these differ in exactly the segments that carry no identity, and in nothing else.
-fn baseline_identifier_forms(baseline_id: &str) -> Vec<(String, String)> {
+pub(crate) fn baseline_identifier_forms(baseline_id: &str) -> Vec<(String, String)> {
     [
         (
             "the region-flavoured form GetBaseline reports",
@@ -117,7 +117,7 @@ pub(crate) fn control_identifier_forms(control: &CatalogControl) -> Vec<(String,
 /// The oldest and the newest version a baseline offers, so a repeat can be written at
 /// another version than the enablement it repeats: the version is not part of what
 /// identifies an enablement.
-fn oldest_and_newest(baseline: &CatalogBaseline) -> (&'static str, &'static str) {
+pub(crate) fn oldest_and_newest(baseline: &CatalogBaseline) -> (&'static str, &'static str) {
     let oldest = baseline
         .versions
         .first()
@@ -130,7 +130,7 @@ fn oldest_and_newest(baseline: &CatalogBaseline) -> (&'static str, &'static str)
 }
 
 /// POST `/enable-baseline` for a baseline/target pair at `version`.
-async fn enable_baseline(
+pub(crate) async fn enable_baseline(
     router: &MultiServiceRouter,
     baseline_identifier: &str,
     version: &str,
@@ -265,7 +265,9 @@ async fn one_baseline_enables_once_per_target_whichever_identifier_names_it() {
         listed.body
     );
 
-    // Once the enablement is deployed rather than in flight, the pair is still taken.
+    // Once the enablement is deployed rather than in flight, the pair is still taken —
+    // and the refusal is now the one for a request that asks for something that already
+    // exists, rather than the in-flight conflict above.
     tokio::time::sleep(past_the_settle_span()).await;
 
     for (index, baseline) in BASELINE_CATALOG.iter().enumerate() {
@@ -279,8 +281,8 @@ async fn one_baseline_enables_once_per_target_whichever_identifier_names_it() {
         assert_refused(
             &format!("{} deployed, repeated with {case}", baseline.name),
             &again,
-            409,
-            "ConflictException",
+            400,
+            "ValidationException",
         );
     }
 }

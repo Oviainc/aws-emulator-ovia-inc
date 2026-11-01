@@ -117,6 +117,8 @@ mod manifest_region_names;
 mod minted_arn_region_segment;
 #[path = "all/non_canonical_page_token_spellings.rs"]
 mod non_canonical_page_token_spellings;
+#[path = "all/one_enabled_baseline_per_target.rs"]
+mod one_enabled_baseline_per_target;
 #[path = "all/one_enabled_control_per_target.rs"]
 mod one_enabled_control_per_target;
 #[path = "all/operation_detail_availability_window.rs"]

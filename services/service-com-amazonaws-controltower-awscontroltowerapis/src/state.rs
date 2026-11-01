@@ -2210,9 +2210,10 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             .map(|(arn, _)| arn.clone())
     }
 
-    /// The ARN of the enabled baseline that already applies `baseline` to
-    /// `target_identifier`, or `None` when that pair is not enabled. Call [`settle`]
-    /// first, so a pair whose DISABLE has become due reads as not enabled.
+    /// The enabled baseline that already applies `baseline` to `target_identifier`, or
+    /// `None` when that pair is not enabled. Call [`settle`] first, so a pair whose
+    /// DISABLE has become due reads as not enabled — and so the status carried by the
+    /// record handed back is the one the clock owes it.
     ///
     /// The baseline is named by the CATALOG ENTRY a caller's identifier resolved to
     /// ([`resolve_baseline`]), not by that identifier's text: the same catalog is
@@ -2221,12 +2222,18 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     /// identifier always resolves, because an enablement is only ever written for a
     /// baseline this service publishes.
     ///
+    /// The whole record rather than its ARN, for the same reason
+    /// [`enabled_control_on_target`] hands one back: `EnableBaseline` classifies a
+    /// refused repeat by the STATE of the enablement it collided with, so it needs more
+    /// of that enablement than its name.
+    ///
     /// [`settle`]: Self::settle
+    /// [`enabled_control_on_target`]: Self::enabled_control_on_target
     pub fn enabled_baseline_on_target(
         &self,
         baseline: &CatalogBaseline,
         target_identifier: &str,
-    ) -> Option<String> {
+    ) -> Option<&EnabledBaseline> {
         self.enabled_baselines
             .values()
             .filter(|enabled| {
@@ -2235,8 +2242,7 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             })
             // The ARN orders the candidates totally, so the answer does not depend on the
             // map's iteration order.
-            .map(|enabled| enabled.arn.clone())
-            .min()
+            .min_by(|a, b| a.arn.cmp(&b.arn))
     }
 
     /// The identifier of the baseline operation still changing the enablement `arn` names,
