@@ -18,10 +18,9 @@
 //! The refusals the same rule implies are tables too: an update that would leave the set
 //! as it was, a set id nothing is stored under, a reused change token and an insert past
 //! the set's own modelled bound each answer their modelled exception and store nothing.
-//! (`WAFInvalidRegexPatternException` — the refusal of a string that is not a regular
-//! expression at all — needs a regex engine to decide, a caller-driven compile cost and a
-//! dependency this change does not take on; the gap is tracked by its own report,
-//! `issues/things-that-do-not-work/20261024T000000Z-waf-regional-updateregexpatternset-accepts-a-pattern-string-that-is-not-a-regex.md`.)
+//! A pattern string that is not a regular expression at all answers the modelled
+//! `WAFInvalidRegexPatternException`, over a table of malformed expressions and of
+//! constructs the syntax AWS documents for a pattern string does not have.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -32,7 +31,9 @@ use service_com_amazonaws_wafregional_awswaf_regional_20161128::state::{
 
 // The wire harness (router, `call`, `ok_call`, the error helpers) is shared with every
 // other suite in this crate; see `tests/all/wire.rs`.
-use crate::wire::{call, change_token, error_code, expect_error, ok_call, router, token_status};
+use crate::wire::{
+    call, change_token, error_code, error_message, expect_error, ok_call, router, token_status,
+};
 
 /// Pattern strings spanning the modelled `RegexPatternString` (`len 1..512`, pattern
 /// `.*`): both declared length bounds, character classes with anchors, the alternation
@@ -51,6 +52,66 @@ fn pattern_table() -> Vec<(&'static str, String)> {
         ("alternation group", r"(bot|crawler)-\d{1,3}".to_string()),
     ]
 }
+
+/// Further well-formed pattern strings, spanning more of the syntax a pattern string may
+/// use: a flag group, both forms of counted repeat, an escaped bracket inside a class, a
+/// literal backslash, an empty alternation branch and a byte-level escape.
+///
+/// They are a table of their own because [`pattern_table`]'s rows each get a pattern set
+/// of their own, and the account holds only a bounded number of those.
+fn more_well_formed_patterns() -> Vec<(&'static str, String)> {
+    vec![
+        ("case-insensitive flag group", "(?i)badbot".to_string()),
+        ("repeat with both bounds", "a{3,5}".to_string()),
+        ("open-ended repeat", "x{2,}".to_string()),
+        ("escaped brackets inside a class", r"[\[\]]+".to_string()),
+        ("a literal backslash", r"\\".to_string()),
+        ("an empty alternation branch", "(bot|)".to_string()),
+        // AWS WAF searches request BYTES, so a byte-level expression is a pattern string
+        // too: the engine this service decides pattern strings with is its byte matcher.
+        ("byte-level escape outside unicode mode", r"(?-u:\xFF)".to_string()),
+    ]
+}
+
+/// Strings the modelled `RegexPatternString` admits (`len 1..512`, pattern `.*`) that are
+/// NOT regular expressions: an unclosed character class and group, an unopened group, a
+/// quantifier with nothing to repeat, an inverted repeat range, a dangling escape, an
+/// empty or inverted class, an unknown character property… plus the constructs the syntax
+/// AWS documents for a pattern string does not have — look-around and a backreference.
+///
+/// Source for "does not have": `RegexPatternSetUpdate$RegexPatternString` documents the
+/// member as "the regular expression (regex) pattern that you want AWS WAF to search
+/// for", and the engine that searches is a linear-time one, which is why look-around and
+/// backreferences are outside the syntax.
+fn malformed_pattern_table() -> Vec<(&'static str, String)> {
+    vec![
+        ("unclosed character class", "[a-z".to_string()),
+        ("unclosed group", "(abc".to_string()),
+        ("unopened group", "abc)".to_string()),
+        ("quantifier with nothing to repeat", "*bad".to_string()),
+        ("inverted repeat range", "a{3,1}".to_string()),
+        ("trailing backslash", r"bad\".to_string()),
+        ("empty character class", "[]".to_string()),
+        ("inverted class range", "[z-a]".to_string()),
+        ("unterminated unicode property", r"\p{L".to_string()),
+        ("unknown unicode property", r"\p{NotAProperty}".to_string()),
+        ("lookahead, which the syntax does not have", "(?=admin)".to_string()),
+        ("lookbehind, which the syntax does not have", "(?<=admin)x".to_string()),
+        (
+            "backreference, which the syntax does not have",
+            r"(a)\1".to_string(),
+        ),
+        (
+            "a long malformed pattern at the modelled maximum length",
+            format!("({}", "a".repeat(511)),
+        ),
+    ]
+}
+
+/// `WAFInvalidRegexPatternException`'s fixed sentence, spelled out here so the test pins
+/// the wire text rather than whichever constant the handler reached for.
+const INVALID_REGEX_PATTERN: &str =
+    "The regular expression (regex) you specified in RegexPatternString is invalid.";
 
 /// One `RegexPatternSetUpdate`.
 fn update(action: &str, pattern: &str) -> Value {
@@ -412,4 +473,215 @@ async fn updates_past_the_modelled_bounds_are_refused() {
              got {reported}"
         );
     }
+}
+
+/// A `RegexPatternString` that is not a regular expression is refused with the modelled
+/// `WAFInvalidRegexPatternException`, whichever action carries it, and neither stores a
+/// pattern nor consumes the change token the request carried.
+#[tokio::test]
+async fn a_pattern_string_that_is_not_a_regular_expression_is_refused() {
+    let router = router();
+    let set_id = create_pattern_set(&router, "malformed").await;
+    // One pattern the set does hold, so a DELETE row is refused for being unparseable and
+    // not for finding an empty set, and so "stored nothing" has something to compare to.
+    let held = "^held-[a-z]+$";
+    apply_updates(&router, &set_id, &[update("INSERT", held)]).await;
+    let before = vec![held.to_string()];
+
+    for (case, pattern) in malformed_pattern_table() {
+        // Both actions: the string names nothing AWS WAF could search for either way.
+        for action in ["INSERT", "DELETE"] {
+            let label = format!("{case} ({action})");
+            let token = change_token(&router).await;
+            let body = expect_error(
+                &router,
+                "UpdateRegexPatternSet",
+                &json!({
+                    "RegexPatternSetId": set_id,
+                    "ChangeToken": token,
+                    "Updates": [update(action, &pattern)],
+                }),
+                "WAFInvalidRegexPatternException",
+                &label,
+            )
+            .await;
+
+            let message = error_message(&body);
+            assert_eq!(
+                message, INVALID_REGEX_PATTERN,
+                "case {label:?}: expected {INVALID_REGEX_PATTERN:?}, got {message:?}"
+            );
+            assert!(
+                !message.contains(pattern.as_str()),
+                "case {label:?}: the message must not echo the rejected pattern, \
+                 got {message:?}"
+            );
+
+            let actual = stored_patterns(&router, &set_id).await;
+            assert_eq!(
+                actual, before,
+                "case {label:?}: a refused update must leave the set as it was, \
+                 got {actual:?}"
+            );
+            let reported = token_status(&router, &token).await;
+            assert_eq!(
+                reported, "PROVISIONED",
+                "case {label:?}: a refused update must leave its change token \
+                 unconsumed, got {reported}"
+            );
+        }
+    }
+}
+
+/// Every well-formed pattern string is still accepted and read back: the forms of
+/// [`more_well_formed_patterns`], inserted and then deleted on ONE set, so the account
+/// stays inside the pattern-set bound `CreateRegexPatternSet` enforces.
+#[tokio::test]
+async fn a_well_formed_pattern_string_is_still_accepted_whatever_form_it_takes() {
+    let router = router();
+    let set_id = create_pattern_set(&router, "well-formed").await;
+
+    for (case, pattern) in more_well_formed_patterns() {
+        apply_updates(&router, &set_id, &[update("INSERT", &pattern)]).await;
+        let after_insert = stored_patterns(&router, &set_id).await;
+        assert_eq!(
+            after_insert,
+            vec![pattern.clone()],
+            "case {case:?}: expected the inserted pattern to be read back, \
+             got {after_insert:?}"
+        );
+
+        apply_updates(&router, &set_id, &[update("DELETE", &pattern)]).await;
+        let after_delete = stored_patterns(&router, &set_id).await;
+        assert!(
+            after_delete.is_empty(),
+            "case {case:?}: expected the deleted pattern to be gone, got {after_delete:?}"
+        );
+    }
+}
+
+/// The whole request is judged before any of it is applied: a batch whose patterns are
+/// well-formed except for one is refused, and the well-formed ones in it are not stored —
+/// wherever in the batch the malformed one sits.
+#[tokio::test]
+async fn one_malformed_pattern_refuses_the_whole_batch() {
+    let router = router();
+    let malformed = "(unclosed";
+
+    // Rows: the batch to apply, differing in where the malformed pattern sits and in how
+    // many well-formed updates surround it.
+    let rows: Vec<(&str, Vec<Value>)> = vec![
+        (
+            "malformed first",
+            vec![update("INSERT", malformed), update("INSERT", "^second$")],
+        ),
+        (
+            "malformed last",
+            vec![update("INSERT", "^first$"), update("INSERT", malformed)],
+        ),
+        (
+            "malformed in the middle of three",
+            vec![
+                update("INSERT", "^first$"),
+                update("INSERT", malformed),
+                update("INSERT", "^third$"),
+            ],
+        ),
+        (
+            "two malformed patterns",
+            vec![update("INSERT", malformed), update("INSERT", "a{9,2}")],
+        ),
+    ];
+
+    for (case, updates) in rows {
+        let set_id = create_pattern_set(&router, &format!("batch-{case}")).await;
+        let token = change_token(&router).await;
+        expect_error(
+            &router,
+            "UpdateRegexPatternSet",
+            &json!({"RegexPatternSetId": set_id, "ChangeToken": token, "Updates": updates}),
+            "WAFInvalidRegexPatternException",
+            case,
+        )
+        .await;
+
+        let actual = stored_patterns(&router, &set_id).await;
+        assert!(
+            actual.is_empty(),
+            "case {case:?}: no update of a refused batch may be stored, got {actual:?}"
+        );
+        let reported = token_status(&router, &token).await;
+        assert_eq!(
+            reported, "PROVISIONED",
+            "case {case:?}: a refused update must leave its change token unconsumed, \
+             got {reported}"
+        );
+    }
+}
+
+/// The pattern string is judged over the bounded `Updates` list before the store is
+/// reached, so an unparseable pattern is the answer even when the rest of the request is
+/// also wrong — and a well-formed pattern still reaches the other refusals, which is what
+/// keeps this check from swallowing them.
+#[tokio::test]
+async fn the_pattern_refusal_does_not_displace_the_other_refusals() {
+    let router = router();
+    let set_id = create_pattern_set(&router, "ordering").await;
+    let spent = change_token(&router).await;
+    ok_call(
+        &router,
+        "CreateRegexPatternSet",
+        &json!({"Name": "token-spender", "ChangeToken": spent}),
+    )
+    .await;
+    let unknown_set = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+
+    // Rows: the request, and the modelled exception it must answer.
+    let rows: Vec<(&str, Value, &str)> = vec![
+        (
+            "a well-formed pattern against an unknown set id",
+            json!({
+                "RegexPatternSetId": unknown_set,
+                "ChangeToken": spent,
+                "Updates": [update("INSERT", "^fine$")],
+            }),
+            "WAFNonexistentContainerException",
+        ),
+        (
+            "a malformed pattern against an unknown set id",
+            json!({
+                "RegexPatternSetId": unknown_set,
+                "ChangeToken": spent,
+                "Updates": [update("INSERT", "[unclosed")],
+            }),
+            "WAFInvalidRegexPatternException",
+        ),
+        (
+            "a well-formed pattern with a spent change token",
+            json!({
+                "RegexPatternSetId": set_id,
+                "ChangeToken": spent,
+                "Updates": [update("INSERT", "^fine$")],
+            }),
+            "WAFStaleDataException",
+        ),
+        (
+            "a malformed pattern with a spent change token",
+            json!({
+                "RegexPatternSetId": set_id,
+                "ChangeToken": spent,
+                "Updates": [update("INSERT", "[unclosed")],
+            }),
+            "WAFInvalidRegexPatternException",
+        ),
+    ];
+
+    for (case, request, expected) in rows {
+        expect_error(&router, "UpdateRegexPatternSet", &request, expected, case).await;
+    }
+
+    assert!(
+        stored_patterns(&router, &set_id).await.is_empty(),
+        "the refusals must have stored nothing"
+    );
 }

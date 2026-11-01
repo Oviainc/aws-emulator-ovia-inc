@@ -482,6 +482,14 @@ pub const MESSAGE_INVALID_OPERATION: &str = "The operation is not valid.";
 /// [`MESSAGE_DISALLOWED_NAME`].
 pub const MESSAGE_INVALID_PERMISSION_POLICY: &str =
     "The specific permission policy is not valid.";
+/// The fixed sentence for `WAFInvalidRegexPatternException`, the refusal of a pattern
+/// string that is not a regular expression, from the shape's own documentation — see
+/// [`MESSAGE_DISALLOWED_NAME`].
+///
+/// It names the member the rejected text came in on, which the shape's documentation
+/// does too, and carries nothing of the request: the text itself is never echoed.
+pub const MESSAGE_INVALID_REGEX_PATTERN: &str =
+    "The regular expression (regex) you specified in RegexPatternString is invalid.";
 
 /// The date AWS WAF Classic (AWS WAF v1, of which this regional endpoint is the
 /// regional half) reached END OF SUPPORT, after which its control plane admits no new
@@ -837,6 +845,32 @@ pub enum IPSetDeleteRefusal {
     /// The IPSet still holds `IPSetDescriptor`s. "… or if it still includes any IP
     /// addresses": the modelled `WAFNonEmptyEntityException`.
     NotEmpty,
+}
+
+/// Emulator resource guard, NOT an AWS quota: the largest compiled form this emulator
+/// builds for one caller-supplied pattern string.
+const REGEX_SIZE_LIMIT: usize = 1 << 20;
+
+/// Emulator resource guard, NOT an AWS quota: the largest automaton cache the engine may
+/// use while deciding one caller-supplied pattern string.
+const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
+
+/// Whether `pattern` is a regular expression AWS WAF would accept as a
+/// `RegexPatternString`.
+///
+/// `RegexPatternString` is constrained by a length bound and `@pattern(".*")` only
+/// (`smithy_query(query="shape",shape="RegexPatternSetUpdate")`), so the request boundary
+/// passes every string of legal length and whether the text is an expression at all is
+/// the service's own judgement, made where a write would store it. Decided by compiling
+/// it with the maintained engine — the pattern AWS WAF searches request BYTES for, in the
+/// syntax AWS documents for a pattern string (no look-around, no backreferences) — under
+/// a compiled-size and an automaton-cache bound, because the text comes from the request.
+pub fn is_regex_pattern_string(pattern: &str) -> bool {
+    ::regex::bytes::RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
+        .build()
+        .is_ok()
 }
 
 /// One stored `RegexPatternSet`.

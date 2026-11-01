@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Decides whether a caller-supplied `RegexPatternString` is a regular expression at all:
+# a linear-time engine whose syntax is the one AWS WAF documents for a pattern string.
+regex = "1.13"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

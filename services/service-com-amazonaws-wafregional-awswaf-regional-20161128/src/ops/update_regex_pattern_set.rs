@@ -7,7 +7,8 @@
 //! pattern-string collection, `DELETE` removes it — so every later `GetRegexPatternSet`
 //! of that id reports the patterns this call wrote. A mutation, as the operation's own
 //! documentation states ("Inserts or deletes RegexPatternString objects in a
-//! RegexPatternSet").
+//! RegexPatternSet"). A pattern string that is not a regular expression at all is
+//! refused with the modelled `WAFInvalidRegexPatternException` and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -207,14 +208,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `ChangeAction` is an enum shape and `RegexPatternString`'s length bounds are
-        // modelled, so both are refused before this handler runs; a pattern string that
-        // satisfies them is stored as given. Whether the string is a regular expression
-        // AWS would compile is what the operation's `WAFInvalidRegexPatternException`
-        // answers, and deciding it means compiling caller text — a caller-driven cost,
-        // and a dependency, this change does not take on. That gap is tracked by its own
-        // report, `issues/things-that-do-not-work/20261024T000000Z-waf-regional-\
-        // updateregexpatternset-accepts-a-pattern-string-that-is-not-a-regex.md`, which
-        // states what a fix needs; it is not guessed at here.
+        // modelled, so both are refused before this handler runs. Whether the string is a
+        // regular expression at all is this service's own judgement, and the operation's
+        // `WAFInvalidRegexPatternException` is its answer: a pattern string the engine
+        // cannot compile names nothing AWS WAF could ever search for, whichever action
+        // carries it. Decided HERE — over the already-bounded `Updates` list, before the
+        // shared store's lock is taken — so no caller-chosen compile cost is ever paid
+        // inside the critical section, and a refused request stores nothing and leaves
+        // its change token unconsumed.
+        if input
+            .updates
+            .iter()
+            .any(|update| !crate::state::is_regex_pattern_string(&update.regex_pattern_string))
+        {
+            return Err(
+                UpdateRegexPatternSetErrorModeled::WAFInvalidRegexPatternException(
+                    WAFInvalidRegexPatternException {
+                        message: Some(crate::state::MESSAGE_INVALID_REGEX_PATTERN.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateRegexPatternSetErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {
