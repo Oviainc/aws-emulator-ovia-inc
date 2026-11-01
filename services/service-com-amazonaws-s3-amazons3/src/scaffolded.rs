@@ -70,7 +70,8 @@
 //!
 //! Beside the code and the message, S3's error document carries the member that says WHICH
 //! resource the refusal is about — `<BucketName>` for a bucket-scoped refusal,
-//! `<AnnotationName>` for an annotation-scoped one — copied from the request. No error
+//! `<AnnotationName>` for an annotation-scoped one, `<TagKey>` for one about a tag of a tag
+//! set — copied from the request. No error
 //! shape in this model declares such a member, and the codes the model does not declare
 //! have no shape at all, so a handler refusing a request because of the resource it
 //! addresses attaches the name through [`Scaffolded::naming`] (or the
@@ -541,6 +542,20 @@ static ANNOTATION_NAME: Schema = Schema::new_member(
 )
 .with_xml_name("AnnotationName");
 
+/// The `<TagKey>` of an S3 error document: the member a refusal about one TAG of a tag set
+/// names that tag's key by. See [`BUCKET_NAME`].
+static TAG_KEY: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedResource$tagKey",
+        "smithy.framework",
+        "tagKey",
+    ),
+    ShapeType::String,
+    "tagKey",
+    3,
+)
+.with_xml_name("TagKey");
+
 /// The resource a refusal is ABOUT, and therefore which member of the error document names
 /// it.
 ///
@@ -561,6 +576,9 @@ pub enum RefusedResource {
     /// An annotation-scoped refusal, named by `<AnnotationName>`: the annotation name the
     /// request addressed.
     Annotation(String),
+    /// A refusal about one TAG of a tag set, named by `<TagKey>`: the key the request
+    /// carried.
+    TagKey(String),
 }
 
 impl RefusedResource {
@@ -569,13 +587,14 @@ impl RefusedResource {
         match self {
             Self::Bucket(_) => &BUCKET_NAME,
             Self::Annotation(_) => &ANNOTATION_NAME,
+            Self::TagKey(_) => &TAG_KEY,
         }
     }
 
     /// The name itself, exactly as the request spelled it.
     fn name(&self) -> &str {
         match self {
-            Self::Bucket(name) | Self::Annotation(name) => name.as_str(),
+            Self::Bucket(name) | Self::Annotation(name) | Self::TagKey(name) => name.as_str(),
         }
     }
 }
@@ -673,6 +692,26 @@ impl<E> Scaffolded<E> {
     /// [`Scaffolded::naming`] for the annotation an annotation-scoped refusal is about.
     pub fn naming_annotation(self, annotation: &str) -> Self {
         self.naming(RefusedResource::Annotation(annotation.to_string()))
+    }
+
+    /// The refusal S3 answers a tag set that breaks one of the published restrictions with:
+    /// the rejection's own wire code and sentence at [`crate::state::TAG_REJECTION_STATUS`],
+    /// plus the `<TagKey>` member when the refusal is about one tag's key.
+    ///
+    /// The ONE place a tag-set rejection becomes a wire refusal, so the several operations
+    /// that write a tag set — the two tagging puts and every object write carrying an
+    /// `x-amz-tagging` header — cannot disagree about the status, the code or the member
+    /// the envelope carries.
+    pub fn tag_set(rejection: &crate::state::TagSetRejection) -> Self {
+        let refusal = Self::unmodeled(
+            rejection.code(),
+            crate::state::TAG_REJECTION_STATUS,
+            rejection.to_string(),
+        );
+        match rejection.tag_key() {
+            Some(key) => refusal.naming(RefusedResource::TagKey(key.to_string())),
+            None => refusal,
+        }
     }
 }
 

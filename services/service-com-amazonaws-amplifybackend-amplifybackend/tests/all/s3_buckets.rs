@@ -33,15 +33,18 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The endpoint host an AmplifyBackend request addresses.
 const AMPLIFYBACKEND_HOST: &str = "amplifybackend.us-east-1.amazonaws.com";
 
-/// The endpoint host an S3 request addresses.
-const S3_HOST: &str = "s3.us-east-1.amazonaws.com";
-
 /// A SigV4 `Authorization` header whose credential scope names `service`, which is the
 /// routing key the router claims a request by. The key id and signature are not
 /// credentials: this harness turns request authentication off, so nothing is verified.
 fn authorization(service: &str) -> String {
+    authorization_in(service, "us-east-1")
+}
+
+/// [`authorization`] whose credential scope names `region`, which is how the emulator reads
+/// WHICH Region's endpoint a client addressed it as.
+fn authorization_in(service: &str, region: &str) -> String {
     format!(
-        "AWS4-HMAC-SHA256 Credential=emulator-test-key/20260101/us-east-1/{service}/aws4_request, \
+        "AWS4-HMAC-SHA256 Credential=emulator-test-key/20260101/{region}/{service}/aws4_request, \
          SignedHeaders=host, Signature=not-verified"
     )
 }
@@ -68,6 +71,10 @@ fn router_on_shared_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>
 
 /// `PUT /<bucket>` — S3's `CreateBucket`, with the location constraint (when any) in its
 /// XML payload. Answers the HTTP status.
+///
+/// The request is addressed to the endpoint of the Region the constraint names, the way a
+/// client that creates a bucket there addresses S3: an endpoint for one Region cannot place
+/// a bucket in another, and an absent constraint names `us-east-1`.
 async fn create_bucket(
     router: &MultiServiceRouter,
     bucket: &str,
@@ -81,11 +88,16 @@ async fn create_bucket(
              </CreateBucketConfiguration>"
         ),
     };
+    // The Region the constraint names, through the one reading S3 itself uses: absent means
+    // `us-east-1` and the legacy `EU` means `eu-west-1`
+    // (`CreateBucketConfiguration$LocationConstraint`).
+    let region = service_com_amazonaws_s3_amazons3::state::bucket_region(location_constraint);
+    let host = format!("s3.{region}.amazonaws.com");
     let request = http::Request::builder()
         .method("PUT")
-        .uri(format!("https://{S3_HOST}/{bucket}"))
-        .header("host", S3_HOST)
-        .header("authorization", authorization("s3"))
+        .uri(format!("https://{host}/{bucket}"))
+        .header("host", &host)
+        .header("authorization", authorization_in("s3", &region))
         .header("content-type", "application/xml")
         .body(Bytes::from(body))
         .expect("build the CreateBucket request");

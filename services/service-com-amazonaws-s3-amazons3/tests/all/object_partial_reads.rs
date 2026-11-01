@@ -646,8 +646,13 @@ async fn a_read_of_an_archived_object_is_refused_until_a_copy_is_restored() {
         let key = format!("mpu-{}.bin", storage_class.to_ascii_lowercase());
         let parts = vec![sized_payload(MIN_MULTIPART_PART_BYTES), sized_payload(32)];
         let assembled: Vec<u8> = parts.concat();
-        bucket(&router, &format!("archived-mpu-{}", storage_class.to_ascii_lowercase())).await;
-        let bucket_name = format!("archived-mpu-{}", storage_class.to_ascii_lowercase());
+        // The published bucket naming rules admit no underscore, so the class names the
+        // bucket with hyphens in place of them.
+        let bucket_name = format!(
+            "archived-mpu-{}",
+            storage_class.to_ascii_lowercase().replace('_', "-")
+        );
+        bucket(&router, &bucket_name).await;
         completed_multipart_object(
             &router,
             &bucket_name,

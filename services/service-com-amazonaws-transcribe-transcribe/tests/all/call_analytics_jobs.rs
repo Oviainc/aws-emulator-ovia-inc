@@ -60,7 +60,7 @@ const ROLE_ARN: &str = "arn:aws:iam::111122223333:role/CallAnalyticsAccess";
 /// STAGE that data before calling the helper: a model's training settles on what the
 /// store answers about this location, and only a model that settled `COMPLETED` is one a
 /// job may apply.
-pub(crate) const MODEL_TRAINING_BUCKET: &str = "DOC-EXAMPLE-BUCKET";
+pub(crate) const MODEL_TRAINING_BUCKET: &str = "doc-example-bucket";
 /// See [`MODEL_TRAINING_BUCKET`].
 pub(crate) const MODEL_TRAINING_PREFIX: &str = "training/";
 /// See [`MODEL_TRAINING_BUCKET`].

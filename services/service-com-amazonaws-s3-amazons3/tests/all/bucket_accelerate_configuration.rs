@@ -298,11 +298,13 @@ async fn an_accelerate_payload_naming_no_settable_state_is_refused() {
 async fn a_bucket_name_carrying_a_period_cannot_be_accelerated() {
     let router = router();
     // Names differing in WHERE the period sits and how many there are, beside one name
-    // with none at all as the control.
+    // with none at all as the control. Each is a name S3 holds a bucket under — the
+    // published naming rules allow a period between two letters and refuse one at either
+    // end — so what the put below is refused for is the feature, not the name.
     let dotted: &[&str] = &[
         "harvest.archive",
         "harvest.archive.logs",
-        "harvest-archive.",
+        "h.arvest-archive",
     ];
     for bucket in dotted {
         create_bucket(&router, bucket).await;

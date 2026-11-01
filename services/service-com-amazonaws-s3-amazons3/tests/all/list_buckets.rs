@@ -192,15 +192,16 @@ fn is_canonical_user_id(id: &str) -> bool {
 #[tokio::test]
 async fn a_listing_reports_every_created_bucket_in_name_order() {
     // Name sets whose byte order differs from any "natural" order a sort might fall back
-    // on, and from the order they are created in: upper case before lower case,
-    // `log-10` before `log-2`, and punctuation ordered by code point (`-` 0x2D < `.`
-    // 0x2E < `0` 0x30).
+    // on, and from the order they are created in: `log-10` before `log-2`, punctuation
+    // ordered by code point (`-` 0x2D < `.` 0x2E < `0` 0x30), and a hyphen sorting before
+    // the letter a punctuation-folding order would skip it for. Every name is one the
+    // published naming rules admit, so a row's set is one an account can really hold.
     let rows: &[(&str, &[&str])] = &[
         ("a single bucket", &["only-bucket"]),
         ("three plain names", &["alpha", "beta", "gamma"]),
         ("digits are not numbers", &["log-1", "log-10", "log-2"]),
         ("punctuation by code point", &["a-b", "a.b", "a0b"]),
-        ("upper case before lower case", &["Zeta", "alpha"]),
+        ("a hyphen before the letter that follows it", &["a-bc", "abc"]),
         (
             "names that are prefixes of one another",
             &["app", "app-data", "app-data-2", "appz"],

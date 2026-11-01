@@ -18,15 +18,24 @@
 //!   `AccessControlListNotSupported`; `CreateBucket`'s `x-amz-object-ownership` chooses
 //!   another setting, and a create that names BOTH an ACL and the enforced setting is
 //!   refused `InvalidBucketAclWithObjectOwnership`.
-//! * The create endpoint. A `CreateBucket` naming no `LocationConstraint` can only mean the
-//!   one Region the unspecified constraint stands for — "If you don't specify a Region, the
-//!   bucket is created in the US East (N. Virginia) Region (us-east-1) by default"
-//!   (`CreateBucketConfiguration$LocationConstraint`) — so an endpoint for any other Region
-//!   refuses it with `IllegalLocationConstraintException`.
+//! * The create endpoint. An endpoint for ONE Region can only create a bucket IN that
+//!   Region, so the `LocationConstraint` a `CreateBucket` carries has to name that Region —
+//!   where an absent constraint names "the US East (N. Virginia) Region (us-east-1) by
+//!   default" (`CreateBucketConfiguration$LocationConstraint`) and the legacy `EU` names
+//!   `eu-west-1`. A constraint naming any other Region is refused with
+//!   `IllegalLocationConstraintException` (HTTP 400), whose message names the constraint the
+//!   request carried, and nothing is created. The GLOBAL endpoint is not an endpoint for one
+//!   Region — "if you send your CreateBucket request to the s3.amazonaws.com global
+//!   endpoint, the request goes to the us-east-1 Region … even if the location constraint in
+//!   the request specifies another Region" (`CreateBucket`'s own documentation) — so it
+//!   serves a create for any of them.
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::bucket_lifecycle::{create_bucket, get_bucket_policy, put_bucket_policy, router, send, Answer};
+use super::bucket_lifecycle::{
+    create_bucket, get_bucket_policy, put_bucket_policy, router, send, send_bytes_to_host,
+    send_in_region, Answer,
+};
 use super::bucket_ownership_controls::put_ownership_controls;
 use super::bucket_public_access_block::{allow_public_access, put_public_access_block};
 
@@ -472,39 +481,23 @@ async fn a_create_naming_both_an_acl_and_the_enforced_setting_is_refused() {
     }
 }
 
-/// Dispatch one request signed for `region`, so the emulator sees the endpoint a client of
-/// that Region addressed it as.
+/// A create addressed to the endpoint of `region`, carrying `body`.
 ///
 /// The suite's shared harness signs every request for `us-east-1`; the location-constraint
-/// rule is about the Region in the credential scope, so this is the one place a request
-/// carries another one.
-async fn send_in_region(
+/// rule is about WHICH endpoint the request reached, so these rows go through the harness's
+/// own per-Region sender ([`send_in_region`]).
+async fn create_at_endpoint(
     router: &MultiServiceRouter,
     region: &str,
-    method: &str,
-    uri: &str,
+    bucket: &str,
     body: &str,
 ) -> Answer {
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential=emulator-test-key/20260101/{region}/s3/aws4_request, \
-         SignedHeaders=host, Signature=not-verified"
-    );
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://s3.{region}.amazonaws.com{uri}"))
-        .header("host", format!("s3.{region}.amazonaws.com"))
-        .header("authorization", authorization)
-        .header("content-type", "application/xml")
-        .body(bytes::Bytes::copy_from_slice(body.as_bytes()))
-        .expect("the test request must build");
-    let response = router.dispatch(request).await;
-    let (parts, body) = response.into_parts();
-    Answer {
-        status: parts.status.as_u16(),
-        headers: parts.headers,
-        body,
-    }
+    send_in_region(router, region, "PUT", &format!("/{bucket}"), &[], body).await
 }
+
+/// The host of S3's GLOBAL endpoint, the one endpoint that is not an endpoint for a single
+/// Region.
+const GLOBAL_ENDPOINT: &str = "s3.amazonaws.com";
 
 /// The `CreateBucketConfiguration` payload naming `constraint`, or no body at all for a
 /// create that names none.
@@ -531,14 +524,7 @@ async fn a_create_naming_no_location_constraint_is_served_only_by_the_us_east_1_
         .enumerate()
     {
         let bucket = format!("location-refused-{index}");
-        let refused = send_in_region(
-            &router,
-            region,
-            "PUT",
-            &format!("/{bucket}"),
-            &location_payload(None),
-        )
-        .await;
+        let refused = create_at_endpoint(&router, region, &bucket, &location_payload(None)).await;
         assert_eq!(
             refused.error_code(),
             "IllegalLocationConstraintException",
@@ -557,14 +543,8 @@ async fn a_create_naming_no_location_constraint_is_served_only_by_the_us_east_1_
         // Nothing was recorded, and the SAME endpoint serves the create once it names the
         // constraint — so the refusal is about the missing constraint, not about the
         // endpoint being unreachable.
-        let named = send_in_region(
-            &router,
-            region,
-            "PUT",
-            &format!("/{bucket}"),
-            &location_payload(Some(region)),
-        )
-        .await;
+        let named =
+            create_at_endpoint(&router, region, &bucket, &location_payload(Some(region))).await;
         assert_eq!(
             named.status, 200,
             "case {region:?}: the create naming the constraint must succeed, got {} with \
@@ -576,11 +556,10 @@ async fn a_create_naming_no_location_constraint_is_served_only_by_the_us_east_1_
 
     // The one endpoint the unspecified constraint names serves it: this is the asymmetry
     // the rule is about.
-    let created = send_in_region(
+    let created = create_at_endpoint(
         &router,
         "us-east-1",
-        "PUT",
-        "/location-default-endpoint",
+        "location-default-endpoint",
         &location_payload(None),
     )
     .await;
@@ -590,4 +569,154 @@ async fn a_create_naming_no_location_constraint_is_served_only_by_the_us_east_1_
         created.status,
         String::from_utf8_lossy(&created.body)
     );
+}
+
+/// One row of the named-constraint table: the endpoint's Region, the constraint the create
+/// carries, and whether that endpoint can place the bucket.
+#[derive(Debug, Clone, Copy)]
+struct EndpointRow {
+    case: &'static str,
+    endpoint_region: &'static str,
+    constraint: &'static str,
+    served: bool,
+}
+
+#[tokio::test]
+async fn a_named_location_constraint_is_served_only_by_the_endpoint_of_its_own_region() {
+    let router = router();
+
+    // The rows differ along what the rule generalises over: which Region the endpoint is
+    // for, how far the constraint is from it (another Region of the same partition, a
+    // Region of another partition, the default Region named explicitly), and the FORM the
+    // constraint takes — the legacy `EU` alias and the Region code it stands for are one
+    // Region, so each is served by that Region's endpoint and refused elsewhere.
+    let rows: &[EndpointRow] = &[
+        EndpointRow {
+            case: "another Region's constraint on a regional endpoint",
+            endpoint_region: "us-east-1",
+            constraint: "eu-west-1",
+            served: false,
+        },
+        EndpointRow {
+            case: "a neighbouring Region's constraint",
+            endpoint_region: "us-west-2",
+            constraint: "us-west-1",
+            served: false,
+        },
+        EndpointRow {
+            case: "a constraint of another partition",
+            endpoint_region: "us-west-2",
+            constraint: "cn-north-1",
+            served: false,
+        },
+        EndpointRow {
+            case: "the legacy EU alias on an endpoint that is not eu-west-1",
+            endpoint_region: "us-east-1",
+            constraint: "EU",
+            served: false,
+        },
+        EndpointRow {
+            case: "the endpoint's own Region",
+            endpoint_region: "ap-northeast-3",
+            constraint: "ap-northeast-3",
+            served: true,
+        },
+        EndpointRow {
+            case: "the legacy EU alias on the endpoint of the Region it stands for",
+            endpoint_region: "eu-west-1",
+            constraint: "EU",
+            served: true,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let EndpointRow {
+            case,
+            endpoint_region,
+            constraint,
+            served,
+        } = *row;
+        let bucket = format!("constraint-endpoint-{index}");
+        let answer = create_at_endpoint(
+            &router,
+            endpoint_region,
+            &bucket,
+            &location_payload(Some(constraint)),
+        )
+        .await;
+        if served {
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected HTTP 200, got {} with body {:?}",
+                answer.status,
+                String::from_utf8_lossy(&answer.body)
+            );
+            continue;
+        }
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400, got {} with body {:?}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.error_code(),
+            "IllegalLocationConstraintException",
+            "case {case:?}: expected the error code \"IllegalLocationConstraintException\", \
+             got {:?}",
+            answer.error_code()
+        );
+        // The message names the constraint the request carried, as it carried it.
+        let expected = format!(
+            "The {constraint} location constraint is incompatible for the region specific \
+             endpoint this request was sent to."
+        );
+        assert_eq!(
+            answer.error_message(),
+            expected,
+            "case {case:?}: expected the message {expected:?}, got {:?}",
+            answer.error_message()
+        );
+        // Refused before anything was written: the bucket is not there afterwards. Read at
+        // the same endpoint, since a read of a bucket this emulator does not hold answers
+        // about the address rather than about the Region.
+        let read = send(&router, "HEAD", &format!("/{bucket}"), &[], "").await;
+        assert_eq!(
+            read.status, 404,
+            "case {case:?}: a refused create must leave no bucket behind, got {}",
+            read.status
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_global_endpoint_serves_a_create_for_any_region() {
+    let router = router();
+
+    // The global endpoint is not an endpoint for one Region, so every constraint — and no
+    // constraint at all — is served there, including the ones a regional endpoint refuses
+    // above. `us-east-1` is not one of them: it is not a `BucketLocationConstraint` value
+    // at all (that Region is what naming NO constraint means).
+    for (index, constraint) in [None, Some("eu-west-1"), Some("EU"), Some("ap-northeast-3")]
+        .into_iter()
+        .enumerate()
+    {
+        let bucket = format!("global-endpoint-{index}");
+        let created = send_bytes_to_host(
+            &router,
+            "PUT",
+            GLOBAL_ENDPOINT,
+            &format!("/{bucket}"),
+            &[("content-type", "application/xml")],
+            location_payload(constraint).as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {constraint:?}: the global endpoint serves the create, got {} with body \
+             {:?}",
+            created.status,
+            String::from_utf8_lossy(&created.body)
+        );
+    }
 }

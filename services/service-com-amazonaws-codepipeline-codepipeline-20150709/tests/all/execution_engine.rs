@@ -220,8 +220,24 @@ pub(crate) fn declaration(name: &str, stages: Value, execution_mode: Option<&str
 }
 
 /// The artifact-store bucket one test pipeline uses.
+///
+/// A pipeline name may carry upper case and punctuation an Amazon S3 bucket name may not
+/// ("bucket names can consist only of lowercase letters, numbers, dots (.), and hyphens
+/// (-)"), so the name is folded into the character class S3 holds a bucket under. This is
+/// the one place the suite derives the bucket from the pipeline name, so the create and the
+/// `artifactStore` declaration name the same bucket.
 pub(crate) fn artifact_bucket(name: &str) -> String {
-    format!("{name}-artifacts")
+    let folded: String = name
+        .chars()
+        .map(|character| {
+            let lowered = character.to_ascii_lowercase();
+            match lowered.is_ascii_lowercase() || lowered.is_ascii_digit() {
+                true => lowered,
+                false => '-',
+            }
+        })
+        .collect();
+    format!("{}-artifacts", folded.trim_matches('-'))
 }
 
 /// An S3 source stage producing `output` from `bucket`/`key`.

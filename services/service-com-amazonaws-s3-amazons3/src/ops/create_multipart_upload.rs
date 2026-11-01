@@ -427,9 +427,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // query string it is declared to be and judged against an OBJECT's published
         // tag-set limits, the same seam `PutObject` judges its own header through, so one
         // header cannot mean two different things. AWS refuses these with `InvalidTag`, a
-        // code this service's model declares no shape for, so the refusal carries the
-        // rejection's own wire code ([`crate::state::TagSetRejection::code`]) through the
-        // unmodelled channel — and is decided BEFORE anything is recorded, so a refused
+        // code this service's model declares no shape for, so the refusal is the one every
+        // tag-set write answers with ([`crate::scaffolded::Scaffolded::tag_set`]) through
+        // the unmodelled channel — and is decided BEFORE anything is recorded, so a refused
         // initiation leaves the bucket's uploads untouched.
         let tags = match input.tagging.as_deref() {
             Some(header) => {
@@ -439,11 +439,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ) {
                     Ok(tags) => tags,
                     Err(rejection) => {
-                        return Err(crate::scaffolded::Scaffolded::unmodeled(
-                            rejection.code(),
-                            crate::state::TAG_REJECTION_STATUS,
-                            rejection.to_string(),
-                        ))
+                        return Err(crate::scaffolded::Scaffolded::tag_set(&rejection))
                     }
                 }
             }

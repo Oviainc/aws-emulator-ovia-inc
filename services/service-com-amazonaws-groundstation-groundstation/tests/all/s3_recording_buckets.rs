@@ -92,10 +92,11 @@ pub(crate) async fn create(router: &MultiServiceRouter, name: &str, config_data:
 async fn a_recording_config_is_created_for_a_bucket_the_account_holds() {
     let router = harness_with_object_storage();
 
-    // Bucket names differing along what the rule generalises over: length, and the
-    // characters S3 allows in a name (hyphens, digits, dots). Each is created through S3,
-    // so Ground Station's acceptance is grounded in S3 holding it.
-    for bucket in ["gs", "aws-groundstation-downlink", "my.recording-bucket-01"] {
+    // Bucket names differing along what the rule generalises over: length (one at the
+    // published three-character minimum), and the characters S3 allows in a name (hyphens,
+    // digits, dots). Each is created through S3, so Ground Station's acceptance is grounded
+    // in S3 holding it.
+    for bucket in ["gs1", "aws-groundstation-downlink", "my.recording-bucket-01"] {
         let created = create_bucket(&router, bucket).await;
         assert_eq!(
             created, 200,
@@ -106,10 +107,10 @@ async fn a_recording_config_is_created_for_a_bucket_the_account_holds() {
     // Rows: the bucket ARN as written, and the bucket it names. The last row carries a
     // key after the bucket, which still names its bucket, so the ARN's form is varied too.
     let rows = [
-        ("short name", "arn:aws:s3:::gs"),
+        ("short name", "arn:aws:s3:::gs1"),
         ("hyphenated name", "arn:aws:s3:::aws-groundstation-downlink"),
         ("dotted name", "arn:aws:s3:::my.recording-bucket-01"),
-        ("a key under an existing bucket", "arn:aws:s3:::gs/downlink/key"),
+        ("a key under an existing bucket", "arn:aws:s3:::gs1/downlink/key"),
     ];
     for (case, bucket_arn) in rows {
         let config_data = recording_config(bucket_arn);

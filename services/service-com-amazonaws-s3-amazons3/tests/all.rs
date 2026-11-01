@@ -117,9 +117,6 @@ mod error_message_envelope;
 // `error_message_envelope`, which spans the same rule from the model's own catalog.
 #[path = "all/error_messages.rs"]
 mod error_messages;
-// Deliberately empty: the general purpose bucket naming rule this fix tried to enforce is a
-// cause of another open issue, and enforcing it here refused names unrelated service crates'
-// fixtures create — see the file's own header.
 #[path = "all/general_purpose_bucket_names.rs"]
 mod general_purpose_bucket_names;
 #[path = "all/head_object_read_back.rs"]
@@ -250,6 +247,8 @@ mod request_integrity_headers;
 mod refusal_messages_published;
 #[path = "all/refusal_resource_naming.rs"]
 mod refusal_resource_naming;
+#[path = "all/reserved_tag_key_prefix.rs"]
+mod reserved_tag_key_prefix;
 #[path = "all/signature_refusal_wording.rs"]
 mod signature_refusal_wording;
 #[path = "all/state_roundtrip.rs"]

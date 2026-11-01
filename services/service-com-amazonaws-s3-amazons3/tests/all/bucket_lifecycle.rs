@@ -35,6 +35,15 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=emulator-test-key/20260101/us-east-1/s3/aws4_request, \
      SignedHeaders=host, Signature=not-verified";
 
+/// [`AUTHORIZATION`] with `region` in its credential scope — which is how the emulator reads
+/// WHICH Region's endpoint a client addressed it as.
+fn authorization_for(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential=emulator-test-key/20260101/{region}/s3/aws4_request, \
+         SignedHeaders=host, Signature=not-verified"
+    )
+}
+
 /// One service mounted on its own engine, reached exactly the way the production router
 /// reaches it.
 ///
@@ -148,11 +157,54 @@ pub(crate) async fn send_bytes_to_host(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Answer {
+    send_bytes_signed(router, AUTHORIZATION, method, host, uri, headers, body).await
+}
+
+/// [`send_bytes_to_host`] signed for `region` and addressed to that Region's own endpoint —
+/// which is what tells the emulator WHICH endpoint a client reached, and so which Region a
+/// `CreateBucket` sent there may place its bucket in.
+///
+/// `pub(crate)`: every suite that drives a request as a client of another Region's endpoint
+/// goes through this one helper rather than spelling a credential scope of its own.
+pub(crate) async fn send_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Answer {
+    let mut all: Vec<(&str, &str)> = vec![("content-type", "application/xml")];
+    all.extend_from_slice(headers);
+    send_bytes_signed(
+        router,
+        &authorization_for(region),
+        method,
+        &format!("s3.{region}.amazonaws.com"),
+        uri,
+        &all,
+        body.as_bytes(),
+    )
+    .await
+}
+
+/// The one place this harness puts a request on the wire: `authorization` carries the
+/// credential scope the emulator reads the endpoint's Region out of, and `host` the endpoint
+/// the request is addressed to.
+async fn send_bytes_signed(
+    router: &MultiServiceRouter,
+    authorization: &str,
+    method: &str,
+    host: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Answer {
     let mut builder = http::Request::builder()
         .method(method)
         .uri(format!("https://{host}{uri}"))
         .header("host", host)
-        .header("authorization", AUTHORIZATION);
+        .header("authorization", authorization);
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
@@ -170,6 +222,12 @@ pub(crate) async fn send_bytes_to_host(
 
 /// `PUT /<bucket>` — `CreateBucket`, with the location constraint (when any) in the XML
 /// payload and the bucket namespace (when any) in its bound header.
+///
+/// The request is addressed to the endpoint of the Region its constraint names, the way a
+/// client that creates a bucket in that Region addresses S3: an endpoint for one Region
+/// cannot place a bucket in another, which S3 refuses with
+/// `IllegalLocationConstraintException`. A create naming no constraint goes to the endpoint
+/// of the Region the unspecified constraint means ([`constraint_region`]).
 pub(crate) async fn create_bucket(
     router: &MultiServiceRouter,
     bucket: &str,
@@ -187,7 +245,23 @@ pub(crate) async fn create_bucket(
     let headers: Vec<(&str, &str)> = bucket_namespace
         .map(|namespace| vec![("x-amz-bucket-namespace", namespace)])
         .unwrap_or_default();
-    send(router, "PUT", &format!("/{bucket}"), &headers, &body).await
+    send_in_region(
+        router,
+        &constraint_region(location_constraint),
+        "PUT",
+        &format!("/{bucket}"),
+        &headers,
+        &body,
+    )
+    .await
+}
+
+/// The Region a location constraint names, through the one reading the service itself uses
+/// (`state::bucket_region`): absent means `us-east-1` — the Region the unspecified constraint
+/// stands for, and the one [`AUTHORIZATION`] is scoped to — the legacy `EU` means
+/// `eu-west-1`, and every other `BucketLocationConstraint` value IS the Region code.
+pub(crate) fn constraint_region(location_constraint: Option<&str>) -> String {
+    service_com_amazonaws_s3_amazons3::state::bucket_region(location_constraint)
 }
 
 /// `HEAD /<bucket>` — `HeadBucket`.

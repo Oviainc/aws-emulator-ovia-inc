@@ -576,7 +576,12 @@ async fn replication_needs_a_versioning_enabled_bucket_that_exists() {
         ("never configured", None),
         ("suspended", Some("Suspended")),
     ] {
-        let bucket = format!("replication-unversioned-{}", status.unwrap_or("none"));
+        // The published naming rules admit only lowercase letters, so the row's state
+        // names the bucket in lowercase.
+        let bucket = format!(
+            "replication-unversioned-{}",
+            status.unwrap_or("none").to_lowercase()
+        );
         let created = create_bucket(&router, &bucket, None, None).await;
         assert_eq!(
             created.status, 200,

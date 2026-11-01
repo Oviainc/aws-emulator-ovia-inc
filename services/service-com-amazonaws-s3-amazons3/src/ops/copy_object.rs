@@ -741,11 +741,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
                 ) {
                     Ok(tags) => tags,
                     Err(rejection) => {
-                        return Err(crate::scaffolded::Scaffolded::unmodeled(
-                            rejection.code(),
-                            crate::state::TAG_REJECTION_STATUS,
-                            rejection.to_string(),
-                        ))
+                        return Err(crate::scaffolded::Scaffolded::tag_set(&rejection))
                     }
                 },
                 None => Vec::new(),

@@ -28,7 +28,8 @@
 //!   the action and the quoted resource ARN are the request's own values.
 
 use super::bucket_lifecycle::{
-    create_bucket, get_bucket_policy, put_bucket_policy, router, send,
+    constraint_region, create_bucket, get_bucket_policy, put_bucket_policy, router, send,
+    send_in_region,
 };
 use super::bucket_ownership_controls::put_ownership_controls;
 use super::bucket_public_access_block::{
@@ -134,7 +135,17 @@ async fn every_newly_created_bucket_reports_all_four_switches_on() {
                 )
             })
             .unwrap_or_default();
-        let created = send(&router, "PUT", &format!("/{bucket}"), &headers, &body).await;
+        // Addressed to the endpoint of the Region the constraint names, since an endpoint
+        // for one Region cannot place a bucket in another.
+        let created = send_in_region(
+            &router,
+            &constraint_region(*constraint),
+            "PUT",
+            &format!("/{bucket}"),
+            &headers,
+            &body,
+        )
+        .await;
         assert_eq!(
             created.status, 200,
             "case {case:?}: the create must succeed, got {} with body {:?}",

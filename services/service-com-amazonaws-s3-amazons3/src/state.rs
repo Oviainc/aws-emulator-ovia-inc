@@ -770,6 +770,9 @@ pub enum TagSetRejectionCause {
     ValueTooLong { key: String, chars: usize },
     /// Two tags in one set name the same key, so the set is not a key/value mapping.
     DuplicateKey { key: String },
+    /// A key begins with the prefix AWS keeps for the tags it generates itself
+    /// ([`RESERVED_TAG_KEY_PREFIX`]), which a caller may therefore not write.
+    ReservedKeyPrefix { key: String },
     /// A key or a value carries a character outside the published class every tag set
     /// shares ([`tag_text_is_allowed`]).
     DisallowedCharacter {
@@ -824,6 +827,12 @@ impl std::fmt::Display for TagSetRejection {
             TagSetRejectionCause::DuplicateKey { .. } => {
                 write!(f, "Cannot provide multiple Tags with the same key")
             }
+            // The reserved prefix is the fixed text of this sentence; the key that carried
+            // it is a variable part of the ENVELOPE ([`TagSetRejection::tag_key`]) rather
+            // than of the message.
+            TagSetRejectionCause::ReservedKeyPrefix { .. } => {
+                write!(f, "{RESERVED_TAG_KEY_PREFIX_MESSAGE}")
+            }
         }
     }
 }
@@ -845,6 +854,18 @@ const INVALID_TAG_KEY_MESSAGE: &str = "The TagKey you have provided is invalid";
 /// value half of [`INVALID_TAG_KEY_MESSAGE`], worded the same way.
 const INVALID_TAG_VALUE_MESSAGE: &str = "The TagValue you have provided is invalid";
 
+/// The prefix AWS keeps for the tags it generates itself, and which a caller's tag key may
+/// therefore not begin with: "the `aws:` prefix is reserved for Amazon Web Services use",
+/// and "you can't edit, delete, or add tags with the `aws:` prefix" (AWS *Tagging your
+/// resources*, *Tag restrictions* — the same list both S3 tagging operations point at).
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// The `<Message>` S3 sends for a tag key beginning with [`RESERVED_TAG_KEY_PREFIX`].
+///
+/// Fixed text: S3 states the reservation and nothing else; the offending key is a member of
+/// the error document rather than part of this sentence.
+const RESERVED_TAG_KEY_PREFIX_MESSAGE: &str = "Your TagKey cannot be prefixed with aws:";
+
 impl TagSetRejection {
     /// The wire error code S3 answers this rejection with.
     ///
@@ -862,7 +883,29 @@ impl TagSetRejection {
             | TagSetRejectionCause::KeyTooLong { .. }
             | TagSetRejectionCause::ValueTooLong { .. }
             | TagSetRejectionCause::DuplicateKey { .. }
+            | TagSetRejectionCause::ReservedKeyPrefix { .. }
             | TagSetRejectionCause::DisallowedCharacter { .. } => INVALID_TAG_CODE,
+        }
+    }
+
+    /// The tag KEY this rejection's error document names, or `None` for a rejection whose
+    /// document names none.
+    ///
+    /// S3's envelope for a key the reserved prefix refuses is
+    /// `<Error><Code/><Message/><TagKey/><RequestId/><HostId/></Error>`: the code and the
+    /// message are the fixed text of the class and `<TagKey>` is the variable part, copied
+    /// from the request, because the message names no key and the envelope is the only
+    /// place the refusal says WHICH key it is about. The caller renders it through the
+    /// naming channel, so no handler decides it for itself.
+    pub fn tag_key(&self) -> Option<&str> {
+        match &self.cause {
+            TagSetRejectionCause::ReservedKeyPrefix { key } => Some(key.as_str()),
+            TagSetRejectionCause::TooManyTags { .. }
+            | TagSetRejectionCause::EmptyKey
+            | TagSetRejectionCause::KeyTooLong { .. }
+            | TagSetRejectionCause::ValueTooLong { .. }
+            | TagSetRejectionCause::DuplicateKey { .. }
+            | TagSetRejectionCause::DisallowedCharacter { .. } => None,
         }
     }
 }
@@ -883,10 +926,12 @@ pub const TAG_REJECTION_STATUS: u16 = 400;
 /// reporting the first restriction it breaks.
 ///
 /// ONE rule for every tag set S3 holds: the count against the resource's own published
-/// maximum, then each key and value against the character bounds every tag set shares, and
-/// the key-uniqueness the set itself has. The count is checked before the per-tag rules so
-/// an enormous set is refused for what it is rather than for whichever of its tags happens
-/// to come first.
+/// maximum, then each key and value against the character bounds every tag set shares, then
+/// each key against the prefix AWS keeps for the tags it generates itself
+/// ([`RESERVED_TAG_KEY_PREFIX`]), and the key-uniqueness the set itself has. The count is
+/// checked before the per-tag rules so an enormous set is refused for what it is rather than
+/// for whichever of its tags happens to come first, and a key's own bounds are checked
+/// before the reservation so the key the refusal NAMES is one within those bounds.
 pub fn validate_tag_set(
     tags: &[ResourceTag],
     limits: TagSetLimits,
@@ -908,6 +953,13 @@ pub fn validate_tag_set(
             return refuse(TagSetRejectionCause::DisallowedCharacter {
                 field: TAG_KEY_FIELD,
                 character,
+            });
+        }
+        // Judged after the key's own bounds, so the key this refusal names in the error
+        // document is one those bounds admit.
+        if tag.key.starts_with(RESERVED_TAG_KEY_PREFIX) {
+            return refuse(TagSetRejectionCause::ReservedKeyPrefix {
+                key: tag.key.clone(),
             });
         }
         let value_chars = tag.value.chars().count();
@@ -11050,11 +11102,54 @@ pub const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
 /// location-constraint is not valid", HTTP 400 (Amazon S3 "Error responses", list of error
 /// codes).
 pub const ILLEGAL_LOCATION_CONSTRAINT_CODE: &str = "IllegalLocationConstraintException";
-/// See [`ILLEGAL_LOCATION_CONSTRAINT_CODE`] — the wording S3 uses for a create that names
-/// NO constraint on an endpoint that is not the one the unspecified constraint means.
-pub const UNSPECIFIED_LOCATION_CONSTRAINT_MESSAGE: &str =
-    "The unspecified location constraint is incompatible for the region specific endpoint \
-     this request was sent to.";
+
+/// What stands in the message below for a create that names NO location constraint, which
+/// is the one thing that sentence varies in.
+pub const UNSPECIFIED_LOCATION_CONSTRAINT: &str = "unspecified";
+
+/// See [`ILLEGAL_LOCATION_CONSTRAINT_CODE`] — the wording S3 uses for a create whose
+/// location constraint the endpoint it was sent to cannot serve.
+///
+/// Fixed text with ONE variable part: the constraint the request named, spelled as the
+/// request spelled it, and [`UNSPECIFIED_LOCATION_CONSTRAINT`] for a create that named
+/// none — the two readings of one sentence, so neither can drift from the other.
+pub fn illegal_location_constraint_message(location_constraint: Option<&str>) -> String {
+    let named = location_constraint.unwrap_or(UNSPECIFIED_LOCATION_CONSTRAINT);
+    format!(
+        "The {named} location constraint is incompatible for the region specific endpoint \
+         this request was sent to."
+    )
+}
+
+/// The host of S3's GLOBAL endpoint, which is not an endpoint for any one Region: "if you
+/// send your `CreateBucket` request to the s3.amazonaws.com global endpoint, the request
+/// goes to the us-east-1 Region" (`CreateBucket`'s own documentation).
+const GLOBAL_ENDPOINT_HOST: &str = "s3.amazonaws.com";
+
+/// Whether `parts` was addressed to the GLOBAL endpoint rather than to an endpoint for one
+/// Region.
+///
+/// Read off the host the request carries, because that is the only thing that tells the two
+/// apart: a request to the global endpoint is signed for [`DEFAULT_BUCKET_REGION`] ("the
+/// signature calculations in Signature Version 4 must use us-east-1 as the Region, even if
+/// the location constraint in the request specifies another Region", `CreateBucket`'s own
+/// documentation), exactly as a request to that Region's own endpoint is. The
+/// virtual-hosted-style form of the same endpoint carries the bucket as a further label in
+/// front of it, so a host that ENDS in the global one is addressed to it too.
+pub fn addressed_global_endpoint(parts: &::http::request::Parts) -> bool {
+    let host = parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| parts.uri.host())
+        .unwrap_or_default();
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    host == GLOBAL_ENDPOINT_HOST
+        || host
+            .strip_suffix(GLOBAL_ENDPOINT_HOST)
+            .is_some_and(|label| label.ends_with('.'))
+}
 
 /// The Region the request was signed for: the third field of its SigV4 credential scope,
 /// which is the endpoint a client addressed this emulator as.

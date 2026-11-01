@@ -460,8 +460,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Judged against the OBJECT's published tag-set limits, the same ones
         // `PutObjectTagging` judges its container against — "Amazon S3 limits the maximum
         // number of tags to 10 tags per object", with the shared key and value character
-        // bounds and the key-uniqueness a tag set has. The wire code is the rejection's
-        // own ([`crate::state::TagSetRejection::code`]) — `BadRequest` for a set past the
+        // bounds and the key-uniqueness a tag set has. The envelope is the one every
+        // tag-set write answers with ([`crate::scaffolded::Scaffolded::tag_set`]) —
+        // `BadRequest` for a set past the
         // count an object may hold, `InvalidTag` for a tag that does not pass input
         // validation — and the refusal is decided BEFORE anything is written, so a
         // refused write leaves whatever was at the key exactly as it was. The parse and
@@ -475,11 +476,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ) {
                     Ok(tags) => tags,
                     Err(rejection) => {
-                        return Err(crate::scaffolded::Scaffolded::unmodeled(
-                            rejection.code(),
-                            crate::state::TAG_REJECTION_STATUS,
-                            rejection.to_string(),
-                        ))
+                        return Err(crate::scaffolded::Scaffolded::tag_set(&rejection))
                     }
                 }
             }

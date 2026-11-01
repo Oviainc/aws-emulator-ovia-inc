@@ -48,7 +48,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_s3_amazons3::scaffolded::BUCKET_SCOPED_ERROR_CODES;
 
-use super::bucket_lifecycle::{create_bucket, router, send};
+use super::bucket_lifecycle::{create_bucket, router, send, send_in_region};
 use super::object_and_tagging_roundtrip::put_object;
 
 /// The bucket name element S3's bucket-scoped error document carries.
@@ -429,7 +429,14 @@ async fn a_bucket_scoped_refusal_names_the_bucket_it_is_about() {
             ),
             false => String::new(),
         };
-        let answer = send(&router, method, uri, &headers, &body).await;
+        let answer = match *method == "PUT" {
+            // A create is addressed to the endpoint of the Region its constraint names, the
+            // way the setup create of the same bucket was: an endpoint for one Region cannot
+            // place a bucket in another, so the second create has to reach the same one for
+            // the name-in-use conflict to be what refuses it.
+            true => send_in_region(&router, CONFLICT_REGION, method, uri, &headers, &body).await,
+            false => send(&router, method, uri, &headers, &body).await,
+        };
         assert_eq!(
             answer.status, *status,
             "case {case:?}: expected HTTP {status}, got {} with body {:?}",

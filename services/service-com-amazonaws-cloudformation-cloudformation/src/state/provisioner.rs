@@ -1345,6 +1345,13 @@ impl Provisioner {
                 | Self::KinesisStream
                 | Self::S3VectorsVectorBucket
                 | Self::S3VectorsIndex
+                // Amazon S3 refuses a tag key in the reserved namespace on every call that
+                // takes a tag set — the `Tagging` payload of `PutBucketTagging` and
+                // `PutObjectTagging` and the `x-amz-tagging` header of a write alike, in the
+                // one check its own crate's tag-set validation makes ("Your TagKey cannot be
+                // prefixed with aws:") — so a bucket carries the stack's own tags without
+                // the three.
+                | Self::S3Bucket
                 | Self::SchedulerScheduleGroup
                 | Self::AcmAcmeEndpoint
                 // ACM refuses a tag key in the reserved namespace on every call that takes

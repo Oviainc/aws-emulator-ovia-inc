@@ -239,6 +239,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let configuration = input.create_bucket_configuration.as_ref();
         let placement = directory_placement(&input.bucket, configuration)?;
 
+        // The NAME a general purpose bucket comes into being under has to be one S3 can
+        // hold a bucket under at all: every sentence of the published general purpose
+        // bucket naming rules, read through the one reading every service in this
+        // workspace judges a caller-supplied bucket name by
+        // (`service_common::s3_bucket_name::is_well_formed`) — the length bound, the
+        // lowercase character class, the first and last character, adjacent periods, a
+        // name formatted as an IP address, and the reserved prefixes and suffixes. A name
+        // outside them names no bucket in any account (such a bucket cannot even be
+        // addressed virtual-hosted-style), so the create is refused BEFORE any state is
+        // written, with the code and sentence S3's published error list states for it and
+        // the `<BucketName>` member that envelope names the rejected name by.
+        //
+        // A DIRECTORY bucket is judged by its own rule instead, in `directory_placement`
+        // above: its name carries the zone the bucket is placed in and ends in the
+        // `--x-s3` suffix these general purpose rules reserve.
+        if placement.is_none() && !::service_common::s3_bucket_name::is_well_formed(&input.bucket) {
+            return Err(invalid_bucket_name(&input.bucket));
+        }
+
         // Where the bucket lives, from the request's own location constraint. Note this
         // is NOT the Region the request was signed for: the constraint is what the model
         // documents as deciding the bucket's Region, and an absent one means us-east-1.
@@ -252,22 +271,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         });
 
+        // WHICH endpoint the request reached is what decides whether the constraint it
+        // names can be served at all: an endpoint for ONE Region can only create a bucket
+        // in that Region, while the global endpoint serves a create for any of them ("if
+        // you send your CreateBucket request to the s3.amazonaws.com global endpoint, the
+        // request goes to the us-east-1 Region … even if the location constraint in the
+        // request specifies another Region where the bucket is to be created", this
+        // operation's own documentation). The Region of a regional endpoint is the one the
+        // request was signed for.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        let region_specific_endpoint = !crate::state::addressed_global_endpoint(ctx.parts());
+
         // A create that names NO constraint can only mean the one Region the unspecified
         // constraint stands for: "If you don't specify a Region, the bucket is created in
         // the US East (N. Virginia) Region (us-east-1) by default"
         // (`CreateBucketConfiguration$LocationConstraint`). An endpoint for any other
         // Region cannot serve that request — it would create the bucket somewhere the
         // caller did not ask for — so S3 refuses it rather than choosing for the caller.
-        // The endpoint is the Region the request was signed for.
-        let endpoint_region = crate::state::request_region(ctx.parts());
+        //
+        // A create that DOES name one is the same rule read the other way: a regional
+        // endpoint cannot place the bucket in another Region either, so a constraint naming
+        // a Region that is not the endpoint's earns the same refusal, worded with the
+        // constraint the request named. The legacy `EU` alias and the Region it stands for
+        // are one Region ([`crate::state::bucket_region`]), so naming the bucket's Region
+        // either way is served by that Region's endpoint.
         if placement.is_none()
-            && constraint.is_none()
-            && endpoint_region != crate::state::DEFAULT_BUCKET_REGION
+            && region_specific_endpoint
+            && crate::state::bucket_region(constraint) != endpoint_region
         {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::ILLEGAL_LOCATION_CONSTRAINT_CODE,
                 crate::state::INVALID_ARGUMENT_STATUS,
-                crate::state::UNSPECIFIED_LOCATION_CONSTRAINT_MESSAGE,
+                crate::state::illegal_location_constraint_message(constraint),
             ));
         }
 
@@ -485,11 +520,7 @@ fn directory_placement(
     // reads the zonal endpoint out of, so a name that names another zone — or that is not
     // shaped like a directory bucket's at all — is not a valid bucket name.
     if crate::state::directory_bucket_zone(bucket) != Some(zone_id) {
-        return Err(crate::scaffolded::Scaffolded::unmodeled(
-            crate::state::INVALID_BUCKET_NAME_CODE,
-            crate::state::INVALID_ARGUMENT_STATUS,
-            crate::state::INVALID_BUCKET_NAME_MESSAGE,
-        ));
+        return Err(invalid_bucket_name(bucket));
     }
 
     // The redundancy: the value the create named, or the one its location type implies.
@@ -528,6 +559,25 @@ fn invalid_request() -> CreateBucketError {
         crate::state::INVALID_REQUEST_STATUS,
         crate::state::INVALID_REQUEST_MESSAGE,
     )
+}
+
+/// The refusal S3 answers a create whose bucket name is not one it can hold a bucket under:
+/// `InvalidBucketName` (400) with the sentence S3's published error list states for that
+/// code ([`crate::state::INVALID_BUCKET_NAME_MESSAGE`]), naming the rejected name in the
+/// `<BucketName>` member the envelope carries it in.
+///
+/// The sentence is fixed text, with nothing of the request interpolated into it — which
+/// rule the name broke is not in it — and the name is the variable part, copied from the
+/// request URI. Answered through the unmodelled channel because `CreateBucket` declares
+/// only the two name-in-use errors
+/// (`smithy_query(query="operation",operation="CreateBucket")`).
+fn invalid_bucket_name(bucket: &str) -> CreateBucketError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        crate::state::INVALID_BUCKET_NAME_CODE,
+        crate::state::INVALID_ARGUMENT_STATUS,
+        crate::state::INVALID_BUCKET_NAME_MESSAGE,
+    )
+    .naming_bucket(bucket)
 }
 
 /// The ACL this create names, or `None` when it names none at all.
