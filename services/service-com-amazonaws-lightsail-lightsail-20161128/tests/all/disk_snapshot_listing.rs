@@ -108,7 +108,8 @@ async fn listed(emulator: &Emulator, region: &str, name: &str) -> Value {
     assert_eq!(
         matching.len(),
         1,
-        "case reading {name} back from the listing: expected exactly one entry, got {matching:?}"
+        "case reading {name} back from the listing in {region:?}: expected exactly one entry, got \
+         {matching:?}"
     );
     matching[0].clone()
 }
@@ -546,7 +547,7 @@ async fn the_listing_pages_in_name_order() {
     );
 }
 
-/// RULE: the listing answers from the store, so a record the account no longer
+/// RULE: the listing answers from the store, so a record the region no longer
 /// holds is no longer reported while every other record still is — and a page
 /// token names a record rather than an index, so a delete between two pages
 /// cannot make the walk skip or repeat another record.

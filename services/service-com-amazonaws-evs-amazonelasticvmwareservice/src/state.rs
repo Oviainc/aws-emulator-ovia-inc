@@ -781,19 +781,29 @@ impl PendingConnectorState {
     }
 }
 
-/// Whether two `applianceFqdn` values name the SAME VCF appliance.
+/// Whether two DNS names name the SAME thing: a domain name is case-insensitive, so two
+/// spellings that differ only in case are one name.
 ///
-/// An `applianceFqdn` is "a fully qualified domain name" (`CreateEnvironmentConnector`
-/// doc) and a domain name is case-insensitive, so two spellings that differ only in
-/// case are one appliance. The ONE comparison every site that matches an appliance FQDN
-/// in this crate makes — the idempotent repeat of `CreateEnvironmentConnector`, the
-/// no-op update of `UpdateEnvironmentConnector`, and the vCenter an entitlement is
-/// associated with ([`StoredEnvironment::entitlements_sharing_vcenter`]) — so none of
-/// them can disagree about which requests name the appliance a connector already
-/// targets. ASCII is the whole alphabet the modelled `ApplianceFqdn` pattern admits
-/// (`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.…)*$`,
-/// `smithy_query(query="shape",shape="ApplianceFqdn")`).
-pub fn same_appliance_fqdn(left: &str, right: &str) -> bool {
+/// The ONE comparison every site in this crate that decides whether two DNS names are
+/// the same name makes, whichever member carries them:
+///
+/// * an appliance FQDN — "a fully qualified domain name" (`CreateEnvironmentConnector`
+///   doc) — at the idempotent repeat of `CreateEnvironmentConnector`, the no-op update of
+///   `UpdateEnvironmentConnector` and the vCenter an entitlement is associated with
+///   ([`StoredEnvironment::entitlements_sharing_vcenter`]);
+/// * a host's DNS hostname, where it is matched against the hosts this service already
+///   holds ([`ComAmazonawsEvsAmazonelasticvmwareserviceState::host_name_is_taken`],
+///   [`StoredEnvironment::host`], [`StoredEnvironment::host_mut`]);
+/// * a `vcfHostnames` member, against the other members of the same object.
+///
+/// So no two of them can disagree about which requests name one DNS name. ASCII is the
+/// whole alphabet the modelled patterns admit — `ApplianceFqdn` is
+/// `^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.…)*$` and `HostName` is
+/// `^([a-zA-Z0-9\-]*)$` (`smithy_query(query="shape",shape="ApplianceFqdn")`,
+/// `smithy_query(query="shape",shape="HostName")`), both of which admit upper and lower
+/// case alike, so the boundary validator passes either spelling and the handler is what
+/// has to decide the two are one name.
+pub fn same_dns_name(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
@@ -1598,6 +1608,11 @@ pub struct StoredEnvironment {
     /// its `hosts` member asked Amazon EVS to add while installing VCF, and
     /// `CreateEnvironmentHost` for one added afterwards. They are one population: a name
     /// either of them took is taken for the other.
+    ///
+    /// The key is the hostname SPELLED as the request gave it, which is what a read
+    /// reports back; which name a request addresses is decided case-insensitively, as a
+    /// DNS name is ([`Self::host`], [`Self::host_mut`]), so the map never holds two
+    /// records for one DNS hostname.
     pub hosts: BTreeMap<String, StoredHost>,
     /// The lifecycle transition the clock owes this environment, if any.
     pub pending: Option<PendingTransition>,
@@ -1907,6 +1922,53 @@ impl StoredEnvironment {
             .filter(|host| host.state != HOST_DELETED)
     }
 
+    /// The host record of this environment that `host_name` ADDRESSES, or `None` when
+    /// the environment holds none.
+    ///
+    /// A host is addressed by its DNS hostname rather than by a minted id, and a DNS name
+    /// is case-insensitive ([`same_dns_name`]), so a request reaches the host whichever
+    /// case it spells the name in — the same reading that makes a name already held
+    /// unavailable to a second host
+    /// ([`ComAmazonawsEvsAmazonelasticvmwareserviceState::host_name_is_taken`]). At most
+    /// one record can match, because that rule is what admitted the records.
+    ///
+    /// Records in every state are reachable, the terminal `DELETED` ones included: a
+    /// finished record is what an idempotent repeat of a delete reports.
+    pub fn host(&self, host_name: &str) -> Option<&StoredHost> {
+        self.hosts
+            .values()
+            .find(|host| same_dns_name(&host.host_name, host_name))
+    }
+
+    /// The host record of this environment that `host_name` addresses, mutably — the
+    /// same lookup as [`Self::host`], for the operations that CHANGE the host they
+    /// address.
+    pub fn host_mut(&mut self, host_name: &str) -> Option<&mut StoredHost> {
+        self.hosts
+            .values_mut()
+            .find(|host| same_dns_name(&host.host_name, host_name))
+    }
+
+    /// Add `host` to this environment's inventory, under the hostname it carries.
+    ///
+    /// One DNS hostname occupies ONE entry of [`Self::hosts`], so any record this
+    /// environment already holds for that name is REPLACED, whichever case it was stored
+    /// under ([`Self::host`]). The only such record is one `DeleteEnvironmentHost` has
+    /// finished with — a live name is refused to a new host
+    /// ([`ComAmazonawsEvsAmazonelasticvmwareserviceState::host_name_is_taken`]) — kept
+    /// for reporting only, and a host added under a freed DNS hostname is a new host.
+    pub fn insert_host(&mut self, host: StoredHost) {
+        if let Some(held) = self
+            .hosts
+            .keys()
+            .find(|key| same_dns_name(key, &host.host_name))
+            .cloned()
+        {
+            self.hosts.remove(&held);
+        }
+        self.hosts.insert(host.host_name.clone(), host);
+    }
+
     /// How many hosts still occupy this environment ([`Self::live_hosts`]).
     pub fn live_host_count(&self) -> usize {
         self.live_hosts().count()
@@ -1936,7 +1998,7 @@ impl StoredEnvironment {
     /// every connector of this environment reaching the same `applianceFqdn` counts —
     /// an entitlement created through a connector that was replaced by a new one for
     /// the same appliance is associated with that same vCenter. Which appliance an
-    /// `applianceFqdn` names is [`same_appliance_fqdn`], case-insensitive because a DNS
+    /// `applianceFqdn` names is [`same_dns_name`], case-insensitive because a DNS
     /// name is.
     ///
     /// Zero for an id this environment holds no connector for: there is no vCenter to
@@ -1948,7 +2010,7 @@ impl StoredEnvironment {
         let same_vcenter: BTreeSet<&str> = self
             .connectors
             .values()
-            .filter(|other| same_appliance_fqdn(&other.appliance_fqdn, &connector.appliance_fqdn))
+            .filter(|other| same_dns_name(&other.appliance_fqdn, &connector.appliance_fqdn))
             .map(|other| other.connector_id.as_str())
             .collect();
         self.live_entitlements()
@@ -3174,12 +3236,15 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
     /// ([`StoredEnvironment::live_hosts`]): a host that has reached the terminal
     /// `DELETED` state is gone from VCF, so its DNS hostname is free for a new host, the
     /// same reading [`StoredEnvironment::next_host_ip`] takes of its address.
+    /// A DNS hostname is compared as a DNS name ([`same_dns_name`]), so two spellings
+    /// that differ only in case are ONE hostname and the second of them names a host
+    /// that cannot be added.
     pub fn host_name_is_taken(&self, host_name: &str) -> bool {
         self.environments.values().any(|environment| {
             environment.state != STATE_DELETED
                 && environment
                     .live_hosts()
-                    .any(|host| host.host_name == host_name)
+                    .any(|host| same_dns_name(&host.host_name, host_name))
         })
     }
 

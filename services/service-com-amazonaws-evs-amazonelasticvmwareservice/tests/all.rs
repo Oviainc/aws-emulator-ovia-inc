@@ -94,6 +94,8 @@ mod hcx_network_acl_references;
 mod host_deletion;
 #[path = "all/host_ec2_instances.rs"]
 mod host_ec2_instances;
+#[path = "all/host_name_case.rs"]
+mod host_name_case;
 #[path = "all/host_placement_references.rs"]
 mod host_placement_references;
 #[path = "all/hosts.rs"]

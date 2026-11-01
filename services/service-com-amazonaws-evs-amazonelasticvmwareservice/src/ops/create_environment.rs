@@ -70,7 +70,9 @@
 //!    request gives twice, names a host that cannot be added. The rule
 //!    `CreateEnvironmentHost` applies to its single `host`, at the scope the doc states
 //!    it, and judged only where the request's VCF version adds the hosts at all, because
-//!    a mode that adds none takes no name.
+//!    a mode that adds none takes no name. Two names are one name when they differ only
+//!    in case, because a DNS name is case-insensitive
+//!    ([`crate::state::same_dns_name`]).
 //! 11. No `tags` key claims the reserved `aws:` namespace
 //!    ([`crate::state::RESERVED_TAG_KEY_PREFIX`]): that namespace is Amazon Web
 //!    Services' own, so a caller cannot create a tag in it — the same reservation
@@ -82,6 +84,7 @@
 //!    hostname a member before it already claimed names an appliance that cannot be
 //!    installed, and that member is refused. Judged only where Amazon EVS INSTALLS
 //!    VCF, exactly as rule 10 is: a mode that installs no appliance claims no hostname.
+//!    "The same" is read as rule 10 reads it, ignoring case.
 //! 13. Each `serviceAccessSecurityGroups.securityGroups` entry names a security group
 //!    the account holds IN that same VPC: those groups "allow traffic between the Amazon
 //!    EVS control plane and your VPC for Amazon EVS service access"
@@ -534,8 +537,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this one request gives twice — names a host that cannot be added, and the entry
         // that named it is refused. Asked only where the hosts ARE added, because a mode
         // that adds none takes no name.
+        //
+        // Both readings compare the name as a DNS name ([`crate::state::same_dns_name`]):
+        // two entries whose hostnames differ only in case name one host, exactly as an
+        // entry colliding with a stored host does.
         if installs_vcf {
-            let mut named: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            let mut named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for (host, member_prefix) in input
                 .hosts
                 .as_deref()
@@ -547,7 +554,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let clause = if state.host_name_is_taken(host_name) {
                     "is already used by a host of an Amazon EVS environment; host DNS \
                      hostnames must be unique across environments"
-                } else if !named.insert(host_name) {
+                } else if !named.insert(host_name.to_ascii_lowercase()) {
                     "is used by another host of this request; host DNS hostnames must be \
                      unique across environments"
                 } else {
@@ -941,8 +948,10 @@ fn add_requested_hosts<Eng: Send + Sync + 'static>(
     let mut transitions_due = Vec::with_capacity(requested.len());
     for host in requested {
         // Defensive: the names are unique by the precondition above, so no entry can
-        // displace a host already added.
-        if environment.hosts.contains_key(&host.host_name) {
+        // displace a host already added. Read as a DNS name
+        // ([`crate::state::StoredEnvironment::host`]), the way that precondition decided
+        // two names are one.
+        if environment.host(&host.host_name).is_some() {
             continue;
         }
         // The host's management address, out of the environment's own `vmkManagement`
@@ -978,17 +987,14 @@ fn add_requested_hosts<Eng: Send + Sync + 'static>(
         // is the move to CREATED the clock owes it.
         let pending = crate::state::PendingStatus::starting_now(crate::state::HOST_CREATED);
         transitions_due.push(pending.due_at);
-        environment.hosts.insert(
-            host.host_name.clone(),
-            crate::state::StoredHost::creating(
-                host,
-                ip_address,
-                esx_version.clone(),
-                created_at_ms,
-                ec2,
-                pending,
-            ),
-        );
+        environment.insert_host(crate::state::StoredHost::creating(
+            host,
+            ip_address,
+            esx_version.clone(),
+            created_at_ms,
+            ec2,
+            pending,
+        ));
     }
     transitions_due
 }
@@ -1115,8 +1121,10 @@ fn vcf_hostname_members(hostnames: &VcfHostnames) -> [(&'static str, &str); 9] {
 /// The FIRST member to carry a hostname keeps it and the ones that repeat it are
 /// refused, one `fieldList` entry each naming the member it collides with — so three
 /// members sharing one hostname draw two entries, and the caller is told which member
-/// claimed the name. The comparison is the exact string the request gave, as the
-/// sibling DNS-hostname rule compares host names
+/// claimed the name. The hostnames are compared as DNS names
+/// ([`crate::state::same_dns_name`]): a member whose spelling differs from an earlier
+/// member's only in case names the same appliance, as the sibling DNS-hostname rule reads
+/// host names
 /// ([`crate::state::ComAmazonawsEvsAmazonelasticvmwareserviceState::host_name_is_taken`]).
 fn vcf_hostname_failures(hostnames: &VcfHostnames) -> Vec<ValidationExceptionField> {
     let members = vcf_hostname_members(hostnames);
@@ -1124,7 +1132,7 @@ fn vcf_hostname_failures(hostnames: &VcfHostnames) -> Vec<ValidationExceptionFie
     for (index, (member, hostname)) in members.iter().enumerate() {
         if let Some((claimed_by, _)) = members[..index]
             .iter()
-            .find(|(_, earlier)| earlier == hostname)
+            .find(|(_, earlier)| crate::state::same_dns_name(earlier, hostname))
         {
             failures.push(crate::state::field_failure(
                 member,

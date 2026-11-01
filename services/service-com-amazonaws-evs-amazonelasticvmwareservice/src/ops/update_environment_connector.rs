@@ -28,7 +28,7 @@
 //! ([`crate::state::secret_resources::resolve_secret_arn`]), because `secretIdentifier`
 //! is "The new ARN or name of" the secret while `Connector$secretArn` is "The Amazon
 //! Resource Name (ARN) of" it, and an appliance FQDN is matched as the domain name it is
-//! ([`crate::state::same_appliance_fqdn`]) — so naming the stored secret or the stored
+//! ([`crate::state::same_dns_name`]) — so naming the stored secret or the stored
 //! appliance in its other form is no change at all.
 //!
 //! ## Shape of an operation
@@ -294,10 +294,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reconfigures nothing and the stored record is left exactly as it was.
         let changed = match requested {
             Requested::ApplianceFqdn(appliance_fqdn) => {
-                let changed = !crate::state::same_appliance_fqdn(
-                    &connector.appliance_fqdn,
-                    appliance_fqdn,
-                );
+                let changed =
+                    !crate::state::same_dns_name(&connector.appliance_fqdn, appliance_fqdn);
                 if changed {
                     connector.appliance_fqdn = appliance_fqdn.to_string();
                 }

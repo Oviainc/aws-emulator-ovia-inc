@@ -40,7 +40,7 @@ const VCF_HOSTNAME_MEMBERS: [&str; 9] = [
 /// that every member named in `sharing` carries the hostname given beside it.
 ///
 /// The names stay inside the modelled `HostName` pattern (`^([a-zA-Z0-9\-]*)$`).
-fn hostnames_with(sharing: &[(&str, &str)]) -> Value {
+pub(crate) fn hostnames_with(sharing: &[(&str, &str)]) -> Value {
     let mut object = serde_json::Map::new();
     for member in VCF_HOSTNAME_MEMBERS {
         object.insert(member.to_string(), json!(format!("evs-{member}")));

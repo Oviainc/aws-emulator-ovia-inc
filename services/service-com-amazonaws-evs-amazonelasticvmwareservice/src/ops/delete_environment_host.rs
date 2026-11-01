@@ -6,7 +6,8 @@
 //! from, which [`crate::ops::list_environment_hosts`] reads back. An `environmentId`
 //! this service holds no live environment for in the request's Region, or a `hostName`
 //! that environment holds no host record for, is a `ResourceNotFoundException`, and
-//! nothing is written for it.
+//! nothing is written for it. The `hostName` is a DNS hostname, so it addresses its host
+//! case-insensitively ([`crate::state::StoredEnvironment::host_mut`]).
 //!
 //! The host goes `DELETING` and the clock owes it `DELETED`: removing an ESX host from
 //! the environment is the same kind of work as adding it and not a record to erase. The
@@ -241,8 +242,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A host record this environment never held is the missing resource, whatever
         // state the records it does hold are in: a record that has already reached
-        // DELETED is what the idempotent repeat below reports.
-        let host = environment.hosts.get_mut(&input.host_name).ok_or_else(|| {
+        // DELETED is what the idempotent repeat below reports. The `hostName` is the
+        // host's DNS hostname, so it is matched as a DNS name
+        // ([`crate::state::StoredEnvironment::host_mut`]) — the reading that also decides
+        // a name is already taken, so a name this service refuses to a second host
+        // addresses the host that holds it however the request spells it.
+        let host = environment.host_mut(&input.host_name).ok_or_else(|| {
             DeleteEnvironmentHostErrorModeled::ResourceNotFoundException(
                 crate::state::host_not_found(&input.host_name),
             )

@@ -22,7 +22,7 @@
 //! the second connector of a type cannot be created, and silently reconfiguring the
 //! first is `UpdateEnvironmentConnector`'s work, not a create's. "The same appliance and
 //! secret" is what the request NAMES, not how it spelled it: the appliance is matched as
-//! the domain name an `applianceFqdn` is ([`crate::state::same_appliance_fqdn`]) and the
+//! the domain name an `applianceFqdn` is ([`crate::state::same_dns_name`]) and the
 //! secret as the ARN its `secretIdentifier` resolves to
 //! ([`crate::state::secret_resources::resolve_secret_arn`]).
 //!
@@ -290,13 +290,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The stored record is the one this request asks for when it names the same
             // appliance and the same secret — what each value NAMES, not how the request
             // spelled it: an appliance FQDN is a domain name
-            // ([`crate::state::same_appliance_fqdn`]) and the secret is compared as the
+            // ([`crate::state::same_dns_name`]) and the secret is compared as the
             // ARN its identifier resolved to.
             if existing.is_live()
-                && crate::state::same_appliance_fqdn(
-                    &existing.appliance_fqdn,
-                    &input.appliance_fqdn,
-                )
+                && crate::state::same_dns_name(&existing.appliance_fqdn, &input.appliance_fqdn)
                 && existing.secret_arn == secret_arn
             {
                 return Ok(CreateEnvironmentConnectorOutput {

@@ -34,7 +34,9 @@
 //!    in the same `CreateEnvironmentHost` action" — the `HostInfoForCreate` shape's own
 //!    rule, refused through the one helper `CreateEnvironment` uses for it.
 //! 4. "DNS hostnames for hosts must be unique across Amazon EVS environments and
-//!    within VCF" (`hostName` doc).
+//!    within VCF" (`hostName` doc). A DNS name is case-insensitive, so a name a host
+//!    already carries is taken in every spelling of it
+//!    ([`crate::state::same_dns_name`]).
 //! 5. The environment's `vmkManagement` VLAN subnet has an address left for the host:
 //!    an ESX host's management interface lives on that VLAN, so that subnet's usable
 //!    range is what bounds how many hosts one environment can hold.
@@ -333,7 +335,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "DNS hostnames for hosts must be unique across Amazon EVS environments and
         // within VCF": the scope is every environment, THIS one included, which is what
-        // `host_name_is_taken` walks.
+        // `host_name_is_taken` walks, comparing the name as the DNS name it is.
         if host_name_is_taken {
             failures.push(crate::state::field_failure(
                 "host.hostName",
@@ -418,11 +420,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pending,
         );
         // The name is free across the hosts that still occupy an environment, checked
-        // above, so the only record that can hold this key is a host
+        // above, so the only record that can hold this name is a host
         // `DeleteEnvironmentHost` has finished with — kept for reporting only — and the
-        // new host replaces it: a host added under a freed DNS hostname is a new host.
+        // new host replaces it, whichever case that record was stored under
+        // ([`crate::state::StoredEnvironment::insert_host`]): a host added under a freed
+        // DNS hostname is a new host.
         let host_wire = host.to_wire();
-        environment.hosts.insert(input.host.host_name.clone(), host);
+        environment.insert_host(host);
         let host = host_wire;
         // Adding a host changes the environment's host inventory, which is part of the
         // environment, so the record is re-stamped and the summary this operation
