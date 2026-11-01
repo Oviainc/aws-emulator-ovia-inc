@@ -134,7 +134,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetResources<Eng>
 {
     type Input = GetResourcesInput;
-    type Output = GetResourcesOutput;
+    type Output = Paged<GetResourcesOutput>;
     type Error = GetResourcesError;
 
     const NAME: &'static str = "GetResources";
@@ -170,9 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|id| api.resources.get(id))
             .map(|resource| super::create_resource::resource_body(resource, embed_methods))
             .collect();
-        Ok(GetResourcesOutput {
-            items: Some(items),
-            position: page.next_position,
-        })
+        Ok(Paged::new(
+            GetResourcesOutput {
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

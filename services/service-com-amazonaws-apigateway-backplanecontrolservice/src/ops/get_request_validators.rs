@@ -150,7 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetRequestValidators<Eng>
 {
     type Input = GetRequestValidatorsInput;
-    type Output = GetRequestValidatorsOutput;
+    type Output = Paged<GetRequestValidatorsOutput>;
     type Error = GetRequestValidatorsError;
 
     const NAME: &'static str = "GetRequestValidators";
@@ -194,12 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|id| api.request_validators.get(id))
             .map(super::create_request_validator::request_validator_body)
             .collect();
-        Ok(GetRequestValidatorsOutput {
-            // Always reported, and empty for an API with no request validators: "the
-            // current page of elements from this collection" is an answer a client can
-            // read.
-            items: Some(items),
-            position: page.next_position,
-        })
+        Ok(Paged::new(
+            GetRequestValidatorsOutput {
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

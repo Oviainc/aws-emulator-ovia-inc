@@ -149,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetAuthorizers<Eng>
 {
     type Input = GetAuthorizersInput;
-    type Output = GetAuthorizersOutput;
+    type Output = Paged<GetAuthorizersOutput>;
     type Error = GetAuthorizersError;
 
     const NAME: &'static str = "GetAuthorizers";
@@ -192,11 +192,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|id| api.authorizers.get(id))
             .map(super::create_authorizer::authorizer_body)
             .collect();
-        Ok(GetAuthorizersOutput {
-            // Always reported, and empty for an API with no authorizers: "the current
-            // page of elements from this collection" is an answer a client can read.
-            items: Some(items),
-            position: page.next_position,
-        })
+        Ok(Paged::new(
+            GetAuthorizersOutput {
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

@@ -334,3 +334,13 @@ mod domain_name_access_association_reject_accounts;
 // stage configuration that turns execution logging on is refused without.
 #[path = "all/stage_execution_logging_account_role.rs"]
 mod stage_execution_logging_account_role;
+// Appended for the reason the note above gives: the `position`/`limit` PAGE ENVELOPE every
+// paginated collection of this service answers in, and the cursor the documentation-part
+// collection is walked by.
+#[path = "all/collection_page_envelope.rs"]
+mod collection_page_envelope;
+// Appended for the reason the note above gives: what an exported definition says about
+// ITSELF — the version the downloaded file is named for, and the containers each OpenAPI
+// dialect always writes.
+#[path = "all/stage_export_version_and_containers.rs"]
+mod stage_export_version_and_containers;

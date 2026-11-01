@@ -726,12 +726,17 @@ async fn a_position_this_service_never_issued_is_refused_with_one_sentence() {
     // Rows differ along the listing the cursor was offered to and along the FORM of the
     // cursor — a token no listing issued, one that looks like an id, and one carrying
     // characters an id never has — because the sentence names the member and nothing else.
+    //
+    // Every listing here is cursored by a MINTED key, which a cursor either names or does
+    // not. The documentation-parts collection is not: its cursor is the location of the
+    // entity a part documents, a point in the order the collection reports, so every text
+    // places one and none is unresolvable (`documentation_part_pagination`).
     let listings = [
         ("GetRestApis", "/restapis".to_string()),
         ("GetUsagePlans", "/usageplans".to_string()),
         (
-            "GetDocumentationParts",
-            format!("/restapis/{api}/documentation/parts"),
+            "GetDeployments",
+            format!("/restapis/{api}/deployments"),
         ),
     ];
     for (case, uri) in listings {

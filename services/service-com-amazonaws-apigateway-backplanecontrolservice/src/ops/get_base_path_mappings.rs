@@ -128,7 +128,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetBasePathMappings<Eng>
 {
     type Input = GetBasePathMappingsInput;
-    type Output = GetBasePathMappingsOutput;
+    type Output = Paged<GetBasePathMappingsOutput>;
     type Error = GetBasePathMappingsError;
 
     const NAME: &'static str = "GetBasePathMappings";
@@ -184,12 +184,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(crate::state::state_unavailable)?;
             items.push(CreateBasePathMappingOutput::from(mapping));
         }
-        Ok(GetBasePathMappingsOutput {
-            // Always reported, and empty for a domain name that carries no mapping: "the
-            // current page of elements from this collection" is an answer a client can
-            // read.
-            items: Some(items),
-            position: page.next_position,
-        })
+        Ok(Paged::new(
+            GetBasePathMappingsOutput {
+                // Always reported, and empty for a domain name that carries no mapping:
+                // "the current page of elements from this collection" is an answer a
+                // client can read.
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

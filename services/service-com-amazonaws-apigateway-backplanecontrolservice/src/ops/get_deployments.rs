@@ -131,7 +131,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetDeployments<Eng>
 {
     type Input = GetDeploymentsInput;
-    type Output = GetDeploymentsOutput;
+    type Output = Paged<GetDeploymentsOutput>;
     type Error = GetDeploymentsError;
 
     const NAME: &'static str = "GetDeployments";
@@ -168,9 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|id| api.deployments.get(id))
             .map(|deployment| super::create_deployment::deployment_body(deployment, false))
             .collect();
-        Ok(GetDeploymentsOutput {
-            items: Some(items),
-            position: page.next_position,
-        })
+        Ok(Paged::new(
+            GetDeploymentsOutput {
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

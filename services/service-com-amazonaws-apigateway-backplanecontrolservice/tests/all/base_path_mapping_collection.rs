@@ -169,9 +169,11 @@ async fn get_base_path_mappings_pages_through_creation_order_on_position_and_lim
         created,
         "case GetBasePathMappings(no limit): expected creation order {created:?}, got {all:?}"
     );
-    assert!(
-        all["position"].is_null(),
-        "case GetBasePathMappings(no limit): the last page omits position, got {:?}",
+    assert_eq!(
+        all["position"].as_str(),
+        created.last().map(String::as_str),
+        "case GetBasePathMappings(no limit): the page reports the cursor of its last element, \
+         got {:?}",
         all["position"]
     );
 
@@ -203,9 +205,10 @@ async fn get_base_path_mappings_pages_through_creation_order_on_position_and_lim
             .chain(created.iter().map(Some))
             .enumerate()
         {
-            // No cursor starts at the first record; a cursor is the base path its page
-            // starts at, which is the key a mapping is stored and addressed under.
-            let start = index.saturating_sub(1);
+            // No cursor starts at the first record; a cursor is the base path of the last
+            // record already handed out — the key a mapping is stored and addressed under
+            // — so its page resumes AFTER that record.
+            let start = index;
             let expected: Vec<String> = created
                 .iter()
                 .skip(start)
@@ -223,14 +226,14 @@ async fn get_base_path_mappings_pages_through_creation_order_on_position_and_lim
                 expected,
                 "case {case}: expected the page {expected:?}, got {body:?}"
             );
-            // The cursor a page hands back names the first record of the NEXT page, and is
-            // absent exactly when this page ended the sequence.
+            // The cursor a page hands back names the LAST record on that page, and a page
+            // that holds no record hands back none: that is where the collection ends.
             let consumed = start.saturating_add(expected.len());
+            let handed_back = (consumed > start).then(|| created[consumed - 1].as_str());
             assert_eq!(
                 body["position"].as_str(),
-                created.get(consumed).map(String::as_str),
-                "case {case}: expected the next cursor {:?}, got {:?}",
-                created.get(consumed),
+                handed_back,
+                "case {case}: expected the cursor {handed_back:?}, got {:?}",
                 body["position"]
             );
         }

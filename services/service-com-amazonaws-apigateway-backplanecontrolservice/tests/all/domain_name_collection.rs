@@ -504,9 +504,11 @@ async fn get_domain_names_pages_through_creation_order_on_position_and_limit() {
         "case GetDomainNames(no limit): expected creation order {created:?}, got {:?}",
         all.body
     );
-    assert!(
-        all.body["position"].is_null(),
-        "case GetDomainNames(no limit): the last page omits position, got {:?}",
+    assert_eq!(
+        all.body["position"].as_str(),
+        created.last().map(String::as_str),
+        "case GetDomainNames(no limit): the page reports the cursor of its last element, got \
+         {:?}",
         all.body["position"]
     );
 
@@ -519,9 +521,10 @@ async fn get_domain_names_pages_through_creation_order_on_position_and_limit() {
             .chain(created.iter().map(Some))
             .enumerate()
         {
-            // No cursor starts at the first record; a cursor is the key its page starts
-            // at, and a non-private record's key is its domain name.
-            let start = index.saturating_sub(1);
+            // No cursor starts at the first record; a cursor is the key of the last
+            // record already handed out, so its page resumes AFTER that one. A
+            // non-private record's key is its domain name.
+            let start = index;
             let expected: Vec<String> = created.iter().skip(start).take(effective).cloned().collect();
             let query = match cursor {
                 None => format!("limit={limit}"),
@@ -639,9 +642,11 @@ async fn the_resource_owner_filter_selects_whose_domain_names_a_page_reports() {
             "case {case}: expected {expected:?}, got {:?}",
             answer.body
         );
-        assert!(
-            answer.body["position"].is_null(),
-            "case {case}: a single page omits position, got {:?}",
+        assert_eq!(
+            answer.body["position"].as_str(),
+            expected.last().map(String::as_str),
+            "case {case}: a page reports the cursor of its last element, and a page that \
+             holds none reports no cursor, got {:?}",
             answer.body["position"]
         );
     }

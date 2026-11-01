@@ -194,6 +194,13 @@ async fn delete_part(gateway: &Gateway, api: &str, id: &str) -> Answer {
         .await
 }
 
+/// `ids` in a stable order, for comparing WHICH records a collection holds without
+/// pinning the order it reports them in.
+fn sorted(mut ids: Vec<String>) -> Vec<String> {
+    ids.sort();
+    ids
+}
+
 /// The ids `GetDocumentationParts` reports for `api`, in the order it reports them.
 async fn listed_ids(gateway: &Gateway, api: &str, case: &str) -> Vec<String> {
     let answer = gateway
@@ -258,10 +265,13 @@ async fn deleting_a_part_removes_exactly_that_part_from_every_reader() {
             stored.push((id, at, properties));
         }
         let created: Vec<String> = stored.iter().map(|(id, _, _)| id.clone()).collect();
+        // What this suite asserts about the collection is WHICH records it holds; the
+        // order it reports them in is `documentation_part_pagination`'s subject, so the
+        // comparison here is of the record sets.
         assert_eq!(
-            listed_ids(&gateway, &api, case.name).await,
-            created,
-            "case {}: expected the created parts to be listed in creation order",
+            sorted(listed_ids(&gateway, &api, case.name).await),
+            sorted(created.clone()),
+            "case {}: expected exactly the created parts to be listed",
             case.name
         );
 
@@ -287,8 +297,7 @@ async fn deleting_a_part_removes_exactly_that_part_from_every_reader() {
             NOT_FOUND,
             &format!("{}: GetDocumentationPart({doomed_id})", case.name),
         );
-        // ...and from the collection, which still reports every survivor in creation
-        // order.
+        // ...and from the collection, which still reports every survivor.
         let survivors: Vec<String> = created
             .iter()
             .enumerate()
@@ -297,7 +306,8 @@ async fn deleting_a_part_removes_exactly_that_part_from_every_reader() {
             .collect();
         let listed = listed_ids(&gateway, &api, case.name).await;
         assert_eq!(
-            listed, survivors,
+            sorted(listed.clone()),
+            sorted(survivors.clone()),
             "case {}: expected the surviving parts {survivors:?}, got {listed:?}",
             case.name
         );

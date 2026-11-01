@@ -118,9 +118,10 @@ async fn get_authorizers_reports_exactly_the_stored_authorizers_in_creation_orde
             &case,
         )
         .await;
-        assert!(
-            next.is_none(),
-            "case {case}: the last page reports no position, got {next:?}"
+        assert_eq!(
+            next.as_deref(),
+            ids.last().map(String::as_str),
+            "case {case}: the page reports the cursor of its last element, got {next:?}"
         );
         let listed: Vec<String> = items
             .iter()
@@ -188,6 +189,17 @@ async fn limit_and_position_walk_the_collection_exactly_once() {
                 Some(cursor) => format!("limit={limit}&position={cursor}"),
             };
             let (items, next) = listed_authorizers(&gateway, &api, &query, &case).await;
+            if items.is_empty() {
+                // The page that holds nothing is where the collection ENDS: a cursor is
+                // the last element a page handed out, so the walk is told it is over by
+                // the empty page that reports no cursor of its own.
+                assert!(
+                    next.is_none(),
+                    "case {case}: page {page} holds nothing, so it reports no cursor, got \
+                     {next:?}"
+                );
+                break;
+            }
             if limit > 0 {
                 assert!(
                     items.len() <= usize::try_from(limit).unwrap_or(0),
@@ -195,10 +207,6 @@ async fn limit_and_position_walk_the_collection_exactly_once() {
                     items.len()
                 );
             }
-            assert!(
-                !items.is_empty(),
-                "case {case}: page {page} of a non-empty collection must hold items, got none"
-            );
             seen.extend(items.iter().map(|item| string_member(item, "id", &case)));
             match next {
                 None => break,
@@ -291,7 +299,7 @@ async fn a_position_naming_nothing_in_this_apis_sequence_is_refused() {
         );
     }
 
-    // A cursor this API's own sequence carries is served, and starts the page at it.
+    // A cursor this API's own sequence carries is served, and resumes the page AFTER it.
     for (index, id) in ids.iter().enumerate() {
         let case = format!("GetAuthorizers(position={id})");
         let (items, _) =
@@ -302,9 +310,9 @@ async fn a_position_naming_nothing_in_this_apis_sequence_is_refused() {
             .collect();
         assert_eq!(
             listed,
-            ids[index..].to_vec(),
-            "case {case}: the page starts at the cursor, expected {:?}, got {listed:?}",
-            &ids[index..]
+            ids[index + 1..].to_vec(),
+            "case {case}: the page resumes after the cursor, expected {:?}, got {listed:?}",
+            &ids[index + 1..]
         );
     }
 

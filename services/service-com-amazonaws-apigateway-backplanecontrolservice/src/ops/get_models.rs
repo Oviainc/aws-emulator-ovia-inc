@@ -128,7 +128,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetModels<Eng>
 {
     type Input = GetModelsInput;
-    type Output = GetModelsOutput;
+    type Output = Paged<GetModelsOutput>;
     type Error = GetModelsError;
 
     const NAME: &'static str = "GetModels";
@@ -177,9 +177,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|name| api.models.get(name).map(super::create_model::model_body))
             .collect::<Option<Vec<_>>>()
             .ok_or_else(crate::state::state_unavailable)?;
-        Ok(GetModelsOutput {
-            items: Some(items),
-            position: page.next_position,
-        })
+        Ok(Paged::new(
+            GetModelsOutput {
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

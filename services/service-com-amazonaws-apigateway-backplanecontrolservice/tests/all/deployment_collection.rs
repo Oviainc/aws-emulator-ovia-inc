@@ -202,7 +202,7 @@ async fn get_deployments_pages_through_creation_order_on_position_and_limit() {
     }
 
     // With no `limit` the default page size (25) covers all seven, so the one page is the
-    // whole collection and carries no next cursor.
+    // whole collection and the cursor it carries names that page's last deployment.
     let all = get_deployments(&gateway, &api, "").await;
     assert_eq!(
         reported_ids(&all.body, "GetDeployments(no limit)"),
@@ -210,9 +210,11 @@ async fn get_deployments_pages_through_creation_order_on_position_and_limit() {
         "case GetDeployments(no limit): expected creation order {created:?}, got {:?}",
         all.body
     );
-    assert!(
-        all.body["position"].is_null(),
-        "case GetDeployments(no limit): the last page omits position, got {:?}",
+    assert_eq!(
+        all.body["position"].as_str(),
+        created.last().map(String::as_str),
+        "case GetDeployments(no limit): the page reports the cursor of its last element, got \
+         {:?}",
         all.body["position"]
     );
 
@@ -256,8 +258,8 @@ async fn get_deployments_pages_through_creation_order_on_position_and_limit() {
         );
     }
 
-    // A cursor is the id the page starts at, so a page requested at one lists that
-    // deployment first.
+    // A cursor is the id of the last deployment already handed out, so a page requested
+    // at one lists the tail PAST that deployment.
     for (index, cursor) in created.iter().enumerate() {
         let case = format!("position={cursor}");
         let answer = get_deployments(&gateway, &api, &format!("?position={cursor}")).await;
@@ -268,7 +270,7 @@ async fn get_deployments_pages_through_creation_order_on_position_and_limit() {
         );
         assert_eq!(
             reported_ids(&answer.body, &case),
-            created[index..].to_vec(),
+            created[index + 1..].to_vec(),
             "case {case}: expected the tail of creation order, got {:?}",
             answer.body
         );

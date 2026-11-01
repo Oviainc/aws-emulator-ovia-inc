@@ -110,6 +110,7 @@ pub mod put_integration_response_types;
 pub mod put_integration_types;
 pub mod put_method_response_types;
 pub mod put_method_types;
+pub mod paged_collection;
 pub mod put_rest_api_types;
 pub mod reject_domain_name_access_association_types;
 pub mod shared_types;
@@ -332,6 +333,8 @@ pub use put_integration_types::*;
 pub use put_method_response_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use put_method_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use paged_collection::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use put_rest_api_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDocumentationParts
-//! IMPLEMENTED: reports the stored `DocumentationPart`s of `restApiId` in creation
-//! order, narrowed by the request's `type`, `name`, `path` and `locationStatus` filters
-//! and cut into a `position`/`limit` page.
+//! IMPLEMENTED: reports the stored `DocumentationPart`s of `restApiId` in the order of
+//! the API entities they document, narrowed by the request's `type`, `name`, `path` and
+//! `locationStatus` filters and cut into a `position`/`limit` page, with the requested
+//! `limit` echoed and `position` naming the location of the last part on the page.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +84,110 @@
 use super::types::*;
 
 use crate::state::DocumentationPartEntry;
+
+/// The entity types a documentation part's location may name, in the order a listing
+/// reports them: the order the model declares `DocumentationPartType`'s values in
+/// (`smithy_query(query="shape", shape="DocumentationPartType")`), which walks the API's
+/// entities from the outermost in — the API itself, the entities declared on it, a
+/// resource, a method on that resource, and then the parts of that method's request and
+/// response.
+///
+/// Written out because the generated `DOCUMENTATION_PART_TYPE_VALUES` carries the same
+/// values in alphabetical order, which is a value SET and not this order; the test
+/// `documentation_part_pagination` pins the two to the same values.
+pub const DOCUMENTATION_PART_TYPE_ORDER: [&str; 12] = [
+    "API",
+    "AUTHORIZER",
+    "MODEL",
+    "RESOURCE",
+    "METHOD",
+    "PATH_PARAMETER",
+    "QUERY_PARAMETER",
+    "REQUEST_HEADER",
+    "REQUEST_BODY",
+    "RESPONSE",
+    "RESPONSE_HEADER",
+    "RESPONSE_BODY",
+];
+
+/// The separator between the segments of a location cursor.
+const CURSOR_SEPARATOR: char = ':';
+
+/// Where one documentation part sorts in its API's collection: the LOCATION of the
+/// entity it documents, with the entity type taken as its rank in
+/// [`DOCUMENTATION_PART_TYPE_ORDER`] and the location's other members compared, as the
+/// text they are, in the order the model declares them in
+/// (`smithy_query(query="shape", shape="DocumentationPartLocation")`: path, method,
+/// statusCode, name) — outermost part of the entity's address first.
+///
+/// The collection is ordered by this key, and a `position` cursor is read back into one
+/// ([`cursor_order`]), so a cursor names a point in the order rather than a record.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LocationOrder {
+    /// The entity type's rank; a type outside the declared order sorts after every
+    /// declared one rather than silently ahead of them.
+    rank: usize,
+    path: String,
+    method: String,
+    status_code: String,
+    name: String,
+}
+
+/// Where `location` sorts.
+fn location_order(location: &DocumentationPartLocation) -> LocationOrder {
+    LocationOrder {
+        rank: type_rank(&location.r#type),
+        path: location.path.clone().unwrap_or_default(),
+        method: location.method.clone().unwrap_or_default(),
+        status_code: location.status_code.clone().unwrap_or_default(),
+        name: location.name.clone().unwrap_or_default(),
+    }
+}
+
+/// `entity_type`'s rank in [`DOCUMENTATION_PART_TYPE_ORDER`].
+fn type_rank(entity_type: &str) -> usize {
+    DOCUMENTATION_PART_TYPE_ORDER
+        .iter()
+        .position(|declared| *declared == entity_type)
+        .unwrap_or(DOCUMENTATION_PART_TYPE_ORDER.len())
+}
+
+/// The `position` cursor of the part at `location`: its five location members — the
+/// entity type, the entity's name, the path, the method and the status code — joined by
+/// `:`, with an empty segment for every member the entity type leaves unset (a model's
+/// location sets a name and no path, a resource's a path and no name).
+pub fn location_cursor(location: &DocumentationPartLocation) -> String {
+    let order = location_order(location);
+    [
+        location.r#type.as_str(),
+        order.name.as_str(),
+        order.path.as_str(),
+        order.method.as_str(),
+        order.status_code.as_str(),
+    ]
+    .join(&CURSOR_SEPARATOR.to_string())
+}
+
+/// The point in the order a `position` cursor names: its segments read back out, with a
+/// cursor naming an entity type this service does not declare placed after every
+/// declared one — there is nothing of this collection beyond it.
+///
+/// Every text places: a cursor names a POINT in the order rather than a record, so a
+/// cursor the collection has walked past is served the page that holds nothing rather
+/// than refused, which is what ends a walk of the collection.
+fn cursor_order(cursor: &str) -> LocationOrder {
+    let mut segments = cursor.split(CURSOR_SEPARATOR);
+    let mut segment = || segments.next().unwrap_or_default().to_string();
+    let entity_type = segment();
+    let name = segment();
+    LocationOrder {
+        rank: type_rank(&entity_type),
+        path: segment(),
+        method: segment(),
+        status_code: segment(),
+        name,
+    }
+}
 
 /// Whether a stored part counts as `DOCUMENTED` for the request's `locationStatus`
 /// filter.
@@ -190,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetDocumentationParts<Eng>
 {
     type Input = GetDocumentationPartsInput;
-    type Output = GetDocumentationPartsOutput;
+    type Output = Paged<GetDocumentationPartsOutput>;
     type Error = GetDocumentationPartsError;
 
     const NAME: &'static str = "GetDocumentationParts";
@@ -214,27 +319,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         // The filters narrow the collection BEFORE it is paged, so `limit` counts the
         // parts the caller asked for and a `position` cursor walks that same sequence.
-        let ordered: Vec<String> = api
-            .documentation_parts_in_creation_order()
-            .into_iter()
+        // The sequence is the API's parts in LOCATION order ([`LocationOrder`]), which
+        // is the order the cursor itself names a point in.
+        let mut ordered: Vec<(LocationOrder, &DocumentationPartEntry)> = api
+            .documentation_parts
+            .values()
             .filter(|part| matches_filters(part, &input))
-            .map(|part| part.id.clone())
+            .map(|part| (location_order(&part.location), part))
             .collect();
-        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
-            .map_err(|message| {
-                GetDocumentationPartsErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(message),
-                })
-            })?;
-        let items = page
-            .ids
+        ordered.sort_by(|left, right| left.0.cmp(&right.0));
+        let cursors: Vec<String> = ordered
             .iter()
-            .filter_map(|id| api.documentation_parts.get(id))
-            .map(super::create_documentation_part::documentation_part_body)
+            .map(|(_, part)| location_cursor(&part.location))
             .collect();
-        Ok(GetDocumentationPartsOutput {
-            items: Some(items),
-            position: page.next_position,
-        })
+        // A cursor names a POINT in that order, so the page is what follows it whether or
+        // not a part sits there — a cursor the collection has been walked past is the end
+        // of the collection and the page that holds nothing.
+        let start = match input.position.as_deref() {
+            None => 0,
+            Some(cursor) => {
+                let after = cursor_order(cursor);
+                ordered.partition_point(|(candidate, _)| *candidate <= after)
+            }
+        };
+        let page = crate::state::Page::cut(&cursors, start, input.limit);
+        let items: Vec<CreateDocumentationPartOutput> = ordered
+            .iter()
+            .skip(start)
+            .take(page.ids.len())
+            .map(|(_, part)| super::create_documentation_part::documentation_part_body(part))
+            .collect();
+        Ok(Paged::new(
+            GetDocumentationPartsOutput {
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

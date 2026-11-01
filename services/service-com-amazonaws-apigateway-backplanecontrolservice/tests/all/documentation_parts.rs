@@ -501,11 +501,12 @@ async fn get_documentation_parts_narrows_the_collection_by_every_filter() {
         ids.push(created_part_id(&gateway, &api, location.clone(), &properties, &case).await);
     }
 
-    // Each row is a query and the indices of the collection it must report, in creation
-    // order: one filter, each filter's other value, a conjunction of filters, and a
-    // query that matches nothing.
+    // Each row is a query and the indices of the collection it must report, in the order
+    // the collection reports them — the order of the API entities documented, which is
+    // not the order these rows were created in: one filter, each filter's other value, a
+    // conjunction of filters, and a query that matches nothing.
     let rows: &[(&str, &[usize])] = &[
-        ("", &[0, 1, 2, 3, 4]),
+        ("", &[3, 4, 0, 1, 2]),
         ("type=METHOD", &[0, 1]),
         ("type=QUERY_PARAMETER", &[2]),
         ("type=RESOURCE", &[4]),
@@ -516,7 +517,7 @@ async fn get_documentation_parts_narrows_the_collection_by_every_filter() {
         ("path=/pets", &[0, 1, 2]),
         ("path=/owners", &[4]),
         ("path=/nothing", &[]),
-        ("locationStatus=DOCUMENTED", &[0, 1, 2, 4]),
+        ("locationStatus=DOCUMENTED", &[4, 0, 1, 2]),
         ("locationStatus=UNDOCUMENTED", &[3]),
         ("type=METHOD&path=/pets", &[0, 1]),
         ("type=METHOD&path=/pets&locationStatus=DOCUMENTED", &[0, 1]),
@@ -535,10 +536,11 @@ async fn get_documentation_parts_narrows_the_collection_by_every_filter() {
 
     // Reading does not change what a later caller sees: the same query answers the same
     // collection.
+    let whole: Vec<String> = [3, 4, 0, 1, 2].iter().map(|at| ids[*at].clone()).collect();
     let again = listed_ids(&gateway, &api, "", "GetDocumentationParts, read twice").await;
     assert_eq!(
-        again, ids,
-        "case GetDocumentationParts, read twice: expected {ids:?}, got {again:?}"
+        again, whole,
+        "case GetDocumentationParts, read twice: expected {whole:?}, got {again:?}"
     );
 }
 
@@ -608,14 +610,30 @@ async fn get_documentation_parts_pages_through_creation_order_on_position_and_li
         }
         assert_eq!(
             walked, ids,
-            "case {case}: expected the whole collection in creation order, got {walked:?}"
+            "case {case}: expected the whole collection in the order of the entities it \
+             documents, got {walked:?}"
         );
     }
 
-    // A cursor naming no part of the collection is refused rather than served an empty
-    // page.
+    // A cursor is a POINT in the order the collection reports, so one the collection
+    // holds no part at — here a text that names no entity type at all, which sorts past
+    // every declared one — is the end of the collection: an empty page, not a refusal.
     let answer = get_parts(&gateway, &api, "position=nosuchpart").await;
-    assert_failure(&answer, 400, BAD_REQUEST, "position=nosuchpart");
+    assert_eq!(
+        answer.status, 200,
+        "case position=nosuchpart: expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    assert!(
+        page_items(&answer.body, "position=nosuchpart").is_empty(),
+        "case position=nosuchpart: expected the empty page, got {:?}",
+        answer.body
+    );
+    assert!(
+        answer.body["position"].is_null(),
+        "case position=nosuchpart: the empty page hands back no cursor, got {:?}",
+        answer.body["position"]
+    );
 
     // An unknown API is a not found on both readers.
     let answer = get_parts(&gateway, "nosuchapi0", "").await;

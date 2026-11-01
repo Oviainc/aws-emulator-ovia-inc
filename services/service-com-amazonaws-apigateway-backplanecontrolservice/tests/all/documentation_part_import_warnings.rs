@@ -171,6 +171,14 @@ fn documented(entries: &[(Value, Value)]) -> Vec<(Value, Value)> {
     held
 }
 
+/// `pairs` in a stable order of the entity each documents, for comparing WHICH entities
+/// a documentation set documents without pinning the order the collection reports them
+/// in (that order is the documentation-part pagination suite's subject).
+fn by_entity(mut pairs: Vec<(Value, Value)>) -> Vec<(Value, Value)> {
+    pairs.sort_by_key(|(location, _)| location.to_string());
+    pairs
+}
+
 #[tokio::test]
 async fn fail_on_warnings_decides_nothing_for_a_body_that_warns_about_nothing() {
     for row in table() {
@@ -211,8 +219,8 @@ async fn fail_on_warnings_decides_nothing_for_a_body_that_warns_about_nothing() 
                     reported.is_empty(),
                     "case {case}: expected no warnings, got {reported:?}"
                 );
-                let expected = documented(&row.entries);
-                let stored = listed_entities(&gateway, &api, &case).await;
+                let expected = by_entity(documented(&row.entries));
+                let stored = by_entity(listed_entities(&gateway, &api, &case).await);
                 assert_eq!(
                     stored, expected,
                     "case {case}: expected the imported documentation set {expected:?}, got \

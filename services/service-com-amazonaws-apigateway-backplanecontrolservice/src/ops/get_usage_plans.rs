@@ -129,7 +129,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetUsagePlans<Eng>
 {
     type Input = GetUsagePlansInput;
-    type Output = GetUsagePlansOutput;
+    type Output = Paged<GetUsagePlansOutput>;
     type Error = GetUsagePlansError;
 
     const NAME: &'static str = "GetUsagePlans";
@@ -172,9 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|id| store.usage_plans.get(id))
             .map(CreateUsagePlanOutput::from)
             .collect();
-        Ok(GetUsagePlansOutput {
-            items: Some(items),
-            position: page.next_position,
-        })
+        Ok(Paged::new(
+            GetUsagePlansOutput {
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

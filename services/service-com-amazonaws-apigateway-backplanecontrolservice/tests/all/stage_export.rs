@@ -80,7 +80,9 @@ pub(crate) struct Export {
     pub(crate) status: u16,
     pub(crate) error: Option<String>,
     content_type: Option<String>,
-    content_disposition: Option<String>,
+    /// `pub(crate)` for the sibling `stage_export_version_and_containers` suite, which
+    /// asserts the attachment is named for the version the document states.
+    pub(crate) content_disposition: Option<String>,
     pub(crate) body: Vec<u8>,
 }
 

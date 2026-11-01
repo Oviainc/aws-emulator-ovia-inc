@@ -132,7 +132,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetDomainNames<Eng>
 {
     type Input = GetDomainNamesInput;
-    type Output = GetDomainNamesOutput;
+    type Output = Paged<GetDomainNamesOutput>;
     type Error = GetDomainNamesError;
 
     const NAME: &'static str = "GetDomainNames";
@@ -169,9 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|key| store.domain_names.get(key))
             .map(CreateDomainNameOutput::from)
             .collect();
-        Ok(GetDomainNamesOutput {
-            items: Some(items),
-            position: page.next_position,
-        })
+        Ok(Paged::new(
+            GetDomainNamesOutput {
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

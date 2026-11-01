@@ -2408,25 +2408,63 @@ pub fn stored_map<V>(
     non_empty_map(Some(patched.into_iter().collect()))
 }
 
-/// One page of an ordered id sequence, as a `position`/`limit` paginated collection
+/// One page of an ordered cursor sequence, as a `position`/`limit` paginated collection
 /// reports it.
 #[derive(Debug, Clone)]
 pub struct Page {
-    /// The ids on this page, in the sequence's own order.
+    /// The cursors on this page, in the sequence's own order.
     pub ids: Vec<String>,
-    /// The `position` cursor the NEXT page starts at; absent on the last page.
+    /// The `position` this answer reports: the cursor of the LAST element on this page,
+    /// which the next page resumes AFTER. Absent for a page that holds no element, which
+    /// is where a walk of the collection ends.
     pub next_position: Option<String>,
+    /// The page size the REQUEST asked for; see [`Page::echoed_limit`].
+    requested_limit: Option<i32>,
 }
 
-/// Cut the page a caller asked for out of `ordered`, a stable sequence of ids.
+impl Page {
+    /// Cut the `limit`-sized page that begins at index `start` out of `ordered`.
+    ///
+    /// `limit` defaults to [`DEFAULT_PAGE_LIMIT`] and is clamped into the documented
+    /// `1..=`[`MAX_PAGE_LIMIT`] range. `start` beyond the last element is the empty final
+    /// page, not a failure: a caller that walks a collection to its end is served the
+    /// page that holds nothing rather than a client error.
+    pub fn cut(ordered: &[String], start: usize, limit: Option<i32>) -> Self {
+        let size = limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
+        let window = usize::try_from(size).unwrap_or(1);
+        let start = start.min(ordered.len());
+        let end = start.saturating_add(window).min(ordered.len());
+        let ids = ordered[start..end].to_vec();
+        Self {
+            // The cursor a client sends back is the LAST element it was handed, and the
+            // page that follows begins after it — so the cursor reported here is the end
+            // of THIS page, whether or not the sequence holds more, and the page that
+            // holds nothing is what tells a caller the collection has ended.
+            next_position: ids.last().cloned(),
+            ids,
+            requested_limit: limit,
+        }
+    }
+
+    /// The page size this answer echoes: the one the REQUEST asked for, for a page that
+    /// holds elements — the member states what the caller asked of the collection, so a
+    /// request that asked for no size is told none. A page that holds nothing limited
+    /// nothing, and reports neither a size nor a cursor.
+    pub fn echoed_limit(&self) -> Option<i32> {
+        self.requested_limit.filter(|_| !self.ids.is_empty())
+    }
+}
+
+/// Cut the page a caller asked for out of `ordered`, a stable sequence of cursors.
 ///
-/// `position` is the id the page starts at — the cursor a previous page handed back —
-/// and `None` starts at the first id. `limit` defaults to [`DEFAULT_PAGE_LIMIT`] and is
-/// clamped into the documented `1..=`[`MAX_PAGE_LIMIT`] range.
+/// `position` is the cursor of the last element the caller was already handed, so the
+/// page begins AFTER it; `None` begins at the first element. The sequence's order is its
+/// own (creation order, for the collections of this service whose cursor is a minted
+/// id), so a cursor is resolved by naming an element of it.
 ///
 /// `Err` carries [`INVALID_POSITION`] for an unresolvable cursor: a `position` naming no
-/// id in the sequence, which the caller must be told about rather than served an empty
-/// page.
+/// element of the sequence, which the caller must be told about rather than served an
+/// arbitrary page.
 pub fn page_of(
     ordered: &[String],
     position: Option<&str>,
@@ -2437,15 +2475,10 @@ pub fn page_of(
         Some(cursor) => ordered
             .iter()
             .position(|id| id == cursor)
+            .map(|at| at.saturating_add(1))
             .ok_or_else(|| INVALID_POSITION.to_string())?,
     };
-    let size = limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
-    let size = usize::try_from(size).unwrap_or(1);
-    let end = start.saturating_add(size).min(ordered.len());
-    Ok(Page {
-        ids: ordered[start..end].to_vec(),
-        next_position: ordered.get(end).cloned(),
-    })
+    Ok(Page::cut(ordered, start, limit))
 }
 
 /// The `BadRequestException` message for a `position` this service did not issue for the

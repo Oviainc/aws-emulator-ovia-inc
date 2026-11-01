@@ -127,7 +127,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetRestApis<Eng>
 {
     type Input = GetRestApisInput;
-    type Output = GetRestApisOutput;
+    type Output = Paged<GetRestApisOutput>;
     type Error = GetRestApisError;
 
     const NAME: &'static str = "GetRestApis";
@@ -157,9 +157,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|id| store.rest_apis.get(id))
             .map(CreateRestApiOutput::from)
             .collect();
-        Ok(GetRestApisOutput {
-            items: Some(items),
-            position: page.next_position,
-        })
+        Ok(Paged::new(
+            GetRestApisOutput {
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

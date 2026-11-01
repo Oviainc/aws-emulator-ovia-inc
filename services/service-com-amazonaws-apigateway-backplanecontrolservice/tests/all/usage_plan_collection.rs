@@ -257,24 +257,27 @@ async fn get_usage_plans_pages_through_creation_order_on_position_and_limit() {
         );
     }
 
-    // Crossed with every cursor the sequence holds: a page starting at a cursor is the
-    // tail of the sequence from that id, and the cursor it hands back is the next id.
+    // Crossed with every cursor the sequence holds: a page resumes AFTER the cursor it is
+    // given — the cursor a page hands back is the LAST id on that page — so the page is
+    // the tail of the sequence past that id, and a cursor is handed back only while the
+    // sequence holds more.
     for (index, cursor) in created.iter().enumerate() {
         let case = format!("GetUsagePlans(position={cursor}, limit=2)");
         let body = listed(&gateway, &format!("position={cursor}&limit=2")).await;
         let page = listed_ids(&body, &case);
-        let end = (index + 2).min(total);
+        let start = index + 1;
+        let end = (start + 2).min(total);
         assert_eq!(
             page,
-            created[index..end].to_vec(),
+            created[start..end].to_vec(),
             "case {case}: expected {:?}, got {page:?}",
-            &created[index..end]
+            &created[start..end]
         );
-        let next = created.get(end).cloned();
+        let next = (end > start).then(|| created[end - 1].clone());
         assert_eq!(
             body["position"].as_str().map(str::to_owned),
             next,
-            "case {case}: expected the next cursor {next:?}, got {:?}",
+            "case {case}: expected the cursor {next:?}, got {:?}",
             body["position"]
         );
     }

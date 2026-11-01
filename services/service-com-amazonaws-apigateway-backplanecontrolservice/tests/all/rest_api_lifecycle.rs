@@ -233,7 +233,9 @@ pub(crate) fn string_member(body: &Value, member: &str, case: &str) -> String {
         .to_owned()
 }
 
-/// The `items` of a paginated collection. The member's `jsonName` is `item`.
+/// The elements on one page of a paginated collection. The member's `jsonName` is
+/// `item`, and it is always reported — a collection that holds no element and a page
+/// requested past the last element are each the empty page.
 pub(crate) fn page_items(body: &Value, case: &str) -> Vec<Value> {
     body["item"]
         .as_array()
@@ -514,9 +516,10 @@ async fn get_rest_apis_pages_through_creation_order_on_position_and_limit() {
         listed, created,
         "case GetRestApis(no limit): expected the APIs in creation order {created:?}, got {listed:?}"
     );
-    assert!(
-        all.body["position"].is_null(),
-        "case GetRestApis(no limit): the last page omits position, got {:?}",
+    assert_eq!(
+        all.body["position"].as_str(),
+        created.last().map(String::as_str),
+        "case GetRestApis(no limit): the page reports the cursor of its last element, got {:?}",
         all.body["position"]
     );
 

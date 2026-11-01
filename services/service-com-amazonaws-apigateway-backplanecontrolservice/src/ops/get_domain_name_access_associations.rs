@@ -135,7 +135,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetDomainNameAccessAssociations<Eng>
 {
     type Input = GetDomainNameAccessAssociationsInput;
-    type Output = GetDomainNameAccessAssociationsOutput;
+    type Output = Paged<GetDomainNameAccessAssociationsOutput>;
     type Error = GetDomainNameAccessAssociationsError;
 
     const NAME: &'static str = "GetDomainNameAccessAssociations";
@@ -176,9 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|id| store.domain_name_access_associations.get(id))
             .map(CreateDomainNameAccessAssociationOutput::from)
             .collect();
-        Ok(GetDomainNameAccessAssociationsOutput {
-            items: Some(items),
-            position: page.next_position,
-        })
+        Ok(Paged::new(
+            GetDomainNameAccessAssociationsOutput {
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

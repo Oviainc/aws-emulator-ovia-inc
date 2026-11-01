@@ -129,7 +129,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetVpcLinks<Eng>
 {
     type Input = GetVpcLinksInput;
-    type Output = GetVpcLinksOutput;
+    type Output = Paged<GetVpcLinksOutput>;
     type Error = GetVpcLinksError;
 
     const NAME: &'static str = "GetVpcLinks";
@@ -166,9 +166,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|id| store.vpc_links.get(id))
             .map(super::create_vpc_link::vpc_link_body)
             .collect();
-        Ok(GetVpcLinksOutput {
-            items: Some(items),
-            position: page.next_position,
-        })
+        Ok(Paged::new(
+            GetVpcLinksOutput {
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

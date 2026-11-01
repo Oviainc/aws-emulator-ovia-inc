@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetApiKeys<Eng>
 {
     type Input = GetApiKeysInput;
-    type Output = GetApiKeysOutput;
+    type Output = Paged<GetApiKeysOutput>;
     type Error = GetApiKeysError;
 
     const NAME: &'static str = "GetApiKeys";
@@ -223,15 +223,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 body
             })
             .collect();
-        Ok(GetApiKeysOutput {
-            // `ApiKeys$warnings` is "a list of warning messages logged during the import
-            // of API keys" — the import call's own diagnostics, which `ImportApiKeys`
-            // reports from the payload it parsed. Listing the stored keys imports
-            // nothing, so there is no warning to report and the member is absent rather
-            // than an empty list some earlier import's diagnostics would have to fill.
-            warnings: None,
-            items: Some(items),
-            position: page.next_position,
-        })
+        Ok(Paged::new(
+            GetApiKeysOutput {
+                // `ApiKeys$warnings` is "a list of warning messages logged during the
+                // import of API keys" — the import call's own diagnostics, which
+                // `ImportApiKeys` reports from the payload it parsed. Listing the stored
+                // keys imports nothing, so there is no warning to report and the member
+                // is absent rather than an empty list some earlier import's diagnostics
+                // would have to fill.
+                warnings: None,
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

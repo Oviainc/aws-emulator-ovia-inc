@@ -130,7 +130,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetDocumentationVersions<Eng>
 {
     type Input = GetDocumentationVersionsInput;
-    type Output = GetDocumentationVersionsOutput;
+    type Output = Paged<GetDocumentationVersionsOutput>;
     type Error = GetDocumentationVersionsError;
 
     const NAME: &'static str = "GetDocumentationVersions";
@@ -173,9 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|version| api.documentation_versions.get(version))
             .map(super::create_documentation_version::documentation_version_body)
             .collect();
-        Ok(GetDocumentationVersionsOutput {
-            items: Some(items),
-            position: page.next_position,
-        })
+        Ok(Paged::new(
+            GetDocumentationVersionsOutput {
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

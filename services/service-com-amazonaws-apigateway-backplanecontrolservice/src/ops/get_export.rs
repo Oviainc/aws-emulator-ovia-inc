@@ -39,8 +39,8 @@
 //! that spelling shows in the `contentDisposition` filename's extension.
 //!
 //! This is a REPORTING operation: it writes nothing, so two exports of one stage answer
-//! the same document (only the `contentDisposition` filename carries the instant of the
-//! call, the way API Gateway stamps the downloaded file).
+//! the same document and the same `contentDisposition` filename, which names the export
+//! type and the version of the definition it carries.
 //!
 //! What the document does NOT carry, and why: a `Model`'s schema (no operation of this
 //! service creates a `Model` yet, and a `$ref` to a definition the document does not
@@ -754,15 +754,20 @@ fn postman_not_generated() -> GetExportError {
     })
 }
 
-/// The `Content-Disposition` of the exported file: an attachment named for the export type
-/// and the instant it was taken, which is the form API Gateway's own CLI examples show
-/// (`attachment; filename="swagger_2018-04-11T22:08:08Z.json"`).
-fn content_disposition(export_type: &str, serialization: Serialization) -> String {
-    let stamp = crate::state::now()
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_default();
+/// The `Content-Disposition` of the exported file: an attachment named for the export
+/// type and the VERSION of the definition being exported, in the serialization the
+/// response carries (`attachment; filename="swagger_1.0.json"`).
+///
+/// The version is the one the document's own `info` states ([`document_version`]), so the
+/// file is named for what is inside it and two exports of one stage download the same
+/// file name rather than one stamped with the instant of the call.
+fn content_disposition(
+    export_type: &str,
+    version: &str,
+    serialization: Serialization,
+) -> String {
     format!(
-        "attachment; filename=\"{export_type}_{stamp}.{}\"",
+        "attachment; filename=\"{export_type}_{version}.{}\"",
         serialization.file_extension()
     )
 }
@@ -840,11 +845,17 @@ fn export_document(
                 Value::Array(vec![server_object(&host, &stage.stage_name)]),
             );
             document.insert("paths".to_string(), Value::Object(paths));
+            // A 3.0 document holds its reusable definitions in ONE Components Object,
+            // which the document carries whether or not anything was put in it: it is
+            // where a reader of the definition looks for them, and an export that left it
+            // out would say the document has no such section rather than nothing in it.
+            // The 2.0 dialect has no such container — its security schemes are the
+            // top-level `securityDefinitions`, written only when there are any.
+            let mut components = Map::new();
             if !schemes.is_empty() {
-                let mut components = Map::new();
                 components.insert("securitySchemes".to_string(), Value::Object(schemes));
-                document.insert("components".to_string(), Value::Object(components));
             }
+            document.insert("components".to_string(), Value::Object(components));
         }
     }
     if extensions.apigateway {
@@ -910,14 +921,26 @@ fn info_object(api: &RestApiEntry, deployment: &DeploymentEntry) -> Value {
     if let Some(description) = &api.description {
         info.insert("description".to_string(), Value::from(description.as_str()));
     }
-    let version = api.version.clone().unwrap_or_else(|| {
+    info.insert(
+        "version".to_string(),
+        Value::from(document_version(api, deployment)),
+    );
+    Value::Object(info)
+}
+
+/// The version of the definition being exported, as the document's `info` states it and
+/// as the downloaded file is named for ([`content_disposition`]): the API's own
+/// `version`, else — `version` being required of an OpenAPI document and optional on a
+/// `RestApi` — what identifies the definition instead, the instant the deployment was
+/// created or its id. All three are stored values, so two exports of one stage carry the
+/// same version.
+fn document_version(api: &RestApiEntry, deployment: &DeploymentEntry) -> String {
+    api.version.clone().unwrap_or_else(|| {
         deployment
             .created_date
             .and_then(|at| at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok())
             .unwrap_or_else(|| deployment.id.clone())
-    });
-    info.insert("version".to_string(), Value::from(version));
-    Value::Object(info)
+    })
 }
 
 /// The Path Item Object key a method's verb is exported under: the lowercased verb, or
@@ -1148,6 +1171,14 @@ fn responses_object(method: &MethodEntry, dialect: Dialect) -> Value {
         let headers = header_objects(response, dialect);
         if !headers.is_empty() {
             body.insert("headers".to_string(), Value::Object(headers));
+        }
+        if matches!(dialect, Dialect::Oas30) {
+            // A 3.0 Response Object states the representations it is returned in as its
+            // `content` map — the container that replaced 2.0's document-level `produces`
+            // — so the response carries it whether or not a representation is described
+            // in it, and it is empty here for the reason no schema is referenced at all
+            // (see this function's own note).
+            body.insert("content".to_string(), Value::Object(Map::new()));
         }
         responses.insert(status_code.clone(), Value::Object(body));
     }
@@ -1767,7 +1798,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(export_not_written)?;
         Ok(GetExportOutput {
             content_type: Some(MEDIA_TYPE_OCTET_STREAM.to_string()),
-            content_disposition: Some(content_disposition(&input.export_type, serialization)),
+            content_disposition: Some(content_disposition(
+                &input.export_type,
+                &document_version(api, deployment),
+                serialization,
+            )),
             body: Some(body),
         })
     }
