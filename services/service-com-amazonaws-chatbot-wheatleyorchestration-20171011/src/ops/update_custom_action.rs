@@ -8,7 +8,7 @@
 //! The request carries the action's WHOLE mutable state, not a patch: `Definition` is
 //! required on the update even though the stored action already has one, so an optional
 //! member the request leaves out (`AliasName`, `Attachments`) is cleared rather than
-//! kept. What the ARN itself fixes — the action's name and region — and the tags, which
+//! kept. What the ARN itself fixes — the action's name — and the tags, which
 //! only the tagging operations write, are untouched.
 //!
 //! An ARN this account holds no custom action under is refused with the modelled 403
@@ -172,9 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Fail closed, exactly as the read does: a lookup miss is answered as an
         // authorization failure rather than a 404, so the answer says nothing about
-        // whether this account holds an action under the requested ARN. The ARN fully
-        // qualifies the action, its region included, so the signing region is not part of
-        // the lookup.
+        // whether this account holds an action under the requested ARN. A custom action
+        // is account-scoped, so its ARN names it on its own and the signing region is not
+        // part of the lookup.
         let record = store
             .custom_actions
             .get_mut(&input.custom_action_arn)

@@ -9,8 +9,10 @@
 //!
 //! A team is authorized by the one-time Microsoft Teams client handshake, which no
 //! operation in this model performs; see
-//! [`crate::state::seed_microsoft_teams_configured_teams`] for how one reaches the
-//! registry this reads.
+//! [`crate::state::authorize_microsoft_teams_team`] for how one reaches the registry
+//! this reads. The registry holds nothing until something authorizes a team, so an
+//! account that has authorized none is answered a listing with no entries rather than
+//! teams it never configured.
 //!
 //! ## Shape of an operation
 //!

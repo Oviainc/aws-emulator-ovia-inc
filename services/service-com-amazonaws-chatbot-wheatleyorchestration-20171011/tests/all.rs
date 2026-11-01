@@ -31,6 +31,8 @@ mod slack_channel_configuration;
 mod slack_workspace_authorization;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/success_response_wire_shape.rs"]
+mod success_response_wire_shape;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
 #[path = "all/wire.rs"]

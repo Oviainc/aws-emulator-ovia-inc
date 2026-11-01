@@ -216,8 +216,8 @@ async fn a_create_for_an_authorized_workspace_succeeds_and_names_it_from_the_aut
         let configuration_name = format!("authorized-{index}");
         let answer = emulator.create(&configuration_name, slack_team_id).await;
         assert_eq!(
-            answer.status, 201,
-            "case {case:?}: expected 201, got {} with {}",
+            answer.status, 200,
+            "case {case:?}: expected 200, got {} with {}",
             answer.status, answer.body
         );
         let created = answer
@@ -266,8 +266,8 @@ async fn an_authorization_reaches_every_region() {
             .create_in_region(region, "regional", "TREGIONWIDE")
             .await;
         assert_eq!(
-            answer.status, 201,
-            "region {region}: expected 201 for an authorized workspace, got {} with {}",
+            answer.status, 200,
+            "region {region}: expected 200 for an authorized workspace, got {} with {}",
             answer.status, answer.body
         );
 
@@ -315,8 +315,8 @@ async fn the_authorizations_the_store_starts_with_are_listed_and_back_a_configur
             .create(&format!("seeded-{slack_team_id}"), slack_team_id)
             .await;
         assert_eq!(
-            answer.status, 201,
-            "workspace {slack_team_id}: expected 201, got {} with {}",
+            answer.status, 200,
+            "workspace {slack_team_id}: expected 200, got {} with {}",
             answer.status, answer.body
         );
         assert_eq!(

@@ -2,11 +2,13 @@
 
 //! @op UpdateAccountPreferences
 //!
-//! Writes the calling account's AWS Chatbot preferences into the store and reports what
-//! the account now holds. A PARTIAL write: a member the request omits leaves that
-//! preference exactly as it was. The preferences are account-scoped, so a write reaches
-//! every region's `GetAccountPreferences`; see
-//! [`crate::state::AccountPreferencesRecord`].
+//! Writes the calling account's AWS Chatbot preferences into the store and reports the
+//! preferences it SET. A PARTIAL write: a member the request omits leaves that preference
+//! exactly as it was, and is left out of the answer rather than reported as off, so a
+//! client cannot mistake a preference nothing configured for one configured off (the
+//! account's whole preference set is what `GetAccountPreferences` answers). The
+//! preferences are account-scoped, so a write reaches every region's
+//! `GetAccountPreferences`; see [`crate::state::AccountPreferencesRecord`].
 //!
 //! ## Shape of an operation
 //!
@@ -165,8 +167,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.user_authorization_required,
             input.training_data_collection_enabled,
         );
+        // A write answers the preferences it SET, read back out of the store: a
+        // preference the request did not name is left out rather than reported as off,
+        // so a client cannot mistake "not configured" for "configured off". A read
+        // (`GetAccountPreferences`) is what answers the account's whole preference set.
         Ok(UpdateAccountPreferencesOutput {
-            account_preferences: Some(updated.view()),
+            account_preferences: Some(updated.view_of_written(
+                input.user_authorization_required,
+                input.training_data_collection_enabled,
+            )),
         })
     }
 }

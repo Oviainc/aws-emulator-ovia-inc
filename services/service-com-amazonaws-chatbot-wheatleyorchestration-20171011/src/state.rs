@@ -10,9 +10,9 @@
 //!
 //! It also owns the registries of chat workspaces AUTHORIZED with the account — Slack
 //! workspaces, which a channel configuration has to name one of, and Microsoft Teams
-//! teams, which `ListMicrosoftTeamsConfiguredTeams` reports. See
-//! [`seed_slack_workspaces`] and [`seed_microsoft_teams_configured_teams`] for how an
-//! authorization gets into them, given that no operation in this model creates one.
+//! teams, which `ListMicrosoftTeamsConfiguredTeams` reports. An authorization gets into
+//! either one only out of band ([`seed_slack_workspaces`],
+//! [`authorize_microsoft_teams_team`]), because no operation in this model creates one.
 //!
 //! It owns the calling account's AWS Chatbot preferences too
 //! ([`AccountPreferencesRecord`]), which are account-scoped rather than per-resource.
@@ -62,11 +62,11 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// refused with the modelled `LimitExceededException`.
 pub const MAX_SLACK_CHANNEL_CONFIGURATIONS: usize = MAX_PAGE_SIZE;
 
-/// The most custom actions this store holds AT ALL — across every region, for the same
-/// reason as [`MAX_SLACK_CHANNEL_CONFIGURATIONS`]: AWS enforces a service quota on
-/// custom actions per account, the model does not carry the number, and this bound is
-/// what keeps repeated creates from growing the emulator's memory without limit. Past it
-/// a create is refused with the modelled `LimitExceededException`.
+/// The most custom actions this store holds AT ALL, for the same reason as
+/// [`MAX_SLACK_CHANNEL_CONFIGURATIONS`]: AWS enforces a service quota on custom actions
+/// per account, the model does not carry the number, and this bound is what keeps
+/// repeated creates from growing the emulator's memory without limit. Past it a create is
+/// refused with the modelled `LimitExceededException`.
 pub const MAX_CUSTOM_ACTIONS: usize = MAX_PAGE_SIZE;
 
 /// The most Amazon Chime webhook configurations this store holds AT ALL, for the same
@@ -182,7 +182,9 @@ pub struct ComAmazonawsChatbotWheatleyorchestration20171011State {
     /// `BTreeMap` so `ListMicrosoftTeamsConfiguredTeams` walks the teams in one stable
     /// total order and can resume that walk from an opaque token.
     ///
-    /// Populated out of band; see [`seed_microsoft_teams_configured_teams`].
+    /// EMPTY until something authorizes a team ([`authorize_microsoft_teams_team`]):
+    /// an account that has authorized none has none to report, so nothing is seeded
+    /// here.
     microsoft_teams_authorizations: BTreeMap<String, MicrosoftTeamsConfiguredTeamRecord>,
 }
 
@@ -197,10 +199,7 @@ impl Default for ComAmazonawsChatbotWheatleyorchestration20171011State {
                 .map(|workspace| (workspace.slack_team_id.clone(), workspace))
                 .collect(),
             account_preferences: AccountPreferencesRecord::default(),
-            microsoft_teams_authorizations: seed_microsoft_teams_configured_teams()
-                .into_iter()
-                .map(|team| (team.team_id.clone(), team))
-                .collect(),
+            microsoft_teams_authorizations: BTreeMap::new(),
         }
     }
 }
@@ -292,17 +291,18 @@ impl ComAmazonawsChatbotWheatleyorchestration20171011State {
     /// A PARTIAL write: every member of `UpdateAccountPreferences` is optional
     /// (`smithy_query` operation=UpdateAccountPreferences), so a member the request
     /// omits names no new value for that preference and leaves the stored one exactly
-    /// as it was — only a member the request carries moves.
+    /// as it was — only a member the request carries moves. A preference nothing has
+    /// ever written stays UNSET, and a read reports it as absent rather than as off.
     pub fn update_account_preferences(
         &mut self,
         user_authorization_required: Option<bool>,
         training_data_collection_enabled: Option<bool>,
     ) -> AccountPreferencesRecord {
         if let Some(required) = user_authorization_required {
-            self.account_preferences.user_authorization_required = required;
+            self.account_preferences.user_authorization_required = Some(required);
         }
         if let Some(enabled) = training_data_collection_enabled {
-            self.account_preferences.training_data_collection_enabled = enabled;
+            self.account_preferences.training_data_collection_enabled = Some(enabled);
         }
         self.account_preferences
     }
@@ -364,26 +364,58 @@ impl ComAmazonawsChatbotWheatleyorchestration20171011State {
 /// `AccountPreferences` as "Preferences related to AWS Chatbot usage in the calling AWS
 /// account", so there is nothing else a read could key on.
 ///
-/// Both preferences are OPT-INS — the model documents `TrainingDataCollectionEnabled`
-/// as "Turns on training data collection" and `UserAuthorizationRequired` as "Enables
-/// use of a user role requirement in your chat configuration" — so an account that has
-/// never called `UpdateAccountPreferences` has opted into neither and holds `false` for
-/// each. Stored as plain `bool`, never `Option`: a preference is on or off, and a read
-/// reports which, rather than "unset".
+/// Each preference is an `Option`, never a plain `bool`: the modelled
+/// `AccountPreferences` members are optional booleans with no default (`smithy_query`
+/// shape=AccountPreferences), so a preference nothing has written yet is UNSET, and only
+/// a write names a value. The two operations project that record differently, as AWS
+/// Chatbot answers them: a WRITE reports the preferences the request named
+/// ([`Self::view_of_written`]), while a READ reports every preference, an opt-in nothing
+/// has turned on reading as off ([`Self::view`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AccountPreferencesRecord {
-    pub user_authorization_required: bool,
-    pub training_data_collection_enabled: bool,
+    pub user_authorization_required: Option<bool>,
+    pub training_data_collection_enabled: Option<bool>,
 }
 
 impl AccountPreferencesRecord {
-    /// Project the stored preferences onto the modelled `AccountPreferences` both
-    /// account-preference operations return, so a read and a write cannot answer two
-    /// different shapes for one record.
+    /// Project the stored preferences onto the modelled `AccountPreferences` a READ
+    /// answers: every preference the model carries, resolved.
+    ///
+    /// Both are OPT-INS — the model documents `TrainingDataCollectionEnabled` as "Turns
+    /// on training data collection" and `UserAuthorizationRequired` as "Enables use of a
+    /// user role requirement in your chat configuration" — so one nothing has turned on
+    /// is reported off rather than left out: a read answers the account's whole
+    /// preference set.
     pub fn view(&self) -> AccountPreferences {
         AccountPreferences {
-            user_authorization_required: Some(self.user_authorization_required),
-            training_data_collection_enabled: Some(self.training_data_collection_enabled),
+            user_authorization_required: Some(self.user_authorization_required.unwrap_or(false)),
+            training_data_collection_enabled: Some(
+                self.training_data_collection_enabled.unwrap_or(false),
+            ),
+        }
+    }
+
+    /// Project the stored preferences onto the modelled `AccountPreferences` a WRITE
+    /// answers: the STORED value of each preference the request named, and nothing at all
+    /// for one it did not name.
+    ///
+    /// A write reports what it set, so a preference the request left out is left out of
+    /// the answer — which is what keeps a client from reading "not configured" as
+    /// "configured off" and pushing an explicit value back. The arguments are the
+    /// request's own members, so `Some` means "the request named this preference"; the
+    /// value reported for it is the one now in the store, never the one off the request.
+    pub fn view_of_written(
+        &self,
+        user_authorization_required: Option<bool>,
+        training_data_collection_enabled: Option<bool>,
+    ) -> AccountPreferences {
+        AccountPreferences {
+            // `Option::and` keeps the stored value where the request named the
+            // preference, and `None` where it did not.
+            user_authorization_required: user_authorization_required
+                .and(self.user_authorization_required),
+            training_data_collection_enabled: training_data_collection_enabled
+                .and(self.training_data_collection_enabled),
         }
     }
 }
@@ -461,6 +493,14 @@ pub fn unauthorized_slack_workspace_message(slack_team_id: &str) -> String {
 
 /// One authorized Microsoft Teams team: what `ListMicrosoftTeamsConfiguredTeams`
 /// reports and what a Microsoft Teams channel configuration is bound to.
+///
+/// A team becomes authorized with an AWS account through the one-time Microsoft Teams
+/// client handshake in the AWS Chatbot console. NO operation in this model performs it:
+/// `ListMicrosoftTeamsConfiguredTeams` lists the authorizations and
+/// `DeleteMicrosoftTeamsConfiguredTeam` removes one, and neither creates one — so the
+/// registry starts EMPTY and only [`authorize_microsoft_teams_team`] (the out-of-band
+/// seam a fixture or an admin path reaches) puts a team in it. An account that has
+/// authorized no team therefore lists none.
 #[derive(Debug, Clone, Default)]
 pub struct MicrosoftTeamsConfiguredTeamRecord {
     /// The Microsoft Teams tenant the team belongs to.
@@ -485,48 +525,6 @@ impl MicrosoftTeamsConfiguredTeamRecord {
             state_reason: self.state_reason.clone(),
         }
     }
-}
-
-/// The Microsoft Teams teams this store starts out holding an authorization for.
-///
-/// A team becomes authorized with an AWS account through the one-time Microsoft Teams
-/// client handshake in the AWS Chatbot console. NO operation in this model performs it:
-/// `ListMicrosoftTeamsConfiguredTeams` lists the authorizations and
-/// `DeleteMicrosoftTeamsConfiguredTeam` removes one, and neither creates one. Without a
-/// seed the registry would therefore be empty for good, so the teams below are a fixture
-/// standing in for that handshake: a client can discover them with
-/// `ListMicrosoftTeamsConfiguredTeams`. A test (or an admin path) registers its own with
-/// [`ComAmazonawsChatbotWheatleyorchestration20171011State::authorize_microsoft_teams_team`].
-///
-/// Every id and name satisfies the model's `UUID` shape (`smithy_query` shape=UUID:
-/// `length 36..36`, `pattern ^[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$`),
-/// which `ConfiguredTeam`'s `TenantId`, `TeamId` AND `TeamName` all target — so the
-/// display name is UUID-shaped too, because that is what this service's model says that
-/// member carries.
-pub fn seed_microsoft_teams_configured_teams() -> Vec<MicrosoftTeamsConfiguredTeamRecord> {
-    [
-        (
-            "11111111-1111-1111-1111-111111111111",
-            "a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
-            "c0ffee00-0001-4000-8000-000000000001",
-        ),
-        (
-            "11111111-1111-1111-1111-111111111111",
-            "f1e2d3c4-b5a6-4987-8765-43210fedcba9",
-            "c0ffee00-0002-4000-8000-000000000002",
-        ),
-    ]
-    .into_iter()
-    .map(
-        |(tenant_id, team_id, team_name)| MicrosoftTeamsConfiguredTeamRecord {
-            tenant_id: tenant_id.to_string(),
-            team_id: team_id.to_string(),
-            team_name: Some(team_name.to_string()),
-            state: STATE_ENABLED.to_string(),
-            state_reason: None,
-        },
-    )
-    .collect()
 }
 
 /// One stored Slack channel configuration: everything a later `Describe`, `Update`,
@@ -601,16 +599,14 @@ impl SlackChannelConfigRecord {
 /// One stored custom action: everything a later `Get`, `List`, `Update`, `Delete` or tag
 /// call has to be able to answer from.
 ///
-/// No `Default`: the ARN, the name, the region and the command text are all required, so
-/// there is no such thing as a default custom action to insert.
+/// No `Default`: the ARN, the name and the command text are all required, so there is no
+/// such thing as a default custom action to insert.
 #[derive(Debug, Clone)]
 pub struct CustomActionRecord {
     pub custom_action_arn: String,
-    /// The name the ARN carries, and the thing a second create in the same region
+    /// The name the ARN carries, and the thing a second create for this account
     /// collides with.
     pub action_name: String,
-    /// The region the action lives in, the one its ARN names.
-    pub region: String,
     /// `Definition.CommandText` — the command the action runs.
     pub command_text: String,
     pub alias_name: Option<String>,
@@ -705,21 +701,25 @@ impl ChimeWebhookConfigRecord {
 }
 
 /// The `CustomActionArn` of a custom action:
-/// `arn:aws:chatbot:{region}:{account}:custom-action/{action_name}`, the form the
-/// model's `CustomActionArn` pattern requires
-/// (`^arn:aws:chatbot:[A-Za-z0-9_/.-]{0,63}:[A-Za-z0-9_/.-]{0,63}:custom-action/[a-zA-Z0-9_-]{1,64}$`).
+/// `arn:aws:chatbot::{account}:custom-action/{action_name}`.
 ///
-/// Built through `emulator_server::emulator_arn`, so the account segment is the one
-/// canonical emulator account id and no ARN is assembled by hand. A custom action is
-/// regional, so the ARN carries the request's region and the same action name can be
-/// created once per region.
-pub fn custom_action_arn(region: &str, action_name: &str) -> String {
+/// A custom action is scoped to the ACCOUNT, not to a region, so its ARN carries an
+/// EMPTY region segment — the form AWS Chatbot answers a create with, and the one the
+/// model's `CustomActionArn` pattern allows, its region segment being
+/// `[A-Za-z0-9_/.-]{0,63}` (`smithy_query` shape=CustomActionArn), i.e. zero length
+/// included. One action name is therefore one action for the whole account, whichever
+/// region a request is signed for.
+///
+/// Built through `emulator_server::emulator_arn` with the empty region that function
+/// documents for an account-scoped resource, so the account segment is the one canonical
+/// emulator account id and no ARN is assembled by hand.
+pub fn custom_action_arn(action_name: &str) -> String {
     // The resource-type segment comes from the same constant
     // [`chatbot_resource_kind`] reads an ARN's kind from, so minting and classifying an
     // ARN cannot disagree about it.
     ::emulator_server::emulator_arn(
         ARN_SERVICE,
-        region,
+        "",
         &format!("{CUSTOM_ACTION_RESOURCE_TYPE}/{action_name}"),
     )
 }

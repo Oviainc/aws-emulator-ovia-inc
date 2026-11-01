@@ -9,11 +9,13 @@
 //! caller's `MaxResults` (and bounded even when it names none), resumable only from a
 //! `NextToken` the service itself issued — and it changes nothing a later caller sees.
 //!
-//! The registry is exercised as a CLASS of inputs rather than one recorded request: the
-//! teams span the published `UUID` shape (`smithy_query` shape=UUID: `length 36..36`,
-//! `pattern ^[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$`) in lower case, upper
-//! case and mixed case, with and without a display name, authorized out of `TeamId`
-//! order; the page sizes span the published `MaxResults` range (`smithy_query`
+//! The registry is exercised as a CLASS of inputs rather than one recorded request: it is
+//! read while EMPTY (an account that authorized no team is listed none — nothing is
+//! pre-seeded), and with teams spanning the published `UUID` shape (`smithy_query`
+//! shape=UUID: `length 36..36`, `pattern
+//! ^[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$`) in lower case, upper case and
+//! mixed case, with and without a display name, authorized out of `TeamId` order; the
+//! page sizes span the published `MaxResults` range (`smithy_query`
 //! operation=ListMicrosoftTeamsConfiguredTeams: `range 1..100`) at both bounds, one past
 //! each bound, and in between.
 
@@ -249,7 +251,8 @@ fn expected_view(tenant_id: &str, team_id: &str, team_name: Option<&str>) -> Val
     Value::Object(view)
 }
 
-/// An emulator holding the seeded registry plus every row of [`AUTHORIZED`].
+/// An emulator holding every row of [`AUTHORIZED`] — and nothing else: the registry starts
+/// empty, since a team reaches it only through the out-of-band handshake seam.
 fn emulator_with_authorized_teams() -> Emulator {
     let emulator = Emulator::new();
     for (_, tenant_id, team_id, team_name) in AUTHORIZED {
@@ -259,21 +262,40 @@ fn emulator_with_authorized_teams() -> Emulator {
 }
 
 #[tokio::test]
+async fn an_account_that_authorized_no_team_is_listed_no_teams() {
+    // Nothing authorizes a team on a fresh store, so the listing reports none: a client
+    // must never be handed a team it never configured. Asserted in both regions and over
+    // every page size, so no path fabricates an entry.
+    let emulator = Emulator::new();
+
+    for region in [REGION, OTHER_REGION] {
+        for max_results in [None, Some(1usize), Some(100)] {
+            let listed = emulator.all_teams_in_region(region, max_results).await;
+            assert!(
+                listed.is_empty(),
+                "case {region} / MaxResults {max_results:?}: an account that authorized no \
+                 team must be listed none, got {listed:?}"
+            );
+        }
+
+        // The member itself is still served, as an empty list rather than omitted.
+        let (page, token) = emulator.teams_page_in_region(region, &json!({})).await;
+        assert!(
+            page.is_empty() && token.is_none(),
+            "case {region}: an empty registry is one empty page with no token, got {page:?} \
+             and {token:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_listing_reports_every_authorization_the_registry_holds_and_nothing_else() {
     let emulator = emulator_with_authorized_teams();
 
-    let mut expected: Vec<Value> = chatbot::state::seed_microsoft_teams_configured_teams()
+    let mut expected: Vec<Value> = AUTHORIZED
         .iter()
-        .map(|team| expected_view(&team.tenant_id, &team.team_id, team.team_name.as_deref()))
+        .map(|(_, tenant_id, team_id, team_name)| expected_view(tenant_id, team_id, *team_name))
         .collect();
-    assert!(
-        !expected.is_empty(),
-        "the store must start with at least one configured team, or no client could ever \
-         discover one"
-    );
-    for (_, tenant_id, team_id, team_name) in AUTHORIZED {
-        expected.push(expected_view(tenant_id, team_id, team_name));
-    }
     // The listing's order is the registry's: `TeamId` ascending, whatever order the
     // authorizations arrived in.
     expected.sort_by(|left, right| team_id_of(left).cmp(team_id_of(right)));
@@ -332,9 +354,10 @@ async fn max_results_pages_the_same_listing_whatever_the_page_size() {
     let emulator = emulator_with_authorized_teams();
 
     let whole = emulator.all_teams(None).await;
-    assert!(
-        whole.len() >= AUTHORIZED.len(),
-        "expected at least the {} authorized teams, got {whole:?}",
+    assert_eq!(
+        whole.len(),
+        AUTHORIZED.len(),
+        "expected exactly the {} authorized teams, got {whole:?}",
         AUTHORIZED.len()
     );
 

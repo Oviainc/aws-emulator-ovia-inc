@@ -278,8 +278,8 @@ fn minimal_create(name: &str) -> Value {
 async fn create_ok(router: &MultiServiceRouter, request: &Value) -> Value {
     let (status, body) = call(router, CREATE_PATH, request).await;
     assert_eq!(
-        status, 201,
-        "create {request}: expected 201, got {status} with {body}"
+        status, 200,
+        "create {request}: expected 200, got {status} with {body}"
     );
     body.get("WebhookConfiguration")
         .cloned()
@@ -430,7 +430,7 @@ async fn a_duplicate_configuration_name_is_a_conflict_and_leaves_the_stored_one_
     // The same name in ANOTHER region is a different configuration, so it is created.
     let (status, body) = call_in_region(&router, OTHER_REGION, CREATE_PATH, &second).await;
     assert_eq!(
-        status, 201,
+        status, 200,
         "the same name in another region is a different configuration, got {status} with {body}"
     );
     assert_eq!(
@@ -450,8 +450,8 @@ async fn a_listing_answers_only_its_own_regions_configurations() {
         let (status, body) =
             call_in_region(&router, region, CREATE_PATH, &minimal_create(region)).await;
         assert_eq!(
-            status, 201,
-            "region {region}: expected 201, got {status} with {body}"
+            status, 200,
+            "region {region}: expected 200, got {status} with {body}"
         );
         assert_eq!(
             body["WebhookConfiguration"]["ChatConfigurationArn"],

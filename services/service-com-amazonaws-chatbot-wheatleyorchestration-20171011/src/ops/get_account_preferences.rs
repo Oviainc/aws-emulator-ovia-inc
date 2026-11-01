@@ -4,9 +4,10 @@
 //!
 //! Reports the calling account's AWS Chatbot preferences out of the store: a pure READ
 //! (`@readonly` in the model), so it writes nothing and a later caller sees exactly what
-//! the last `UpdateAccountPreferences` left. The preferences are account-scoped, so the
-//! answer does not depend on the region the request is signed for; see
-//! [`crate::state::AccountPreferencesRecord`].
+//! the last `UpdateAccountPreferences` left. A read answers the account's WHOLE
+//! preference set, so a preference nothing has turned on reads as off (both are opt-ins).
+//! The preferences are account-scoped, so the answer does not depend on the region the
+//! request is signed for; see [`crate::state::AccountPreferencesRecord`].
 //!
 //! ## Shape of an operation
 //!

@@ -172,7 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CreateSlackChannelConfiguration";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_SLACK_CHANNEL_CONFIGURATION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_SLACK_CHANNEL_CONFIGURATION_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 201u16;
+    /// AWS Chatbot answers a successful create with 200 and the create's result
+    /// document, which is what the recorded create responses carry; the model's `@http`
+    /// code for this operation (201) is stale and the live service does not use it.
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomAction
-//! Implemented: mints a `CustomActionArn` for `ActionName` in the request's region
+//! Implemented: mints a `CustomActionArn` for `ActionName`
 //! ([`crate::state::custom_action_arn`]), persists the whole action — definition, alias,
 //! attachments and tags — in [`crate::state`], and answers with that ARN. A later
 //! `GetCustomAction` therefore reads back exactly what the create stored.
 //!
-//! Two creates cannot hold one name in one region: a second create for a name the store
+//! A custom action is ACCOUNT-scoped, so two creates cannot hold one name for one
+//! account whichever region they are signed for: a second create for a name the store
 //! already holds is a 409 `ConflictException`, UNLESS it carries the SAME `ClientToken`
 //! as the create that minted the action. `ClientToken` is the model's
 //! `@idempotencyToken`, so that retry answers the original successful create — the same
@@ -159,23 +160,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CreateCustomAction";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_CUSTOM_ACTION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_CUSTOM_ACTION_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 201u16;
+    /// AWS Chatbot answers a successful create with 200 and the create's result
+    /// document, which is what the recorded create responses carry; the model's `@http`
+    /// code for this operation (201) is stale and the live service does not use it.
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateCustomActionErrorModeled::InternalServiceError(InternalServiceError {
                 message: Some("the chatbot configuration store is unavailable".to_string()),
             })
         })?;
 
-        // A custom action is regional, so its name is unique per region and the minted
-        // ARN, which carries the region, is the store's key.
-        let region = crate::state::request_region(ctx.parts());
-        let custom_action_arn = crate::state::custom_action_arn(&region, &input.action_name);
+        // A custom action is account-scoped, so its name is unique for the whole account
+        // and the minted ARN — which carries no region — is the store's key.
+        let custom_action_arn = crate::state::custom_action_arn(&input.action_name);
 
         let mut store = state.lock();
 
@@ -204,9 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The store is bounded: past the cap a create is refused rather than grown. The
-        // count is the WHOLE store's, not the region's, so signing for another region
-        // does not hand the caller a fresh budget.
+        // The store is bounded: past the cap a create is refused rather than grown.
         if store.custom_actions.len() >= crate::state::MAX_CUSTOM_ACTIONS {
             return Err(
                 CreateCustomActionErrorModeled::LimitExceededException(LimitExceededException {
@@ -222,7 +224,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::CustomActionRecord {
             custom_action_arn: custom_action_arn.clone(),
             action_name: input.action_name,
-            region,
             command_text: input.definition.command_text,
             alias_name: input.alias_name,
             // Stored as the request carried them — an absent `Attachments` stays absent

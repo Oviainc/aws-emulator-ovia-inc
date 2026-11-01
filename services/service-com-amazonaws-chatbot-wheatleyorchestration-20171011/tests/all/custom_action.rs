@@ -8,30 +8,31 @@
 //! of inputs rather than one recorded request:
 //!
 //! * a created custom action is persisted under
-//!   `arn:aws:chatbot:{region}:{account}:custom-action/{ActionName}` and read back by
+//!   `arn:aws:chatbot::{account}:custom-action/{ActionName}` and read back by
 //!   `GetCustomAction` exactly as created, whatever subset of the optional members
 //!   (`AliasName`, `Attachments`, `Tags`, `ClientToken`) the create carried and however
 //!   many attachments, criteria or variables they hold;
-//! * one `ActionName` per region: a second create for a name a region already holds is a
-//!   409 `ConflictException` and leaves the stored action alone, while the SAME
-//!   `ClientToken` the action was minted under makes the retry answer the original
-//!   create's ARN instead (the model's `@idempotencyToken`);
-//! * the ARN is regional, so the same `ActionName` can be created once per region, and an
-//!   ARN this account holds no action under is refused with the modelled 403
-//!   `UnauthorizedException`: AWS Chatbot decides a custom-action request against the ARN
-//!   before any existence lookup, so the answer discloses nothing about whether the
-//!   action exists (see `tests/all/custom_action_fail_closed.rs`, which asserts that rule
-//!   across every operation addressed by a custom-action ARN).
+//! * one `ActionName` per ACCOUNT: a second create for a name the account already holds is
+//!   a 409 `ConflictException` and leaves the stored action alone — whichever region it is
+//!   signed for — while the SAME `ClientToken` the action was minted under makes the retry
+//!   answer the original create's ARN instead (the model's `@idempotencyToken`);
+//! * a custom action is account-scoped, so its ARN carries no region and the same
+//!   `ActionName` names one action for the whole account, and an ARN this account holds no
+//!   action under is refused with the modelled 403 `UnauthorizedException`: AWS Chatbot
+//!   decides a custom-action request against the ARN before any existence lookup, so the
+//!   answer discloses nothing about whether the action exists (see
+//!   `tests/all/custom_action_fail_closed.rs`, which asserts that rule across every
+//!   operation addressed by a custom-action ARN).
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The region the test signs for, so the minted ARNs carry it.
+/// The region the test signs for.
 const REGION: &str = "us-east-1";
 
-/// A second region, for the rows that show an ARN — and so a name — is regional.
+/// A second region, for the rows that show a custom action is NOT regional.
 const OTHER_REGION: &str = "us-west-2";
 
 /// The canonical emulator account id (`emulator_server::EMULATOR_ACCOUNT_ID`), spelled
@@ -114,12 +115,16 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-fn arn_in_region(region: &str, action_name: &str) -> String {
-    format!("arn:aws:chatbot:{region}:{ACCOUNT}:custom-action/{action_name}")
+/// A custom action is account-scoped, so its ARN carries an EMPTY region segment
+/// (`state::custom_action_arn`).
+fn expected_arn(action_name: &str) -> String {
+    format!("arn:aws:chatbot::{ACCOUNT}:custom-action/{action_name}")
 }
 
-fn expected_arn(action_name: &str) -> String {
-    arn_in_region(REGION, action_name)
+/// The same ARN with a region segment filled in: a well-formed `CustomActionArn` that is
+/// NOT the one a create mints, so this account holds no action under it.
+fn arn_in_region(region: &str, action_name: &str) -> String {
+    format!("arn:aws:chatbot:{region}:{ACCOUNT}:custom-action/{action_name}")
 }
 
 /// Create `request` and return the `CustomActionArn` it answers.
@@ -130,8 +135,8 @@ async fn create_ok(router: &MultiServiceRouter, request: &Value) -> String {
 async fn create_ok_in_region(router: &MultiServiceRouter, region: &str, request: &Value) -> String {
     let (status, body) = call_in_region(router, region, "/create-custom-action", request).await;
     assert_eq!(
-        status, 201,
-        "create {request} in {region}: expected 201, got {status} with {body}"
+        status, 200,
+        "create {request} in {region}: expected 200, got {status} with {body}"
     );
     body.get("CustomActionArn")
         .and_then(Value::as_str)
@@ -340,37 +345,78 @@ async fn a_created_custom_action_is_persisted_and_read_back_exactly_as_created()
 }
 
 #[tokio::test]
-async fn an_action_name_is_regional_so_the_same_name_is_created_once_per_region() {
-    let router = router();
-
+async fn an_action_name_is_account_scoped_so_the_same_name_is_one_action_in_every_region() {
     for case in create_cases() {
+        // A fresh store per row, so each row's second create races the same first one.
+        let router = router();
         let action_name = case.request["ActionName"].as_str().unwrap().to_string();
         let here = create_ok(&router, &case.request).await;
-        let there = create_ok_in_region(&router, OTHER_REGION, &case.request).await;
         assert_eq!(
             here,
-            arn_in_region(REGION, &action_name),
-            "case {:?}: the ARN must name the request's region, got {here:?}",
-            case.label
-        );
-        assert_eq!(
-            there,
-            arn_in_region(OTHER_REGION, &action_name),
-            "case {:?}: the ARN must name the request's region, got {there:?}",
+            expected_arn(&action_name),
+            "case {:?}: the minted ARN must carry no region, got {here:?}",
             case.label
         );
 
-        // An ARN fully qualifies an action, so either region's ARN reads back from
-        // either region's request, and each holds its own record.
-        for arn in [&here, &there] {
-            let action = get_ok_in_region(&router, OTHER_REGION, arn).await;
+        // The SAME name created from another region is the same action, not a second
+        // one: the create is refused as a conflict unless it retries the minting token.
+        let (status, body) =
+            call_in_region(&router, OTHER_REGION, "/create-custom-action", &case.request).await;
+        let is_retry = case.request.get("ClientToken").is_some();
+        if is_retry {
             assert_eq!(
-                action["CustomActionArn"].as_str(),
-                Some(arn.as_str()),
-                "case {:?}: {arn} must read back as itself, got {action}",
+                status, 200,
+                "case {:?}: a retry of the minting create in {OTHER_REGION} must answer the \
+                 original create, got {status} with {body}",
+                case.label
+            );
+            assert_eq!(
+                body.get("CustomActionArn").and_then(Value::as_str),
+                Some(here.as_str()),
+                "case {:?}: a retry must answer the original ARN, got {body}",
+                case.label
+            );
+        } else {
+            assert_eq!(
+                status, 409,
+                "case {:?}: the same name in {OTHER_REGION} is a conflict, got {status} with \
+                 {body}",
+                case.label
+            );
+            assert_eq!(
+                error_code(&body),
+                "ConflictException",
+                "case {:?}: expected ConflictException, got {body}",
                 case.label
             );
         }
+
+        // One action, reachable by its ARN from either region: the signing region is not
+        // part of the lookup.
+        for region in [REGION, OTHER_REGION] {
+            let action = get_ok_in_region(&router, region, &here).await;
+            assert_eq!(
+                action["CustomActionArn"].as_str(),
+                Some(here.as_str()),
+                "case {:?}: {here} must read back as itself in {region}, got {action}",
+                case.label
+            );
+        }
+
+        // The region-qualified spelling of the same name is a well-formed ARN this
+        // account holds no action under, so it is refused rather than served.
+        let regional = arn_in_region(REGION, &action_name);
+        let (status, body) = call(
+            &router,
+            "/get-custom-action",
+            &json!({"CustomActionArn": regional}),
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "case {:?}: {regional} names no action, got {status} with {body}",
+            case.label
+        );
     }
 }
 
@@ -428,7 +474,7 @@ async fn a_duplicate_action_name_conflicts_unless_it_retries_the_minting_client_
 
         if case.is_retry {
             assert_eq!(
-                status, 201,
+                status, 200,
                 "case {:?}: a retry of the minting create must succeed, got {status} with {body}",
                 case.label
             );
@@ -502,7 +548,7 @@ async fn a_create_past_the_store_bound_is_refused_and_persists_nothing() {
         // Nothing was persisted for the refused name: the read of it is refused the way
         // any ARN this account holds no action under is — fail closed, 403, disclosing
         // nothing about whether the action exists.
-        let refused = json!({"CustomActionArn": arn_in_region(region, "one-too-many")});
+        let refused = json!({"CustomActionArn": expected_arn("one-too-many")});
         let (status, body) = call_in_region(&router, region, "/get-custom-action", &refused).await;
         assert_eq!(
             status, 403,
@@ -536,12 +582,12 @@ async fn getting_an_arn_the_store_does_not_hold_is_refused_as_unauthorized() {
     let cases = [
         ("a name nothing was created under", expected_arn("absent")),
         (
-            "the created name in another region",
+            "the created name spelled with a region segment",
             arn_in_region(OTHER_REGION, "present"),
         ),
         (
             "another account's ARN for the created name",
-            format!("arn:aws:chatbot:{REGION}:999999999999:custom-action/present"),
+            "arn:aws:chatbot::999999999999:custom-action/present".to_string(),
         ),
     ];
 

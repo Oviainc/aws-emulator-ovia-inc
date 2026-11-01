@@ -199,8 +199,9 @@ fn chat_configuration_arn(region: &str, client: &str, name: &str) -> String {
     format!("arn:aws:chatbot:{region}:{ACCOUNT}:chat-configuration/{client}/{name}")
 }
 
-fn custom_action_arn(region: &str, name: &str) -> String {
-    format!("arn:aws:chatbot:{region}:{ACCOUNT}:custom-action/{name}")
+fn custom_action_arn(name: &str) -> String {
+    // A custom action is account-scoped, so its ARN carries an EMPTY region segment.
+    format!("arn:aws:chatbot::{ACCOUNT}:custom-action/{name}")
 }
 
 /// Create a resource of `kind` named `name`, carrying `tags`, and answer its ARN.
@@ -242,8 +243,8 @@ async fn create(emulator: &Emulator, kind: Kind, name: &str, tags: &Value) -> St
 
     let created = emulator.call(path, &request).await;
     assert_eq!(
-        created.status, 201,
-        "kind {kind:?}: creating {name:?} must answer 201, got {} with {}",
+        created.status, 200,
+        "kind {kind:?}: creating {name:?} must answer 200, got {} with {}",
         created.status, created.body
     );
     let mut value = &created.body;
@@ -493,13 +494,13 @@ async fn an_arn_the_store_does_not_hold_is_refused_the_way_its_resource_kind_is(
         ),
         (
             "a custom action that was never created",
-            custom_action_arn(REGION, "never-created"),
+            custom_action_arn("never-created"),
             403,
             UNAUTHORIZED_EXCEPTION,
         ),
         (
-            "another region's ARN for a custom action",
-            custom_action_arn(OTHER_REGION, "never-created"),
+            "a region-qualified ARN for a custom action",
+            format!("arn:aws:chatbot:{OTHER_REGION}:{ACCOUNT}:custom-action/never-created"),
             403,
             UNAUTHORIZED_EXCEPTION,
         ),

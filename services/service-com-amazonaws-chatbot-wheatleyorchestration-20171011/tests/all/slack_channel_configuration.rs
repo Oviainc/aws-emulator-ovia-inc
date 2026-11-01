@@ -253,8 +253,8 @@ fn minimal_create(name: &str) -> Value {
 async fn create_ok(router: &MultiServiceRouter, request: &Value) -> Value {
     let (status, body) = call(router, "/create-slack-channel-configuration", request).await;
     assert_eq!(
-        status, 201,
-        "create {request}: expected 201, got {status} with {body}"
+        status, 200,
+        "create {request}: expected 200, got {status} with {body}"
     );
     body.get("ChannelConfiguration")
         .cloned()
@@ -839,7 +839,7 @@ async fn a_configuration_belongs_to_the_region_its_request_was_signed_for() {
         )
         .await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "region {region:?}: the same name in another region is not a conflict, got \
              {status} with {body}"
         );
@@ -888,7 +888,7 @@ async fn the_store_refuses_to_grow_past_the_configuration_quota() {
         )
         .await;
         assert_eq!(
-            status, 201,
+            status, 200,
             "configuration {n} is within the quota of {QUOTA}, got {status} with {body}"
         );
     }

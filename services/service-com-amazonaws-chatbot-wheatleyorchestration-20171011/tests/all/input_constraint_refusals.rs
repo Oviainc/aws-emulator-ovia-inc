@@ -328,7 +328,7 @@ async fn input_inside_every_modelled_constraint_is_not_refused_as_a_constraint_v
             label: "Slack create with a LoggingLevel from the published catalogue",
             path: "/create-slack-channel-configuration",
             request: slack_create(SEEDED_SLACK_TEAM_ID, "accepted-config", json!("INFO")),
-            expected_status: Some(201),
+            expected_status: Some(200),
         },
         AcceptedCase {
             label: "CreateCustomAction with a ClientToken at the length minimum",
@@ -338,7 +338,7 @@ async fn input_inside_every_modelled_constraint_is_not_refused_as_a_constraint_v
                 "Definition": {"CommandText": "ssm list-documents"},
                 "ClientToken": "a".repeat(33),
             }),
-            expected_status: Some(201),
+            expected_status: Some(200),
         },
         AcceptedCase {
             label: "Chime create with a WebhookUrl that satisfies its pattern",

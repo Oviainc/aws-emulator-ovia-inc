@@ -14,9 +14,9 @@
 //! tagging operations declare.
 //!
 //! The tables span the class rather than one recorded request: the refused ARNs differ in
-//! the action name's length and charset and in the region segment, and each one is then
-//! CREATED and re-addressed, so the refusal provably follows from the store rather than
-//! from the shape of the ARN.
+//! the action name's length and charset and in whether the ARN carries a region segment at
+//! all, and each name is then CREATED and re-addressed, so the refusal provably follows
+//! from the store rather than from the shape of the ARN.
 
 use serde_json::{json, Value};
 
@@ -33,12 +33,16 @@ const UNAUTHORIZED_EXCEPTION: &str = "UnauthorizedException";
 /// hold.
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
-fn custom_action_arn_in_region(region: &str, action_name: &str) -> String {
-    format!("arn:aws:chatbot:{region}:{ACCOUNT}:custom-action/{action_name}")
+/// A custom action is account-scoped, so the ARN a create mints carries an EMPTY region
+/// segment (`state::custom_action_arn`).
+fn custom_action_arn(action_name: &str) -> String {
+    format!("arn:aws:chatbot::{ACCOUNT}:custom-action/{action_name}")
 }
 
-fn custom_action_arn(action_name: &str) -> String {
-    custom_action_arn_in_region(REGION, action_name)
+/// The same ARN with a region segment filled in — a well-formed `CustomActionArn` that no
+/// create ever mints.
+fn custom_action_arn_in_region(region: &str, action_name: &str) -> String {
+    format!("arn:aws:chatbot:{region}:{ACCOUNT}:custom-action/{action_name}")
 }
 
 /// The implemented operations that address a resource by ARN: the member the ARN travels
@@ -64,14 +68,13 @@ async fn a_custom_action_arn_this_account_holds_no_action_for_is_unauthorized() 
 
     // Well-formed `CustomActionArn`s (the modelled pattern
     // `^arn:aws:chatbot:…:custom-action/[a-zA-Z0-9_-]{1,64}$`) that no create ever minted:
-    // they differ in the action name's length and charset and in the region segment, so the
-    // refusal cannot follow from the spelling of the ARN.
+    // they differ in the action name's length and charset, so the refusal cannot follow
+    // from the spelling of the ARN.
     let unknown = [
         custom_action_arn("sim2real-never-created-action"),
         custom_action_arn("a"),
         custom_action_arn(&"z".repeat(64)),
         custom_action_arn("Mixed_Case-9"),
-        custom_action_arn_in_region(OTHER_REGION, "never-created"),
     ];
 
     for arn in &unknown {
@@ -92,14 +95,12 @@ async fn a_custom_action_arn_this_account_holds_no_action_for_is_unauthorized() 
     }
 
     // The same ARNs, once the action exists, are served — so the 403 above came from the
-    // store and not from the ARN itself.
-    for arn in &unknown {
+    // store and not from the ARN itself. The create is signed for each region in turn: a
+    // custom action is account-scoped, so the region the create is signed for changes
+    // neither the ARN it mints nor what the ARN then answers.
+    for (index, arn) in unknown.iter().enumerate() {
         let action_name = arn.rsplit('/').next().expect("the ARN names an action");
-        let region = if arn.contains(OTHER_REGION) {
-            OTHER_REGION
-        } else {
-            REGION
-        };
+        let region = if index % 2 == 0 { REGION } else { OTHER_REGION };
         let created = emulator
             .call_in_region(
                 region,
@@ -111,9 +112,15 @@ async fn a_custom_action_arn_this_account_holds_no_action_for_is_unauthorized() 
             )
             .await;
         assert_eq!(
-            created.status, 201,
-            "case {arn:?}: the create answers 201, got {} with {}",
+            created.status, 200,
+            "case {arn:?}: the create answers 200, got {} with {}",
             created.status, created.body
+        );
+        assert_eq!(
+            created.body.get("CustomActionArn").and_then(Value::as_str),
+            Some(arn.as_str()),
+            "case {arn:?}: a create signed for {region} must mint the region-less ARN, got {}",
+            created.body
         );
 
         for (member, path) in ARN_ADDRESSED {
@@ -121,6 +128,21 @@ async fn a_custom_action_arn_this_account_holds_no_action_for_is_unauthorized() 
             assert_eq!(
                 answer.status, 200,
                 "case {arn:?} on {path}: an action that exists is served, got {} with {}",
+                answer.status, answer.body
+            );
+        }
+
+        // The region-qualified spelling of the same name names no action, so it stays
+        // refused even now that the action exists.
+        let regional = custom_action_arn_in_region(region, action_name);
+        for (member, path) in ARN_ADDRESSED {
+            let answer = emulator
+                .call(path, &arn_request(member, path, &regional))
+                .await;
+            assert_eq!(
+                answer.status, 403,
+                "case {regional:?} on {path}: a region-qualified ARN names no action, got {} \
+                 with {}",
                 answer.status, answer.body
             );
         }
@@ -176,8 +198,8 @@ async fn tags_on_a_custom_action_merge_by_key_and_are_reported_by_list_tags() {
         )
         .await;
     assert_eq!(
-        created.status, 201,
-        "the create answers 201, got {} with {}",
+        created.status, 200,
+        "the create answers 200, got {} with {}",
         created.status, created.body
     );
 
@@ -282,8 +304,8 @@ async fn a_chime_webhook_configuration_is_tagged_like_any_other_chat_configurati
         )
         .await;
     assert_eq!(
-        created.status, 201,
-        "the Chime webhook create answers 201, got {} with {}",
+        created.status, 200,
+        "the Chime webhook create answers 200, got {} with {}",
         created.status, created.body
     );
     let arn = created.body["WebhookConfiguration"]["ChatConfigurationArn"].clone();

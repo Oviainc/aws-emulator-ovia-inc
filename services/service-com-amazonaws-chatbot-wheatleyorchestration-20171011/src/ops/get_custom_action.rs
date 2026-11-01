@@ -11,9 +11,8 @@
 //! See [`crate::state::ChatbotResourceKind::CustomAction`], which the tagging operations
 //! answer a custom-action ARN through for the same reason.
 //!
-//! `@readonly`: it reads the store and writes nothing. An ARN fully qualifies an action,
-//! its region included, so the lookup is by ARN alone and the signing region does not
-//! narrow it.
+//! `@readonly`: it reads the store and writes nothing. A custom action is account-scoped,
+//! so its ARN names it on its own and the signing region does not narrow the lookup.
 //!
 //! ## Shape of an operation
 //!
@@ -161,8 +160,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Fail closed: the authorization decision is made against the requested ARN before
         // the store is consulted, so an ARN this account holds no custom action for is an
         // authorization failure and never a 404 — the answer must not disclose whether the
-        // action exists. The ARN fully qualifies the action, its region included, so the
-        // signing region is not part of the lookup.
+        // action exists. A custom action is account-scoped, so its ARN names it on its own
+        // and the signing region is not part of the lookup.
         let record = store
             .custom_actions
             .get(&input.custom_action_arn)

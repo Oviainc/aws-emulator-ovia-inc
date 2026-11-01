@@ -8,12 +8,12 @@
 //! action's WHOLE mutable state rather than a patch — `Definition` is required even though
 //! the stored action already has one — so the stored action's definition, alias and
 //! attachments afterwards are exactly the members the request carried, an omitted optional
-//! member being cleared; what the ARN fixes (the action's name and region) and the tags,
-//! which only the tagging operations write, are left alone; and an ARN this account holds
-//! no action under is refused with the modelled 403 `UnauthorizedException` before the
-//! store is consulted, so the refusal discloses nothing about whether the action exists
-//! (the same fail-closed answer `tests/all/custom_action_fail_closed.rs` asserts for the
-//! other custom-action-addressed operations).
+//! member being cleared; what the ARN fixes (the action's name) and the tags, which only
+//! the tagging operations write, are left alone; and an ARN this account holds no action
+//! under is refused with the modelled 403 `UnauthorizedException` before the store is
+//! consulted, so the refusal discloses nothing about whether the action exists (the same
+//! fail-closed answer `tests/all/custom_action_fail_closed.rs` asserts for the other
+//! custom-action-addressed operations).
 //!
 //! The tables span the class rather than one recorded request: the rows differ in which
 //! optional members the update carries, in how many attachments, criteria and variables
@@ -31,12 +31,16 @@ const ACCOUNT: &str = "000000000000";
 /// The modelled error an ARN this account holds no custom action under is refused with.
 const UNAUTHORIZED_EXCEPTION: &str = "UnauthorizedException";
 
-fn custom_action_arn_in_region(region: &str, action_name: &str) -> String {
-    format!("arn:aws:chatbot:{region}:{ACCOUNT}:custom-action/{action_name}")
+/// A custom action is account-scoped, so the ARN a create mints carries an EMPTY region
+/// segment (`state::custom_action_arn`).
+fn custom_action_arn(action_name: &str) -> String {
+    format!("arn:aws:chatbot::{ACCOUNT}:custom-action/{action_name}")
 }
 
-fn custom_action_arn(action_name: &str) -> String {
-    custom_action_arn_in_region(REGION, action_name)
+/// The same ARN with a region segment filled in — a well-formed `CustomActionArn` that no
+/// create ever mints.
+fn custom_action_arn_in_region(region: &str, action_name: &str) -> String {
+    format!("arn:aws:chatbot:{region}:{ACCOUNT}:custom-action/{action_name}")
 }
 
 /// The create every update row starts from: it carries EVERY optional member, so a row
@@ -62,8 +66,8 @@ async fn create_baseline(emulator: &Emulator, action_name: &str) -> String {
         .call("/create-custom-action", &baseline_create(action_name))
         .await;
     assert_eq!(
-        created.status, 201,
-        "creating {action_name:?} answers 201, got {} with {}",
+        created.status, 200,
+        "creating {action_name:?} answers 200, got {} with {}",
         created.status, created.body
     );
     created.body["CustomActionArn"]
@@ -335,36 +339,37 @@ async fn successive_updates_each_replace_the_state_the_previous_one_left() {
 #[tokio::test]
 async fn an_update_is_addressed_by_arn_alone_whatever_region_it_is_signed_for() {
     let emulator = Emulator::new();
-    // The same name created in two regions: each ARN names its own action, and an ARN
-    // fully qualifies one, so a request signed for either region updates exactly the
-    // action its ARN names and leaves the other alone.
-    let action_name = "regional-action";
-    let here = create_baseline(&emulator, action_name).await;
+    // Two actions, each created from a different region: a custom action is
+    // account-scoped, so both ARNs are region-less and either one is updated from a
+    // request signed for any region.
+    let here_name = "signed-here";
+    let there_name = "signed-there";
+    let here = create_baseline(&emulator, here_name).await;
     let created_there = emulator
         .call_in_region(
             OTHER_REGION,
             "/create-custom-action",
-            &baseline_create(action_name),
+            &baseline_create(there_name),
         )
         .await;
     assert_eq!(
-        created_there.status, 201,
-        "creating {action_name:?} in {OTHER_REGION} answers 201, got {} with {}",
+        created_there.status, 200,
+        "creating {there_name:?} in {OTHER_REGION} answers 200, got {} with {}",
         created_there.status, created_there.body
     );
-    let there = custom_action_arn_in_region(OTHER_REGION, action_name);
+    let there = custom_action_arn(there_name);
     assert_eq!(
         created_there.body.get("CustomActionArn").and_then(Value::as_str),
         Some(there.as_str()),
-        "the create's ARN must name its own region, got {}",
+        "a create signed for {OTHER_REGION} must mint the region-less ARN, got {}",
         created_there.body
     );
 
-    // Update the OTHER region's action from a request signed for REGION, and this
-    // region's from one signed for the other: the signing region is not part of the
-    // lookup.
-    let pairs = [(&there, REGION), (&here, OTHER_REGION)];
-    for (arn, signing_region) in pairs {
+    // Update the action created in the OTHER region from a request signed for REGION, and
+    // the one created here from a request signed for the other: the signing region is not
+    // part of the lookup.
+    let pairs = [(&there, there_name, REGION), (&here, here_name, OTHER_REGION)];
+    for (arn, _, signing_region) in pairs {
         let answer = emulator
             .call_in_region(
                 signing_region,
@@ -382,7 +387,7 @@ async fn an_update_is_addressed_by_arn_alone_whatever_region_it_is_signed_for() 
         );
     }
 
-    for (arn, signing_region) in pairs {
+    for (arn, action_name, signing_region) in pairs {
         let stored = get_ok(&emulator, arn).await;
         assert_eq!(
             stored,
@@ -405,20 +410,25 @@ async fn updating_an_arn_the_store_does_not_hold_is_refused_as_unauthorized() {
 
     // Each row is a well-formed `CustomActionArn` (the modelled pattern
     // `^arn:aws:chatbot:…:custom-action/[a-zA-Z0-9_-]{1,64}$`) this account holds no action
-    // under: they differ in the action name's length and charset, in the region and in the
-    // account, so the refusal cannot follow from the spelling of the ARN.
+    // under: they differ in the action name's length and charset, in whether the ARN
+    // carries a region segment and in the account, so the refusal cannot follow from the
+    // spelling of the ARN.
     let unknown = [
         ("a name nothing was created under", custom_action_arn("absent")),
         ("the shortest allowed name", custom_action_arn("a")),
         ("the longest allowed name", custom_action_arn(&"z".repeat(64))),
         ("a mixed-case name", custom_action_arn("Mixed_Case-9")),
         (
-            "the created name in another region",
+            "the created name spelled with a region segment",
+            custom_action_arn_in_region(REGION, "present"),
+        ),
+        (
+            "the created name spelled with another region segment",
             custom_action_arn_in_region(OTHER_REGION, "present"),
         ),
         (
             "another account's ARN for the created name",
-            format!("arn:aws:chatbot:{REGION}:999999999999:custom-action/present"),
+            "arn:aws:chatbot::999999999999:custom-action/present".to_string(),
         ),
     ];
 
