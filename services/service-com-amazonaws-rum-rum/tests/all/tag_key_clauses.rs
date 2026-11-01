@@ -76,14 +76,15 @@ impl KeySetCase {
 
     /// The clause opening the refusal must state for each offending key, in the order a
     /// map-carried refusal states them: the key's own value and the member path the walk
-    /// spells a map entry as, for the keys in sorted order (which is the order the handler
-    /// judges a map's keys in, so it is fixed by the request and not by a hash order).
+    /// spells a TERMINAL map entry as — the map member and the key alone — for the keys in
+    /// sorted order (which is the order the handler judges a map's keys in, so it is fixed
+    /// by the request and not by a hash order).
     fn map_clauses(&self) -> Vec<String> {
         let mut sorted = self.offending.clone();
         sorted.sort();
         sorted
             .iter()
-            .map(|key| format!("Value '{key}' at 'tags.{key}.member' failed to satisfy constraint:"))
+            .map(|key| format!("Value '{key}' at 'tags.{key}' failed to satisfy constraint:"))
             .collect()
     }
 

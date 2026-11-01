@@ -279,8 +279,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // declares (which the boundary validator leaves unapplied for a map key), and the
         // map the write leaves behind stays inside the documented per-resource ceiling.
         // Both are refused before anything is written, under the modelled
-        // `ValidationException` an app-monitor call answers with.
-        if let Some(message) = crate::state::tag_keys_refusal(tags.keys().map(String::as_str)) {
+        // `ValidationException` an app-monitor call answers with — and the key refusal is
+        // worded by the one place a constraint refusal of this service is worded
+        // (`crate::state::validation`), which is what every other constraint clause this
+        // operation states goes through.
+        if let Some(message) =
+            crate::state::tag_keys_constraint_refusal(tags.keys().map(String::as_str))
+        {
             return Err(
                 CreateAppMonitorErrorModeled::ValidationException(ValidationException { message })
                     .into(),

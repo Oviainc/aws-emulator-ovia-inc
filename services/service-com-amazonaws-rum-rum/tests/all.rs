@@ -27,6 +27,8 @@ mod batch_delete_metric_definitions;
 mod batch_get_metric_definitions_reads;
 #[path = "all/constraint_refusals.rs"]
 mod constraint_refusals;
+#[path = "all/create_app_monitor_tag_key_wording.rs"]
+mod create_app_monitor_tag_key_wording;
 #[path = "all/create_app_monitor_tags.rs"]
 mod create_app_monitor_tags;
 #[path = "all/custom_metric_event_fields.rs"]

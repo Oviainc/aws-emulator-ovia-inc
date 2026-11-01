@@ -2926,17 +2926,17 @@ impl ::std::error::Error for TaggingRefusal {}
 /// own frontend uses for an invalid request.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
-/// Why the key shape of `TagMap` rejects these keys, worded as the FRAMEWORK's own
-/// validation envelope — or `None` when every one of them satisfies every constraint
-/// `TagKey` declares.
+/// Every constraint the modelled `TagKey` rejects these keys on, each at the dotted member
+/// path `keyed` spells that key's position as — empty when every one of them satisfies
+/// every constraint `TagKey` declares.
 ///
-/// EVERY offending key is stated: the envelope carries one clause per failing
+/// EVERY offending key yields its violation: a refusal then carries one clause per failing
 /// (key, requirement) pair, in the order `keyed` yields them, so a caller sending several
 /// bad keys is told about each of them in one answer instead of one per round trip. That is
 /// the rule [`validation`] states for every constraint refusal this service words, and a
-/// key carried by a map and a key carried by a list are the same kind of failure, so both
-/// callers below envelope their keys through here — only the PATH a clause reports a key at
-/// differs between them.
+/// key carried by a map and a key carried by a list are the same kind of failure, so every
+/// caller below collects its keys through here — what differs between them is the PATH a
+/// clause reports a key at, and which frontend's words state it.
 ///
 /// These checks belong in the handlers rather than at the boundary: the vendored boundary
 /// validator does not validate a map KEY at all — it captures the key as the path segment
@@ -2948,14 +2948,16 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// all.
 ///
 /// The CHECK is [`validation`]'s, which is where this service applies a modelled `@length`
-/// and `@pattern` itself; the WORDS stay the framework's. A tag key is only ever refused by
-/// the tagging frontend, whose wording is not this service's (see that module's docs and
-/// `crate::service`), so the clauses here are the ones the boundary would have produced —
-/// quoting the model's pattern as written, anchors and all. Each path is the dotted member
-/// path the framework would have reported for that position, and the key is echoed into its
-/// clause exactly as the caller sent it.
-fn tag_key_refusal<'a>(keyed: impl IntoIterator<Item = (String, &'a str)>) -> Option<String> {
-    let violations: Vec<::aws_smithy_schema_server::constraints::Violation> = keyed
+/// and `@pattern` itself. The violation is handed back STRUCTURALLY, unworded, because
+/// which words state it is the answering frontend's choice and not this check's: an
+/// ARN-addressed tag call keeps the framework's own sentence under that frontend's error
+/// code ([`tag_key_refusal`]), and an app-monitor call states it in this service's one
+/// constraint wording ([`constraint_refusal`]). The key is echoed into its clause exactly
+/// as the caller sent it.
+fn tag_key_violations<'a>(
+    keyed: impl IntoIterator<Item = (String, &'a str)>,
+) -> Vec<::aws_smithy_schema_server::constraints::Violation> {
+    keyed
         .into_iter()
         .filter_map(|(path, key)| {
             validation::string_violation(validation::ConstrainedString::TagKey, &path, key)
@@ -2965,10 +2967,17 @@ fn tag_key_refusal<'a>(keyed: impl IntoIterator<Item = (String, &'a str)>) -> Op
         // the violations found so far, so the message a refusal states is not sized by how
         // many keys a caller sent.
         .take(service_common::validation::MAX_VIOLATIONS)
-        .collect();
+        .collect()
+}
+
+/// [`tag_key_violations`] in the words RUM's ARN-addressed TAGGING frontend states a
+/// refusal in: the framework's own validation envelope, which is what that frontend's
+/// refusals are recorded carrying under its own error code (`crate::service`, and
+/// [`TAGGING_BAD_REQUEST_ERROR_CODE`]). `None` when every key is admitted.
+fn tag_key_refusal<'a>(keyed: impl IntoIterator<Item = (String, &'a str)>) -> Option<String> {
     // `envelope` answers `None` for an EMPTY violation list, which is exactly the case
     // where every key is admitted; a non-empty list always states its clauses.
-    ::aws_smithy_schema_server::envelope(&violations)
+    ::aws_smithy_schema_server::envelope(&tag_key_violations(keyed))
 }
 
 /// The dotted member path a violation on the tag MAP a request carries is reported at: the
@@ -2976,28 +2985,54 @@ fn tag_key_refusal<'a>(keyed: impl IntoIterator<Item = (String, &'a str)>) -> Op
 /// member every tag map this service WRITES is carried by.
 const TAG_MAP_PATH: &str = "tags";
 
-/// Why these tag keys cannot be written, or `None` when every one of them satisfies the
-/// constraints the modelled `TagKey` declares.
+/// The tag keys of a request carried by the tag MAP, each paired with the dotted member
+/// path a clause reports that entry at, in the order a refusal states them.
 ///
-/// Shared by every operation that WRITES tags — the create that seeds a resource's map and
-/// the tag call that merges onto it — because the constraints are the map's, declared once
-/// on `TagMap`'s key shape, not the property of whichever operation happens to carry it.
-/// Each offending key is reported at the path the framework's walk spells a map entry as
-/// (`<map>.<key>.member`), and the keys are judged in SORTED order, so the order a multi-key
-/// refusal states its clauses in is fixed by the request rather than by a `HashMap`'s
-/// iteration order. A tag key carried by a LIST rather than by the map — the keys a removal
-/// NAMES — is judged by [`tag_key_list_refusal`], which applies these same constraints at
-/// the path a list element is reported at.
-pub fn tag_keys_refusal<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
+/// The path is the map member followed by the key the CALLER chose and nothing else: that
+/// is the segment the framework's walk spells a TERMINAL map value with
+/// (`begin_collection_child` in `vendor/smithy-schema-server/src/constraints.rs`, whose
+/// `member` step is written only when DESCENDING into a structure value), and a `TagMap`
+/// value is a scalar. It is the same spelling the sibling `DimensionKeysMap` entries are
+/// reported at ([`dimension_keys_violations`]), so two map-entry violations of one kind are
+/// not reported at two path shapes. The keys are judged in SORTED order, so the order a
+/// multi-key refusal states its clauses in is fixed by the request rather than by a
+/// `HashMap`'s iteration order.
+fn tag_map_keyed<'a>(keys: impl IntoIterator<Item = &'a str>) -> Vec<(String, &'a str)> {
     let mut keys: Vec<&str> = keys.into_iter().collect();
     keys.sort_unstable();
-    tag_key_refusal(keys.into_iter().map(|key| {
-        let path = format!(
-            "{TAG_MAP_PATH}.{}",
-            ::aws_smithy_schema_server::constraints::path::entry(key)
-        );
-        (path, key)
-    }))
+    keys.into_iter()
+        .map(|key| (format!("{TAG_MAP_PATH}.{key}"), key))
+        .collect()
+}
+
+/// Why these tag keys cannot be written by a call of the ARN-addressed TAGGING frontend, or
+/// `None` when every one of them satisfies the constraints the modelled `TagKey` declares.
+///
+/// The constraints are the map's, declared once on `TagMap`'s key shape and not the
+/// property of whichever operation happens to carry it, so they are collected by the one
+/// [`tag_key_violations`] every tag-key check of this service goes through — this is the
+/// half that chooses that frontend's WORDS for them. The app-monitor create that seeds a
+/// monitor's map applies the same constraints at the same paths and states them in this
+/// service's own constraint wording ([`tag_keys_constraint_refusal`]), because that call is
+/// answered by the app-monitor frontend. A tag key carried by a LIST rather than by the map
+/// — the keys a removal NAMES — is judged by [`tag_key_list_refusal`], which applies these
+/// same constraints at the path a list element is reported at.
+pub fn tag_keys_refusal<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    tag_key_refusal(tag_map_keyed(keys))
+}
+
+/// Why these tag keys cannot be written by a call the APP-MONITOR frontend answers, or
+/// `None` when every one of them satisfies the constraints the modelled `TagKey` declares.
+///
+/// Same constraints, same paths and same completeness as [`tag_keys_refusal`] — both go
+/// through [`tag_key_violations`] over [`tag_map_keyed`] — worded through
+/// [`constraint_refusal`], which is the ONE place a constraint refusal of this service is
+/// stated ([`validation`]). So a create refused on a tag key states its clause the way the
+/// same call's refusal on any other member of the same request does: the modelled
+/// `@pattern` without the `^`/`$` pair the model writes around it, under the modelled
+/// `ValidationException` an app-monitor call answers with.
+pub fn tag_keys_constraint_refusal<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    constraint_refusal(&tag_key_violations(tag_map_keyed(keys)))
 }
 
 /// The dotted member path a violation on the tag-key LIST a request carries is reported
@@ -3018,8 +3053,10 @@ const TAG_KEY_LIST_PATH: &str = "tagKeys";
 /// carried by a LIST is reported at the position it holds in that list, which is the path
 /// the framework's walk spells a list element as (`<list>.<1-based position>.member`), and
 /// the keys are judged in the order the request listed them. EVERY offending key is stated
-/// here as it is on the map side, because both envelope their keys through the one
-/// [`tag_key_refusal`] — so a caller is told about each key it has to fix.
+/// here as it is on the map side, because every tag-key check of this service collects
+/// through the one [`tag_key_violations`] — so a caller is told about each key it has to
+/// fix. The removal is the ARN-addressed tagging frontend's own operation, so its clauses
+/// keep that frontend's words ([`tag_key_refusal`]).
 pub fn tag_key_list_refusal<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
     tag_key_refusal(keys.into_iter().enumerate().map(|(position, key)| {
         let path = format!(
