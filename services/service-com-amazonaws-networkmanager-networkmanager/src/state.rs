@@ -9095,16 +9095,27 @@ pub fn same_connect_options(
 /// Whether two `VpcOptions` ask for the same thing. See [`same_connect_options`]; an
 /// absent `Options` asks for the modelled defaults, which is what an absent one on the
 /// other side asks for too, so two absent options are the same request.
+///
+/// EVERY member of `VpcOptions` carries a modelled `@default` of `false` (`smithy_query
+/// shape=VpcOptions`), so a set that leaves a member out asks for that member off, and a
+/// set that is absent altogether asks for all four off. Each side is therefore read as the
+/// four flags it asks for — the defaults where it says nothing — rather than as "present"
+/// against "absent": an absent options set and one spelling the defaults out, the empty
+/// object included, are the same request. Unlike [`same_location`], where every member is
+/// optional with no default and an absent structure names no location at all, no spelling
+/// of `VpcOptions` can leave a flag unasked-for.
 pub fn same_vpc_options(left: Option<&VpcOptions>, right: Option<&VpcOptions>) -> bool {
     let members = |options: Option<&VpcOptions>| {
-        options.map(|options| {
-            (
-                options.ipv6_support,
-                options.appliance_mode_support,
-                options.dns_support,
-                options.security_group_referencing_support,
-            )
-        })
+        options
+            .map(|options| {
+                (
+                    options.ipv6_support,
+                    options.appliance_mode_support,
+                    options.dns_support,
+                    options.security_group_referencing_support,
+                )
+            })
+            .unwrap_or_default()
     };
     members(left) == members(right)
 }

@@ -316,15 +316,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // REPLACES all four flags — every member of `VpcOptions` carries a modelled
         // `@default` of `false` (`smithy_query shape=VpcOptions`), so one the request
         // leaves out is off rather than left alone — and a request carrying none leaves the
-        // stored options as they are.
-        let options = input.options.or_else(|| held_options.clone());
+        // stored options as they are. A carried set asking for the flags the attachment
+        // already has (`crate::state::same_vpc_options`, which reads an absent set as those
+        // same defaults) asks for no change either, so the stored spelling is kept rather
+        // than rewritten into the one the request used.
+        let options_unchanged = input.options.as_ref().is_none_or(|requested| {
+            crate::state::same_vpc_options(Some(requested), held_options.as_ref())
+        });
+        let options = if options_unchanged {
+            held_options.clone()
+        } else {
+            input.options
+        };
 
         // A request that asks for the state the attachment is already in changes nothing:
         // it does not move the attachment to `UPDATING`, does not advance `UpdatedAt` and
         // writes nothing, because there is no change for the service to apply.
-        if subnet_arns == held_subnets
-            && crate::state::same_vpc_options(options.as_ref(), held_options.as_ref())
-        {
+        if subnet_arns == held_subnets && options_unchanged {
             return Ok(UpdateVpcAttachmentOutput {
                 vpc_attachment: record.to_vpc_attachment(now),
             });

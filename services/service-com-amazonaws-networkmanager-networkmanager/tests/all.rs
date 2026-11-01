@@ -251,3 +251,5 @@ mod update_no_op_while_creating;
 mod update_site;
 #[path = "all/vpc_attachment_lifecycle.rs"]
 mod vpc_attachment_lifecycle;
+#[path = "all/vpc_attachment_options_spelling.rs"]
+mod vpc_attachment_options_spelling;
