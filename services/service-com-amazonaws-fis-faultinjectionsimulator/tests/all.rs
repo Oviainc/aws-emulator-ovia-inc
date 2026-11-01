@@ -41,6 +41,8 @@ mod experiment_target_account_configurations;
 mod experiment_template_not_found;
 #[path = "all/experiment_template_shape_floors.rs"]
 mod experiment_template_shape_floors;
+#[path = "all/fresh_start_reports_the_runs_it_ends.rs"]
+mod fresh_start_reports_the_runs_it_ends;
 #[path = "all/get_target_resource_type.rs"]
 mod get_target_resource_type;
 #[path = "all/length_refusal_wording.rs"]
